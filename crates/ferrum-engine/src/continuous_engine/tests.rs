@@ -1515,8 +1515,12 @@ impl DecoderOnlyLLM for RecurrentSpecLlm {
         Ok(Some(RecurrentStateSpec {
             request_id: request_id.clone(),
             num_layers: 1,
-            tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
-            dtype: DataType::FP32,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![4],
+                DataType::FP32,
+            )],
             device: Device::CPU,
             max_batch_slots: 1,
         }))
@@ -1625,8 +1629,12 @@ impl ModelExecutor for RecurrentSpecExecutor {
         Ok(Some(RecurrentStateSpec {
             request_id: request_id.clone(),
             num_layers: 1,
-            tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
-            dtype: DataType::BF16,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![4],
+                DataType::BF16,
+            )],
             device: Device::CPU,
             max_batch_slots: 1,
         }))
@@ -4391,8 +4399,12 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
     let recurrent_spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
-        dtype: DataType::FP32,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "state",
+            vec![1],
+            DataType::FP32,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -4722,8 +4734,12 @@ async fn sequence_recurrent_admission_helpers_keep_handle_and_slots_together() {
     let recurrent_spec = RecurrentStateSpec {
         request_id,
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
-        dtype: DataType::FP32,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "state",
+            vec![1],
+            DataType::FP32,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -4969,8 +4985,12 @@ async fn recurrent_state_lease_drop_without_consumption_panics_in_tests() {
     let spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
-        dtype: DataType::FP32,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "state",
+            vec![1],
+            DataType::FP32,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -5521,8 +5541,12 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
     let recurrent_spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
-        dtype: DataType::FP32,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "state",
+            vec![1],
+            DataType::FP32,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -5770,8 +5794,12 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
     let victim_spec = RecurrentStateSpec {
         request_id: victim_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
-        dtype: DataType::BF16,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "delta_state",
+            vec![4],
+            DataType::BF16,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -7684,8 +7712,12 @@ async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state
     let recurrent_spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
-        dtype: DataType::BF16,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "delta_state",
+            vec![4],
+            DataType::BF16,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -7773,8 +7805,12 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
     let recurrent_spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
-        dtype: DataType::BF16,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "delta_state",
+            vec![4],
+            DataType::BF16,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };
@@ -7878,8 +7914,12 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
     let recurrent_spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
-        dtype: DataType::BF16,
+        tensors: vec![RecurrentStateTensorSpec::new(
+            0,
+            "delta_state",
+            vec![4],
+            DataType::BF16,
+        )],
         device: Device::CPU,
         max_batch_slots: 1,
     };

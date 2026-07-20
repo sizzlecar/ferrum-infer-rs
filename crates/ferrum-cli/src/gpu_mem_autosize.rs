@@ -734,6 +734,7 @@ mod tests {
                 "model_type": "synthetic_recurrent_state_text",
                 "layer_types": ["linear_attention", "full_attention"],
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "linear_key_head_dim": 128,
                 "linear_num_key_heads": 16,
                 "linear_num_value_heads": 16,
@@ -785,6 +786,7 @@ mod tests {
             "text_config": {
                 "layer_types": ["linear_attention", "full_attention"],
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "linear_key_head_dim": 128,
                 "linear_num_key_heads": 16,
                 "linear_num_value_heads": 16,

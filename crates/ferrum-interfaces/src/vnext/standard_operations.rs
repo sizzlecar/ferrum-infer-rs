@@ -314,7 +314,7 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
 pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(2, 0),
+        version: ContractVersion::new(3, 0),
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
@@ -382,7 +382,7 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
                     symbol("value_head_dim"),
                     symbol("key_head_dim"),
                 ],
-                [ElementType::F16],
+                [ElementType::F32],
                 TensorAccess::ReadWrite,
             )?,
         ],
@@ -409,7 +409,7 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(
             GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-            ContractVersion::new(2, 0),
+            ContractVersion::new(3, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -744,10 +744,6 @@ mod tests {
         for contract in [&linear, &full] {
             let descriptor = contract.descriptor();
             assert_eq!(
-                descriptor.provider.minimum_version,
-                ContractVersion::new(2, 0)
-            );
-            assert_eq!(
                 descriptor.resources.scratch,
                 ResourcePresenceRequirement::Required
             );
@@ -761,12 +757,16 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(linear.descriptor().inputs.len(), 13);
-        assert_eq!(linear.descriptor().version, ContractVersion::new(2, 0));
+        assert_eq!(linear.descriptor().version, ContractVersion::new(3, 0));
+        assert_eq!(
+            linear.descriptor().provider.minimum_version,
+            ContractVersion::new(3, 0)
+        );
         assert_eq!(
             linear.descriptor().resources.binding,
             ResourcePresenceRequirement::Forbidden
         );
-        for ordinal in [7, 8, 9] {
+        for ordinal in [7, 8, 9, 12] {
             assert_eq!(
                 linear.descriptor().inputs[ordinal].element_types(),
                 &BTreeSet::from([ElementType::F32])
@@ -782,6 +782,10 @@ mod tests {
         );
         assert_eq!(full.descriptor().inputs.len(), 9);
         assert_eq!(full.descriptor().version, ContractVersion::new(2, 0));
+        assert_eq!(
+            full.descriptor().provider.minimum_version,
+            ContractVersion::new(2, 0)
+        );
         assert_eq!(
             full.descriptor().resources.binding,
             ResourcePresenceRequirement::Required

@@ -84,6 +84,7 @@ fn write_qwen35_reference_config(dir: &Path) {
             "linear_key_head_dim": 1,
             "linear_value_head_dim": 1,
             "linear_conv_kernel_dim": 1,
+            "mamba_ssm_dtype": "float32",
             "head_dim": 2,
             "num_attention_heads": 1,
             "num_key_value_heads": 1,

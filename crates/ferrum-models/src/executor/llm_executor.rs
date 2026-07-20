@@ -1384,8 +1384,8 @@ mod tests {
                 0,
                 "delta_state",
                 vec![1, 2, 3],
+                DataType::FP32,
             )],
-            dtype: DataType::FP32,
             device: Device::CPU,
             max_batch_slots: 1,
         };
@@ -1404,7 +1404,6 @@ mod tests {
 
         assert_eq!(actual.request_id, request_id);
         assert_eq!(actual.device, Device::CUDA(0));
-        assert_eq!(actual.dtype, spec.dtype);
         assert_eq!(actual.max_batch_slots, spec.max_batch_slots);
         assert_eq!(actual.tensors, spec.tensors);
     }

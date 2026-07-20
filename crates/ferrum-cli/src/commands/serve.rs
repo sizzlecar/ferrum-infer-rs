@@ -1700,7 +1700,7 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     definition: &ferrum_models::ModelDefinition,
     model_weight_bytes: Option<u64>,
 ) -> ModelCapabilities {
-    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+    model_capabilities_from_definition_with_weight_bytes_and_conv_state_dtype(
         definition,
         model_weight_bytes,
         ferrum_types::DataType::FP32,
@@ -1712,17 +1712,17 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes_for_hardware(
     model_weight_bytes: Option<u64>,
     hardware: &HardwareCapabilities,
 ) -> ModelCapabilities {
-    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+    model_capabilities_from_definition_with_weight_bytes_and_conv_state_dtype(
         definition,
         model_weight_bytes,
-        qwen35_recurrent_state_dtype_for_hardware(hardware),
+        qwen35_conv_state_dtype_for_hardware(hardware),
     )
 }
 
-fn model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+fn model_capabilities_from_definition_with_weight_bytes_and_conv_state_dtype(
     definition: &ferrum_models::ModelDefinition,
     model_weight_bytes: Option<u64>,
-    recurrent_state_dtype: ferrum_types::DataType,
+    conv_state_dtype: ferrum_types::DataType,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
@@ -1778,7 +1778,7 @@ fn model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtyp
         None
     };
     let recurrent_state_bytes_per_sequence =
-        recurrent_state_bytes_per_sequence_from_definition(definition, recurrent_state_dtype);
+        recurrent_state_bytes_per_sequence_from_definition(definition, conv_state_dtype);
 
     ModelCapabilities {
         architecture,
@@ -1797,9 +1797,7 @@ fn model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtyp
     }
 }
 
-fn qwen35_recurrent_state_dtype_for_hardware(
-    hardware: &HardwareCapabilities,
-) -> ferrum_types::DataType {
+fn qwen35_conv_state_dtype_for_hardware(hardware: &HardwareCapabilities) -> ferrum_types::DataType {
     if hardware.backend.eq_ignore_ascii_case("cuda") && hardware.compiled_features.cuda {
         ferrum_types::DataType::FP16
     } else {
@@ -1809,7 +1807,7 @@ fn qwen35_recurrent_state_dtype_for_hardware(
 
 fn recurrent_state_bytes_per_sequence_from_definition(
     definition: &ferrum_models::ModelDefinition,
-    dtype: ferrum_types::DataType,
+    conv_state_dtype: ferrum_types::DataType,
 ) -> Option<u64> {
     if !matches!(
         definition.architecture,
@@ -1817,10 +1815,28 @@ fn recurrent_state_bytes_per_sequence_from_definition(
     ) {
         return None;
     }
+    let config =
+        ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition).ok()?;
+    let dtypes = match definition.architecture {
+        // Dense Qwen3.5 is registered on vNext, whose temporal state follows
+        // mamba_ssm_dtype independently of the convolution state.
+        ferrum_models::Architecture::Qwen35 => {
+            ferrum_models::qwen35_config::Qwen35RecurrentStateDtypes::new(
+                conv_state_dtype,
+                config.mamba_ssm_dtype,
+            )
+        }
+        // Qwen3.5 MoE remains on the legacy indexed executor until its vNext
+        // family is registered. That executor physically owns one homogeneous
+        // pool, so admission must budget the allocation it actually makes.
+        ferrum_models::Architecture::Qwen35Moe => {
+            ferrum_models::qwen35_config::Qwen35RecurrentStateDtypes::homogeneous(conv_state_dtype)
+        }
+        _ => return None,
+    };
     Some(
-        ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
-            .ok()?
-            .recurrent_state_bytes_per_slot(dtype)
+        config
+            .recurrent_state_bytes_per_slot_with_dtypes(dtypes)
             .ok()?,
     )
 }
@@ -2977,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_moe_cuda_model_capabilities_use_cuda_recurrent_state_dtype() {
+    fn qwen35_moe_cuda_model_capabilities_follow_legacy_homogeneous_state_pool() {
         let definition = qwen35_moe_reference_definition();
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
@@ -2991,6 +3007,30 @@ mod tests {
         assert_eq!(
             capabilities.recurrent_state_bytes_per_sequence,
             Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
+        );
+    }
+
+    #[test]
+    fn qwen35_dense_cuda_model_capabilities_follow_vnext_mixed_state_layout() {
+        let mut definition = qwen35_moe_reference_definition();
+        definition.architecture = ferrum_models::Architecture::Qwen35;
+        definition.extra_params["num_experts"] = serde_json::Value::Null;
+        definition.extra_params["num_experts_per_tok"] = serde_json::Value::Null;
+        definition.extra_params["moe_intermediate_size"] = serde_json::Value::Null;
+        definition.extra_params["shared_expert_intermediate_size"] = serde_json::Value::Null;
+        definition.extra_params["intermediate_size"] = serde_json::json!(11008);
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+
+        let capabilities = model_capabilities_from_definition_with_weight_bytes_for_hardware(
+            &definition,
+            None,
+            &hardware,
+        );
+
+        assert_eq!(
+            capabilities.recurrent_state_bytes_per_sequence,
+            Some(30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4))
         );
     }
 

@@ -4,17 +4,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
-    residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
-    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
-    DynamicStorageView, ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    SemanticValue, VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
+    last_token_dense_linear_contract, residual_add_contract, rms_norm_contract,
+    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
+    CapabilityId, ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
+    EngineProviderDescriptor, ExecutionIdentityEnvelope, OperationContract, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationRuntimeRegistry, ProfilePhase, ProviderId,
+    ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
 };
 use sha2::{Digest, Sha256};
@@ -24,10 +25,12 @@ use super::vnext_runtime::{
     MetalDeviceRuntimeError,
 };
 
+mod gated_delta_attention;
 mod linear;
 mod primitives;
 mod weights;
 
+use gated_delta_attention::{MetalGatedDeltaPipelines, MetalGatedDeltaRecurrentAttentionProvider};
 use linear::{
     MetalDenseLinearProvider, MetalDenseSwiGluProvider, MetalLastTokenDenseLinearProvider,
     MetalLinearPipelines,
@@ -55,6 +58,7 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -74,6 +78,8 @@ pub fn metal_vnext_runtime_config(
             include_str!("primitives.metal").as_bytes(),
             include_str!("linear.rs").as_bytes(),
             include_str!("linear.metal").as_bytes(),
+            include_str!("gated_delta_attention.rs").as_bytes(),
+            include_str!("gated_delta_attention.metal").as_bytes(),
         ]),
         capabilities: metal_vnext_capabilities()?,
         dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
@@ -88,6 +94,7 @@ pub fn metal_vnext_operation_registry(
 ) -> Result<OperationRuntimeRegistry<MetalDeviceRuntime>, MetalDeviceRuntimeError> {
     let pipelines = Arc::new(MetalPrimitivePipelines::new(runtime.device())?);
     let linear_pipelines = Arc::new(MetalLinearPipelines::new(runtime.device())?);
+    let gated_delta_pipelines = Arc::new(MetalGatedDeltaPipelines::new(runtime.device())?);
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
@@ -95,6 +102,7 @@ pub fn metal_vnext_operation_registry(
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
+        Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<MetalDeviceRuntime>>> = vec![
         Box::new(MetalTokenEmbeddingProvider::new(
@@ -102,7 +110,10 @@ pub fn metal_vnext_operation_registry(
             Arc::clone(&pipelines),
         )?),
         Box::new(MetalRmsNormProvider::new(runtime, Arc::clone(&pipelines))?),
-        Box::new(MetalResidualAddProvider::new(runtime, pipelines)?),
+        Box::new(MetalResidualAddProvider::new(
+            runtime,
+            Arc::clone(&pipelines),
+        )?),
         Box::new(MetalDenseLinearProvider::new(
             runtime,
             Arc::clone(&linear_pipelines),
@@ -113,7 +124,13 @@ pub fn metal_vnext_operation_registry(
         )?),
         Box::new(MetalLastTokenDenseLinearProvider::new(
             runtime,
+            Arc::clone(&linear_pipelines),
+        )?),
+        Box::new(MetalGatedDeltaRecurrentAttentionProvider::new(
+            runtime,
+            gated_delta_pipelines,
             linear_pipelines,
+            pipelines,
         )?),
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
@@ -205,6 +222,11 @@ pub(crate) fn provider_descriptor(
         .map(|format| QuantizationFormatId::new(*format))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(contract_error)?;
+    let estimator_fingerprint = implementation_fingerprint(&[
+        include_str!("mod.rs").as_bytes(),
+        estimator_id.as_bytes(),
+        provider_fingerprint.as_bytes(),
+    ]);
     OperationProviderDescriptor::new(
         ProviderId::new(provider_id).map_err(contract_error)?,
         contract.descriptor().id.clone(),
@@ -213,7 +235,7 @@ pub(crate) fn provider_descriptor(
             .fingerprint()
             .map_err(contract_error)?,
         provider_fingerprint,
-        ContractVersion::new(1, 0),
+        contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([capability]),
         weight_formats,
@@ -221,7 +243,7 @@ pub(crate) fn provider_descriptor(
         bindings,
         estimator_id,
         ContractVersion::new(1, 0),
-        implementation_fingerprint(&[include_str!("mod.rs").as_bytes(), estimator_id.as_bytes()]),
+        estimator_fingerprint,
     )
     .map_err(contract_error)
 }
@@ -596,16 +618,16 @@ mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
         OperationId, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
-        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
-        TOKEN_EMBEDDING_OPERATION_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+        RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
     };
 
     #[test]
     fn partial_composition_advertises_only_installed_operation_capabilities() {
         let composition = MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
             .expect("create Metal primitive composition");
-        assert_eq!(composition.runtime().descriptor().capabilities.len(), 6);
-        assert_eq!(composition.catalog().device().capabilities.len(), 6);
+        assert_eq!(composition.runtime().descriptor().capabilities.len(), 7);
+        assert_eq!(composition.catalog().device().capabilities.len(), 7);
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             RMS_NORM_OPERATION_ID,
@@ -613,6 +635,7 @@ mod tests {
             DENSE_LINEAR_OPERATION_ID,
             DENSE_SWIGLU_OPERATION_ID,
             LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+            GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
         ] {
             assert_eq!(
                 composition

@@ -89,6 +89,28 @@ pub struct Qwen35QuantizationConfig {
     pub sym: bool,
 }
 
+/// Physical storage dtypes for the two independent Qwen3.5 recurrent-state
+/// tensor families. This is route-specific: vNext follows model metadata,
+/// while the temporary legacy executor owns a homogeneous state pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35RecurrentStateDtypes {
+    pub conv_state: DataType,
+    pub delta_state: DataType,
+}
+
+impl Qwen35RecurrentStateDtypes {
+    pub const fn new(conv_state: DataType, delta_state: DataType) -> Self {
+        Self {
+            conv_state,
+            delta_state,
+        }
+    }
+
+    pub const fn homogeneous(dtype: DataType) -> Self {
+        Self::new(dtype, dtype)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Qwen35TextConfig {
     pub top_level_model_type: Option<String>,
@@ -97,6 +119,8 @@ pub struct Qwen35TextConfig {
     pub num_hidden_layers: usize,
     pub layer_types: Vec<Qwen35LayerType>,
     pub linear_attention: Qwen35LinearAttentionConfig,
+    /// Storage dtype for the Gated DeltaNet temporal/SSM state.
+    pub mamba_ssm_dtype: DataType,
     pub head_dim: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
@@ -198,6 +222,7 @@ impl Qwen35TextConfig {
             num_hidden_layers,
             layer_types,
             linear_attention,
+            mamba_ssm_dtype: parse_mamba_ssm_dtype(text_config)?,
             head_dim: required_usize(text_config, "head_dim")?,
             num_attention_heads: required_usize(text_config, "num_attention_heads")?,
             num_key_value_heads: required_usize(text_config, "num_key_value_heads")?,
@@ -397,8 +422,22 @@ impl Qwen35TextConfig {
     /// The dim-first layout is `[conv_channels, conv_kernel - 1]`, where
     /// `conv_channels = q_total + k_total + v_total`.
     pub fn recurrent_conv_state_shape(&self) -> Result<Vec<usize>, String> {
+        let qk_total = self
+            .linear_attention
+            .num_key_heads
+            .checked_mul(self.linear_attention.key_head_dim)
+            .ok_or_else(|| "Qwen3.5 recurrent QK width overflows usize".to_string())?;
+        let value_total = self
+            .linear_attention
+            .num_value_heads
+            .checked_mul(self.linear_attention.value_head_dim)
+            .ok_or_else(|| "Qwen3.5 recurrent value width overflows usize".to_string())?;
+        let conv_channels = qk_total
+            .checked_mul(2)
+            .and_then(|qk| qk.checked_add(value_total))
+            .ok_or_else(|| "Qwen3.5 recurrent convolution width overflows usize".to_string())?;
         Ok(vec![
-            self.linear_qk_total_dim() * 2 + self.linear_value_total_dim(),
+            conv_channels,
             self.linear_attention.conv_kernel_dim.saturating_sub(1),
         ])
     }
@@ -423,10 +462,32 @@ impl Qwen35TextConfig {
         ])
     }
 
-    pub fn recurrent_state_tensor_specs(&self) -> Result<Vec<RecurrentStateTensorSpec>, String> {
+    pub fn recurrent_state_tensor_specs(
+        &self,
+        conv_state_dtype: DataType,
+    ) -> Result<Vec<RecurrentStateTensorSpec>, String> {
+        self.recurrent_state_tensor_specs_with_dtypes(Qwen35RecurrentStateDtypes::new(
+            conv_state_dtype,
+            self.mamba_ssm_dtype,
+        ))
+    }
+
+    pub fn recurrent_state_tensor_specs_with_dtypes(
+        &self,
+        dtypes: Qwen35RecurrentStateDtypes,
+    ) -> Result<Vec<RecurrentStateTensorSpec>, String> {
+        validate_recurrent_state_dtype("model/conv", dtypes.conv_state)?;
+        validate_recurrent_state_dtype("model/delta", dtypes.delta_state)?;
         let conv_shape = self.recurrent_conv_state_shape()?;
         let delta_shape = self.recurrent_delta_state_shape()?;
-        let mut specs = Vec::with_capacity(self.linear_attention_layers() * 2);
+        let capacity = self
+            .linear_attention_layers()
+            .checked_mul(2)
+            .ok_or_else(|| "Qwen3.5 recurrent state tensor count overflows".to_string())?;
+        let mut specs = Vec::new();
+        specs
+            .try_reserve(capacity)
+            .map_err(|_| "Qwen3.5 recurrent state tensor reservation failed".to_string())?;
         for (layer_index, kind) in self.layer_types.iter().copied().enumerate() {
             if kind != Qwen35LayerType::LinearAttention {
                 continue;
@@ -435,35 +496,87 @@ impl Qwen35TextConfig {
                 layer_index,
                 QWEN35_CONV_STATE_NAME,
                 conv_shape.clone(),
+                dtypes.conv_state,
             ));
             specs.push(RecurrentStateTensorSpec::new(
                 layer_index,
                 QWEN35_DELTA_STATE_NAME,
                 delta_shape.clone(),
+                dtypes.delta_state,
             ));
         }
         Ok(specs)
     }
 
     pub fn recurrent_state_elements_per_slot(&self) -> Result<usize, String> {
-        Ok(self
-            .recurrent_state_tensor_specs()?
-            .iter()
-            .map(RecurrentStateTensorSpec::num_elements)
-            .sum())
+        let conv_shape = self.recurrent_conv_state_shape()?;
+        let delta_shape = self.recurrent_delta_state_shape()?;
+        let conv_elements = checked_recurrent_shape_elements("convolution", &conv_shape)?;
+        let delta_elements = checked_recurrent_shape_elements("delta", &delta_shape)?;
+        conv_elements
+            .checked_add(delta_elements)
+            .and_then(|per_layer| per_layer.checked_mul(self.linear_attention_layers()))
+            .ok_or_else(|| "Qwen3.5 recurrent state element count overflows".to_string())
     }
 
-    pub fn recurrent_state_bytes_per_slot(&self, dtype: DataType) -> Result<u64, String> {
-        self.recurrent_state_elements_per_slot()?
-            .checked_mul(dtype.size_bytes())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| format!("Qwen3.5 recurrent state bytes overflow for dtype {dtype:?}"))
+    pub fn recurrent_state_bytes_per_slot(
+        &self,
+        conv_state_dtype: DataType,
+    ) -> Result<u64, String> {
+        self.recurrent_state_bytes_per_slot_with_dtypes(Qwen35RecurrentStateDtypes::new(
+            conv_state_dtype,
+            self.mamba_ssm_dtype,
+        ))
+    }
+
+    pub fn recurrent_state_bytes_per_slot_with_dtypes(
+        &self,
+        dtypes: Qwen35RecurrentStateDtypes,
+    ) -> Result<u64, String> {
+        self.recurrent_state_tensor_specs_with_dtypes(dtypes)?
+            .iter()
+            .try_fold(0u64, |total, tensor| {
+                let tensor_bytes = tensor
+                    .checked_num_elements()
+                    .ok_or_else(|| {
+                        format!(
+                            "Qwen3.5 recurrent state element count overflows for {}",
+                            tensor.name
+                        )
+                    })?
+                    .checked_mul(tensor.dtype.size_bytes())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "Qwen3.5 recurrent state bytes overflow for {} dtype {}",
+                            tensor.name, tensor.dtype
+                        )
+                    })?;
+                total
+                    .checked_add(tensor_bytes)
+                    .ok_or_else(|| "Qwen3.5 recurrent state byte total overflows u64".to_string())
+            })
     }
 
     pub fn to_recurrent_state_spec(
         &self,
         request_id: RequestId,
-        dtype: DataType,
+        conv_state_dtype: DataType,
+        device: Device,
+        max_batch_slots: usize,
+    ) -> Result<RecurrentStateSpec, String> {
+        self.to_recurrent_state_spec_with_dtypes(
+            request_id,
+            Qwen35RecurrentStateDtypes::new(conv_state_dtype, self.mamba_ssm_dtype),
+            device,
+            max_batch_slots,
+        )
+    }
+
+    pub fn to_recurrent_state_spec_with_dtypes(
+        &self,
+        request_id: RequestId,
+        dtypes: Qwen35RecurrentStateDtypes,
         device: Device,
         max_batch_slots: usize,
     ) -> Result<RecurrentStateSpec, String> {
@@ -473,8 +586,7 @@ impl Qwen35TextConfig {
         Ok(RecurrentStateSpec {
             request_id,
             num_layers: self.num_hidden_layers,
-            tensors: self.recurrent_state_tensor_specs()?,
-            dtype,
+            tensors: self.recurrent_state_tensor_specs_with_dtypes(dtypes)?,
             device,
             max_batch_slots,
         })
@@ -545,6 +657,36 @@ impl Qwen35TextConfig {
         }
         Ok(())
     }
+}
+
+fn parse_mamba_ssm_dtype(text_config: &serde_json::Map<String, Value>) -> Result<DataType, String> {
+    let value = required_string(text_config, "mamba_ssm_dtype")?;
+    match value.as_str() {
+        "float32" => Ok(DataType::FP32),
+        "float16" => Ok(DataType::FP16),
+        "bfloat16" => Ok(DataType::BF16),
+        _ => Err(format!(
+            "unsupported Qwen3.5 mamba_ssm_dtype {value:?}; expected float32, float16, or bfloat16"
+        )),
+    }
+}
+
+fn validate_recurrent_state_dtype(label: &str, dtype: DataType) -> Result<(), String> {
+    if matches!(dtype, DataType::FP32 | DataType::FP16 | DataType::BF16) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Qwen3.5 {label} recurrent state dtype must be fp32, fp16, or bf16, got {dtype}"
+        ))
+    }
+}
+
+fn checked_recurrent_shape_elements(label: &str, shape: &[usize]) -> Result<usize, String> {
+    shape.iter().try_fold(1usize, |elements, dimension| {
+        elements
+            .checked_mul(*dimension)
+            .ok_or_else(|| format!("Qwen3.5 {label} recurrent state element count overflows usize"))
+    })
 }
 
 fn parse_rope_parameters(

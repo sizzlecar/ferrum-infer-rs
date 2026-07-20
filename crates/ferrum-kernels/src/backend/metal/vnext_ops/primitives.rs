@@ -614,6 +614,19 @@ fn set_region(encoder: &ComputeCommandEncoderRef, index: u64, region: &MetalBuff
     encoder.set_buffer(index, Some(region.buffer()), region.offset_bytes());
 }
 
+fn set_region_offset(
+    encoder: &ComputeCommandEncoderRef,
+    index: u64,
+    region: &MetalBufferRegion,
+    extra_offset_bytes: u64,
+) {
+    encoder.set_buffer(
+        index,
+        Some(region.buffer()),
+        region.offset_bytes() + extra_offset_bytes,
+    );
+}
+
 fn dispatch_embedding(
     pipelines: &MetalPrimitivePipelines,
     encoder: &ComputeCommandEncoderRef,
@@ -654,10 +667,42 @@ fn dispatch_rms_norm(
     output: &MetalBufferRegion,
     params: RmsNormParams,
 ) {
+    dispatch_rms_norm_at(
+        pipelines,
+        encoder,
+        input,
+        0,
+        weight,
+        output,
+        0,
+        params.rows,
+        params.hidden_size,
+        params.epsilon,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_rms_norm_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    input_offset_bytes: u64,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+) {
+    let params = RmsNormParams {
+        rows,
+        hidden_size,
+        epsilon,
+    };
     encoder.set_compute_pipeline_state(&pipelines.rms_norm);
-    set_region(encoder, 0, input);
+    set_region_offset(encoder, 0, input, input_offset_bytes);
     set_region(encoder, 1, weight);
-    set_region(encoder, 2, output);
+    set_region_offset(encoder, 2, output, output_offset_bytes);
     encoder.set_bytes(
         3,
         std::mem::size_of::<RmsNormParams>() as u64,
@@ -678,10 +723,36 @@ fn dispatch_residual_add(
     output: &MetalBufferRegion,
     params: ResidualAddParams,
 ) {
+    dispatch_residual_add_at(
+        pipelines,
+        encoder,
+        left,
+        0,
+        right,
+        0,
+        output,
+        0,
+        params.elements,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_residual_add_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    left: &MetalBufferRegion,
+    left_offset_bytes: u64,
+    right: &MetalBufferRegion,
+    right_offset_bytes: u64,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    elements: u32,
+) {
+    let params = ResidualAddParams { elements };
     encoder.set_compute_pipeline_state(&pipelines.residual_add);
-    set_region(encoder, 0, left);
-    set_region(encoder, 1, right);
-    set_region(encoder, 2, output);
+    set_region_offset(encoder, 0, left, left_offset_bytes);
+    set_region_offset(encoder, 1, right, right_offset_bytes);
+    set_region_offset(encoder, 2, output, output_offset_bytes);
     encoder.set_bytes(
         3,
         std::mem::size_of::<ResidualAddParams>() as u64,

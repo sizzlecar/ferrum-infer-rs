@@ -40,7 +40,7 @@ use crate::{
         moe_forward, moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeForwardParams,
         MoeRouteScratch,
     },
-    qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
+    qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35RecurrentStateDtypes, Qwen35TextConfig},
     qwen35_weights::{
         Qwen35ResolvedWeightPlan, Qwen35WeightInventory, Qwen35WeightPlanLoader,
         Qwen35WeightValidation,
@@ -200,7 +200,6 @@ pub struct Qwen35LinearStatePools<B: MoeLlmBackend> {
 pub struct Qwen35RecurrentStateCache<B: Backend> {
     pub request_id: RequestId,
     pub num_layers: usize,
-    pub dtype: DataType,
     pub device: Device,
     pub max_batch_slots: usize,
     pub tensors: Vec<Qwen35RecurrentStateTensor<B>>,
@@ -210,6 +209,7 @@ pub struct Qwen35RecurrentStateTensor<B: Backend> {
     pub layer_index: usize,
     pub name: String,
     pub shape: Vec<usize>,
+    pub dtype: DataType,
     pub elements_per_slot: usize,
     pub buffer: B::Buffer,
 }
@@ -1312,10 +1312,36 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         {
             return Ok(());
         }
-        let shape = self.linear_attention_state_shape();
-        let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
-        let delta_state_len = shape.state_len();
+        let checked_state_elements = |label: &str, shape: Vec<usize>| {
+            shape.into_iter().try_fold(1usize, |elements, dimension| {
+                elements.checked_mul(dimension).ok_or_else(|| {
+                    FerrumError::resource_exhausted(format!(
+                        "Qwen3.5 {label} state size overflows usize"
+                    ))
+                })
+            })
+        };
+        let conv_state_len = checked_state_elements(
+            "convolution",
+            self.weights
+                .config
+                .recurrent_conv_state_shape()
+                .map_err(FerrumError::model)?,
+        )?;
+        let delta_state_len = checked_state_elements(
+            "delta",
+            self.weights
+                .config
+                .recurrent_delta_state_shape()
+                .map_err(FerrumError::model)?,
+        )?;
         let max_slots = self.linear_state_max_slots.max(1);
+        let conv_pool_len = max_slots.checked_mul(conv_state_len).ok_or_else(|| {
+            FerrumError::resource_exhausted("Qwen3.5 convolution state pool size overflows usize")
+        })?;
+        let delta_pool_len = max_slots.checked_mul(delta_state_len).ok_or_else(|| {
+            FerrumError::resource_exhausted("Qwen3.5 delta state pool size overflows usize")
+        })?;
         let layer_plan = self
             .weights
             .config
@@ -1329,14 +1355,10 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .collect::<Vec<_>>();
         for layer in layer_plan {
             if matches!(layer.attention, Qwen35LayerType::LinearAttention) {
-                conv_states[layer.layer_index] = Some(B::alloc_typed(
-                    self.linear_state_pool_dtype,
-                    max_slots * conv_state_len,
-                ));
-                delta_states[layer.layer_index] = Some(B::alloc_typed(
-                    self.linear_state_pool_dtype,
-                    max_slots * delta_state_len,
-                ));
+                conv_states[layer.layer_index] =
+                    Some(B::alloc_typed(self.linear_state_pool_dtype, conv_pool_len));
+                delta_states[layer.layer_index] =
+                    Some(B::alloc_typed(self.linear_state_pool_dtype, delta_pool_len));
             }
         }
         self.linear_state_pools = Some(Qwen35LinearStatePools {
@@ -4333,11 +4355,17 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
                 )));
             }
         };
-        self.weights
+        let spec = self
+            .weights
             .config
-            .to_recurrent_state_spec(request_id.clone(), dtype, Device::CPU, 1)
-            .map(Some)
-            .map_err(|err| FerrumError::model(format!("invalid Qwen3.5 recurrent spec: {err}")))
+            .to_recurrent_state_spec_with_dtypes(
+                request_id.clone(),
+                Qwen35RecurrentStateDtypes::homogeneous(dtype),
+                Device::CPU,
+                1,
+            )
+            .map_err(|err| FerrumError::model(format!("invalid Qwen3.5 recurrent spec: {err}")))?;
+        Ok(Some(spec))
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -10969,7 +10997,6 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
                 "Qwen3.5 recurrent state requires at least one batch slot",
             ));
         }
-        let storage_dtype = qwen35_recurrent_backend_dtype(spec.dtype)?;
         let mut tensors = Vec::with_capacity(spec.tensors.len());
         for tensor in &spec.tensors {
             if tensor.shape.is_empty() {
@@ -10978,12 +11005,34 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
                     tensor.layer_index, tensor.name
                 )));
             }
-            let elements_per_slot = tensor.num_elements();
-            let total_elements = elements_per_slot.saturating_mul(spec.max_batch_slots);
+            let elements_per_slot = tensor.checked_num_elements().ok_or_else(|| {
+                FerrumError::resource_exhausted(format!(
+                    "Qwen3.5 recurrent tensor layer={} name={} element count overflows usize",
+                    tensor.layer_index, tensor.name
+                ))
+            })?;
+            let total_elements = elements_per_slot
+                .checked_mul(spec.max_batch_slots)
+                .ok_or_else(|| {
+                    FerrumError::resource_exhausted(format!(
+                        "Qwen3.5 recurrent tensor layer={} name={} slot allocation overflows usize",
+                        tensor.layer_index, tensor.name
+                    ))
+                })?;
+            total_elements
+                .checked_mul(tensor.dtype.size_bytes())
+                .ok_or_else(|| {
+                    FerrumError::resource_exhausted(format!(
+                        "Qwen3.5 recurrent tensor layer={} name={} byte allocation overflows usize",
+                        tensor.layer_index, tensor.name
+                    ))
+                })?;
+            let storage_dtype = qwen35_recurrent_backend_dtype(tensor.dtype)?;
             tensors.push(Qwen35RecurrentStateTensor {
                 layer_index: tensor.layer_index,
                 name: tensor.name.clone(),
                 shape: tensor.shape.clone(),
+                dtype: tensor.dtype,
                 elements_per_slot,
                 buffer: B::alloc_typed(storage_dtype, total_elements),
             });
@@ -10991,7 +11040,6 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
         Ok(Self {
             request_id: spec.request_id.clone(),
             num_layers: spec.num_layers,
-            dtype: spec.dtype,
             device: spec.device.clone(),
             max_batch_slots: spec.max_batch_slots,
             tensors,
@@ -10999,14 +11047,24 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
     }
 
     pub fn total_elements(&self) -> usize {
-        self.tensors
-            .iter()
-            .map(|tensor| tensor.elements_per_slot * self.max_batch_slots)
-            .sum()
+        self.tensors.iter().fold(0usize, |total, tensor| {
+            total.saturating_add(
+                tensor
+                    .elements_per_slot
+                    .saturating_mul(self.max_batch_slots),
+            )
+        })
     }
 
     pub fn estimated_memory_bytes(&self) -> usize {
-        self.total_elements() * self.dtype.size_bytes()
+        self.tensors.iter().fold(0usize, |total, tensor| {
+            total.saturating_add(
+                tensor
+                    .elements_per_slot
+                    .saturating_mul(self.max_batch_slots)
+                    .saturating_mul(tensor.dtype.size_bytes()),
+            )
+        })
     }
 
     pub fn tensor(&self, layer_index: usize, name: &str) -> Option<&Qwen35RecurrentStateTensor<B>> {
@@ -11072,28 +11130,25 @@ impl<B: Backend> Qwen35RecurrentStateManager<B> {
     fn used_memory_bytes_locked(
         handles: &HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>,
     ) -> usize {
-        handles
-            .values()
-            .map(|handle| handle.cache.lock().estimated_memory_bytes())
-            .sum()
+        handles.values().fold(0usize, |total, handle| {
+            total.saturating_add(handle.cache.lock().estimated_memory_bytes())
+        })
     }
 
     fn used_batch_slots_locked(
         handles: &HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>,
     ) -> usize {
-        handles
-            .values()
-            .map(|handle| handle.cache.lock().max_batch_slots)
-            .sum()
+        handles.values().fold(0usize, |total, handle| {
+            total.saturating_add(handle.cache.lock().max_batch_slots)
+        })
     }
 
     fn active_state_tensors_locked(
         handles: &HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>,
     ) -> usize {
-        handles
-            .values()
-            .map(|handle| handle.cache.lock().tensors.len())
-            .sum()
+        handles.values().fold(0usize, |total, handle| {
+            total.saturating_add(handle.cache.lock().tensors.len())
+        })
     }
 }
 
@@ -11102,7 +11157,14 @@ impl<B: Backend> fmt::Debug for Qwen35RecurrentStateHandle<B> {
         let cache = self.cache.lock();
         f.debug_struct("Qwen35RecurrentStateHandle")
             .field("request_id", &cache.request_id)
-            .field("dtype", &cache.dtype)
+            .field(
+                "tensor_dtypes",
+                &cache
+                    .tensors
+                    .iter()
+                    .map(|tensor| tensor.dtype)
+                    .collect::<Vec<_>>(),
+            )
             .field("device", &cache.device)
             .field("max_batch_slots", &cache.max_batch_slots)
             .field("state_tensors", &cache.tensors.len())
@@ -11278,17 +11340,22 @@ impl<B: Backend> Qwen35RecurrentStateTensor<B> {
                 "Qwen3.5 recurrent state slot {slot} exceeds max_batch_slots {max_batch_slots}"
             )));
         }
-        let start = slot * self.elements_per_slot;
-        Ok(start..start + self.elements_per_slot)
+        let start = slot.checked_mul(self.elements_per_slot).ok_or_else(|| {
+            FerrumError::resource_exhausted("Qwen3.5 recurrent state slot offset overflows usize")
+        })?;
+        let end = start.checked_add(self.elements_per_slot).ok_or_else(|| {
+            FerrumError::resource_exhausted("Qwen3.5 recurrent state slot range overflows usize")
+        })?;
+        Ok(start..end)
     }
 }
 
 fn qwen35_recurrent_backend_dtype(dtype: DataType) -> Result<Dtype> {
     match dtype {
         DataType::FP32 => Ok(Dtype::F32),
-        DataType::FP16 | DataType::BF16 => Ok(Dtype::F16),
+        DataType::FP16 => Ok(Dtype::F16),
         other => Err(FerrumError::unsupported(format!(
-            "Qwen3.5 recurrent state dtype {other:?} is not supported"
+            "Qwen3.5 recurrent state dtype {other:?} has no exact backend storage representation"
         ))),
     }
 }
@@ -13065,6 +13132,7 @@ mod tests {
                 "linear_key_head_dim": 4,
                 "linear_value_head_dim": 4,
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 4,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
@@ -13090,6 +13158,7 @@ mod tests {
                 "linear_key_head_dim": 2,
                 "linear_value_head_dim": 4,
                 "linear_conv_kernel_dim": 2,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 4,
                 "num_attention_heads": 1,
                 "num_key_value_heads": 1,
@@ -13115,6 +13184,7 @@ mod tests {
                 "linear_key_head_dim": 4,
                 "linear_value_head_dim": 4,
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 4,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
@@ -13144,6 +13214,7 @@ mod tests {
                 "linear_key_head_dim": 4,
                 "linear_value_head_dim": 4,
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 4,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
@@ -13931,6 +14002,7 @@ mod tests {
             "linear_key_head_dim": 4,
             "linear_value_head_dim": 4,
             "linear_conv_kernel_dim": 4,
+            "mamba_ssm_dtype": "float32",
             "head_dim": 4,
             "num_attention_heads": 2,
             "num_key_value_heads": 1,
@@ -14211,6 +14283,7 @@ mod tests {
             "linear_key_head_dim": 4,
             "linear_value_head_dim": 4,
             "linear_conv_kernel_dim": 4,
+            "mamba_ssm_dtype": "float32",
             "head_dim": 4,
             "num_attention_heads": 2,
             "num_key_value_heads": 1,
@@ -14572,7 +14645,7 @@ mod tests {
         let config = dense_config();
         let request_id = RequestId::new();
         let spec = config
-            .to_recurrent_state_spec(request_id.clone(), DataType::BF16, Device::CPU, 2)
+            .to_recurrent_state_spec(request_id.clone(), DataType::FP16, Device::CPU, 2)
             .unwrap();
 
         let cache = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec).unwrap();
@@ -14587,18 +14660,19 @@ mod tests {
 
         assert_eq!(cache.request_id, request_id);
         assert_eq!(cache.num_layers, 4);
-        assert_eq!(cache.dtype, DataType::BF16);
         assert_eq!(cache.device, Device::CPU);
         assert_eq!(cache.max_batch_slots, 2);
         assert_eq!(cache.tensors.len(), 6);
         assert_eq!(first_conv.shape, vec![24, 3]);
+        assert_eq!(first_conv.dtype, DataType::FP16);
         assert_eq!(first_conv.elements_per_slot, 72);
         assert_eq!(first_delta.shape, vec![2, 4, 4]);
+        assert_eq!(first_delta.dtype, DataType::FP32);
         assert_eq!(first_delta.elements_per_slot, 32);
         assert_eq!(second_conv_slot, 72..144);
         assert_eq!(second_delta_slot, 32..64);
         assert_eq!(cache.total_elements(), 3 * 2 * (72 + 32));
-        assert_eq!(cache.estimated_memory_bytes(), 3 * 2 * (72 + 32) * 2);
+        assert_eq!(cache.estimated_memory_bytes(), 3 * 2 * (72 * 2 + 32 * 4));
     }
 
     #[test]
@@ -14619,18 +14693,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_recurrent_state_dtype() {
-        let config = dense_config();
-        let spec = config
-            .to_recurrent_state_spec(RequestId::new(), DataType::FP8, Device::CPU, 1)
-            .unwrap();
-
-        let err = match Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec) {
-            Ok(_) => panic!("FP8 recurrent state storage is not implemented"),
-            Err(err) => err,
+    fn rejects_recurrent_state_shape_overflow_before_backend_allocation() {
+        let spec = RecurrentStateSpec {
+            request_id: RequestId::new(),
+            num_layers: 1,
+            tensors: vec![ferrum_interfaces::RecurrentStateTensorSpec::new(
+                0,
+                crate::qwen35_config::QWEN35_DELTA_STATE_NAME,
+                vec![usize::MAX, 2],
+                DataType::FP32,
+            )],
+            device: Device::CPU,
+            max_batch_slots: 1,
         };
 
-        assert!(err.to_string().contains("dtype FP8"), "{err}");
+        let err = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec)
+            .err()
+            .expect("overflowing public state shape must fail before backend allocation");
+
+        assert!(err.to_string().contains("element count overflows"), "{err}");
+    }
+
+    #[test]
+    fn rejects_recurrent_state_slot_allocation_overflow_before_backend_allocation() {
+        let spec = RecurrentStateSpec {
+            request_id: RequestId::new(),
+            num_layers: 1,
+            tensors: vec![ferrum_interfaces::RecurrentStateTensorSpec::new(
+                0,
+                crate::qwen35_config::QWEN35_DELTA_STATE_NAME,
+                vec![usize::MAX / 2 + 1],
+                DataType::FP32,
+            )],
+            device: Device::CPU,
+            max_batch_slots: 2,
+        };
+
+        let err = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec)
+            .err()
+            .expect("overflowing slot allocation must fail before backend allocation");
+
+        assert!(
+            err.to_string().contains("slot allocation overflows"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_recurrent_state_dtype() {
+        let config = dense_config();
+        let err = config
+            .to_recurrent_state_spec(RequestId::new(), DataType::FP8, Device::CPU, 1)
+            .expect_err("FP8 recurrent state storage is not implemented");
+
+        assert!(err.contains("got fp8"), "{err}");
+    }
+
+    #[test]
+    fn rejects_bf16_state_when_backend_storage_would_be_f16() {
+        let config = dense_config();
+        let spec = config
+            .to_recurrent_state_spec(RequestId::new(), DataType::BF16, Device::CPU, 1)
+            .unwrap();
+
+        let err = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec)
+            .err()
+            .expect("BF16 storage must not be silently represented by an F16 buffer");
+
+        assert!(err.to_string().contains("BF16"), "{err}");
     }
 
     #[test]
@@ -14655,7 +14785,7 @@ mod tests {
         assert_eq!(typed.cache_id(), handle.cache_id());
         assert_eq!(stats.state_tensors, 6);
         assert_eq!(stats.batch_slots, 1);
-        assert_eq!(stats.memory_bytes, 3 * (72 + 32) * 2);
+        assert_eq!(stats.memory_bytes, spec.estimated_memory_bytes());
         let cache = typed.cache();
         assert_eq!(cache.tensors.len(), 6);
         assert!(typed.is_valid());
@@ -14664,11 +14794,6 @@ mod tests {
     #[test]
     fn recurrent_state_manager_allocates_rejects_capacity_and_invalidates() {
         let config = dense_config();
-        let manager =
-            Qwen35RecurrentStateManager::<CpuBackend>::new(Qwen35RecurrentStateManagerConfig {
-                total_memory_bytes: 3 * (72 + 32) * 2,
-                total_batch_slots: 1,
-            });
         let request_id = RequestId::new();
         let spec = config
             .to_recurrent_state_spec(request_id.clone(), DataType::FP16, Device::CPU, 1)
@@ -14676,6 +14801,11 @@ mod tests {
         let second_spec = config
             .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 1)
             .unwrap();
+        let manager =
+            Qwen35RecurrentStateManager::<CpuBackend>::new(Qwen35RecurrentStateManagerConfig {
+                total_memory_bytes: spec.estimated_memory_bytes(),
+                total_batch_slots: 1,
+            });
 
         assert!(manager.can_allocate(&spec));
         let handle = tokio_test::block_on(manager.allocate(&spec)).unwrap();
@@ -14687,7 +14817,10 @@ mod tests {
         assert_eq!(typed.cache().tensors.len(), 6);
         assert_eq!(manager.stats().active_states, 1);
         assert_eq!(manager.stats().active_state_tensors, 6);
-        assert_eq!(manager.stats().used_memory_bytes, 3 * (72 + 32) * 2);
+        assert_eq!(
+            manager.stats().used_memory_bytes,
+            spec.estimated_memory_bytes()
+        );
         assert!(!manager.can_allocate(&spec));
         assert!(!manager.can_allocate(&second_spec));
 
