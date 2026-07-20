@@ -1156,7 +1156,6 @@ fn create_registered_vnext_executor(
                     })?;
                 let (runtime, operation_registry, catalog) = composition.into_parts();
                 let executor = crate::product_composition::create_vnext_executor(
-                    model_path,
                     &config.engine_config,
                     prepared,
                     model_info,

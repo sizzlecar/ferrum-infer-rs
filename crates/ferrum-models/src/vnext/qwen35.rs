@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, ExternalModelMetadataId,
@@ -32,7 +33,10 @@ use sha2::{Digest, Sha256};
 use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig};
 use crate::qwen35_weights::{Qwen35ResolvedWeightSpec, Qwen35WeightInventory};
 
-use super::{CausalLanguageModelDescriptor, PreparedProductionModel};
+use super::{
+    CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
+    ProductionWeightArtifact,
+};
 
 pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
@@ -667,9 +671,23 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
 }
 
 pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
-    let weights = SafetensorsArchive::open(model_dir)?;
+    let sources = Arc::new(ProductionModelSourceBundle::open_colocated_safetensors(
+        model_dir,
+    )?);
+    prepare_from_sources(sources)
+}
+
+pub fn prepare_from_sources(
+    sources: Arc<ProductionModelSourceBundle>,
+) -> ferrum_types::Result<PreparedProductionModel> {
+    let ProductionWeightArtifact::SafetensorsDirectory(weight_root) = sources.weights() else {
+        return Err(ferrum_types::FerrumError::unsupported(
+            "Qwen3.5 GGUF requires the typed physical-schema adapter before vNext preparation",
+        ));
+    };
+    let weights = SafetensorsArchive::open(weight_root)?;
     let config =
-        load_family_config(model_dir, &weights).map_err(ferrum_types::FerrumError::model)?;
+        load_family_config(&sources, &weights).map_err(ferrum_types::FerrumError::model)?;
     let descriptor = production_descriptor(&config).map_err(ferrum_types::FerrumError::model)?;
     let raw = serde_json::to_value(config)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
@@ -678,7 +696,9 @@ pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<Prepared
     let family = TypedFamilyRegistration::new(provider)
         .prepare(&raw)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    Ok(PreparedProductionModel::new(family, weights, descriptor))
+    Ok(PreparedProductionModel::new(
+        family, weights, descriptor, sources,
+    ))
 }
 
 fn production_descriptor(
@@ -723,10 +743,11 @@ fn production_descriptor(
 }
 
 fn load_family_config(
-    model_dir: &Path,
+    sources: &ProductionModelSourceBundle,
     archive: &SafetensorsArchive,
 ) -> Result<Qwen35FamilyConfig, String> {
-    let hf_config = read_json(&model_dir.join("config.json"))?;
+    let hf_config: Value = serde_json::from_slice(sources.config_json())
+        .map_err(|error| format!("parse semantic config.json: {error}"))?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
     if text.is_moe() {
         return Err("the first vNext Qwen3.5 production slice requires the dense model".to_owned());
@@ -739,11 +760,11 @@ fn load_family_config(
     let vocab_size = required_u64(text_value, "vocab_size")?;
     let max_position_embeddings = required_u64(text_value, "max_position_embeddings")?;
     let rms_norm_epsilon = hf_rms_norm_epsilon(&hf_config)?;
-    let tokenizer_config_path = model_dir.join("tokenizer_config.json");
-    let tokenizer_config_bytes = fs::read(&tokenizer_config_path)
-        .map_err(|error| format!("read {tokenizer_config_path:?}: {error}"))?;
+    let tokenizer_config_bytes = sources
+        .tokenizer_config_json()
+        .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
     let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
-        .map_err(|error| format!("parse {tokenizer_config_path:?}: {error}"))?;
+        .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
     let template = tokenizer_config
         .get("chat_template")
         .and_then(Value::as_str)
