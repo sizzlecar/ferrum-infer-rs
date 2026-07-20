@@ -209,6 +209,7 @@ impl EngineInner {
     }
 
     async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
+        let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
         let completion_resources = {
             let mut sequences = self.sequences.write();
             let Some(mut sequence) = sequences.remove(request_id) else {
@@ -216,6 +217,30 @@ impl EngineInner {
             };
             sequence.take_completion_resources()
         };
+        let physical_resources_present = !completion_resources.physical.is_empty();
+        let request_slot_present = completion_resources.request_slot.is_some();
+        self.write_executor_scheduler_profile_event(
+            request_id,
+            "engine_client_disconnect_detected",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([(
+                "scheduler_iteration".to_string(),
+                serde_json::json!(detected_scheduler_iteration),
+            )]),
+            BTreeMap::from([
+                (
+                    "disconnect_reason".to_string(),
+                    serde_json::json!("client_receiver_closed"),
+                ),
+                (
+                    "terminal_state".to_string(),
+                    serde_json::json!("pending_release"),
+                ),
+            ]),
+            None,
+        );
 
         if self.model_executor.execution_resource_authority()
             == ExecutionResourceAuthority::PlanRuntime
@@ -235,6 +260,82 @@ impl EngineInner {
         if let Some(request_slot) = completion_resources.request_slot {
             request_slot.close(self);
         }
+
+        let terminal_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
+        let scheduler_tick_delta =
+            terminal_scheduler_iteration.saturating_sub(detected_scheduler_iteration);
+        let (phase, status, scheduler_cancel_result, terminal_state, profile_error) =
+            match &scheduler_cancel {
+                Ok(true) => (
+                    "engine_client_disconnect_released",
+                    ProfileStatus::Ok,
+                    "cancelled",
+                    "released",
+                    None,
+                ),
+                Ok(false) => (
+                    "engine_client_disconnect_released",
+                    ProfileStatus::Ok,
+                    "already_absent",
+                    "released",
+                    None,
+                ),
+                Err(error) => (
+                    "engine_client_disconnect_release_failed",
+                    ProfileStatus::Failure,
+                    "error",
+                    "release_failed",
+                    Some(ProfileError {
+                        kind: "scheduler_cancel_failed".to_string(),
+                        message: error.to_string(),
+                        blocking: true,
+                    }),
+                ),
+            };
+        self.write_executor_scheduler_profile_event(
+            request_id,
+            phase,
+            ProfileEventKind::Instant,
+            status,
+            None,
+            BTreeMap::from([
+                (
+                    "detected_scheduler_iteration".to_string(),
+                    serde_json::json!(detected_scheduler_iteration),
+                ),
+                (
+                    "terminal_scheduler_iteration".to_string(),
+                    serde_json::json!(terminal_scheduler_iteration),
+                ),
+                (
+                    "scheduler_tick_delta".to_string(),
+                    serde_json::json!(scheduler_tick_delta),
+                ),
+            ]),
+            BTreeMap::from([
+                (
+                    "disconnect_reason".to_string(),
+                    serde_json::json!("client_receiver_closed"),
+                ),
+                (
+                    "scheduler_cancel_result".to_string(),
+                    serde_json::json!(scheduler_cancel_result),
+                ),
+                (
+                    "terminal_state".to_string(),
+                    serde_json::json!(terminal_state),
+                ),
+                (
+                    "physical_resources_present".to_string(),
+                    serde_json::json!(physical_resources_present),
+                ),
+                (
+                    "request_slot_present".to_string(),
+                    serde_json::json!(request_slot_present),
+                ),
+            ]),
+            profile_error,
+        );
 
         match scheduler_cancel {
             Ok(true) => {

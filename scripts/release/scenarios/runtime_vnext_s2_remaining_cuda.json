@@ -1,0 +1,51 @@
+{
+  "backend": "cuda",
+  "ferrum_bin": "target/release/ferrum",
+  "model": "Qwen/Qwen3.5-4B",
+  "observability": {
+    "enabled": true,
+    "profile_detail": "basic",
+    "profile_sample_rate": 1.0
+  },
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--backend",
+      "cuda",
+      "--max-num-seqs",
+      "1"
+    ],
+    "mode": "start"
+  },
+  "timeout_sec": 600,
+  "scenarios": [
+    {
+      "name": "m1_s2_stream_equivalence_unicode",
+      "type": "serve_stream_equivalence_unicode",
+      "case_count": 20,
+      "enable_thinking": false,
+      "preset": "P_DETERMINISTIC",
+      "max_tokens": 1024,
+      "sampling": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 9271,
+        "stop": []
+      }
+    },
+    {
+      "name": "m1_s2_disconnect_release",
+      "type": "serve_disconnect_release",
+      "expected_effective_max_concurrent": 1,
+      "max_tokens": 1024,
+      "poll_interval_sec": 0.05,
+      "release_timeout_sec": 5.0,
+      "require_scheduler_trace": true,
+      "seed": 9271
+    }
+  ]
+}
