@@ -13,8 +13,12 @@ use ferrum_types::{DataType, Device, ModelId, ModelInfo, ModelType};
 use serde_json::Value;
 
 pub mod qwen35;
+pub mod source;
 
-type PrepareModel = fn(&Path) -> ferrum_types::Result<PreparedProductionModel>;
+pub use source::{ProductionModelSourceBundle, ProductionWeightArtifact};
+
+type PrepareModel =
+    fn(Arc<ProductionModelSourceBundle>) -> ferrum_types::Result<PreparedProductionModel>;
 type CreateFamilyRegistration = fn() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>>;
 
 struct ModelLoaderRegistration {
@@ -29,7 +33,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
     external_metadata_id: qwen35::EXTERNAL_METADATA_ID,
     execution_kind: ProductionExecutionKind::CausalLanguage,
     allows_legacy_reference: true,
-    prepare: qwen35::prepare_from_model_dir,
+    prepare: qwen35::prepare_from_sources,
     create_family_registration: qwen35_family_registration,
 }];
 
@@ -290,6 +294,7 @@ pub struct PreparedProductionModel {
     family: PreparedModelFamily,
     weights: Arc<dyn WeightComponentSource>,
     descriptor: CausalLanguageModelDescriptor,
+    sources: Arc<ProductionModelSourceBundle>,
 }
 
 impl PreparedProductionModel {
@@ -297,11 +302,13 @@ impl PreparedProductionModel {
         family: PreparedModelFamily,
         weights: impl WeightComponentSource + 'static,
         descriptor: CausalLanguageModelDescriptor,
+        sources: Arc<ProductionModelSourceBundle>,
     ) -> Self {
         Self {
             family,
             weights: Arc::new(weights),
             descriptor,
+            sources,
         }
     }
 
@@ -319,6 +326,10 @@ impl PreparedProductionModel {
 
     pub fn descriptor(&self) -> &CausalLanguageModelDescriptor {
         &self.descriptor
+    }
+
+    pub fn sources(&self) -> &Arc<ProductionModelSourceBundle> {
+        &self.sources
     }
 
     pub const fn execution_kind(&self) -> ProductionExecutionKind {
@@ -373,7 +384,24 @@ impl RegisteredProductionModel {
                 self.external_metadata_id, current
             )));
         }
-        let prepared = (self.registration.prepare)(model_dir)?;
+        let sources = Arc::new(ProductionModelSourceBundle::open_colocated_safetensors(
+            model_dir,
+        )?);
+        self.prepare_from_sources(sources)
+    }
+
+    pub fn prepare_from_sources(
+        &self,
+        sources: Arc<ProductionModelSourceBundle>,
+    ) -> ferrum_types::Result<PreparedProductionModel> {
+        let current = external_metadata_id_from_bytes(sources.config_json(), "config.json")?;
+        if current != self.external_metadata_id {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "model metadata identity changed between registration and preparation: expected {} got {}",
+                self.external_metadata_id, current
+            )));
+        }
+        let prepared = (self.registration.prepare)(sources)?;
         if prepared.family().external_metadata_id() != &self.external_metadata_id {
             return Err(ferrum_types::FerrumError::model(format!(
                 "registered model loader returned metadata identity {} for resolved identity {}",
@@ -446,6 +474,20 @@ pub fn resolve_registered_model_from_dir(
     model_dir: &Path,
 ) -> ferrum_types::Result<ProductionModelRegistration> {
     let external_metadata_id = external_metadata_id_from_model_dir(model_dir)?;
+    resolve_registered_model(external_metadata_id)
+}
+
+pub fn resolve_registered_model_from_sources(
+    sources: &ProductionModelSourceBundle,
+) -> ferrum_types::Result<ProductionModelRegistration> {
+    let external_metadata_id =
+        external_metadata_id_from_bytes(sources.config_json(), "config.json")?;
+    resolve_registered_model(external_metadata_id)
+}
+
+fn resolve_registered_model(
+    external_metadata_id: ExternalModelMetadataId,
+) -> ferrum_types::Result<ProductionModelRegistration> {
     let mut loaders = MODEL_LOADERS
         .iter()
         .filter(|registration| registration.external_metadata_id == external_metadata_id.as_str());
@@ -489,10 +531,17 @@ fn external_metadata_id_from_model_dir(
     model_dir: &Path,
 ) -> ferrum_types::Result<ExternalModelMetadataId> {
     let path = model_dir.join("config.json");
-    let raw = fs::read_to_string(&path)
+    let raw = fs::read(&path)
         .map_err(|error| ferrum_types::FerrumError::model(format!("read {path:?}: {error}")))?;
-    let config: Value = serde_json::from_str(&raw)
-        .map_err(|error| ferrum_types::FerrumError::model(format!("parse {path:?}: {error}")))?;
+    external_metadata_id_from_bytes(&raw, &path.display().to_string())
+}
+
+fn external_metadata_id_from_bytes(
+    raw: &[u8],
+    source: &str,
+) -> ferrum_types::Result<ExternalModelMetadataId> {
+    let config: Value = serde_json::from_slice(raw)
+        .map_err(|error| ferrum_types::FerrumError::model(format!("parse {source}: {error}")))?;
     let architectures = config
         .get("architectures")
         .and_then(Value::as_array)

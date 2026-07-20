@@ -3,26 +3,21 @@
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     CapabilityCatalog, ContractVersion, DeviceRuntime, EngineSelection, ExecutablePlanView,
-    FileFingerprint, ModelConfigFingerprint, ModelSourceKind, OperationRuntimeRegistry,
-    OriginalModelSource, OriginalModelSources, ProgramPlanCompilation, RationalValue,
-    ResolutionArtifactId, ResolutionDecisionBinding, ResolutionDecisionSource, ResolutionField,
-    ResolutionFingerprint, ResolutionReasonId, ResolutionSourceEvidence,
-    ResolutionSourceProvenance, ResolvedModelPlan, ResolvedModelPlanInputs, ResolvedModelSource,
-    ResolvedModelSources, ResolvedPlanValidationContext, ResolvedRuntimePolicy, SamplingPolicy,
+    ModelArtifactSourceRole, ModelConfigFingerprint, OperationRuntimeRegistry,
+    ProgramPlanCompilation, RationalValue, ResolutionArtifactId, ResolutionDecisionBinding,
+    ResolutionDecisionSource, ResolutionField, ResolutionFingerprint, ResolutionReasonId,
+    ResolutionSourceEvidence, ResolutionSourceProvenance, ResolvedModelPlan,
+    ResolvedModelPlanInputs, ResolvedPlanValidationContext, ResolvedRuntimePolicy, SamplingPolicy,
     SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy, StructuredOutputPolicy,
     TokenizerDescriptor, TokenizerId, TriStatePolicy, JSON_RESOLUTION_SOURCE_PARSER,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
 use ferrum_models::VNextModelExecutor;
-use ferrum_types::{
-    EngineConfig, FerrumError, ModelInfo, ModelSource, ResponseFormat, Result, SamplingParams,
-};
+use ferrum_types::{EngineConfig, FerrumError, ModelInfo, ResponseFormat, Result, SamplingParams};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -31,7 +26,6 @@ const PRODUCT_COMPOSITION_PRODUCER: &str = "ferrum.product-composition";
 const DEFAULT_SAMPLER_SEED: u64 = 42;
 
 pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
-    model_dir: &Path,
     engine: &EngineConfig,
     prepared: PreparedProductionModel,
     model_info: ModelInfo,
@@ -47,34 +41,31 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         operation_registry,
         catalog,
         |prepared, runtime, catalog, compilation| {
-            resolve_model_plan(model_dir, engine, prepared, catalog, runtime, compilation)
+            resolve_model_plan(engine, prepared, catalog, runtime, compilation)
         },
     )
 }
 
 fn resolve_model_plan(
-    model_dir: &Path,
     engine: &EngineConfig,
     prepared: &PreparedProductionModel,
     catalog: &CapabilityCatalog,
     runtime: &ResolvedRuntimePolicy,
     compilation: &ProgramPlanCompilation,
 ) -> Result<ResolvedModelPlan> {
-    let source_files = fingerprint_source_files(model_dir)?;
-    let config_sha256 = source_file(&source_files, "config.json")?.sha256.clone();
-    let tokenizer_sha256 = source_file(&source_files, "tokenizer.json")?.sha256.clone();
-    let (original_source, resolved_source) =
-        resolve_source_identity(model_dir, engine, source_files)?;
-    let original_sources = OriginalModelSources {
-        semantic: original_source.clone(),
-        tokenizer: original_source.clone(),
-        weights: original_source,
-    };
-    let resolved_sources = ResolvedModelSources {
-        semantic: resolved_source.clone(),
-        tokenizer: resolved_source.clone(),
-        weights: resolved_source,
-    };
+    let sources = prepared.sources();
+    let config_sha256 = sources
+        .fingerprint(ModelArtifactSourceRole::Semantic, "config.json")
+        .ok_or_else(|| FerrumError::internal("semantic config.json fingerprint was lost"))?
+        .sha256
+        .clone();
+    let tokenizer_sha256 = sources
+        .fingerprint(ModelArtifactSourceRole::Tokenizer, "tokenizer.json")
+        .ok_or_else(|| FerrumError::internal("tokenizer.json fingerprint was lost"))?
+        .sha256
+        .clone();
+    let original_sources = sources.original_sources().clone();
+    let resolved_sources = sources.resolved_sources().clone();
     let family = prepared.family();
 
     let engine_provider = match catalog
@@ -136,125 +127,6 @@ fn resolve_model_plan(
     );
     ResolvedModelPlan::new(inputs, bindings, &context)
         .map_err(|error| FerrumError::model(format!("resolve vNext product plan: {error}")))
-}
-
-fn fingerprint_source_files(model_dir: &Path) -> Result<Vec<FileFingerprint>> {
-    ["config.json", "tokenizer.json", "tokenizer_config.json"]
-        .into_iter()
-        .map(|relative_path| {
-            let path = model_dir.join(relative_path);
-            let bytes = fs::read(&path).map_err(|error| {
-                FerrumError::model(format!(
-                    "read required vNext source file {}: {error}",
-                    path.display()
-                ))
-            })?;
-            if bytes.is_empty() {
-                return Err(FerrumError::model(format!(
-                    "required vNext source file {} is empty",
-                    path.display()
-                )));
-            }
-            Ok(FileFingerprint {
-                relative_path: relative_path.to_owned(),
-                size_bytes: bytes.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(bytes)),
-            })
-        })
-        .collect()
-}
-
-fn source_file<'a>(files: &'a [FileFingerprint], name: &str) -> Result<&'a FileFingerprint> {
-    files
-        .iter()
-        .find(|file| file.relative_path == name)
-        .ok_or_else(|| FerrumError::internal(format!("source fingerprint for {name} was lost")))
-}
-
-fn resolve_source_identity(
-    model_dir: &Path,
-    engine: &EngineConfig,
-    files: Vec<FileFingerprint>,
-) -> Result<(OriginalModelSource, ResolvedModelSource)> {
-    let source = engine.model.source.as_ref().ok_or_else(|| {
-        FerrumError::config(
-            "registered vNext models require EngineConfig.model.source from the product resolver",
-        )
-    })?;
-    let canonical_path = canonical_path(model_dir)?;
-    let manifest_revision = source_manifest_revision(&files)?;
-    let (kind, location, requested_revision, canonical_location, resolved_revision) = match source {
-        ModelSource::Local(location) => {
-            let kind = if model_dir.is_file() {
-                ModelSourceKind::LocalFile
-            } else {
-                ModelSourceKind::LocalDirectory
-            };
-            (
-                kind,
-                location.clone(),
-                None,
-                canonical_path,
-                manifest_revision,
-            )
-        }
-        ModelSource::HuggingFace {
-            repo_id, revision, ..
-        } => (
-            ModelSourceKind::Repository,
-            repo_id.clone(),
-            revision.clone(),
-            repo_id.clone(),
-            huggingface_snapshot_revision(model_dir)?,
-        ),
-        ModelSource::Url { .. } | ModelSource::S3 { .. } => {
-            return Err(FerrumError::unsupported(
-                "URL and S3 sources are not yet accepted by the resolved vNext product plan",
-            ))
-        }
-    };
-    Ok((
-        OriginalModelSource {
-            kind,
-            location,
-            requested_revision,
-        },
-        ResolvedModelSource {
-            canonical_location,
-            resolved_revision,
-            files,
-        },
-    ))
-}
-
-fn canonical_path(path: &Path) -> Result<String> {
-    path.canonicalize()
-        .map_err(|error| FerrumError::model(format!("canonicalize {}: {error}", path.display())))
-        .map(|path| path.display().to_string())
-}
-
-fn huggingface_snapshot_revision(model_dir: &Path) -> Result<String> {
-    let revision = model_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty());
-    let snapshot_parent = model_dir
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|value| value.to_str());
-    match (snapshot_parent, revision) {
-        (Some("snapshots"), Some(revision)) => Ok(revision.to_owned()),
-        _ => Err(FerrumError::config(format!(
-            "Hugging Face source resolved outside a snapshots/<revision> directory: {}",
-            model_dir.display()
-        ))),
-    }
-}
-
-fn source_manifest_revision(files: &[FileFingerprint]) -> Result<String> {
-    let bytes = serde_json::to_vec(files)
-        .map_err(|error| FerrumError::internal(format!("serialize source manifest: {error}")))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn generation_defaults(
@@ -538,18 +410,5 @@ mod tests {
         let value = rational_from_f32(0.000_001, "test").unwrap();
         assert_eq!(value.numerator(), 1);
         assert_eq!(value.denominator(), 1_000_000);
-    }
-
-    #[test]
-    fn local_source_revision_is_content_derived() {
-        let files = vec![FileFingerprint {
-            relative_path: "config.json".to_owned(),
-            size_bytes: 2,
-            sha256: format!("{:x}", Sha256::digest(b"{}")),
-        }];
-        let first = source_manifest_revision(&files).unwrap();
-        let second = source_manifest_revision(&files).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 64);
     }
 }
