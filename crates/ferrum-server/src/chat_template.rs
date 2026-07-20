@@ -1,7 +1,7 @@
 use crate::openai::{
     ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole, ToolChoice,
 };
-use ferrum_types::FerrumError;
+use ferrum_types::{ApiToolCallProtocol, FerrumError};
 use minijinja::Environment;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
@@ -15,16 +15,30 @@ pub struct ModelChatTemplate {
     pub source: String,
     pub bos_token: Option<String>,
     pub eos_token: Option<String>,
+    pub tool_call_protocol: ApiToolCallProtocol,
 }
 
 impl ModelChatTemplate {
     pub fn new(template: impl Into<String>, source: impl Into<String>) -> Self {
+        let template = template.into();
         Self {
-            template: template.into(),
+            tool_call_protocol: tool_call_protocol_for_template(&template),
+            template,
             source: source.into(),
             bos_token: None,
             eos_token: None,
         }
+    }
+}
+
+fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
+    if template.contains("<tool_call>")
+        && template.contains("<function=")
+        && template.contains("<parameter=")
+    {
+        ApiToolCallProtocol::FunctionParameterXml
+    } else {
+        ApiToolCallProtocol::Json
     }
 }
 

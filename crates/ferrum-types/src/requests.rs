@@ -59,6 +59,10 @@ pub struct ApiChatRequest {
     pub tools: Vec<ApiTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ApiToolChoice>,
+    /// Wire protocol emitted by the model's chat template for automatic tool calls.
+    /// Forced/named calls may still use a hard argument grammar and the JSON fallback.
+    #[serde(default)]
+    pub tool_call_protocol: ApiToolCallProtocol,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub legacy_functions: Vec<ApiFunction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +150,14 @@ pub enum ApiToolChoice {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiToolChoiceFunction {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiToolCallProtocol {
+    #[default]
+    Json,
+    FunctionParameterXml,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -268,6 +280,12 @@ fn parse_tool_calls_from_generated_text(
     text: &str,
     chat_request: &ApiChatRequest,
 ) -> Option<Vec<ApiToolCall>> {
+    if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
+        if let Some(calls) = parse_function_parameter_xml_tool_calls(text, chat_request) {
+            return Some(calls);
+        }
+    }
+
     let value = parse_json_value_from_generated_text(text)?;
     if let Some(calls) = value.get("tool_calls").and_then(|value| value.as_array()) {
         let parsed = calls
@@ -286,6 +304,91 @@ fn parse_tool_calls_from_generated_text(
     parse_tool_call_value(&value, 0, chat_request)
         .or_else(|| parse_forced_tool_arguments_value(&value, 0, chat_request))
         .map(|call| vec![call])
+}
+
+fn parse_function_parameter_xml_tool_calls(
+    text: &str,
+    chat_request: &ApiChatRequest,
+) -> Option<Vec<ApiToolCall>> {
+    const TOOL_START: &str = "<tool_call>";
+    const TOOL_END: &str = "</tool_call>";
+    const FUNCTION_START: &str = "<function=";
+    const FUNCTION_END: &str = "</function>";
+
+    let mut remaining = text;
+    let mut calls = Vec::new();
+    while let Some(tool_start) = remaining.find(TOOL_START) {
+        remaining = &remaining[tool_start + TOOL_START.len()..];
+        let tool_end = remaining.find(TOOL_END).unwrap_or(remaining.len());
+        let block = &remaining[..tool_end];
+        remaining = if tool_end < remaining.len() {
+            &remaining[tool_end + TOOL_END.len()..]
+        } else {
+            ""
+        };
+
+        let Some(function_start) = block.find(FUNCTION_START) else {
+            continue;
+        };
+        let function = &block[function_start + FUNCTION_START.len()..];
+        let Some(name_end) = function.find('>') else {
+            continue;
+        };
+        let name = function[..name_end].trim();
+        if !api_tool_name_allowed(chat_request, name) {
+            continue;
+        }
+        let arguments_end = function[name_end + 1..]
+            .find(FUNCTION_END)
+            .map(|offset| name_end + 1 + offset)
+            .unwrap_or(function.len());
+        let arguments =
+            parse_function_parameter_xml_arguments(&function[name_end + 1..arguments_end]);
+        calls.push(ApiToolCall {
+            id: format!("call_{}", calls.len()),
+            tool_type: "function".to_string(),
+            function: ApiFunctionCall {
+                name: name.to_string(),
+                arguments: serde_json::to_string(&arguments).ok()?,
+            },
+        });
+    }
+
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn parse_function_parameter_xml_arguments(
+    text: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    const PARAMETER_START: &str = "<parameter=";
+    const PARAMETER_END: &str = "</parameter>";
+
+    let mut arguments = serde_json::Map::new();
+    let mut remaining = text;
+    while let Some(parameter_start) = remaining.find(PARAMETER_START) {
+        remaining = &remaining[parameter_start + PARAMETER_START.len()..];
+        let Some(name_end) = remaining.find('>') else {
+            break;
+        };
+        let name = remaining[..name_end].trim();
+        remaining = &remaining[name_end + 1..];
+        let value_end = remaining
+            .find(PARAMETER_END)
+            .or_else(|| remaining.find(PARAMETER_START))
+            .unwrap_or(remaining.len());
+        if !name.is_empty() {
+            arguments.insert(
+                name.to_string(),
+                serde_json::Value::String(remaining[..value_end].trim().to_string()),
+            );
+        }
+        remaining = if remaining[value_end..].starts_with(PARAMETER_END) {
+            &remaining[value_end + PARAMETER_END.len()..]
+        } else {
+            &remaining[value_end..]
+        };
+    }
+    arguments
 }
 
 fn parse_wrapped_tool_call_value(

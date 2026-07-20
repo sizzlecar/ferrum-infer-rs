@@ -2116,7 +2116,11 @@ async fn handle_chat_completions_stream(
     );
     let stream_api_request = match inference_request.api_request.as_ref() {
         Some(ferrum_types::ApiRequest::Chat(request)) => request.clone(),
-        _ => api_chat_request(&openai_request, openai_request.tool_choice.as_ref()),
+        _ => api_chat_request(
+            &openai_request,
+            openai_request.tool_choice.as_ref(),
+            ferrum_types::ApiToolCallProtocol::default(),
+        ),
     };
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
@@ -2879,6 +2883,7 @@ fn convert_chat_request_with_template_model(
     let functions = request.functions.as_deref().unwrap_or_default();
     let output_contract = EffectiveChatOutputContract::resolve(request);
     let forced_response_format = forced_tool_choice_response_format(request);
+    let hard_tool_call_contract = forced_response_format.is_some();
     let requested_response_format = output_contract
         .accepts_requested_response_format()
         .then(|| requested_response_format_for_sampling(request))
@@ -2906,8 +2911,10 @@ fn convert_chat_request_with_template_model(
             request.function_call.as_ref(),
         )?
     };
-    let api_chat = api_chat_request(request, effective_tool_choice);
-    let may_emit_structured_call = ferrum_types::chat_api_may_emit_tool_or_function_call(&api_chat);
+    let tool_call_protocol = model_template
+        .map(|template| template.tool_call_protocol)
+        .unwrap_or_default();
+    let api_chat = api_chat_request(request, effective_tool_choice, tool_call_protocol);
     let mut metadata = HashMap::new();
     metadata.insert(
         "openai_messages".to_string(),
@@ -2945,7 +2952,7 @@ fn convert_chat_request_with_template_model(
     }
     if !has_unclosed_thinking_block(&prompt) {
         let mut forbidden = vec![THINK_END_TAG.to_string()];
-        if may_emit_structured_call {
+        if hard_tool_call_contract {
             for token_text in INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS {
                 push_unique_forbidden_token_text(&mut forbidden, token_text);
             }
@@ -2968,7 +2975,6 @@ fn convert_chat_request_with_template_model(
     }
     let response_format = forced_response_format
         .or(requested_response_format)
-        .or_else(|| inferred_auto_tool_response_format(request))
         .unwrap_or(ferrum_types::ResponseFormat::Text);
     let structured_output_start = if matches!(response_format, ferrum_types::ResponseFormat::Text)
         || !has_unclosed_thinking_block(&prompt)
@@ -3152,24 +3158,6 @@ fn requested_response_format_for_sampling(
     }
 }
 
-fn inferred_auto_tool_response_format(
-    request: &ChatCompletionsRequest,
-) -> Option<ferrum_types::ResponseFormat> {
-    if !tool_choice_auto_or_omitted(request.tool_choice.as_ref()) {
-        return None;
-    }
-    let tool = single_function_tool(request.tools.as_deref()?)?;
-    let prompt = latest_user_text(request)?;
-    if !text_mentions_tool(&prompt, &tool.function) {
-        return None;
-    }
-    let schema = serde_json::to_string(&guided_tool_arguments_schema(
-        tool.function.parameters.as_ref(),
-    )?)
-    .ok()?;
-    Some(ferrum_types::ResponseFormat::JsonSchema(schema))
-}
-
 fn selected_tool_for_forced_tool_choice(request: &ChatCompletionsRequest) -> Option<&ChatTool> {
     match request.tool_choice.as_ref()? {
         ToolChoice::Function {
@@ -3233,70 +3221,10 @@ fn bound_unconstrained_tool_argument_strings(value: &mut serde_json::Value, defa
     }
 }
 
-fn tool_choice_auto_or_omitted(choice: Option<&ToolChoice>) -> bool {
-    match choice {
-        None => true,
-        Some(ToolChoice::Mode(mode)) => mode.eq_ignore_ascii_case("auto"),
-        _ => false,
-    }
-}
-
 fn single_function_tool(tools: &[ChatTool]) -> Option<&ChatTool> {
     let mut function_tools = tools.iter().filter(|tool| tool.tool_type == "function");
     let tool = function_tools.next()?;
     function_tools.next().is_none().then_some(tool)
-}
-
-fn latest_user_text(request: &ChatCompletionsRequest) -> Option<String> {
-    request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.role, MessageRole::User))
-        .map(|message| message.content.clone())
-        .filter(|content| !content.trim().is_empty())
-}
-
-fn text_mentions_tool(text: &str, function: &ChatFunction) -> bool {
-    let text_lower = text.to_lowercase();
-    for word in ascii_words(&function.name) {
-        if text_lower.contains(&word) {
-            return true;
-        }
-    }
-    if let Some(description) = &function.description {
-        for word in ascii_words(description) {
-            if text_lower.contains(&word) {
-                return true;
-            }
-        }
-        for bigram in cjk_bigrams(description) {
-            if text.contains(&bigram) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn ascii_words(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter_map(|word| {
-            let word = word.to_ascii_lowercase();
-            (word.len() >= 3).then_some(word)
-        })
-        .collect()
-}
-
-fn cjk_bigrams(text: &str) -> Vec<String> {
-    let chars = text
-        .chars()
-        .filter(|ch| matches!(*ch as u32, 0x3400..=0x9fff | 0xf900..=0xfaff))
-        .collect::<Vec<_>>();
-    chars
-        .windows(2)
-        .map(|window| window.iter().collect::<String>())
-        .collect()
 }
 
 fn has_unclosed_thinking_block(prompt: &str) -> bool {
@@ -3500,6 +3428,7 @@ fn extract_json_object_text(text: &str) -> Option<String> {
 fn api_chat_request(
     request: &ChatCompletionsRequest,
     effective_tool_choice: Option<&ToolChoice>,
+    tool_call_protocol: ferrum_types::ApiToolCallProtocol,
 ) -> ferrum_types::ApiChatRequest {
     ferrum_types::ApiChatRequest {
         messages: request.messages.iter().map(api_chat_message).collect(),
@@ -3511,6 +3440,7 @@ fn api_chat_request(
             .map(api_tool)
             .collect(),
         tool_choice: effective_tool_choice.map(api_tool_choice),
+        tool_call_protocol,
         legacy_functions: request
             .functions
             .as_deref()
@@ -5811,6 +5741,12 @@ mod tests {
         AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
     }
 
+    fn router_with_stub_and_template(text: &str, template: ModelChatTemplate) -> Router {
+        AxumServer::from_llm(Arc::new(StubLlm::new(text)))
+            .with_prompt_template(Some(template))
+            .build_router()
+    }
+
     fn router_with_stub_and_request_dump_dir(text: &str, request_dump_dir: PathBuf) -> Router {
         AxumServer::from_state(
             AppState::default()
@@ -6733,6 +6669,52 @@ mod tests {
         assert_eq!(
             body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"city\":\"北京\",\"unit\":\"c\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_uses_template_tool_protocol_for_function_parameter_xml() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{{ tools | tojson }}</tools>Use <tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}",
+            "function-parameter-xml-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(
+                "<tool_call>\n<function=get_weather>\n<parameter=city>\n北京\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+                template,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "请调用 get_weather 查询北京天气。"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"北京\",\"unit\":\"celsius\"}"
         );
     }
 
@@ -9603,18 +9585,12 @@ mod tests {
         let initial_forbidden = internal.metadata[INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY]
             .as_array()
             .expect("initial forbidden token list");
-        for token in [
-            THINK_END_TAG,
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<|eot_id|>",
-            "</s>",
-        ] {
-            assert!(
-                initial_forbidden.iter().any(|value| value == token),
-                "missing initial forbidden token {token}: {initial_forbidden:?}"
-            );
-        }
+        assert_eq!(initial_forbidden, &[serde_json::json!(THINK_END_TAG)]);
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "auto tool choice must preserve native model selection instead of forcing arguments JSON",
+        );
         let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request.as_ref() else {
             panic!("expected structured chat api_request");
         };
@@ -9625,7 +9601,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_single_matching_tool_uses_tool_schema_response_format() {
+    fn omitted_tool_choice_uses_native_template_protocol_without_hard_schema() {
         let request: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "served-alias",
             "messages": [{"role": "user", "content": "北京现在天气怎么样?用摄氏度。"}],
@@ -9646,16 +9622,27 @@ mod tests {
             }]
         }))
         .expect("tool request parses");
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{{ tools | tojson }}</tools>Use <tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "function-parameter-xml-template",
+        );
 
         validate_chat_request(&request).expect("tool request validates");
-        let internal = convert_chat_request(&request).expect("convert");
+        let internal =
+            convert_chat_request_with_template_model(&request, "served-alias", Some(&template))
+                .expect("convert");
         assert_eq!(internal.metadata["openai_tool_choice"], "auto");
-        match internal.sampling_params.response_format {
-            ferrum_types::ResponseFormat::JsonSchema(ref schema) => {
-                assert!(schema.contains(r#""required":["city"]"#), "{schema}");
-            }
-            ref other => panic!("expected inferred tool json schema, got {other:?}"),
-        }
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+        );
+        let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request else {
+            panic!("expected chat API request");
+        };
+        assert_eq!(
+            api.tool_call_protocol,
+            ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+        );
     }
 
     #[test]
