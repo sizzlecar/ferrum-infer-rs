@@ -217,6 +217,13 @@ TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
         "source_path": "scripts/release/qwen35_gguf_full_attention_reference.py",
         "test_name": "build_reference",
     },
+    "cpu.fp32.python.qwen35_gguf_model_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference",
+    },
 }
 
 
@@ -528,6 +535,59 @@ G08A_COVERAGE_RULES["layer.full_attention"] = _coverage_selector(
         },
     },
     oracle_identity="cpu.fp32.python.qwen35_gguf_full_attention_reference",
+)
+
+G08A_COVERAGE_RULES["checkpoint.full_model"] = _coverage_selector(
+    model_scope="qwen3.5-4b",
+    operation_id="operation.qwen35_model_forward",
+    operation_schema_version="1.0",
+    checkpoint_kind="full_model",
+    checkpoint_name="final_hidden",
+    dtype="fp16",
+    quant_format="gguf_q4_k_m",
+    shape_domain={
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-model.tokens-24",
+        "dimensions": {"hidden_size": 2560, "layers": 32, "tokens": 24},
+        "semantics": {
+            "final_norm": "rms_norm",
+            "full_attention_interval": 4,
+            "layer_pattern": "three_linear_then_one_full",
+            "model_sha256": (
+                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+            ),
+            "prompt_token_sequence_sha256": (
+                "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
+            ),
+            "quantized_embedding_is_model_input": True,
+        },
+    },
+    oracle_identity="cpu.fp32.python.qwen35_gguf_model_reference",
+)
+
+G08A_COVERAGE_RULES["checkpoint.full_vocab_logits"] = _coverage_selector(
+    model_scope="qwen3.5-4b",
+    operation_id="operation.qwen35_tied_lm_head",
+    operation_schema_version="1.0",
+    checkpoint_kind="full_vocab_logits",
+    checkpoint_name="last_token_logits",
+    dtype="fp16",
+    quant_format="gguf_q4_k_m",
+    shape_domain={
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-vocab-logits.tokens-24",
+        "dimensions": {"vocabulary_size": 248320},
+        "semantics": {
+            "argmax_token_id": 57590,
+            "last_token_index": 23,
+            "model_sha256": (
+                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+            ),
+            "prompt_token_sequence_sha256": (
+                "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
+            ),
+            "tied_embedding_lm_head": True,
+        },
+    },
+    oracle_identity="cpu.fp32.python.qwen35_gguf_model_reference",
 )
 
 for _decay, _mapping, _suffix in (
