@@ -10,6 +10,7 @@ summary artifact plus one PASS line.
 from __future__ import annotations
 
 import argparse
+import codecs
 import hashlib
 import http.server
 import json
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openai_concurrency_quality_regression import run_concurrency_quality_regression
 from openai_tool_call_regression import run_tool_call_regression
@@ -52,6 +53,8 @@ SERVE_TYPES = {
     "serve_multiturn_recall",
     "serve_stateful_loop",
     "serve_stream",
+    "serve_stream_equivalence_unicode",
+    "serve_disconnect_release",
     "serve_structured_output",
     "serve_response_format_matrix",
     "serve_negative_api_matrix",
@@ -290,6 +293,156 @@ def request_sse(
             if line.startswith("data: "):
                 event_times.append(time.time())
     return response.status, "".join(chunks), event_times
+
+
+def request_sse_incremental(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int,
+    read_size: int = 1,
+) -> tuple[int, bytes, str, dict[str, Any]]:
+    require(read_size > 0, "incremental SSE read_size must be positive")
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        response = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ScenarioError(f"SSE error response is not valid UTF-8: {error}") from error
+        return exc.code, raw, decoded, {
+            "read_size": read_size,
+            "read_count": 1 if raw else 0,
+            "wire_size_bytes": len(raw),
+            "wire_sha256": hashlib.sha256(raw).hexdigest(),
+            "decoded_sha256": hashlib.sha256(decoded.encode("utf-8")).hexdigest(),
+            "split_boundary_count": 0,
+        }
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    raw_chunks: list[bytes] = []
+    decoded_fragments: list[str] = []
+    split_boundary_count = 0
+    with response:
+        status = response.status
+        while True:
+            raw = response.read(read_size)
+            if not raw:
+                break
+            raw_chunks.append(raw)
+            try:
+                fragment = decoder.decode(raw, final=False)
+            except UnicodeDecodeError as error:
+                raise ScenarioError(f"SSE wire is not valid incremental UTF-8: {error}") from error
+            buffered, _ = decoder.getstate()
+            if buffered:
+                split_boundary_count += 1
+            if fragment:
+                decoded_fragments.append(fragment)
+        try:
+            tail = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as error:
+            raise ScenarioError(f"SSE wire ended inside a UTF-8 sequence: {error}") from error
+        if tail:
+            decoded_fragments.append(tail)
+
+    raw_body = b"".join(raw_chunks)
+    decoded_body = "".join(decoded_fragments)
+    require(
+        decoded_body.encode("utf-8") == raw_body,
+        "incremental SSE decoder did not reproduce the exact wire bytes",
+    )
+    return status, raw_body, decoded_body, {
+        "read_size": read_size,
+        "read_count": len(raw_chunks),
+        "wire_size_bytes": len(raw_body),
+        "wire_sha256": hashlib.sha256(raw_body).hexdigest(),
+        "decoded_sha256": hashlib.sha256(decoded_body.encode("utf-8")).hexdigest(),
+        "split_boundary_count": split_boundary_count,
+    }
+
+
+def request_sse_until_output_then_disconnect(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int,
+    on_first_output: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        response = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        return {
+            "http_status": exc.code,
+            "partial_wire": body.encode("utf-8"),
+            "first_output_event": None,
+            "active_health": None,
+            "time_to_first_output_sec": None,
+        }
+
+    started = time.monotonic()
+    raw_lines: list[bytes] = []
+    first_output_event: dict[str, Any] | None = None
+    active_health: dict[str, Any] | None = None
+    with response:
+        status = response.status
+        while True:
+            raw = response.readline()
+            if not raw:
+                break
+            raw_lines.append(raw)
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ScenarioError(f"disconnect probe received invalid UTF-8: {error}") from error
+            if not line.startswith("data: "):
+                continue
+            event_text = line.removeprefix("data: ").strip()
+            if not event_text or event_text == "[DONE]":
+                continue
+            try:
+                event = json.loads(event_text)
+            except json.JSONDecodeError as error:
+                raise ScenarioError(
+                    f"disconnect probe received malformed SSE JSON: {event_text[:500]}"
+                ) from error
+            for choice in event.get("choices", []):
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                output = (
+                    delta.get("content")
+                    or delta.get("reasoning")
+                    or delta.get("reasoning_content")
+                )
+                if output:
+                    first_output_event = event
+                    active_health = on_first_output()
+                    break
+            if first_output_event is not None:
+                break
+
+    return {
+        "http_status": status,
+        "partial_wire": b"".join(raw_lines),
+        "first_output_event": first_output_event,
+        "active_health": active_health,
+        "time_to_first_output_sec": time.monotonic() - started,
+    }
 
 
 def parse_json_response(label: str, status: int, body: str, expected_status: int = 200) -> dict[str, Any]:
@@ -690,6 +843,25 @@ def finish_reason(data: dict[str, Any]) -> str | None:
     return str(value) if value is not None else None
 
 
+def response_usage(label: str, data: dict[str, Any]) -> dict[str, int]:
+    usage = data.get("usage")
+    require(isinstance(usage, dict), f"{label}: missing usage object")
+    result: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+            f"{label}: usage.{key} must be a non-negative integer: {usage}",
+        )
+        result[key] = value
+    require(result["completion_tokens"] > 0, f"{label}: completion_tokens must be positive")
+    require(
+        result["total_tokens"] == result["prompt_tokens"] + result["completion_tokens"],
+        f"{label}: usage total is inconsistent: {result}",
+    )
+    return result
+
+
 def chat_payload(
     model: str,
     messages: list[dict[str, Any]],
@@ -893,6 +1065,7 @@ def parse_sse(body: str) -> dict[str, Any]:
     usage_chunks = 0
     chunks = 0
     finish_reasons: list[str] = []
+    usage_payloads: list[dict[str, Any]] = []
     tool_call_deltas: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for raw_line in body.splitlines():
@@ -914,8 +1087,11 @@ def parse_sse(body: str) -> dict[str, Any]:
         error = parsed.get("error")
         if isinstance(error, dict):
             errors.append(error)
-        if parsed.get("usage"):
+        usage = parsed.get("usage")
+        if usage:
+            require(isinstance(usage, dict), f"SSE usage must be an object: {usage!r}")
             usage_chunks += 1
+            usage_payloads.append(usage)
         for choice in parsed.get("choices", []):
             if not isinstance(choice, dict):
                 continue
@@ -940,6 +1116,7 @@ def parse_sse(body: str) -> dict[str, Any]:
         "chunk_count": chunks,
         "output_text": output_text,
         "finish_reasons": finish_reasons,
+        "usage_payloads": usage_payloads,
         "tool_call_deltas": tool_call_deltas,
         "errors": errors,
     }
@@ -1056,6 +1233,72 @@ def wait_health(base_url: str, timeout: int) -> dict[str, Any]:
             last = repr(exc)
         time.sleep(0.5)
     raise ScenarioError(f"server did not become healthy within {timeout}s; last={last}")
+
+
+ADMISSION_QUIESCENT_FIELDS = (
+    "queue_depth",
+    "active_prefill",
+    "active_decode",
+    "current_batch_size",
+)
+
+
+def admission_health_snapshot(base_url: str, timeout: float) -> dict[str, Any]:
+    status, body = get_url(
+        base_url.rstrip("/") + "/health",
+        timeout=max(0.1, timeout),
+    )
+    data = parse_json_response("admission health", status, body)
+    admission = data.get("admission")
+    require(isinstance(admission, dict), "health response is missing admission object")
+    counters: dict[str, int] = {}
+    for key in ("effective_max_concurrent", *ADMISSION_QUIESCENT_FIELDS):
+        value = admission.get(key)
+        require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+            f"health admission.{key} must be a non-negative integer: {admission}",
+        )
+        counters[key] = value
+    return {
+        "captured_at": iso_now(),
+        "http_status": status,
+        "admission": counters,
+        "response": data,
+    }
+
+
+def wait_admission_quiescent(
+    base_url: str,
+    *,
+    timeout: float,
+    poll_interval: float = 0.05,
+) -> dict[str, Any]:
+    require(timeout > 0, "admission quiescence timeout must be positive")
+    require(poll_interval > 0, "admission poll interval must be positive")
+    started = time.monotonic()
+    samples: list[dict[str, Any]] = []
+    last: dict[str, Any] | None = None
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed > timeout:
+            break
+        snapshot = admission_health_snapshot(base_url, min(2.0, max(0.1, timeout - elapsed)))
+        snapshot["elapsed_sec"] = time.monotonic() - started
+        samples.append(snapshot)
+        last = snapshot
+        if all(snapshot["admission"][key] == 0 for key in ADMISSION_QUIESCENT_FIELDS):
+            return {
+                "status": "pass",
+                "elapsed_sec": snapshot["elapsed_sec"],
+                "sample_count": len(samples),
+                "samples": samples,
+                "terminal": snapshot,
+            }
+        time.sleep(poll_interval)
+    raise ScenarioError(
+        f"admission did not become quiescent within {timeout:.3f}s; "
+        f"last={last['admission'] if last else None}"
+    )
 
 
 def capture_health(
@@ -1493,6 +1736,10 @@ class ScenarioRunner:
             return self.serve_stateful_loop(scenario, out)
         if typ == "serve_stream":
             return self.serve_stream(scenario, out)
+        if typ == "serve_stream_equivalence_unicode":
+            return self.serve_stream_equivalence_unicode(scenario, out)
+        if typ == "serve_disconnect_release":
+            return self.serve_disconnect_release(scenario, out)
         if typ == "serve_structured_output":
             return self.serve_structured_output(scenario, out)
         if typ == "serve_response_format_matrix":
@@ -1637,6 +1884,357 @@ class ScenarioRunner:
         require(parsed["malformed_json"] == 0, f"stream malformed_json={parsed['malformed_json']}")
         require(parsed["usage_chunks"] == 1, f"stream usage_chunks={parsed['usage_chunks']} != 1")
         return {"status": "pass", **parsed, "event_count": len(event_times)}
+
+    def serve_stream_equivalence_unicode(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        case_count = int(scenario.get("case_count", 20))
+        require(case_count >= 3, "Unicode stream equivalence requires at least three cases")
+        categories = ("chinese", "emoji", "combining")
+        category_counts = {category: 0 for category in categories}
+        results: list[dict[str, Any]] = []
+
+        for ordinal in range(case_count):
+            category = categories[ordinal % len(categories)]
+            if category == "chinese":
+                value = f"你好，Ferrum，编号 {ordinal:03d}"
+            elif category == "emoji":
+                value = f"Ferrum 🔥🚀 {ordinal:03d}"
+            else:
+                value = f"Cafe\u0301 Ferrum {ordinal:03d}"
+            expected = {
+                "category": category,
+                "ordinal": ordinal,
+                "value": value,
+            }
+            expected_text = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+            prompt = (
+                "Return the following JSON object exactly, with no markdown or extra text. "
+                f"EXACT_JSON:{expected_text}"
+            )
+            common_payload = chat_payload(
+                self.model,
+                [{"role": "user", "content": prompt}],
+                max_tokens=int(scenario.get("max_tokens", 1024)),
+                temperature=0,
+            )
+            if scenario.get("preset") == "P_DETERMINISTIC":
+                apply_deterministic_sampling(common_payload, scenario)
+            else:
+                common_payload["seed"] = int(scenario.get("seed", 9271))
+                common_payload["chat_template_kwargs"] = {"enable_thinking": False}
+            common_payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"unicode_equivalence_{ordinal:03d}",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string", "const": category},
+                            "ordinal": {"type": "integer", "const": ordinal},
+                            "value": {"type": "string", "const": value},
+                        },
+                        "required": ["category", "ordinal", "value"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+            common_payload["metadata"] = {
+                "ferrum_scenario": "stream_equivalence_unicode",
+                "ferrum_case": f"{category}-{ordinal:03d}",
+            }
+            pair_fingerprint = json_fingerprint(common_payload)
+            case_out = out / f"{ordinal:03d}-{category}"
+            case_out.mkdir(parents=True, exist_ok=True)
+
+            sync_payload = dict(common_payload)
+            write_json(case_out / "sync.request.json", sync_payload)
+            sync_status, sync_body = post_json(
+                self.require_base_url(), sync_payload, timeout=self.timeout
+            )
+            (case_out / "sync.response.json").write_text(sync_body, encoding="utf-8")
+            sync_data = parse_json_response(
+                f"Unicode equivalence {ordinal} sync", sync_status, sync_body
+            )
+            sync_text = message_text(sync_data)
+            assert_no_bad_text(f"Unicode equivalence {ordinal} sync", sync_text)
+            try:
+                sync_object = json.loads(sync_text)
+            except json.JSONDecodeError as error:
+                raise ScenarioError(
+                    f"Unicode equivalence {ordinal} sync content is not JSON: {sync_text!r}"
+                ) from error
+            require(
+                sync_object == expected,
+                f"Unicode equivalence {ordinal} sync object mismatch: {sync_object!r}",
+            )
+            sync_finish = finish_reason(sync_data)
+            require(sync_finish == "stop", f"Unicode equivalence {ordinal} sync finish={sync_finish}")
+            sync_usage = response_usage(f"Unicode equivalence {ordinal} sync", sync_data)
+
+            stream_payload = dict(common_payload)
+            stream_payload["stream"] = True
+            stream_payload["stream_options"] = {"include_usage": True}
+            write_json(case_out / "stream.request.json", stream_payload)
+            stream_status, stream_wire, stream_body, wire_evidence = request_sse_incremental(
+                self.require_base_url(),
+                stream_payload,
+                timeout=self.timeout,
+                read_size=1,
+            )
+            (case_out / "stream.response.sse").write_bytes(stream_wire)
+            write_json(case_out / "stream.wire.json", wire_evidence)
+            require(
+                stream_status == 200,
+                f"Unicode equivalence {ordinal} stream HTTP {stream_status}: {stream_body[:500]}",
+            )
+            assert_no_bad_text(f"Unicode equivalence {ordinal} stream wire", stream_body)
+            parsed = parse_sse(stream_body)
+            assert_no_bad_text(f"Unicode equivalence {ordinal} stream", parsed["output_text"])
+            require(parsed["done_count"] == 1, f"Unicode equivalence {ordinal} DONE mismatch")
+            require(parsed["malformed_json"] == 0, f"Unicode equivalence {ordinal} malformed SSE")
+            require(parsed["usage_chunks"] == 1, f"Unicode equivalence {ordinal} usage mismatch")
+            require(parsed["content_delta_count"] > 0, f"Unicode equivalence {ordinal} no content")
+            require(not parsed["errors"], f"Unicode equivalence {ordinal} stream errors")
+            require(
+                parsed["finish_reasons"] == [sync_finish],
+                f"Unicode equivalence {ordinal} finish mismatch: {parsed['finish_reasons']}",
+            )
+            require(
+                parsed["output_text"] == sync_text,
+                f"Unicode equivalence {ordinal} stream/non-stream content differs",
+            )
+            stream_usage = response_usage(
+                f"Unicode equivalence {ordinal} stream",
+                {"usage": parsed["usage_payloads"][0]},
+            )
+            require(
+                stream_usage == sync_usage,
+                f"Unicode equivalence {ordinal} usage differs: {stream_usage} != {sync_usage}",
+            )
+            try:
+                stream_object = json.loads(parsed["output_text"])
+            except json.JSONDecodeError as error:
+                raise ScenarioError(
+                    f"Unicode equivalence {ordinal} stream content is not JSON"
+                ) from error
+            require(stream_object == expected, f"Unicode equivalence {ordinal} stream object mismatch")
+            require(
+                wire_evidence["split_boundary_count"] > 0,
+                f"Unicode equivalence {ordinal} did not exercise a multibyte wire split",
+            )
+
+            case_result = with_canonical_sha256(
+                {
+                    "status": "pass",
+                    "ordinal": ordinal,
+                    "category": category,
+                    "expected": expected,
+                    "expected_sha256": json_fingerprint(expected),
+                    "pair_payload_sha256": pair_fingerprint,
+                    "sync_request_sha256": json_fingerprint(sync_payload),
+                    "stream_request_sha256": json_fingerprint(stream_payload),
+                    "sync_response_sha256": hashlib.sha256(sync_body.encode("utf-8")).hexdigest(),
+                    "stream_response_sha256": wire_evidence["wire_sha256"],
+                    "finish_reason": sync_finish,
+                    "usage": sync_usage,
+                    "wire": wire_evidence,
+                }
+            )
+            write_json(case_out / "result.json", case_result)
+            results.append(case_result)
+            category_counts[category] += 1
+
+        require(all(count > 0 for count in category_counts.values()), "Unicode category missing")
+        return {
+            "status": "pass",
+            "case_count": len(results),
+            "category_counts": category_counts,
+            "exact_content_matches": len(results),
+            "exact_finish_matches": len(results),
+            "exact_usage_matches": len(results),
+            "multibyte_split_cases": sum(
+                int(case["wire"]["split_boundary_count"] > 0) for case in results
+            ),
+            "cases": results,
+        }
+
+    def serve_disconnect_release(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        release_timeout = float(scenario.get("release_timeout_sec", 5.0))
+        poll_interval = float(scenario.get("poll_interval_sec", 0.05))
+        max_tokens = int(scenario.get("max_tokens", 1024))
+        expected_cap = scenario.get("expected_effective_max_concurrent")
+        require(max_tokens > 0, "disconnect release max_tokens must be positive")
+        if scenario.get("require_scheduler_trace") is True:
+            require(
+                self.observability_enabled(),
+                "disconnect release scheduler-tick validation requires observability",
+            )
+
+        before = wait_admission_quiescent(
+            self.require_base_url(), timeout=release_timeout, poll_interval=poll_interval
+        )
+        write_json(out / "health.before.json", before)
+        if expected_cap is not None:
+            require(
+                before["terminal"]["admission"]["effective_max_concurrent"] == int(expected_cap),
+                "disconnect release effective capacity does not match the scenario contract",
+            )
+
+        marker = str(scenario.get("marker") or "m1-s2-disconnect-release")
+        disconnect_payload = chat_payload(
+            self.model,
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Write the integers from 1 through 1000, one per line, and do not "
+                        "summarize or stop before the requested sequence is complete."
+                    ),
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=0,
+        )
+        disconnect_payload["stream"] = True
+        disconnect_payload["stream_options"] = {"include_usage": True}
+        disconnect_payload["chat_template_kwargs"] = {"enable_thinking": False}
+        disconnect_payload["metadata"] = {
+            "ferrum_scenario": "disconnect_release",
+            "ferrum_disconnect_probe": True,
+            "ferrum_marker": marker,
+        }
+        write_json(out / "disconnect.request.json", disconnect_payload)
+
+        def capture_active_health() -> dict[str, Any]:
+            snapshot = admission_health_snapshot(self.require_base_url(), min(2.0, release_timeout))
+            active = sum(snapshot["admission"][key] for key in ADMISSION_QUIESCENT_FIELDS)
+            require(active > 0, f"disconnect probe was not active at first output: {snapshot}")
+            if expected_cap is not None:
+                require(
+                    snapshot["admission"]["effective_max_concurrent"] == int(expected_cap),
+                    "disconnect probe changed effective capacity",
+                )
+            return snapshot
+
+        disconnected = request_sse_until_output_then_disconnect(
+            self.require_base_url(),
+            disconnect_payload,
+            timeout=self.timeout,
+            on_first_output=capture_active_health,
+        )
+        partial_wire = disconnected.pop("partial_wire")
+        require(isinstance(partial_wire, bytes), "disconnect partial wire must be bytes")
+        (out / "disconnect.partial.sse").write_bytes(partial_wire)
+        require(
+            disconnected["http_status"] == 200,
+            f"disconnect probe HTTP {disconnected['http_status']}",
+        )
+        require(
+            isinstance(disconnected["first_output_event"], dict),
+            "disconnect probe received no output event before closing",
+        )
+        require(
+            isinstance(disconnected["active_health"], dict),
+            "disconnect probe did not capture active health",
+        )
+        write_json(out / "disconnect.observed.json", disconnected)
+
+        released = wait_admission_quiescent(
+            self.require_base_url(), timeout=release_timeout, poll_interval=poll_interval
+        )
+        require(
+            released["elapsed_sec"] <= release_timeout,
+            f"disconnect release exceeded {release_timeout:.3f}s",
+        )
+        write_json(out / "health.released.json", released)
+
+        expected = {"marker": marker, "status": "released"}
+        expected_text = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+        followup_payload = chat_payload(
+            self.model,
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Return the following JSON object exactly, with no extra text. "
+                        f"EXACT_JSON:{expected_text}"
+                    ),
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=0,
+        )
+        followup_payload["seed"] = int(scenario.get("seed", 9271))
+        followup_payload["chat_template_kwargs"] = {"enable_thinking": False}
+        followup_payload["metadata"] = {
+            "ferrum_scenario": "disconnect_release_followup",
+            "ferrum_marker": marker,
+        }
+        followup_payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "disconnect_release_followup",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "marker": {"type": "string", "const": marker},
+                        "status": {"type": "string", "const": "released"},
+                    },
+                    "required": ["marker", "status"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        require(
+            followup_payload["max_tokens"] == disconnect_payload["max_tokens"],
+            "disconnect follow-up must request the same token capacity",
+        )
+        write_json(out / "followup.request.json", followup_payload)
+        followup_status, followup_body = post_json(
+            self.require_base_url(), followup_payload, timeout=self.timeout
+        )
+        (out / "followup.response.json").write_text(followup_body, encoding="utf-8")
+        followup = parse_json_response(
+            "disconnect same-capacity follow-up", followup_status, followup_body
+        )
+        followup_text = message_text(followup)
+        assert_no_bad_text("disconnect same-capacity follow-up", followup_text)
+        try:
+            followup_object = json.loads(followup_text)
+        except json.JSONDecodeError as error:
+            raise ScenarioError("disconnect follow-up content is not JSON") from error
+        require(followup_object == expected, f"disconnect follow-up mismatch: {followup_object!r}")
+        require(finish_reason(followup) == "stop", "disconnect follow-up did not finish normally")
+        followup_usage = response_usage("disconnect same-capacity follow-up", followup)
+
+        after = wait_admission_quiescent(
+            self.require_base_url(), timeout=release_timeout, poll_interval=poll_interval
+        )
+        write_json(out / "health.after.json", after)
+        return {
+            "status": "pass",
+            "marker": marker,
+            "max_tokens": max_tokens,
+            "effective_max_concurrent": before["terminal"]["admission"][
+                "effective_max_concurrent"
+            ],
+            "time_to_first_output_sec": disconnected["time_to_first_output_sec"],
+            "release_elapsed_sec": released["elapsed_sec"],
+            "release_timeout_sec": release_timeout,
+            "same_capacity_followup": True,
+            "followup_usage": followup_usage,
+            "scheduler_tick_limit": 2,
+            "scheduler_trace_required": scenario.get("require_scheduler_trace") is True,
+            "request_fingerprints": {
+                "disconnect": json_fingerprint(disconnect_payload),
+                "followup": json_fingerprint(followup_payload),
+            },
+        }
 
     def serve_structured_output(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
         expected = scenario.get("expected_object") or {"answer": "scenario-ok"}
@@ -2435,13 +3033,39 @@ def is_optional_skip(exc: Exception) -> bool:
 
 class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    active_lock = threading.Lock()
+    active_requests = 0
+
+    @classmethod
+    def change_active_requests(cls, delta: int) -> int:
+        with cls.active_lock:
+            cls.active_requests += delta
+            return cls.active_requests
+
+    @classmethod
+    def active_request_count(cls) -> int:
+        with cls.active_lock:
+            return cls.active_requests
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self.send_json(200, {"status": "ok"})
+            active = self.active_request_count()
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "admission": {
+                        "effective_max_concurrent": 1,
+                        "queue_depth": 0,
+                        "active_prefill": 0,
+                        "active_decode": active,
+                        "current_batch_size": active,
+                    },
+                },
+            )
             return
         if self.path == "/v1/models":
             self.send_json(
@@ -2602,10 +3226,24 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 None,
             )
             return
+        prompt = " ".join(str(msg.get("content") or "") for msg in messages)
+        last_user = ""
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                last_user = str(msg.get("content") or "")
+                break
+        exact_object = self.exact_json_object(last_user)
         echo_marker = self.echo_value_marker(payload)
         if payload.get("stream"):
-            if echo_marker is not None:
+            metadata = payload.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("ferrum_disconnect_probe") is True:
+                self.send_disconnect_stream()
+            elif echo_marker is not None:
                 self.send_stream_tool_call(echo_marker)
+            elif response_format and exact_object is not None:
+                self.send_stream(
+                    json.dumps(exact_object, ensure_ascii=False, separators=(",", ":"))
+                )
             else:
                 self.send_stream()
             return
@@ -2615,15 +3253,8 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 {"error": {"type": "invalid_request_error", "message": "context limit"}},
             )
             return
-        prompt = " ".join(str(msg.get("content") or "") for msg in messages)
-        last_user = ""
-        for msg in reversed(messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                last_user = str(msg.get("content") or "")
-                break
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
-        exact_object = self.exact_json_object(last_user)
         response_format_type = (
             response_format.get("type") if isinstance(response_format, dict) else None
         )
@@ -2658,7 +3289,9 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         elif response_format_type == "json_object":
             self.send_chat("{}")
         elif response_format and exact_object is not None:
-            self.send_chat(json.dumps(exact_object, separators=(",", ":")))
+            self.send_chat(
+                json.dumps(exact_object, ensure_ascii=False, separators=(",", ":"))
+            )
         elif response_format:
             self.send_chat('{"answer":"scenario-ok"}')
         elif "remembered code" in last_user.lower() or "secret code" in last_user.lower():
@@ -2781,22 +3414,70 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             },
         )
 
-    def send_stream(self) -> None:
+    def send_stream(self, text: str = "scenario") -> None:
         lines = [
             {
                 "choices": [
-                    {"index": 0, "delta": {"role": "assistant", "content": "scenario"}, "finish_reason": None}
+                    {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}
                 ]
             },
-            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens": 1}},
+            {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
         ]
-        raw = "".join(f"data: {json.dumps(line)}\n\n" for line in lines) + "data: [DONE]\n\n"
+        raw = (
+            "".join(f"data: {json.dumps(line, ensure_ascii=False)}\n\n" for line in lines)
+            + "data: [DONE]\n\n"
+        )
         body = raw.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_disconnect_stream(self) -> None:
+        first = (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "1\n"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        remainder = (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+            )
+            + "\n\ndata: [DONE]\n\n"
+        ).encode("utf-8")
+        self.change_active_requests(1)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(first) + len(remainder)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            time.sleep(0.2)
+            self.wfile.write(remainder)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.change_active_requests(-1)
 
     def send_stream_tool_call(self, marker: str) -> None:
         arguments = json.dumps({"value": marker}, separators=(",", ":"))
@@ -3008,6 +3689,24 @@ def self_test() -> int:
                         {"name": "loop", "type": "serve_stateful_loop"},
                         {"name": "stream", "type": "serve_stream"},
                         {
+                            "name": "stream-equivalence-unicode",
+                            "type": "serve_stream_equivalence_unicode",
+                            "case_count": 3,
+                            "enable_thinking": False,
+                            "preset": "P_DETERMINISTIC",
+                            "max_tokens": 1024,
+                            "sampling": dict(deterministic_sampling),
+                        },
+                        {
+                            "name": "disconnect-release",
+                            "type": "serve_disconnect_release",
+                            "expected_effective_max_concurrent": 1,
+                            "max_tokens": 64,
+                            "release_timeout_sec": 5.0,
+                            "poll_interval_sec": 0.02,
+                            "require_scheduler_trace": False,
+                        },
+                        {
                             "name": "structured",
                             "type": "serve_structured_output",
                             "expected_object": {"answer": "scenario-ok"},
@@ -3093,16 +3792,19 @@ def self_test() -> int:
                 ]
             )
             if proc.returncode != 0:
-                raise AssertionError(proc.stderr or proc.stdout)
+                diagnostic = ""
+                if (out / "summary.json").is_file():
+                    diagnostic = (out / "summary.json").read_text(encoding="utf-8")
+                raise AssertionError((proc.stderr or proc.stdout) + "\n" + diagnostic)
             if f"BACKEND REGRESSION SMOKE PASS: {out.resolve()}" not in proc.stdout:
                 raise AssertionError(proc.stdout)
             summary = load_json_object(out / "summary.json")
-            if summary.get("status") != "pass" or summary.get("scenario_count") != 13:
+            if summary.get("status") != "pass" or summary.get("scenario_count") != 15:
                 raise AssertionError(summary)
             if (
-                summary.get("manifest_scenario_count") != 13
+                summary.get("manifest_scenario_count") != 15
                 or summary.get("requested_scenarios") != []
-                or len(summary.get("selected_scenarios", [])) != 13
+                or len(summary.get("selected_scenarios", [])) != 15
             ):
                 raise AssertionError(summary)
             receipt = load_json_object(out / "execution_receipt.json")
@@ -3163,6 +3865,27 @@ def self_test() -> int:
                 raise AssertionError(object_result)
             if [case.get("object") for case in object_result.get("cases", [])] != [{}, {}]:
                 raise AssertionError(object_result)
+            equivalence_result = load_json_object(
+                out / "stream-equivalence-unicode" / "result.json"
+            )
+            if (
+                equivalence_result.get("case_count") != 3
+                or equivalence_result.get("category_counts")
+                != {"chinese": 1, "emoji": 1, "combining": 1}
+                or equivalence_result.get("exact_content_matches") != 3
+                or equivalence_result.get("exact_finish_matches") != 3
+                or equivalence_result.get("exact_usage_matches") != 3
+                or equivalence_result.get("multibyte_split_cases") != 3
+            ):
+                raise AssertionError(equivalence_result)
+            disconnect_result = load_json_object(out / "disconnect-release" / "result.json")
+            if (
+                disconnect_result.get("same_capacity_followup") is not True
+                or disconnect_result.get("effective_max_concurrent") != 1
+                or disconnect_result.get("release_elapsed_sec", 6) > 5.0
+                or disconnect_result.get("scheduler_tick_limit") != 2
+            ):
+                raise AssertionError(disconnect_result)
             matrix_contract = load_json_object(out / "response_format_matrix_contract.json")
             if matrix_contract.get("case_counts") != {"json_schema": 4, "json_object": 2}:
                 raise AssertionError(matrix_contract)

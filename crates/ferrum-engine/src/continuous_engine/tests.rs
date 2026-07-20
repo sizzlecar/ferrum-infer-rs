@@ -5362,7 +5362,11 @@ async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
 
 #[tokio::test]
 async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state() {
+    let trace_path = resource_trace_temp_path("client-disconnect-release");
+    let _ = std::fs::remove_file(&trace_path);
     let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Serve);
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
@@ -5420,6 +5424,7 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
         .insert(request_id.clone(), sequence);
 
     engine.inner.run_iteration().await.unwrap();
+    flush_engine_profile_events(&engine);
 
     assert!(!engine.inner.sequences.read().contains_key(&request_id));
     assert_eq!(scheduler.trace_phase(&request_id), None);
@@ -5431,6 +5436,51 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
     assert_eq!(recurrent_stats.used_memory_bytes, 0);
+
+    let events = read_engine_profile_events(&trace_path);
+    let detected = events
+        .iter()
+        .find(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "engine_client_disconnect_detected"
+        })
+        .expect("disconnect detection must be traced");
+    let released = events
+        .iter()
+        .find(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "engine_client_disconnect_released"
+        })
+        .expect("disconnect release must be traced");
+    assert_eq!(
+        detected.attributes.get("terminal_state"),
+        Some(&serde_json::json!("pending_release"))
+    );
+    assert_eq!(
+        released.attributes.get("terminal_state"),
+        Some(&serde_json::json!("released"))
+    );
+    assert_eq!(
+        released.attributes.get("scheduler_cancel_result"),
+        Some(&serde_json::json!("cancelled"))
+    );
+    assert!(
+        released.shape["scheduler_tick_delta"]
+            .as_u64()
+            .expect("scheduler tick delta must be an unsigned integer")
+            <= 2,
+        "disconnect resources must reach a terminal state within two scheduler ticks"
+    );
+    assert_eq!(
+        released.attributes["scheduler_snapshot"]["cancelled_total"],
+        serde_json::json!(1)
+    );
+    assert!(!events.iter().any(|event| {
+        event.request_id == request_id.to_string()
+            && event.phase == "engine_client_disconnect_release_failed"
+    }));
+
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[test]
