@@ -1334,13 +1334,7 @@ mod tests {
             command.wait_until_completed();
             assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
             let actual = read_f16(&output, rows * output_width);
-            for (index, (actual, expected)) in actual.iter().zip(&reference).enumerate() {
-                let tolerance = 0.02_f32.max(expected.abs() * 0.01);
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "{format:?}[{index}] {actual} != {expected}"
-                );
-            }
+            assert_linear_diagnostic_close(&format!("{format:?}"), &actual, &reference);
         }
     }
 
@@ -1398,11 +1392,251 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_dense_swiglu_q4k_q6k_matches_full_cpu_oracle_on_real_metal() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping dense SwiGLU conformance");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let rows = 2_usize;
+        let hidden = 256_usize;
+        let intermediate = 256_usize;
+        let input = (0..rows * hidden)
+            .map(|index| f16::from_f32((index as f32 * 0.017).sin() * 0.125))
+            .collect::<Vec<_>>();
+        let gate_up = (0..2 * intermediate * hidden)
+            .map(|index| (index as f32 * 0.0031).cos() * 0.0625)
+            .collect::<Vec<_>>();
+        let down = (0..hidden * intermediate)
+            .map(|index| (index as f32 * 0.0043).sin() * 0.0625)
+            .collect::<Vec<_>>();
+        let cpu = CandleDevice::Cpu;
+        let input_tensor = Tensor::from_vec(
+            input.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
+            (rows, hidden),
+            &cpu,
+        )
+        .unwrap();
+        let gate_up_tensor = Tensor::from_vec(gate_up, (2 * intermediate, hidden), &cpu).unwrap();
+        let down_tensor = Tensor::from_vec(down, (hidden, intermediate), &cpu).unwrap();
+        let gate_up_quantized = QTensor::quantize(&gate_up_tensor, GgmlDType::Q4K).unwrap();
+        let down_quantized = QTensor::quantize(&down_tensor, GgmlDType::Q6K).unwrap();
+
+        let cpu_gate_up = input_tensor
+            .matmul(
+                &gate_up_quantized
+                    .dequantize(&cpu)
+                    .unwrap()
+                    .transpose(0, 1)
+                    .unwrap(),
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut cpu_activated = vec![0.0_f32; rows * intermediate];
+        for row in 0..rows {
+            for column in 0..intermediate {
+                let gate = cpu_gate_up[row * 2 * intermediate + column];
+                let up = cpu_gate_up[row * 2 * intermediate + intermediate + column];
+                cpu_activated[row * intermediate + column] = gate / (1.0 + (-gate).exp()) * up;
+            }
+        }
+        let cpu_output = Tensor::from_vec(cpu_activated, (rows, intermediate), &cpu)
+            .unwrap()
+            .matmul(
+                &down_quantized
+                    .dequantize(&cpu)
+                    .unwrap()
+                    .transpose(0, 1)
+                    .unwrap(),
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let input_buffer = shared_buffer(&device, &input);
+        let gate_up_buffer = shared_buffer(&device, &gate_up_quantized.data().unwrap());
+        let down_buffer = shared_buffer(&device, &down_quantized.data().unwrap());
+        let projected = output_buffer::<f16>(&device, rows * 2 * intermediate);
+        let activated = output_buffer::<f16>(&device, rows * intermediate);
+        let output = output_buffer::<f16>(&device, rows * hidden);
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        dispatch_raw_linear(
+            &pipelines,
+            encoder,
+            LinearPhysicalFormat::Q4K,
+            &input_buffer,
+            &gate_up_buffer,
+            &projected,
+            LinearParams {
+                rows: rows as u32,
+                in_features: hidden as u32,
+                out_features: (2 * intermediate) as u32,
+                output_stride: (2 * intermediate) as u32,
+                output_column_offset: 0,
+            },
+        );
+        encoder.set_compute_pipeline_state(&pipelines.swiglu);
+        encoder.set_buffer(0, Some(&projected), 0);
+        encoder.set_buffer(1, Some(&activated), 0);
+        let swiglu = SwiGluParams {
+            rows: rows as u32,
+            intermediate_size: intermediate as u32,
+            gate_up_stride: (2 * intermediate) as u32,
+        };
+        encoder.set_bytes(
+            2,
+            std::mem::size_of::<SwiGluParams>() as u64,
+            &swiglu as *const _ as *const c_void,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                (rows as u64 * intermediate as u64).div_ceil(THREADS_PER_GROUP),
+                1,
+                1,
+            ),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+        dispatch_raw_linear(
+            &pipelines,
+            encoder,
+            LinearPhysicalFormat::Q6K,
+            &activated,
+            &down_buffer,
+            &output,
+            LinearParams {
+                rows: rows as u32,
+                in_features: intermediate as u32,
+                out_features: hidden as u32,
+                output_stride: hidden as u32,
+                output_column_offset: 0,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        let actual = read_f16(&output, rows * hidden);
+        assert!(actual.iter().any(|value| value.abs() > 1.0e-5));
+        assert_linear_diagnostic_close("dense SwiGLU Q4_K/Q6_K", &actual, &cpu_output);
+    }
+
+    #[test]
+    fn native_last_token_q6k_linear_selects_final_row_on_real_metal() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping last-token linear conformance");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let rows = 3_usize;
+        let hidden = 256_usize;
+        let output_width = 64_usize;
+        let input = (0..rows * hidden)
+            .map(|index| {
+                let row = index / hidden;
+                f16::from_f32((index as f32 * 0.011).sin() * 0.125 + row as f32 * 0.03125)
+            })
+            .collect::<Vec<_>>();
+        let weight = (0..output_width * hidden)
+            .map(|index| (index as f32 * 0.0071).cos() * 0.0625)
+            .collect::<Vec<_>>();
+        let cpu = CandleDevice::Cpu;
+        let weight_tensor = Tensor::from_vec(weight, (output_width, hidden), &cpu).unwrap();
+        let quantized = QTensor::quantize(&weight_tensor, GgmlDType::Q6K).unwrap();
+        let dequantized = quantized.dequantize(&cpu).unwrap().transpose(0, 1).unwrap();
+        let cpu_row = |row: usize| {
+            Tensor::from_vec(
+                input[row * hidden..(row + 1) * hidden]
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                (1, hidden),
+                &cpu,
+            )
+            .unwrap()
+            .matmul(&dequantized)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+        };
+        let first_row = cpu_row(0);
+        let final_row = cpu_row(rows - 1);
+        assert!(first_row
+            .iter()
+            .zip(&final_row)
+            .any(|(first, last)| (first - last).abs() > 1.0e-3));
+
+        let input_buffer = shared_buffer(&device, &input);
+        let weight_buffer = shared_buffer(&device, &quantized.data().unwrap());
+        let output = output_buffer::<f16>(&device, output_width);
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        dispatch_raw_linear_at(
+            &pipelines,
+            encoder,
+            LinearPhysicalFormat::Q6K,
+            &input_buffer,
+            ((rows - 1) * hidden * std::mem::size_of::<f16>()) as u64,
+            &weight_buffer,
+            &output,
+            LinearParams {
+                rows: 1,
+                in_features: hidden as u32,
+                out_features: output_width as u32,
+                output_stride: output_width as u32,
+                output_column_offset: 0,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        let actual = read_f16(&output, output_width);
+        assert_linear_diagnostic_close("last-token Q6_K", &actual, &final_row);
+    }
+
+    fn assert_linear_diagnostic_close(label: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = 0.02_f32.max(expected.abs() * 0.01);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "{label}[{index}] {actual} != {expected}"
+            );
+        }
+    }
+
     fn dispatch_raw_linear(
         pipelines: &MetalLinearPipelines,
         encoder: &ComputeCommandEncoderRef,
         format: LinearPhysicalFormat,
         input: &BufferRef,
+        weight: &BufferRef,
+        output: &BufferRef,
+        params: LinearParams,
+    ) {
+        dispatch_raw_linear_at(pipelines, encoder, format, input, 0, weight, output, params);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_raw_linear_at(
+        pipelines: &MetalLinearPipelines,
+        encoder: &ComputeCommandEncoderRef,
+        format: LinearPhysicalFormat,
+        input: &BufferRef,
+        input_offset_bytes: u64,
         weight: &BufferRef,
         output: &BufferRef,
         params: LinearParams,
@@ -1414,7 +1648,7 @@ mod tests {
             LinearPhysicalFormat::Q6K => &pipelines.q6_k,
             LinearPhysicalFormat::Q8_0 => &pipelines.q8_0,
         });
-        encoder.set_buffer(0, Some(input), 0);
+        encoder.set_buffer(0, Some(input), input_offset_bytes);
         encoder.set_buffer(1, Some(weight), 0);
         encoder.set_buffer(2, Some(output), 0);
         encoder.set_bytes(
