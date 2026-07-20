@@ -581,10 +581,13 @@ pub fn metal_gguf_moe_correctness_entries(
 /// requests (sync correctness, multi-turn, then stream) end the stream
 /// immediately with an empty EOS. Keep this product path correct by default:
 /// enough context for Qwen3 thinking-mode responses and a multi-request pool
-/// for dense and MoE GGUF serving.
+/// for dense and MoE GGUF serving. A registered vNext execution plan owns its
+/// context capacity through admission and the dynamic resource pool, so the
+/// legacy static capacity guard must not override it.
 pub fn serve_profile_runtime_entries(
     snapshot_path: &Path,
     device: &ferrum_types::Device,
+    vnext_plan_owns_context_capacity: bool,
     current: &RuntimeConfigSnapshot,
     source: RuntimeConfigSource,
 ) -> Vec<RuntimeConfigEntry> {
@@ -597,6 +600,7 @@ pub fn serve_profile_runtime_entries(
         is_gguf,
         detect_moe_arch(snapshot_path),
         device_is_metal(device),
+        vnext_plan_owns_context_capacity,
         current,
         source,
     )
@@ -618,6 +622,7 @@ pub fn serve_profile_runtime_entries_for_arch(
     is_gguf: bool,
     is_moe: bool,
     is_metal: bool,
+    vnext_plan_owns_context_capacity: bool,
     current: &RuntimeConfigSnapshot,
     source: RuntimeConfigSource,
 ) -> Vec<RuntimeConfigEntry> {
@@ -626,24 +631,26 @@ pub fn serve_profile_runtime_entries_for_arch(
     }
 
     let mut entries = Vec::new();
-    let kv_capacity = if is_moe && is_metal {
-        // Metal Qwen3-MoE paged KV is stable for the README c16 path when
-        // total pool blocks stay <= 1024. c16 × 1024 tokens gives exactly
-        // that bound and avoids the repeated-token failure seen at
-        // c16 × 2048.
-        "1024"
-    } else if is_moe {
-        "2048"
-    } else {
-        "512"
-    };
-    push_missing_entry(
-        &mut entries,
-        current,
-        "FERRUM_KV_CAPACITY",
-        kv_capacity,
-        source,
-    );
+    if !vnext_plan_owns_context_capacity {
+        let kv_capacity = if is_moe && is_metal {
+            // Metal Qwen3-MoE paged KV is stable for the README c16 path when
+            // total pool blocks stay <= 1024. c16 × 1024 tokens gives exactly
+            // that bound and avoids the repeated-token failure seen at
+            // c16 × 2048.
+            "1024"
+        } else if is_moe {
+            "2048"
+        } else {
+            "512"
+        };
+        push_missing_entry(
+            &mut entries,
+            current,
+            "FERRUM_KV_CAPACITY",
+            kv_capacity,
+            source,
+        );
+    }
     push_paged_kv_compat_entries(&mut entries, current, "1", source);
     for (k, v) in [
         (
@@ -1467,6 +1474,7 @@ mod tests {
             true,
             true,
             true,
+            false,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -1497,6 +1505,7 @@ mod tests {
         let entries = serve_profile_runtime_entries_for_arch(
             true,
             true,
+            false,
             false,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
@@ -1529,6 +1538,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -1550,6 +1560,30 @@ mod tests {
     }
 
     #[test]
+    fn serve_profile_leaves_context_capacity_to_vnext_plan() {
+        let entries = serve_profile_runtime_entries_for_arch(
+            true,
+            false,
+            true,
+            true,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("16")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
+        );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
+    }
+
+    #[test]
     fn serve_profile_respects_explicit_user_env() {
         let current = RuntimeConfigSnapshot::from_entries(vec![RuntimeConfigEntry::new(
             "FERRUM_KV_CAPACITY",
@@ -1560,6 +1594,7 @@ mod tests {
             true,
             true,
             true,
+            false,
             &current,
             RuntimeConfigSource::Default,
         );
