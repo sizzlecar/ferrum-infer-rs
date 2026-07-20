@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
+use ferrum_models::vnext::ProductionModelSourceBundle;
 use ferrum_types::{DataType, Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -43,15 +44,26 @@ pub struct ComponentConfig {
     pub device: Device,
     /// Additional component-specific options
     pub component_options: HashMap<String, serde_json::Value>,
+    /// Immutable role-specific product sources. This is deliberately absent
+    /// from serialized EngineConfig and shared by tokenizer and executor.
+    pub model_sources: Option<Arc<ProductionModelSourceBundle>>,
 }
 
 impl ComponentConfig {
     /// Create from engine config
     pub fn from_engine_config(config: &EngineConfig) -> Self {
+        Self::from_engine_config_and_sources(config, None)
+    }
+
+    pub fn from_engine_config_and_sources(
+        config: &EngineConfig,
+        model_sources: Option<Arc<ProductionModelSourceBundle>>,
+    ) -> Self {
         Self {
             engine_config: config.clone(),
             device: config.backend.device.clone(),
             component_options: config.backend.backend_options.clone(),
+            model_sources,
         }
     }
 
@@ -532,6 +544,21 @@ pub struct HuggingFaceTokenizerFactory;
 #[async_trait]
 impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizerFactory {
     async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Tokenizer + Send + Sync>> {
+        if let Some(sources) = config.model_sources.as_ref() {
+            let tokenizer =
+                ferrum_tokenizer::implementations::HuggingFaceTokenizer::from_source_bytes(
+                    sources.tokenizer_json(),
+                    sources.tokenizer_config_json(),
+                    sources.generation_config_json(),
+                )
+                .await?;
+            info!(
+                tokenizer_root = %sources.tokenizer_root().display(),
+                "Loaded HuggingFace tokenizer from typed product sources"
+            );
+            return Ok(Arc::new(tokenizer));
+        }
+
         // Try to find tokenizer path from config or environment
         let tokenizer_path = config
             .get_string_option("tokenizer_path")
@@ -1114,6 +1141,7 @@ where
 fn create_registered_vnext_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
+    sources: Option<Arc<ProductionModelSourceBundle>>,
     registration: ferrum_models::vnext::RegisteredProductionModel,
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
@@ -1122,7 +1150,10 @@ fn create_registered_vnext_executor(
         (ProductionExecutionKind::CausalLanguage, Device::CUDA(ordinal)) => {
             #[cfg(feature = "cuda")]
             {
-                let prepared = registration.prepare(model_path)?;
+                let prepared = match sources {
+                    Some(sources) => registration.prepare_from_sources(sources)?,
+                    None => registration.prepare(model_path)?,
+                };
                 let model_info = prepared.model_info(
                     config.engine_config.model.model_id.clone(),
                     config.device.clone(),
@@ -1174,7 +1205,7 @@ fn create_registered_vnext_executor(
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (ordinal, model_path);
+                let _ = (ordinal, model_path, sources);
                 Err(FerrumError::device(
                     "registered vNext CUDA composition requires the 'cuda' feature",
                 ))
@@ -1202,8 +1233,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use ferrum_models::weight_format::WeightFormat;
 
         // Try to load model from path
-        let model_path = config
-            .get_string_option("model_path")
+        let model_sources = config.model_sources.clone();
+        let model_path = model_sources
+            .as_ref()
+            .map(|sources| sources.weights().path().display().to_string())
+            .or_else(|| config.get_string_option("model_path"))
             .or_else(|| config.engine_config.runtime.model_path.clone());
 
         let model_path = match model_path {
@@ -1247,9 +1281,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         let legacy_reference_enabled = config
             .get_option::<bool>("qwen35_reference")
             .unwrap_or(false);
-        let production_registration = ferrum_models::vnext::resolve_registered_model_from_dir(
-            std::path::Path::new(&model_path),
-        )?;
+        let production_registration = match model_sources.as_ref() {
+            Some(sources) => ferrum_models::vnext::resolve_registered_model_from_sources(sources)?,
+            None => ferrum_models::vnext::resolve_registered_model_from_dir(std::path::Path::new(
+                &model_path,
+            ))?,
+        };
         if legacy_reference_enabled && !production_registration.allows_legacy_reference() {
             return Err(FerrumError::unsupported(format!(
                 "--qwen35-reference is not permitted for model metadata {}",
@@ -1267,6 +1304,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     return create_registered_vnext_executor(
                         config,
                         std::path::Path::new(&model_path),
+                        model_sources,
                         registration,
                     );
                 }
@@ -2036,6 +2074,7 @@ mod tests {
             engine_config: EngineConfig::default(),
             device: Device::CPU,
             component_options: options,
+            model_sources: None,
         };
 
         assert_eq!(

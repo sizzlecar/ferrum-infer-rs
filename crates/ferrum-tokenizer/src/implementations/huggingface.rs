@@ -140,6 +140,33 @@ impl HuggingFaceTokenizer {
         Ok(this)
     }
 
+    /// Construct from the immutable bytes retained by product source
+    /// resolution. Config bytes are parsed from the same source bundle so
+    /// special-token semantics cannot drift through a second filesystem read.
+    pub async fn from_source_bytes(
+        tokenizer_json: &[u8],
+        tokenizer_config_json: Option<&[u8]>,
+        generation_config_json: Option<&[u8]>,
+    ) -> Result<Self> {
+        let tokenizer = HfTokenizer::from_bytes(tokenizer_json).map_err(|error| {
+            ferrum_types::FerrumError::tokenizer(format!(
+                "Failed to load tokenizer from resolved source bytes: {error}"
+            ))
+        })?;
+        let tokenizer_config =
+            parse_optional_config_bytes(tokenizer_config_json, "tokenizer_config.json")?;
+        let generation_config =
+            parse_optional_config_bytes(generation_config_json, "generation_config.json")?;
+        let overrides = special_token_overrides_from_values(
+            generation_config.as_ref(),
+            tokenizer_config.as_ref(),
+            &tokenizer,
+        );
+        let mut this = Self::new(tokenizer).await?;
+        this.apply_special_token_overrides(overrides);
+        Ok(this)
+    }
+
     fn apply_special_token_overrides(&mut self, overrides: SpecialTokenOverrides) {
         if overrides.bos.is_some() {
             self.special_tokens.bos_token = overrides.bos;
@@ -549,9 +576,23 @@ fn special_token_overrides_from_configs(
     let Some(dir) = tokenizer_json.parent() else {
         return SpecialTokenOverrides::default();
     };
+    let generation_config = read_json(&dir.join("generation_config.json"));
+    let tokenizer_config = read_json(&dir.join("tokenizer_config.json"));
+    special_token_overrides_from_values(
+        generation_config.as_ref(),
+        tokenizer_config.as_ref(),
+        tokenizer,
+    )
+}
+
+fn special_token_overrides_from_values(
+    generation_config: Option<&serde_json::Value>,
+    tokenizer_config: Option<&serde_json::Value>,
+    tokenizer: &HfTokenizer,
+) -> SpecialTokenOverrides {
     let mut overrides = SpecialTokenOverrides::default();
 
-    if let Some(gen) = read_json(&dir.join("generation_config.json")) {
+    if let Some(gen) = generation_config {
         let mut eos_ids = token_id_list(gen.get("eos_token_id"));
         if !eos_ids.is_empty() {
             overrides.eos = Some(eos_ids.remove(0));
@@ -562,7 +603,7 @@ fn special_token_overrides_from_configs(
         }
     }
 
-    if let Some(tok_cfg) = read_json(&dir.join("tokenizer_config.json")) {
+    if let Some(tok_cfg) = tokenizer_config {
         if overrides.eos.is_none() {
             overrides.eos = token_from_config_value(tok_cfg.get("eos_token"), tokenizer);
         }
@@ -572,6 +613,21 @@ fn special_token_overrides_from_configs(
     }
 
     overrides
+}
+
+fn parse_optional_config_bytes(
+    bytes: Option<&[u8]>,
+    source_file: &str,
+) -> Result<Option<serde_json::Value>> {
+    bytes
+        .map(|bytes| {
+            serde_json::from_slice(bytes).map_err(|error| {
+                ferrum_types::FerrumError::tokenizer(format!(
+                    "Failed to parse resolved {source_file}: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -1055,6 +1111,37 @@ mod tests {
             Some(eos_id)
         );
         assert!(loaded.special_tokens().extra_eos_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn immutable_source_bytes_preserve_generation_config_eos() {
+        let tokenizer = tiny_tokenizer_with_specials(&["<|end_of_text|>", "<|end_of_turn|>"]);
+        let primary = tokenizer.token_to_id("<|end_of_text|>").unwrap();
+        let extra = tokenizer.token_to_id("<|end_of_turn|>").unwrap();
+        let tokenizer_json = tokenizer.to_string(false).unwrap();
+        let generation_config = format!(r#"{{"eos_token_id":[{primary},{extra}]}}"#);
+
+        let loaded = HuggingFaceTokenizer::from_source_bytes(
+            tokenizer_json.as_bytes(),
+            None,
+            Some(generation_config.as_bytes()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            loaded.special_tokens().eos_token.map(|token| token.get()),
+            Some(primary)
+        );
+        assert_eq!(
+            loaded
+                .special_tokens()
+                .extra_eos_tokens
+                .iter()
+                .map(|token| token.get())
+                .collect::<Vec<_>>(),
+            vec![extra]
+        );
     }
 
     #[tokio::test]
