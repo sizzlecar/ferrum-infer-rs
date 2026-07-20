@@ -34,7 +34,7 @@ pub mod source;
 pub use file::GgufFile;
 pub use linear::{linear_from_qtensor, GgufLinear};
 pub use loader::GgufLoader;
-pub use names::{ferrum_to_gguf, gate_up_split_parts, qkv_split_parts};
+pub use names::{ferrum_to_gguf, ferrum_to_gguf_with_arch, gate_up_split_parts, qkv_split_parts};
 pub use source::{block_quantization_format, GgufWeightComponentSource};
 
 // Re-exports — callers can import these from `ferrum_quantization::gguf` rather

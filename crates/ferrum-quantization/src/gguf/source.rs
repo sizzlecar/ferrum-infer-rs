@@ -7,10 +7,13 @@ use ferrum_interfaces::vnext::{
 use ferrum_types::{FerrumError, Result};
 
 use super::{GgmlDType, GgufFile};
+use crate::safetensors_archive::transcode_dense_bytes;
 
 /// Schema-addressed, mmap-backed GGUF source for vNext static weights.
-/// Tensor payloads borrow the immutable file mapping and are never
-/// dequantized or repacked at this boundary.
+/// Fixed-block payloads borrow the immutable file mapping without
+/// dequantization or repacking. Dense floating-point payloads are borrowed
+/// when their type matches the schema and materialized once on the cold path
+/// when the typed execution plan requests another floating-point type.
 pub struct GgufWeightComponentSource {
     file: GgufFile,
     source_file: String,
@@ -72,7 +75,7 @@ impl WeightComponentSource for GgufWeightComponentSource {
             )
         })?;
 
-        let element_type = match &component.encoding {
+        let (element_type, payload_bytes) = match &component.encoding {
             WeightEncoding::Dense { element_type } => {
                 let actual = dense_element_type(info.ggml_dtype).ok_or_else(|| {
                     invalid_component(
@@ -89,16 +92,18 @@ impl WeightComponentSource for GgufWeightComponentSource {
                     .iter()
                     .map(|dimension| *dimension as u64)
                     .collect::<Vec<_>>();
-                if actual != *element_type || dimensions != component.dimensions {
+                if dimensions != component.dimensions {
                     return Err(invalid_component(
                         component,
                         format!(
-                            "GGUF dense tensor identity differs: dtype={:?} dimensions={dimensions:?}",
-                            info.ggml_dtype
+                            "GGUF dense tensor dimensions differ: source_dtype={:?} dimensions={dimensions:?}",
+                            info.ggml_dtype,
                         ),
                     ));
                 }
-                actual
+                let materialized =
+                    transcode_dense_bytes(bytes, actual, *element_type, external_name, None)?;
+                (*element_type, materialized)
             }
             WeightEncoding::BlockQuantized(spec) => {
                 spec.validate()?;
@@ -153,7 +158,7 @@ impl WeightComponentSource for GgufWeightComponentSource {
                         ),
                     ));
                 }
-                ElementType::U8
+                (ElementType::U8, bytes.into())
             }
             WeightEncoding::DenseAffine { .. } => {
                 return Err(invalid_component(
@@ -175,7 +180,7 @@ impl WeightComponentSource for GgufWeightComponentSource {
             self.source_file.clone(),
             component.dimensions.clone(),
             element_type,
-            bytes,
+            payload_bytes,
         )
     }
 }

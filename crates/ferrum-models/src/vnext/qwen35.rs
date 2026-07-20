@@ -1,6 +1,6 @@
 //! Typed Qwen3.5 dense-hybrid model package for the production vNext path.
 //!
-//! Preparation reads configuration, tokenizer metadata, and safetensors
+//! Preparation reads configuration, tokenizer metadata, and typed weight
 //! headers only. Tensor payloads remain untouched until the selected backend
 //! executor allocates them.
 
@@ -10,27 +10,28 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    AttributeId, CanonicalRational, ContractVersion, ElementType, ExternalModelMetadataId,
-    ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration, ModelProgram,
-    ModelSemanticMetadata, NodeId, OperationId, PhysicalStorageLayout,
-    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
-    PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
-    ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
+    AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
+    ElementType, ExternalModelMetadataId, ModelFamilyId, ModelFamilyProvider,
+    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NodeId, OperationId,
+    PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightLayout,
+    PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec,
+    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
     SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
     StateId, StateInitialization, StateLifetime, StateSpec, TemplateMetadata,
-    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSpec, WeightEncoding,
-    WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
-    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
+    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
-use ferrum_quantization::SafetensorsArchive;
+use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
+use ferrum_quantization::{GgufWeightComponentSource, SafetensorsArchive};
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig};
+use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig, Qwen35WeightSpec};
 use crate::qwen35_weights::{Qwen35ResolvedWeightSpec, Qwen35WeightInventory};
 
 use super::{
@@ -66,6 +67,21 @@ struct FamilyWeight {
     role: String,
     external_name: String,
     dimensions: Vec<u64>,
+    source_encoding: FamilyWeightSourceEncoding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum FamilyWeightSourceEncoding {
+    Dense { element_type: ElementType },
+    BlockQuantized(BlockQuantizationSpec),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FamilyWeightFormat {
+    SafetensorsDense,
+    GgufNative,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +93,7 @@ pub struct Qwen35FamilyConfig {
     rms_norm_epsilon: CanonicalRational,
     template: TemplateInput,
     special_tokens: SpecialTokenInput,
+    weight_format: FamilyWeightFormat,
     weights: Vec<FamilyWeight>,
 }
 
@@ -150,6 +167,39 @@ impl Qwen35FamilyProvider {
                     "resolved tensor names, roles, and non-zero shapes must be unique",
                 ));
             }
+            match &weight.source_encoding {
+                FamilyWeightSourceEncoding::Dense { element_type }
+                    if matches!(
+                        element_type,
+                        ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                    ) => {}
+                FamilyWeightSourceEncoding::BlockQuantized(spec) => {
+                    spec.validate()?;
+                    let block_width = u64::from(spec.logical_values_per_block);
+                    if weight
+                        .dimensions
+                        .last()
+                        .is_none_or(|extent| !extent.is_multiple_of(block_width))
+                    {
+                        return Err(invalid_config(
+                            "weights.source_encoding",
+                            format!(
+                                "role {:?} innermost dimension is not divisible by block width {block_width}",
+                                weight.role
+                            ),
+                        ));
+                    }
+                }
+                FamilyWeightSourceEncoding::Dense { element_type } => {
+                    return Err(invalid_config(
+                        "weights.source_encoding",
+                        format!(
+                            "role {:?} has non-floating dense source type {element_type:?}",
+                            weight.role
+                        ),
+                    ));
+                }
+            }
             let actual_elements = weight
                 .dimensions
                 .iter()
@@ -167,41 +217,47 @@ impl Qwen35FamilyProvider {
             }
         }
 
-        let inventory = Qwen35WeightInventory::from_names(
-            config
-                .weights
-                .iter()
-                .map(|weight| weight.external_name.clone()),
-        );
-        let resolved = inventory
-            .detect_prefix_and_resolve(&text)
-            .map_err(|reason| invalid_config("weights", reason))?;
-        let expected =
-            resolved_weight_keys(&resolved.global_tensors, None, text.tie_word_embeddings)
-                .chain(resolved.layers.iter().flat_map(|layer| {
-                    resolved_weight_keys(
-                        &layer.tensors,
-                        Some(layer.layer_index as u32),
-                        text.tie_word_embeddings,
+        match config.weight_format {
+            FamilyWeightFormat::SafetensorsDense => {
+                if config.weights.iter().any(|weight| {
+                    !matches!(
+                        weight.source_encoding,
+                        FamilyWeightSourceEncoding::Dense { .. }
                     )
-                }))
-                .collect::<BTreeSet<_>>();
-        let actual = config
-            .weights
-            .iter()
-            .map(|weight| {
-                (
-                    weight.layer_index,
-                    weight.role.clone(),
-                    weight.external_name.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        if actual != expected {
-            return Err(invalid_config(
-                "weights",
-                "resolved tensors do not exactly match the supported dense Qwen3.5 manifest",
-            ));
+                }) {
+                    return Err(invalid_config(
+                        "weights.source_encoding",
+                        "safetensors dense packages cannot contain block-quantized components",
+                    ));
+                }
+                let inventory = Qwen35WeightInventory::from_names(
+                    config
+                        .weights
+                        .iter()
+                        .map(|weight| weight.external_name.clone()),
+                );
+                let resolved = inventory
+                    .detect_prefix_and_resolve(&text)
+                    .map_err(|reason| invalid_config("weights", reason))?;
+                let expected =
+                    resolved_weight_keys(&resolved.global_tensors, None, text.tie_word_embeddings)
+                        .chain(resolved.layers.iter().flat_map(|layer| {
+                            resolved_weight_keys(
+                                &layer.tensors,
+                                Some(layer.layer_index as u32),
+                                text.tie_word_embeddings,
+                            )
+                        }))
+                        .collect::<BTreeSet<_>>();
+                let actual = resolved_weight_keys_from_config(config);
+                if actual != expected {
+                    return Err(invalid_config(
+                        "weights",
+                        "resolved tensors do not exactly match the supported dense Qwen3.5 manifest",
+                    ));
+                }
+            }
+            FamilyWeightFormat::GgufNative => validate_gguf_manifest(&text, config)?,
         }
         Ok(())
     }
@@ -255,71 +311,10 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     }
 
     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        let mut components = Vec::with_capacity(config.weights.len());
-        let mut tensors = Vec::with_capacity(config.weights.len());
-        for weight in &config.weights {
-            if weight.role == "mlp_up" {
-                continue;
-            }
-            let (component_id, tensor_id, external_names, physical_dimensions, logical_dimensions) =
-                if weight.role == "mlp_gate" {
-                    let layer_index = weight.layer_index.ok_or_else(|| {
-                        invalid_config("weights.mlp_gate", "dense gate weight has no layer")
-                    })?;
-                    let up = required_weight(config, Some(layer_index), "mlp_up")?;
-                    let dimensions = packed_gate_up_dimensions(weight, up)?;
-                    (
-                        packed_gate_up_component_id(layer_index)?,
-                        packed_gate_up_weight_id(layer_index)?,
-                        vec![weight.external_name.clone(), up.external_name.clone()],
-                        dimensions.clone(),
-                        dimensions,
-                    )
-                } else {
-                    (
-                        component_id(weight)?,
-                        weight_id(weight)?,
-                        vec![weight.external_name.clone()],
-                        weight.dimensions.clone(),
-                        logical_weight_dimensions(weight)?,
-                    )
-                };
-            components.push(WeightComponentSpec {
-                id: component_id.clone(),
-                role: WeightComponentRole::Values,
-                external_names,
-                dimensions: physical_dimensions.clone(),
-                encoding: dense_weight_encoding(if weight.role == "mlp_gate" {
-                    PACKED_GATE_UP_ROLE
-                } else {
-                    &weight.role
-                })?,
-                required: true,
-            });
-            let element_type = materialized_element_type(if weight.role == "mlp_gate" {
-                PACKED_GATE_UP_ROLE
-            } else {
-                &weight.role
-            });
-            tensors.push(WeightTensorSpec {
-                id: tensor_id,
-                dimensions: logical_dimensions.clone(),
-                logical_element_type: element_type,
-                physical_layout: physical_weight_layout(
-                    component_id,
-                    &physical_dimensions,
-                    &logical_dimensions,
-                )?,
-                required: true,
-            });
+        match config.weight_format {
+            FamilyWeightFormat::SafetensorsDense => safetensors_weight_schema(config),
+            FamilyWeightFormat::GgufNative => gguf_weight_schema(config),
         }
-        Ok(WeightSchema {
-            format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
-            layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.packed_gate_up")?,
-            version: ContractVersion::new(1, 2),
-            components,
-            tensors,
-        })
     }
 
     fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
@@ -670,6 +665,263 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     }
 }
 
+fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+    let mut components = Vec::with_capacity(config.weights.len());
+    let mut tensors = Vec::with_capacity(config.weights.len());
+    for weight in &config.weights {
+        if weight.role == "mlp_up" {
+            continue;
+        }
+        let (component_id, tensor_id, external_names, physical_dimensions, logical_dimensions) =
+            if weight.role == "mlp_gate" {
+                let layer_index = weight.layer_index.ok_or_else(|| {
+                    invalid_config("weights.mlp_gate", "dense gate weight has no layer")
+                })?;
+                let up = required_weight(config, Some(layer_index), "mlp_up")?;
+                let dimensions = packed_gate_up_dimensions(weight, up)?;
+                (
+                    packed_gate_up_component_id(layer_index)?,
+                    packed_gate_up_weight_id(layer_index)?,
+                    vec![weight.external_name.clone(), up.external_name.clone()],
+                    dimensions.clone(),
+                    dimensions,
+                )
+            } else {
+                (
+                    component_id(weight)?,
+                    weight_id(weight)?,
+                    vec![weight.external_name.clone()],
+                    weight.dimensions.clone(),
+                    logical_weight_dimensions(weight)?,
+                )
+            };
+        components.push(WeightComponentSpec {
+            id: component_id.clone(),
+            role: WeightComponentRole::Values,
+            external_names,
+            dimensions: physical_dimensions.clone(),
+            encoding: dense_weight_encoding(if weight.role == "mlp_gate" {
+                PACKED_GATE_UP_ROLE
+            } else {
+                &weight.role
+            })?,
+            required: true,
+        });
+        let element_type = materialized_element_type(if weight.role == "mlp_gate" {
+            PACKED_GATE_UP_ROLE
+        } else {
+            &weight.role
+        });
+        tensors.push(WeightTensorSpec {
+            id: tensor_id,
+            dimensions: logical_dimensions.clone(),
+            logical_element_type: element_type,
+            physical_layout: physical_weight_layout(
+                component_id,
+                &physical_dimensions,
+                &logical_dimensions,
+            )?,
+            required: true,
+        });
+    }
+    Ok(WeightSchema {
+        format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
+        layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.packed_gate_up")?,
+        version: ContractVersion::new(1, 2),
+        components,
+        tensors,
+    })
+}
+
+fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+    let mut components = Vec::with_capacity(config.weights.len());
+    let mut tensors = Vec::with_capacity(config.weights.len());
+    for weight in &config.weights {
+        if weight.role == "mlp_up" {
+            continue;
+        }
+        if weight.role == "mlp_gate" {
+            let layer_index = weight.layer_index.ok_or_else(|| {
+                invalid_config("weights.mlp_gate", "dense gate weight has no layer")
+            })?;
+            let up = required_weight(config, Some(layer_index), "mlp_up")?;
+            let packed_dimensions = packed_gate_up_dimensions(weight, up)?;
+            let partition_dimensions = packed_dimensions[1..].to_vec();
+            let composite_extents = std::iter::once(1_u64)
+                .chain(partition_dimensions.iter().copied())
+                .collect::<Vec<_>>();
+            let mut parts = Vec::with_capacity(2);
+            for (partition, source) in [weight, up].into_iter().enumerate() {
+                let component = gguf_component_spec(source)?;
+                let layout =
+                    gguf_component_layout(source, component.id.clone(), &composite_extents)?;
+                let mut logical_offsets = vec![0_u64; packed_dimensions.len()];
+                logical_offsets[0] = partition as u64;
+                parts.push(CompositeWeightPart {
+                    layout: Box::new(layout),
+                    logical_offsets,
+                    extents: composite_extents.clone(),
+                });
+                components.push(component);
+            }
+            tensors.push(WeightTensorSpec {
+                id: packed_gate_up_weight_id(layer_index)?,
+                dimensions: packed_dimensions,
+                logical_element_type: materialized_element_type(PACKED_GATE_UP_ROLE),
+                physical_layout: PhysicalWeightLayout::Composite { parts },
+                required: true,
+            });
+            continue;
+        }
+
+        let component = gguf_component_spec(weight)?;
+        let logical_dimensions = logical_weight_dimensions(weight)?;
+        let layout = gguf_component_layout(weight, component.id.clone(), &logical_dimensions)?;
+        components.push(component);
+        tensors.push(WeightTensorSpec {
+            id: weight_id(weight)?,
+            dimensions: logical_dimensions,
+            logical_element_type: materialized_element_type(&weight.role),
+            physical_layout: layout,
+            required: true,
+        });
+    }
+    Ok(WeightSchema {
+        format_id: WeightFormatId::new("weight-format.gguf.native-block")?,
+        layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.gguf.native")?,
+        version: ContractVersion::new(1, 0),
+        components,
+        tensors,
+    })
+}
+
+fn gguf_component_spec(weight: &FamilyWeight) -> Result<WeightComponentSpec, VNextError> {
+    let (role, dimensions, encoding) = match &weight.source_encoding {
+        FamilyWeightSourceEncoding::Dense { .. } => (
+            WeightComponentRole::Values,
+            weight.dimensions.clone(),
+            WeightEncoding::Dense {
+                element_type: materialized_element_type(&weight.role),
+            },
+        ),
+        FamilyWeightSourceEncoding::BlockQuantized(spec) => {
+            let mut dimensions = weight.dimensions.clone();
+            let innermost = dimensions.last_mut().ok_or_else(|| {
+                invalid_config("weights.dimensions", "GGUF block tensor has no axis")
+            })?;
+            let block_width = u64::from(spec.logical_values_per_block);
+            if !innermost.is_multiple_of(block_width) {
+                return Err(invalid_config(
+                    "weights.dimensions",
+                    "GGUF block tensor innermost dimension is not block aligned",
+                ));
+            }
+            *innermost /= block_width;
+            (
+                WeightComponentRole::PackedValues,
+                dimensions,
+                WeightEncoding::BlockQuantized(spec.clone()),
+            )
+        }
+    };
+    Ok(WeightComponentSpec {
+        id: component_id(weight)?,
+        role,
+        external_names: vec![weight.external_name.clone()],
+        dimensions,
+        encoding,
+        required: true,
+    })
+}
+
+fn gguf_component_layout(
+    weight: &FamilyWeight,
+    component_id: WeightId,
+    logical_dimensions: &[u64],
+) -> Result<PhysicalWeightLayout, VNextError> {
+    match &weight.source_encoding {
+        FamilyWeightSourceEncoding::Dense { .. } => {
+            physical_weight_layout(component_id, &weight.dimensions, logical_dimensions)
+        }
+        FamilyWeightSourceEncoding::BlockQuantized(spec) => {
+            let block_axis = logical_dimensions
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| invalid_config("weights.dimensions", "GGUF weight has no axis"))?;
+            let block_width = u64::from(spec.logical_values_per_block);
+            let mut logical_blocks = logical_dimensions.to_vec();
+            let innermost = logical_blocks.last_mut().unwrap();
+            if !innermost.is_multiple_of(block_width) {
+                return Err(invalid_config(
+                    "weights.dimensions",
+                    "GGUF logical tensor innermost dimension is not block aligned",
+                ));
+            }
+            *innermost /= block_width;
+            let mut physical_blocks = weight.dimensions.clone();
+            *physical_blocks.last_mut().unwrap() /= block_width;
+            Ok(PhysicalWeightLayout::BlockQuantized {
+                blocks: physical_component_binding(
+                    component_id,
+                    &physical_blocks,
+                    &logical_blocks,
+                )?,
+                block_axis: u32::try_from(block_axis).map_err(|_| {
+                    invalid_config("weights.dimensions", "GGUF block axis exceeds u32")
+                })?,
+                block_padding: PhysicalWeightPadding::Exact,
+            })
+        }
+    }
+}
+
+fn physical_component_binding(
+    component_id: WeightId,
+    physical_dimensions: &[u64],
+    logical_dimensions: &[u64],
+) -> Result<PhysicalWeightComponentBinding, VNextError> {
+    if physical_dimensions == logical_dimensions {
+        return Ok(PhysicalWeightComponentBinding::exact_contiguous(
+            component_id,
+        ));
+    }
+    let physical_elements = checked_dimension_product(physical_dimensions)?;
+    let logical_elements = checked_dimension_product(logical_dimensions)?;
+    if physical_elements != logical_elements {
+        return Err(invalid_config(
+            "weights.dimensions",
+            "GGUF physical reshape changes the logical element count",
+        ));
+    }
+    Ok(PhysicalWeightComponentBinding {
+        component_id,
+        storage: PhysicalStorageLayout::Strided {
+            strides_in_elements: row_major_strides(logical_dimensions)?,
+            padding: PhysicalWeightPadding::Exact,
+        },
+    })
+}
+
+fn checked_dimension_product(dimensions: &[u64]) -> Result<u64, VNextError> {
+    dimensions.iter().try_fold(1_u64, |total, extent| {
+        total
+            .checked_mul(*extent)
+            .ok_or_else(|| invalid_config("weights.dimensions", "tensor size overflows u64"))
+    })
+}
+
+fn row_major_strides(dimensions: &[u64]) -> Result<Vec<u64>, VNextError> {
+    let mut strides = vec![0_u64; dimensions.len()];
+    let mut stride = 1_u64;
+    for (axis, extent) in dimensions.iter().enumerate().rev() {
+        strides[axis] = stride;
+        stride = stride
+            .checked_mul(*extent)
+            .ok_or_else(|| invalid_config("weights.dimensions", "tensor stride overflows u64"))?;
+    }
+    Ok(strides)
+}
+
 pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
     let sources = Arc::new(ProductionModelSourceBundle::open_colocated_safetensors(
         model_dir,
@@ -680,14 +932,30 @@ pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<Prepared
 pub fn prepare_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
 ) -> ferrum_types::Result<PreparedProductionModel> {
-    let ProductionWeightArtifact::SafetensorsDirectory(weight_root) = sources.weights() else {
-        return Err(ferrum_types::FerrumError::unsupported(
-            "Qwen3.5 GGUF requires the typed physical-schema adapter before vNext preparation",
-        ));
-    };
-    let weights = SafetensorsArchive::open(weight_root)?;
-    let config =
-        load_family_config(&sources, &weights).map_err(ferrum_types::FerrumError::model)?;
+    match sources.weights() {
+        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
+            let weights = SafetensorsArchive::open(weight_root)?;
+            let config = load_safetensors_family_config(&sources, &weights)
+                .map_err(ferrum_types::FerrumError::model)?;
+            finish_preparation(sources, weights, config)
+        }
+        ProductionWeightArtifact::GgufFile(path) => {
+            let weights = GgufWeightComponentSource::open(path)?;
+            let config = load_gguf_family_config(&sources, &weights)
+                .map_err(ferrum_types::FerrumError::model)?;
+            finish_preparation(sources, weights, config)
+        }
+    }
+}
+
+fn finish_preparation<W>(
+    sources: Arc<ProductionModelSourceBundle>,
+    weights: W,
+    config: Qwen35FamilyConfig,
+) -> ferrum_types::Result<PreparedProductionModel>
+where
+    W: WeightComponentSource + 'static,
+{
     let descriptor = production_descriptor(&config).map_err(ferrum_types::FerrumError::model)?;
     let raw = serde_json::to_value(config)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
@@ -742,7 +1010,7 @@ fn production_descriptor(
     .map_err(|error| error.to_string())
 }
 
-fn load_family_config(
+fn load_safetensors_family_config(
     sources: &ProductionModelSourceBundle,
     archive: &SafetensorsArchive,
 ) -> Result<Qwen35FamilyConfig, String> {
@@ -806,8 +1074,156 @@ fn load_family_config(
             source_file: "tokenizer_config.json".to_owned(),
         },
         special_tokens,
+        weight_format: FamilyWeightFormat::SafetensorsDense,
         weights,
     })
+}
+
+fn load_gguf_family_config(
+    sources: &ProductionModelSourceBundle,
+    source: &GgufWeightComponentSource,
+) -> Result<Qwen35FamilyConfig, String> {
+    let hf_config: Value = serde_json::from_slice(sources.config_json())
+        .map_err(|error| format!("parse semantic config.json: {error}"))?;
+    let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
+    if text.is_moe() {
+        return Err("the first vNext Qwen3.5 production slice requires the dense model".to_owned());
+    }
+    if text.quantization.is_some() {
+        return Err(
+            "GGUF physical quantization must not be duplicated in Hugging Face semantic metadata"
+                .to_owned(),
+        );
+    }
+    let architecture = source
+        .file()
+        .architecture()
+        .map_err(|error| format!("read GGUF architecture: {error}"))?;
+    if architecture != "qwen35" {
+        return Err(format!(
+            "Qwen3.5 family package requires GGUF architecture qwen35, got {architecture:?}"
+        ));
+    }
+
+    let text_value = hf_config.get("text_config").unwrap_or(&hf_config);
+    let vocab_size = required_u64(text_value, "vocab_size")?;
+    let max_position_embeddings = required_u64(text_value, "max_position_embeddings")?;
+    let rms_norm_epsilon = hf_rms_norm_epsilon(&hf_config)?;
+    let tokenizer_config_bytes = sources
+        .tokenizer_config_json()
+        .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
+    let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
+        .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
+    let template = tokenizer_config
+        .get("chat_template")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tokenizer_config.json missing string chat_template".to_owned())?
+        .to_owned();
+    let special_tokens = parse_special_tokens(&hf_config, &tokenizer_config)?;
+
+    let manifest = text.weight_manifest("model.language_model")?;
+    let mut weights = Vec::new();
+    append_gguf_weights(
+        &mut weights,
+        &manifest.global_tensors,
+        None,
+        text.tie_word_embeddings,
+        source,
+    )?;
+    for layer in &manifest.layers {
+        append_gguf_weights(
+            &mut weights,
+            &layer.tensors,
+            Some(layer.layer_index as u32),
+            text.tie_word_embeddings,
+            source,
+        )?;
+    }
+    weights.sort_by(|left, right| {
+        (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
+    });
+
+    Ok(Qwen35FamilyConfig {
+        hf_config,
+        vocab_size,
+        max_position_embeddings,
+        rms_norm_epsilon,
+        template: TemplateInput {
+            sha256: format!("{:x}", Sha256::digest(tokenizer_config_bytes)),
+            template,
+            source_file: "tokenizer_config.json".to_owned(),
+        },
+        special_tokens,
+        weight_format: FamilyWeightFormat::GgufNative,
+        weights,
+    })
+}
+
+fn append_gguf_weights(
+    output: &mut Vec<FamilyWeight>,
+    specs: &[Qwen35WeightSpec],
+    layer_index: Option<u32>,
+    tied_embeddings: bool,
+    source: &GgufWeightComponentSource,
+) -> Result<(), String> {
+    for spec in specs
+        .iter()
+        .filter(|spec| !(tied_embeddings && spec.role == "lm_head"))
+    {
+        let external_name = ferrum_to_gguf_with_arch("qwen35", &spec.name).ok_or_else(|| {
+            format!(
+                "Qwen3.5 GGUF has no typed name mapping for role {:?} source {:?}",
+                spec.role, spec.name
+            )
+        })?;
+        let Some(info) = source.file().tensor_info(&external_name) else {
+            if spec.required {
+                return Err(format!(
+                    "Qwen3.5 GGUF is missing required role {:?} tensor {external_name:?}",
+                    spec.role
+                ));
+            }
+            continue;
+        };
+        let dimensions = info
+            .shape
+            .dims()
+            .iter()
+            .map(|dimension| *dimension as u64)
+            .collect::<Vec<_>>();
+        output.push(FamilyWeight {
+            layer_index,
+            role: spec.role.clone(),
+            external_name,
+            dimensions,
+            source_encoding: gguf_source_encoding(info.ggml_dtype)?,
+        });
+    }
+    Ok(())
+}
+
+fn gguf_source_encoding(dtype: GgmlDType) -> Result<FamilyWeightSourceEncoding, String> {
+    if let Some(format_id) = block_quantization_format(dtype) {
+        return Ok(FamilyWeightSourceEncoding::BlockQuantized(
+            BlockQuantizationSpec {
+                format_id: format_id
+                    .to_owned()
+                    .try_into()
+                    .map_err(|error: VNextError| error.to_string())?,
+                logical_values_per_block: u32::try_from(dtype.block_size())
+                    .map_err(|_| "GGUF logical block width exceeds u32".to_owned())?,
+                bytes_per_block: u32::try_from(dtype.type_size())
+                    .map_err(|_| "GGUF physical block size exceeds u32".to_owned())?,
+            },
+        ));
+    }
+    let element_type = match dtype {
+        GgmlDType::F16 => ElementType::F16,
+        GgmlDType::BF16 => ElementType::Bf16,
+        GgmlDType::F32 => ElementType::F32,
+        _ => return Err(format!("unsupported Qwen3.5 GGUF tensor dtype {dtype:?}")),
+    };
+    Ok(FamilyWeightSourceEncoding::Dense { element_type })
 }
 
 fn append_resolved_weights(
@@ -845,6 +1261,9 @@ fn append_resolved_weights(
             role: weight.role.clone(),
             external_name: weight.name.clone(),
             dimensions: tensor.shape().to_vec(),
+            source_encoding: FamilyWeightSourceEncoding::Dense {
+                element_type: source_element_type,
+            },
         });
     }
     Ok(())
@@ -859,6 +1278,68 @@ fn resolved_weight_keys<'a>(
         .iter()
         .filter(move |weight| weight.present && !(tied_embeddings && weight.role == "lm_head"))
         .map(move |weight| (layer_index, weight.role.clone(), weight.name.clone()))
+}
+
+fn resolved_weight_keys_from_config(
+    config: &Qwen35FamilyConfig,
+) -> BTreeSet<(Option<u32>, String, String)> {
+    config
+        .weights
+        .iter()
+        .map(|weight| {
+            (
+                weight.layer_index,
+                weight.role.clone(),
+                weight.external_name.clone(),
+            )
+        })
+        .collect()
+}
+
+fn validate_gguf_manifest(
+    text: &Qwen35TextConfig,
+    config: &Qwen35FamilyConfig,
+) -> Result<(), VNextError> {
+    let manifest = text
+        .weight_manifest("model.language_model")
+        .map_err(|reason| invalid_config("weights", reason))?;
+    let mut allowed = BTreeSet::new();
+    let mut required = BTreeSet::new();
+    for (layer_index, spec) in manifest
+        .global_tensors
+        .iter()
+        .map(|spec| (None, spec))
+        .chain(manifest.layers.iter().flat_map(|layer| {
+            layer
+                .tensors
+                .iter()
+                .map(move |spec| (Some(layer.layer_index as u32), spec))
+        }))
+        .filter(|(_, spec)| !(text.tie_word_embeddings && spec.role == "lm_head"))
+    {
+        let external_name = ferrum_to_gguf_with_arch("qwen35", &spec.name).ok_or_else(|| {
+            invalid_config(
+                "weights",
+                format!(
+                    "GGUF has no typed name mapping for role {:?} source {:?}",
+                    spec.role, spec.name
+                ),
+            )
+        })?;
+        let key = (layer_index, spec.role.clone(), external_name);
+        if spec.required {
+            required.insert(key.clone());
+        }
+        allowed.insert(key);
+    }
+    let actual = resolved_weight_keys_from_config(config);
+    if !required.is_subset(&actual) || !actual.is_subset(&allowed) {
+        return Err(invalid_config(
+            "weights",
+            "resolved GGUF tensors do not exactly match the supported dense Qwen3.5 manifest",
+        ));
+    }
+    Ok(())
 }
 
 fn layer_weights(
@@ -1332,7 +1813,8 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        gated_delta_recurrent_attention_contract, OperationContract, WeightComponentSource,
+        gated_delta_recurrent_attention_contract, ModelSourceKind, OperationContract,
+        OriginalModelSource, OriginalModelSources, WeightComponentSource,
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -1408,6 +1890,9 @@ mod tests {
                 role: spec.role.clone(),
                 external_name: spec.name.clone(),
                 dimensions: vec![1],
+                source_encoding: FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::F32,
+                },
             };
             weight.dimensions = test_weight_dimensions(&text, &weight);
             weights.push(weight);
@@ -1419,6 +1904,9 @@ mod tests {
                     role: spec.role.clone(),
                     external_name: spec.name.clone(),
                     dimensions: vec![1],
+                    source_encoding: FamilyWeightSourceEncoding::Dense {
+                        element_type: ElementType::F32,
+                    },
                 };
                 weight.dimensions = test_weight_dimensions(&text, &weight);
                 weights.push(weight);
@@ -1443,6 +1931,7 @@ mod tests {
                 eos_token_ids: BTreeSet::from([2]),
                 pad_token_id: Some(0),
             },
+            weight_format: FamilyWeightFormat::SafetensorsDense,
             weights,
         }
     }
@@ -1845,5 +2334,61 @@ mod tests {
             payload.source_files(),
             ["model.safetensors", "model.safetensors"]
         );
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5 semantic metadata and Qwen3.5-4B-Q4_K_M GGUF"]
+    fn prepares_real_qwen35_gguf_without_repacking_quantized_components() {
+        let semantic_root = std::env::var("FERRUM_TEST_QWEN35_SEMANTIC_DIR")
+            .expect("FERRUM_TEST_QWEN35_SEMANTIC_DIR");
+        let gguf_path = std::env::var("FERRUM_TEST_GGUF_PATH").expect("FERRUM_TEST_GGUF_PATH");
+        let semantic = OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: semantic_root.clone(),
+            requested_revision: None,
+        };
+        let weights = OriginalModelSource {
+            kind: ModelSourceKind::LocalFile,
+            location: gguf_path.clone(),
+            requested_revision: None,
+        };
+        let sources = Arc::new(
+            ProductionModelSourceBundle::open(
+                &semantic_root,
+                &semantic_root,
+                ProductionWeightArtifact::gguf_file(&gguf_path),
+                OriginalModelSources {
+                    semantic: semantic.clone(),
+                    tokenizer: semantic,
+                    weights,
+                },
+            )
+            .unwrap(),
+        );
+        let prepared = prepare_from_sources(sources).unwrap();
+        let schema = prepared.family().weight_schema();
+        assert_eq!(schema.format_id.as_str(), "weight-format.gguf.native-block");
+        assert!(schema
+            .quantization_formats()
+            .iter()
+            .any(|format| format.as_str() == "quantization.gguf.q5-k"));
+        assert!(schema
+            .quantization_formats()
+            .iter()
+            .any(|format| format.as_str() == "quantization.gguf.q8-0"));
+        let gate_up = schema
+            .tensor(&packed_gate_up_weight_id(0).unwrap())
+            .unwrap();
+        assert!(matches!(
+            &gate_up.physical_layout,
+            PhysicalWeightLayout::Composite { parts } if parts.len() == 2
+        ));
+        assert!(schema
+            .components
+            .iter()
+            .all(|component| component.external_names.len() == 1));
+        for component in &schema.components {
+            prepared.weights().component(component).unwrap();
+        }
     }
 }
