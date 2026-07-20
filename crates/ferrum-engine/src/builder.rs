@@ -14,6 +14,7 @@ use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
     TensorFactory, Tokenizer,
 };
+use ferrum_models::vnext::ProductionModelSourceBundle;
 use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -30,6 +31,8 @@ pub struct EngineBuilder {
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
     config: EngineConfig,
+    /// Product-resolved semantic, tokenizer, and weight sources.
+    model_sources: Option<Arc<ProductionModelSourceBundle>>,
     /// Override: custom tokenizer name
     tokenizer_name: Option<String>,
     /// Override: custom sampler name
@@ -65,6 +68,7 @@ impl EngineBuilder {
         Self {
             registry,
             config,
+            model_sources: None,
             tokenizer_name: None,
             sampler_name: None,
             scheduler_name: None,
@@ -77,6 +81,11 @@ impl EngineBuilder {
             custom_recurrent_state_manager: None,
             custom_executor: None,
         }
+    }
+
+    pub fn with_model_sources(mut self, sources: Arc<ProductionModelSourceBundle>) -> Self {
+        self.model_sources = Some(sources);
+        self
     }
 
     /// Set the tokenizer to use by name
@@ -200,12 +209,14 @@ impl EngineBuilder {
     }
 
     fn has_typed_model_path(&self) -> bool {
-        self.config
-            .backend
-            .backend_options
-            .get("model_path")
-            .and_then(|value| value.as_str())
-            .is_some()
+        self.model_sources.is_some()
+            || self
+                .config
+                .backend
+                .backend_options
+                .get("model_path")
+                .and_then(|value| value.as_str())
+                .is_some()
     }
 
     /// Build the inference engine
@@ -228,7 +239,10 @@ impl EngineBuilder {
         let executor_name = self.resolve_executor_name();
         let explicit_kv_cache_override = self.kv_cache_name.is_some();
 
-        let component_config = ComponentConfig::from_engine_config(&self.config);
+        let component_config = ComponentConfig::from_engine_config_and_sources(
+            &self.config,
+            self.model_sources.clone(),
+        );
         validate_layer_split_plan(&component_config)?;
         let typed_model_path = component_config.get_string_option("model_path");
         let has_model_path = typed_model_path.is_some() || self.config.runtime.model_path.is_some();
@@ -551,6 +565,17 @@ pub async fn create_engine(
     EngineBuilder::new(config).build().await
 }
 
+/// Create a product engine from one immutable role-specific source bundle.
+pub async fn create_product_engine(
+    config: EngineConfig,
+    sources: Arc<ProductionModelSourceBundle>,
+) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+    EngineBuilder::new(config)
+        .with_model_sources(sources)
+        .build()
+        .await
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -758,6 +783,55 @@ mod tests {
         assert!(builder.has_typed_model_path());
         assert_eq!(builder.resolve_tokenizer_name(), "huggingface");
         assert_eq!(builder.resolve_executor_name(), "llm");
+    }
+
+    #[test]
+    fn test_builder_retains_one_typed_source_bundle_for_components() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-builder-source-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            br#"{"architectures":["Fixture"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(root.join("model.safetensors"), b"fixture").unwrap();
+        let original = ferrum_interfaces::vnext::OriginalModelSource {
+            kind: ferrum_interfaces::vnext::ModelSourceKind::LocalDirectory,
+            location: root.display().to_string(),
+            requested_revision: None,
+        };
+        let sources = Arc::new(
+            ProductionModelSourceBundle::open(
+                &root,
+                &root,
+                ferrum_models::vnext::ProductionWeightArtifact::safetensors_directory(&root),
+                ferrum_interfaces::vnext::OriginalModelSources {
+                    semantic: original.clone(),
+                    tokenizer: original.clone(),
+                    weights: original,
+                },
+            )
+            .unwrap(),
+        );
+
+        let builder =
+            EngineBuilder::new(EngineConfig::default()).with_model_sources(Arc::clone(&sources));
+        assert!(builder.has_typed_model_path());
+        assert!(Arc::ptr_eq(
+            builder.model_sources.as_ref().unwrap(),
+            &sources
+        ));
+        assert_eq!(builder.resolve_tokenizer_name(), "huggingface");
+        assert_eq!(builder.resolve_executor_name(), "llm");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -90,7 +90,7 @@ pub use recurrent_state::{
 };
 
 // Re-exports of builder
-pub use builder::{create_engine, EngineBuilder};
+pub use builder::{create_engine, create_product_engine, EngineBuilder};
 
 // Re-exports of registry
 pub use registry::{
