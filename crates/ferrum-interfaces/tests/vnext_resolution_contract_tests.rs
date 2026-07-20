@@ -30,9 +30,9 @@ fn resolution_test_error(field: &str, reason: &str) -> VNextError {
 
 fn decision_source(field: ResolutionField) -> ResolutionDecisionSource {
     match field {
-        ResolutionField::OriginalSource => ResolutionDecisionSource::UserInput,
+        ResolutionField::OriginalSources => ResolutionDecisionSource::UserInput,
         ResolutionField::Config => ResolutionDecisionSource::ModelMetadata,
-        ResolutionField::ResolvedSource
+        ResolutionField::ResolvedSources
         | ResolutionField::ExternalMetadata
         | ResolutionField::Family
         | ResolutionField::WeightSchema
@@ -54,8 +54,8 @@ fn decision_source(field: ResolutionField) -> ResolutionDecisionSource {
 }
 
 const RESOLUTION_FIELDS: [ResolutionField; 20] = [
-    ResolutionField::OriginalSource,
-    ResolutionField::ResolvedSource,
+    ResolutionField::OriginalSources,
+    ResolutionField::ResolvedSources,
     ResolutionField::Config,
     ResolutionField::ExternalMetadata,
     ResolutionField::Family,
@@ -98,7 +98,7 @@ impl ResolutionSourceParser for LockedConfigResolutionParser {
         if source != ResolutionDecisionSource::ModelMetadata
             || !matches!(
                 provenance,
-                ResolutionSourceProvenance::LockedModelFile { relative_path }
+                ResolutionSourceProvenance::LockedModelFile { relative_path, .. }
                     if relative_path == "config.json"
             )
         {
@@ -193,20 +193,48 @@ fn upstream_provenance(index: usize) -> ResolutionSourceProvenance {
 fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
     let config_sha = bytes_sha256(RESOLUTION_CONFIG_BYTES);
     assert_eq!(config_sha, fixture.family.config_fingerprint());
-    ResolvedModelPlanInputs {
-        original_source: OriginalModelSource {
+    let original_sources = OriginalModelSources {
+        semantic: OriginalModelSource {
             kind: ModelSourceKind::Repository,
-            location: "repo/model".to_owned(),
-            requested_revision: Some("main".to_owned()),
+            location: "repo/model-semantic".to_owned(),
+            requested_revision: Some("semantic-main".to_owned()),
         },
-        resolved_source: ResolvedModelSource {
-            canonical_location: "repo/model".to_owned(),
-            resolved_revision: "0123456789abcdef".to_owned(),
+        tokenizer: OriginalModelSource {
+            kind: ModelSourceKind::Repository,
+            location: "repo/model-tokenizer".to_owned(),
+            requested_revision: Some("tokenizer-main".to_owned()),
+        },
+        weights: OriginalModelSource {
+            kind: ModelSourceKind::Repository,
+            location: "repo/model-weights".to_owned(),
+            requested_revision: Some("weights-main".to_owned()),
+        },
+    };
+    let resolved_sources = ResolvedModelSources {
+        semantic: ResolvedModelSource {
+            canonical_location: "repo/model-semantic".to_owned(),
+            resolved_revision: "semantic-0123456789abcdef".to_owned(),
             files: vec![
                 FileFingerprint {
                     relative_path: "config.json".to_owned(),
                     size_bytes: RESOLUTION_CONFIG_BYTES.len() as u64,
                     sha256: config_sha.clone(),
+                },
+                FileFingerprint {
+                    relative_path: "manifest.json".to_owned(),
+                    size_bytes: 10,
+                    sha256: sha('1'),
+                },
+            ],
+        },
+        tokenizer: ResolvedModelSource {
+            canonical_location: "repo/model-tokenizer".to_owned(),
+            resolved_revision: "tokenizer-0123456789abcdef".to_owned(),
+            files: vec![
+                FileFingerprint {
+                    relative_path: "manifest.json".to_owned(),
+                    size_bytes: 11,
+                    sha256: sha('2'),
                 },
                 FileFingerprint {
                     relative_path: "template.json".to_owned(),
@@ -220,6 +248,26 @@ fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
                 },
             ],
         },
+        weights: ResolvedModelSource {
+            canonical_location: "repo/model-weights".to_owned(),
+            resolved_revision: "weights-0123456789abcdef".to_owned(),
+            files: vec![
+                FileFingerprint {
+                    relative_path: "manifest.json".to_owned(),
+                    size_bytes: 12,
+                    sha256: sha('3'),
+                },
+                FileFingerprint {
+                    relative_path: "model.safetensors".to_owned(),
+                    size_bytes: 4096,
+                    sha256: sha('d'),
+                },
+            ],
+        },
+    };
+    ResolvedModelPlanInputs {
+        original_sources,
+        resolved_sources,
         config: ModelConfigFingerprint {
             source_file: "config.json".to_owned(),
             sha256: config_sha.clone(),
@@ -265,8 +313,8 @@ fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
 
 fn fixture_resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Value {
     match field {
-        ResolutionField::OriginalSource => serde_json::to_value(&inputs.original_source).unwrap(),
-        ResolutionField::ResolvedSource => serde_json::to_value(&inputs.resolved_source).unwrap(),
+        ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources).unwrap(),
+        ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources).unwrap(),
         ResolutionField::Config => serde_json::to_value(&inputs.config).unwrap(),
         ResolutionField::ExternalMetadata => {
             serde_json::to_value(&inputs.external_metadata_id).unwrap()
@@ -445,6 +493,7 @@ fn resolved_evidence_for_inputs(inputs: ResolvedModelPlanInputs) -> ResolvedFixt
                 artifact_id.clone(),
                 source,
                 ResolutionSourceProvenance::LockedModelFile {
+                    source_role: ModelArtifactSourceRole::Semantic,
                     relative_path: "config.json".to_owned(),
                 },
                 RESOLUTION_CONFIG_BYTES.to_vec(),
@@ -502,6 +551,19 @@ fn resolved_model_plan_closes_all_contract_links() {
     assert_eq!(plan.execution_plan(), &fixture.plan);
     assert_eq!(plan.parts().engine.implementation_fingerprint, sha('8'));
     assert_eq!(plan.parts().decisions().len(), RESOLUTION_FIELDS.len());
+    assert_ne!(
+        plan.parts().resolved_sources.semantic.canonical_location,
+        plan.parts().resolved_sources.tokenizer.canonical_location
+    );
+    for role in ModelArtifactSourceRole::ALL {
+        assert!(plan
+            .parts()
+            .resolved_sources
+            .for_role(role)
+            .files
+            .iter()
+            .any(|file| file.relative_path == "manifest.json"));
+    }
     let locked = plan
         .parts()
         .source_artifacts()
@@ -510,8 +572,10 @@ fn resolved_model_plan_closes_all_contract_links() {
         .unwrap();
     assert!(matches!(
         locked.provenance(),
-        ResolutionSourceProvenance::LockedModelFile { relative_path }
-            if relative_path == "config.json"
+        ResolutionSourceProvenance::LockedModelFile {
+            source_role: ModelArtifactSourceRole::Semantic,
+            relative_path,
+        } if relative_path == "config.json"
     ));
     assert_eq!(
         locked.content_size_bytes(),
@@ -547,6 +611,67 @@ fn resolved_model_plan_closes_all_contract_links() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn locked_file_provenance_cannot_cross_source_roles() {
+    let fixture = plan_fixture(0);
+    let mut inputs = resolved_inputs(&fixture);
+    inputs
+        .resolved_sources
+        .tokenizer
+        .files
+        .push(FileFingerprint {
+            relative_path: "config.json".to_owned(),
+            size_bytes: RESOLUTION_CONFIG_BYTES.len() as u64,
+            sha256: bytes_sha256(RESOLUTION_CONFIG_BYTES),
+        });
+    inputs
+        .resolved_sources
+        .tokenizer
+        .files
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let mut evidence = resolved_evidence_for_inputs(inputs);
+    let config_artifact_id = evidence
+        .bindings
+        .iter()
+        .find(|binding| binding.field() == ResolutionField::Config)
+        .unwrap()
+        .source_artifact_id()
+        .clone();
+    let config_index = evidence
+        .source_evidence
+        .iter()
+        .position(|source| source.id() == &config_artifact_id)
+        .unwrap();
+    evidence.source_evidence[config_index] = ResolutionSourceEvidence::new(
+        config_artifact_id,
+        ResolutionDecisionSource::ModelMetadata,
+        ResolutionSourceProvenance::LockedModelFile {
+            source_role: ModelArtifactSourceRole::Tokenizer,
+            relative_path: "config.json".to_owned(),
+        },
+        RESOLUTION_CONFIG_BYTES.to_vec(),
+        BTreeSet::from(["/chosen".to_owned()]),
+        &LOCKED_CONFIG_RESOLUTION_PARSER,
+    )
+    .unwrap();
+    let context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &evidence.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+    );
+    let error = ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &context)
+        .err()
+        .expect("semantic config evidence cannot claim the tokenizer source role");
+    assert!(matches!(
+        error,
+        VNextError::InvalidResolvedModelPlan { field, .. }
+            if field == "decisions.source_role"
+    ));
 }
 
 #[test]
@@ -784,6 +909,7 @@ fn resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering() {
         missing_locked_file[config_index].id().clone(),
         ResolutionDecisionSource::ModelMetadata,
         ResolutionSourceProvenance::LockedModelFile {
+            source_role: ModelArtifactSourceRole::Semantic,
             relative_path: "missing.json".to_owned(),
         },
         serde_json::to_vec(&config_document).unwrap(),

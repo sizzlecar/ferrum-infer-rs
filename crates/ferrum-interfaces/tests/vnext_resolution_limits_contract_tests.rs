@@ -9,6 +9,7 @@ fn artifact_id(value: &str) -> ResolutionArtifactId {
 
 fn provenance() -> ResolutionSourceProvenance {
     ResolutionSourceProvenance::LockedModelFile {
+        source_role: ModelArtifactSourceRole::Semantic,
         relative_path: "config.json".to_owned(),
     }
 }
@@ -420,11 +421,14 @@ fn json_parser_preflight_reports_depth_budget_before_serde_recursion_failure() {
 #[test]
 fn provenance_limit_accepts_max_and_rejects_max_plus_one_before_parser() {
     let parser = ShapeParser::new(DocumentShape::Small);
+    let maximum_path_bytes =
+        MAX_RESOLUTION_PROVENANCE_BYTES - ModelArtifactSourceRole::Semantic.as_str().len();
     let evidence = ResolutionSourceEvidence::new(
         artifact_id("artifact.provenance-max"),
         ResolutionDecisionSource::ModelMetadata,
         ResolutionSourceProvenance::LockedModelFile {
-            relative_path: "p".repeat(MAX_RESOLUTION_PROVENANCE_BYTES),
+            source_role: ModelArtifactSourceRole::Semantic,
+            relative_path: "p".repeat(maximum_path_bytes),
         },
         b"ignored".to_vec(),
         chosen_path(),
@@ -442,7 +446,8 @@ fn provenance_limit_accepts_max_and_rejects_max_plus_one_before_parser() {
             artifact_id("artifact.provenance-over"),
             ResolutionDecisionSource::ModelMetadata,
             ResolutionSourceProvenance::LockedModelFile {
-                relative_path: "p".repeat(MAX_RESOLUTION_PROVENANCE_BYTES + 1),
+                source_role: ModelArtifactSourceRole::Semantic,
+                relative_path: "p".repeat(maximum_path_bytes + 1),
             },
             b"ignored".to_vec(),
             chosen_path(),

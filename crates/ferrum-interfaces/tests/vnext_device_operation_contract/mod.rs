@@ -1144,8 +1144,8 @@ impl ModelFamilyRegistry for TestModelRegistry {
 }
 
 pub(crate) const RESOLUTION_FIELDS: [ResolutionField; 20] = [
-    ResolutionField::OriginalSource,
-    ResolutionField::ResolvedSource,
+    ResolutionField::OriginalSources,
+    ResolutionField::ResolvedSources,
     ResolutionField::Config,
     ResolutionField::ExternalMetadata,
     ResolutionField::Family,
@@ -1168,8 +1168,8 @@ pub(crate) const RESOLUTION_FIELDS: [ResolutionField; 20] = [
 
 pub(crate) fn resolution_source(field: ResolutionField) -> ResolutionDecisionSource {
     match field {
-        ResolutionField::OriginalSource => ResolutionDecisionSource::UserInput,
-        ResolutionField::ResolvedSource
+        ResolutionField::OriginalSources => ResolutionDecisionSource::UserInput,
+        ResolutionField::ResolvedSources
         | ResolutionField::Config
         | ResolutionField::ExternalMetadata
         | ResolutionField::Family
@@ -1193,8 +1193,8 @@ pub(crate) fn resolution_source(field: ResolutionField) -> ResolutionDecisionSou
 
 pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Value {
     match field {
-        ResolutionField::OriginalSource => serde_json::to_value(&inputs.original_source).unwrap(),
-        ResolutionField::ResolvedSource => serde_json::to_value(&inputs.resolved_source).unwrap(),
+        ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources).unwrap(),
+        ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources).unwrap(),
         ResolutionField::Config => serde_json::to_value(&inputs.config).unwrap(),
         ResolutionField::ExternalMetadata => {
             serde_json::to_value(&inputs.external_metadata_id).unwrap()
@@ -1377,32 +1377,42 @@ pub(crate) fn resolved_model_plan_with_zero_state(
     )
     .unwrap();
     let config_fingerprint = family.config_fingerprint().to_owned();
+    let original_source = OriginalModelSource {
+        kind: ModelSourceKind::Repository,
+        location: "repo/device-operation-model".to_owned(),
+        requested_revision: Some("main".to_owned()),
+    };
+    let resolved_source = ResolvedModelSource {
+        canonical_location: "repo/device-operation-model".to_owned(),
+        resolved_revision: "0123456789abcdef".to_owned(),
+        files: vec![
+            FileFingerprint {
+                relative_path: "config.json".to_owned(),
+                size_bytes: 11,
+                sha256: config_fingerprint.clone(),
+            },
+            FileFingerprint {
+                relative_path: "template.json".to_owned(),
+                size_bytes: 30,
+                sha256: sha('a'),
+            },
+            FileFingerprint {
+                relative_path: "tokenizer.json".to_owned(),
+                size_bytes: 20,
+                sha256: sha('b'),
+            },
+        ],
+    };
     let inputs = ResolvedModelPlanInputs {
-        original_source: OriginalModelSource {
-            kind: ModelSourceKind::Repository,
-            location: "repo/device-operation-model".to_owned(),
-            requested_revision: Some("main".to_owned()),
+        original_sources: OriginalModelSources {
+            semantic: original_source.clone(),
+            tokenizer: original_source.clone(),
+            weights: original_source,
         },
-        resolved_source: ResolvedModelSource {
-            canonical_location: "repo/device-operation-model".to_owned(),
-            resolved_revision: "0123456789abcdef".to_owned(),
-            files: vec![
-                FileFingerprint {
-                    relative_path: "config.json".to_owned(),
-                    size_bytes: 11,
-                    sha256: config_fingerprint.clone(),
-                },
-                FileFingerprint {
-                    relative_path: "template.json".to_owned(),
-                    size_bytes: 30,
-                    sha256: sha('a'),
-                },
-                FileFingerprint {
-                    relative_path: "tokenizer.json".to_owned(),
-                    size_bytes: 20,
-                    sha256: sha('b'),
-                },
-            ],
+        resolved_sources: ResolvedModelSources {
+            semantic: resolved_source.clone(),
+            tokenizer: resolved_source.clone(),
+            weights: resolved_source,
         },
         config: ModelConfigFingerprint {
             source_file: "config.json".to_owned(),
