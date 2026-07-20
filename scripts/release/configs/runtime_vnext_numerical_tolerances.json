@@ -3,9 +3,7 @@
     "missing_required_coverage": [
       "checkpoint.full_model",
       "checkpoint.full_vocab_logits",
-      "layer.full_attention",
-      "layer.linear_attention",
-      "quant_format.gguf_q4_k_m"
+      "layer.full_attention"
     ],
     "profile": "g08a_m1_metal.v1",
     "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; token sequence equality remains a separate exact gate",
@@ -615,6 +613,58 @@
       },
       "source_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
       "tolerance_id": "runtime-vnext.metal.last-token-dense-linear.v1.operation.fp16.gguf-q6-k.final-row"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal layer-0 linear-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_linear_attention_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "layer_output",
+      "checkpoint_name": "layer_0_attention_residual",
+      "coverage_markers": [
+        "layer.linear_attention",
+        "quant_format.gguf_q4_k_m"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.gated_delta_recurrent_attention",
+      "operation_schema_version": "4.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_linear_attention_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
+      "row_fingerprint": "f86fefac404f6b7feadbfaa2b0b8e28bc6eeba0d2df759e929250104b0f67f9c",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 2560,
+          "tokens": 24
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.layer-0.linear-attention.tokens-24",
+        "semantics": {
+          "decay_parameterization": "negative_rate",
+          "layer_index": 0,
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "value_head_mapping": "interleaved_by_key_head"
+        }
+      },
+      "source_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v4.layer.fp16.gguf-q4-k-m.tokens-24"
     },
     {
       "backend": "metal",
