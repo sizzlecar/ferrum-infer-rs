@@ -428,6 +428,9 @@ pub struct RunCommand {
     #[arg(long, value_name = "DIR")]
     pub observability_vertical_slice_out: Option<PathBuf>,
 
+    #[command(flatten)]
+    pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
+
     /// Write product observability profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
@@ -651,6 +654,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
+    engine_config.runtime.vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
     if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
         .or_else(|| {
             runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
@@ -2003,6 +2007,7 @@ mod tests {
             effective_config_json: None,
             decision_trace_jsonl: None,
             observability_vertical_slice_out: None,
+            vnext_checkpoint: Default::default(),
             profile_jsonl: None,
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
             memory_profile_jsonl: None,

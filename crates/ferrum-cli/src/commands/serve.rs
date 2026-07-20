@@ -233,6 +233,9 @@ pub struct ServeCommand {
     #[arg(long, value_name = "DIR")]
     pub observability_vertical_slice_out: Option<PathBuf>,
 
+    #[command(flatten)]
+    pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
+
     /// Write native structured profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
@@ -333,6 +336,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         effective_config_json,
         decision_trace_jsonl,
         observability_vertical_slice_out,
+        vnext_checkpoint,
         profile_jsonl,
         profile_detail,
         memory_profile_jsonl,
@@ -808,6 +812,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         Some(ferrum_models::Architecture::Qwen3TTS) => ServedModelKind::Speech,
         _ => ServedModelKind::Llm,
     };
+    let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
+    if vnext_checkpoint_capture.is_some() && served_model_kind != ServedModelKind::Llm {
+        return Err(FerrumError::unsupported(
+            "vNext checkpoint capture is only supported for causal language models",
+        ));
+    }
     let served_model_registry = ServedModelRegistry::try_new(
         model_id.clone(),
         served_model_kind,
@@ -903,6 +913,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             engine_config
                 .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
                 .map_err(ferrum_types::FerrumError::config)?;
+            engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
             engine_config.backend.backend_options.insert(
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
