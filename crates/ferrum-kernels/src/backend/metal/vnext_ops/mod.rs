@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
+    dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
     residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
     BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
     DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
@@ -12,8 +13,9 @@ use ferrum_interfaces::vnext::{
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
     QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    SemanticValue, VNextError, WeightFormatId, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    SemanticValue, VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -22,9 +24,14 @@ use super::vnext_runtime::{
     MetalDeviceRuntimeError,
 };
 
+mod linear;
 mod primitives;
 mod weights;
 
+use linear::{
+    MetalDenseLinearProvider, MetalDenseSwiGluProvider, MetalLastTokenDenseLinearProvider,
+    MetalLinearPipelines,
+};
 use primitives::{
     MetalPrimitivePipelines, MetalResidualAddProvider, MetalRmsNormProvider,
     MetalTokenEmbeddingProvider,
@@ -33,7 +40,10 @@ use primitives::{
 const METAL_ENGINE_PROVIDER_ID: &str = "provider.engine.metal.vnext";
 pub(crate) const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 pub(crate) const GGUF_NATIVE_BLOCK_FORMAT_ID: &str = "weight-format.gguf.native-block";
+pub(crate) const Q4_K_FORMAT_ID: &str = "quantization.gguf.q4-k";
+pub(crate) const Q5_K_FORMAT_ID: &str = "quantization.gguf.q5-k";
 pub(crate) const Q6_K_FORMAT_ID: &str = "quantization.gguf.q6-k";
+pub(crate) const Q8_0_FORMAT_ID: &str = "quantization.gguf.q8-0";
 pub(crate) const VALUE_ALIGNMENT_BYTES: u64 = 16;
 pub(crate) const THREADS_PER_GROUP: u64 = 256;
 
@@ -42,6 +52,9 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
         RESIDUAL_ADD_F16_CAPABILITY_ID,
+        DENSE_LINEAR_F16_CAPABILITY_ID,
+        DENSE_SWIGLU_F16_CAPABILITY_ID,
+        LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -59,6 +72,8 @@ pub fn metal_vnext_runtime_config(
             include_str!("weights.rs").as_bytes(),
             include_str!("primitives.rs").as_bytes(),
             include_str!("primitives.metal").as_bytes(),
+            include_str!("linear.rs").as_bytes(),
+            include_str!("linear.metal").as_bytes(),
         ]),
         capabilities: metal_vnext_capabilities()?,
         dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
@@ -72,10 +87,14 @@ pub fn metal_vnext_operation_registry(
     runtime: &MetalDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<MetalDeviceRuntime>, MetalDeviceRuntimeError> {
     let pipelines = Arc::new(MetalPrimitivePipelines::new(runtime.device())?);
+    let linear_pipelines = Arc::new(MetalLinearPipelines::new(runtime.device())?);
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
         Box::new(residual_add_contract().map_err(contract_error)?),
+        Box::new(dense_linear_contract().map_err(contract_error)?),
+        Box::new(dense_swiglu_contract().map_err(contract_error)?),
+        Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<MetalDeviceRuntime>>> = vec![
         Box::new(MetalTokenEmbeddingProvider::new(
@@ -84,6 +103,18 @@ pub fn metal_vnext_operation_registry(
         )?),
         Box::new(MetalRmsNormProvider::new(runtime, Arc::clone(&pipelines))?),
         Box::new(MetalResidualAddProvider::new(runtime, pipelines)?),
+        Box::new(MetalDenseLinearProvider::new(
+            runtime,
+            Arc::clone(&linear_pipelines),
+        )?),
+        Box::new(MetalDenseSwiGluProvider::new(
+            runtime,
+            Arc::clone(&linear_pipelines),
+        )?),
+        Box::new(MetalLastTokenDenseLinearProvider::new(
+            runtime,
+            linear_pipelines,
+        )?),
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
@@ -419,6 +450,35 @@ pub(crate) fn shared_token_region(
     Ok(region)
 }
 
+pub(crate) fn token_binding_is_shared(
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    role: ResolvedValueRole,
+    ordinal: u32,
+    element_type: ElementType,
+) -> Result<bool, String> {
+    let first = &invocation.participants()[0];
+    let region = contiguous_token_region(
+        first,
+        binding(first.bindings(), role, ordinal)?,
+        element_type,
+        0,
+        1,
+    )?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = contiguous_token_region(
+            participant,
+            binding(participant.bindings(), role, ordinal)?,
+            element_type,
+            0,
+            1,
+        )?;
+        if !region.same_physical_region(&candidate) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn shared_full_region(
     invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
     role: ResolvedValueRole,
@@ -444,6 +504,48 @@ pub(crate) fn shared_full_region(
         }
     }
     Ok(region)
+}
+
+pub(crate) fn shared_scratch_region(
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    required_bytes: u64,
+) -> Result<MetalBufferRegion, String> {
+    let region = contiguous_scratch_region(&invocation.participants()[0], required_bytes)?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = contiguous_scratch_region(participant, required_bytes)?;
+        if !region.same_physical_region(&candidate) {
+            return Err("Metal batch scratch is not one invocation-scoped region".to_owned());
+        }
+    }
+    Ok(region)
+}
+
+fn contiguous_scratch_region(
+    participant: &OperationInvocation<'_, MetalDeviceBuffer>,
+    required_bytes: u64,
+) -> Result<MetalBufferRegion, String> {
+    let view = participant
+        .scratch_view()
+        .ok_or_else(|| "Metal invocation has no scratch view".to_owned())?;
+    if view.descriptor().element_type != ElementType::U8
+        || view.descriptor().size_bytes < required_bytes
+    {
+        return Err("Metal scratch differs from its admitted estimate".to_owned());
+    }
+    let translated = view
+        .translate(0, view.descriptor().size_bytes)
+        .map_err(|error| error.to_string())?;
+    let mut physical = translated.iter();
+    let region = physical
+        .next()
+        .ok_or_else(|| "Metal scratch has no physical region".to_owned())?;
+    if physical.next().is_some() {
+        return Err("Metal scratch is not physically contiguous".to_owned());
+    }
+    let (buffer, range, retention) = region.buffer_and_physical_range();
+    buffer
+        .retained_region(range, retention)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn f16_contiguous(binding: &ResolvedValueBinding) -> bool {
@@ -493,19 +595,24 @@ pub(crate) fn implementation_fingerprint(parts: &[&[u8]]) -> String {
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        OperationId, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+        OperationId, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
+        TOKEN_EMBEDDING_OPERATION_ID,
     };
 
     #[test]
-    fn partial_composition_advertises_only_installed_primitive_capabilities() {
+    fn partial_composition_advertises_only_installed_operation_capabilities() {
         let composition = MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
             .expect("create Metal primitive composition");
-        assert_eq!(composition.runtime().descriptor().capabilities.len(), 3);
-        assert_eq!(composition.catalog().device().capabilities.len(), 3);
+        assert_eq!(composition.runtime().descriptor().capabilities.len(), 6);
+        assert_eq!(composition.catalog().device().capabilities.len(), 6);
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             RMS_NORM_OPERATION_ID,
             RESIDUAL_ADD_OPERATION_ID,
+            DENSE_LINEAR_OPERATION_ID,
+            DENSE_SWIGLU_OPERATION_ID,
+            LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
         ] {
             assert_eq!(
                 composition
