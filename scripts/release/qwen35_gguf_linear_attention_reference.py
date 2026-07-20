@@ -186,9 +186,29 @@ def read_optional_text(root: Path, name: str) -> str | None:
 def load_token_ids(path: Path) -> list[int]:
     document = load_json(path)
     require(isinstance(document, dict), "prompt token JSON must be an object")
-    allowed = {"request_id", "token_count", "token_ids"}
+    allowed = {
+        "schema_version",
+        "request_id",
+        "model",
+        "tokenizer_or_model",
+        "token_count",
+        "token_ids",
+        "unavailable_reason",
+        "sanitized",
+    }
     require(not set(document) - allowed,
             f"prompt token JSON has unknown fields: {sorted(set(document) - allowed)}")
+    if "schema_version" in document:
+        require(document["schema_version"] == 1,
+                "prompt token JSON schema_version must be 1")
+        require(document.get("model") == "qwen3.5:4b-q4_k_m",
+                "prompt token JSON model is not the reviewed fixture")
+        require(document.get("tokenizer_or_model") == document["model"],
+                "prompt token JSON tokenizer/model identity differs")
+        require(document.get("unavailable_reason") is None,
+                "prompt token IDs were marked unavailable")
+        require(document.get("sanitized") is True,
+                "prompt token JSON must be sanitized")
     values = document.get("token_ids")
     require(isinstance(values, list) and values, "token_ids must be a non-empty list")
     token_ids: list[int] = []
@@ -711,7 +731,19 @@ def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="qwen35-linear-reference-") as tmp:
         root = Path(tmp)
         valid = root / "tokens.json"
-        write_json(valid, {"token_count": 2, "token_ids": [0, VOCABULARY_SIZE - 1]})
+        write_json(
+            valid,
+            {
+                "schema_version": 1,
+                "request_id": "request-1",
+                "model": "qwen3.5:4b-q4_k_m",
+                "tokenizer_or_model": "qwen3.5:4b-q4_k_m",
+                "token_count": 2,
+                "token_ids": [0, VOCABULARY_SIZE - 1],
+                "unavailable_reason": None,
+                "sanitized": True,
+            },
+        )
         require(load_token_ids(valid) == [0, VOCABULARY_SIZE - 1],
                 "valid token fixture did not roundtrip")
 
