@@ -467,9 +467,12 @@ impl Sampler for GreedySampler {
         let max_idx = logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .filter(|(_, logit)| logit.is_finite())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx)
-            .ok_or_else(|| ferrum_types::FerrumError::backend("Empty logits for sampling"))?;
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::backend("No finite logits available for sampling")
+            })?;
 
         Ok(TokenId::new(max_idx as u32))
     }

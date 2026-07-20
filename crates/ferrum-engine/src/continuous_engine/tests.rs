@@ -1093,6 +1093,125 @@ impl Tokenizer for PolicyTokenizer {
     }
 }
 
+struct FragmentedUtf8PolicyTokenizer {
+    special: ferrum_types::SpecialTokens,
+    texts: Vec<Option<String>>,
+}
+
+impl FragmentedUtf8PolicyTokenizer {
+    const FIRE_HEAD: u32 = 128;
+    const FIRE_TAIL: u32 = 129;
+    const REPLACEMENT: u32 = 130;
+    const EOS: u32 = 131;
+    const BASE_VOCAB_SIZE: usize = 132;
+    const MODEL_VOCAB_SIZE: usize = 133;
+
+    fn new() -> Self {
+        let mut texts = (0u8..=127)
+            .map(|byte| Some((byte as char).to_string()))
+            .collect::<Vec<_>>();
+        texts.extend([
+            Some("fire-head".to_string()),
+            Some("fire-tail".to_string()),
+            Some("\u{FFFD}".to_string()),
+            Some("<eos>".to_string()),
+        ]);
+        Self {
+            special: ferrum_types::SpecialTokens {
+                eos_token: Some(TokenId::new(Self::EOS)),
+                ..ferrum_types::SpecialTokens::default()
+            },
+            texts,
+        }
+    }
+
+    fn raw_bytes(token: TokenId) -> Option<Vec<u8>> {
+        match token.get() {
+            byte @ 0..=127 => Some(vec![byte as u8]),
+            Self::FIRE_HEAD => Some(vec![0xF0, 0x9F]),
+            Self::FIRE_TAIL => Some(vec![0x94, 0xA5]),
+            Self::REPLACEMENT => Some("\u{FFFD}".as_bytes().to_vec()),
+            _ => None,
+        }
+    }
+}
+
+impl Tokenizer for FragmentedUtf8PolicyTokenizer {
+    fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+        let mut tokens = Vec::new();
+        let mut bytes = text.as_bytes();
+        while let Some((&byte, remaining)) = bytes.split_first() {
+            if bytes.starts_with(&[0xF0, 0x9F, 0x94, 0xA5]) {
+                tokens.push(TokenId::new(Self::FIRE_HEAD));
+                tokens.push(TokenId::new(Self::FIRE_TAIL));
+                bytes = &bytes[4..];
+            } else if byte.is_ascii() {
+                tokens.push(TokenId::new(byte as u32));
+                bytes = remaining;
+            } else {
+                return Err(FerrumError::tokenizer(
+                    "fragmented UTF-8 policy tokenizer received unsupported input",
+                ));
+            }
+        }
+        Ok(tokens)
+    }
+
+    fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
+        let bytes = tokens
+            .iter()
+            .filter_map(|token| Self::raw_bytes(*token))
+            .flatten()
+            .collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn decode_incremental(&self, _prev: &[TokenId], next: TokenId) -> Result<String> {
+        self.decode(&[next], true)
+    }
+
+    fn vocab_size(&self) -> usize {
+        Self::BASE_VOCAB_SIZE
+    }
+
+    fn special_tokens(&self) -> &ferrum_types::SpecialTokens {
+        &self.special
+    }
+
+    fn token_id(&self, text: &str) -> Option<TokenId> {
+        match text {
+            "\u{FFFD}" => Some(TokenId::new(Self::REPLACEMENT)),
+            "<eos>" => Some(TokenId::new(Self::EOS)),
+            _ if text.len() == 1 && text.is_ascii() => {
+                Some(TokenId::new(text.as_bytes()[0] as u32))
+            }
+            _ => None,
+        }
+    }
+
+    fn token_text(&self, token_id: TokenId) -> Option<&str> {
+        self.texts
+            .get(token_id.get() as usize)
+            .and_then(|text| text.as_deref())
+    }
+
+    fn token_bytes(&self, token_id: TokenId) -> Option<Vec<u8>> {
+        Self::raw_bytes(token_id)
+    }
+
+    fn info(&self) -> TokenizerInfo {
+        TokenizerInfo {
+            tokenizer_type: TokenizerType::BPE,
+            vocab_size: Self::BASE_VOCAB_SIZE,
+            special_tokens: self.special.clone(),
+            supports_incremental: true,
+            supports_chat_template: false,
+            max_token_length: Some(2),
+            model_name: Some("fragmented-utf8-policy-test".to_string()),
+        }
+    }
+}
+
 fn policy_request() -> InferenceRequest {
     InferenceRequest {
         id: RequestId::new(),
@@ -8504,6 +8623,128 @@ fn sample_masks_tokenizer_vocab_holes() {
 }
 
 #[test]
+fn sampling_rejects_when_engine_masks_remove_the_last_finite_candidate() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("<pad>", 4),
+            ("ok", 5),
+        ],
+    ));
+    let mut state =
+        SequenceState::new_with_tokenizer(policy_request(), vec![TokenId::new(0)], Some(tokenizer));
+    let mut logits = vec![f32::NEG_INFINITY; 6];
+    logits[2] = 100.0;
+
+    let error = state
+        .sample_with_processors(&mut logits)
+        .expect_err("a forbidden token must not become an arbitrary greedy fallback");
+
+    assert_eq!(logits[2], f32::NEG_INFINITY);
+    assert!(
+        error
+            .to_string()
+            .contains("engine sampling policies have no finite token"),
+        "{error}"
+    );
+}
+
+#[test]
+fn structured_sampling_preserves_split_utf8_fragments_and_masks_model_vocab_holes() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(FragmentedUtf8PolicyTokenizer::new());
+    let fire_head = TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_HEAD);
+    let fire_tail = TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_TAIL);
+    assert!(tokenizer
+        .decode(&[fire_head], true)
+        .unwrap()
+        .contains('\u{FFFD}'));
+    assert!(tokenizer
+        .decode(&[fire_tail], true)
+        .unwrap()
+        .contains('\u{FFFD}'));
+    assert_eq!(
+        tokenizer.decode(&[fire_head, fire_tail], true).unwrap(),
+        "🔥"
+    );
+
+    let forbidden = cached_forbidden_generation_tokens(tokenizer.as_ref(), &HashSet::new());
+    assert!(!forbidden.contains(&fire_head.get()));
+    assert!(!forbidden.contains(&fire_tail.get()));
+    assert!(forbidden.contains(&FragmentedUtf8PolicyTokenizer::REPLACEMENT));
+
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"value":{"const":"\ud83d\udd25"}},"required":["value"],"additionalProperties":false}"#
+            .to_string(),
+    );
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE),
+    );
+    let prefix = "{\"value\":\"";
+    state.generated_tokens = tokenizer.encode(prefix, false).unwrap();
+
+    let hole = FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE - 1;
+    let mut head_logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
+    head_logits[usize::from(fire_head)] = 10.0;
+    head_logits[hole] = 100.0;
+    let sampled_head = state
+        .sample_with_processors_with_tokenizer(&mut head_logits, Some(tokenizer.as_ref()))
+        .expect("the legal UTF-8 head fragment must remain selectable");
+    assert_eq!(sampled_head, fire_head);
+    assert_eq!(head_logits[hole], f32::NEG_INFINITY);
+    state.generated_tokens.push(sampled_head);
+
+    let mut tail_logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
+    tail_logits[usize::from(fire_tail)] = 10.0;
+    tail_logits[hole] = 100.0;
+    let sampled_tail = state
+        .sample_with_processors_with_tokenizer(&mut tail_logits, Some(tokenizer.as_ref()))
+        .expect("the legal UTF-8 tail fragment must remain selectable");
+    assert_eq!(sampled_tail, fire_tail);
+    assert_eq!(tail_logits[hole], f32::NEG_INFINITY);
+    state.generated_tokens.push(sampled_tail);
+
+    assert_eq!(
+        tokenizer.decode(&state.generated_tokens, true).unwrap(),
+        format!("{prefix}🔥")
+    );
+}
+
+#[test]
+fn utf8_fragment_classifier_rejects_bytes_that_cannot_form_valid_text() {
+    for bytes in [
+        &[0xF0, 0x9F][..],
+        &[0x94, 0xA5][..],
+        &[0x94, b'x'][..],
+        &[0xF0, 0x9F, 0x94, 0xA5][..],
+        b"Ferrum".as_slice(),
+    ] {
+        assert!(is_potential_utf8_fragment(bytes), "bytes={bytes:?}");
+    }
+
+    for bytes in [
+        &[][..],
+        &[0xFF][..],
+        &[0xC0, 0x80][..],
+        &[0xF0, 0x80][..],
+        &[0xED, 0xA0][..],
+        &[0xF4, 0x90][..],
+        &[0x80, 0x80, 0x80, 0x80][..],
+        &[0xF0, 0x9F, b'x'][..],
+    ] {
+        assert!(!is_potential_utf8_fragment(bytes), "bytes={bytes:?}");
+    }
+}
+
+#[test]
 fn sample_resamples_candidate_that_would_flush_replacement_char() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         8,
@@ -8655,13 +8896,13 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
             ("<unk>", 2),
             ("</s>", 3),
             ("ok", 4),
-            ("</think>", 5),
+            ("blocked-once", 5),
         ],
     ));
     let mut request = policy_request();
     request.metadata.insert(
         "ferrum_initial_forbidden_token_texts".to_string(),
-        serde_json::json!(["</think>"]),
+        serde_json::json!(["blocked-once"]),
     );
     let mut state =
         SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));

@@ -468,7 +468,7 @@ fn cached_forbidden_generation_tokens(
         let raw_text_forbidden = raw_text.is_some_and(is_forbidden_generation_token_text);
         let decoded_text_forbidden = tok
             .decode(&[token], true)
-            .map(|text| is_forbidden_generation_token_text(&text))
+            .map(|text| decoded_token_is_statically_forbidden(tok, token, &text))
             .unwrap_or(true);
         if missing_token_text || raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
@@ -562,6 +562,89 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
         || lower.contains("mask")
         || lower.contains("reserved")
         || lower.contains("unused")
+}
+
+fn decoded_token_is_statically_forbidden(
+    tokenizer: &(dyn Tokenizer + Send + Sync),
+    token: TokenId,
+    decoded: &str,
+) -> bool {
+    if !decoded.contains('\u{FFFD}') {
+        return is_forbidden_generation_token_text(decoded);
+    }
+    if contains_replacement_char_mojibake(decoded) {
+        return true;
+    }
+
+    let Some(bytes) = tokenizer.token_bytes(token) else {
+        return true;
+    };
+    if bytes.is_empty() || std::str::from_utf8(&bytes).is_ok() {
+        return true;
+    }
+
+    // Byte-level vocabularies can split one UTF-8 scalar across tokens. A
+    // one-token string decode must render such a fragment as U+FFFD, but the
+    // raw bytes remain legal in context and are owned by candidate decoding.
+    !is_potential_utf8_fragment(&bytes)
+}
+
+fn is_potential_utf8_fragment(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while offset < bytes.len() && is_utf8_continuation(bytes[offset]) {
+        offset += 1;
+    }
+    if offset > 3 {
+        return false;
+    }
+
+    while offset < bytes.len() {
+        let lead = bytes[offset];
+        if lead.is_ascii() {
+            offset += 1;
+            continue;
+        }
+
+        let continuation_count = match lead {
+            0xC2..=0xDF => 1,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF4 => 3,
+            _ => return false,
+        };
+        let available = bytes.len() - offset - 1;
+        let present = available.min(continuation_count);
+        for index in 0..present {
+            let byte = bytes[offset + index + 1];
+            if !is_utf8_continuation(byte) {
+                return false;
+            }
+            if index == 0
+                && matches!(
+                    (lead, byte),
+                    (0xE0, 0x80..=0x9F)
+                        | (0xED, 0xA0..=0xBF)
+                        | (0xF0, 0x80..=0x8F)
+                        | (0xF4, 0x90..=0xBF)
+                )
+            {
+                return false;
+            }
+        }
+        if present < continuation_count {
+            return true;
+        }
+        offset += continuation_count + 1;
+    }
+
+    true
+}
+
+fn is_utf8_continuation(byte: u8) -> bool {
+    matches!(byte, 0x80..=0xBF)
 }
 
 fn decoded_delta_has_forbidden_quality(
@@ -1793,11 +1876,6 @@ impl SequenceState {
             if !constraint.accepting {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
-            if !logits.iter().any(|logit| logit.is_finite()) {
-                return Err(FerrumError::model(
-                    "structured-output grammar has no legal token after engine masks",
-                ));
-            }
         }
 
         for &token_id in &self.forbidden_token_ids {
@@ -1843,6 +1921,14 @@ impl SequenceState {
                 vocab_size,
             );
             self.sampling_plan.processor_chain.process(&mut ctx)?;
+            if !ctx.logits.iter().any(|logit| logit.is_finite()) {
+                let message = if self.structured_output_processor.is_some() {
+                    "structured-output constraints and engine sampling policies have no finite token"
+                } else {
+                    "engine sampling policies have no finite token"
+                };
+                return Err(FerrumError::model(message));
+            }
             let mut attempts = 0usize;
             let mut rejected_tokens = Vec::new();
             loop {
