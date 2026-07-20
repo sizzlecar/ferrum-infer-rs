@@ -79,14 +79,201 @@ G08A_REQUIRED_COVERAGE = frozenset(
         "operation.token_embedding@1.0",
         "quant_format.gguf_q4_k_m",
         "state.causal_attention.kv_state",
-        "state.gated_delta.conv_state",
-        "state.gated_delta.delta_state",
+        "state.gated_delta.conv_state.log_rate_grouped",
+        "state.gated_delta.conv_state.negative_rate_interleaved",
+        "state.gated_delta.delta_state.log_rate_grouped",
+        "state.gated_delta.delta_state.negative_rate_interleaved",
     }
 )
 G08A_SCOPE = (
     "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; "
     "token sequence equality remains a separate exact gate"
 )
+
+# Coverage is awarded only to reviewed, exact oracle descriptors. An oracle name
+# that merely looks like a CPU/Transformers reference is not trusted.
+TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
+    "cpu.fp32.rust.causal_attention_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/"
+            "causal_attention_tests.rs"
+        ),
+        "test_name": (
+            "fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+        ),
+    },
+    "cpu.fp32.rust.gated_delta_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/"
+            "gated_delta_attention_tests.rs"
+        ),
+        "test_name": (
+            "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+        ),
+    },
+    "cpu.fp32.rust.gated_delta_conv_state_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/"
+            "gated_delta_attention_tests.rs"
+        ),
+        "test_name": (
+            "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+        ),
+    },
+    "cpu.fp32.rust.gated_delta_delta_state_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/"
+            "gated_delta_attention_tests.rs"
+        ),
+        "test_name": (
+            "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+        ),
+    },
+}
+
+
+def _gated_delta_shape_domain(
+    checkpoint_name: str, decay: str, mapping: str
+) -> dict[str, Any]:
+    dimensions = {
+        "key_dim": 128,
+        "key_heads": 16,
+        "tokens": 4,
+        "value_dim": 128,
+        "value_heads": 32,
+    }
+    if checkpoint_name == "output":
+        dimensions["conv_kernel"] = 4
+        fixture_prefix = "gated_delta"
+    elif checkpoint_name == "conv_state":
+        dimensions.update(
+            {"conv_kernel": 4, "conv_state_width": 3, "qkv_features": 8192}
+        )
+        fixture_prefix = "gated_delta.conv_state"
+    elif checkpoint_name == "delta_state":
+        fixture_prefix = "gated_delta.delta_state"
+    else:
+        raise AssertionError(f"unsupported checked-in GDN fixture: {checkpoint_name}")
+    fixture_decay = "log_rate" if decay == "log_rate" else "negative_rate"
+    fixture_mapping = "grouped" if mapping == "grouped_by_key_head" else "interleaved"
+    return {
+        "fixture_id": f"{fixture_prefix}.{fixture_decay}.{fixture_mapping}.split_decode",
+        "dimensions": dimensions,
+        "semantics": {
+            "decay_parameterization": decay,
+            "split_segments": [3, 1],
+            "value_head_mapping": mapping,
+        },
+    }
+
+
+def _coverage_selector(
+    *,
+    model_scope: str,
+    operation_id: str,
+    operation_schema_version: str,
+    checkpoint_kind: str,
+    checkpoint_name: str,
+    dtype: str,
+    quant_format: str,
+    shape_domain: dict[str, Any],
+    oracle_identity: str,
+) -> dict[str, Any]:
+    return {
+        "backend": "metal",
+        "model_scope": model_scope,
+        "operation_id": operation_id,
+        "operation_schema_version": operation_schema_version,
+        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_name": checkpoint_name,
+        "dtype": dtype,
+        "quant_format": quant_format,
+        "shape_domain": shape_domain,
+        "oracle_identity": oracle_identity,
+    }
+
+
+# Only finalized coverage has a rule. Missing G08A markers intentionally have no
+# rule until their exact fixture and independent oracle are reviewed.
+G08A_COVERAGE_RULES: dict[str, dict[str, Any]] = {
+    "operation.causal_paged_attention@2.0.fixed_page_split": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.causal_paged_attention",
+        operation_schema_version="2.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="none",
+        shape_domain={
+            "fixture_id": "causal_attention.fixed_page.split_decode",
+            "dimensions": {
+                "head_dim": 32,
+                "key_value_heads": 1,
+                "query_heads": 2,
+                "rope_dim": 16,
+                "tokens": 2,
+            },
+            "semantics": {"fixed_page_kv": True, "split_segments": [1, 1]},
+        },
+        oracle_identity="cpu.fp32.rust.causal_attention_reference",
+    ),
+}
+
+for _decay, _mapping, _suffix in (
+    ("log_rate", "grouped_by_key_head", "log_rate_grouped"),
+    ("negative_rate", "interleaved_by_key_head", "negative_rate_interleaved"),
+):
+    G08A_COVERAGE_RULES[
+        f"operation.gated_delta_recurrent_attention@4.0.{_suffix}"
+    ] = _coverage_selector(
+        model_scope="qwen3.5-4b",
+        operation_id="operation.gated_delta_recurrent_attention",
+        operation_schema_version="4.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="none",
+        shape_domain=_gated_delta_shape_domain("output", _decay, _mapping),
+        oracle_identity="cpu.fp32.rust.gated_delta_reference",
+    )
+    G08A_COVERAGE_RULES[f"state.gated_delta.conv_state.{_suffix}"] = (
+        _coverage_selector(
+            model_scope="qwen3.5-4b",
+            operation_id="operation.gated_delta_recurrent_attention",
+            operation_schema_version="4.0",
+            checkpoint_kind="state",
+            checkpoint_name="conv_state",
+            dtype="fp16",
+            quant_format="none",
+            shape_domain=_gated_delta_shape_domain("conv_state", _decay, _mapping),
+            oracle_identity="cpu.fp32.rust.gated_delta_conv_state_reference",
+        )
+    )
+    G08A_COVERAGE_RULES[f"state.gated_delta.delta_state.{_suffix}"] = (
+        _coverage_selector(
+            model_scope="qwen3.5-4b",
+            operation_id="operation.gated_delta_recurrent_attention",
+            operation_schema_version="4.0",
+            checkpoint_kind="state",
+            checkpoint_name="delta_state",
+            dtype="fp32",
+            quant_format="none",
+            shape_domain=_gated_delta_shape_domain("delta_state", _decay, _mapping),
+            oracle_identity="cpu.fp32.rust.gated_delta_delta_state_reference",
+        )
+    )
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9][a-z0-9._@-]{0,191}$")
 OPERATION_ID_RE = re.compile(r"^operation\.[a-z0-9][a-z0-9._-]{0,182}$")
@@ -324,97 +511,50 @@ def _validate_basis(value: Any, label: str) -> dict[str, Any]:
     return basis
 
 
+def _has_trusted_oracle(row: dict[str, Any]) -> bool:
+    expected = TRUSTED_ORACLE_REGISTRY.get(row["oracle_identity"])
+    if expected is None:
+        return False
+    basis = row["basis"]
+    actual = {
+        "oracle_precision": row["oracle_precision"],
+        "source_commit": row["source_commit"],
+        "basis_kind": basis["kind"],
+        "source_path": basis["source_path"],
+        "test_name": basis["test_name"],
+    }
+    return actual == expected
+
+
+def _coverage_selector_material(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "backend": row["backend"],
+        "model_scope": row["model_scope"],
+        "operation_id": row["operation_id"],
+        "operation_schema_version": row["operation_schema_version"],
+        "checkpoint_kind": row["checkpoint_kind"],
+        "checkpoint_name": row["checkpoint_name"],
+        "dtype": row["dtype"],
+        "quant_format": row["quant_format"],
+        "shape_domain": row["shape_domain"],
+        "oracle_identity": row["oracle_identity"],
+    }
+
+
 def _derived_coverage_markers(row: dict[str, Any]) -> list[str]:
-    markers: set[str] = set()
-    operation_id = row["operation_id"]
-    operation_version = row["operation_schema_version"]
-    checkpoint_kind = row["checkpoint_kind"]
-    checkpoint_name = row["checkpoint_name"]
-    semantics = row["shape_domain"]["semantics"]
-    trusted_fp32_oracle = row["oracle_precision"] == "fp32" and row[
-        "oracle_identity"
-    ].startswith(("cpu.fp32.", "transformers.fp32."))
-
-    if (
-        trusted_fp32_oracle
-        and checkpoint_kind == "operation_output"
-        and checkpoint_name == "output"
-    ):
-        simple_operations = {
-            ("operation.dense_linear", "1.0"),
-            ("operation.dense_swiglu", "1.0"),
-            ("operation.last_token_dense_linear", "1.0"),
-            ("operation.residual_add", "1.0"),
-            ("operation.rms_norm", "1.0"),
-            ("operation.token_embedding", "1.0"),
-        }
-        if (operation_id, operation_version) in simple_operations:
-            markers.add(f"{operation_id}@{operation_version}")
-        if (
-            operation_id == "operation.causal_paged_attention"
-            and operation_version == "2.0"
-            and semantics.get("fixed_page_kv") is True
-            and isinstance(semantics.get("split_segments"), list)
-            and len(semantics["split_segments"]) >= 2
-        ):
-            markers.add("operation.causal_paged_attention@2.0.fixed_page_split")
-        if (
-            operation_id == "operation.gated_delta_recurrent_attention"
-            and operation_version == "4.0"
-        ):
-            pair = (
-                semantics.get("decay_parameterization"),
-                semantics.get("value_head_mapping"),
-            )
-            if pair == ("log_rate", "grouped_by_key_head"):
-                markers.add(
-                    "operation.gated_delta_recurrent_attention@4.0.log_rate_grouped"
-                )
-            elif pair == ("negative_rate", "interleaved_by_key_head"):
-                markers.add(
-                    "operation.gated_delta_recurrent_attention@4.0.negative_rate_interleaved"
-                )
-    elif trusted_fp32_oracle and checkpoint_kind == "state":
-        state_marker = {
-            ("operation.causal_paged_attention", "2.0", "kv_state"):
-                "state.causal_attention.kv_state",
-            ("operation.gated_delta_recurrent_attention", "4.0", "conv_state"):
-                "state.gated_delta.conv_state",
-            ("operation.gated_delta_recurrent_attention", "4.0", "delta_state"):
-                "state.gated_delta.delta_state",
-        }.get((operation_id, operation_version, checkpoint_name))
-        if state_marker is not None:
-            markers.add(state_marker)
-    elif trusted_fp32_oracle and checkpoint_kind == "layer_output":
-        layer_marker = {
-            "full_attention": "layer.full_attention",
-            "linear_attention": "layer.linear_attention",
-        }.get(checkpoint_name)
-        if layer_marker is not None:
-            markers.add(layer_marker)
-    elif (
-        trusted_fp32_oracle
-        and checkpoint_kind == "full_model"
-        and checkpoint_name == "final_hidden_state"
-    ):
-        markers.add("checkpoint.full_model")
-    elif (
-        trusted_fp32_oracle
-        and checkpoint_kind == "full_vocab_logits"
-        and checkpoint_name == "logits"
-    ):
-        markers.add("checkpoint.full_vocab_logits")
-
-    if (
-        trusted_fp32_oracle
-        and row["model_scope"] == "qwen3.5-4b"
-        and row["quant_format"] == "gguf_q4_k_m"
-    ):
-        markers.add("quant_format.gguf_q4_k_m")
-    return sorted(markers)
+    if not _has_trusted_oracle(row):
+        return []
+    selector = _coverage_selector_material(row)
+    return sorted(
+        marker
+        for marker, expected_selector in G08A_COVERAGE_RULES.items()
+        if selector == expected_selector
+    )
 
 
-def _validate_row(value: Any, index: int) -> dict[str, Any]:
+def _validate_row(
+    value: Any, index: int, *, enforce_current_coverage: bool = True
+) -> dict[str, Any]:
     label = f"rows[{index}]"
     row = _require_exact_fields(value, ROW_FIELDS, label)
     tolerance_id = _require_identifier(row["tolerance_id"], f"{label}.tolerance_id")
@@ -462,11 +602,12 @@ def _validate_row(value: Any, index: int) -> dict[str, Any]:
     _require(fingerprint == expected,
              f"{label}.row_fingerprint mismatch: expected {expected}")
     derived_markers = _derived_coverage_markers(row)
-    _require(
-        normalized_markers == derived_markers,
-        f"{label}.coverage_markers do not match the typed row selector: "
-        f"expected {derived_markers}, declared {normalized_markers}",
-    )
+    if enforce_current_coverage:
+        _require(
+            normalized_markers == derived_markers,
+            f"{label}.coverage_markers do not match the typed row selector: "
+            f"expected {derived_markers}, declared {normalized_markers}",
+        )
 
     identity = canonical_json_sha256(
         {
@@ -490,6 +631,22 @@ def _validate_row(value: Any, index: int) -> dict[str, Any]:
 
 
 def validate_catalog_document(value: Any, *, require_complete: bool = False) -> dict[str, Any]:
+    unknown_rules = sorted(set(G08A_COVERAGE_RULES) - G08A_REQUIRED_COVERAGE)
+    _require(
+        not unknown_rules,
+        f"coverage rules are outside the reviewed G08A profile: {unknown_rules}",
+    )
+    unregistered_rule_oracles = sorted(
+        {
+            selector["oracle_identity"]
+            for selector in G08A_COVERAGE_RULES.values()
+            if selector["oracle_identity"] not in TRUSTED_ORACLE_REGISTRY
+        }
+    )
+    _require(
+        not unregistered_rule_oracles,
+        f"coverage rules use unregistered oracles: {unregistered_rule_oracles}",
+    )
     document = _require_exact_fields(value, ROOT_FIELDS, "catalog")
     schema_version = document["schema_version"]
     _require(isinstance(schema_version, int) and not isinstance(schema_version, bool),
@@ -596,7 +753,6 @@ def _selector_material(row: dict[str, Any]) -> dict[str, Any]:
     return {
         key: row[key]
         for key in (
-            "coverage_markers",
             "backend",
             "model_scope",
             "operation_id",
@@ -645,14 +801,20 @@ def validate_no_widening_documents(
         )
 
 
-def _latest_catalog_commit(revision: str) -> str | None:
-    result = _git(["log", "-1", "--format=%H", revision, "--", CATALOG_REPO_PATH])
+def _catalog_history_commits(revision: str) -> list[str]:
+    result = _git(
+        ["log", "--first-parent", "--format=%H", revision, "--", CATALOG_REPO_PATH]
+    )
     _require(isinstance(result, str), "git log returned non-text output")
     if not result:
-        return None
-    _require(GIT_SHA_RE.fullmatch(result) is not None,
-             "previous catalog history did not resolve to a full commit SHA")
-    return result
+        return []
+    commits = result.splitlines()
+    _require(
+        all(GIT_SHA_RE.fullmatch(commit) is not None for commit in commits),
+        "catalog history did not resolve to full commit SHAs",
+    )
+    _require(len(commits) == len(set(commits)), "catalog history contains duplicates")
+    return commits
 
 
 def _first_parent(commit: str) -> str | None:
@@ -663,18 +825,62 @@ def _first_parent(commit: str) -> str | None:
     return parts[1] if len(parts) > 1 else None
 
 
+def _validate_historical_catalog_document(document: Any) -> None:
+    catalog = _require_exact_fields(document, ROOT_FIELDS, "historical catalog")
+    _require(
+        catalog["schema_version"] == CATALOG_SCHEMA_VERSION,
+        f"historical catalog.schema_version must be {CATALOG_SCHEMA_VERSION}",
+    )
+    _require_exact_fields(catalog["coverage"], COVERAGE_FIELDS, "historical coverage")
+    rows = catalog["rows"]
+    _require(
+        isinstance(rows, list) and bool(rows),
+        "historical catalog.rows must be a non-empty list",
+    )
+    tolerance_ids: list[str] = []
+    identities: set[str] = set()
+    for index, row in enumerate(rows):
+        validated = _validate_row(row, index, enforce_current_coverage=False)
+        tolerance_id = validated["tolerance_id"]
+        _require(
+            tolerance_id not in tolerance_ids,
+            f"historical duplicate tolerance id: {tolerance_id}",
+        )
+        _require(
+            validated["identity"] not in identities,
+            f"historical ambiguous duplicate exact fixture: {tolerance_id}",
+        )
+        tolerance_ids.append(tolerance_id)
+        identities.add(validated["identity"])
+    _require(
+        tolerance_ids == sorted(tolerance_ids),
+        "historical catalog rows must be sorted by tolerance_id",
+    )
+
+
+def validate_no_widening_document_history(
+    current: dict[str, Any], history: list[dict[str, Any]]
+) -> None:
+    for previous in history:
+        validate_no_widening_documents(current, previous)
+
+
 def validate_no_widening_from_revision(
     current: dict[str, Any], baseline_revision: str | None
-) -> str | None:
+) -> list[str]:
     if baseline_revision is None:
-        return None
-    previous_commit = _latest_catalog_commit(baseline_revision)
-    if previous_commit is None:
-        return None
-    previous, _ = load_catalog_from_git(previous_commit, None)
-    validate_catalog_document(previous)
-    validate_no_widening_documents(current, previous)
-    return previous_commit
+        return []
+    commits = _catalog_history_commits(baseline_revision)
+    for commit in commits:
+        previous, _ = load_catalog_from_git(commit, None)
+        try:
+            _validate_historical_catalog_document(previous)
+            validate_no_widening_documents(current, previous)
+        except CatalogError as error:
+            raise CatalogError(
+                f"catalog violates historical version {commit}: {error}"
+            ) from error
+    return commits
 
 
 def _self_test() -> None:
@@ -758,6 +964,71 @@ def _self_test() -> None:
         "do not match the typed row selector",
     )
 
+    forged_oracle_prefix = copy.deepcopy(document)
+    forged_oracle_prefix["rows"][0]["oracle_identity"] = (
+        "cpu.fp32.rust.unregistered_reference"
+    )
+    forged_oracle_prefix["rows"][0]["row_fingerprint"] = row_fingerprint(
+        forged_oracle_prefix["rows"][0]
+    )
+    _expect_rejected(
+        "unregistered trusted-looking oracle",
+        lambda: validate_catalog_document(forged_oracle_prefix),
+        "do not match the typed row selector",
+    )
+
+    for field, replacement in (
+        ("backend", "cuda"),
+        ("model_scope", "qwen3.5-4b"),
+        ("operation_id", "operation.dense_linear"),
+        ("quant_format", "gguf_q4_k_m"),
+    ):
+        wrong_selector = copy.deepcopy(document)
+        wrong_selector["rows"][0][field] = replacement
+        wrong_selector["rows"][0]["row_fingerprint"] = row_fingerprint(
+            wrong_selector["rows"][0]
+        )
+        _expect_rejected(
+            f"coverage selector {field}",
+            lambda candidate=wrong_selector: validate_catalog_document(candidate),
+            "do not match the typed row selector",
+        )
+
+    wrong_fixture = copy.deepcopy(document)
+    wrong_fixture["rows"][0]["shape_domain"]["fixture_id"] = (
+        "causal_attention.fixed_page.other"
+    )
+    wrong_fixture["rows"][0]["row_fingerprint"] = row_fingerprint(
+        wrong_fixture["rows"][0]
+    )
+    _expect_rejected(
+        "coverage selector fixture",
+        lambda: validate_catalog_document(wrong_fixture),
+        "do not match the typed row selector",
+    )
+
+    wrong_oracle_descriptor = copy.deepcopy(document)
+    wrong_oracle_descriptor["rows"][0]["basis"]["test_name"] = "forged_test"
+    wrong_oracle_descriptor["rows"][0]["row_fingerprint"] = row_fingerprint(
+        wrong_oracle_descriptor["rows"][0]
+    )
+    _expect_rejected(
+        "oracle descriptor mutation",
+        lambda: validate_catalog_document(wrong_oracle_descriptor),
+        "do not match the typed row selector",
+    )
+
+    wrong_oracle_implementation = copy.deepcopy(document)
+    wrong_oracle_implementation["rows"][0]["source_commit"] = "d" * 40
+    wrong_oracle_implementation["rows"][0]["row_fingerprint"] = row_fingerprint(
+        wrong_oracle_implementation["rows"][0]
+    )
+    _expect_rejected(
+        "oracle implementation commit mutation",
+        lambda: validate_catalog_document(wrong_oracle_implementation),
+        "do not match the typed row selector",
+    )
+
     stale_gaps = copy.deepcopy(document)
     stale_gaps["coverage"]["missing_required_coverage"] = []
     _expect_rejected(
@@ -778,6 +1049,44 @@ def _self_test() -> None:
         "history absolute widening",
         lambda: validate_no_widening_documents(history_widened, document),
         "post-hoc absolute widening",
+    )
+
+    strict_oldest = copy.deepcopy(document)
+    strict_oldest["rows"][0]["bounds"]["max_abs_max"] = 0.005
+    strict_oldest["rows"][0]["row_fingerprint"] = row_fingerprint(
+        strict_oldest["rows"][0]
+    )
+    relaxed_nearest = copy.deepcopy(document)
+    validate_no_widening_documents(document, relaxed_nearest)
+    _expect_rejected(
+        "all-history widening after skipped nearest gate",
+        lambda: validate_no_widening_document_history(
+            document, [relaxed_nearest, strict_oldest]
+        ),
+        "post-hoc absolute widening",
+    )
+
+    state_catalog = load_worktree_catalog()
+    removed_state_id = (
+        "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped"
+    )
+    state_catalog["rows"] = [
+        row for row in state_catalog["rows"] if row["tolerance_id"] != removed_state_id
+    ]
+    expected_state_gap = "state.gated_delta.conv_state.log_rate_grouped"
+    state_catalog["coverage"]["missing_required_coverage"] = sorted(
+        set(state_catalog["coverage"]["missing_required_coverage"])
+        | {expected_state_gap}
+    )
+    state_summary = validate_catalog_document(state_catalog)
+    _require(
+        expected_state_gap in state_summary["missing_required_coverage"],
+        "removing one GDN state semantic fixture must create its own coverage gap",
+    )
+    _require(
+        "state.gated_delta.conv_state.negative_rate_interleaved"
+        not in state_summary["missing_required_coverage"],
+        "one GDN state semantic fixture must not cover or erase the other",
     )
 
     removed_row = copy.deepcopy(document)
@@ -868,7 +1177,7 @@ def _self_test_document() -> dict[str, Any]:
             "test_name": "fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal",
             "assertion": "Real Metal operation output is checked against the CPU FP32 oracle with max_abs <= 0.006.",
         },
-        "source_commit": "e" * 40,
+        "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
         "owner": "runtime-vnext-g03",
         "review_commit": "f" * 40,
     }
@@ -933,18 +1242,20 @@ def main() -> int:
             head = _git(["rev-parse", "HEAD^{commit}"])
             _require(isinstance(head, str), "HEAD did not resolve to text")
             validate_catalog_provenance(document, head)
-            summary["compared_catalog_commit"] = validate_no_widening_from_revision(
-                document, head
-            )
+            compared = validate_no_widening_from_revision(document, head)
+            summary["compared_catalog_commit"] = compared[0] if compared else None
+            summary["compared_catalog_commits"] = compared
             print(f"{WORKTREE_VALID}: {DEFAULT_CATALOG} {json.dumps(summary, sort_keys=True)}")
             return 0
 
         document, binding = load_catalog_from_git(args.git_revision, args.expected_blob_sha)
         summary = validate_catalog_document(document, require_complete=args.require_complete)
         validate_catalog_provenance(document, binding["commit"])
-        summary["compared_catalog_commit"] = validate_no_widening_from_revision(
+        compared = validate_no_widening_from_revision(
             document, _first_parent(binding["commit"])
         )
+        summary["compared_catalog_commit"] = compared[0] if compared else None
+        summary["compared_catalog_commits"] = compared
         summary["catalog_commit"] = binding["commit"]
         summary["catalog_git_blob_sha"] = binding["git_blob_sha"]
         pass_line = COMPLETE_PASS if summary["coverage_status"] == "complete" else FOUNDATION_PASS

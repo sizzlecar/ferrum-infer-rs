@@ -157,50 +157,67 @@ fn assert_recurrent_conformance(semantics: TestSemantics) {
         &mut cpu_delta_state,
         semantics,
     );
-    let output_tolerance = cpu_output_tolerance(semantics);
-    let conv_state_tolerance = cpu_conv_state_tolerance(semantics);
-    let delta_state_tolerance = cpu_delta_state_tolerance(semantics);
-
     assert!(full_output.iter().any(|value| value.abs() > 1.0e-4));
-    assert_close(
+    let (output_tolerance_id, output_tolerance_fingerprint) = cpu_output_tolerance(semantics);
+    numerical_tolerance::assert_matches(
         "full/cpu output",
         &full_output,
+        &[TOKENS, VALUE_HEADS, VALUE_DIM],
         &cpu_output,
-        output_tolerance.max_abs,
-    );
+        &[TOKENS, VALUE_HEADS, VALUE_DIM],
+        numerical_tolerance::LogicalDtype::Fp16,
+        output_tolerance_id,
+        output_tolerance_fingerprint,
+    )
+    .expect("reviewed gated-delta output numerical contract");
     assert_close(
         "full/split output",
         &full_output,
         &split_output,
         SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
     );
-    assert_close(
+    let full_conv_state_values = read_f16(&full_conv_state, initial_conv.len());
+    let cpu_conv_state_values = as_f32(&cpu_conv_state);
+    let (conv_tolerance_id, conv_tolerance_fingerprint) = cpu_conv_state_tolerance(semantics);
+    numerical_tolerance::assert_matches(
         "full/cpu conv state",
-        &read_f16(&full_conv_state, initial_conv.len()),
-        &as_f32(&cpu_conv_state),
-        conv_state_tolerance.max_abs,
-    );
-    assert_close(
+        &full_conv_state_values,
+        &[QKV_FEATURES, CONV_STATE_WIDTH],
+        &cpu_conv_state_values,
+        &[QKV_FEATURES, CONV_STATE_WIDTH],
+        numerical_tolerance::LogicalDtype::Fp16,
+        conv_tolerance_id,
+        conv_tolerance_fingerprint,
+    )
+    .expect("reviewed gated-delta conv-state numerical contract");
+    let full_delta_state_values = read_f32(&full_delta_state, initial_delta.len());
+    let (delta_tolerance_id, delta_tolerance_fingerprint) = cpu_delta_state_tolerance(semantics);
+    numerical_tolerance::assert_matches(
         "full/cpu delta state",
-        &read_f32(&full_delta_state, initial_delta.len()),
+        &full_delta_state_values,
+        &[VALUE_HEADS, VALUE_DIM, KEY_DIM],
         &cpu_delta_state,
-        delta_state_tolerance.max_abs,
-    );
+        &[VALUE_HEADS, VALUE_DIM, KEY_DIM],
+        numerical_tolerance::LogicalDtype::Fp32,
+        delta_tolerance_id,
+        delta_tolerance_fingerprint,
+    )
+    .expect("reviewed gated-delta delta-state numerical contract");
     assert_close(
         "full/split conv state",
-        &read_f16(&full_conv_state, initial_conv.len()),
+        &full_conv_state_values,
         &read_f16(&split_conv_state, initial_conv.len()),
         SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
     );
     assert_close(
         "full/split delta state",
-        &read_f32(&full_delta_state, initial_delta.len()),
+        &full_delta_state_values,
         &read_f32(&split_delta_state, initial_delta.len()),
         SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
     );
 }
 
-fn cpu_output_tolerance(semantics: TestSemantics) -> numerical_tolerance::NumericalTolerance {
+fn cpu_output_tolerance(semantics: TestSemantics) -> (&'static str, &'static str) {
     match (
         semantics.decay_parameterization,
         semantics.value_head_mapping,
@@ -208,24 +225,22 @@ fn cpu_output_tolerance(semantics: TestSemantics) -> numerical_tolerance::Numeri
         (
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
-        ) => numerical_tolerance::resolve(
+        ) => (
             "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.log-rate-grouped",
             "042cde4824acf50ff0c5fd4d77f0ae4c7e7424bca0ff4a09fcf176e3369c7935",
-        )
-        .expect("reviewed gated-delta log-rate output tolerance binding"),
+        ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
-        ) => numerical_tolerance::resolve(
+        ) => (
             "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.negative-rate-interleaved",
             "2cc1888ca5453ff990ab09e788e49b3d90ffddea6e0c1e2669b81d62ee531f95",
-        )
-        .expect("reviewed gated-delta negative-rate output tolerance binding"),
+        ),
         _ => panic!("unreviewed gated-delta output tolerance selector"),
     }
 }
 
-fn cpu_conv_state_tolerance(semantics: TestSemantics) -> numerical_tolerance::NumericalTolerance {
+fn cpu_conv_state_tolerance(semantics: TestSemantics) -> (&'static str, &'static str) {
     match (
         semantics.decay_parameterization,
         semantics.value_head_mapping,
@@ -233,24 +248,22 @@ fn cpu_conv_state_tolerance(semantics: TestSemantics) -> numerical_tolerance::Nu
         (
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
-        ) => numerical_tolerance::resolve(
+        ) => (
             "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped",
-            "414482e48c100a1f7151bce38f2106432e2341ef8a501f86d7d0a91efc3b3e83",
-        )
-        .expect("reviewed gated-delta log-rate conv-state tolerance binding"),
+            "be3d2caf3c6b0b7fe6b28e00639a6dd6e3f04e56f9b16e8ed11dae07e314ff98",
+        ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
-        ) => numerical_tolerance::resolve(
+        ) => (
             "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.negative-rate-interleaved",
-            "8b50357bcb3da1cc4a2c0414744e0424f5aacfa2744e6ce120af148b3bad8342",
-        )
-        .expect("reviewed gated-delta negative-rate conv-state tolerance binding"),
+            "fd0a279ca3aea3684f60625e09d130295af6ad0afca771d640eda8567b7a827c",
+        ),
         _ => panic!("unreviewed gated-delta conv-state tolerance selector"),
     }
 }
 
-fn cpu_delta_state_tolerance(semantics: TestSemantics) -> numerical_tolerance::NumericalTolerance {
+fn cpu_delta_state_tolerance(semantics: TestSemantics) -> (&'static str, &'static str) {
     match (
         semantics.decay_parameterization,
         semantics.value_head_mapping,
@@ -258,19 +271,17 @@ fn cpu_delta_state_tolerance(semantics: TestSemantics) -> numerical_tolerance::N
         (
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
-        ) => numerical_tolerance::resolve(
+        ) => (
             "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.log-rate-grouped",
-            "829f052a366faa64b892c96cd00f0711660bbeb1a273cfc5b4851dd5c12d1e70",
-        )
-        .expect("reviewed gated-delta log-rate delta-state tolerance binding"),
+            "a779e9b4045c63023ac9250463b71cef5993f70933a013a6c749da6ae2c753ab",
+        ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
-        ) => numerical_tolerance::resolve(
+        ) => (
             "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.negative-rate-interleaved",
-            "eabe2655cb3936838465a9a74a74704b328cf818575af868624968328768e9c6",
-        )
-        .expect("reviewed gated-delta negative-rate delta-state tolerance binding"),
+            "0dbe4774a52f662adb015b47792eb4ffb481b5a82c1acb9ee85378fc417c935d",
+        ),
         _ => panic!("unreviewed gated-delta delta-state tolerance selector"),
     }
 }

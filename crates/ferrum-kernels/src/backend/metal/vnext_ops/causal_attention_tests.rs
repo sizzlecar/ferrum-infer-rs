@@ -79,16 +79,18 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
     ));
 
     let cpu_output = cpu_attention(&query_raw, &key_raw, &value_raw, &query_norm, &key_norm);
-    let cpu_output_tolerance =
-        numerical_tolerance::resolve(CPU_OUTPUT_TOLERANCE_ID, CPU_OUTPUT_TOLERANCE_FINGERPRINT)
-            .expect("reviewed causal-attention tolerance binding");
     assert!(full_output.iter().any(|value| value.abs() > 1.0e-4));
-    assert_close(
+    numerical_tolerance::assert_matches(
         "Metal/CPU causal output",
         &full_output,
+        &[TOKENS, QUERY_HEADS, HEAD_DIM],
         &cpu_output,
-        cpu_output_tolerance.max_abs,
-    );
+        &[TOKENS, QUERY_HEADS, HEAD_DIM],
+        numerical_tolerance::LogicalDtype::Fp16,
+        CPU_OUTPUT_TOLERANCE_ID,
+        CPU_OUTPUT_TOLERANCE_FINGERPRINT,
+    )
+    .expect("reviewed causal-attention numerical contract");
     assert_close(
         "full/split causal output",
         &full_output,

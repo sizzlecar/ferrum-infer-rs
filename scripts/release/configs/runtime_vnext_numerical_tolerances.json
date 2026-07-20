@@ -201,7 +201,7 @@
       "checkpoint_kind": "state",
       "checkpoint_name": "conv_state",
       "coverage_markers": [
-        "state.gated_delta.conv_state"
+        "state.gated_delta.conv_state.log_rate_grouped"
       ],
       "dtype": "fp16",
       "invariants": {
@@ -218,7 +218,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "none",
       "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
-      "row_fingerprint": "414482e48c100a1f7151bce38f2106432e2341ef8a501f86d7d0a91efc3b3e83",
+      "row_fingerprint": "be3d2caf3c6b0b7fe6b28e00639a6dd6e3f04e56f9b16e8ed11dae07e314ff98",
       "shape_domain": {
         "dimensions": {
           "conv_kernel": 4,
@@ -259,7 +259,7 @@
       "checkpoint_kind": "state",
       "checkpoint_name": "conv_state",
       "coverage_markers": [
-        "state.gated_delta.conv_state"
+        "state.gated_delta.conv_state.negative_rate_interleaved"
       ],
       "dtype": "fp16",
       "invariants": {
@@ -276,7 +276,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "none",
       "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
-      "row_fingerprint": "8b50357bcb3da1cc4a2c0414744e0424f5aacfa2744e6ce120af148b3bad8342",
+      "row_fingerprint": "fd0a279ca3aea3684f60625e09d130295af6ad0afca771d640eda8567b7a827c",
       "shape_domain": {
         "dimensions": {
           "conv_kernel": 4,
@@ -317,7 +317,7 @@
       "checkpoint_kind": "state",
       "checkpoint_name": "delta_state",
       "coverage_markers": [
-        "state.gated_delta.delta_state"
+        "state.gated_delta.delta_state.log_rate_grouped"
       ],
       "dtype": "fp32",
       "invariants": {
@@ -334,7 +334,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "none",
       "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
-      "row_fingerprint": "829f052a366faa64b892c96cd00f0711660bbeb1a273cfc5b4851dd5c12d1e70",
+      "row_fingerprint": "a779e9b4045c63023ac9250463b71cef5993f70933a013a6c749da6ae2c753ab",
       "shape_domain": {
         "dimensions": {
           "key_dim": 128,
@@ -372,7 +372,7 @@
       "checkpoint_kind": "state",
       "checkpoint_name": "delta_state",
       "coverage_markers": [
-        "state.gated_delta.delta_state"
+        "state.gated_delta.delta_state.negative_rate_interleaved"
       ],
       "dtype": "fp32",
       "invariants": {
@@ -389,7 +389,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "none",
       "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
-      "row_fingerprint": "eabe2655cb3936838465a9a74a74704b328cf818575af868624968328768e9c6",
+      "row_fingerprint": "0dbe4774a52f662adb015b47792eb4ffb481b5a82c1acb9ee85378fc417c935d",
       "shape_domain": {
         "dimensions": {
           "key_dim": 128,
