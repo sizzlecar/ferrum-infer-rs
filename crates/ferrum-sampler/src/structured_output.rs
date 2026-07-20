@@ -21,7 +21,9 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 const MAX_CACHED_GRAMMARS: usize = 64;
-const AUTO_STRUCTURED_RESERVE_DIVISOR: usize = 4;
+// Structured output is the requested product result; hidden reasoning may use
+// at most the other half of a normal-sized completion budget.
+const AUTO_STRUCTURED_RESERVE_DIVISOR: usize = 2;
 const MIN_AUTO_STRUCTURED_RESERVE_TOKENS: usize = 32;
 const MAX_AUTO_STRUCTURED_RESERVE_TOKENS: usize = 1024;
 
@@ -1041,6 +1043,19 @@ mod tests {
         );
         assert!(!reset_progress.boundary_forced);
         assert_eq!(reset_progress.reasoning_token_count, Some(0));
+    }
+
+    #[test]
+    fn reasoning_budget_reserves_half_of_a_normal_completion_for_structure() {
+        assert_eq!(
+            StructuredOutputBudgetPlan::automatic(1024, 1).unwrap(),
+            StructuredOutputBudgetPlan {
+                total_output_tokens: 1024,
+                reasoning_token_limit: 511,
+                boundary_token_count: 1,
+                structured_reserve_tokens: 512,
+            }
+        );
     }
 
     #[test]
