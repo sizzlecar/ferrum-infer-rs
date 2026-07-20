@@ -4,7 +4,9 @@ use crate::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo, To
 use async_trait::async_trait;
 use ferrum_types::{Result, SpecialTokens, TokenId};
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use tokenizers::decoders::DecoderWrapper;
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::debug;
 
@@ -14,6 +16,7 @@ pub struct HuggingFaceTokenizer {
     special_tokens: SpecialTokens,
     info: TokenizerInfo,
     id_to_token: Vec<Option<String>>,
+    byte_level_decoder: bool,
     /// Reasoning-marker token ids mapped to the canonical tag emitted in
     /// their place. Some vocabs mark think tags `special: true`
     /// (Magistral's `[THINK]`/`[/THINK]`), so a skip-special decode would
@@ -110,12 +113,14 @@ impl HuggingFaceTokenizer {
         );
 
         let think_markers = probe_think_markers(&tokenizer);
+        let byte_level_decoder = tokenizer.get_decoder().is_some_and(decoder_uses_byte_level);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
             special_tokens,
             info,
             id_to_token,
+            byte_level_decoder,
             think_markers,
             decode_cache: RwLock::new(DecodeCache::new(1000)),
         })
@@ -285,6 +290,19 @@ impl Tokenizer for HuggingFaceTokenizer {
             .and_then(|value| value.as_deref())
     }
 
+    fn token_bytes(&self, token_id: TokenId) -> Option<Vec<u8>> {
+        if self.byte_level_decoder {
+            return self.token_text(token_id).map(byte_level_token_bytes);
+        }
+        self.decode(&[token_id], false)
+            .ok()
+            .map(String::into_bytes)
+            .or_else(|| {
+                self.token_text(token_id)
+                    .map(|text| text.as_bytes().to_vec())
+            })
+    }
+
     fn apply_chat_template(
         &self,
         messages: &[ferrum_interfaces::tokenizer::ChatMessage],
@@ -409,6 +427,51 @@ fn build_id_to_token(tokenizer: &HfTokenizer) -> Vec<Option<String>> {
         }
     }
     id_to_token
+}
+
+fn decoder_uses_byte_level(decoder: &DecoderWrapper) -> bool {
+    match decoder {
+        DecoderWrapper::ByteLevel(_) => true,
+        DecoderWrapper::Sequence(sequence) => {
+            sequence.get_decoders().iter().any(decoder_uses_byte_level)
+        }
+        _ => false,
+    }
+}
+
+fn byte_level_char_bytes() -> &'static HashMap<char, u8> {
+    static CHAR_BYTES: OnceLock<HashMap<char, u8>> = OnceLock::new();
+    CHAR_BYTES.get_or_init(|| {
+        let mut direct = Vec::with_capacity(256);
+        direct.extend(b'!'..=b'~');
+        direct.extend(b'\xA1'..=b'\xAC');
+        direct.extend(b'\xAE'..=b'\xFF');
+
+        let mut next_codepoint = 256u32;
+        let mut mapping = HashMap::with_capacity(256);
+        for byte in 0..=u8::MAX {
+            let codepoint = if direct.contains(&byte) {
+                byte as u32
+            } else {
+                let codepoint = next_codepoint;
+                next_codepoint += 1;
+                codepoint
+            };
+            let character = char::from_u32(codepoint)
+                .expect("GPT-2 byte alphabet uses valid Unicode scalar values");
+            mapping.insert(character, byte);
+        }
+        mapping
+    })
+}
+
+fn byte_level_token_bytes(token: &str) -> Vec<u8> {
+    let mapping = byte_level_char_bytes();
+    token
+        .chars()
+        .map(|character| mapping.get(&character).copied())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_else(|| token.as_bytes().to_vec())
 }
 
 /// Extract special tokens from HF tokenizer
@@ -843,6 +906,51 @@ mod tests {
         assert_eq!(tokenizer.token_text(TokenId::new(1)), Some("[PAD151935]"));
         assert_eq!(tokenizer.token_text(TokenId::new(2)), Some("</think>"));
         assert_eq!(tokenizer.token_text(TokenId::new(99)), None);
+    }
+
+    #[tokio::test]
+    async fn byte_level_token_bytes_preserve_split_utf8_fragments() {
+        use tokenizers::decoders::byte_level::ByteLevel;
+        use tokenizers::models::bpe::{Vocab, BPE};
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+
+        // GPT-2 byte-alphabet spellings for [f0, 9f] and [94, a5]. Each
+        // fragment is invalid UTF-8 alone, but together they encode U+1F525.
+        let vocab: Vocab = [
+            ("\u{00f0}\u{0141}".to_string(), 0),
+            ("\u{0136}\u{00a5}".to_string(), 1),
+            ("<eos>".to_string(), 2),
+        ]
+        .into_iter()
+        .collect();
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .build()
+            .unwrap();
+        let mut hf_tokenizer = HfTokenizer::new(bpe);
+        hf_tokenizer.with_decoder(Some(ByteLevel::default()));
+        hf_tokenizer.add_special_tokens(&[AddedToken::from("<eos>", true)]);
+
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        assert!(tokenizer
+            .decode(&[TokenId::new(0)], false)
+            .unwrap()
+            .contains('\u{fffd}'));
+        assert_eq!(
+            tokenizer
+                .decode(&[TokenId::new(0), TokenId::new(1)], false)
+                .unwrap(),
+            "\u{1f525}"
+        );
+        assert_eq!(
+            tokenizer.token_bytes(TokenId::new(0)),
+            Some(vec![0xf0, 0x9f])
+        );
+        assert_eq!(
+            tokenizer.token_bytes(TokenId::new(1)),
+            Some(vec![0x94, 0xa5])
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,23 @@ pub trait Tokenizer: Send + Sync {
     /// Get text for a specific token ID
     fn token_text(&self, token_id: TokenId) -> Option<&str>;
 
+    /// Return the context-free byte surface represented by one vocabulary token.
+    ///
+    /// This is distinct from decoding a one-token sequence: byte-level BPE
+    /// vocabularies may split one UTF-8 scalar across multiple tokens, so a
+    /// string decoder must replace an incomplete fragment. Grammar/token-trie
+    /// consumers need the original bytes instead. Tokenizers with a byte-level
+    /// vocabulary should override this method.
+    fn token_bytes(&self, token_id: TokenId) -> Option<Vec<u8>> {
+        self.decode(&[token_id], false)
+            .ok()
+            .map(String::into_bytes)
+            .or_else(|| {
+                self.token_text(token_id)
+                    .map(|text| text.as_bytes().to_vec())
+            })
+    }
+
     /// Check if token is a special token
     fn is_special_token(&self, token_id: TokenId) -> bool {
         let special = self.special_tokens();
