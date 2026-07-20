@@ -5,12 +5,6 @@
       "checkpoint.full_vocab_logits",
       "layer.full_attention",
       "layer.linear_attention",
-      "operation.dense_linear@1.0",
-      "operation.dense_swiglu@1.0",
-      "operation.last_token_dense_linear@1.0",
-      "operation.residual_add@1.0",
-      "operation.rms_norm@1.0",
-      "operation.token_embedding@1.0",
       "quant_format.gguf_q4_k_m",
       "state.causal_attention.kv_state"
     ],
@@ -72,6 +66,107 @@
       },
       "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
       "tolerance_id": "runtime-vnext.metal.causal-attention.v2.operation.fp16.none.fixed-page-split"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal Q4_K dense-linear output is checked against a dequantized CPU FP32 oracle with max_abs <= 0.02.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": "native_linear_formats_match_cpu_oracles_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.dense_linear@1.0"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.dense_linear",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.rust.dense_linear_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k",
+      "review_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "row_fingerprint": "afde4fbda18b82e0d7dfde8e92a416f1ee30f65a5b5ab0b1e31b27b8d3a27878",
+      "shape_domain": {
+        "dimensions": {
+          "in_features": 2560,
+          "out_features": 32,
+          "rows": 2
+        },
+        "fixture_id": "dense_linear.q4_k.hidden_2560",
+        "semantics": {
+          "input_dtype": "fp16",
+          "output_dtype": "fp16",
+          "weight_format": "gguf_q4_k"
+        }
+      },
+      "source_commit": "d718268a287d5ca6b608c4b5161cf27d5a00f6b3",
+      "tolerance_id": "runtime-vnext.metal.dense-linear.v1.operation.fp16.gguf-q4-k.hidden-2560"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal Q4_K gate/up, SiLU, and Q6_K down full SwiGLU output is checked against the dequantized CPU FP32 oracle with max_abs <= 0.02.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": "native_dense_swiglu_q4k_q6k_matches_full_cpu_oracle_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.dense_swiglu@1.0"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.dense_swiglu",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.rust.dense_swiglu_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_q6_k",
+      "review_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "row_fingerprint": "42d0496fbb889d9c95a35f151cda9726f7730f42f20efbd61aa593083f80661b",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 256,
+          "intermediate_size": 256,
+          "rows": 2
+        },
+        "fixture_id": "dense_swiglu.q4_k_q6_k.full_pipeline",
+        "semantics": {
+          "activation": "silu",
+          "down_format": "gguf_q6_k",
+          "gate_up_format": "gguf_q4_k",
+          "packed_order": "gate_then_up"
+        }
+      },
+      "source_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "tolerance_id": "runtime-vnext.metal.dense-swiglu.v1.operation.fp16.gguf-q4-k-q6-k.full-pipeline"
     },
     {
       "backend": "metal",
@@ -410,6 +505,204 @@
       },
       "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
       "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.negative-rate-interleaved"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal Q6_K last-token dense-linear output is checked against the final-row CPU FP32 oracle with max_abs <= 0.02.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": "native_last_token_q6k_linear_selects_final_row_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.last_token_dense_linear@1.0"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.last_token_dense_linear",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.rust.last_token_dense_linear_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q6_k",
+      "review_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "row_fingerprint": "5dc080fb15a72c886acf83fc02877265f57359cf1c28c424a6cc1148cb256056",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 256,
+          "out_features": 64,
+          "sequence_rows": 3
+        },
+        "fixture_id": "last_token_dense_linear.q6_k.final_row",
+        "semantics": {
+          "selected_row_index": 2,
+          "selection": "final_row",
+          "weight_format": "gguf_q6_k"
+        }
+      },
+      "source_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "tolerance_id": "runtime-vnext.metal.last-token-dense-linear.v1.operation.fp16.gguf-q6-k.final-row"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal FP16 residual-add output is checked against the CPU FP32 oracle with max_abs <= 0.001.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/primitives.rs",
+        "test_name": "native_f16_primitives_match_cpu_references_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.residual_add@1.0"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.residual_add",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.rust.residual_add_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "row_fingerprint": "221c4135f6edba3ad4d8e311a5042dabebcb6d9c55bfcabc2b3bdca6c8b0adba",
+      "shape_domain": {
+        "dimensions": {
+          "elements": 2560,
+          "rows": 1
+        },
+        "fixture_id": "residual_add.hidden_2560",
+        "semantics": {
+          "input_dtype": "fp16",
+          "output_dtype": "fp16",
+          "rounding": "ieee_f16"
+        }
+      },
+      "source_commit": "869d9bc74ba174a2820c934c06085c318ea1676d",
+      "tolerance_id": "runtime-vnext.metal.residual-add.v1.operation.fp16.none.hidden-2560"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal FP16 RMSNorm output is checked against the CPU FP32 oracle with max_abs <= 0.002.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/primitives.rs",
+        "test_name": "native_f16_primitives_match_cpu_references_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.002,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.rms_norm@1.0"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.rms_norm",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.rust.rms_norm_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "row_fingerprint": "fa18de9e42a1a74cdc0fa795a3ce94312ed7c9f8313ee40828f911a0ae89cd07",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 2560,
+          "rows": 1
+        },
+        "fixture_id": "rms_norm.hidden_2560",
+        "semantics": {
+          "epsilon": "1e-6",
+          "input_dtype": "fp16",
+          "weight_dtype": "fp16"
+        }
+      },
+      "source_commit": "869d9bc74ba174a2820c934c06085c318ea1676d",
+      "tolerance_id": "runtime-vnext.metal.rms-norm.v1.operation.fp16.none.hidden-2560"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal Q6_K token embedding output, including out-of-range zero fill, is checked against the CPU FP32 oracle with max_abs <= 0.02.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/primitives.rs",
+        "test_name": "native_f16_primitives_match_cpu_references_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.token_embedding@1.0"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.token_embedding",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.rust.token_embedding_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q6_k",
+      "review_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+      "row_fingerprint": "f0b7cf49cf36ae1fb1b351713bcd7d0e7c5ba60940c8789bf83d1c85a42ac9d3",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 2560,
+          "token_count": 2,
+          "vocabulary_size": 4
+        },
+        "fixture_id": "token_embedding.q6_k.padding",
+        "semantics": {
+          "out_of_range_zero_fill": true,
+          "padding_token": "u32_max",
+          "selected_token_id": 2
+        }
+      },
+      "source_commit": "869d9bc74ba174a2820c934c06085c318ea1676d",
+      "tolerance_id": "runtime-vnext.metal.token-embedding.v1.operation.fp16.gguf-q6-k.padding"
     }
   ],
   "schema_version": 1

@@ -1226,11 +1226,25 @@ fn validate_swiglu_participant(
 
 #[cfg(test)]
 mod tests {
+    use super::super::numerical_tolerance;
     use super::*;
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device as CandleDevice, Tensor};
     use half::f16;
     use metal::{BufferRef, MTLCommandBufferStatus, MTLResourceOptions};
+
+    const DENSE_LINEAR_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.dense-linear.v1.operation.fp16.gguf-q4-k.hidden-2560";
+    const DENSE_LINEAR_TOLERANCE_FINGERPRINT: &str =
+        "afde4fbda18b82e0d7dfde8e92a416f1ee30f65a5b5ab0b1e31b27b8d3a27878";
+    const DENSE_SWIGLU_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.dense-swiglu.v1.operation.fp16.gguf-q4-k-q6-k.full-pipeline";
+    const DENSE_SWIGLU_TOLERANCE_FINGERPRINT: &str =
+        "42d0496fbb889d9c95a35f151cda9726f7730f42f20efbd61aa593083f80661b";
+    const LAST_TOKEN_LINEAR_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.last-token-dense-linear.v1.operation.fp16.gguf-q6-k.final-row";
+    const LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT: &str =
+        "5dc080fb15a72c886acf83fc02877265f57359cf1c28c424a6cc1148cb256056";
 
     fn shared_buffer<T>(device: &Device, values: &[T]) -> metal::Buffer {
         device.new_buffer_with_data(
@@ -1334,7 +1348,21 @@ mod tests {
             command.wait_until_completed();
             assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
             let actual = read_f16(&output, rows * output_width);
-            assert_linear_diagnostic_close(&format!("{format:?}"), &actual, &reference);
+            if format == LinearPhysicalFormat::Q4K {
+                numerical_tolerance::assert_matches(
+                    "Metal/CPU Q4_K dense linear",
+                    &actual,
+                    &[rows, output_width],
+                    &reference,
+                    &[rows, output_width],
+                    numerical_tolerance::LogicalDtype::Fp16,
+                    DENSE_LINEAR_TOLERANCE_ID,
+                    DENSE_LINEAR_TOLERANCE_FINGERPRINT,
+                )
+                .expect("reviewed dense-linear numerical contract");
+            } else {
+                assert_linear_diagnostic_close(&format!("{format:?}"), &actual, &reference);
+            }
         }
     }
 
@@ -1526,7 +1554,17 @@ mod tests {
 
         let actual = read_f16(&output, rows * hidden);
         assert!(actual.iter().any(|value| value.abs() > 1.0e-5));
-        assert_linear_diagnostic_close("dense SwiGLU Q4_K/Q6_K", &actual, &cpu_output);
+        numerical_tolerance::assert_matches(
+            "Metal/CPU dense SwiGLU Q4_K/Q6_K",
+            &actual,
+            &[rows, hidden],
+            &cpu_output,
+            &[rows, hidden],
+            numerical_tolerance::LogicalDtype::Fp16,
+            DENSE_SWIGLU_TOLERANCE_ID,
+            DENSE_SWIGLU_TOLERANCE_FINGERPRINT,
+        )
+        .expect("reviewed dense-SwiGLU numerical contract");
     }
 
     #[test]
@@ -1604,7 +1642,17 @@ mod tests {
         assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
 
         let actual = read_f16(&output, output_width);
-        assert_linear_diagnostic_close("last-token Q6_K", &actual, &final_row);
+        numerical_tolerance::assert_matches(
+            "Metal/CPU last-token Q6_K dense linear",
+            &actual,
+            &[1, output_width],
+            &final_row,
+            &[1, output_width],
+            numerical_tolerance::LogicalDtype::Fp16,
+            LAST_TOKEN_LINEAR_TOLERANCE_ID,
+            LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
+        )
+        .expect("reviewed last-token dense-linear numerical contract");
     }
 
     fn assert_linear_diagnostic_close(label: &str, actual: &[f32], expected: &[f32]) {

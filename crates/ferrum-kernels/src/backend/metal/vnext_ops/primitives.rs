@@ -766,11 +766,25 @@ pub(super) fn dispatch_residual_add_at(
 
 #[cfg(test)]
 mod tests {
+    use super::super::numerical_tolerance;
     use super::*;
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device as CandleDevice, Tensor};
     use half::f16;
     use metal::{BufferRef, MTLCommandBufferStatus, MTLResourceOptions};
+
+    const TOKEN_EMBEDDING_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.token-embedding.v1.operation.fp16.gguf-q6-k.padding";
+    const TOKEN_EMBEDDING_TOLERANCE_FINGERPRINT: &str =
+        "f0b7cf49cf36ae1fb1b351713bcd7d0e7c5ba60940c8789bf83d1c85a42ac9d3";
+    const RMS_NORM_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.rms-norm.v1.operation.fp16.none.hidden-2560";
+    const RMS_NORM_TOLERANCE_FINGERPRINT: &str =
+        "fa18de9e42a1a74cdc0fa795a3ce94312ed7c9f8313ee40828f911a0ae89cd07";
+    const RESIDUAL_ADD_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.residual-add.v1.operation.fp16.none.hidden-2560";
+    const RESIDUAL_ADD_TOLERANCE_FINGERPRINT: &str =
+        "221c4135f6edba3ad4d8e311a5042dabebcb6d9c55bfcabc2b3bdca6c8b0adba";
 
     fn shared_buffer<T>(device: &Device, values: &[T]) -> metal::Buffer {
         device.new_buffer_with_data(
@@ -881,9 +895,20 @@ mod tests {
         assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
 
         let embedding = read_f16(&embedding_output, hidden * 2);
-        for (actual, expected) in embedding[..hidden].iter().zip(&reference) {
-            assert!((actual - expected).abs() <= 0.02, "{actual} != {expected}");
-        }
+        let mut embedding_reference = Vec::with_capacity(hidden * 2);
+        embedding_reference.extend_from_slice(&reference);
+        embedding_reference.resize(hidden * 2, 0.0);
+        numerical_tolerance::assert_matches(
+            "Metal/CPU Q6_K token embedding",
+            &embedding,
+            &[2, hidden],
+            &embedding_reference,
+            &[2, hidden],
+            numerical_tolerance::LogicalDtype::Fp16,
+            TOKEN_EMBEDDING_TOLERANCE_ID,
+            TOKEN_EMBEDDING_TOLERANCE_FINGERPRINT,
+        )
+        .expect("reviewed token-embedding numerical contract");
         assert!(embedding[hidden..].iter().all(|value| *value == 0.0));
 
         let rms = read_f16(&rms_output, hidden);
@@ -893,15 +918,35 @@ mod tests {
             .sum::<f32>()
             / hidden as f32;
         let inverse_rms = (mean_square + 1e-6).sqrt().recip();
-        for index in 0..hidden {
-            let expected = rms_input[index].to_f32() * inverse_rms * rms_weight[index].to_f32();
-            assert!((rms[index] - expected).abs() <= 0.002);
-        }
+        let rms_reference = (0..hidden)
+            .map(|index| rms_input[index].to_f32() * inverse_rms * rms_weight[index].to_f32())
+            .collect::<Vec<_>>();
+        numerical_tolerance::assert_matches(
+            "Metal/CPU RMSNorm",
+            &rms,
+            &[1, hidden],
+            &rms_reference,
+            &[1, hidden],
+            numerical_tolerance::LogicalDtype::Fp16,
+            RMS_NORM_TOLERANCE_ID,
+            RMS_NORM_TOLERANCE_FINGERPRINT,
+        )
+        .expect("reviewed RMSNorm numerical contract");
         let residual = read_f16(&residual_output, hidden);
-        for index in 0..hidden {
-            let expected = f16::from_f32(rms[index] + residual_right[index].to_f32()).to_f32();
-            assert!((residual[index] - expected).abs() <= 0.001);
-        }
+        let residual_reference = (0..hidden)
+            .map(|index| rms[index] + residual_right[index].to_f32())
+            .collect::<Vec<_>>();
+        numerical_tolerance::assert_matches(
+            "Metal/CPU residual add",
+            &residual,
+            &[1, hidden],
+            &residual_reference,
+            &[1, hidden],
+            numerical_tolerance::LogicalDtype::Fp16,
+            RESIDUAL_ADD_TOLERANCE_ID,
+            RESIDUAL_ADD_TOLERANCE_FINGERPRINT,
+        )
+        .expect("reviewed residual-add numerical contract");
     }
 
     fn set_raw(encoder: &ComputeCommandEncoderRef, index: u64, buffer: &BufferRef) {

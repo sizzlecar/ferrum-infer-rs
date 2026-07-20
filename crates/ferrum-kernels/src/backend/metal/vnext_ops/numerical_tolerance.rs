@@ -140,6 +140,10 @@ pub(super) fn assert_matches(
         ));
     }
     if violations.is_empty() {
+        let evidence = serde_json::json!({"label": label, "metrics": &metrics});
+        let encoded = serde_json::to_string(&evidence)
+            .map_err(|error| format!("{label}: cannot serialize numerical metrics: {error}"))?;
+        println!("FERRUM VNEXT NUMERICAL METRICS: {encoded}");
         Ok(metrics)
     } else {
         Err(format!(
@@ -343,7 +347,7 @@ fn compute_row_fingerprint(row: &Value) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
 }
 
-// Matches Python json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True).
+// Matches Python json.dumps for the catalog's validated number/string domain.
 fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), String> {
     match value {
         Value::Null => output.push_str("null"),
