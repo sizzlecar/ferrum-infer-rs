@@ -21,8 +21,8 @@
       "expected_recall": "ferrum-blue",
       "min_assistant_turns": 2,
       "prompts": [
-        "Remember the exact code ferrum-blue for the next turn. Reply with only OK.",
-        "Reply with only the exact remembered code."
+        "The code is ferrum-blue. Reply with only OK.",
+        "What was the code from my previous message? Reply with only that code."
       ]
     },
     {
