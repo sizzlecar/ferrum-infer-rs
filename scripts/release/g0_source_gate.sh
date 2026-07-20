@@ -65,6 +65,7 @@ run_unit() {
     scripts/release/runtime_vnext_historical_capture.py \
     scripts/release/runtime_vnext_g01a_checkpoint.py \
     scripts/release/runtime_vnext_numerical_tolerances.py \
+    scripts/release/runtime_vnext_checkpoint_artifact.py \
     scripts/release/bounded_command.py \
     scripts/release/run_gate.py \
     scripts/release/run_scenarios.py \

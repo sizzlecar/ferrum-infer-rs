@@ -35,6 +35,9 @@ RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_
 RUNTIME_VNEXT_NUMERICAL_TOLERANCES = (
     REPO_ROOT / "scripts/release/runtime_vnext_numerical_tolerances.py"
 )
+RUNTIME_VNEXT_CHECKPOINT_ARTIFACT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_checkpoint_artifact.py"
+)
 RUNTIME_VNEXT_S1_CUDA_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_checkpoint.py"
 )
@@ -465,6 +468,15 @@ def test_runtime_vnext_numerical_tolerances_selftest() -> None:
     )
 
 
+def test_runtime_vnext_checkpoint_artifact_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_CHECKPOINT_ARTIFACT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT CHECKPOINT ARTIFACT SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_s1_cuda_capacity_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_S1_CUDA_CAPACITY), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -782,6 +794,7 @@ def main() -> int:
     test_runtime_vnext_historical_capture_selftest()
     test_runtime_vnext_g01a_checkpoint_selftest()
     test_runtime_vnext_numerical_tolerances_selftest()
+    test_runtime_vnext_checkpoint_artifact_selftest()
     test_runtime_vnext_s1_cuda_checkpoint_selftest()
     test_runtime_vnext_s1_cuda_basic_collector_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()
