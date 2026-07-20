@@ -111,7 +111,10 @@ impl StructuredOutputFactory {
                 if special_ids.contains(&token.get()) {
                     special_token_marker(token)
                 } else {
-                    tokenizer.token_bytes(token).unwrap_or_default()
+                    tokenizer
+                        .token_bytes(token)
+                        .filter(|bytes| !bytes.is_empty())
+                        .unwrap_or_else(|| special_token_marker(token))
                 }
             })
             .collect::<Vec<_>>();
@@ -841,6 +844,36 @@ mod tests {
         assert!(!logits[b'[' as usize].is_finite());
         assert!(!logits[b'`' as usize].is_finite());
         assert!(!logits[EOS as usize].is_finite());
+    }
+
+    #[test]
+    fn undefined_model_vocab_ids_are_never_zero_width_tokens() {
+        let tokenizer = Arc::new(ByteTokenizer::new());
+        let undefined_token = tokenizer.vocab_size() as u32;
+        assert_eq!(
+            tokenizer.token_bytes(TokenId::new(undefined_token)),
+            Some(Vec::new()),
+            "the test tokenizer must reproduce a decoder that returns empty text for an unknown id"
+        );
+        let processor = StructuredOutputFactory::new_with_model_vocab_size(
+            tokenizer,
+            Some(undefined_token as usize + 1),
+        )
+        .unwrap()
+        .create_processor(
+            &ResponseFormat::JsonObject,
+            &StructuredOutputStart::Immediate,
+            TEST_MAX_OUTPUT_TOKENS,
+            &HashSet::new(),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut logits = vec![0.0; undefined_token as usize + 1];
+        processor.mask_logits(&mut logits, &[]).unwrap();
+        assert!(logits[b'{' as usize].is_finite());
+        assert!(!logits[undefined_token as usize].is_finite());
     }
 
     #[test]
