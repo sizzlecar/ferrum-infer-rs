@@ -71,6 +71,8 @@ fn map_top_level(name: &str) -> Option<String> {
         "model.embed_tokens.weight" => "token_embd.weight",
         "model.norm" => "output_norm",
         "model.norm.weight" => "output_norm.weight",
+        "model.lm_head" => "output",
+        "model.lm_head.weight" => "output.weight",
         "lm_head" => "output",
         "lm_head.weight" => "output.weight",
         _ => return None,
@@ -226,6 +228,7 @@ mod tests {
                 "model.language_model.embed_tokens.weight",
                 "token_embd.weight",
             ),
+            ("model.language_model.lm_head.weight", "output.weight"),
             (
                 "model.language_model.layers.0.post_attention_layernorm.weight",
                 "blk.0.post_attention_norm.weight",

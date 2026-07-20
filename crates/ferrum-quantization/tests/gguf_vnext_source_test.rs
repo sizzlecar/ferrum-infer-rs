@@ -100,7 +100,7 @@ fn mmap_source_returns_exact_dense_and_q4_k_payloads() {
 }
 
 #[test]
-fn dense_source_materializes_the_typed_float_payload_once() {
+fn dense_source_materializes_the_requested_typed_float_payload() {
     let file = build_gguf();
     let source = GgufWeightComponentSource::open(file.path()).unwrap();
     let dense = component(

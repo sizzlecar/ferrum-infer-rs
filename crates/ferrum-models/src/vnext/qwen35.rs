@@ -200,18 +200,13 @@ impl Qwen35FamilyProvider {
                     ));
                 }
             }
-            let actual_elements = weight
-                .dimensions
-                .iter()
-                .try_fold(1_u64, |total, extent| total.checked_mul(*extent))
-                .ok_or_else(|| invalid_config("weights.dimensions", "tensor size overflows u64"))?;
-            let expected_elements = expected_weight_elements(&text, config.vocab_size, weight)?;
-            if actual_elements != expected_elements {
+            let expected_dimensions = expected_weight_dimensions(&text, config.vocab_size, weight)?;
+            if !expected_dimensions.contains(&weight.dimensions) {
                 return Err(invalid_config(
                     "weights.dimensions",
                     format!(
-                        "role {:?} has {actual_elements} elements, expected {expected_elements}",
-                        weight.role
+                        "role {:?} has dimensions {:?}, expected one of {expected_dimensions:?}",
+                        weight.role, weight.dimensions,
                     ),
                 ));
             }
@@ -1443,11 +1438,11 @@ fn dense_weight_encoding(role: &str) -> Result<WeightEncoding, VNextError> {
     Ok(WeightEncoding::Dense { element_type })
 }
 
-fn expected_weight_elements(
+fn expected_weight_dimensions(
     text: &Qwen35TextConfig,
     vocab_size: u64,
     weight: &FamilyWeight,
-) -> Result<u64, VNextError> {
+) -> Result<Vec<Vec<u64>>, VNextError> {
     let hidden = text.hidden_size as u64;
     let intermediate = text.dense_intermediate_size.unwrap_or_default() as u64;
     let key_total = text.linear_qk_total_dim() as u64;
@@ -1461,23 +1456,26 @@ fn expected_weight_elements(
     let full_query_without_gate = text.full_attention_query_total_dim() as u64;
     let full_kv = text.full_attention_kv_total_dim() as u64;
     let expected = match weight.role.as_str() {
-        "embed_tokens" | "lm_head" => vocab_size.checked_mul(hidden),
-        "final_norm" | "input_layernorm" | "post_attention_layernorm" => Some(hidden),
-        "linear_attn_qkv" => conv_channels.checked_mul(hidden),
-        "linear_attn_z" => value_total.checked_mul(hidden),
-        "linear_attn_a" | "linear_attn_b" => value_heads.checked_mul(hidden),
-        "linear_attn_conv" => {
-            conv_channels.checked_mul(text.linear_attention.conv_kernel_dim as u64)
+        "embed_tokens" | "lm_head" => vec![vec![vocab_size, hidden]],
+        "final_norm" | "input_layernorm" | "post_attention_layernorm" => {
+            vec![vec![hidden]]
         }
-        "linear_attn_a_log" | "linear_attn_dt_bias" => Some(value_heads),
-        "linear_attn_norm" => Some(text.linear_attention.value_head_dim as u64),
-        "linear_attn_out" => hidden.checked_mul(value_total),
-        "self_attn_q" => full_query.checked_mul(hidden),
-        "self_attn_k" | "self_attn_v" => full_kv.checked_mul(hidden),
-        "self_attn_o" => hidden.checked_mul(full_query_without_gate),
-        "self_attn_q_norm" | "self_attn_k_norm" => Some(text.head_dim as u64),
-        "mlp_gate" | "mlp_up" => intermediate.checked_mul(hidden),
-        "mlp_down" => hidden.checked_mul(intermediate),
+        "linear_attn_qkv" => vec![vec![conv_channels, hidden]],
+        "linear_attn_z" => vec![vec![value_total, hidden]],
+        "linear_attn_a" | "linear_attn_b" => vec![vec![value_heads, hidden]],
+        "linear_attn_conv" => {
+            let kernel = text.linear_attention.conv_kernel_dim as u64;
+            vec![vec![conv_channels, kernel], vec![conv_channels, 1, kernel]]
+        }
+        "linear_attn_a_log" | "linear_attn_dt_bias" => vec![vec![value_heads]],
+        "linear_attn_norm" => vec![vec![text.linear_attention.value_head_dim as u64]],
+        "linear_attn_out" => vec![vec![hidden, value_total]],
+        "self_attn_q" => vec![vec![full_query, hidden]],
+        "self_attn_k" | "self_attn_v" => vec![vec![full_kv, hidden]],
+        "self_attn_o" => vec![vec![hidden, full_query_without_gate]],
+        "self_attn_q_norm" | "self_attn_k_norm" => vec![vec![text.head_dim as u64]],
+        "mlp_gate" | "mlp_up" => vec![vec![intermediate, hidden]],
+        "mlp_down" => vec![vec![hidden, intermediate]],
         role => {
             return Err(invalid_config(
                 "weights.role",
@@ -1485,7 +1483,7 @@ fn expected_weight_elements(
             ));
         }
     };
-    expected.ok_or_else(|| invalid_config("weights.dimensions", "tensor size overflows u64"))
+    Ok(expected)
 }
 
 fn parse_special_tokens(root: &Value, tokenizer: &Value) -> Result<SpecialTokenInput, String> {
@@ -1849,7 +1847,7 @@ mod tests {
             "self_attn_k" | "self_attn_v" => vec![full_kv, hidden],
             "self_attn_o" => vec![hidden, full_query],
             "self_attn_q_norm" | "self_attn_k_norm" => vec![text.head_dim as u64],
-            _ => vec![expected_weight_elements(text, 32, weight).unwrap()],
+            role => panic!("test has no dimensions for Qwen3.5 role {role:?}"),
         }
     }
 
@@ -2178,11 +2176,17 @@ mod tests {
         assert_eq!(prepared.fingerprint().unwrap().len(), 64);
 
         let mut malformed = config;
-        malformed.weights[0].dimensions = vec![1];
+        malformed
+            .weights
+            .iter_mut()
+            .find(|weight| weight.role == "embed_tokens")
+            .unwrap()
+            .dimensions
+            .swap(0, 1);
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&serde_json::to_value(malformed).unwrap())
-            .expect_err("shape drift must fail before backend allocation");
-        assert!(error.to_string().contains("elements, expected"), "{error}");
+            .expect_err("same-element axis drift must fail before backend allocation");
+        assert!(error.to_string().contains("dimensions"), "{error}");
     }
 
     #[test]
@@ -2379,16 +2383,45 @@ mod tests {
         let gate_up = schema
             .tensor(&packed_gate_up_weight_id(0).unwrap())
             .unwrap();
-        assert!(matches!(
-            &gate_up.physical_layout,
-            PhysicalWeightLayout::Composite { parts } if parts.len() == 2
-        ));
+        assert_eq!(gate_up.dimensions, [2, 9216, 2560]);
+        let gate = schema
+            .components
+            .iter()
+            .find(|component| component.external_names == ["blk.0.ffn_gate.weight"])
+            .unwrap();
+        let up = schema
+            .components
+            .iter()
+            .find(|component| component.external_names == ["blk.0.ffn_up.weight"])
+            .unwrap();
+        let PhysicalWeightLayout::Composite { parts } = &gate_up.physical_layout else {
+            panic!("GGUF gate/up must preserve two native physical tensors");
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].logical_offsets, [0, 0, 0]);
+        assert_eq!(parts[1].logical_offsets, [1, 0, 0]);
+        assert_eq!(parts[0].extents, [1, 9216, 2560]);
+        assert_eq!(parts[1].extents, [1, 9216, 2560]);
+        for (part, source) in parts.iter().zip([gate, up]) {
+            assert!(matches!(
+                part.layout.as_ref(),
+                PhysicalWeightLayout::BlockQuantized {
+                    blocks,
+                    block_axis: 2,
+                    block_padding: PhysicalWeightPadding::Exact,
+                } if blocks.component_id == source.id
+            ));
+        }
         assert!(schema
             .components
             .iter()
             .all(|component| component.external_names.len() == 1));
         for component in &schema.components {
-            prepared.weights().component(component).unwrap();
+            let first = prepared.weights().component(component).unwrap();
+            if matches!(component.encoding, WeightEncoding::BlockQuantized(_)) {
+                let second = prepared.weights().component(component).unwrap();
+                assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
+            }
         }
     }
 }
