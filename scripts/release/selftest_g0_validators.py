@@ -44,6 +44,12 @@ RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
 )
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
+RUNTIME_VNEXT_S2_RESPONSE_FORMAT_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s2_response_format_checkpoint.py"
+)
+RUNTIME_VNEXT_S2_API_MODALITY_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s2_api_modality_checkpoint.py"
+)
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
 BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
@@ -477,6 +483,28 @@ def test_run_scenarios_selftest() -> None:
     require("BACKEND SCENARIO RUNNER SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_runtime_vnext_s2_response_format_checkpoint_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S2_RESPONSE_FORMAT_CHECKPOINT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s2_api_modality_checkpoint_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S2_API_MODALITY_CHECKPOINT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 API MODALITY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_product_backend_sentinel_selftest() -> None:
     ok = run([sys.executable, str(PRODUCT_BACKEND_SENTINEL_GATE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -663,6 +691,8 @@ def main() -> int:
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
+    test_runtime_vnext_s2_response_format_checkpoint_selftest()
+    test_runtime_vnext_s2_api_modality_checkpoint_selftest()
     test_product_backend_sentinel_selftest()
     test_product_observability_l1_smoke_selftest()
     test_backend_runtime_goal_gate_selftest()

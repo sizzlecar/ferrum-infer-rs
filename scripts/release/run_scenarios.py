@@ -17,6 +17,8 @@ import os
 import pty
 import re
 import select
+import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -52,6 +54,8 @@ SERVE_TYPES = {
     "serve_stream",
     "serve_structured_output",
     "serve_response_format_matrix",
+    "serve_negative_api_matrix",
+    "serve_text_only_modality_matrix",
     "serve_context_limit",
     "serve_concurrency_quality",
     "serve_tool_schema_priority",
@@ -62,6 +66,11 @@ RUN_TYPES = {
     "run_multiturn",
     "run_first_token_ux",
 }
+C20_REMOTE_MEDIA_URL = (
+    "https://raw.githubusercontent.com/sizzlecar/ferrum-infer-rs/"
+    "cff4c47765ef3259b8a04890187d99c60da86394/"
+    "docs/bench/framework-validation-2026-05-25/m3_layerwise.png"
+)
 
 
 class ScenarioError(Exception):
@@ -69,15 +78,19 @@ class ScenarioError(Exception):
 
 
 class StartedServer:
-    def __init__(self, cmd: list[str], log_path: Path) -> None:
+    def __init__(self, cmd: list[str], log_path: Path, env: dict[str, str]) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cmd = list(cmd)
         self.log_path = log_path
+        self.started_at = iso_now()
+        self.finished_at: str | None = None
+        self.returncode: int | None = None
         self.file = log_path.open("wb")
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.file,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "NO_COLOR": "1"},
+            env=env,
         )
 
     def stop(self) -> None:
@@ -89,7 +102,9 @@ class StartedServer:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
         self.file.close()
-        assert_no_bad_text(self.log_path.name, self.log_path.read_text(errors="replace"))
+        self.finished_at = iso_now()
+        self.returncode = self.proc.returncode
+        assert_no_bad_text(self.log_path.name, self.log_path.read_text(encoding="utf-8"))
 
 
 def repo_root() -> Path:
@@ -128,6 +143,55 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def command_receipt(cmd: list[str]) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return {"argv": cmd, "returncode": None, "stdout": "", "stderr": str(exc)}
+    return {
+        "argv": cmd,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+def write_artifact_tree(root: Path) -> dict[str, Any]:
+    entries = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.is_symlink() or path.name == "artifact_tree.json":
+            continue
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": file_sha256(path),
+            }
+        )
+    manifest = with_canonical_sha256({
+        "schema_version": 1,
+        "artifact_root": str(root),
+        "file_count": len(entries),
+        "files": entries,
+    })
+    write_json(root / "artifact_tree.json", manifest)
+    return manifest
+
+
 def load_json_object(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
@@ -152,6 +216,10 @@ def strip_ansi(text: str) -> str:
 
 
 def assert_no_bad_text(label: str, text: str, extra: list[str] | None = None) -> None:
+    if "\ufffd" in text:
+        raise ScenarioError(f"{label}: Unicode replacement character")
+    if "\x00" in text:
+        raise ScenarioError(f"{label}: NUL byte")
     lowered = text.lower()
     for token in [*BAD_TEXT, *(extra or [])]:
         if token.lower() in lowered:
@@ -182,17 +250,17 @@ def post_json(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            return response.status, response.read().decode("utf-8", "replace")
+            return response.status, response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
+        return exc.code, exc.read().decode("utf-8")
 
 
 def get_url(url: str, *, timeout: int) -> tuple[int, str]:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
-            return response.status, response.read().decode("utf-8", "replace")
+            return response.status, response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
+        return exc.code, exc.read().decode("utf-8")
 
 
 def request_sse(
@@ -209,7 +277,7 @@ def request_sse(
     try:
         response = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace"), []
+        return exc.code, exc.read().decode("utf-8"), []
     chunks: list[str] = []
     event_times: list[float] = []
     with response:
@@ -217,7 +285,7 @@ def request_sse(
             raw = response.readline()
             if not raw:
                 break
-            line = raw.decode("utf-8", "replace")
+            line = raw.decode("utf-8")
             chunks.append(line)
             if line.startswith("data: "):
                 event_times.append(time.time())
@@ -235,6 +303,371 @@ def parse_json_response(label: str, status: int, body: str, expected_status: int
     if not isinstance(data, dict):
         raise ScenarioError(f"{label}: response must be JSON object")
     return data
+
+
+def parse_openai_error(label: str, status: int, body: str) -> dict[str, Any]:
+    require(400 <= status < 500, f"{label}: expected HTTP 4xx, got {status}: {body[:500]}")
+    assert_no_bad_text(label, body)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ScenarioError(f"{label}: invalid JSON error response: {exc}: {body[:500]}") from exc
+    require(isinstance(data, dict), f"{label}: error response must be a JSON object")
+    error = data.get("error")
+    require(isinstance(error, dict), f"{label}: missing OpenAI error object")
+    require(error.get("type") == "invalid_request_error", f"{label}: bad error type: {error}")
+    require(isinstance(error.get("message"), str) and error["message"], f"{label}: empty error message")
+    require("param" in error, f"{label}: OpenAI error is missing param: {error}")
+    require(
+        error["param"] is None or isinstance(error["param"], str),
+        f"{label}: OpenAI error param must be a string or null: {error}",
+    )
+    return error
+
+
+def with_canonical_sha256(value: dict[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    result["canonical_sha256_scope"] = "document_without_canonical_sha256_fields"
+    result["canonical_sha256"] = json_fingerprint(result)
+    return result
+
+
+def register_unique_payload(
+    payload: dict[str, Any],
+    *,
+    owner: str,
+    category: str,
+    global_owners: dict[str, str],
+    category_owners: dict[str, dict[str, str]],
+) -> str:
+    fingerprint = json_fingerprint(payload)
+    previous = global_owners.get(fingerprint)
+    require(previous is None, f"duplicate matrix payload: {previous} and {owner}")
+    per_category = category_owners.setdefault(category, {})
+    previous_category = per_category.get(fingerprint)
+    require(
+        previous_category is None,
+        f"duplicate {category} payload: {previous_category} and {owner}",
+    )
+    global_owners[fingerprint] = owner
+    per_category[fingerprint] = owner
+    return fingerprint
+
+
+def parse_text_only_model_declaration(
+    label: str, status: int, body: str, model: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = parse_json_response(label, status, body)
+    require(data.get("object") == "list", f"{label}: /v1/models object must be list")
+    models = data.get("data")
+    require(isinstance(models, list), f"{label}: /v1/models data must be an array")
+    require(models, f"{label}: /v1/models must contain at least one model")
+    for candidate in models:
+        require(isinstance(candidate, dict), f"{label}: every model entry must be an object")
+        require(
+            candidate.get("modalities") == ["text"],
+            f"{label}: every served model must declare modalities exactly ['text']: {candidate}",
+        )
+    matches = [entry for entry in models if isinstance(entry, dict) and entry.get("id") == model]
+    require(len(matches) == 1, f"{label}: expected one /v1/models entry for {model!r}, got {len(matches)}")
+    entry = matches[0]
+    require(
+        entry.get("modalities") == ["text"],
+        f"{label}: model {model!r} must declare modalities exactly ['text']: {entry}",
+    )
+    return data, entry
+
+
+def function_tool(name: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "parameters": {"type": "object"},
+        },
+    }
+
+
+def deterministic_sampling_plan(scenario: dict[str, Any]) -> dict[str, Any]:
+    require(
+        scenario.get("preset") == "P_DETERMINISTIC",
+        "scenario preset must be P_DETERMINISTIC",
+    )
+    require(
+        scenario.get("enable_thinking") is False,
+        "P_DETERMINISTIC requires enable_thinking=false",
+    )
+    sampling = scenario.get("sampling")
+    require(isinstance(sampling, dict), "P_DETERMINISTIC sampling is required")
+    expected = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 9271,
+        "stop": [],
+    }
+    require(sampling == expected, f"P_DETERMINISTIC sampling mismatch: {sampling!r}")
+    require(
+        int(scenario.get("max_tokens", 0)) == 1024,
+        "P_DETERMINISTIC max_tokens must be 1024",
+    )
+    return sampling
+
+
+def apply_deterministic_sampling(
+    payload: dict[str, Any], scenario: dict[str, Any]
+) -> None:
+    sampling = deterministic_sampling_plan(scenario)
+    payload["max_tokens"] = int(scenario["max_tokens"])
+    payload.update(sampling)
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+
+def negative_api_case(
+    category: str,
+    ordinal: int,
+    payload: dict[str, Any],
+    valid_model: str,
+) -> tuple[str, str | None, str, dict[str, Any]]:
+    require(0 <= ordinal < 6, f"unsupported C16 ordinal: {ordinal}")
+
+    if category == "invalid-tool":
+        variants: list[tuple[str, dict[str, Any], str | None, str]] = [
+            (
+                "required-without-tools",
+                {"tool_choice": "required"},
+                "tool_choice",
+                "requires at least one function tool",
+            ),
+            (
+                "unsupported-choice-mode",
+                {"tool_choice": "forced"},
+                "tool_choice",
+                "unsupported tool_choice mode",
+            ),
+            (
+                "unsupported-tool-type",
+                {"tools": [{**function_tool("search"), "type": "retrieval"}]},
+                "tools",
+                "only function tools are supported",
+            ),
+            (
+                "unsupported-choice-type",
+                {
+                    "tools": [function_tool("weather")],
+                    "tool_choice": {
+                        "type": "retrieval",
+                        "function": {"name": "weather"},
+                    },
+                },
+                "tool_choice",
+                "only function tool_choice is supported",
+            ),
+            (
+                "undeclared-tool-choice",
+                {
+                    "tools": [function_tool("weather")],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "calendar"},
+                    },
+                },
+                "tool_choice",
+                "not declared in tools",
+            ),
+            (
+                "undeclared-legacy-function",
+                {
+                    "functions": [function_tool("weather")["function"]],
+                    "function_call": {"name": "calendar"},
+                },
+                "function_call",
+                "not declared in functions",
+            ),
+        ]
+    elif category == "invalid-schema":
+        variants = [
+            (
+                "unsupported-format-type",
+                {"response_format": {"type": "xml"}},
+                "response_format.type",
+                "unsupported response_format.type",
+            ),
+            (
+                "missing-json-schema-config",
+                {"response_format": {"type": "json_schema"}},
+                "response_format.json_schema",
+                "schema is required",
+            ),
+            (
+                "null-json-schema-config",
+                {"response_format": {"type": "json_schema", "json_schema": None}},
+                "response_format.json_schema",
+                "schema is required",
+            ),
+            (
+                "missing-schema-body",
+                {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "missing", "strict": True},
+                    }
+                },
+                "response_format.json_schema",
+                "schema is required",
+            ),
+            (
+                "invalid-schema-type",
+                {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "bad-type",
+                            "strict": True,
+                            "schema": {"type": "definitely-not-a-json-type"},
+                        },
+                    }
+                },
+                "response_format.json_schema",
+                "unsupported strict json_schema",
+            ),
+            (
+                "invalid-required-keyword",
+                {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "bad-required",
+                            "strict": True,
+                            "schema": {"type": "object", "required": "name"},
+                        },
+                    }
+                },
+                "response_format.json_schema",
+                "unsupported strict json_schema",
+            ),
+        ]
+    elif category == "invalid-stream-option":
+        variants = [
+            (
+                "options-with-stream-false",
+                {"stream": False, "stream_options": {"include_usage": True}},
+                "stream_options",
+                "only valid when stream=true",
+            ),
+            (
+                "disabled-usage-with-stream-false",
+                {"stream": False, "stream_options": {"include_usage": False}},
+                "stream_options",
+                "only valid when stream=true",
+            ),
+            (
+                "empty-options-with-stream-false",
+                {"stream": False, "stream_options": {}},
+                "stream_options",
+                "only valid when stream=true",
+            ),
+            (
+                "unknown-stream-option",
+                {"stream": True, "stream_options": {"continuous_usage_stats": True}},
+                None,
+                "invalid chat completions request",
+            ),
+            (
+                "non-boolean-include-usage",
+                {"stream": True, "stream_options": {"include_usage": "yes"}},
+                None,
+                "invalid chat completions request",
+            ),
+            (
+                "non-object-stream-options",
+                {"stream": True, "stream_options": []},
+                None,
+                "invalid chat completions request",
+            ),
+        ]
+    elif category == "invalid-model":
+        case_variant = valid_model.swapcase()
+        if case_variant == valid_model:
+            case_variant = valid_model + "-CASE-MISMATCH"
+        variants = [
+            ("unknown-name", {"model": "not-a-loaded-model"}, "model", "unknown model"),
+            ("empty-name", {"model": ""}, "model", "unknown model"),
+            ("whitespace-name", {"model": " "}, "model", "unknown model"),
+            (
+                "leading-whitespace",
+                {"model": " " + valid_model},
+                "model",
+                "unknown model",
+            ),
+            ("case-mismatch", {"model": case_variant}, "model", "unknown model"),
+            (
+                "missing-adapter",
+                {"model": valid_model + ":missing-adapter"},
+                "model",
+                "unknown model",
+            ),
+        ]
+    elif category == "invalid-context":
+        variants = [
+            (
+                "sync-max-tokens",
+                {"max_tokens": 1_000_000_000},
+                None,
+                "This model context is limited to",
+            ),
+            (
+                "max-completion-tokens",
+                {"max_tokens": None, "max_completion_tokens": 1_000_000_001},
+                None,
+                "This model context is limited to",
+            ),
+            (
+                "max-completion-precedence",
+                {"max_tokens": 1, "max_completion_tokens": 1_000_000_002},
+                None,
+                "This model context is limited to",
+            ),
+            (
+                "stream-context-budget",
+                {"stream": True, "max_tokens": 1_000_000_003},
+                None,
+                "This model context is limited to",
+            ),
+            (
+                "text-array-context-budget",
+                {
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}],
+                    "max_tokens": 1_000_000_004,
+                },
+                None,
+                "This model context is limited to",
+            ),
+            (
+                "tool-template-context-budget",
+                {
+                    "tools": [function_tool("weather")],
+                    "tool_choice": "auto",
+                    "max_tokens": 1_000_000_005,
+                },
+                None,
+                "This model context is limited to",
+            ),
+        ]
+    else:
+        raise ScenarioError(f"unsupported C16 category: {category}")
+
+    variant, patch, expected_param, message_substring = variants[ordinal]
+    for key, value in patch.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    failure_contract = {"category": category, "request_patch": patch}
+    return variant, expected_param, message_substring, failure_contract
 
 
 def first_choice(data: dict[str, Any]) -> dict[str, Any]:
@@ -638,15 +1071,24 @@ def capture_health(
 def selected_scenarios(scenarios: list[dict[str, Any]], only: list[str]) -> list[dict[str, Any]]:
     if not only:
         return scenarios
+    require(
+        len(only) == len(set(only)),
+        f"--only contains duplicate scenario names: {only!r}",
+    )
     allowed = set(only)
-    return [scenario for scenario in scenarios if str(scenario.get("name")) in allowed]
+    available = {str(scenario.get("name")) for scenario in scenarios}
+    missing = sorted(allowed - available)
+    require(not missing, f"--only did not match manifest scenarios: {missing!r}")
+    selected = [scenario for scenario in scenarios if str(scenario.get("name")) in allowed]
+    require(selected, "--only selected zero scenarios")
+    return selected
 
 
 class ScenarioRunner:
     def __init__(self, args: argparse.Namespace, manifest: dict[str, Any]) -> None:
         self.args = args
         self.manifest = manifest
-        self.out = args.out
+        self.out = args.out.resolve()
         self.model = args.model or str(manifest.get("model") or "")
         self.backend = args.backend or str(manifest.get("backend") or "auto")
         self.ferrum_bin = Path(args.ferrum_bin or manifest.get("ferrum_bin") or "target/release/ferrum")
@@ -654,6 +1096,20 @@ class ScenarioRunner:
         self.base_url = args.base_url or self.manifest_base_url()
         self.started_server: StartedServer | None = None
         self.run_observability_roots: list[Path] = []
+        self.git_sha = git_output(["rev-parse", "HEAD"])
+        self.dirty_status = git_dirty_status()
+        self.execution_receipt: dict[str, Any] = {
+            "schema_version": 1,
+            "mode": "external",
+            "runner_argv": [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+            "runner_path": str(Path(__file__).resolve()),
+            "runner_sha256": file_sha256(Path(__file__).resolve()),
+            "manifest_path": str(args.manifest.resolve()),
+            "manifest_sha256": file_sha256(args.manifest.resolve()),
+            "cwd": str(Path.cwd().resolve()),
+            "git_sha": self.git_sha,
+            "dirty_status": self.dirty_status,
+        }
 
     def observability_config(self) -> dict[str, Any]:
         raw = self.manifest.get("observability")
@@ -710,6 +1166,11 @@ class ScenarioRunner:
                 raise ScenarioError(f"manifest.scenarios[{idx}] must be an object")
             if not scenario.get("name") or not scenario.get("type"):
                 raise ScenarioError(f"manifest.scenarios[{idx}] must include name and type")
+        names = [str(scenario["name"]) for scenario in scenarios]
+        require(
+            len(names) == len(set(names)),
+            "manifest.scenarios names must be unique",
+        )
         return scenarios
 
     def needs_serve(self) -> bool:
@@ -758,16 +1219,120 @@ class ScenarioRunner:
             if isinstance(extra_args, list):
                 cmd.extend(str(part) for part in extra_args)
         cmd.append(self.model)
-        self.started_server = StartedServer(cmd, self.out / "server.log")
+        binary_path = self.ferrum_bin
+        if not binary_path.is_absolute():
+            binary_path = repo_root() / binary_path
+        binary_path = binary_path.resolve(strict=True)
+        cmd[0] = str(binary_path)
+        binary_sha256 = file_sha256(binary_path)
+        hardware = command_receipt(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,uuid,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+        if self.backend == "cuda":
+            require(hardware["returncode"] == 0, f"CUDA hardware probe failed: {hardware}")
+            gpu_rows = [row.strip() for row in hardware["stdout"].splitlines() if row.strip()]
+            require(len(gpu_rows) == 1, f"CUDA S2 requires exactly one GPU: {gpu_rows!r}")
+            require("RTX 4090" in gpu_rows[0], f"CUDA S2 requires RTX 4090: {gpu_rows[0]!r}")
+        child_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FERRUM_")
+        }
+        child_env["NO_COLOR"] = "1"
+        self.execution_receipt.update(
+            {
+                "mode": "start",
+                "server_argv": cmd,
+                "binary_path": str(binary_path),
+                "binary_sha256": binary_sha256,
+                "hardware": hardware,
+                "removed_hidden_env_names": sorted(
+                    key for key in os.environ if key.startswith("FERRUM_")
+                ),
+                "child_env": {
+                    key: child_env[key]
+                    for key in (
+                        "CUDA_VISIBLE_DEVICES",
+                        "HF_HOME",
+                        "HF_HUB_CACHE",
+                        "RUST_BACKTRACE",
+                        "RUST_LOG",
+                    )
+                    if key in child_env
+                },
+            }
+        )
+        self.started_server = StartedServer(cmd, self.out / "server.log", child_env)
         capture_health(self.base_url, self.out, self.timeout)
+
+    def finalize_execution_receipt(self) -> dict[str, Any]:
+        receipt = dict(self.execution_receipt)
+        if self.started_server is not None:
+            server = self.started_server
+            receipt.update(
+                {
+                    "server_started_at": server.started_at,
+                    "server_finished_at": server.finished_at,
+                    "server_returncode": server.returncode,
+                }
+            )
+            evidence_files = {
+                "effective_config": self.out / "server.effective_config.json",
+                "decision_trace": self.out / "server.decision_trace.jsonl",
+                "server_log": self.out / "server.log",
+                "health_before": self.out / "server.health.json",
+                "health_after": self.out / "server.health.after.json",
+            }
+            evidence: dict[str, Any] = {}
+            for label, path in evidence_files.items():
+                require(path.is_file() and not path.is_symlink(), f"missing execution evidence: {path}")
+                require(path.stat().st_size > 0, f"empty execution evidence: {path}")
+                evidence[label] = {
+                    "path": str(path),
+                    "size": path.stat().st_size,
+                    "sha256": file_sha256(path),
+                }
+            receipt["evidence_files"] = evidence
+            require(
+                server.returncode in (0, -signal.SIGTERM),
+                f"unexpected ferrum serve return code: {server.returncode}",
+            )
+        receipt = with_canonical_sha256(receipt)
+        write_json(self.out / "execution_receipt.json", receipt)
+        return receipt
 
     def run_all(self) -> dict[str, Any]:
         self.out.mkdir(parents=True, exist_ok=True)
+        inputs = self.out / "inputs"
+        inputs.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(__file__).resolve(), inputs / "run_scenarios.py")
+        shutil.copyfile(self.args.manifest.resolve(), inputs / "scenario_manifest.json")
+        self.execution_receipt["input_artifacts"] = {
+            "runner": {
+                "path": str(inputs / "run_scenarios.py"),
+                "sha256": file_sha256(inputs / "run_scenarios.py"),
+            },
+            "manifest": {
+                "path": str(inputs / "scenario_manifest.json"),
+                "sha256": file_sha256(inputs / "scenario_manifest.json"),
+            },
+        }
         started_at = iso_now()
         scenarios = self.scenarios()
-        matrix_contract = response_format_matrix_contract(scenarios)
-        write_json(self.out / "response_format_matrix_contract.json", matrix_contract)
         selected = selected_scenarios(scenarios, self.args.only)
+        self.execution_receipt.update(
+            {
+                "backend": self.backend,
+                "model": self.model,
+                "selected_scenarios": [str(scenario["name"]) for scenario in selected],
+            }
+        )
+        matrix_contract = response_format_matrix_contract(selected)
+        write_json(self.out / "response_format_matrix_contract.json", matrix_contract)
         results: list[dict[str, Any]] = []
         failures = 0
         skipped = 0
@@ -792,7 +1357,15 @@ class ScenarioRunner:
         finally:
             if self.started_server is not None:
                 self.started_server.stop()
-        status = "fail" if failures else "pass"
+        self.execution_receipt.update(
+            {
+                "scenario_count": len(results),
+                "failed": failures,
+                "skipped": skipped,
+            }
+        )
+        execution_receipt = self.finalize_execution_receipt()
+        status = "fail" if failures or skipped else "pass"
         summary = {
             "schema_version": 1,
             "status": status,
@@ -801,11 +1374,14 @@ class ScenarioRunner:
             "model": self.model,
             "backend": self.backend,
             "base_url": self.base_url,
-            "git_sha": git_output(["rev-parse", "HEAD"]),
-            "dirty_status": git_dirty_status(),
+            "git_sha": self.git_sha,
+            "dirty_status": self.dirty_status,
             "started_at": started_at,
             "finished_at": iso_now(),
             "scenario_count": len(results),
+            "manifest_scenario_count": len(scenarios),
+            "requested_scenarios": list(self.args.only),
+            "selected_scenarios": [str(scenario["name"]) for scenario in selected],
             "failed": failures,
             "skipped": skipped,
             "scenarios": results,
@@ -815,9 +1391,19 @@ class ScenarioRunner:
                 "unique_json_schema_count": matrix_contract["unique_json_schema_count"],
             },
             "observability": observability,
+            "execution_receipt": {
+                "artifact": str(self.out / "execution_receipt.json"),
+                "artifact_sha256": file_sha256(self.out / "execution_receipt.json"),
+                "canonical_sha256": execution_receipt["canonical_sha256"],
+                "mode": execution_receipt["mode"],
+                "runner_sha256": execution_receipt["runner_sha256"],
+                "manifest_sha256": execution_receipt["manifest_sha256"],
+                "binary_sha256": execution_receipt.get("binary_sha256"),
+            },
             "pass_line": f"BACKEND REGRESSION SMOKE PASS: {self.out}" if status == "pass" else None,
         }
         write_json(self.out / "summary.json", summary)
+        write_artifact_tree(self.out)
         return summary
 
     def observability_summary(self) -> dict[str, Any] | None:
@@ -911,6 +1497,10 @@ class ScenarioRunner:
             return self.serve_structured_output(scenario, out)
         if typ == "serve_response_format_matrix":
             return self.serve_response_format_matrix(scenario, out)
+        if typ == "serve_negative_api_matrix":
+            return self.serve_negative_api_matrix(scenario, out)
+        if typ == "serve_text_only_modality_matrix":
+            return self.serve_text_only_modality_matrix(scenario, out)
         if typ == "serve_context_limit":
             return self.serve_context_limit(scenario, out)
         if typ == "serve_concurrency_quality":
@@ -1185,6 +1775,370 @@ class ScenarioRunner:
             "enable_thinking": thinking,
             "case_count": len(results),
             "category_counts": category_counts if format_type == "json_schema" else {},
+            "cases": results,
+        }
+
+    def serve_negative_api_matrix(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        categories = (
+            "invalid-tool",
+            "invalid-schema",
+            "invalid-stream-option",
+            "invalid-model",
+            "invalid-context",
+        )
+        cases_per_category = int(scenario.get("cases_per_category", 6))
+        require(
+            1 <= cases_per_category <= 6,
+            "serve_negative_api_matrix.cases_per_category must be 1..6",
+        )
+        global_payload_owners: dict[str, str] = {}
+        category_payload_owners: dict[str, dict[str, str]] = {}
+        global_contract_owners: dict[str, str] = {}
+        category_contract_owners: dict[str, dict[str, str]] = {}
+        category_counts = {category: 0 for category in categories}
+        results: list[dict[str, Any]] = []
+        deterministic_sampling_plan(scenario)
+
+        for category in categories:
+            for ordinal in range(cases_per_category):
+                marker = f"c16-{category}-{ordinal:03d}"
+                payload = chat_payload(
+                    self.model,
+                    [
+                        {
+                            "role": "user",
+                            "content": f"C16 boundary case {marker}; reply with the marker.",
+                        }
+                    ],
+                    max_tokens=int(scenario["max_tokens"]),
+                    temperature=0.0,
+                )
+                apply_deterministic_sampling(payload, scenario)
+                payload["metadata"] = {
+                    "ferrum_regression_case": marker,
+                    "ferrum_regression_category": category,
+                }
+                variant, expected_param, expected_message, failure_contract = negative_api_case(
+                    category,
+                    ordinal,
+                    payload,
+                    self.model,
+                )
+
+                owner = f"{category}/{ordinal:03d}"
+                request_sha256 = register_unique_payload(
+                    payload,
+                    owner=owner,
+                    category=category,
+                    global_owners=global_payload_owners,
+                    category_owners=category_payload_owners,
+                )
+                failure_contract_sha256 = register_unique_payload(
+                    failure_contract,
+                    owner=owner,
+                    category=category,
+                    global_owners=global_contract_owners,
+                    category_owners=category_contract_owners,
+                )
+                case_out = out / category / f"{ordinal:03d}"
+                case_out.mkdir(parents=True, exist_ok=True)
+                write_json(case_out / "request.json", payload)
+
+                status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+                error = parse_openai_error(owner, status, body)
+                require(
+                    error["param"] == expected_param,
+                    f"{owner}: error param {error['param']!r} != {expected_param!r}",
+                )
+                require(
+                    expected_message in error["message"],
+                    f"{owner}: error message does not identify {variant!r}: {error['message']!r}",
+                )
+                response = json.loads(body)
+                require(isinstance(response, dict), f"{owner}: response must be an object")
+                write_json(case_out / "response.json", response)
+                response_sha256 = json_fingerprint(response)
+                case_result = with_canonical_sha256(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "case_id": marker,
+                        "category": category,
+                        "variant": variant,
+                        "preset": "P_DETERMINISTIC",
+                        "ordinal": ordinal,
+                        "http_status": status,
+                        "expected_error_param": expected_param,
+                        "expected_error_message_substring": expected_message,
+                        "observed_error": error,
+                        "request_canonical_sha256": request_sha256,
+                        "failure_contract_canonical_sha256": failure_contract_sha256,
+                        "response_canonical_sha256": response_sha256,
+                        "request_artifact": str(case_out / "request.json"),
+                        "response_artifact": str(case_out / "response.json"),
+                    }
+                )
+                write_json(case_out / "result.json", case_result)
+                category_counts[category] += 1
+                results.append(case_result)
+
+        expected_count = len(categories) * cases_per_category
+        require(len(results) == expected_count, "C16 matrix case count mismatch")
+        require(
+            len(global_payload_owners) == expected_count,
+            "C16 matrix global payloads are not unique",
+        )
+        require(
+            all(len(category_payload_owners[category]) == cases_per_category for category in categories),
+            "C16 matrix category payloads are not unique",
+        )
+        require(
+            len(global_contract_owners) == expected_count,
+            "C16 matrix failure contracts are not unique",
+        )
+        require(
+            all(len(category_contract_owners[category]) == cases_per_category for category in categories),
+            "C16 matrix category failure contracts are not unique",
+        )
+        return {
+            "status": "pass",
+            "case_count": len(results),
+            "passed_count": len(results),
+            "cases_per_category": cases_per_category,
+            "preset": "P_DETERMINISTIC",
+            "category_counts": category_counts,
+            "unique_payload_count": len(global_payload_owners),
+            "unique_payload_count_by_category": {
+                category: len(category_payload_owners[category]) for category in categories
+            },
+            "unique_failure_contract_count": len(global_contract_owners),
+            "unique_failure_contract_count_by_category": {
+                category: len(category_contract_owners[category]) for category in categories
+            },
+            "cases": results,
+        }
+
+    def serve_text_only_modality_matrix(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        categories = (
+            "image-url",
+            "data-url",
+            "video-url",
+            "mixed-text-media",
+            "text-array",
+        )
+        cases_per_category = int(scenario.get("cases_per_category", 10))
+        require(
+            1 <= cases_per_category <= 10,
+            "serve_text_only_modality_matrix.cases_per_category must be 1..10",
+        )
+        deterministic_sampling_plan(scenario)
+
+        models_out = out / "models"
+        models_out.mkdir(parents=True, exist_ok=True)
+        models_request = {
+            "method": "GET",
+            "path": "/v1/models",
+            "target_model": self.model,
+        }
+        write_json(models_out / "request.json", models_request)
+        models_status, models_body = get_url(
+            self.require_base_url().rstrip("/") + "/v1/models",
+            timeout=self.timeout,
+        )
+        models_response, model_entry = parse_text_only_model_declaration(
+            "serve_text_only_modality_matrix.models",
+            models_status,
+            models_body,
+            self.model,
+        )
+        write_json(models_out / "response.json", models_response)
+        models_result = with_canonical_sha256(
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "http_status": models_status,
+                "model": self.model,
+                "declared_modalities": model_entry["modalities"],
+                "request_canonical_sha256": json_fingerprint(models_request),
+                "response_canonical_sha256": json_fingerprint(models_response),
+                "request_artifact": str(models_out / "request.json"),
+                "response_artifact": str(models_out / "response.json"),
+            }
+        )
+        write_json(models_out / "result.json", models_result)
+
+        global_payload_owners: dict[str, str] = {}
+        category_payload_owners: dict[str, dict[str, str]] = {}
+        category_counts = {category: 0 for category in categories}
+        results: list[dict[str, Any]] = []
+        rejected_media_count = 0
+        text_array_success_count = 0
+
+        for category in categories:
+            for ordinal in range(cases_per_category):
+                marker = f"c20-{category}-{ordinal:03d}"
+                prompt = f"Reply with exactly this marker and no other text: {marker}"
+                if category == "text-array":
+                    content: list[dict[str, Any]] = [
+                        {"type": "text", "text": "Reply with exactly this marker and no other text:"},
+                        {"type": "text", "text": marker},
+                    ]
+                elif category == "data-url":
+                    content = [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,"
+                                + hashlib.sha256(marker.encode("utf-8")).hexdigest()
+                            },
+                        }
+                    ]
+                elif category == "video-url":
+                    content = [
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"{C20_REMOTE_MEDIA_URL}?ferrum_case={marker}"
+                            },
+                        }
+                    ]
+                else:
+                    content = [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"{C20_REMOTE_MEDIA_URL}?ferrum_case={marker}"
+                            },
+                        }
+                    ]
+                    if category == "mixed-text-media":
+                        content.insert(0, {"type": "text", "text": prompt})
+
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": content}],
+                }
+                case_preset: str | None = None
+                if category == "text-array":
+                    apply_deterministic_sampling(payload, scenario)
+                    case_preset = "P_DETERMINISTIC"
+                payload["metadata"] = {
+                    "ferrum_regression_case": marker,
+                    "ferrum_regression_category": category,
+                    "ferrum_expected_marker": marker,
+                }
+
+                owner = f"{category}/{ordinal:03d}"
+                request_sha256 = register_unique_payload(
+                    payload,
+                    owner=owner,
+                    category=category,
+                    global_owners=global_payload_owners,
+                    category_owners=category_payload_owners,
+                )
+                case_out = out / category / f"{ordinal:03d}"
+                case_out.mkdir(parents=True, exist_ok=True)
+                write_json(case_out / "request.json", payload)
+                status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+
+                if category == "text-array":
+                    response = parse_json_response(owner, status, body)
+                    require(
+                        response.get("object") == "chat.completion",
+                        f"{owner}: response object must be chat.completion",
+                    )
+                    text = message_text(response)
+                    require(
+                        text.strip() == marker,
+                        f"{owner}: text-array response must equal {marker!r}: {text[:500]}",
+                    )
+                    require(finish_reason(response) != "length", f"{owner}: text-array length finish")
+                    observed: dict[str, Any] = {
+                        "finish_reason": finish_reason(response),
+                        "content": text,
+                    }
+                    text_array_success_count += 1
+                else:
+                    error = parse_openai_error(owner, status, body)
+                    require(
+                        error["param"] is None,
+                        f"{owner}: media boundary error param must be null: {error}",
+                    )
+                    require(
+                        "unsupported message content part type" in error["message"],
+                        f"{owner}: media must fail during request deserialization: {error}",
+                    )
+                    response = json.loads(body)
+                    require(isinstance(response, dict), f"{owner}: response must be an object")
+                    observed = {
+                        "error": error,
+                        "rejection_stage": "request-deserialization",
+                    }
+                    rejected_media_count += 1
+
+                write_json(case_out / "response.json", response)
+                response_sha256 = json_fingerprint(response)
+                case_result = with_canonical_sha256(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "case_id": marker,
+                        "category": category,
+                        "preset": case_preset,
+                        "ordinal": ordinal,
+                        "http_status": status,
+                        "declared_modalities": model_entry["modalities"],
+                        "observed": observed,
+                        "request_canonical_sha256": request_sha256,
+                        "response_canonical_sha256": response_sha256,
+                        "request_artifact": str(case_out / "request.json"),
+                        "response_artifact": str(case_out / "response.json"),
+                    }
+                )
+                write_json(case_out / "result.json", case_result)
+                category_counts[category] += 1
+                results.append(case_result)
+
+        expected_count = len(categories) * cases_per_category
+        require(len(results) == expected_count, "C20 matrix case count mismatch")
+        require(
+            len(global_payload_owners) == expected_count,
+            "C20 matrix global payloads are not unique",
+        )
+        require(
+            all(len(category_payload_owners[category]) == cases_per_category for category in categories),
+            "C20 matrix category payloads are not unique",
+        )
+        require(
+            rejected_media_count == 4 * cases_per_category,
+            "C20 media rejection count mismatch",
+        )
+        require(
+            text_array_success_count == cases_per_category,
+            "C20 text-array success count mismatch",
+        )
+        return {
+            "status": "pass",
+            "case_count": len(results),
+            "passed_count": len(results),
+            "cases_per_category": cases_per_category,
+            "preset_counts": {
+                "P_DETERMINISTIC": text_array_success_count,
+                "unpreset": rejected_media_count,
+            },
+            "category_counts": category_counts,
+            "unique_payload_count": len(global_payload_owners),
+            "unique_payload_count_by_category": {
+                category: len(category_payload_owners[category]) for category in categories
+            },
+            "rejected_media_count": rejected_media_count,
+            "text_array_success_count": text_array_success_count,
+            "declared_modalities": model_entry["modalities"],
+            "models_artifact": str(models_out / "result.json"),
             "cases": results,
         }
 
@@ -1489,6 +2443,21 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {"status": "ok"})
             return
+        if self.path == "/v1/models":
+            self.send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "mock-model",
+                            "object": "model",
+                            "modalities": ["text"],
+                        }
+                    ],
+                },
+            )
+            return
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -1498,6 +2467,141 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         payload = json.loads(body)
+        messages = payload.get("messages", [])
+        media_part = any(
+            isinstance(message, dict)
+            and isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") in {"image_url", "video_url"}
+                for part in message["content"]
+            )
+            for message in messages
+        )
+        if payload.get("model") != "mock-model":
+            self.send_openai_error("unknown model", "model")
+            return
+        if payload.get("tool_choice") == "required" and not payload.get("tools"):
+            self.send_openai_error(
+                "tool_choice=required requires at least one function tool",
+                "tool_choice",
+            )
+            return
+        if isinstance(payload.get("tool_choice"), str) and payload["tool_choice"] not in {
+            "auto",
+            "none",
+            "required",
+        }:
+            self.send_openai_error("unsupported tool_choice mode", "tool_choice")
+            return
+        tools = payload.get("tools")
+        if isinstance(tools, list) and any(
+            isinstance(tool, dict) and tool.get("type") != "function" for tool in tools
+        ):
+            self.send_openai_error("only function tools are supported", "tools")
+            return
+        tool_choice = payload.get("tool_choice")
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") != "function":
+                self.send_openai_error("only function tool_choice is supported", "tool_choice")
+                return
+            selected_name = (
+                tool_choice.get("function", {}).get("name")
+                if isinstance(tool_choice.get("function"), dict)
+                else None
+            )
+            declared_names = {
+                tool.get("function", {}).get("name")
+                for tool in tools or []
+                if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+            }
+            if selected_name not in declared_names:
+                self.send_openai_error(
+                    "tool_choice selects a function that is not declared in tools",
+                    "tool_choice",
+                )
+                return
+        function_call = payload.get("function_call")
+        if isinstance(function_call, dict):
+            selected_name = function_call.get("name")
+            declared_names = {
+                function.get("name")
+                for function in payload.get("functions") or []
+                if isinstance(function, dict)
+            }
+            if selected_name not in declared_names:
+                self.send_openai_error(
+                    "function_call selects a function that is not declared in functions",
+                    "function_call",
+                )
+                return
+        response_format = payload.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") not in {
+            None,
+            "text",
+            "json_object",
+            "json_schema",
+        }:
+            self.send_openai_error("unsupported response_format.type", "response_format.type")
+            return
+        if (
+            isinstance(response_format, dict)
+            and response_format.get("type") == "json_schema"
+            and (
+                not isinstance(response_format.get("json_schema"), dict)
+                or response_format["json_schema"].get("schema") is None
+            )
+        ):
+            self.send_openai_error(
+                "response_format.json_schema.schema is required",
+                "response_format.json_schema",
+            )
+            return
+        if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+            schema = response_format["json_schema"].get("schema")
+            if isinstance(schema, dict) and (
+                schema.get("type") == "definitely-not-a-json-type"
+                or ("required" in schema and not isinstance(schema["required"], list))
+            ):
+                self.send_openai_error(
+                    "unsupported strict json_schema",
+                    "response_format.json_schema",
+                )
+                return
+        if payload.get("stream_options") is not None and payload.get("stream") is not True:
+            self.send_openai_error(
+                "stream_options is only valid when stream=true",
+                "stream_options",
+            )
+            return
+        stream_options = payload.get("stream_options")
+        if payload.get("stream") is True and not isinstance(stream_options, (dict, type(None))):
+            self.send_openai_error("invalid chat completions request: invalid stream_options type", None)
+            return
+        if isinstance(stream_options, dict):
+            unknown_stream_options = set(stream_options) - {"include_usage"}
+            if unknown_stream_options:
+                self.send_openai_error(
+                    "invalid chat completions request: unknown field in stream_options",
+                    None,
+                )
+                return
+            include_usage = stream_options.get("include_usage")
+            if include_usage is not None and not isinstance(include_usage, bool):
+                self.send_openai_error(
+                    "invalid chat completions request: invalid stream_options.include_usage type",
+                    None,
+                )
+                return
+        effective_max_tokens = payload.get("max_completion_tokens", payload.get("max_tokens", 0))
+        if int(effective_max_tokens or 0) >= 1_000_000_000:
+            self.send_openai_error("This model context is limited to 4096 tokens", None)
+            return
+        if media_part:
+            self.send_openai_error(
+                "invalid chat completions request: unsupported message content part type",
+                None,
+            )
+            return
         echo_marker = self.echo_value_marker(payload)
         if payload.get("stream"):
             if echo_marker is not None:
@@ -1511,7 +2615,6 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 {"error": {"type": "invalid_request_error", "message": "context limit"}},
             )
             return
-        messages = payload.get("messages", [])
         prompt = " ".join(str(msg.get("content") or "") for msg in messages)
         last_user = ""
         for msg in reversed(messages):
@@ -1521,7 +2624,6 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
         exact_object = self.exact_json_object(last_user)
-        response_format = payload.get("response_format")
         response_format_type = (
             response_format.get("type") if isinstance(response_format, dict) else None
         )
@@ -1569,6 +2671,10 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             self.send_chat("Rust")
         elif "code" in prompt.lower():
             self.send_chat("ferrum-blue ferrum-loop-blue")
+        elif isinstance(payload.get("metadata"), dict) and isinstance(
+            payload["metadata"].get("ferrum_expected_marker"), str
+        ):
+            self.send_chat(str(payload["metadata"]["ferrum_expected_marker"]))
         else:
             self.send_chat("scenario-ok")
 
@@ -1613,6 +2719,19 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def send_openai_error(self, message: str, param: str | None) -> None:
+        self.send_json(
+            400,
+            {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": param,
+                    "code": None,
+                }
+            },
+        )
 
     def send_chat(self, text: str) -> None:
         self.send_json(
@@ -1734,6 +2853,16 @@ def self_test() -> int:
         "seed": 9271,
         "stop": [],
     }
+    deterministic_sampling = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 9271,
+        "stop": [],
+    }
     full_c14_contract = response_format_matrix_contract(
         [
             {
@@ -1798,6 +2927,66 @@ def self_test() -> int:
     else:
         raise AssertionError("duplicate response-format matrix scenario unexpectedly passed")
 
+    duplicate_global: dict[str, str] = {}
+    duplicate_categories: dict[str, dict[str, str]] = {}
+    register_unique_payload(
+        {"model": "mock-model", "messages": []},
+        owner="first",
+        category="duplicate",
+        global_owners=duplicate_global,
+        category_owners=duplicate_categories,
+    )
+    try:
+        register_unique_payload(
+            {"model": "mock-model", "messages": []},
+            owner="mutated-duplicate",
+            category="duplicate",
+            global_owners=duplicate_global,
+            category_owners=duplicate_categories,
+        )
+    except ScenarioError as exc:
+        if "duplicate matrix payload" not in str(exc):
+            raise AssertionError(str(exc)) from exc
+    else:
+        raise AssertionError("duplicate negative/modality payload unexpectedly passed")
+
+    try:
+        parse_openai_error(
+            "missing-param-mutation",
+            400,
+            json.dumps(
+                {
+                    "error": {
+                        "message": "mutated error",
+                        "type": "invalid_request_error",
+                    }
+                }
+            ),
+        )
+    except ScenarioError as exc:
+        if "missing param" not in str(exc):
+            raise AssertionError(str(exc)) from exc
+    else:
+        raise AssertionError("OpenAI error without param unexpectedly passed")
+
+    try:
+        parse_text_only_model_declaration(
+            "bad-modalities-mutation",
+            200,
+            json.dumps(
+                {
+                    "object": "list",
+                    "data": [{"id": "mock-model", "modalities": ["text", "image"]}],
+                }
+            ),
+            "mock-model",
+        )
+    except ScenarioError as exc:
+        if "modalities exactly" not in str(exc):
+            raise AssertionError(str(exc)) from exc
+    else:
+        raise AssertionError("non-text-only model declaration unexpectedly passed")
+
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
     port = int(server.server_address[1])
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1859,6 +3048,24 @@ def self_test() -> int:
                                 "stop": [],
                             },
                         },
+                        {
+                            "name": "negative-api-matrix",
+                            "type": "serve_negative_api_matrix",
+                            "cases_per_category": 6,
+                            "enable_thinking": False,
+                            "preset": "P_DETERMINISTIC",
+                            "max_tokens": 1024,
+                            "sampling": dict(deterministic_sampling),
+                        },
+                        {
+                            "name": "text-only-modality-matrix",
+                            "type": "serve_text_only_modality_matrix",
+                            "cases_per_category": 1,
+                            "enable_thinking": False,
+                            "preset": "P_DETERMINISTIC",
+                            "max_tokens": 1024,
+                            "sampling": dict(deterministic_sampling),
+                        },
                         {"name": "context", "type": "serve_context_limit"},
                         {
                             "name": "concurrency",
@@ -1887,11 +3094,62 @@ def self_test() -> int:
             )
             if proc.returncode != 0:
                 raise AssertionError(proc.stderr or proc.stdout)
-            if f"BACKEND REGRESSION SMOKE PASS: {out}" not in proc.stdout:
+            if f"BACKEND REGRESSION SMOKE PASS: {out.resolve()}" not in proc.stdout:
                 raise AssertionError(proc.stdout)
             summary = load_json_object(out / "summary.json")
-            if summary.get("status") != "pass" or summary.get("scenario_count") != 11:
+            if summary.get("status") != "pass" or summary.get("scenario_count") != 13:
                 raise AssertionError(summary)
+            if (
+                summary.get("manifest_scenario_count") != 13
+                or summary.get("requested_scenarios") != []
+                or len(summary.get("selected_scenarios", [])) != 13
+            ):
+                raise AssertionError(summary)
+            receipt = load_json_object(out / "execution_receipt.json")
+            receipt_sha = receipt.pop("canonical_sha256", None)
+            if (
+                receipt.get("mode") != "external"
+                or json_fingerprint(receipt) != receipt_sha
+                or summary.get("execution_receipt", {}).get("artifact_sha256")
+                != file_sha256(out / "execution_receipt.json")
+            ):
+                raise AssertionError(receipt)
+            tree = load_json_object(out / "artifact_tree.json")
+            tree_sha = tree.pop("canonical_sha256", None)
+            if json_fingerprint(tree) != tree_sha:
+                raise AssertionError(tree)
+            tree_entries = tree.get("files")
+            if not isinstance(tree_entries, list):
+                raise AssertionError(tree)
+            actual_tree_paths = {
+                path.relative_to(out).as_posix()
+                for path in out.rglob("*")
+                if path.is_file() and not path.is_symlink() and path.name != "artifact_tree.json"
+            }
+            recorded_tree_paths = {str(entry.get("path")) for entry in tree_entries}
+            if actual_tree_paths != recorded_tree_paths:
+                raise AssertionError({"actual": actual_tree_paths, "recorded": recorded_tree_paths})
+            for entry in tree_entries:
+                path = out / str(entry["path"])
+                if entry.get("size") != path.stat().st_size or entry.get("sha256") != file_sha256(path):
+                    raise AssertionError(entry)
+            unmatched_out = root / "unmatched-only-out"
+            unmatched = run_selftest_command(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--manifest",
+                    str(manifest),
+                    "--out",
+                    str(unmatched_out),
+                    "--only",
+                    "does-not-exist",
+                ]
+            )
+            if unmatched.returncode == 0:
+                raise AssertionError("unmatched --only unexpectedly passed")
+            if "--only did not match manifest scenarios" not in unmatched.stderr:
+                raise AssertionError(unmatched.stderr or unmatched.stdout)
             strict_result = load_json_object(out / "strict-matrix" / "result.json")
             if strict_result.get("category_counts") != {
                 "required": 1,
@@ -1915,6 +3173,109 @@ def self_test() -> int:
                 "json_object": 2,
             }:
                 raise AssertionError(matrix_contract)
+            negative_result = load_json_object(out / "negative-api-matrix" / "result.json")
+            if (
+                negative_result.get("case_count") != 30
+                or negative_result.get("unique_payload_count") != 30
+                or negative_result.get("unique_failure_contract_count") != 30
+            ):
+                raise AssertionError(negative_result)
+            if negative_result.get("category_counts") != {
+                "invalid-tool": 6,
+                "invalid-schema": 6,
+                "invalid-stream-option": 6,
+                "invalid-model": 6,
+                "invalid-context": 6,
+            }:
+                raise AssertionError(negative_result)
+            if negative_result.get("preset") != "P_DETERMINISTIC":
+                raise AssertionError(negative_result)
+            modality_result = load_json_object(
+                out / "text-only-modality-matrix" / "result.json"
+            )
+            if modality_result.get("case_count") != 5 or modality_result.get(
+                "unique_payload_count"
+            ) != 5:
+                raise AssertionError(modality_result)
+            if modality_result.get("category_counts") != {
+                "image-url": 1,
+                "data-url": 1,
+                "video-url": 1,
+                "mixed-text-media": 1,
+                "text-array": 1,
+            }:
+                raise AssertionError(modality_result)
+            if (
+                modality_result.get("rejected_media_count") != 4
+                or modality_result.get("text_array_success_count") != 1
+                or modality_result.get("declared_modalities") != ["text"]
+                or modality_result.get("preset_counts")
+                != {"P_DETERMINISTIC": 1, "unpreset": 4}
+            ):
+                raise AssertionError(modality_result)
+            for scenario_name, scenario_result in (
+                ("negative-api-matrix", negative_result),
+                ("text-only-modality-matrix", modality_result),
+            ):
+                cases = scenario_result.get("cases")
+                if not isinstance(cases, list) or not cases:
+                    raise AssertionError(scenario_result)
+                for case in cases:
+                    if not isinstance(case, dict):
+                        raise AssertionError(case)
+                    request_path = Path(str(case.get("request_artifact") or ""))
+                    response_path = Path(str(case.get("response_artifact") or ""))
+                    case_path = (
+                        out
+                        / scenario_name
+                        / str(case["category"])
+                        / f"{int(case['ordinal']):03d}"
+                        / "result.json"
+                    )
+                    if not request_path.is_file() or not response_path.is_file() or not case_path.is_file():
+                        raise AssertionError(case)
+                    request = load_json_object(request_path)
+                    if json_fingerprint(request) != case.get("request_canonical_sha256"):
+                        raise AssertionError(case)
+                    if json_fingerprint(load_json_object(response_path)) != case.get(
+                        "response_canonical_sha256"
+                    ):
+                        raise AssertionError(case)
+                    persisted_case = load_json_object(case_path)
+                    persisted_sha = persisted_case.pop("canonical_sha256", None)
+                    if json_fingerprint(persisted_case) != persisted_sha:
+                        raise AssertionError(case)
+                    if scenario_name == "negative-api-matrix":
+                        if case.get("preset") != "P_DETERMINISTIC":
+                            raise AssertionError(case)
+                        for key, value in deterministic_sampling.items():
+                            if request.get(key) != value:
+                                raise AssertionError({"case": case, "request": request})
+                        if request.get("chat_template_kwargs") != {"enable_thinking": False}:
+                            raise AssertionError({"case": case, "request": request})
+                    elif case.get("category") == "text-array":
+                        if case.get("preset") != "P_DETERMINISTIC":
+                            raise AssertionError(case)
+                        for key, value in deterministic_sampling.items():
+                            if request.get(key) != value:
+                                raise AssertionError({"case": case, "request": request})
+                        if (
+                            request.get("max_tokens") != 1024
+                            or request.get("chat_template_kwargs")
+                            != {"enable_thinking": False}
+                        ):
+                            raise AssertionError({"case": case, "request": request})
+                    else:
+                        forbidden = {
+                            *deterministic_sampling,
+                            "max_tokens",
+                            "chat_template_kwargs",
+                        }
+                        leaked = sorted(key for key in forbidden if key in request)
+                        if leaked or case.get("preset") is not None:
+                            raise AssertionError(
+                                {"case": case, "request": request, "leaked": leaked}
+                            )
             health = load_json_object(out / "server.health.json")
             if health.get("status") != "pass" or health.get("http_status") != 200:
                 raise AssertionError(health)
