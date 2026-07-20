@@ -67,6 +67,7 @@ fn inference_request_can_carry_structured_chat_api_request() {
             },
         }],
         tool_choice: Some(ApiToolChoice::Mode("auto".to_string())),
+        tool_call_protocol: ApiToolCallProtocol::Json,
         legacy_functions: vec![],
         legacy_function_call: None,
         response_format: Some(ApiResponseFormat {
@@ -181,6 +182,13 @@ fn stream_chunk_can_carry_structured_chat_tool_call() {
 }
 
 fn chat_request_with_tool(tool_choice: Option<ApiToolChoice>) -> InferenceRequest {
+    chat_request_with_tool_protocol(tool_choice, ApiToolCallProtocol::Json)
+}
+
+fn chat_request_with_tool_protocol(
+    tool_choice: Option<ApiToolChoice>,
+    tool_call_protocol: ApiToolCallProtocol,
+) -> InferenceRequest {
     InferenceRequest::new("rendered prompt", "mock-model").with_api_request(ApiRequest::Chat(
         ApiChatRequest {
             messages: vec![ApiChatMessage {
@@ -209,12 +217,73 @@ fn chat_request_with_tool(tool_choice: Option<ApiToolChoice>) -> InferenceReques
                 },
             }],
             tool_choice,
+            tool_call_protocol,
             legacy_functions: Vec::new(),
             legacy_function_call: None,
             response_format: None,
             stream_options: None,
         },
     ))
+}
+
+#[test]
+fn function_parameter_xml_becomes_structured_chat_response() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let text = r#"<tool_call>
+<function=weather>
+<parameter=city>
+Paris
+</parameter>
+<parameter=unit>
+c
+</parameter>
+</function>
+</tool_call>"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected XML tool call");
+    };
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.message.tool_calls[0].function.name, "weather");
+    assert_eq!(
+        response.message.tool_calls[0].function.arguments,
+        r#"{"city":"Paris","unit":"c"}"#
+    );
+}
+
+#[test]
+fn function_parameter_xml_rejects_undeclared_tool() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let text =
+        r#"<tool_call><function=calendar><parameter=date>today</parameter></function></tool_call>"#;
+
+    assert!(api_response_from_generated_text(&request, text).is_none());
+}
+
+#[test]
+fn function_parameter_xml_protocol_keeps_forced_json_arguments_fallback() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: ApiToolChoiceFunction {
+                name: "weather".to_string(),
+            },
+        }),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+
+    let Some(ApiResponse::Chat(response)) =
+        api_response_from_generated_text(&request, r#"{"city":"Paris","unit":"c"}"#)
+    else {
+        panic!("expected forced JSON argument fallback");
+    };
+    assert_eq!(response.message.tool_calls[0].function.name, "weather");
 }
 
 #[test]
@@ -397,6 +466,7 @@ fn forced_tool_choice_accepts_only_selected_tool() {
                     name: "weather".to_string(),
                 },
             }),
+            tool_call_protocol: ApiToolCallProtocol::Json,
             legacy_functions: Vec::new(),
             legacy_function_call: None,
             response_format: None,
@@ -425,6 +495,7 @@ fn generated_legacy_function_call_json_becomes_structured_chat_response() {
             messages: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
+            tool_call_protocol: ApiToolCallProtocol::Json,
             legacy_functions: vec![ApiFunction {
                 name: "weather".to_string(),
                 description: None,
@@ -457,6 +528,7 @@ fn forced_legacy_function_call_accepts_only_selected_function() {
             messages: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
+            tool_call_protocol: ApiToolCallProtocol::Json,
             legacy_functions: vec![
                 ApiFunction {
                     name: "weather".to_string(),
@@ -511,6 +583,7 @@ fn legacy_function_call_still_parses_when_tools_are_present() {
                 },
             }],
             tool_choice: Some(ApiToolChoice::Mode("auto".to_string())),
+            tool_call_protocol: ApiToolCallProtocol::Json,
             legacy_functions: vec![ApiFunction {
                 name: "legacy_weather".to_string(),
                 description: None,
