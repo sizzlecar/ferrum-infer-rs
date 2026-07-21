@@ -1073,6 +1073,21 @@ pub struct ProductEngineInput {
     pub autosized: bool,
 }
 
+/// Prepare a migrated typed family exactly once at the product composition
+/// boundary. Explicit legacy registrations return `None`; unknown metadata is
+/// rejected by the model registry instead of gaining an implicit fallback.
+pub fn prepare_registered_product_model(
+    sources: &Arc<ProductionModelSourceBundle>,
+) -> Result<Option<Arc<ferrum_models::vnext::PreparedProductionModel>>> {
+    match ferrum_models::vnext::resolve_registered_model_from_sources(sources)? {
+        ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => registration
+            .prepare_from_sources(Arc::clone(sources))
+            .map(Arc::new)
+            .map(Some),
+        ferrum_models::vnext::ProductionModelRegistration::LegacyRegistered { .. } => Ok(None),
+    }
+}
+
 impl Resolved {
     pub fn local_path(&self) -> &Path {
         &self.source.local_path

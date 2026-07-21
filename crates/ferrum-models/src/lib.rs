@@ -26,6 +26,7 @@ pub mod gguf_engine_loader;
 pub mod gguf_runtime;
 pub mod hf_download;
 pub mod image_processor;
+pub mod legacy_capabilities;
 pub mod loader;
 pub mod lora;
 pub mod mel;

@@ -9,9 +9,9 @@ use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
 use ferrum_types::{
     CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder, FerrumError,
-    HardwareCapabilities, ModelCapabilities, MoeCapabilities, ResolvedFerrumConfig, Result,
-    RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile,
-    M3_QWEN3_30B_A3B_INT4_PRESET, QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
+    HardwareCapabilities, ModelCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
+    QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -445,13 +445,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let source = product_input.source;
     let product_engine_config = product_input.engine_config;
     let model_sources = product_input.model_sources;
-    let vnext_plan_owns_context_capacity = match model_sources.as_deref() {
-        Some(sources) => matches!(
-            ferrum_models::vnext::resolve_registered_model_from_sources(sources)?,
-            ferrum_models::vnext::ProductionModelRegistration::Registered(_)
-        ),
-        None => false,
-    };
+    let prepared_model = model_sources
+        .as_ref()
+        .map(crate::source_resolver::prepare_registered_product_model)
+        .transpose()?
+        .flatten();
+    let vnext_plan_owns_context_capacity = prepared_model.is_some();
     let model_id = crate::source_resolver::public_model_id(&source);
     let model_chat_template = match model_sources.as_deref() {
         Some(sources) => crate::source_resolver::load_product_chat_template(sources),
@@ -599,16 +598,17 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // and route directly to the continuous-batching LLM engine — the
     // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
     println!();
-    let model_definition: Option<ferrum_models::ModelDefinition> =
-        if let Some(sources) = model_sources.as_deref() {
-            let mut config_manager = ferrum_models::ConfigManager::new();
-            Some(config_manager.load_from_bytes(sources.config_json())?)
-        } else if gguf_path.is_some() {
-            None
-        } else {
-            let mut config_manager = ferrum_models::ConfigManager::new();
-            Some(config_manager.load_from_path(&source.local_path).await?)
-        };
+    let model_definition: Option<ferrum_models::ModelDefinition> = if prepared_model.is_some() {
+        None
+    } else if let Some(sources) = model_sources.as_deref() {
+        let mut config_manager = ferrum_models::ConfigManager::new();
+        Some(config_manager.load_from_bytes(sources.config_json())?)
+    } else if gguf_path.is_some() {
+        None
+    } else {
+        let mut config_manager = ferrum_models::ConfigManager::new();
+        Some(config_manager.load_from_path(&source.local_path).await?)
+    };
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
@@ -616,7 +616,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // gets the layer count from ModelDefinition; the GGUF path reads it
     // from the file header — without this the placeholder plan
     // (`layers=auto`) reaches the engine and is rejected.
-    let model_layer_count = if let Some(definition) = model_definition.as_ref() {
+    let model_layer_count = if let Some(prepared) = prepared_model.as_ref() {
+        Some(prepared.descriptor().layer_count())
+    } else if let Some(definition) = model_definition.as_ref() {
         Some(definition.num_hidden_layers)
     } else if let (Some(selection), Some(p)) = (gpu_selection.as_ref(), gguf_path.as_ref()) {
         if selection.selected_layer_split_plan.is_some() {
@@ -777,8 +779,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     materialized_runtime_keys.sort();
     materialized_runtime_keys.dedup();
+    let typed_model_capabilities = prepared_model
+        .as_ref()
+        .map(|prepared| prepared.model_capabilities())
+        .transpose()?;
     let startup_auto_config = startup_auto_config(
         &device,
+        typed_model_capabilities,
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
@@ -959,11 +966,15 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             }
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-                Arc::from(match model_sources {
-                    Some(sources) => {
+                Arc::from(match (prepared_model, model_sources) {
+                    (Some(prepared), _) => {
+                        ferrum_engine::create_prepared_product_engine(engine_config, prepared)
+                            .await?
+                    }
+                    (None, Some(sources)) => {
                         ferrum_engine::create_product_engine(engine_config, sources).await?
                     }
-                    None => ferrum_engine::create_default_engine(engine_config).await?,
+                    (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
                 });
             if product_memory_enabled {
                 cache_allocated_status = Some(engine.status().await);
@@ -1246,6 +1257,7 @@ fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraS
 
 fn startup_auto_config(
     device: &ferrum_types::Device,
+    typed_model_capabilities: Option<ModelCapabilities>,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -1259,13 +1271,15 @@ fn startup_auto_config(
     let runtime_config =
         merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
     let hardware = hardware_capabilities_for_device(device);
-    let model = model_definition
-        .map(|definition| {
-            model_capabilities_from_definition_with_weight_bytes_for_hardware(
-                definition,
-                model_weight_bytes,
-                &hardware,
-            )
+    let model = typed_model_capabilities
+        .or_else(|| {
+            model_definition.map(|definition| {
+                model_capabilities_from_definition_with_weight_bytes_for_hardware(
+                    definition,
+                    model_weight_bytes,
+                    &hardware,
+                )
+            })
         })
         .unwrap_or_else(ModelCapabilities::unknown);
     let workload = match runtime_preset {
@@ -1735,10 +1749,9 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     definition: &ferrum_models::ModelDefinition,
     model_weight_bytes: Option<u64>,
 ) -> ModelCapabilities {
-    model_capabilities_from_definition_with_weight_bytes_and_conv_state_dtype(
+    ferrum_models::legacy_capabilities::from_definition_with_weight_bytes(
         definition,
         model_weight_bytes,
-        ferrum_types::DataType::FP32,
     )
 }
 
@@ -1747,132 +1760,10 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes_for_hardware(
     model_weight_bytes: Option<u64>,
     hardware: &HardwareCapabilities,
 ) -> ModelCapabilities {
-    model_capabilities_from_definition_with_weight_bytes_and_conv_state_dtype(
+    ferrum_models::legacy_capabilities::from_definition_with_weight_bytes_for_hardware(
         definition,
         model_weight_bytes,
-        qwen35_conv_state_dtype_for_hardware(hardware),
-    )
-}
-
-fn model_capabilities_from_definition_with_weight_bytes_and_conv_state_dtype(
-    definition: &ferrum_models::ModelDefinition,
-    model_weight_bytes: Option<u64>,
-    conv_state_dtype: ferrum_types::DataType,
-) -> ModelCapabilities {
-    let architecture = match definition.architecture {
-        ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
-        ferrum_models::Architecture::Qwen35Moe => "qwen3_5_moe",
-        ferrum_models::Architecture::Gemma3 => "gemma3",
-        ferrum_models::Architecture::Qwen35 => "qwen3_5",
-        ferrum_models::Architecture::Qwen3 => "qwen3",
-        ferrum_models::Architecture::Qwen2 => "qwen2",
-        ferrum_models::Architecture::Llama => "llama",
-        ferrum_models::Architecture::Mistral => "mistral",
-        ferrum_models::Architecture::Phi => "phi",
-        ferrum_models::Architecture::GPT2 => "gpt2",
-        ferrum_models::Architecture::Bert => "bert",
-        ferrum_models::Architecture::Clip => "clip",
-        ferrum_models::Architecture::Whisper => "whisper",
-        ferrum_models::Architecture::Qwen3TTS => "qwen3_tts",
-        ferrum_models::Architecture::Unknown => "unknown",
-    }
-    .to_string();
-    let head_dim = definition
-        .extra_params
-        .get("head_dim")
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .or_else(|| {
-            (definition.num_attention_heads > 0)
-                .then_some(definition.hidden_size / definition.num_attention_heads)
-        });
-    let moe = if matches!(
-        definition.architecture,
-        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
-    ) {
-        let num_experts = definition
-            .extra_params
-            .get("num_experts")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0) as usize;
-        let experts_per_token = definition
-            .extra_params
-            .get("num_experts_per_tok")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0) as usize;
-        Some(MoeCapabilities {
-            num_experts,
-            experts_per_token,
-            moe_intermediate_size: definition
-                .extra_params
-                .get("moe_intermediate_size")
-                .and_then(|value| value.as_u64())
-                .map(|value| value as usize),
-        })
-    } else {
-        None
-    };
-    let recurrent_state_bytes_per_sequence =
-        recurrent_state_bytes_per_sequence_from_definition(definition, conv_state_dtype);
-
-    ModelCapabilities {
-        architecture,
-        quantization: quantization_from_definition(definition),
-        moe,
-        max_context_len: Some(definition.max_position_embeddings),
-        num_hidden_layers: Some(definition.num_hidden_layers),
-        head_dim,
-        kv_heads: definition.num_key_value_heads,
-        estimated_weight_bytes: model_weight_bytes
-            .filter(|value| *value > 0)
-            .or_else(|| estimated_weight_bytes_from_definition(definition)),
-        recurrent_state_bytes_per_sequence,
-        supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-        graph_safe_moe: false,
-    }
-}
-
-fn qwen35_conv_state_dtype_for_hardware(hardware: &HardwareCapabilities) -> ferrum_types::DataType {
-    if hardware.backend.eq_ignore_ascii_case("cuda") && hardware.compiled_features.cuda {
-        ferrum_types::DataType::FP16
-    } else {
-        ferrum_types::DataType::FP32
-    }
-}
-
-fn recurrent_state_bytes_per_sequence_from_definition(
-    definition: &ferrum_models::ModelDefinition,
-    conv_state_dtype: ferrum_types::DataType,
-) -> Option<u64> {
-    if !matches!(
-        definition.architecture,
-        ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe
-    ) {
-        return None;
-    }
-    let config =
-        ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition).ok()?;
-    let dtypes = match definition.architecture {
-        // Dense Qwen3.5 is registered on vNext, whose temporal state follows
-        // mamba_ssm_dtype independently of the convolution state.
-        ferrum_models::Architecture::Qwen35 => {
-            ferrum_models::qwen35_config::Qwen35RecurrentStateDtypes::new(
-                conv_state_dtype,
-                config.mamba_ssm_dtype,
-            )
-        }
-        // Qwen3.5 MoE remains on the legacy indexed executor until its vNext
-        // family is registered. That executor physically owns one homogeneous
-        // pool, so admission must budget the allocation it actually makes.
-        ferrum_models::Architecture::Qwen35Moe => {
-            ferrum_models::qwen35_config::Qwen35RecurrentStateDtypes::homogeneous(conv_state_dtype)
-        }
-        _ => return None,
-    };
-    Some(
-        config
-            .recurrent_state_bytes_per_slot_with_dtypes(dtypes)
-            .ok()?,
+        hardware,
     )
 }
 
@@ -1902,94 +1793,6 @@ pub(crate) fn model_weight_bytes_from_path(path: &Path) -> Option<u64> {
         }
     }
     (total > 0).then_some(total)
-}
-
-fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> Option<String> {
-    let quant = definition.extra_params.get("quantization_config")?;
-    let method = quant
-        .get("quant_method")
-        .or_else(|| quant.get("type"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("quantized");
-    let bits = quant.get("bits").and_then(|value| value.as_u64());
-    Some(match bits {
-        Some(bits) => format!("{method}_int{bits}"),
-        None => method.to_string(),
-    })
-}
-
-fn estimated_weight_bytes_from_definition(
-    definition: &ferrum_models::ModelDefinition,
-) -> Option<u64> {
-    let params = estimated_total_parameters_from_definition(definition)?;
-    if params == 0 {
-        return None;
-    }
-    let quant = definition.extra_params.get("quantization_config");
-    let bits_per_param = quant
-        .and_then(|quant| quant.get("bits"))
-        .and_then(|value| value.as_u64())
-        .filter(|bits| *bits > 0)
-        .unwrap_or(16);
-    Some(params.saturating_mul(bits_per_param).div_ceil(8))
-}
-
-fn estimated_total_parameters_from_definition(
-    definition: &ferrum_models::ModelDefinition,
-) -> Option<u64> {
-    let dense_params = definition.to_model_info("__auto_config").num_parameters;
-    if !matches!(
-        definition.architecture,
-        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
-    ) {
-        return Some(dense_params);
-    }
-
-    let hidden = definition.hidden_size as u128;
-    let layers = definition.num_hidden_layers as u128;
-    let vocab = definition.vocab_size as u128;
-    let num_experts = definition
-        .extra_params
-        .get("num_experts")
-        .and_then(|value| value.as_u64())? as u128;
-    let moe_intermediate = definition
-        .extra_params
-        .get("moe_intermediate_size")
-        .and_then(|value| value.as_u64())
-        .or_else(|| {
-            (definition.intermediate_size > 0).then_some(definition.intermediate_size as u64)
-        })? as u128;
-    let shared_intermediate = definition
-        .extra_params
-        .get("shared_expert_intermediate_size")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0) as u128;
-
-    let embedding_params = vocab.saturating_mul(hidden);
-    let lm_head_params = embedding_params;
-    let attention_params = layers
-        .saturating_mul(4)
-        .saturating_mul(hidden)
-        .saturating_mul(hidden);
-    let norm_params = layers.saturating_mul(2).saturating_mul(hidden);
-    let router_params = layers.saturating_mul(hidden).saturating_mul(num_experts);
-    let expert_params = layers
-        .saturating_mul(num_experts)
-        .saturating_mul(3)
-        .saturating_mul(hidden)
-        .saturating_mul(moe_intermediate);
-    let shared_expert_params = layers
-        .saturating_mul(3)
-        .saturating_mul(hidden)
-        .saturating_mul(shared_intermediate);
-    let total = embedding_params
-        .saturating_add(lm_head_params)
-        .saturating_add(attention_params)
-        .saturating_add(norm_params)
-        .saturating_add(router_params)
-        .saturating_add(expert_params)
-        .saturating_add(shared_expert_params);
-    Some(total.min(u64::MAX as u128) as u64)
 }
 
 pub(crate) fn hardware_capabilities_for_device(
@@ -2271,7 +2074,9 @@ impl RuntimePresetInferenceRule {
             return false;
         }
         if self.quantization.is_some()
-            && quantization_from_definition(definition).as_deref() != self.quantization
+            && ferrum_models::legacy_capabilities::quantization_from_definition(definition)
+                .as_deref()
+                != self.quantization
         {
             return false;
         }

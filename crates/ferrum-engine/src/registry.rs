@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_models::vnext::ProductionModelSourceBundle;
+use ferrum_models::vnext::{PreparedProductionModel, ProductionModelSourceBundle};
 #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
 use ferrum_types::DataType;
 use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
@@ -51,23 +51,35 @@ pub struct ComponentConfig {
     /// Immutable role-specific product sources. This is deliberately absent
     /// from serialized EngineConfig and shared by tokenizer and executor.
     pub model_sources: Option<Arc<ProductionModelSourceBundle>>,
+    /// Prepared typed model derived from `model_sources`, when the composition
+    /// root has already resolved a migrated family.
+    pub prepared_model: Option<Arc<PreparedProductionModel>>,
 }
 
 impl ComponentConfig {
     /// Create from engine config
     pub fn from_engine_config(config: &EngineConfig) -> Self {
-        Self::from_engine_config_and_sources(config, None)
+        Self::from_engine_config_and_product_model(config, None, None)
     }
 
     pub fn from_engine_config_and_sources(
         config: &EngineConfig,
         model_sources: Option<Arc<ProductionModelSourceBundle>>,
     ) -> Self {
+        Self::from_engine_config_and_product_model(config, model_sources, None)
+    }
+
+    pub fn from_engine_config_and_product_model(
+        config: &EngineConfig,
+        model_sources: Option<Arc<ProductionModelSourceBundle>>,
+        prepared_model: Option<Arc<PreparedProductionModel>>,
+    ) -> Self {
         Self {
             engine_config: config.clone(),
             device: config.backend.device.clone(),
             component_options: config.backend.backend_options.clone(),
             model_sources,
+            prepared_model,
         }
     }
 
@@ -1119,18 +1131,40 @@ fn create_registered_vnext_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
     sources: Option<Arc<ProductionModelSourceBundle>>,
+    prepared_model: Option<Arc<PreparedProductionModel>>,
     registration: ferrum_models::vnext::RegisteredProductionModel,
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
+
+    let prepared_model_reused = prepared_model.is_some();
+    if let (Some(prepared), Some(sources)) = (prepared_model.as_ref(), sources.as_ref()) {
+        if !Arc::ptr_eq(prepared.sources(), sources) {
+            return Err(FerrumError::model(
+                "prepared product model and component sources do not share one source lease",
+            ));
+        }
+    }
+    let prepared = match prepared_model {
+        Some(prepared) => {
+            if prepared.family().external_metadata_id() != registration.external_metadata_id() {
+                return Err(FerrumError::model(format!(
+                    "prepared product metadata {} differs from registered metadata {}",
+                    prepared.family().external_metadata_id(),
+                    registration.external_metadata_id()
+                )));
+            }
+            prepared
+        }
+        None => Arc::new(match sources {
+            Some(sources) => registration.prepare_from_sources(sources)?,
+            None => registration.prepare(model_path)?,
+        }),
+    };
 
     match (registration.execution_kind(), &config.device) {
         (ProductionExecutionKind::CausalLanguage, Device::CUDA(ordinal)) => {
             #[cfg(feature = "cuda")]
             {
-                let prepared = match sources {
-                    Some(sources) => registration.prepare_from_sources(sources)?,
-                    None => registration.prepare(model_path)?,
-                };
                 let model_info = prepared.model_info(
                     config.engine_config.model.model_id.clone(),
                     config.device.clone(),
@@ -1148,6 +1182,7 @@ fn create_registered_vnext_executor(
                     family_id = %family.family_id(),
                     family_fingerprint,
                     program_fingerprint,
+                    prepared_model_reused,
                     backend = "cuda",
                     "Building registered model from a typed vNext execution plan"
                 );
@@ -1165,7 +1200,7 @@ fn create_registered_vnext_executor(
                 let (runtime, operation_registry, catalog) = composition.into_parts();
                 let executor = crate::product_composition::create_vnext_executor(
                     &config.engine_config,
-                    prepared,
+                    prepared.as_ref(),
                     model_info,
                     runtime,
                     operation_registry,
@@ -1182,7 +1217,7 @@ fn create_registered_vnext_executor(
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (ordinal, model_path, sources);
+                let _ = (ordinal, model_path, prepared);
                 Err(FerrumError::device(
                     "registered vNext CUDA composition requires the 'cuda' feature",
                 ))
@@ -1190,10 +1225,6 @@ fn create_registered_vnext_executor(
         }
         #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
         (ProductionExecutionKind::CausalLanguage, Device::Metal) => {
-            let prepared = match sources {
-                Some(sources) => registration.prepare_from_sources(sources)?,
-                None => registration.prepare(model_path)?,
-            };
             let model_info = prepared.model_info(
                 config.engine_config.model.model_id.clone(),
                 config.device.clone(),
@@ -1211,6 +1242,7 @@ fn create_registered_vnext_executor(
                 family_id = %family.family_id(),
                 family_fingerprint,
                 program_fingerprint,
+                prepared_model_reused,
                 backend = "metal",
                 "Building registered model from a typed vNext execution plan"
             );
@@ -1226,7 +1258,7 @@ fn create_registered_vnext_executor(
             let (runtime, operation_registry, catalog) = composition.into_parts();
             let executor = crate::product_composition::create_vnext_executor(
                 &config.engine_config,
-                prepared,
+                prepared.as_ref(),
                 model_info,
                 runtime,
                 operation_registry,
@@ -1269,6 +1301,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             .vnext_checkpoint_capture
             .is_some();
         let model_sources = config.model_sources.clone();
+        let prepared_model = config.prepared_model.clone();
         let model_path = model_sources
             .as_ref()
             .map(|sources| sources.weights().path().display().to_string())
@@ -1355,6 +1388,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             config,
                             std::path::Path::new(&model_path),
                             model_sources,
+                            prepared_model,
                             registration,
                         );
                     }
