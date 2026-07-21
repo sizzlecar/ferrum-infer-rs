@@ -80,6 +80,10 @@ fn map_top_level(name: &str) -> Option<String> {
     Some(mapped.to_string())
 }
 
+fn is_qwen35_text_architecture(arch: &str) -> bool {
+    matches!(arch, "qwen35" | "qwen35moe")
+}
+
 fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
     // Peel off the .weight / .bias suffix, map the stem, then re-attach.
     let (stem, suffix) = if let Some(s) = rest.strip_suffix(".weight") {
@@ -96,7 +100,9 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Gemma 3 sandwich norms: post_attention_layernorm applies to the
         // attention output (pre-residual); pre_feedforward is the pre-MLP
         // slot; post_feedforward wraps the MLP output.
-        "post_attention_layernorm" if matches!(arch, "gemma3" | "qwen35") => "post_attention_norm",
+        "post_attention_layernorm" if arch == "gemma3" || is_qwen35_text_architecture(arch) => {
+            "post_attention_norm"
+        }
         "pre_feedforward_layernorm" => "ffn_norm",
         "post_feedforward_layernorm" => "post_ffw_norm",
         "post_attention_layernorm" => "ffn_norm",
@@ -110,15 +116,15 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         "self_attn.k_norm" => "attn_k_norm",
         // Qwen3.5 gated-delta recurrent attention. These are storage names,
         // not operation names; execution remains selected by typed contracts.
-        "linear_attn.in_proj_qkv" if arch == "qwen35" => "attn_qkv",
-        "linear_attn.in_proj_z" if arch == "qwen35" => "attn_gate",
-        "linear_attn.in_proj_b" if arch == "qwen35" => "ssm_beta",
-        "linear_attn.in_proj_a" if arch == "qwen35" => "ssm_alpha",
-        "linear_attn.conv1d" if arch == "qwen35" => "ssm_conv1d",
-        "linear_attn.A_log" if arch == "qwen35" => "ssm_a",
-        "linear_attn.dt_bias" if arch == "qwen35" => "ssm_dt.bias",
-        "linear_attn.norm" if arch == "qwen35" => "ssm_norm",
-        "linear_attn.out_proj" if arch == "qwen35" => "ssm_out",
+        "linear_attn.in_proj_qkv" if is_qwen35_text_architecture(arch) => "attn_qkv",
+        "linear_attn.in_proj_z" if is_qwen35_text_architecture(arch) => "attn_gate",
+        "linear_attn.in_proj_b" if is_qwen35_text_architecture(arch) => "ssm_beta",
+        "linear_attn.in_proj_a" if is_qwen35_text_architecture(arch) => "ssm_alpha",
+        "linear_attn.conv1d" if is_qwen35_text_architecture(arch) => "ssm_conv1d",
+        "linear_attn.A_log" if is_qwen35_text_architecture(arch) => "ssm_a",
+        "linear_attn.dt_bias" if is_qwen35_text_architecture(arch) => "ssm_dt.bias",
+        "linear_attn.norm" if is_qwen35_text_architecture(arch) => "ssm_norm",
+        "linear_attn.out_proj" if is_qwen35_text_architecture(arch) => "ssm_out",
         // Dense MLP projections
         "mlp.gate_proj" => "ffn_gate",
         "mlp.up_proj" => "ffn_up",
@@ -131,11 +137,11 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Loaded as flat fp32 buffers; the MoE runtime slices per-expert
         // at forward time.
         "mlp.router" => "ffn_gate_inp",
-        "mlp.gate" if arch == "qwen35" => "ffn_gate_inp",
-        "mlp.shared_expert_gate" if arch == "qwen35" => "ffn_gate_inp_shexp",
-        "mlp.shared_expert.gate_proj" if arch == "qwen35" => "ffn_gate_shexp",
-        "mlp.shared_expert.up_proj" if arch == "qwen35" => "ffn_up_shexp",
-        "mlp.shared_expert.down_proj" if arch == "qwen35" => "ffn_down_shexp",
+        "mlp.gate" if is_qwen35_text_architecture(arch) => "ffn_gate_inp",
+        "mlp.shared_expert_gate" if is_qwen35_text_architecture(arch) => "ffn_gate_inp_shexp",
+        "mlp.shared_expert.gate_proj" if is_qwen35_text_architecture(arch) => "ffn_gate_shexp",
+        "mlp.shared_expert.up_proj" if is_qwen35_text_architecture(arch) => "ffn_up_shexp",
+        "mlp.shared_expert.down_proj" if is_qwen35_text_architecture(arch) => "ffn_down_shexp",
         "mlp.gate_exps" => "ffn_gate_exps",
         "mlp.up_exps" => "ffn_up_exps",
         "mlp.down_exps" => "ffn_down_exps",
@@ -275,11 +281,13 @@ mod tests {
                 "blk.0.ssm_out.weight",
             ),
         ];
-        for (source, expected) in cases {
-            assert_eq!(
-                ferrum_to_gguf_with_arch("qwen35", source).as_deref(),
-                Some(expected)
-            );
+        for architecture in ["qwen35", "qwen35moe"] {
+            for (source, expected) in cases {
+                assert_eq!(
+                    ferrum_to_gguf_with_arch(architecture, source).as_deref(),
+                    Some(expected)
+                );
+            }
         }
     }
 
@@ -301,13 +309,15 @@ mod tests {
             ("mlp.up_exps.weight", "ffn_up_exps.weight"),
             ("mlp.down_exps.weight", "ffn_down_exps.weight"),
         ];
-        for (suffix, expected) in cases {
-            let source = format!("model.language_model.layers.7.{suffix}");
-            let expected = format!("blk.7.{expected}");
-            assert_eq!(
-                ferrum_to_gguf_with_arch("qwen35", &source).as_deref(),
-                Some(expected.as_str())
-            );
+        for architecture in ["qwen35", "qwen35moe"] {
+            for (suffix, expected) in cases {
+                let source = format!("model.language_model.layers.7.{suffix}");
+                let expected = format!("blk.7.{expected}");
+                assert_eq!(
+                    ferrum_to_gguf_with_arch(architecture, &source).as_deref(),
+                    Some(expected.as_str())
+                );
+            }
         }
     }
 
