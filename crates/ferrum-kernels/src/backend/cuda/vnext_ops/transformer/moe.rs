@@ -109,7 +109,7 @@ struct MoeLaunchShape {
     device_ordinal: i32,
 }
 
-pub(super) struct CudaRoutedSharedSwiGluMoeProvider {
+pub(in crate::backend::cuda::vnext_ops) struct CudaRoutedSharedSwiGluMoeProvider {
     descriptor: OperationProviderDescriptor,
     kernels: MoeCudaKernels,
     multiprocessor_count: u64,
@@ -117,7 +117,9 @@ pub(super) struct CudaRoutedSharedSwiGluMoeProvider {
 }
 
 impl CudaRoutedSharedSwiGluMoeProvider {
-    pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+    pub(in crate::backend::cuda::vnext_ops) fn new(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = routed_shared_swiglu_moe_contract().map_err(contract_error)?;
         let capability = CapabilityId::new(ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID)
             .map_err(contract_error)?;
