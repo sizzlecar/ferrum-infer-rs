@@ -912,6 +912,9 @@ fn sparse_moe_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
             "mlp.shared_expert.down_proj.weight",
             true,
         ),
+        ("moe_stacked_gate_proj", "mlp.gate_exps.weight", false),
+        ("moe_stacked_up_proj", "mlp.up_exps.weight", false),
+        ("moe_stacked_down_proj", "mlp.down_exps.weight", false),
         ("moe_fused_gate_up_proj", "mlp.experts.gate_up_proj", false),
         ("moe_fused_down_proj", "mlp.experts.down_proj", false),
         (
