@@ -89,6 +89,8 @@ pub struct StaticInitializationReceipt {
     initialized_resource_count: usize,
     uploaded_component_count: usize,
     uploaded_bytes: u64,
+    imported_component_count: usize,
+    imported_bytes: u64,
     upload_command_count: usize,
     submission_batch_count: usize,
     source_files: BTreeSet<String>,
@@ -107,6 +109,14 @@ impl StaticInitializationReceipt {
         self.uploaded_bytes
     }
 
+    pub const fn imported_component_count(&self) -> usize {
+        self.imported_component_count
+    }
+
+    pub const fn imported_bytes(&self) -> u64 {
+        self.imported_bytes
+    }
+
     pub const fn upload_command_count(&self) -> usize {
         self.upload_command_count
     }
@@ -120,8 +130,9 @@ impl StaticInitializationReceipt {
     }
 }
 
-/// Typestate owner proving every plan-static allocation was zeroed and every
-/// selected weight component reached a quiescent successful upload fence.
+/// Typestate owner proving every plan-static allocation was initialized and
+/// every selected weight component reached either a quiescent successful
+/// upload fence or one sealed all-or-nothing import transaction.
 #[must_use = "initialized static resources must be handed to the plan runtime"]
 pub struct InitializedResourceTransaction<D>
 where
@@ -407,16 +418,22 @@ where
 {
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
     let placements = weight_placements(family, plan).map_err(contract_failure)?;
-    let uploaded_component_count = placements.len();
-    let uploaded_bytes = placements.values().try_fold(0_u64, |total, placement| {
-        total.checked_add(placement.length_bytes).ok_or_else(|| {
-            contract_failure(VNextError::InvalidExecutionPlan {
-                reason: "static initialization upload bytes overflow u64".to_owned(),
-            })
-        })
-    })?;
-
     let runtime = Arc::clone(transaction.lease().runtime());
+    let mut weight_import = if placements.is_empty() {
+        None
+    } else {
+        match runtime.begin_static_weight_import() {
+            None => None,
+            Some(Ok(import)) => Some(import),
+            Some(Err(error)) => {
+                return Err(InitializationStepFailure::Quiescent(device_failure(
+                    &runtime,
+                    &error,
+                    "static_weight_import_begin",
+                )))
+            }
+        }
+    };
     let created_stream = runtime.create_stream().map_err(|error| {
         InitializationStepFailure::Quiescent(device_failure(
             &runtime,
@@ -429,9 +446,16 @@ where
     let mut pending_staging_bytes = 0_u64;
     let mut submission_batch_count = 0_usize;
     let mut upload_command_count = 0_usize;
+    let mut uploaded_component_count = 0_usize;
+    let mut uploaded_bytes = 0_u64;
+    let mut imported_component_count = 0_usize;
+    let mut imported_bytes = 0_u64;
     let mut source_files = BTreeSet::new();
 
     for allocation in plan.payload().memory().static_allocations() {
+        if allocation.usage() == BufferUsage::Weights && weight_import.is_some() {
+            continue;
+        }
         let command = with_static_buffer(transaction, allocation.resource_id(), |buffer| {
             runtime.encode_zero(buffer, 0, allocation.size_bytes())
         })
@@ -458,6 +482,23 @@ where
         // entire model in host memory.
         let upload = prepare_upload(source, component, placement).map_err(contract_failure)?;
         source_files.extend(upload.source_files().iter().cloned());
+        if let Some(import) = weight_import.as_mut() {
+            with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                import.import_component(&upload, buffer, placement.offset_bytes)
+            })
+            .map_err(|error| {
+                runtime_or_contract_failure(&runtime, error, "static_weight_component_import")
+            })?;
+            imported_component_count += 1;
+            imported_bytes = imported_bytes
+                .checked_add(placement.length_bytes)
+                .ok_or_else(|| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "static initialization imported bytes overflow u64".to_owned(),
+                    })
+                })?;
+            continue;
+        }
         let element_bytes = upload.element_type().size_bytes();
         let maximum_chunk_bytes =
             policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element_bytes;
@@ -531,6 +572,14 @@ where
             upload_command_count += 1;
             source_offset = source_end;
         }
+        uploaded_component_count += 1;
+        uploaded_bytes = uploaded_bytes
+            .checked_add(placement.length_bytes)
+            .ok_or_else(|| {
+                contract_failure(VNextError::InvalidExecutionPlan {
+                    reason: "static initialization uploaded bytes overflow u64".to_owned(),
+                })
+            })?;
     }
 
     if !pending.is_empty() {
@@ -542,10 +591,21 @@ where
         )?;
         submission_batch_count += 1;
     }
+    if let Some(import) = weight_import {
+        import.seal().map_err(|error| {
+            InitializationStepFailure::Quiescent(device_failure(
+                &runtime,
+                &error,
+                "static_weight_import_seal",
+            ))
+        })?;
+    }
     Ok(StaticInitializationReceipt {
         initialized_resource_count: plan.payload().memory().static_allocations().len(),
         uploaded_component_count,
         uploaded_bytes,
+        imported_component_count,
+        imported_bytes,
         upload_command_count,
         submission_batch_count,
         source_files,

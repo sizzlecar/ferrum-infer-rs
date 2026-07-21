@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, VNextError,
+    WeightComponentPayload,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable
@@ -1641,6 +1642,24 @@ impl<C> DeviceCommandBatch<C> {
     }
 }
 
+/// Cold-path transaction for backends that can bind immutable weight
+/// components directly instead of allocating and uploading one contiguous
+/// physical arena.
+///
+/// The session must not publish a partially imported arena. [`Self::seal`]
+/// consumes the complete transaction and is the only point at which imported
+/// regions may become visible to device execution.
+pub trait StaticWeightImportSession<B, E> {
+    fn import_component(
+        &mut self,
+        payload: &WeightComponentPayload<'_>,
+        destination: &B,
+        destination_offset_bytes: u64,
+    ) -> Result<(), E>;
+
+    fn seal(self: Box<Self>) -> Result<(), E>;
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
 ///
 /// Associated buffer, stream, command, and error types preserve compile-time
@@ -1662,6 +1681,17 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error>;
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor;
+
+    /// Begins an optional all-or-nothing static-weight import transaction.
+    /// Returning `None` selects the portable zero-and-upload path. The default
+    /// preserves existing CUDA, CPU, and test runtime behavior.
+    fn begin_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        None
+    }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error>;
 

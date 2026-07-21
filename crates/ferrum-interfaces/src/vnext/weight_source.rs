@@ -56,6 +56,13 @@ impl RetainedHostMemoryRegion {
         &self.owner.stable_bytes()[self.offset_bytes..self.offset_bytes + self.length_bytes]
     }
 
+    /// Entire stable allocation. Backends use this only to prove that a
+    /// page-aligned native view enclosing [`Self::bytes`] remains within the
+    /// retained owner.
+    pub fn owner_bytes(&self) -> &[u8] {
+        self.owner.stable_bytes()
+    }
+
     pub const fn offset_bytes(&self) -> usize {
         self.offset_bytes
     }

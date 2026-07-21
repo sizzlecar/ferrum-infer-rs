@@ -753,6 +753,11 @@ pub(crate) struct RuntimeTrace {
     pub(crate) synchronize_fails: bool,
     pub(crate) stream_failed: bool,
     pub(crate) describe_error_panics: bool,
+    pub(crate) static_weight_import_enabled: bool,
+    pub(crate) static_weight_import_begin_calls: u64,
+    pub(crate) static_weight_import_seal_calls: u64,
+    pub(crate) imported_component_count: usize,
+    pub(crate) imported_bytes: u64,
 }
 
 pub(crate) struct TestRuntime {
@@ -761,6 +766,51 @@ pub(crate) struct TestRuntime {
     pub(crate) use_alternate_descriptor: AtomicBool,
     pub(crate) descriptor_reads_until_drift: AtomicU64,
     pub(crate) trace: Arc<Mutex<RuntimeTrace>>,
+}
+
+struct TestStaticWeightImport {
+    trace: Arc<Mutex<RuntimeTrace>>,
+    components: Vec<(ResourceId, u64, u64)>,
+}
+
+impl StaticWeightImportSession<TestBuffer, TestRuntimeError> for TestStaticWeightImport {
+    fn import_component(
+        &mut self,
+        payload: &WeightComponentPayload<'_>,
+        destination: &TestBuffer,
+        destination_offset_bytes: u64,
+    ) -> Result<(), TestRuntimeError> {
+        let length_bytes = u64::try_from(payload.bytes().len())
+            .map_err(|_| TestRuntimeError("import payload exceeds u64"))?;
+        let end = destination_offset_bytes
+            .checked_add(length_bytes)
+            .ok_or(TestRuntimeError("import range overflows"))?;
+        if destination.descriptor.usage != BufferUsage::Weights
+            || destination.descriptor.element_type != payload.element_type()
+            || end > destination.descriptor.size_bytes
+        {
+            return Err(TestRuntimeError("import range differs from destination"));
+        }
+        self.components.push((
+            destination.descriptor.resource_id.clone(),
+            destination_offset_bytes,
+            length_bytes,
+        ));
+        Ok(())
+    }
+
+    fn seal(self: Box<Self>) -> Result<(), TestRuntimeError> {
+        let imported_bytes = self
+            .components
+            .iter()
+            .try_fold(0_u64, |total, (_, _, length)| total.checked_add(*length))
+            .ok_or(TestRuntimeError("import byte count overflows"))?;
+        let mut trace = self.trace.lock().unwrap();
+        trace.static_weight_import_seal_calls += 1;
+        trace.imported_component_count += self.components.len();
+        trace.imported_bytes += imported_bytes;
+        Ok(())
+    }
 }
 
 impl DeviceRuntime for TestRuntime {
@@ -807,6 +857,22 @@ impl DeviceRuntime for TestRuntime {
             descriptor.size_bytes += 1;
         }
         descriptor
+    }
+
+    fn begin_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.static_weight_import_enabled {
+            return None;
+        }
+        trace.static_weight_import_begin_calls += 1;
+        Some(Ok(Box::new(TestStaticWeightImport {
+            trace: Arc::clone(&self.trace),
+            components: Vec::new(),
+        })))
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
