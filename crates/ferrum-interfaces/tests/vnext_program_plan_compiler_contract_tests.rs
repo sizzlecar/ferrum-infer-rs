@@ -2,6 +2,24 @@ mod vnext_core_contract;
 
 use vnext_core_contract::*;
 
+fn prepared_with_weight_schema(schema: WeightSchema) -> PreparedModelFamily {
+    TypedFamilyRegistration::new(FixedSchemaFamily { schema })
+        .prepare(&json!({"width": 4}))
+        .unwrap()
+}
+
+fn compile_options() -> ProgramPlanCompileOptions {
+    ProgramPlanCompileOptions::new(BTreeMap::from([(
+        id("value.input"),
+        ProgramTensorSpec {
+            dimensions: vec![4],
+            element_type: ElementType::F32,
+            layout: ResolvedTensorLayout::Contiguous,
+        },
+    )]))
+    .unwrap()
+}
+
 #[test]
 fn semantic_program_compiles_through_the_registered_provider_authority() {
     let family = TestRegistry::new().prepare();
@@ -59,6 +77,84 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
         0
     );
     assert!(registry.estimator_calls.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn dense_binding_in_mixed_checkpoint_does_not_require_the_container_format() {
+    let mut schema = TestFamily.weight_schema(&TestConfig { width: 4 }).unwrap();
+    schema.format_id = id("weight-format.safetensors.mixed-gptq");
+    schema.layout_id = id("weight-layout.synthetic.mixed-gptq");
+    let family = prepared_with_weight_schema(schema);
+    let catalog = catalog();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+
+    let compilation = ProgramPlanCompiler::compile(
+        &family,
+        &catalog,
+        &policy(4096),
+        &registry.planning(),
+        &compile_options(),
+    )
+    .unwrap();
+    let weight = compilation.executable().execution_plan().payload().nodes()[0]
+        .values()
+        .iter()
+        .find(|binding| binding.usage() == BufferUsage::Weights)
+        .unwrap();
+    assert_eq!(
+        weight.weight().unwrap().format_id(),
+        &id("weight-format.safetensors.mixed-gptq")
+    );
+}
+
+#[test]
+fn quantized_binding_still_requires_its_format_and_abi_before_allocation() {
+    let schema = WeightSchema {
+        format_id: id("weight-format.synthetic.quantized"),
+        layout_id: id("weight-layout.synthetic.quantized"),
+        version: ContractVersion::new(1, 0),
+        components: vec![WeightComponentSpec {
+            id: id("weight.component"),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec!["weight.bin".to_owned()],
+            dimensions: vec![1],
+            encoding: WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                format_id: id("quantization.synthetic.int4"),
+                logical_values_per_block: 4,
+                bytes_per_block: 2,
+            }),
+            required: true,
+        }],
+        tensors: vec![WeightTensorSpec {
+            id: id("weight.matrix"),
+            dimensions: vec![4],
+            logical_element_type: ElementType::F32,
+            physical_layout: PhysicalWeightLayout::BlockQuantized {
+                blocks: PhysicalWeightComponentBinding::exact_contiguous(id("weight.component")),
+                block_axis: 0,
+                block_padding: PhysicalWeightPadding::Exact,
+            },
+            required: true,
+        }],
+    };
+    let family = prepared_with_weight_schema(schema);
+    let catalog = catalog();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+
+    let error = ProgramPlanCompiler::compile(
+        &family,
+        &catalog,
+        &policy(4096),
+        &registry.planning(),
+        &compile_options(),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("weight-format.synthetic.quantized"),
+        "{message}"
+    );
+    assert!(message.contains("quantization.synthetic.int4"), "{message}");
 }
 
 #[test]
