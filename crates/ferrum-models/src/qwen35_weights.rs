@@ -42,8 +42,31 @@ pub struct Qwen35ResolvedWeightSpec {
     /// Numeric position captured from an expert wildcard. String ordering is
     /// not semantic here: expert 10 must never precede expert 2.
     pub expert_index: Option<u32>,
+    pub source: Option<Qwen35ResolvedWeightSource>,
     pub required: bool,
     pub present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Qwen35ResolvedWeightSource {
+    Dense {
+        values: String,
+    },
+    Gptq {
+        qweight: String,
+        scales: String,
+        qzeros: String,
+        g_idx: Option<String>,
+    },
+}
+
+impl Qwen35ResolvedWeightSource {
+    pub fn primary_name(&self) -> &str {
+        match self {
+            Self::Dense { values } => values,
+            Self::Gptq { qweight, .. } => qweight,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,17 +379,19 @@ impl Qwen35WeightInventory {
 
         Ok(Qwen35ResolvedWeightPlan {
             prefix: manifest.prefix.clone(),
-            global_tensors: self.resolve_weight_specs(&manifest.global_tensors),
+            global_tensors: self.resolve_weight_specs(&manifest.global_tensors)?,
             layers: manifest
                 .layers
                 .iter()
-                .map(|layer| Qwen35ResolvedLayerWeights {
-                    layer_index: layer.layer_index,
-                    attention: layer.attention,
-                    mlp: layer.mlp,
-                    tensors: self.resolve_weight_specs(&layer.tensors),
+                .map(|layer| {
+                    Ok(Qwen35ResolvedLayerWeights {
+                        layer_index: layer.layer_index,
+                        attention: layer.attention,
+                        mlp: layer.mlp,
+                        tensors: self.resolve_weight_specs(&layer.tensors)?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
         })
     }
 
@@ -593,33 +618,68 @@ impl Qwen35WeightInventory {
             .then_some(qweight)
     }
 
-    fn resolve_weight_specs(&self, specs: &[Qwen35WeightSpec]) -> Vec<Qwen35ResolvedWeightSpec> {
+    fn resolve_weight_specs(
+        &self,
+        specs: &[Qwen35WeightSpec],
+    ) -> Result<Vec<Qwen35ResolvedWeightSpec>, String> {
         specs
             .iter()
             .flat_map(|spec| {
                 let matches = self.matching_names(spec);
                 if matches.is_empty() {
-                    vec![Qwen35ResolvedWeightSpec {
+                    return vec![Ok(Qwen35ResolvedWeightSpec {
                         role: spec.role.clone(),
                         name: spec.name.clone(),
                         expert_index: None,
+                        source: None,
                         required: spec.required,
                         present: false,
-                    }]
-                } else {
-                    matches
-                        .into_iter()
-                        .map(|(expert_index, name)| Qwen35ResolvedWeightSpec {
+                    })];
+                }
+                matches
+                    .into_iter()
+                    .map(|(expert_index, name)| {
+                        let source = self.resolved_source(&name)?;
+                        Ok(Qwen35ResolvedWeightSpec {
                             role: spec.role.clone(),
-                            name,
+                            name: name.clone(),
                             expert_index,
+                            source: Some(source),
                             required: spec.required,
                             present: true,
                         })
-                        .collect()
-                }
+                    })
+                    .collect()
             })
             .collect()
+    }
+
+    fn resolved_source(&self, name: &str) -> Result<Qwen35ResolvedWeightSource, String> {
+        let Some(module) = name.strip_suffix(".qweight") else {
+            return Ok(Qwen35ResolvedWeightSource::Dense {
+                values: name.to_owned(),
+            });
+        };
+        let scales = format!("{module}.scales");
+        let qzeros = format!("{module}.qzeros");
+        let missing = [&scales, &qzeros]
+            .into_iter()
+            .filter(|sidecar| !self.contains(sidecar))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "incomplete GPTQ source bundle for {name:?}; missing {}",
+                missing.join(", ")
+            ));
+        }
+        let g_idx = format!("{module}.g_idx");
+        Ok(Qwen35ResolvedWeightSource::Gptq {
+            qweight: name.to_owned(),
+            scales,
+            qzeros,
+            g_idx: self.contains(&g_idx).then_some(g_idx),
+        })
     }
 }
 
@@ -1148,19 +1208,26 @@ mod tests {
 
     #[test]
     fn resolves_expert_wildcards_in_numeric_order() {
-        let inventory = Qwen35WeightInventory::from_names([
-            "model.layers.0.mlp.experts.10.gate_proj.qweight",
-            "model.layers.0.mlp.experts.2.gate_proj.qweight",
-            "model.layers.0.mlp.experts.1.gate_proj.qweight",
-            "model.layers.0.mlp.experts.0.gate_proj.qweight",
-            "model.layers.0.mlp.experts.01.gate_proj.qweight",
-            "model.layers.0.mlp.experts.invalid.gate_proj.qweight",
+        let mut names = [10, 2, 1, 0]
+            .into_iter()
+            .flat_map(|expert| {
+                ["qweight", "scales", "qzeros"].map(|component| {
+                    format!("model.layers.0.mlp.experts.{expert}.gate_proj.{component}")
+                })
+            })
+            .collect::<Vec<_>>();
+        names.extend([
+            "model.layers.0.mlp.experts.01.gate_proj.qweight".to_owned(),
+            "model.layers.0.mlp.experts.invalid.gate_proj.qweight".to_owned(),
         ]);
-        let resolved = inventory.resolve_weight_specs(&[Qwen35WeightSpec {
-            role: "moe_per_expert_gate_proj_qweight".to_owned(),
-            name: "model.layers.0.mlp.experts.*.gate_proj.qweight".to_owned(),
-            required: false,
-        }]);
+        let inventory = Qwen35WeightInventory::from_names(names);
+        let resolved = inventory
+            .resolve_weight_specs(&[Qwen35WeightSpec {
+                role: "moe_per_expert_gate_proj_qweight".to_owned(),
+                name: "model.layers.0.mlp.experts.*.gate_proj.qweight".to_owned(),
+                required: false,
+            }])
+            .unwrap();
 
         assert_eq!(
             resolved
@@ -1169,6 +1236,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(0), Some(1), Some(2), Some(10)]
         );
+        assert!(resolved
+            .iter()
+            .all(|weight| matches!(weight.source, Some(Qwen35ResolvedWeightSource::Gptq { .. }))));
         assert_eq!(
             resolved
                 .iter()
@@ -1197,6 +1267,22 @@ mod tests {
                 .map(|tensor| tensor.name.as_str()),
             Some("model.layers.0.mlp.experts.0.gate_proj.qweight")
         );
+        let source = &plan
+            .layer_tensor(0, "moe_per_expert_gate_proj_qweight")
+            .unwrap()
+            .source;
+        assert!(matches!(
+            source,
+            Some(Qwen35ResolvedWeightSource::Gptq {
+                qweight,
+                scales,
+                qzeros,
+                g_idx: Some(g_idx),
+            }) if qweight.ends_with(".qweight")
+                && scales.ends_with(".scales")
+                && qzeros.ends_with(".qzeros")
+                && g_idx.ends_with(".g_idx")
+        ));
         assert!(plan.validation().is_pass());
     }
 
