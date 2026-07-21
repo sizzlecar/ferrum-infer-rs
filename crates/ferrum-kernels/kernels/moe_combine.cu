@@ -83,6 +83,27 @@ extern "C" __global__ void weighted_sum_batched_f16(
     out[b * hidden + h] = __float2half(acc);
 }
 
+// Shared-expert merge used by the backend-neutral routed/shared SwiGLU MoE
+// contract: dst += values * sigmoid(token_gate). The gate has one scalar per
+// token and is broadcast across the hidden dimension.
+extern "C" __global__ void apply_token_gate_and_add_inplace_f16(
+    __half* __restrict__ dst,              // [batch, hidden]
+    const __half* __restrict__ values,     // [batch, hidden]
+    const __half* __restrict__ token_gate, // [batch]
+    int batch,
+    int hidden
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * hidden;
+    if (idx >= total) return;
+
+    int token = idx / hidden;
+    float gate = __half2float(token_gate[token]);
+    float scale = 1.0f / (1.0f + expf(-gate));
+    float merged = __half2float(dst[idx]) + __half2float(values[idx]) * scale;
+    dst[idx] = __float2half(merged);
+}
+
 // Same logic for f32 outputs (CPU parity testing convenience).
 extern "C" __global__ void moe_combine_f32(
     const float* __restrict__ packed_down,

@@ -37,10 +37,19 @@ use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 
 mod attention;
 mod causal_attention;
+#[cfg(feature = "vllm-moe-marlin")]
+mod moe;
+#[cfg(feature = "vllm-moe-marlin")]
+mod moe_launch;
+#[cfg(feature = "vllm-moe-marlin")]
 mod moe_weights;
+#[cfg(feature = "vllm-moe-marlin")]
+mod moe_workspace;
 
 pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
 pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
+#[cfg(feature = "vllm-moe-marlin")]
+pub(super) use moe::CudaRoutedSharedSwiGluMoeProvider;
 
 const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";

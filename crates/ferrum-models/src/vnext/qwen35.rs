@@ -1350,11 +1350,45 @@ fn append_safetensors_composite_moe_weight(
     tensors: &mut Vec<WeightTensorSpec>,
 ) -> Result<(), VNextError> {
     let dimensions = moe_logical_dimensions(text, logical_role)?;
+    let sources = source_roles
+        .into_iter()
+        .map(|role| required_weight(config, Some(layer_index), role))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_dimensions = &dimensions[1..];
+    if sources.iter().all(|source| {
+        matches!(
+            &source.source_encoding,
+            FamilyWeightSourceEncoding::Dense { .. }
+        ) && source.dimensions == source_dimensions
+    }) {
+        let component_id = moe_component_id(layer_index, logical_role)?;
+        components.push(WeightComponentSpec {
+            id: component_id.clone(),
+            role: WeightComponentRole::Values,
+            external_names: sources
+                .iter()
+                .map(|source| source.external_name.clone())
+                .collect(),
+            dimensions: dimensions.clone(),
+            encoding: WeightEncoding::Dense {
+                element_type: materialized_element_type(logical_role),
+            },
+            required: true,
+        });
+        tensors.push(WeightTensorSpec {
+            id: moe_weight_id(layer_index, logical_role)?,
+            dimensions,
+            logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+            physical_layout: PhysicalWeightLayout::Dense { component_id },
+            required: true,
+        });
+        return Ok(());
+    }
+
     let mut extents = dimensions.clone();
     extents[0] = 1;
     let mut parts = Vec::with_capacity(2);
-    for (partition, role) in source_roles.into_iter().enumerate() {
-        let source = required_weight(config, Some(layer_index), role)?;
+    for (partition, source) in sources.into_iter().enumerate() {
         let layout = append_safetensors_source_layout(source, &extents, quantization, components)?;
         let mut offsets = vec![0_u64; dimensions.len()];
         offsets[0] = partition as u64;
@@ -2535,6 +2569,10 @@ fn moe_weight_id(layer_index: u32, role: &str) -> Result<WeightId, VNextError> {
     WeightId::new(scoped_weight_key(Some(layer_index), role, "weight"))
 }
 
+fn moe_component_id(layer_index: u32, role: &str) -> Result<WeightId, VNextError> {
+    WeightId::new(scoped_weight_key(Some(layer_index), role, "component"))
+}
+
 fn moe_weight_value_id(layer_index: u32, role: &str) -> Result<ProgramValueId, VNextError> {
     ProgramValueId::new(scoped_weight_key(Some(layer_index), role, "value.weight"))
 }
@@ -3294,6 +3332,21 @@ mod tests {
             .unwrap();
         assert_eq!(schema.physical_component_refs(&routed.id).unwrap().len(), 2);
         assert_eq!(schema.physical_component_refs(&down.id).unwrap().len(), 2);
+        let shared_gate_up = schema
+            .tensor(&moe_weight_id(0, MOE_SHARED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        assert!(matches!(
+            &shared_gate_up.physical_layout,
+            PhysicalWeightLayout::Dense { component_id }
+                if component_id == &moe_component_id(0, MOE_SHARED_GATE_UP_ROLE).unwrap()
+        ));
+        let shared_component = schema
+            .components
+            .iter()
+            .find(|component| component.id == moe_component_id(0, MOE_SHARED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        assert_eq!(shared_component.dimensions, shared_gate_up.dimensions);
+        assert_eq!(shared_component.external_names.len(), 2);
     }
 
     #[test]
