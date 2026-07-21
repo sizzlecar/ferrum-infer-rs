@@ -9,13 +9,14 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
     CapabilityId, ContractVersion, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping,
+    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities,
+    GatedDeltaExecutionForm, GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping,
     OperationContract, OperationFailure, OperationInvocation, OperationProvider,
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProfilePhase, ProviderId, ProviderWorkspaceRequirement,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 
@@ -48,6 +49,7 @@ const CONTROL_BYTES: u64 = 16;
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionProvider {
     descriptor: OperationProviderDescriptor,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
     functions: AttentionFunctions,
 }
 
@@ -68,6 +70,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = gated_delta_recurrent_attention_contract().map_err(contract_error)?;
+        let execution_capabilities = GatedDeltaExecutionCapabilities::recurrent_only();
         let capability = CapabilityId::new(GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID)
             .map_err(contract_error)?;
         if !runtime.descriptor().capabilities.contains(&capability) {
@@ -84,6 +87,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             crate::ptx::GATED_DELTA_RULE.as_bytes(),
             crate::ptx::SANDWICH_NORM.as_bytes(),
             crate::ptx::RESIDUAL_ADD.as_bytes(),
+            GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION.as_bytes(),
         ]);
         let estimator_fingerprint =
             implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
@@ -149,6 +153,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         };
         Ok(Self {
             descriptor,
+            execution_capabilities,
             functions,
         })
     }
@@ -206,6 +211,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         encode_attention(
             self.descriptor.provider_implementation_fingerprint(),
             &self.functions,
+            self.execution_capabilities,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -545,6 +551,7 @@ struct AttentionLaunch {
     conv_state_region: usize,
     delta_state_region: usize,
     host_control: usize,
+    execution_form: GatedDeltaExecutionForm,
     tokens: u64,
     tokens_i32: i32,
 }
@@ -567,6 +574,7 @@ struct SharedRegions {
 fn encode_attention(
     provider_fingerprint: &str,
     functions: &AttentionFunctions,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     if invocation.participants().is_empty()
@@ -662,6 +670,16 @@ fn encode_attention(
             ElementType::F32,
         )?);
         let tokens_i32 = checked_i32(tokens, "attention participant token count")?;
+        let execution_form = execution_capabilities
+            .select(tokens, GatedDeltaExecutionPreference::RecurrentScan)
+            .map_err(|error| error.to_string())?;
+        if let GatedDeltaExecutionForm::ChunkedScan(plan) = execution_form {
+            return Err(format!(
+                "CUDA gated-delta provider selected an uninstalled {} form for {} tokens",
+                execution_form.as_str(),
+                plan.token_count()
+            ));
+        }
         let host_control = host_storage.len();
         host_storage.push(sequence_control(tokens_i32 as u32));
         launches.push(AttentionLaunch {
@@ -670,6 +688,7 @@ fn encode_attention(
             conv_state_region,
             delta_state_region,
             host_control,
+            execution_form,
             tokens,
             tokens_i32,
         });
@@ -701,6 +720,7 @@ fn encode_attention(
             .u64(launch.conv_state_region as u64)
             .u64(launch.delta_state_region as u64)
             .u64(launch.host_control as u64)
+            .bytes(launch.execution_form.as_str().as_bytes())
             .u64(launch.tokens)
             .i32(launch.tokens_i32);
     }

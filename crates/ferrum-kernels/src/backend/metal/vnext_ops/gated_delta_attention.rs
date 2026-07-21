@@ -7,12 +7,13 @@ use std::sync::Arc;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
     DeviceBatchingForm, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
-    GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping, OperationFailure,
+    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
+    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProviderWorkspaceRequirement,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
@@ -44,10 +45,39 @@ const COLLECT_CONV_STATE_KERNEL: &str = "vnext_gated_delta_collect_conv_state_f1
 const COPY_F16_KERNEL: &str = "vnext_gated_delta_copy_f16";
 const QK_NORM_KERNEL: &str = "vnext_gated_delta_qk_norm_f32";
 const DELTA_KERNEL: &str = "vnext_gated_delta_rule_tiled16_f32_state";
+const CHUNK_KKT_INVERSE_KERNEL: &str = "vnext_gated_delta_chunk_kkt_inverse_c64";
+const CHUNK_UW_KERNEL: &str = "vnext_gated_delta_chunk_uw_c64";
+const CHUNK_QK_KERNEL: &str = "vnext_gated_delta_chunk_qk_c64";
+const CHUNK_CARRY_KERNEL: &str = "vnext_gated_delta_chunk_carry_c64";
+const CHUNK_OUTPUT_KERNEL: &str = "vnext_gated_delta_chunk_output_c64";
 const GATED_NORM_KERNEL: &str = "vnext_gated_delta_gated_norm_f16";
 const CONV_STATE_ELEMENT_TYPE: ElementType = ElementType::F16;
 const DELTA_STATE_ELEMENT_TYPE: ElementType = ElementType::F32;
 const VALUE_TILE: u64 = 16;
+const GATED_DELTA_CHUNK_SIZE: u32 = 64;
+const GATED_DELTA_CHUNK_KEY_DIM_LIMIT: u64 = 128;
+const GATED_DELTA_CHUNK_INITIAL_CROSSOVER_TOKENS: u64 = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct MetalGatedDeltaExecutionCostModel {
+    chunked_scan_crossover_tokens: u64,
+}
+
+impl MetalGatedDeltaExecutionCostModel {
+    const fn initial_c64() -> Self {
+        Self {
+            chunked_scan_crossover_tokens: GATED_DELTA_CHUNK_INITIAL_CROSSOVER_TOKENS,
+        }
+    }
+
+    const fn preference(self, tokens: u64) -> GatedDeltaExecutionPreference {
+        if tokens >= self.chunked_scan_crossover_tokens {
+            GatedDeltaExecutionPreference::ChunkedScan
+        } else {
+            GatedDeltaExecutionPreference::RecurrentScan
+        }
+    }
+}
 
 pub(super) struct MetalGatedDeltaPipelines {
     prepare_conv: ComputePipelineState,
@@ -56,6 +86,11 @@ pub(super) struct MetalGatedDeltaPipelines {
     copy_f16: ComputePipelineState,
     qk_norm: ComputePipelineState,
     delta: ComputePipelineState,
+    chunk_kkt_inverse: ComputePipelineState,
+    chunk_uw: ComputePipelineState,
+    chunk_qk: ComputePipelineState,
+    chunk_carry: ComputePipelineState,
+    chunk_output: ComputePipelineState,
     gated_norm: ComputePipelineState,
 }
 
@@ -89,6 +124,11 @@ impl MetalGatedDeltaPipelines {
             copy_f16: pipeline(COPY_F16_KERNEL)?,
             qk_norm: pipeline(QK_NORM_KERNEL)?,
             delta: pipeline(DELTA_KERNEL)?,
+            chunk_kkt_inverse: pipeline(CHUNK_KKT_INVERSE_KERNEL)?,
+            chunk_uw: pipeline(CHUNK_UW_KERNEL)?,
+            chunk_qk: pipeline(CHUNK_QK_KERNEL)?,
+            chunk_carry: pipeline(CHUNK_CARRY_KERNEL)?,
+            chunk_output: pipeline(CHUNK_OUTPUT_KERNEL)?,
             gated_norm: pipeline(GATED_NORM_KERNEL)?,
         })
     }
@@ -96,6 +136,8 @@ impl MetalGatedDeltaPipelines {
 
 pub(super) struct MetalGatedDeltaRecurrentAttentionProvider {
     descriptor: OperationProviderDescriptor,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
+    execution_cost_model: MetalGatedDeltaExecutionCostModel,
     attention: Arc<MetalGatedDeltaPipelines>,
     linear: Arc<MetalLinearPipelines>,
     primitives: Arc<MetalPrimitivePipelines>,
@@ -109,6 +151,10 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
         let contract = gated_delta_recurrent_attention_contract().map_err(super::contract_error)?;
+        let execution_capabilities =
+            GatedDeltaExecutionCapabilities::with_chunked_scan(GATED_DELTA_CHUNK_SIZE)
+                .map_err(super::contract_error)?;
+        let execution_cost_model = MetalGatedDeltaExecutionCostModel::initial_c64();
         let descriptor = provider_descriptor(
             runtime,
             &contract,
@@ -130,11 +176,14 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
                 include_str!("linear.metal").as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
+                GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION.as_bytes(),
                 PROVIDER_ID.as_bytes(),
             ]),
         )?;
         Ok(Self {
             descriptor,
+            execution_capabilities,
+            execution_cost_model,
             attention,
             linear,
             primitives,
@@ -193,6 +242,8 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
             Arc::clone(&self.attention),
             Arc::clone(&self.linear),
             Arc::clone(&self.primitives),
+            self.execution_capabilities,
+            self.execution_cost_model,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -384,6 +435,63 @@ impl AttentionShape {
         }
         Ok(())
     }
+
+    fn supports_chunked_scan_c64(self) -> Result<bool, String> {
+        if self.key_dim > GATED_DELTA_CHUNK_KEY_DIM_LIMIT {
+            return Ok(false);
+        }
+        let chunk = u64::from(GATED_DELTA_CHUNK_SIZE);
+        let inverse_bytes =
+            checked_product(&[self.value_heads, chunk, ElementType::F16.size_bytes()])?;
+        let core_bytes = checked_product(&[
+            self.value_heads,
+            self.value_dim,
+            ElementType::F32.size_bytes(),
+        ])?;
+        let uw_bytes = checked_product(&[
+            self.value_heads,
+            self.value_dim
+                .checked_add(self.key_dim)
+                .ok_or_else(|| "Metal gated-delta chunk U/W width overflows".to_owned())?,
+            ElementType::F16.size_bytes(),
+        ])?;
+        let qkv_bytes = checked_product(&[self.qkv_features, ElementType::F16.size_bytes()])?;
+        let raw_qk_bytes =
+            checked_product(&[self.key_heads, chunk, ElementType::F16.size_bytes()])?;
+        let value_bytes = checked_product(&[
+            self.value_heads,
+            self.value_dim,
+            ElementType::F32.size_bytes(),
+        ])?;
+        Ok(inverse_bytes <= core_bytes && uw_bytes <= qkv_bytes && raw_qk_bytes <= value_bytes)
+    }
+
+    fn validate_chunked_launch_extents(self, tokens: u64) -> Result<(), String> {
+        let chunk = u64::from(GATED_DELTA_CHUNK_SIZE);
+        let uw_width = self
+            .value_dim
+            .checked_add(self.key_dim)
+            .ok_or_else(|| "Metal gated-delta chunk U/W width overflows".to_owned())?;
+        for (name, extent) in [
+            (
+                "chunk inverse elements",
+                checked_product(&[tokens, self.value_heads, chunk])?,
+            ),
+            (
+                "chunk U/W elements",
+                checked_product(&[tokens, self.value_heads, uw_width])?,
+            ),
+            (
+                "chunk QK elements",
+                checked_product(&[tokens, self.key_heads, chunk])?,
+            ),
+        ] {
+            if extent > u64::from(u32::MAX) {
+                return Err(format!("Metal gated-delta {name} exceed MSL uint indexing"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[repr(C)]
@@ -546,6 +654,7 @@ struct ParticipantLaunch {
     core: u64,
     residual_elements: u32,
     conv_state_elements: u32,
+    execution_form: GatedDeltaExecutionForm,
     params: GatedDeltaParams,
     qkv_projection: LinearLaunch,
     z_projection: LinearLaunch,
@@ -571,6 +680,8 @@ fn encode_attention(
     attention: Arc<MetalGatedDeltaPipelines>,
     linear: Arc<MetalLinearPipelines>,
     primitives: Arc<MetalPrimitivePipelines>,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
+    execution_cost_model: MetalGatedDeltaExecutionCostModel,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
     ensure_invocation(&invocation, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?;
@@ -651,6 +762,17 @@ fn encode_attention(
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
         let tokens = token_range.immediate_tokens();
         shape.validate_launch_extents(tokens)?;
+        let participant_capabilities = if shape.supports_chunked_scan_c64()? {
+            execution_capabilities
+        } else {
+            GatedDeltaExecutionCapabilities::recurrent_only()
+        };
+        let execution_form = participant_capabilities
+            .select(tokens, execution_cost_model.preference(tokens))
+            .map_err(|error| error.to_string())?;
+        if matches!(execution_form, GatedDeltaExecutionForm::ChunkedScan(_)) {
+            shape.validate_chunked_launch_extents(tokens)?;
+        }
         let packed_start = token_range.immediate_token_range().start;
         let input_start = if input_shared {
             packed_start
@@ -808,6 +930,7 @@ fn encode_attention(
             core,
             residual_elements,
             conv_state_elements,
+            execution_form,
             params: shape.params(tokens)?,
             qkv_projection,
             z_projection,
@@ -926,17 +1049,51 @@ fn encode_attention(
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
     let dispatch_count = if packed_enabled {
-        (launches.len() as u64).saturating_mul(4).saturating_add(10)
+        launches.iter().fold(10_u64, |total, launch| {
+            total
+                .saturating_add(3)
+                .saturating_add(delta_dispatch_count(launch.execution_form))
+        })
     } else {
-        (launches.len() as u64).saturating_mul(14)
+        launches.iter().fold(0_u64, |total, launch| {
+            total
+                .saturating_add(13)
+                .saturating_add(delta_dispatch_count(launch.execution_form))
+        })
     };
-    MetalDeviceCommand::operation(
-        "vnext_gated_delta_recurrent_attention",
-        regions,
-        move |encoder, regions| {
-            encoder.record_compute_dispatches(dispatch_count);
-            if let Some(packed) = packed.as_ref() {
-                enqueue_packed_attention(
+    let chunked_count = launches
+        .iter()
+        .filter(|launch| {
+            matches!(
+                launch.execution_form,
+                GatedDeltaExecutionForm::ChunkedScan(_)
+            )
+        })
+        .count();
+    let operation_label = if chunked_count == launches.len() {
+        "vnext_gated_delta_chunked_attention"
+    } else if chunked_count == 0 {
+        "vnext_gated_delta_recurrent_attention"
+    } else {
+        "vnext_gated_delta_mixed_attention"
+    };
+    MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(dispatch_count);
+        if let Some(packed) = packed.as_ref() {
+            enqueue_packed_attention(
+                &attention,
+                &linear,
+                &primitives,
+                encoder.compute_encoder(),
+                regions,
+                shared,
+                layout,
+                packed,
+                &launches,
+            );
+        } else {
+            for launch in &launches {
+                enqueue_attention(
                     &attention,
                     &linear,
                     &primitives,
@@ -944,26 +1101,12 @@ fn encode_attention(
                     regions,
                     shared,
                     layout,
-                    packed,
-                    &launches,
+                    launch,
                 );
-            } else {
-                for launch in &launches {
-                    enqueue_attention(
-                        &attention,
-                        &linear,
-                        &primitives,
-                        encoder.compute_encoder(),
-                        regions,
-                        shared,
-                        layout,
-                        launch,
-                    );
-                }
             }
-            Ok(())
-        },
-    )
+        }
+        Ok(())
+    })
     .map_err(|error| error.to_string())?
     .with_work_shape(
         if packed_enabled {
@@ -977,6 +1120,13 @@ fn encode_attention(
         token_count,
     )
     .map_err(|error| error.to_string())
+}
+
+const fn delta_dispatch_count(form: GatedDeltaExecutionForm) -> u64 {
+    match form {
+        GatedDeltaExecutionForm::RecurrentScan => 1,
+        GatedDeltaExecutionForm::ChunkedScan(_) => 5,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1246,6 +1396,24 @@ fn dispatch_delta(
     state: &MetalBufferRegion,
     launch: &ParticipantLaunch,
 ) {
+    match launch.execution_form {
+        GatedDeltaExecutionForm::RecurrentScan => {
+            dispatch_recurrent_delta(pipelines, encoder, scratch, state, launch)
+        }
+        GatedDeltaExecutionForm::ChunkedScan(plan) => {
+            debug_assert_eq!(plan.chunk_size(), GATED_DELTA_CHUNK_SIZE);
+            dispatch_chunked_delta_c64(pipelines, encoder, scratch, state, launch);
+        }
+    }
+}
+
+fn dispatch_recurrent_delta(
+    pipelines: &MetalGatedDeltaPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    scratch: &MetalBufferRegion,
+    state: &MetalBufferRegion,
+    launch: &ParticipantLaunch,
+) {
     encoder.set_compute_pipeline_state(&pipelines.delta);
     for (index, offset) in [
         launch.query,
@@ -1269,6 +1437,97 @@ fn dispatch_delta(
             1,
         ),
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
+    );
+}
+
+fn dispatch_chunked_delta_c64(
+    pipelines: &MetalGatedDeltaPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    scratch: &MetalBufferRegion,
+    state: &MetalBufferRegion,
+    launch: &ParticipantLaunch,
+) {
+    let params = &launch.params;
+    let chunks = u64::from(params.tokens).div_ceil(u64::from(GATED_DELTA_CHUNK_SIZE));
+
+    encoder.set_compute_pipeline_state(&pipelines.chunk_kkt_inverse);
+    for (index, offset) in [launch.key, launch.g, launch.beta, launch.core]
+        .into_iter()
+        .enumerate()
+    {
+        set_region_offset(encoder, index as u64, scratch, offset);
+    }
+    set_params(encoder, 4, params);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(chunks, u64::from(params.value_heads), 1),
+        MTLSize::new(THREADS_PER_GROUP, 1, 1),
+    );
+
+    encoder.set_compute_pipeline_state(&pipelines.chunk_uw);
+    for (index, offset) in [
+        launch.key,
+        launch.value,
+        launch.g,
+        launch.beta,
+        launch.core,
+        launch.qkv,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set_region_offset(encoder, index as u64, scratch, offset);
+    }
+    set_params(encoder, 6, params);
+    dispatch_elements(
+        encoder,
+        u64::from(params.tokens)
+            * u64::from(params.value_heads)
+            * (u64::from(params.value_dim) + u64::from(params.key_dim)),
+    );
+
+    encoder.set_compute_pipeline_state(&pipelines.chunk_qk);
+    for (index, offset) in [launch.query, launch.key, launch.value]
+        .into_iter()
+        .enumerate()
+    {
+        set_region_offset(encoder, index as u64, scratch, offset);
+    }
+    set_params(encoder, 3, params);
+    dispatch_elements(
+        encoder,
+        u64::from(params.tokens) * u64::from(params.key_heads) * u64::from(GATED_DELTA_CHUNK_SIZE),
+    );
+
+    encoder.set_compute_pipeline_state(&pipelines.chunk_carry);
+    for (index, offset) in [launch.query, launch.key, launch.g, launch.qkv]
+        .into_iter()
+        .enumerate()
+    {
+        set_region_offset(encoder, index as u64, scratch, offset);
+    }
+    set_region_offset(encoder, 4, state, 0);
+    set_region_offset(encoder, 5, scratch, launch.core);
+    set_params(encoder, 6, params);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            u64::from(params.value_dim).div_ceil(VALUE_TILE),
+            u64::from(params.value_heads),
+            1,
+        ),
+        MTLSize::new(THREADS_PER_GROUP, 1, 1),
+    );
+
+    encoder.set_compute_pipeline_state(&pipelines.chunk_output);
+    for (index, offset) in [launch.value, launch.g, launch.qkv, launch.core]
+        .into_iter()
+        .enumerate()
+    {
+        set_region_offset(encoder, index as u64, scratch, offset);
+    }
+    set_params(encoder, 4, params);
+    dispatch_elements(
+        encoder,
+        u64::from(params.tokens) * u64::from(params.value_heads) * u64::from(params.value_dim),
     );
 }
 

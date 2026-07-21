@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
 use super::{
     AliasPolicy, AttributeConstraint, AttributeId, AttributeSchema, AttributeSpec,
@@ -25,6 +26,8 @@ pub const GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID: &str =
     "operation.gated_delta_recurrent_attention";
 pub const GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.gated_delta_recurrent_attention.f16";
+pub const GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION: &str =
+    "gated-delta-execution-form-selector-v1";
 pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_attention";
 pub const CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f16";
@@ -72,6 +75,139 @@ impl GatedDeltaValueHeadMapping {
         Self::ALL
             .into_iter()
             .find(|candidate| candidate.as_str() == value)
+    }
+}
+
+/// Physical gated-delta implementation available to one provider for an
+/// already-compatible operation shape. This capability is deliberately not a
+/// model attribute: the same immutable model plan can select a different form
+/// as the request work shape changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatedDeltaExecutionCapabilities {
+    chunked_scan: Option<GatedDeltaChunkedScanCapability>,
+}
+
+impl GatedDeltaExecutionCapabilities {
+    pub const fn recurrent_only() -> Self {
+        Self { chunked_scan: None }
+    }
+
+    pub fn with_chunked_scan(chunk_size: u32) -> Result<Self, VNextError> {
+        Ok(Self {
+            chunked_scan: Some(GatedDeltaChunkedScanCapability::new(chunk_size)?),
+        })
+    }
+
+    pub const fn chunked_scan(self) -> Option<GatedDeltaChunkedScanCapability> {
+        self.chunked_scan
+    }
+
+    /// Selects a physical form for one participant. Providers must first
+    /// remove capabilities that do not support the resolved dtype or shape.
+    pub fn select(
+        self,
+        token_count: u64,
+        preference: GatedDeltaExecutionPreference,
+    ) -> Result<GatedDeltaExecutionForm, VNextError> {
+        if token_count == 0 {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "gated-delta execution requires at least one token".to_owned(),
+            });
+        }
+        match (preference, self.chunked_scan, token_count) {
+            (GatedDeltaExecutionPreference::ChunkedScan, Some(capability), 2..) => {
+                Ok(GatedDeltaExecutionForm::ChunkedScan(
+                    GatedDeltaChunkPlan::new(token_count, capability.chunk_size),
+                ))
+            }
+            _ => Ok(GatedDeltaExecutionForm::RecurrentScan),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatedDeltaChunkedScanCapability {
+    chunk_size: NonZeroU32,
+}
+
+impl GatedDeltaChunkedScanCapability {
+    fn new(chunk_size: u32) -> Result<Self, VNextError> {
+        let chunk_size =
+            NonZeroU32::new(chunk_size).ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "gated-delta chunk size must be positive".to_owned(),
+            })?;
+        Ok(Self { chunk_size })
+    }
+
+    pub const fn chunk_size(self) -> u32 {
+        self.chunk_size.get()
+    }
+}
+
+/// Cost-model preference kept separate from physical support. A provider may
+/// derive it from calibrated crossover data and live batch topology without
+/// changing the immutable model plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedDeltaExecutionPreference {
+    RecurrentScan,
+    ChunkedScan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatedDeltaChunkPlan {
+    token_count: u64,
+    chunk_size: NonZeroU32,
+    chunk_count: u64,
+    final_chunk_tokens: u32,
+}
+
+impl GatedDeltaChunkPlan {
+    fn new(token_count: u64, chunk_size: NonZeroU32) -> Self {
+        debug_assert!(token_count > 0);
+        let chunk_size_u64 = u64::from(chunk_size.get());
+        let chunk_count = ((token_count - 1) / chunk_size_u64) + 1;
+        let remainder = (token_count % chunk_size_u64) as u32;
+        Self {
+            token_count,
+            chunk_size,
+            chunk_count,
+            final_chunk_tokens: if remainder == 0 {
+                chunk_size.get()
+            } else {
+                remainder
+            },
+        }
+    }
+
+    pub const fn token_count(self) -> u64 {
+        self.token_count
+    }
+
+    pub const fn chunk_size(self) -> u32 {
+        self.chunk_size.get()
+    }
+
+    pub const fn chunk_count(self) -> u64 {
+        self.chunk_count
+    }
+
+    pub const fn final_chunk_tokens(self) -> u32 {
+        self.final_chunk_tokens
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedDeltaExecutionForm {
+    RecurrentScan,
+    ChunkedScan(GatedDeltaChunkPlan),
+}
+
+impl GatedDeltaExecutionForm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecurrentScan => "recurrent_scan",
+            Self::ChunkedScan(_) => "chunked_scan",
+        }
     }
 }
 
@@ -753,6 +889,64 @@ fn text_choices_attribute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gated_delta_recurrent_only_capability_never_claims_chunked_scan() {
+        let capabilities = GatedDeltaExecutionCapabilities::recurrent_only();
+        assert_eq!(
+            capabilities
+                .select(1, GatedDeltaExecutionPreference::ChunkedScan)
+                .unwrap(),
+            GatedDeltaExecutionForm::RecurrentScan
+        );
+        assert_eq!(
+            capabilities
+                .select(64, GatedDeltaExecutionPreference::ChunkedScan)
+                .unwrap(),
+            GatedDeltaExecutionForm::RecurrentScan
+        );
+    }
+
+    #[test]
+    fn gated_delta_chunk_plan_preserves_exact_tail_boundaries() {
+        let capabilities = GatedDeltaExecutionCapabilities::with_chunked_scan(64).unwrap();
+        assert_eq!(
+            capabilities
+                .select(1, GatedDeltaExecutionPreference::ChunkedScan)
+                .unwrap(),
+            GatedDeltaExecutionForm::RecurrentScan
+        );
+        assert_eq!(
+            capabilities
+                .select(64, GatedDeltaExecutionPreference::RecurrentScan)
+                .unwrap(),
+            GatedDeltaExecutionForm::RecurrentScan
+        );
+        for (tokens, chunks, final_tokens) in [(2, 1, 2), (64, 1, 64), (65, 2, 1)] {
+            let GatedDeltaExecutionForm::ChunkedScan(plan) = capabilities
+                .select(tokens, GatedDeltaExecutionPreference::ChunkedScan)
+                .unwrap()
+            else {
+                panic!("{tokens} tokens must select chunked scan");
+            };
+            assert_eq!(plan.token_count(), tokens);
+            assert_eq!(plan.chunk_size(), 64);
+            assert_eq!(plan.chunk_count(), chunks);
+            assert_eq!(plan.final_chunk_tokens(), final_tokens);
+            assert_eq!(
+                GatedDeltaExecutionForm::ChunkedScan(plan).as_str(),
+                "chunked_scan"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_delta_execution_capabilities_reject_invalid_domains() {
+        assert!(GatedDeltaExecutionCapabilities::with_chunked_scan(0).is_err());
+        assert!(GatedDeltaExecutionCapabilities::recurrent_only()
+            .select(0, GatedDeltaExecutionPreference::RecurrentScan)
+            .is_err());
+    }
 
     #[test]
     fn token_embedding_contract_is_backend_and_model_neutral() {
