@@ -23,6 +23,10 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
     RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
+#[cfg(feature = "vllm-moe-marlin")]
+use ferrum_interfaces::vnext::{
+    routed_shared_swiglu_moe_contract, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
+};
 use sha2::{Digest, Sha256};
 
 use super::vnext_replay::CudaCommandReplayKeyBuilder;
@@ -52,25 +56,40 @@ pub fn cuda_vnext_runtime_config(
     ordinal: usize,
     device_id: DeviceId,
 ) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let fingerprint_parts: Vec<&[u8]> = vec![
+        include_str!("vnext_runtime.rs").as_bytes(),
+        include_str!("vnext_replay.rs").as_bytes(),
+        include_str!("vnext_ops.rs").as_bytes(),
+        include_str!("vnext_ops/transformer.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
+        crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
+        crate::ptx::RMS_NORM.as_bytes(),
+        crate::ptx::FUSED_SILU_MUL.as_bytes(),
+        crate::ptx::RESIDUAL_ADD.as_bytes(),
+        crate::ptx::SANDWICH_NORM.as_bytes(),
+        crate::ptx::LINEAR_ATTENTION.as_bytes(),
+        crate::ptx::GATED_DELTA_RULE.as_bytes(),
+        crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
+    ];
+    #[cfg(feature = "vllm-moe-marlin")]
+    let fingerprint_parts = {
+        let mut fingerprint_parts = fingerprint_parts;
+        fingerprint_parts.extend([
+            include_str!("vnext_ops/transformer/moe.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/moe_launch.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/moe_weights.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/moe_workspace.rs").as_bytes(),
+            crate::ptx::MOE_ROUTER.as_bytes(),
+            crate::ptx::MOE_ALIGN_BLOCK_SIZE_PAIR_IDS.as_bytes(),
+            crate::ptx::MOE_COMBINE.as_bytes(),
+        ]);
+        fingerprint_parts
+    };
     Ok(CudaDeviceRuntimeConfig {
         ordinal,
         device_id,
-        runtime_implementation_fingerprint: implementation_fingerprint(&[
-            include_str!("vnext_runtime.rs").as_bytes(),
-            include_str!("vnext_replay.rs").as_bytes(),
-            include_str!("vnext_ops.rs").as_bytes(),
-            include_str!("vnext_ops/transformer.rs").as_bytes(),
-            include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
-            include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
-            crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
-            crate::ptx::RMS_NORM.as_bytes(),
-            crate::ptx::FUSED_SILU_MUL.as_bytes(),
-            crate::ptx::RESIDUAL_ADD.as_bytes(),
-            crate::ptx::SANDWICH_NORM.as_bytes(),
-            crate::ptx::LINEAR_ATTENTION.as_bytes(),
-            crate::ptx::GATED_DELTA_RULE.as_bytes(),
-            crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
-        ]),
+        runtime_implementation_fingerprint: implementation_fingerprint(&fingerprint_parts),
         capabilities: cuda_vnext_capabilities()?,
         dynamic_storage_profiles: BTreeSet::from([
             DynamicStorageProfile::new(
@@ -90,7 +109,7 @@ pub fn cuda_vnext_runtime_config(
 }
 
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
-    [
+    let capabilities = [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
@@ -103,7 +122,16 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     ]
     .into_iter()
     .map(CapabilityId::new)
-    .collect()
+    .collect::<Result<BTreeSet<_>, _>>()?;
+    #[cfg(feature = "vllm-moe-marlin")]
+    let capabilities = {
+        let mut capabilities = capabilities;
+        capabilities.insert(CapabilityId::new(
+            ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
+        )?);
+        capabilities
+    };
+    Ok(capabilities)
 }
 
 /// Build the exact composition root used for both planning and dispatch.
@@ -120,6 +148,14 @@ pub fn cuda_vnext_operation_registry(
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
     ];
+    #[cfg(feature = "vllm-moe-marlin")]
+    let contracts = {
+        let mut contracts = contracts;
+        contracts.push(Box::new(
+            routed_shared_swiglu_moe_contract().map_err(contract_error)?,
+        ));
+        contracts
+    };
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
@@ -132,6 +168,14 @@ pub fn cuda_vnext_operation_registry(
         )?),
         Box::new(transformer::CudaCausalPagedAttentionProvider::new(runtime)?),
     ];
+    #[cfg(feature = "vllm-moe-marlin")]
+    let providers = {
+        let mut providers = providers;
+        providers.push(Box::new(
+            transformer::CudaRoutedSharedSwiGluMoeProvider::new(runtime)?,
+        ));
+        providers
+    };
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
 
