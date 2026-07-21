@@ -1,6 +1,7 @@
 //! Native Metal linear providers over typed physical weight layouts.
 
 use std::ffi::c_void;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
@@ -44,6 +45,8 @@ const LAST_TOKEN_PROVIDER_ID: &str = "provider.metal.last_token_dense_linear.f16
 const LAST_TOKEN_ESTIMATOR_ID: &str = "resource-estimator.metal.last_token_dense_linear.f16.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 const K_QUANT_TILED_GEMM_MIN_ROWS: u32 = 8;
+const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
+const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
@@ -302,11 +305,40 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(
-            &self.descriptor,
-            &request,
-            LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-        )
+        if request.operation().id.as_str() != LAST_TOKEN_DENSE_LINEAR_OPERATION_ID
+            || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
+        {
+            return Err(invalid_plan(format!(
+                "Metal estimator `{}` received another operation",
+                self.descriptor.resource_estimator_id()
+            )));
+        }
+        let out_features =
+            unsigned_attribute(request.attributes(), "out_features").map_err(invalid_plan)?;
+        let hidden_size =
+            unsigned_attribute(request.attributes(), "hidden_size").map_err(invalid_plan)?;
+        let bytes_per_sequence = last_token_scratch_bytes_per_sequence(hidden_size, out_features)
+            .map_err(invalid_plan)?;
+        let scratch = ProviderWorkspaceRequirement::from_formula(
+            ProviderWorkspaceSizeFormula::affine(
+                LAST_TOKEN_SCRATCH_PADDING_BYTES,
+                bytes_per_sequence,
+                0,
+            )?,
+            VALUE_ALIGNMENT_BYTES,
+            ProviderWorkspaceScope::Invocation,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(OperationResourceEstimate::new(
+            self.descriptor.resource_estimator_id(),
+            self.descriptor.resource_estimator_version(),
+            self.descriptor
+                .resource_estimator_implementation_fingerprint(),
+            request.input_fingerprint(),
+            VALUE_ALIGNMENT_BYTES,
+            Some(scratch),
+            None,
+        ))
     }
 }
 
@@ -590,6 +622,159 @@ fn encode_last_token_dense_linear(
     }
     let input_shared =
         token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
+    let participant_count = invocation.participants().len();
+    let participant_count_u32 = checked_u32(
+        participant_count as u64,
+        "Metal last-token linear participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let scratch_layout =
+        LastTokenPackedScratchLayout::new(participant_count as u64, hidden_size, out_features)?;
+    let shared_packed_input = packed_last_token_rows(
+        input_shared,
+        participant_count,
+        token_ranges
+            .iter()
+            .map(|token_range| token_range.immediate_token_range()),
+    );
+
+    if participant_count > 1
+        && scratch_layout.input_row_bytes % METAL_BLIT_ALIGNMENT_BYTES == 0
+        && scratch_layout.output_row_bytes % METAL_BLIT_ALIGNMENT_BYTES == 0
+    {
+        let packed_inputs = if shared_packed_input {
+            Vec::new()
+        } else {
+            invocation
+                .participants()
+                .iter()
+                .zip(token_ranges)
+                .map(|(participant, token_range)| {
+                    let selected = if input_shared {
+                        token_range.immediate_token_range()
+                    } else {
+                        token_range.source_token_range()
+                    };
+                    if selected.is_empty() {
+                        return Err(
+                            "Metal last-token linear cannot select an empty span".to_owned()
+                        );
+                    }
+                    contiguous_token_region(
+                        participant,
+                        binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+                        ElementType::F16,
+                        selected.end - 1,
+                        1,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let packed_outputs = invocation
+            .participants()
+            .iter()
+            .map(|participant| {
+                contiguous_region(
+                    participant,
+                    binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+                    ElementType::F16,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let blit_compatible = packed_inputs.iter().all(|input| {
+            input.length_bytes() == scratch_layout.input_row_bytes
+                && input.offset_bytes() % METAL_BLIT_ALIGNMENT_BYTES == 0
+        }) && packed_outputs.iter().all(|output| {
+            output.length_bytes() == scratch_layout.output_row_bytes
+                && output.offset_bytes() % METAL_BLIT_ALIGNMENT_BYTES == 0
+        });
+        if blit_compatible {
+            let shared_input_region = if shared_packed_input {
+                let region = regions.len();
+                regions.push(shared_token_region(
+                    &invocation,
+                    ResolvedValueRole::Input,
+                    0,
+                    ElementType::F16,
+                    participant_count as u64,
+                )?);
+                Some(region)
+            } else {
+                None
+            };
+            let gathered_input_region_base = (!packed_inputs.is_empty()).then_some(regions.len());
+            regions.extend(packed_inputs);
+            let output_region_base = regions.len();
+            regions.extend(packed_outputs);
+            let scratch_region = regions.len();
+            let scratch = shared_scratch_region(&invocation, scratch_layout.required_bytes)?;
+            if scratch.offset_bytes() % METAL_BLIT_ALIGNMENT_BYTES != 0 {
+                return Err("Metal packed last-token scratch is not blit aligned".to_owned());
+            }
+            regions.push(scratch);
+            let launch = linear_launch(
+                part,
+                shared_input_region.unwrap_or(scratch_region),
+                scratch_region,
+                participant_count as u64,
+                hidden_size,
+                out_features,
+                0,
+                scratch_layout.output_offset_bytes,
+            )?;
+            validate_launch_regions(&regions, &[launch])?;
+            validate_region_span(
+                &regions[scratch_region],
+                0,
+                scratch_layout.required_bytes,
+                "Metal packed last-token scratch",
+            )?;
+            return MetalDeviceCommand::operation(
+                "vnext_last_token_dense_linear",
+                regions,
+                move |encoder, regions| {
+                    if let Some(input_region_base) = gathered_input_region_base {
+                        encoder.with_blit_commands(participant_count as u64, |blit| {
+                            for participant_index in 0..participant_count {
+                                blit.copy_from_buffer(
+                                    regions[input_region_base + participant_index].buffer(),
+                                    regions[input_region_base + participant_index].offset_bytes(),
+                                    regions[scratch_region].buffer(),
+                                    regions[scratch_region].offset_bytes()
+                                        + participant_index as u64 * scratch_layout.input_row_bytes,
+                                    scratch_layout.input_row_bytes,
+                                );
+                            }
+                        });
+                    }
+                    encoder.record_compute_dispatches(1);
+                    dispatch_linear(&pipelines, encoder.compute_encoder(), regions, launch);
+                    encoder.with_blit_commands(participant_count as u64, |blit| {
+                        for participant_index in 0..participant_count {
+                            blit.copy_from_buffer(
+                                regions[scratch_region].buffer(),
+                                regions[scratch_region].offset_bytes()
+                                    + scratch_layout.output_offset_bytes
+                                    + participant_index as u64 * scratch_layout.output_row_bytes,
+                                regions[output_region_base + participant_index].buffer(),
+                                regions[output_region_base + participant_index].offset_bytes(),
+                                scratch_layout.output_row_bytes,
+                            );
+                        }
+                    });
+                    Ok(())
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .with_work_shape(
+                DeviceBatchingForm::Packed,
+                participant_count_u32,
+                token_count,
+            )
+            .map_err(|error| error.to_string());
+        }
+    }
+
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
         let selected = if input_shared {
@@ -626,11 +811,6 @@ fn encode_last_token_dense_linear(
         )?);
     }
     validate_launch_regions(&regions, &launches)?;
-    let participant_count = checked_u32(
-        invocation.participants().len() as u64,
-        "Metal last-token linear participant count",
-    )?;
-    let token_count = invocation.work_shape().immediate_tokens();
     let dispatch_count = launches.len() as u64;
     MetalDeviceCommand::operation(
         "vnext_last_token_dense_linear",
@@ -645,15 +825,99 @@ fn encode_last_token_dense_linear(
     )
     .map_err(|error| error.to_string())?
     .with_work_shape(
-        if participant_count == 1 {
+        if participant_count_u32 == 1 {
             DeviceBatchingForm::Scalar
         } else {
             DeviceBatchingForm::ParticipantLoop
         },
-        participant_count,
+        participant_count_u32,
         token_count,
     )
     .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastTokenPackedScratchLayout {
+    input_row_bytes: u64,
+    output_row_bytes: u64,
+    output_offset_bytes: u64,
+    required_bytes: u64,
+}
+
+impl LastTokenPackedScratchLayout {
+    fn new(participant_count: u64, hidden_size: u64, out_features: u64) -> Result<Self, String> {
+        if participant_count == 0 {
+            return Err("Metal packed last-token scratch has zero participants".to_owned());
+        }
+        let input_row_bytes = hidden_size
+            .checked_mul(ElementType::F16.size_bytes())
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| "Metal last-token input row size is zero or overflows".to_owned())?;
+        let output_row_bytes = out_features
+            .checked_mul(ElementType::F16.size_bytes())
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| "Metal last-token output row size is zero or overflows".to_owned())?;
+        let input_bytes = input_row_bytes
+            .checked_mul(participant_count)
+            .ok_or_else(|| "Metal packed last-token input size overflows".to_owned())?;
+        let output_offset_bytes = align_up_bytes(input_bytes, VALUE_ALIGNMENT_BYTES)?;
+        let output_bytes = output_row_bytes
+            .checked_mul(participant_count)
+            .ok_or_else(|| "Metal packed last-token output size overflows".to_owned())?;
+        let required_bytes = output_offset_bytes
+            .checked_add(output_bytes)
+            .ok_or_else(|| "Metal packed last-token scratch size overflows".to_owned())?;
+        Ok(Self {
+            input_row_bytes,
+            output_row_bytes,
+            output_offset_bytes,
+            required_bytes,
+        })
+    }
+}
+
+fn last_token_scratch_bytes_per_sequence(
+    hidden_size: u64,
+    out_features: u64,
+) -> Result<u64, String> {
+    hidden_size
+        .checked_add(out_features)
+        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| "Metal last-token scratch bytes per sequence overflow".to_owned())
+}
+
+fn align_up_bytes(value: u64, alignment: u64) -> Result<u64, String> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err("Metal scratch alignment is invalid".to_owned());
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|aligned| aligned & !(alignment - 1))
+        .ok_or_else(|| "Metal scratch alignment overflows".to_owned())
+}
+
+fn packed_last_token_rows(
+    input_shared: bool,
+    participant_count: usize,
+    ranges: impl IntoIterator<Item = Range<u64>>,
+) -> bool {
+    if !input_shared || participant_count < 2 {
+        return false;
+    }
+    let mut next_row = 0_u64;
+    let mut observed = 0_usize;
+    for range in ranges {
+        let Some(expected_end) = next_row.checked_add(1) else {
+            return false;
+        };
+        if range.start != next_row || range.end != expected_end {
+            return false;
+        }
+        next_row = expected_end;
+        observed += 1;
+    }
+    observed == participant_count && next_row == participant_count as u64
 }
 
 fn encode_dense_swiglu(
@@ -1384,6 +1648,41 @@ mod tests {
     }
 
     #[test]
+    fn packed_last_token_shape_requires_shared_consecutive_unit_rows() {
+        assert!(!packed_last_token_rows(true, 1, [0..1]));
+        assert!(!packed_last_token_rows(false, 2, [0..1, 1..2]));
+        assert!(packed_last_token_rows(true, 2, [0..1, 1..2]));
+        assert!(packed_last_token_rows(
+            true,
+            15,
+            (0_u64..15).map(|row| row..row + 1),
+        ));
+        assert!(!packed_last_token_rows(true, 2, [0..1, 2..3]));
+        assert!(!packed_last_token_rows(true, 2, [0..2, 2..3]));
+        assert!(!packed_last_token_rows(true, 3, [0..1, 1..2]));
+    }
+
+    #[test]
+    fn packed_last_token_scratch_formula_covers_1_2_and_15_participants() {
+        let hidden_size = 2560_u64;
+        let out_features = 248_320_u64;
+        let bytes_per_sequence =
+            last_token_scratch_bytes_per_sequence(hidden_size, out_features).unwrap();
+        for participant_count in [1_u64, 2, 15] {
+            let layout =
+                LastTokenPackedScratchLayout::new(participant_count, hidden_size, out_features)
+                    .unwrap();
+            let admitted = align_up_bytes(
+                LAST_TOKEN_SCRATCH_PADDING_BYTES + participant_count * bytes_per_sequence,
+                VALUE_ALIGNMENT_BYTES,
+            )
+            .unwrap();
+            assert_eq!(layout.output_offset_bytes % VALUE_ALIGNMENT_BYTES, 0);
+            assert!(layout.required_bytes <= admitted);
+        }
+    }
+
+    #[test]
     fn native_linear_formats_match_cpu_oracles_on_real_metal() {
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping linear conformance");
@@ -1984,6 +2283,142 @@ mod tests {
             LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed last-token dense-linear numerical contract");
+    }
+
+    #[test]
+    fn native_packed_last_token_q6k_linear_gathers_and_scatters_on_real_metal() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping packed last-token linear conformance");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let participant_count = 15_usize;
+        let hidden = 256_usize;
+        let output_width = 64_usize;
+        let token_counts = (0..participant_count)
+            .map(|participant| participant % 4 + 1)
+            .collect::<Vec<_>>();
+        let total_rows = token_counts.iter().sum::<usize>();
+        let input = (0..total_rows * hidden)
+            .map(|index| {
+                let row = index / hidden;
+                f16::from_f32((index as f32 * 0.011).sin() * 0.125 + row as f32 * 0.003)
+            })
+            .collect::<Vec<_>>();
+
+        let mut final_row_offsets = Vec::with_capacity(participant_count);
+        let mut selected_input = Vec::with_capacity(participant_count * hidden);
+        let mut row_cursor = 0_usize;
+        for token_count in token_counts {
+            let final_row = row_cursor + token_count - 1;
+            final_row_offsets.push(final_row * hidden * std::mem::size_of::<f16>());
+            selected_input.extend(
+                input[final_row * hidden..(final_row + 1) * hidden]
+                    .iter()
+                    .map(|value| value.to_f32()),
+            );
+            row_cursor += token_count;
+        }
+
+        let weight = (0..output_width * hidden)
+            .map(|index| (index as f32 * 0.0071).cos() * 0.0625)
+            .collect::<Vec<_>>();
+        let cpu = CandleDevice::Cpu;
+        let weight_tensor = Tensor::from_vec(weight, (output_width, hidden), &cpu).unwrap();
+        let quantized = QTensor::quantize(&weight_tensor, GgmlDType::Q6K).unwrap();
+        let reference = Tensor::from_vec(selected_input, (participant_count, hidden), &cpu)
+            .unwrap()
+            .matmul(&quantized.dequantize(&cpu).unwrap().transpose(0, 1).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let input_buffer = shared_buffer(&device, &input);
+        let weight_buffer = shared_buffer(&device, &quantized.data().unwrap());
+        let layout = LastTokenPackedScratchLayout::new(
+            participant_count as u64,
+            hidden as u64,
+            output_width as u64,
+        )
+        .unwrap();
+        let scratch = output_buffer::<u8>(&device, layout.required_bytes as usize);
+        let sentinel = f16::from_f32(-37.0);
+        let outputs = (0..participant_count)
+            .map(|_| shared_buffer(&device, &vec![sentinel; output_width + 2]))
+            .collect::<Vec<_>>();
+
+        let command = queue.new_command_buffer();
+        let gather = command.new_blit_command_encoder();
+        for (participant, source_offset) in final_row_offsets.into_iter().enumerate() {
+            gather.copy_from_buffer(
+                &input_buffer,
+                source_offset as u64,
+                &scratch,
+                participant as u64 * layout.input_row_bytes,
+                layout.input_row_bytes,
+            );
+        }
+        gather.end_encoding();
+
+        let encoder = command.new_compute_command_encoder();
+        let (_, dispatch_kind) =
+            pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, participant_count as u32);
+        assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
+        dispatch_raw_linear_with_offsets(
+            &pipelines,
+            encoder,
+            LinearPhysicalFormat::Q6K,
+            &scratch,
+            0,
+            &weight_buffer,
+            &scratch,
+            layout.output_offset_bytes,
+            LinearParams {
+                rows: participant_count as u32,
+                in_features: hidden as u32,
+                out_features: output_width as u32,
+                output_stride: output_width as u32,
+                output_column_offset: 0,
+            },
+        );
+        encoder.end_encoding();
+
+        let scatter = command.new_blit_command_encoder();
+        for (participant, output) in outputs.iter().enumerate() {
+            scatter.copy_from_buffer(
+                &scratch,
+                layout.output_offset_bytes + participant as u64 * layout.output_row_bytes,
+                output,
+                std::mem::size_of::<f16>() as u64,
+                layout.output_row_bytes,
+            );
+        }
+        scatter.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        let mut actual = Vec::with_capacity(participant_count * output_width);
+        for output in &outputs {
+            let guarded = read_f16(output, output_width + 2);
+            assert_eq!(guarded[0], sentinel.to_f32());
+            assert_eq!(guarded[output_width + 1], sentinel.to_f32());
+            actual.extend_from_slice(&guarded[1..output_width + 1]);
+        }
+        numerical_tolerance::assert_matches(
+            "Metal/CPU packed last-token Q6_K dense linear",
+            &actual,
+            &[participant_count, output_width],
+            &reference,
+            &[participant_count, output_width],
+            numerical_tolerance::LogicalDtype::Fp16,
+            LAST_TOKEN_LINEAR_TOLERANCE_ID,
+            LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
+        )
+        .expect("reviewed packed last-token dense-linear numerical contract");
     }
 
     fn assert_linear_diagnostic_close(label: &str, actual: &[f32], expected: &[f32]) {
