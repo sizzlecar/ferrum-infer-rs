@@ -1036,6 +1036,213 @@ pub fn marlin_gemm_moe(
 
 // ===================== Stage 14: vLLM marlin_moe_wna16 port =====================
 
+/// Raw, allocation-agnostic arguments for the vLLM Marlin-MoE launch.
+///
+/// The owning caller must retain every allocation until work enqueued on
+/// `stream` has completed. Optional pointers deliberately retain their
+/// corresponding mode flags so this boundary can reject inconsistent FFI
+/// states before the vendored C++ implementation reaches `TORCH_CHECK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarlinMoeRawLaunchArgs {
+    pub(crate) a: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) b: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c_tmp: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) scales: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) zero_points: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) workspace: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) sorted_token_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) expert_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) num_tokens_past_padded: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) topk_weights: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) moe_block_size: i32,
+    pub(crate) top_k: i32,
+    pub(crate) mul_topk_weights: bool,
+    pub(crate) is_ep: bool,
+    pub(crate) prob_m: i32,
+    pub(crate) prob_n: i32,
+    pub(crate) prob_k: i32,
+    pub(crate) group_size: i32,
+    pub(crate) has_zero_points: bool,
+    pub(crate) device_ordinal: i32,
+    pub(crate) use_atomic_add: bool,
+    pub(crate) use_fp32_reduce: bool,
+}
+
+impl MarlinMoeRawLaunchArgs {
+    fn validate(&self) -> candle_core::Result<()> {
+        validate_marlin_moe_pointer("a", self.a, 16)?;
+        validate_marlin_moe_pointer("b", self.b, 16)?;
+        validate_marlin_moe_pointer("c", self.c, 16)?;
+        validate_marlin_moe_pointer("scales", self.scales, 16)?;
+        validate_marlin_moe_pointer("workspace", self.workspace, 4)?;
+        validate_marlin_moe_pointer("sorted_token_ids", self.sorted_token_ids, 4)?;
+        validate_marlin_moe_pointer("expert_ids", self.expert_ids, 4)?;
+        validate_marlin_moe_pointer("num_tokens_past_padded", self.num_tokens_past_padded, 4)?;
+        if let Some(pointer) = self.c_tmp {
+            validate_marlin_moe_pointer("c_tmp", pointer, 16)?;
+        }
+        if let Some(pointer) = self.zero_points {
+            validate_marlin_moe_pointer("zero_points", pointer, 16)?;
+        }
+        if let Some(pointer) = self.topk_weights {
+            validate_marlin_moe_pointer("topk_weights", pointer, 4)?;
+        }
+
+        if self.prob_m <= 0 || self.prob_n <= 0 || self.prob_k <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "prob_m, prob_n, and prob_k must be positive, got [{}, {}, {}]",
+                self.prob_m, self.prob_n, self.prob_k
+            )));
+        }
+        if !matches!(self.moe_block_size, 8 | 16 | 32 | 48 | 64) {
+            return Err(invalid_marlin_moe_args(format!(
+                "unsupported moe_block_size {}; expected one of 8, 16, 32, 48, 64",
+                self.moe_block_size
+            )));
+        }
+        if self.top_k <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "top_k must be positive, got {}",
+                self.top_k
+            )));
+        }
+        if self.prob_m.checked_mul(self.top_k).is_none() {
+            return Err(invalid_marlin_moe_args(
+                "prob_m * top_k overflows the kernel's i32 output-row domain",
+            ));
+        }
+        if self.prob_n % 64 != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "prob_n {} must be divisible by the Marlin minimum thread width 64",
+                self.prob_n
+            )));
+        }
+        if self.prob_k % 64 != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "prob_k {} must be divisible by the Marlin minimum thread width 64",
+                self.prob_k
+            )));
+        }
+        if self.group_size != -1 {
+            if self.group_size <= 0 || self.group_size % 16 != 0 {
+                return Err(invalid_marlin_moe_args(format!(
+                    "group_size must be -1 or a positive multiple of 16, got {}",
+                    self.group_size
+                )));
+            }
+            if self.prob_k % self.group_size != 0 {
+                return Err(invalid_marlin_moe_args(format!(
+                    "prob_k {} must be divisible by group_size {}",
+                    self.prob_k, self.group_size
+                )));
+            }
+        }
+        if self.device_ordinal < 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "device_ordinal must be non-negative, got {}",
+                self.device_ordinal
+            )));
+        }
+        if self.has_zero_points != self.zero_points.is_some() {
+            return Err(invalid_marlin_moe_args(
+                "has_zero_points must exactly match the zero_points pointer",
+            ));
+        }
+        if self.mul_topk_weights && self.topk_weights.is_none() {
+            return Err(invalid_marlin_moe_args(
+                "mul_topk_weights requires a non-null topk_weights pointer",
+            ));
+        }
+        if self.use_atomic_add == self.use_fp32_reduce {
+            return Err(invalid_marlin_moe_args(
+                "exactly one of use_atomic_add and use_fp32_reduce must be enabled",
+            ));
+        }
+        if self.use_fp32_reduce != self.c_tmp.is_some() {
+            return Err(invalid_marlin_moe_args(
+                "use_fp32_reduce must exactly match the c_tmp pointer",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_marlin_moe_pointer(
+    name: &str,
+    pointer: cudarc::driver::sys::CUdeviceptr,
+    alignment: u64,
+) -> candle_core::Result<()> {
+    if pointer == 0 {
+        return Err(invalid_marlin_moe_args(format!(
+            "{name} pointer must be non-null"
+        )));
+    }
+    if pointer % alignment != 0 {
+        return Err(invalid_marlin_moe_args(format!(
+            "{name} pointer 0x{pointer:x} must be aligned to {alignment} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_marlin_moe_args(reason: impl std::fmt::Display) -> candle_core::Error {
+    candle_core::Error::Msg(format!("invalid vLLM Marlin-MoE launch: {reason}"))
+}
+
+#[cfg(feature = "vllm-moe-marlin")]
+pub(crate) fn launch_marlin_moe_vllm_raw(
+    stream: &CudaStream,
+    args: MarlinMoeRawLaunchArgs,
+) -> candle_core::Result<()> {
+    args.validate()?;
+    let ret = unsafe {
+        ferrum_vllm_marlin_moe_f16(
+            args.a as *const _,
+            args.b as *const _,
+            args.c as *mut _,
+            args.c_tmp.unwrap_or_default() as *mut _,
+            args.scales as *const _,
+            args.zero_points.unwrap_or_default() as *const _,
+            args.workspace as *mut _,
+            args.sorted_token_ids as *const i32,
+            args.expert_ids as *const i32,
+            args.num_tokens_past_padded as *const i32,
+            args.topk_weights.unwrap_or_default() as *const f32,
+            args.moe_block_size,
+            args.top_k,
+            i32::from(args.mul_topk_weights),
+            i32::from(args.is_ep),
+            args.prob_m,
+            args.prob_n,
+            args.prob_k,
+            args.group_size,
+            i32::from(args.has_zero_points),
+            args.device_ordinal,
+            stream.cu_stream(),
+            i32::from(args.use_atomic_add),
+            i32::from(args.use_fp32_reduce),
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "ferrum_vllm_marlin_moe_f16 failed: ret={ret} (m={}, n={}, k={})",
+            args.prob_m, args.prob_n, args.prob_k
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-moe-marlin"))]
+pub(crate) fn launch_marlin_moe_vllm_raw(
+    _stream: &CudaStream,
+    _args: MarlinMoeRawLaunchArgs,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "vLLM marlin_moe_wna16 not built — compile with --features vllm-moe-marlin".into(),
+    ))
+}
+
 /// Stage 14 — fused MoE Marlin via the vendored vLLM marlin_moe_wna16
 /// kernel. Replaces our Stage 12.1 bucketed `marlin_gemm_moe` with a
 /// single launch that processes ALL `(token, expert)` pairs of a layer
@@ -1090,8 +1297,8 @@ pub fn marlin_gemm_moe_vllm(
     let (c_ptr, _cg) = output.device_ptr(stream);
     let (s_ptr, _sg) = weight.scales.device_ptr(stream);
     let z_ptr = match weight.qzeros.as_ref() {
-        Some(z) => z.device_ptr(stream).0 as *const std::ffi::c_void,
-        None => std::ptr::null(),
+        Some(z) => Some(z.device_ptr(stream).0),
+        None => None,
     };
     let (ws_ptr, _wg) = weight.workspace.device_ptr(stream);
     let (st_ptr, _stg) = sorted_token_ids.device_ptr(stream);
@@ -1099,48 +1306,45 @@ pub fn marlin_gemm_moe_vllm(
     let (npp_ptr, _nppg) = num_tokens_past_padded.device_ptr(stream);
 
     let c_tmp_ptr = match c_tmp.as_ref() {
-        Some(c) => c.device_ptr(stream).0 as *mut std::ffi::c_void,
-        None => std::ptr::null_mut(),
+        Some(c) => Some(c.device_ptr(stream).0),
+        None => None,
     };
     let topk_w_ptr = match topk_weights {
-        Some(w) => w.device_ptr(stream).0 as *const f32,
-        None => std::ptr::null(),
+        Some(w) => Some(w.device_ptr(stream).0),
+        None => None,
     };
 
     let timer = profile
         .then(|| CudaMarlinEventTimer::start(raw_stream))
         .flatten();
-    let ret = unsafe {
-        ferrum_vllm_marlin_moe_f16(
-            a_ptr as *const _,
-            b_ptr as *const _,
-            c_ptr as *mut _,
-            c_tmp_ptr,
-            s_ptr as *const _,
-            z_ptr,
-            ws_ptr as *mut _,
-            st_ptr as *const _,
-            eid_ptr as *const _,
-            npp_ptr as *const _,
-            topk_w_ptr,
+    let result = launch_marlin_moe_vllm_raw(
+        stream,
+        MarlinMoeRawLaunchArgs {
+            a: a_ptr,
+            b: b_ptr,
+            c: c_ptr,
+            c_tmp: c_tmp_ptr,
+            scales: s_ptr,
+            zero_points: z_ptr,
+            workspace: ws_ptr,
+            sorted_token_ids: st_ptr,
+            expert_ids: eid_ptr,
+            num_tokens_past_padded: npp_ptr,
+            topk_weights: topk_w_ptr,
             moe_block_size,
             top_k,
-            if mul_topk_weights { 1 } else { 0 },
-            if is_ep { 1 } else { 0 },
+            mul_topk_weights,
+            is_ep,
             prob_m,
             prob_n,
             prob_k,
-            weight.group_size,
-            if weight.qzeros.is_some() { 1 } else { 0 },
-            0, // dev
-            raw_stream,
-            // Atomic-add path when c_tmp is null (fp32-reduce needs the
-            // scratch buffer; passing it but having c_tmp=null makes the
-            // kernel deref a null pointer → NaN / OOB).
-            if c_tmp_ptr.is_null() { 1 } else { 0 }, // use_atomic_add
-            if c_tmp_ptr.is_null() { 0 } else { 1 }, // use_fp32_reduce
-        )
-    };
+            group_size: weight.group_size,
+            has_zero_points: weight.qzeros.is_some(),
+            device_ordinal: 0,
+            use_atomic_add: c_tmp_ptr.is_none(),
+            use_fp32_reduce: c_tmp_ptr.is_some(),
+        },
+    );
     if let Some(timer) = timer {
         let elapsed_us = timer.finish_us(raw_stream);
         MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
@@ -1149,12 +1353,7 @@ pub fn marlin_gemm_moe_vllm(
             record_marlin_kernel(bucket, elapsed_us);
         }
     }
-    if ret != 0 {
-        return Err(candle_core::Error::Msg(format!(
-            "ferrum_vllm_marlin_moe_f16 failed: ret={ret} (m={prob_m}, n={prob_n}, k={prob_k})"
-        )));
-    }
-    Ok(())
+    result
 }
 
 #[cfg(not(feature = "vllm-moe-marlin"))]
@@ -1190,8 +1389,141 @@ pub use crate::marlin_repack::{
 mod tests {
     use super::{
         marlin_profile_bucket_from_label, should_zero_workspace, CudaMarlinRuntimeConfig,
-        MarlinProfileBucket, MarlinProfileBucketStats,
+        MarlinMoeRawLaunchArgs, MarlinProfileBucket, MarlinProfileBucketStats,
     };
+
+    fn valid_marlin_moe_raw_args() -> MarlinMoeRawLaunchArgs {
+        MarlinMoeRawLaunchArgs {
+            a: 0x1000,
+            b: 0x2000,
+            c: 0x3000,
+            c_tmp: None,
+            scales: 0x4000,
+            zero_points: None,
+            workspace: 0x5000,
+            sorted_token_ids: 0x6000,
+            expert_ids: 0x7000,
+            num_tokens_past_padded: 0x8000,
+            topk_weights: None,
+            moe_block_size: 16,
+            top_k: 8,
+            mul_topk_weights: false,
+            is_ep: false,
+            prob_m: 4,
+            prob_n: 1024,
+            prob_k: 2048,
+            group_size: 128,
+            has_zero_points: false,
+            device_ordinal: 0,
+            use_atomic_add: true,
+            use_fp32_reduce: false,
+        }
+    }
+
+    fn assert_invalid_marlin_moe_args(args: MarlinMoeRawLaunchArgs, expected: &str) {
+        let error = args.validate().expect_err("launch arguments must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_accept_supported_modes() {
+        valid_marlin_moe_raw_args().validate().unwrap();
+
+        let mut fp32_reduce = valid_marlin_moe_raw_args();
+        fp32_reduce.c_tmp = Some(0x9000);
+        fp32_reduce.zero_points = Some(0xa000);
+        fp32_reduce.topk_weights = Some(0xb000);
+        fp32_reduce.has_zero_points = true;
+        fp32_reduce.mul_topk_weights = true;
+        fp32_reduce.use_atomic_add = false;
+        fp32_reduce.use_fp32_reduce = true;
+        fp32_reduce.validate().unwrap();
+
+        let mut per_channel = valid_marlin_moe_raw_args();
+        per_channel.group_size = -1;
+        per_channel.validate().unwrap();
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_reject_invalid_pointers() {
+        let mut args = valid_marlin_moe_raw_args();
+        args.a = 0;
+        assert_invalid_marlin_moe_args(args, "a pointer must be non-null");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.scales += 2;
+        assert_invalid_marlin_moe_args(args, "scales pointer");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.topk_weights = Some(0xb002);
+        assert_invalid_marlin_moe_args(args, "topk_weights pointer");
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_reject_invalid_shapes_and_config() {
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_m = 0;
+        assert_invalid_marlin_moe_args(args, "must be positive");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.moe_block_size = 24;
+        assert_invalid_marlin_moe_args(args, "unsupported moe_block_size");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.top_k = 0;
+        assert_invalid_marlin_moe_args(args, "top_k must be positive");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_m = i32::MAX;
+        assert_invalid_marlin_moe_args(args, "prob_m * top_k overflows");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_n = 96;
+        assert_invalid_marlin_moe_args(args, "prob_n 96 must be divisible");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_k = 96;
+        args.group_size = -1;
+        assert_invalid_marlin_moe_args(args, "prob_k 96 must be divisible");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.group_size = 0;
+        assert_invalid_marlin_moe_args(args, "group_size must be -1");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.group_size = 96;
+        assert_invalid_marlin_moe_args(args, "must be divisible by group_size");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.device_ordinal = -1;
+        assert_invalid_marlin_moe_args(args, "device_ordinal must be non-negative");
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_reject_inconsistent_optional_modes() {
+        let mut args = valid_marlin_moe_raw_args();
+        args.has_zero_points = true;
+        assert_invalid_marlin_moe_args(args, "has_zero_points must exactly match");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.mul_topk_weights = true;
+        assert_invalid_marlin_moe_args(args, "requires a non-null topk_weights");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.use_fp32_reduce = true;
+        assert_invalid_marlin_moe_args(args, "exactly one");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.use_atomic_add = false;
+        assert_invalid_marlin_moe_args(args, "exactly one");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.c_tmp = Some(0x9000);
+        assert_invalid_marlin_moe_args(args, "use_fp32_reduce must exactly match");
+    }
 
     #[test]
     fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
