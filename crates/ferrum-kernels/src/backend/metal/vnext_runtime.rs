@@ -334,8 +334,17 @@ impl MetalSubmissionEncoder {
         &mut self,
         encode: impl FnOnce(&metal::BlitCommandEncoderRef) -> T,
     ) -> T {
+        self.with_blit_commands(1, encode)
+    }
+
+    pub(crate) fn with_blit_commands<T>(
+        &mut self,
+        command_count: u64,
+        encode: impl FnOnce(&metal::BlitCommandEncoderRef) -> T,
+    ) -> T {
+        debug_assert!(command_count > 0);
         if self.profile_enabled {
-            self.transfer_command_count = self.transfer_command_count.saturating_add(1);
+            self.transfer_command_count = self.transfer_command_count.saturating_add(command_count);
         }
         self.end_compute();
         let encoder = self.command_buffer.new_blit_command_encoder().to_owned();
@@ -1527,6 +1536,55 @@ mod tests {
             terminal.execution_timing(),
             DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
         ));
+    }
+
+    #[test]
+    fn kernel_profile_counts_each_command_inside_one_blit_encoder() {
+        let runtime = runtime();
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/kernel-profile-batched-transfer"))
+            .expect("destination allocation");
+        let region = destination.region(0..8).expect("destination region");
+        let command = MetalDeviceCommand::operation(
+            "batched device zero",
+            vec![region],
+            |encoder, regions| {
+                encoder.with_blit_commands(3, |blit| {
+                    for _ in 0..3 {
+                        blit.fill_buffer(
+                            regions[0].buffer(),
+                            NSRange::new(regions[0].offset_bytes(), regions[0].length_bytes()),
+                            0,
+                        );
+                    }
+                });
+                Ok(())
+            },
+        )
+        .expect("batched transfer command")
+        .with_work_shape(DeviceBatchingForm::Packed, 3, 3)
+        .expect("work shape");
+        let mut stream = runtime.create_stream().expect("stream");
+
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                vec![(DeviceCommandPhase::Compute, Some(0), command)],
+                DeviceTimingMode::Kernel,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .expect("kernel-profiled submission");
+        let attribution = runtime
+            .submission_attribution(&fence)
+            .expect("kernel profile must retain native work attribution");
+        let [command] = attribution.commands() else {
+            panic!("expected exactly one native command attribution")
+        };
+        assert_eq!(command.compute_dispatch_count(), 0);
+        assert_eq!(command.transfer_command_count(), 3);
+
+        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+        assert!(terminal.terminal().is_succeeded());
     }
 
     #[test]

@@ -297,7 +297,7 @@ pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextErro
 pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)?,
-        version: ContractVersion::new(1, 0),
+        version: ContractVersion::new(1, 1),
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
@@ -325,11 +325,16 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
             unsigned_attribute("hidden_size")?,
             unsigned_attribute("out_features")?,
         ]))?,
-        resources: no_auxiliary_resources(),
+        resources: ResourceRequirements {
+            minimum_value_alignment_bytes: 16,
+            scratch: ResourcePresenceRequirement::Optional,
+            binding: ResourcePresenceRequirement::Forbidden,
+            persistent: ResourcePresenceRequirement::Forbidden,
+        },
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(
             LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-            ContractVersion::new(1, 0),
+            ContractVersion::new(1, 1),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -964,6 +969,11 @@ mod tests {
         let contract = last_token_dense_linear_contract().unwrap();
         let descriptor = contract.descriptor();
         assert_eq!(descriptor.id.as_str(), LAST_TOKEN_DENSE_LINEAR_OPERATION_ID);
+        assert_eq!(descriptor.version, ContractVersion::new(1, 1));
+        assert_eq!(
+            descriptor.resources.scratch,
+            ResourcePresenceRequirement::Optional
+        );
         assert_eq!(
             descriptor.outputs[0].dimensions(),
             &[
