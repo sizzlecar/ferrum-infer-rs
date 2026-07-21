@@ -13,14 +13,15 @@ use super::{
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape,
-    EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
-    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape, EncodedDeviceOperation,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
+    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
+    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
+    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedWeightBinding, ResourceId,
     SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
     SpanId, StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
@@ -4720,6 +4721,73 @@ where
 pub type SubmissionWaveDispatchError<R> =
     OperationDispatchError<R, DefinitelyNotSubmittedWaveRetryAuthority<R>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoundDeviceSubmissionAttribution {
+    batch_identity: BatchOperationIdentity,
+    submission_fingerprint: String,
+    device: DeviceSubmissionAttribution,
+}
+
+impl BoundDeviceSubmissionAttribution {
+    fn new(
+        batch_identity: BatchOperationIdentity,
+        submission_fingerprint: String,
+        device: DeviceSubmissionAttribution,
+    ) -> Result<Self, VNextError> {
+        if device.commands().iter().any(|command| {
+            command.node_index().is_some_and(|node_index| {
+                let Ok(node_index_usize) = usize::try_from(node_index) else {
+                    return true;
+                };
+                let Some(node) = batch_identity.nodes().get(node_index_usize) else {
+                    return true;
+                };
+                node.node_index() != node_index
+                    || u32::try_from(node.participants().len())
+                        .map_or(true, |count| count != command.participant_count())
+            })
+        }) {
+            return Err(invalid_operation(
+                "device submission attribution differs from batch node identity",
+            ));
+        }
+        Ok(Self {
+            batch_identity,
+            submission_fingerprint,
+            device,
+        })
+    }
+
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        &self.batch_identity
+    }
+
+    pub fn submission_fingerprint(&self) -> &str {
+        &self.submission_fingerprint
+    }
+
+    pub fn device(&self) -> &DeviceSubmissionAttribution {
+        &self.device
+    }
+}
+
+#[must_use = "profiled submission evidence and completion must be consumed together"]
+pub struct ProfiledSubmissionHandle<R: DeviceRuntime> {
+    completion: CompletionHandle<R>,
+    attribution: Option<BoundDeviceSubmissionAttribution>,
+}
+
+impl<R: DeviceRuntime> ProfiledSubmissionHandle<R> {
+    pub fn into_parts(
+        self,
+    ) -> (
+        CompletionHandle<R>,
+        Option<BoundDeviceSubmissionAttribution>,
+    ) {
+        (self.completion, self.attribution)
+    }
+}
+
 /// Typed host boundaries inside one prepared wave dispatch. These intervals
 /// are host wall time and must not be combined with backend device timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5437,7 +5505,7 @@ impl OperationDispatch {
         completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
-        commands.push_operation(operation);
+        commands.push_operation(0, operation);
         let timing_mode = commands.timing_mode();
         let mut lane_reservation = lane
             .reserve_enqueue()
@@ -5543,6 +5611,7 @@ impl OperationDispatch {
             lane,
             reaper,
         )
+        .map(|profiled| profiled.into_parts().0)
     }
 
     /// Dispatches one prepared wave while attributing host time to exact typed
@@ -5560,7 +5629,7 @@ impl OperationDispatch {
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
-    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
@@ -5592,7 +5661,7 @@ impl OperationDispatch {
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
-    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
@@ -5736,7 +5805,14 @@ impl OperationDispatch {
                         "submission wave command count overflows usize",
                     ))
                 })?;
-            commands.push_operation(operation);
+            commands.push_operation(
+                u32::try_from(node_index).map_err(|_| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission wave node index exceeds u32",
+                    ))
+                })?,
+                operation,
+            );
         }
         if commands.len()
             != pre_provider_command_count.saturating_add(encoded_provider_command_count)
@@ -5790,6 +5866,7 @@ impl OperationDispatch {
                 Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery })
             }
             LaneSubmitOutcome::Submitted(fence) => {
+                let device_attribution = runtime.submission_attribution(&fence);
                 let completion_arm_stage = SubmissionWaveDispatchStageTimer::start(
                     timing_sink,
                     SubmissionWaveDispatchStage::CompletionArm,
@@ -5810,8 +5887,29 @@ impl OperationDispatch {
                         completion,
                     });
                 }
+                let attribution = match device_attribution
+                    .map(|device| {
+                        BoundDeviceSubmissionAttribution::new(
+                            batch_identity.clone(),
+                            completion.receipt().fingerprint().to_owned(),
+                            device,
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(attribution) => attribution,
+                    Err(error) => {
+                        return Err(SubmissionWaveDispatchError::PostSubmitContract {
+                            error,
+                            completion,
+                        });
+                    }
+                };
                 drop(completion_arm_stage);
-                Ok(completion)
+                Ok(ProfiledSubmissionHandle {
+                    completion,
+                    attribution,
+                })
             }
         };
         drop(lane_stage);

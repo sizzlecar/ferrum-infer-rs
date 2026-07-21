@@ -712,6 +712,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
     );
+    startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+        "FERRUM_PROFILE_DETAIL",
+        profile_detail.as_str(),
+        RuntimeConfigSource::Cli,
+    ));
     push_sequence_fit_policy_cli_entry(&mut startup_cli_runtime_entries, sequence_fit_policy);
     if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(

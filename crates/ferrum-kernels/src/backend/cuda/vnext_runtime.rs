@@ -1199,6 +1199,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .into_entries()
             .into_iter()
             .map(DeviceCommandEntry::into_parts)
+            .map(|(phase, _node_index, command)| (phase, command))
             .unzip();
         if commands
             .iter()
@@ -1283,7 +1284,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
-            DeviceTimingMode::Completion => {
+            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
                 match stream
                     .stream
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -1354,7 +1355,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         );
         let fence_flags = match timing_mode {
             DeviceTimingMode::Off => None,
-            DeviceTimingMode::Completion => {
+            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
                 Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)
             }
         };

@@ -653,7 +653,8 @@ pub enum StreamState {
 /// Backend timing is enabled monotonically before product requests start.
 /// `Off` must not allocate backend events or add host clock reads to the hot
 /// path; `Completion` measures only the existing submission terminal and
-/// readback boundaries.
+/// readback boundaries; `Kernel` additionally attributes backend-observed
+/// physical work to the core-issued immutable-plan node index.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
@@ -661,6 +662,51 @@ pub enum DeviceTimingMode {
     #[default]
     Off,
     Completion,
+    Kernel,
+}
+
+impl DeviceTimingMode {
+    pub const fn completion_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub const fn kernel_attribution_enabled(self) -> bool {
+        matches!(self, Self::Kernel)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecutionPath {
+    Eager,
+    Replayed,
+}
+
+impl DeviceExecutionPath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::Replayed => "replayed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceBatchingForm {
+    Scalar,
+    Packed,
+    ParticipantLoop,
+}
+
+impl DeviceBatchingForm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Packed => "packed",
+            Self::ParticipantLoop => "participant_loop",
+        }
+    }
 }
 
 /// Typed host boundaries inside one backend submission. These intervals use
@@ -1299,6 +1345,110 @@ pub enum DeviceCommandPhase {
     ResultBinding,
 }
 
+/// Backend-observed physical work for one core-owned command entry.
+///
+/// Rows are created only in `DeviceTimingMode::Kernel`. The node index is
+/// issued by core and binds backend work back to the immutable plan; backend
+/// labels and counters carry observation only and grant no execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceNativeWorkAttribution {
+    node_index: Option<u32>,
+    command_phase: DeviceCommandPhase,
+    native_op_id: &'static str,
+    execution_path: DeviceExecutionPath,
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
+}
+
+impl DeviceNativeWorkAttribution {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        node_index: Option<u32>,
+        command_phase: DeviceCommandPhase,
+        native_op_id: &'static str,
+        execution_path: DeviceExecutionPath,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+    ) -> Option<Self> {
+        if native_op_id.is_empty()
+            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+            || (node_index.is_some() && participant_count == 0)
+        {
+            return None;
+        }
+        Some(Self {
+            node_index,
+            command_phase,
+            native_op_id,
+            execution_path,
+            batching_form,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+        })
+    }
+
+    pub const fn node_index(&self) -> Option<u32> {
+        self.node_index
+    }
+
+    pub const fn command_phase(&self) -> DeviceCommandPhase {
+        self.command_phase
+    }
+
+    pub const fn native_op_id(&self) -> &'static str {
+        self.native_op_id
+    }
+
+    pub const fn execution_path(&self) -> DeviceExecutionPath {
+        self.execution_path
+    }
+
+    pub const fn batching_form(&self) -> DeviceBatchingForm {
+        self.batching_form
+    }
+
+    pub const fn participant_count(&self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+
+    pub const fn compute_dispatch_count(&self) -> u64 {
+        self.compute_dispatch_count
+    }
+
+    pub const fn transfer_command_count(&self) -> u64 {
+        self.transfer_command_count
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionAttribution {
+    commands: Box<[DeviceNativeWorkAttribution]>,
+}
+
+impl DeviceSubmissionAttribution {
+    pub fn new(commands: Vec<DeviceNativeWorkAttribution>) -> Option<Self> {
+        (!commands.is_empty()).then(|| Self {
+            commands: commands.into_boxed_slice(),
+        })
+    }
+
+    pub fn commands(&self) -> &[DeviceNativeWorkAttribution] {
+        &self.commands
+    }
+}
+
 /// Provider-encoded work for one logical operation.
 ///
 /// Core owns the phase boundaries: request-specific inputs are written before
@@ -1348,6 +1498,7 @@ impl<C> EncodedDeviceOperation<C> {
 /// execution optimizations.
 pub struct DeviceCommandEntry<C> {
     phase: DeviceCommandPhase,
+    node_index: Option<u32>,
     command: C,
 }
 
@@ -1356,12 +1507,16 @@ impl<C> DeviceCommandEntry<C> {
         self.phase
     }
 
+    pub const fn node_index(&self) -> Option<u32> {
+        self.node_index
+    }
+
     pub const fn command(&self) -> &C {
         &self.command
     }
 
-    pub fn into_parts(self) -> (DeviceCommandPhase, C) {
-        (self.phase, self.command)
+    pub fn into_parts(self) -> (DeviceCommandPhase, Option<u32>, C) {
+        (self.phase, self.node_index, self.command)
     }
 }
 
@@ -1382,6 +1537,7 @@ impl<C> DeviceCommandBatch<C> {
         Self {
             commands: vec![DeviceCommandEntry {
                 phase: DeviceCommandPhase::Compute,
+                node_index: None,
                 command,
             }],
             timing_mode: DeviceTimingMode::Off,
@@ -1405,6 +1561,7 @@ impl<C> DeviceCommandBatch<C> {
     pub(crate) fn push_initialization(&mut self, command: C) {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Initialization,
+            node_index: None,
             command,
         });
     }
@@ -1412,6 +1569,7 @@ impl<C> DeviceCommandBatch<C> {
     pub(crate) fn push_dynamic_binding(&mut self, command: C) {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::DynamicBinding,
+            node_index: None,
             command,
         });
     }
@@ -1419,6 +1577,7 @@ impl<C> DeviceCommandBatch<C> {
     pub(crate) fn push_compute(&mut self, command: C) {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Compute,
+            node_index: None,
             command,
         });
     }
@@ -1426,18 +1585,31 @@ impl<C> DeviceCommandBatch<C> {
     pub(crate) fn push_result_binding(&mut self, command: C) {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::ResultBinding,
+            node_index: None,
             command,
         });
     }
 
-    pub(crate) fn push_operation(&mut self, operation: EncodedDeviceOperation<C>) {
+    pub(crate) fn push_operation(&mut self, node_index: u32, operation: EncodedDeviceOperation<C>) {
         let (dynamic_bindings, compute, result_bindings) = operation.into_parts();
         for command in dynamic_bindings {
-            self.push_dynamic_binding(command);
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::DynamicBinding,
+                node_index: Some(node_index),
+                command,
+            });
         }
-        self.push_compute(compute);
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Compute,
+            node_index: Some(node_index),
+            command: compute,
+        });
         for command in result_bindings {
-            self.push_result_binding(command);
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::ResultBinding,
+                node_index: Some(node_index),
+                command,
+            });
         }
     }
 
@@ -1588,6 +1760,14 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         self.submit(stream, commands)
     }
 
+    /// Returns backend-observed native work for an already submitted fence.
+    /// Only `DeviceTimingMode::Kernel` fences may carry attribution. The
+    /// returned rows are diagnostic evidence and never grant completion or
+    /// resource-release authority.
+    fn submission_attribution(&self, _fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
+        None
+    }
+
     /// Observes a fence without blocking. `Indeterminate` is not terminal and
     /// therefore cannot release command-owned resources.
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error>;
@@ -1720,7 +1900,7 @@ mod deferred_cleanup_tests {
             .with_dynamic_binding("bind-b")
             .with_result_binding("writeback");
         let mut batch = DeviceCommandBatch::with_capacity(4);
-        batch.push_operation(operation);
+        batch.push_operation(0, operation);
 
         let entries = batch.into_entries();
         assert_eq!(
@@ -1739,7 +1919,7 @@ mod deferred_cleanup_tests {
             entries
                 .into_iter()
                 .map(DeviceCommandEntry::into_parts)
-                .map(|(_, command)| command)
+                .map(|(_, _, command)| command)
                 .collect::<Vec<_>>(),
             vec!["bind-a", "bind-b", "compute", "writeback"]
         );

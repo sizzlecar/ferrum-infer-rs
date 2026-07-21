@@ -681,8 +681,8 @@ pub(crate) enum TestCommand {
     Zero,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TestFence(u64, DeviceTimingMode);
+#[derive(Debug, Clone)]
+pub(crate) struct TestFence(u64, DeviceTimingMode, Option<DeviceSubmissionAttribution>);
 
 impl TestFence {
     fn terminal_receipt(
@@ -691,12 +691,14 @@ impl TestFence {
     ) -> DeviceTerminalReceipt<TestRuntimeError> {
         match self.1 {
             DeviceTimingMode::Off => DeviceTerminalReceipt::unprofiled(terminal),
-            DeviceTimingMode::Completion => DeviceTerminalReceipt::profiled(
-                terminal,
-                DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
-                    1_000_000,
-                )),
-            ),
+            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
+                DeviceTerminalReceipt::profiled(
+                    terminal,
+                    DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
+                        1_000_000,
+                    )),
+                )
+            }
         }
     }
 }
@@ -856,10 +858,38 @@ impl DeviceRuntime for TestRuntime {
         let timing_mode = commands.timing_mode();
         let entries = commands.into_entries();
         let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
+        let attribution = timing_mode.kernel_attribution_enabled().then(|| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let (native_op_id, compute_dispatch_count, transfer_command_count) =
+                        match entry.command() {
+                            TestCommand::Provider => ("test_provider", 1, 0),
+                            TestCommand::DynamicBinding => ("test_dynamic_binding", 0, 1),
+                            TestCommand::ResultBinding => ("test_result_binding", 0, 1),
+                            TestCommand::Copy => ("test_copy", 0, 1),
+                            TestCommand::Upload => ("test_upload", 0, 1),
+                            TestCommand::Zero => ("test_zero", 0, 1),
+                        };
+                    DeviceNativeWorkAttribution::new(
+                        entry.node_index(),
+                        entry.phase(),
+                        native_op_id,
+                        DeviceExecutionPath::Eager,
+                        DeviceBatchingForm::Scalar,
+                        u32::from(entry.node_index().is_some()),
+                        u64::from(entry.node_index().is_some()),
+                        compute_dispatch_count,
+                        transfer_command_count,
+                    )
+                })
+                .collect()
+        });
+        let attribution = attribution.and_then(DeviceSubmissionAttribution::new);
         let commands = entries
             .into_iter()
             .map(DeviceCommandEntry::into_parts)
-            .map(|(_, command)| command)
+            .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
         let command_count = commands.len();
         let (drift, behavior, fence) = {
@@ -872,7 +902,7 @@ impl DeviceRuntime for TestRuntime {
             (
                 trace.drift_on_submit,
                 trace.submit_behavior,
-                TestFence(trace.next_fence, timing_mode),
+                TestFence(trace.next_fence, timing_mode, attribution),
             )
         };
         match behavior {
@@ -888,6 +918,10 @@ impl DeviceRuntime for TestRuntime {
             self.use_alternate_descriptor.store(true, Ordering::Release);
         }
         Ok(fence)
+    }
+
+    fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
+        fence.2.clone()
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {

@@ -27,10 +27,11 @@ use ferrum_interfaces::{
     },
     sampler::SamplingConfig as TokenSamplingPlan,
     vnext::{
-        AdmissionDeferred, AdmissionRejected, CapacityAvailabilityEpoch, DeferredAction,
-        DeviceCapacityPressureScope, EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent,
-        ExecutionEventCapturePolicy, ExecutionEventDetail,
-        ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
+        AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
+        CapacityAvailabilityEpoch, DeferredAction, DeviceCapacityPressureScope,
+        EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy,
+        ExecutionEventDetail, ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink,
+        ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
@@ -49,9 +50,9 @@ use ferrum_scheduler::vnext::{
 };
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
-    InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileError,
-    ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result,
-    SamplingParams, StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    InferenceRequest, InferenceResponse, ObservabilityProfileDetail, Priority, ProfileEntrypoint,
+    ProfileError, ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent,
+    Result, SamplingParams, StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
     ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
     PROMPT_TOKENS_METADATA_KEY,
 };
@@ -2667,9 +2668,15 @@ impl EngineInner {
                 "backend_type".to_string(),
                 serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
             ),
-            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            (
+                "diagnostic_only".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.diagnostic_only()),
+            ),
             ("l0_only".to_string(), serde_json::json!(false)),
-            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.as_str()),
+            ),
             (
                 "resource_trace_source".to_string(),
                 serde_json::json!("engine"),
@@ -2821,9 +2828,15 @@ impl EngineInner {
                 "backend_type".to_string(),
                 serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
             ),
-            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            (
+                "diagnostic_only".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.diagnostic_only()),
+            ),
             ("l0_only".to_string(), serde_json::json!(false)),
-            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.as_str()),
+            ),
             (
                 "resource_owner_close_summary".to_string(),
                 serde_json::Value::Array(close_summary_json),
@@ -3643,6 +3656,7 @@ struct VNextProfileEventContext {
     model: String,
     backend_device: String,
     backend_type: String,
+    profile_detail: ObservabilityProfileDetail,
     capture_policy: ExecutionEventCapturePolicy,
 }
 
@@ -3689,7 +3703,6 @@ impl SchedulerTraceJournal {
         self.inner.enqueue(SchedulerTraceRecord::Profile(event))
     }
 
-    #[cfg(test)]
     fn enqueue_batch(
         &self,
         events: Vec<FerrumProfileEvent>,
@@ -3750,7 +3763,13 @@ impl VNextProfileExecutionEventSink {
                 model: config.model.model_id.to_string(),
                 backend_device: format!("{:?}", config.backend.device),
                 backend_type: format!("{:?}", config.backend.backend_type),
-                capture_policy: ExecutionEventCapturePolicy::FirstFramePerRequest,
+                profile_detail: config.runtime.profile_detail,
+                capture_policy: if config.runtime.profile_detail == ObservabilityProfileDetail::Full
+                {
+                    ExecutionEventCapturePolicy::AllFrames
+                } else {
+                    ExecutionEventCapturePolicy::FirstFramePerRequest
+                },
             }),
         }
     }
@@ -3817,9 +3836,15 @@ impl VNextProfileEventContext {
                 "backend_type".to_string(),
                 serde_json::json!(self.backend_type),
             ),
-            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            (
+                "diagnostic_only".to_string(),
+                serde_json::json!(self.profile_detail.diagnostic_only()),
+            ),
             ("l0_only".to_string(), serde_json::json!(false)),
-            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.profile_detail.as_str()),
+            ),
             (
                 "execution_capture_policy".to_string(),
                 serde_json::json!(self.capture_policy.as_str()),
@@ -3929,6 +3954,178 @@ impl VNextProfileEventContext {
         })?;
         Ok(profile)
     }
+
+    fn device_submission_attribution_events(
+        &self,
+        attribution: &BoundDeviceSubmissionAttribution,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<Vec<FerrumProfileEvent>, ExecutionEventSinkError> {
+        let batch = attribution.batch_identity();
+        let mut events = Vec::with_capacity(attribution.device().commands().len());
+        for (command_index, command) in attribution.device().commands().iter().enumerate() {
+            let Some(node_index) = command.node_index() else {
+                continue;
+            };
+            let node_index_usize = usize::try_from(node_index).map_err(|_| {
+                ExecutionEventSinkError::new(
+                    "device attribution node index exceeds the host index range",
+                )
+            })?;
+            let node = batch.nodes().get(node_index_usize).ok_or_else(|| {
+                ExecutionEventSinkError::new(
+                    "device attribution node index is absent from its batch identity",
+                )
+            })?;
+            let first = node.participants().first().ok_or_else(|| {
+                ExecutionEventSinkError::new("device attribution node has no participants")
+            })?;
+            let first_identity = first.identity().parts();
+            let participant_request_ids = node
+                .participants()
+                .iter()
+                .map(|participant| participant.identity().parts().request_id.to_string())
+                .collect::<Vec<_>>();
+            let shape = BTreeMap::from([
+                ("node_index".to_string(), serde_json::json!(node_index)),
+                (
+                    "participant_count".to_string(),
+                    serde_json::json!(command.participant_count()),
+                ),
+                (
+                    "token_count".to_string(),
+                    serde_json::json!(command.token_count()),
+                ),
+                (
+                    "physical_compute_dispatch_count".to_string(),
+                    serde_json::json!(command.compute_dispatch_count()),
+                ),
+                (
+                    "physical_transfer_command_count".to_string(),
+                    serde_json::json!(command.transfer_command_count()),
+                ),
+            ]);
+            let attributes = BTreeMap::from([
+                (
+                    "actual_model_smoke".to_string(),
+                    serde_json::json!(matches!(
+                        self.entrypoint,
+                        ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                    )),
+                ),
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+                (
+                    "batching_form".to_string(),
+                    serde_json::json!(command.batching_form().as_str()),
+                ),
+                (
+                    "command_phase".to_string(),
+                    serde_json::json!(format!("{:?}", command.command_phase()).to_ascii_lowercase()),
+                ),
+                (
+                    "device_id".to_string(),
+                    serde_json::json!(batch.device_id().to_string()),
+                ),
+                ("diagnostic_only".to_string(), serde_json::json!(true)),
+                (
+                    "execution_path".to_string(),
+                    serde_json::json!(command.execution_path().as_str()),
+                ),
+                (
+                    "native_op_id".to_string(),
+                    serde_json::json!(command.native_op_id()),
+                ),
+                (
+                    "node_id".to_string(),
+                    serde_json::json!(node.node_id().to_string()),
+                ),
+                (
+                    "operation_id".to_string(),
+                    serde_json::json!(node.operation_id().to_string()),
+                ),
+                (
+                    "participant_request_ids".to_string(),
+                    serde_json::json!(participant_request_ids),
+                ),
+                (
+                    "plan_hash".to_string(),
+                    serde_json::json!(batch.plan_hash().to_string()),
+                ),
+                (
+                    "plan_id".to_string(),
+                    serde_json::json!(batch.plan_id().to_string()),
+                ),
+                (
+                    "profile_detail".to_string(),
+                    serde_json::json!(self.profile_detail.as_str()),
+                ),
+                (
+                    "provider_id".to_string(),
+                    serde_json::json!(node.provider_id().to_string()),
+                ),
+                (
+                    "physical_submission_fingerprint".to_string(),
+                    serde_json::json!(attribution.submission_fingerprint()),
+                ),
+                (
+                    "runtime_implementation_fingerprint".to_string(),
+                    serde_json::json!(batch.runtime_implementation_fingerprint()),
+                ),
+            ]);
+            let event = FerrumProfileEvent {
+                schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                ts_unix_nanos: timestamp
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+                event_id: format!(
+                    "evt-vnext-native-{}-{}-{}",
+                    attribution.submission_fingerprint(),
+                    node_index,
+                    command_index
+                ),
+                request_id: first_identity.request_id.to_string(),
+                correlation_id: Some(attribution.submission_fingerprint().to_owned()),
+                entrypoint: self.entrypoint,
+                backend: "actual".to_string(),
+                runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+                phase: "vnext.device_native_work".to_string(),
+                event_kind: ProfileEventKind::Instant,
+                timestamp,
+                status: ProfileStatus::DiagnosticOnly,
+                model: Some(self.model.clone()),
+                duration_us: None,
+                memory: None,
+                resource: None,
+                error: None,
+                replay: None,
+                shape,
+                backend_detail: Some(BTreeMap::from([
+                    (
+                        "backend_device".to_string(),
+                        serde_json::json!(self.backend_device),
+                    ),
+                    (
+                        "backend_type".to_string(),
+                        serde_json::json!(self.backend_type),
+                    ),
+                ])),
+                attributes,
+            };
+            event.validate().map_err(|error| {
+                ExecutionEventSinkError::new(format!(
+                    "invalid vNext device attribution profile event: {error}"
+                ))
+            })?;
+            events.push(event);
+        }
+        Ok(events)
+    }
 }
 
 impl VNextProfileExecutionEventSink {
@@ -3975,11 +4172,34 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
     }
 
     fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
-        ferrum_interfaces::vnext::DeviceTimingMode::Completion
+        match self.context.profile_detail {
+            ObservabilityProfileDetail::Off => ferrum_interfaces::vnext::DeviceTimingMode::Off,
+            ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Completion
+            }
+            ObservabilityProfileDetail::Full => ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
+        }
     }
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         self.context.capture_policy
+    }
+
+    fn record_device_submission_attribution(
+        &self,
+        attribution: &BoundDeviceSubmissionAttribution,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let events = self
+            .context
+            .device_submission_attribution_events(attribution, chrono::Utc::now())?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.journal.enqueue_batch(events).map_err(|error| {
+            ExecutionEventSinkError::new(format!(
+                "enqueue vNext device attribution profile batch: {error}"
+            ))
+        })
     }
 
     fn record(

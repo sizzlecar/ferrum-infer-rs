@@ -526,6 +526,80 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
         ]
     );
+    let (handle, attribution) = handle.into_parts();
+    assert!(attribution.is_none());
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let timing = RecordingSubmissionTimingSink::default();
+
+    let profiled = OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Kernel,
+        &[],
+        &timing,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let (handle, attribution) = profiled.into_parts();
+    let attribution = attribution.expect("kernel profile must return bound native work");
+    assert_eq!(
+        attribution.submission_fingerprint(),
+        handle.receipt().fingerprint()
+    );
+    let node_rows = attribution
+        .device()
+        .commands()
+        .iter()
+        .filter(|command| command.node_index().is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(node_rows.len(), batch_identity.nodes().len());
+    for (expected_index, command) in node_rows.into_iter().enumerate() {
+        assert_eq!(command.node_index(), Some(expected_index as u32));
+        assert_eq!(command.native_op_id(), "test_provider");
+        assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
+        assert_eq!(command.batching_form(), DeviceBatchingForm::Scalar);
+        assert_eq!(command.participant_count(), 1);
+        assert_eq!(command.token_count(), 1);
+        assert_eq!(command.compute_dispatch_count(), 1);
+        assert_eq!(command.transfer_command_count(), 0);
+    }
     assert!(matches!(
         handle.wait().unwrap(),
         CompletionObservation::Terminal(_)

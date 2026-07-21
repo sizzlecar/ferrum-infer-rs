@@ -2,7 +2,8 @@
 
 use crate::{
     parse_bool_env_value, parse_path_env_value, parse_usize_env_value, DataType, Device, ModelId,
-    ModelInfo, ProfileEntrypoint, RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RuntimeConfigSnapshot,
+    SamplingParams, SamplingPresets,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
@@ -67,6 +68,7 @@ pub struct RuntimeKnobs {
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
+    pub profile_detail: ObservabilityProfileDetail,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
@@ -180,6 +182,14 @@ impl EngineConfig {
                 "FERRUM_PROFILE_ENTRYPOINT",
                 value,
             )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_DETAIL") {
+            self.runtime.profile_detail =
+                ObservabilityProfileDetail::parse(value).ok_or_else(|| {
+                    format!(
+                    "FERRUM_PROFILE_DETAIL: expected one of off, basic, debug, full; got {value:?}"
+                )
+                })?;
         }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
@@ -968,5 +978,33 @@ mod tests {
             config.runtime.profile_entrypoint,
             Some(ProfileEntrypoint::Run)
         );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_profile_detail_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "full")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Full
+        );
+    }
+
+    #[test]
+    fn engine_config_rejects_unknown_profile_detail() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "everything")]);
+
+        let error = config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect_err("unknown profile detail must fail closed");
+
+        assert!(error.contains("FERRUM_PROFILE_DETAIL"));
     }
 }

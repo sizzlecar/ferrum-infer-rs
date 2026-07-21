@@ -16,12 +16,13 @@ use std::time::Instant;
 
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
-    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceDescriptor, DeviceErrorReport,
-    DeviceExecutionTiming, DeviceId, DeviceRuntime, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    StreamState, VNextError,
+    DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
+    DeviceCommandPhase, DeviceDescriptor, DeviceErrorReport, DeviceExecutionPath,
+    DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
 };
 use metal::objc::runtime::{Object, BOOL, YES};
 use metal::objc::{msg_send, sel, sel_impl};
@@ -270,14 +271,35 @@ impl MetalBufferRegion {
 pub(crate) struct MetalSubmissionEncoder {
     command_buffer: CommandBuffer,
     compute: Option<ComputeCommandEncoder>,
+    profile_enabled: bool,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
 }
 
 impl MetalSubmissionEncoder {
-    fn new(command_buffer: &CommandBufferRef) -> Self {
+    fn new(command_buffer: &CommandBufferRef, profile_enabled: bool) -> Self {
         Self {
             command_buffer: command_buffer.to_owned(),
             compute: None,
+            profile_enabled,
+            compute_dispatch_count: 0,
+            transfer_command_count: 0,
         }
+    }
+
+    pub(crate) fn record_compute_dispatches(&mut self, count: u64) {
+        if self.profile_enabled {
+            self.compute_dispatch_count = self.compute_dispatch_count.saturating_add(count);
+        }
+    }
+
+    fn begin_command(&mut self) {
+        self.compute_dispatch_count = 0;
+        self.transfer_command_count = 0;
+    }
+
+    fn command_counts(&self) -> (u64, u64) {
+        (self.compute_dispatch_count, self.transfer_command_count)
     }
 
     pub(crate) fn compute_encoder(&mut self) -> &ComputeCommandEncoderRef {
@@ -299,6 +321,9 @@ impl MetalSubmissionEncoder {
         &mut self,
         encode: impl FnOnce(&metal::BlitCommandEncoderRef) -> T,
     ) -> T {
+        if self.profile_enabled {
+            self.transfer_command_count = self.transfer_command_count.saturating_add(1);
+        }
         self.end_compute();
         let encoder =
             MetalBlitEncoderGuard(self.command_buffer.new_blit_command_encoder().to_owned());
@@ -339,6 +364,9 @@ type EncodeAction = Box<
 pub struct MetalDeviceCommand {
     runtime_instance: u64,
     operation: &'static str,
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
     regions: Vec<MetalBufferRegion>,
     staging: Vec<Buffer>,
     encode: EncodeAction,
@@ -350,6 +378,9 @@ impl fmt::Debug for MetalDeviceCommand {
             .debug_struct("MetalDeviceCommand")
             .field("runtime_instance", &self.runtime_instance)
             .field("operation", &self.operation)
+            .field("batching_form", &self.batching_form)
+            .field("participant_count", &self.participant_count)
+            .field("token_count", &self.token_count)
             .field("region_count", &self.regions.len())
             .field("staging_count", &self.staging.len())
             .finish_non_exhaustive()
@@ -373,10 +404,30 @@ impl MetalDeviceCommand {
         Ok(Self {
             runtime_instance,
             operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 1,
+            token_count: 0,
             regions,
             staging: Vec::new(),
             encode: Box::new(move |encoder, regions, _staging| encode(encoder, regions)),
         })
+    }
+
+    pub(crate) fn with_work_shape(
+        mut self,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        if participant_count == 0 {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal command attribution has zero participants",
+            ));
+        }
+        self.batching_form = batching_form;
+        self.participant_count = participant_count;
+        self.token_count = token_count;
+        Ok(self)
     }
 
     fn transfer(
@@ -389,6 +440,9 @@ impl MetalDeviceCommand {
         Self {
             runtime_instance,
             operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 0,
+            token_count: 0,
             regions,
             staging,
             encode,
@@ -571,6 +625,7 @@ pub struct MetalDeviceFence {
     pending: Arc<MetalPendingSubmissions>,
     terminal_accounted: AtomicBool,
     commands: Vec<MetalDeviceCommand>,
+    attribution: Option<DeviceSubmissionAttribution>,
 }
 
 impl fmt::Debug for MetalDeviceFence {
@@ -811,7 +866,7 @@ impl MetalDeviceRuntime {
     fn submit_commands<S>(
         &self,
         stream: &mut MetalDeviceStream,
-        commands: Vec<MetalDeviceCommand>,
+        entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
         timing_mode: DeviceTimingMode,
         timing_sink: &S,
     ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
@@ -825,14 +880,14 @@ impl MetalDeviceRuntime {
         if let Err(error) = self.validate_stream(stream) {
             return Err(DefinitelyNotSubmitted::new(error));
         }
-        if commands.is_empty() {
+        if entries.is_empty() {
             return Err(DefinitelyNotSubmitted::new(
                 MetalDeviceRuntimeError::contract("Metal command batch is empty"),
             ));
         }
-        if commands
+        if entries
             .iter()
-            .any(|command| command.runtime_instance != self.runtime_instance)
+            .any(|(_, _, command)| command.runtime_instance != self.runtime_instance)
         {
             return Err(DefinitelyNotSubmitted::new(
                 MetalDeviceRuntimeError::contract(
@@ -849,22 +904,45 @@ impl MetalDeviceRuntime {
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => MetalFenceTiming::NotRequested,
-            DeviceTimingMode::Completion => MetalFenceTiming::CommandBuffer,
+            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
+                MetalFenceTiming::CommandBuffer
+            }
         };
         drop(begin_timing_stage);
 
         let command_buffer = stream.queue.new_command_buffer().to_owned();
-        let mut encoder = MetalSubmissionEncoder::new(&command_buffer);
+        let kernel_attribution = timing_mode.kernel_attribution_enabled();
+        let mut encoder = MetalSubmissionEncoder::new(&command_buffer, kernel_attribution);
+        let mut attribution = kernel_attribution.then(|| Vec::with_capacity(entries.len()));
         let enqueue_stage =
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
-        for command in &commands {
+        for (phase, node_index, command) in &entries {
+            encoder.begin_command();
             if let Err(error) = command.encode(&mut encoder) {
                 stream.state.cancel_recording();
                 return Err(DefinitelyNotSubmitted::new(error));
             }
+            if let Some(attribution) = attribution.as_mut() {
+                let (compute_dispatch_count, transfer_command_count) = encoder.command_counts();
+                if let Some(observation) = DeviceNativeWorkAttribution::new(
+                    *node_index,
+                    *phase,
+                    command.operation,
+                    DeviceExecutionPath::Eager,
+                    command.batching_form,
+                    command.participant_count,
+                    command.token_count,
+                    compute_dispatch_count,
+                    transfer_command_count,
+                ) {
+                    attribution.push(observation);
+                }
+            }
         }
         encoder.finish();
         drop(enqueue_stage);
+        let attribution = attribution.and_then(DeviceSubmissionAttribution::new);
+        let commands = entries.into_iter().map(|(_, _, command)| command).collect();
 
         let fence_stage = MetalSubmissionStageTimer::start(
             timing_sink,
@@ -897,6 +975,7 @@ impl MetalDeviceRuntime {
             pending: Arc::clone(&stream.pending),
             terminal_accounted: AtomicBool::new(false),
             commands,
+            attribution,
         };
         drop(fence_stage);
         Ok(fence)
@@ -1114,7 +1193,16 @@ impl DeviceRuntime for MetalDeviceRuntime {
         S: DeviceSubmissionTimingSink,
     {
         let timing_mode = commands.timing_mode();
-        self.submit_commands(stream, commands.into_commands(), timing_mode, timing_sink)
+        let entries = commands
+            .into_entries()
+            .into_iter()
+            .map(DeviceCommandEntry::into_parts)
+            .collect();
+        self.submit_commands(stream, entries, timing_mode, timing_sink)
+    }
+
+    fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
+        fence.attribution.clone()
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
@@ -1279,6 +1367,15 @@ mod tests {
         .expect("buffer request")
     }
 
+    fn compute_entries(
+        commands: Vec<MetalDeviceCommand>,
+    ) -> Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)> {
+        commands
+            .into_iter()
+            .map(|command| (DeviceCommandPhase::Compute, None, command))
+            .collect()
+    }
+
     #[test]
     fn ordered_transfer_batch_is_async_and_readback_is_exact() {
         let runtime = runtime();
@@ -1317,11 +1414,12 @@ mod tests {
         let fence = runtime
             .submit_commands(
                 &mut stream,
-                commands,
+                compute_entries(commands),
                 DeviceTimingMode::Off,
                 &DisabledDeviceSubmissionTimingSink,
             )
             .expect("submission");
+        assert!(runtime.submission_attribution(&fence).is_none());
         assert_eq!(runtime.stream_state(&stream), StreamState::Submitted);
         let terminal = runtime.wait_fence(&fence).expect("terminal fence");
         assert!(terminal.terminal().is_succeeded());
@@ -1353,13 +1451,58 @@ mod tests {
         let fence = runtime
             .submit_commands(
                 &mut stream,
-                vec![command],
+                compute_entries(vec![command]),
                 DeviceTimingMode::Completion,
                 &DisabledDeviceSubmissionTimingSink,
             )
             .expect("profiled submission");
         let terminal = runtime.wait_fence(&fence).expect("terminal fence");
 
+        assert!(terminal.terminal().is_succeeded());
+        assert!(matches!(
+            terminal.execution_timing(),
+            DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
+        ));
+    }
+
+    #[test]
+    fn kernel_profile_attributes_node_bound_native_work() {
+        let runtime = runtime();
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/kernel-profile-destination"))
+            .expect("destination allocation");
+        let command = runtime
+            .encode_zero(&destination, 0, 8)
+            .expect("zero command")
+            .with_work_shape(DeviceBatchingForm::Packed, 2, 8)
+            .expect("work shape");
+        let mut stream = runtime.create_stream().expect("stream");
+
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                vec![(DeviceCommandPhase::Compute, Some(0), command)],
+                DeviceTimingMode::Kernel,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .expect("kernel-profiled submission");
+        let attribution = runtime
+            .submission_attribution(&fence)
+            .expect("kernel profile must retain native work attribution");
+        let [command] = attribution.commands() else {
+            panic!("expected exactly one native command attribution")
+        };
+        assert_eq!(command.node_index(), Some(0));
+        assert_eq!(command.command_phase(), DeviceCommandPhase::Compute);
+        assert_eq!(command.native_op_id(), "device zero");
+        assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
+        assert_eq!(command.batching_form(), DeviceBatchingForm::Packed);
+        assert_eq!(command.participant_count(), 2);
+        assert_eq!(command.token_count(), 8);
+        assert_eq!(command.compute_dispatch_count(), 0);
+        assert_eq!(command.transfer_command_count(), 1);
+
+        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
         assert!(terminal.terminal().is_succeeded());
         assert!(matches!(
             terminal.execution_timing(),
@@ -1384,7 +1527,7 @@ mod tests {
         let failure = runtime
             .submit_commands(
                 &mut stream,
-                vec![command],
+                compute_entries(vec![command]),
                 DeviceTimingMode::Off,
                 &DisabledDeviceSubmissionTimingSink,
             )

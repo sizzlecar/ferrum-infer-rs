@@ -5634,6 +5634,10 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
         sink.capture_policy(),
         ExecutionEventCapturePolicy::FirstFramePerRequest
     );
+    assert_eq!(
+        sink.device_timing_mode(),
+        ferrum_interfaces::vnext::DeviceTimingMode::Off
+    );
     assert_eq!(sink.capture_policy().as_str(), "first_frame_per_request");
     let (run_id, request_id, event) = vnext_profile_test_event();
     let mut emitter = ExecutionEventEmitter::new(&sink, run_id.clone(), request_id.clone());
@@ -5660,6 +5664,40 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
         Some(&serde_json::json!("first_frame_per_request"))
     );
 
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+fn full_vnext_profile_enables_kernel_attribution_and_all_frames() {
+    let trace_path = resource_trace_temp_path("vnext-full-profile");
+    let _ = std::fs::remove_file(&trace_path);
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Full;
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+
+    assert_eq!(
+        sink.capture_policy(),
+        ExecutionEventCapturePolicy::AllFrames
+    );
+    assert_eq!(
+        sink.device_timing_mode(),
+        ferrum_interfaces::vnext::DeviceTimingMode::Kernel
+    );
+    let (_, _, accepted) = vnext_profile_test_event();
+    let profile = sink.profile_event(&accepted).unwrap();
+    assert_eq!(
+        profile.attributes.get("profile_detail"),
+        Some(&serde_json::json!("full"))
+    );
+    assert_eq!(
+        profile.attributes.get("diagnostic_only"),
+        Some(&serde_json::json!(true))
+    );
+
+    drop(sink);
+    journal.close().unwrap();
     let _ = std::fs::remove_file(trace_path);
 }
 

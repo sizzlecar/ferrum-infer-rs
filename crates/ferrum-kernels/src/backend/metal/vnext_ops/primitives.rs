@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     residual_add_contract, rms_norm_contract, token_embedding_contract, BatchedOperationInvocation,
-    ElementType, EncodedDeviceOperation, OperationFailure, OperationProvider,
+    DeviceBatchingForm, ElementType, EncodedDeviceOperation, OperationFailure, OperationProvider,
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, PhysicalWeightPadding, ResolvedValueRole, VNextError,
     WeightEncoding, RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID,
@@ -327,7 +327,14 @@ fn encode_token_embedding(
             },
         });
     }
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal embedding participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let dispatch_count = launches.len() as u64;
     MetalDeviceCommand::operation("vnext_token_embedding", regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(dispatch_count);
         let compute = encoder.compute_encoder();
         for launch in &launches {
             dispatch_embedding(
@@ -342,6 +349,16 @@ fn encode_token_embedding(
         }
         Ok(())
     })
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::ParticipantLoop
+        },
+        participant_count,
+        token_count,
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -495,7 +512,12 @@ fn encode_rms_norm(
         hidden_size: checked_u32(hidden_size, "Metal RMSNorm hidden size")?,
         epsilon,
     };
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal RMSNorm participant count",
+    )?;
     MetalDeviceCommand::operation("vnext_rms_norm", regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(1);
         dispatch_rms_norm(
             &pipelines,
             encoder.compute_encoder(),
@@ -506,6 +528,16 @@ fn encode_rms_norm(
         );
         Ok(())
     })
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::Packed
+        },
+        participant_count,
+        tokens,
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -579,7 +611,12 @@ fn encode_residual_add(
     let params = ResidualAddParams {
         elements: checked_u32(elements, "Metal residual-add element count")?,
     };
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal residual-add participant count",
+    )?;
     MetalDeviceCommand::operation("vnext_residual_add", regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(1);
         dispatch_residual_add(
             &pipelines,
             encoder.compute_encoder(),
@@ -590,6 +627,16 @@ fn encode_residual_add(
         );
         Ok(())
     })
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::Packed
+        },
+        participant_count,
+        tokens,
+    )
     .map_err(|error| error.to_string())
 }
 

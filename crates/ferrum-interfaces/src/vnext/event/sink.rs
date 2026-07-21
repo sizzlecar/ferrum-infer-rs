@@ -105,6 +105,13 @@ pub trait ExecutionEventSink: Send + Sync {
         ExecutionEventCapturePolicy::AllFrames
     }
 
+    fn record_device_submission_attribution(
+        &self,
+        _attribution: &super::super::BoundDeviceSubmissionAttribution,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+
     fn record(&self, permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError>;
 
     /// Records one cursor-ordered batch. Sinks with a buffered transport should
