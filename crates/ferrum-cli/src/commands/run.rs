@@ -8,12 +8,15 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
+    has_unclosed_thinking_block, parse_reasoning_response_for_prompt, FerrumConfigBuilder,
+    FerrumError, FinishReason, InferenceRequest, InferenceResponse, ModelCapabilities, Priority,
     RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, SamplingParams, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY,
+    RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage, WorkloadProfile,
+    DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG, THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
@@ -21,14 +24,14 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use uuid::Uuid;
 
 #[cfg(test)]
 use crate::source_resolver::tokenizer_sibling_repo;
 
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
-const THINK_START_TAG: &str = "<think>";
-const THINK_END_TAG: &str = "</think>";
+const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
 
 /// Output format for `ferrum run`. JSONL mode emits one record per event
 /// (assistant generation result, user input, exit) on stdout — used by
@@ -53,50 +56,177 @@ fn finish_reason_str(r: FinishReason) -> &'static str {
     }
 }
 
-fn emit_jsonl_ready(model: &str, backend: &str) {
+fn emit_jsonl_ready(session_id: &str, requested_model: &str, resolved_model: &str, backend: &str) {
     let record = serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "ready",
-        "model": model,
+        "session_id": session_id,
+        "history_epoch": 0,
+        "model": resolved_model,
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
         "backend": backend,
     });
-    println!("{record}");
+    emit_jsonl_record(&record);
 }
 
-fn emit_jsonl_user(turn: usize, content: &str) {
+fn emit_jsonl_user(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    content: &str,
+    history: &[(String, String)],
+) {
     let record = serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "user",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
+        "request_id": request_id,
         "turn": turn,
         "content": content,
+        "history_before": history_evidence(history),
     });
-    println!("{record}");
+    emit_jsonl_record(&record);
+}
+
+fn emit_jsonl_assistant_delta(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    index: usize,
+    raw_text_delta: &str,
+    token_id: Option<u32>,
+) {
+    emit_jsonl_record(&jsonl_assistant_delta_record(
+        session_id,
+        history_epoch,
+        request_id,
+        turn,
+        index,
+        raw_text_delta,
+        token_id,
+    ));
+}
+
+fn jsonl_assistant_delta_record(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    index: usize,
+    raw_text_delta: &str,
+    token_id: Option<u32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
+        "event": "assistant_delta",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
+        "request_id": request_id,
+        "turn": turn,
+        "index": index,
+        "raw_text_delta": raw_text_delta,
+        "utf8_bytes": raw_text_delta.len(),
+        "token_id": token_id,
+    })
 }
 
 fn emit_jsonl_assistant(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
     turn: usize,
     content: &str,
+    reasoning: Option<&str>,
+    history: &[(String, String)],
     finish_reason: Option<FinishReason>,
+    usage: Option<&TokenUsage>,
     n_tokens: usize,
     chunk_count: usize,
+    raw_text: &str,
     ms: f64,
 ) {
-    let record = serde_json::json!({
-        "event": "assistant",
-        "turn": turn,
-        "content": content,
-        "finish_reason": finish_reason.map(finish_reason_str),
-        "n_tokens": n_tokens,
-        "chunk_count": chunk_count,
-        "ms": ms,
-    });
-    println!("{record}");
+    emit_jsonl_record(&jsonl_assistant_record(
+        session_id,
+        history_epoch,
+        request_id,
+        turn,
+        content,
+        reasoning,
+        history,
+        finish_reason,
+        usage,
+        n_tokens,
+        chunk_count,
+        raw_text,
+        ms,
+    ));
 }
 
-fn emit_jsonl_exit(reason: &str) {
+fn jsonl_assistant_record(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    content: &str,
+    reasoning: Option<&str>,
+    history: &[(String, String)],
+    finish_reason: Option<FinishReason>,
+    usage: Option<&TokenUsage>,
+    n_tokens: usize,
+    chunk_count: usize,
+    raw_text: &str,
+    ms: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
+        "event": "assistant",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
+        "request_id": request_id,
+        "turn": turn,
+        "content": content,
+        "reasoning": reasoning,
+        "history_before": history_evidence(history),
+        "finish_reason": finish_reason.map(finish_reason_str),
+        "usage": usage,
+        "n_tokens": n_tokens,
+        "chunk_count": chunk_count,
+        "raw_text_sha256": sha256_text(raw_text),
+        "ms": ms,
+    })
+}
+
+fn emit_jsonl_exit(session_id: &str, history_epoch: usize, reason: &str) {
     let record = serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "exit",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
         "reason": reason,
     });
+    emit_jsonl_record(&record);
+}
+
+fn emit_jsonl_record(record: &serde_json::Value) {
     println!("{record}");
+    io::stdout().flush().ok();
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn history_evidence(history: &[(String, String)]) -> serde_json::Value {
+    let encoded = serde_json::to_vec(history).expect("run history serialization cannot fail");
+    serde_json::json!({
+        "message_count": history.len(),
+        "turn_count": history.iter().filter(|(role, _)| role == "user").count(),
+        "sha256": format!("{:x}", Sha256::digest(encoded)),
+    })
 }
 
 fn run_request_metadata(
@@ -115,14 +245,6 @@ fn run_request_metadata(
         );
     }
     metadata
-}
-
-fn has_unclosed_thinking_block(prompt: &str) -> bool {
-    match (prompt.rfind(THINK_START_TAG), prompt.rfind(THINK_END_TAG)) {
-        (Some(start), Some(end)) => start > end,
-        (Some(_), None) => true,
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +351,103 @@ impl RunBudget {
 
 fn display_response_text(text: &str) -> String {
     text.trim().to_string()
+}
+
+struct CollectedRunGeneration {
+    request_id: String,
+    raw_text: String,
+    finish_reason: Option<FinishReason>,
+    usage: Option<TokenUsage>,
+    token_count: usize,
+    token_ids: Vec<u32>,
+    chunk_count: usize,
+}
+
+impl CollectedRunGeneration {
+    fn from_response(response: InferenceResponse) -> Self {
+        Self {
+            request_id: response.request_id.to_string(),
+            raw_text: response.text,
+            finish_reason: Some(response.finish_reason),
+            usage: Some(response.usage),
+            token_count: response.tokens.len(),
+            token_ids: response
+                .tokens
+                .into_iter()
+                .map(|token| token.get())
+                .collect(),
+            chunk_count: 1,
+        }
+    }
+}
+
+type RunResponseStream = Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + 'static>>;
+
+async fn collect_run_stream(
+    mut stream: RunResponseStream,
+    trace_tokens: bool,
+    turn: usize,
+    session_id: &str,
+    history_epoch: usize,
+    expected_request_id: &str,
+) -> Result<CollectedRunGeneration> {
+    let mut request_id = None;
+    let mut raw_text = String::new();
+    let mut finish_reason = None;
+    let mut latest_usage = None;
+    let mut token_count = 0usize;
+    let mut token_ids = Vec::new();
+    let mut chunk_count = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let chunk_request_id = chunk.request_id.to_string();
+        if chunk_request_id != expected_request_id {
+            return Err(FerrumError::internal(format!(
+                "run stream request id drift: expected {expected_request_id}, got {chunk_request_id}"
+            )));
+        }
+        request_id.get_or_insert_with(|| chunk_request_id.clone());
+        let token_id = chunk.token.map(|token| token.get());
+        if !chunk.text.is_empty() {
+            raw_text.push_str(&chunk.text);
+            emit_jsonl_assistant_delta(
+                session_id,
+                history_epoch,
+                expected_request_id,
+                turn,
+                chunk_count,
+                &chunk.text,
+                token_id,
+            );
+            chunk_count += 1;
+        }
+        if let Some(token_id) = token_id {
+            if trace_tokens {
+                eprintln!(
+                    "[run-token-trace] turn={turn} token={} text={:?}",
+                    token_id, chunk.text
+                );
+            }
+            token_ids.push(token_id);
+            token_count += 1;
+        }
+        if let Some(usage) = chunk.usage.as_ref() {
+            token_count = usage.completion_tokens;
+            latest_usage = Some(usage.clone());
+        }
+        if chunk.finish_reason.is_some() {
+            finish_reason = chunk.finish_reason;
+        }
+    }
+    Ok(CollectedRunGeneration {
+        request_id: request_id.unwrap_or_else(|| expected_request_id.to_string()),
+        raw_text,
+        finish_reason,
+        usage: latest_usage,
+        token_count,
+        token_ids,
+        chunk_count,
+    })
 }
 
 #[derive(Args)]
@@ -739,6 +958,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         )
         .dimmed()
     );
+    let run_session_id = Uuid::new_v4().to_string();
 
     // One-shot mode: --prompt supplied → run a single request and exit.
     // Matches the GGUF run_gguf_one_shot UX. Previously cmd.prompt was
@@ -758,14 +978,29 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             &run_budget,
         )?;
         maybe_warn_context_shift(&plan, format);
+        let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
         let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
         let prompt_chars = plan.prompt.chars().count();
+        let request_id = RequestId(Uuid::new_v4());
+        let request_id_text = request_id.to_string();
+        let one_shot_history = Vec::new();
+        if format == OutputFormat::Jsonl {
+            emit_jsonl_ready(&run_session_id, &cmd.model, &model_id, &device_label);
+            emit_jsonl_user(
+                &run_session_id,
+                0,
+                &request_id_text,
+                0,
+                &one_shot,
+                &one_shot_history,
+            );
+        }
         let request = InferenceRequest {
-            id: RequestId(Uuid::new_v4()),
+            id: request_id,
             model_id: ferrum_types::ModelId(model_id.clone()),
             prompt: plan.prompt,
             sampling_params: plan.sampling_params.clone(),
-            stream: false,
+            stream: format == OutputFormat::Jsonl,
             priority: Priority::Normal,
             client_id: None,
             session_id: None,
@@ -779,8 +1014,31 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let start = std::time::Instant::now();
-        let response = match engine.infer(request).await {
-            Ok(response) => response,
+        let trace_tokens =
+            crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_RUN_TRACE_TOKENS")
+                .is_some();
+        let generation_result = match format {
+            OutputFormat::Text => engine
+                .infer(request)
+                .await
+                .map(CollectedRunGeneration::from_response),
+            OutputFormat::Jsonl => match engine.infer_stream(request).await {
+                Ok(stream) => {
+                    collect_run_stream(
+                        stream,
+                        trace_tokens,
+                        0,
+                        &run_session_id,
+                        0,
+                        &request_id_text,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        let generation = match generation_result {
+            Ok(generation) => generation,
             Err(err) => {
                 let memory_after = product_memory_enabled
                     .then(|| memory_sampler.sample())
@@ -824,18 +1082,31 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let memory = process_memory_observation_between(memory_before, memory_after.clone());
-        let tokens = response.tokens.len();
-        let output_token_ids = response
-            .tokens
-            .iter()
-            .map(|token| token.get())
-            .collect::<Vec<_>>();
-        let content = display_response_text(&response.text);
-        let chunk_count = usize::from(!content.is_empty());
-        let finish_reason = Some(response.finish_reason);
+        let CollectedRunGeneration {
+            request_id: response_request_id,
+            raw_text,
+            finish_reason,
+            usage,
+            token_count: tokens,
+            token_ids: output_token_ids,
+            chunk_count,
+        } = generation;
+        if response_request_id != request_id_text {
+            return Err(FerrumError::internal(format!(
+                "run response request id drift: expected {request_id_text}, got {response_request_id}"
+            )));
+        }
+        let raw_response = display_response_text(&raw_text);
+        let parsed = parse_reasoning_response_for_prompt(&raw_response, prompt_opened_thinking);
+        let content = display_response_text(&parsed.content);
+        let reasoning = parsed
+            .reasoning
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let bench = cmd.bench_mode;
         if format == OutputFormat::Text && !bench {
-            print!("{}", content);
+            print!("{}", raw_response);
             io::stdout().flush().ok();
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -856,11 +1127,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             }
             OutputFormat::Jsonl => {
                 emit_jsonl_assistant(
+                    &run_session_id,
+                    0,
+                    &request_id_text,
                     0,
                     &content,
+                    reasoning,
+                    &one_shot_history,
                     finish_reason,
+                    usage.as_ref(),
                     tokens,
                     chunk_count,
+                    &raw_response,
                     elapsed * 1000.0,
                 );
             }
@@ -890,8 +1168,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 chunk_count,
                 finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
                 prompt_chars,
-                response_chars: content.chars().count(),
-                response_text: content.clone(),
+                response_chars: raw_response.chars().count(),
+                response_text: raw_response,
                 memory,
                 memory_stages: actual_run_memory_stages(
                     product_memory_enabled,
@@ -907,8 +1185,16 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             },
         )?;
         shutdown_result?;
+        if format == OutputFormat::Jsonl {
+            emit_jsonl_exit(&run_session_id, 0, "one_shot_complete");
+        }
         return Ok(());
     }
+
+    let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
+    let mut history_epoch = 0usize;
+    let mut turn = 0usize;
+    let mut exit_reason: &str = "eof";
 
     // Print ready message
     let format = cmd.output_format;
@@ -923,14 +1209,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             eprintln!();
         }
         OutputFormat::Jsonl => {
-            emit_jsonl_ready(&model_id, &device_label);
+            emit_jsonl_ready(&run_session_id, &cmd.model, &model_id, &device_label);
         }
     }
-
-    // Interactive loop
-    let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
-    let mut turn = 0usize;
-    let mut exit_reason: &str = "eof";
 
     // If stdin is not a TTY (piped input), don't print prompts and just consume lines.
     // This enables: `printf "hi\n/bye\n" | ferrum run ...` for automation/profiling.
@@ -965,24 +1246,28 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     break;
                 }
                 if input == "/clear" {
+                    let before = history_evidence(&history);
                     history.clear();
+                    history_epoch += 1;
+                    turn = 0;
                     match format {
                         OutputFormat::Text => {
                             eprintln!("{}", "History cleared.".dimmed());
                         }
                         OutputFormat::Jsonl => {
                             let record = serde_json::json!({
-                                "event": "clear",
+                                "schema_version": RUN_JSONL_SCHEMA_VERSION,
+                                "event": "history_reset",
+                                "session_id": run_session_id,
+                                "history_epoch": history_epoch,
                                 "turn": turn,
+                                "history_before": before,
+                                "history_after": history_evidence(&history),
                             });
-                            println!("{record}");
+                            emit_jsonl_record(&record);
                         }
                     }
                     continue;
-                }
-
-                if format == OutputFormat::Jsonl {
-                    emit_jsonl_user(turn, input);
                 }
 
                 let plan = build_run_prompt_plan(
@@ -996,14 +1281,27 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     &run_budget,
                 )?;
                 maybe_warn_context_shift(&plan, format);
+                let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
                 let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
+                let request_id = RequestId(Uuid::new_v4());
+                let request_id_text = request_id.to_string();
+                if format == OutputFormat::Jsonl {
+                    emit_jsonl_user(
+                        &run_session_id,
+                        history_epoch,
+                        &request_id_text,
+                        turn,
+                        input,
+                        &history,
+                    );
+                }
                 // Create request
                 let request = InferenceRequest {
-                    id: RequestId(Uuid::new_v4()),
+                    id: request_id,
                     model_id: ferrum_types::ModelId(model_id.clone()),
                     prompt: plan.prompt,
                     sampling_params: plan.sampling_params,
-                    stream: format == OutputFormat::Text,
+                    stream: true,
                     priority: Priority::Normal,
                     client_id: None,
                     session_id: None,
@@ -1018,7 +1316,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     "FERRUM_RUN_TRACE_TOKENS",
                 )
                 .is_some();
-                let (clean_response, finish_reason, token_count, chunk_count) = match format {
+                let (
+                    raw_response,
+                    clean_response,
+                    reasoning,
+                    finish_reason,
+                    usage,
+                    token_count,
+                    chunk_count,
+                ) = match format {
                     OutputFormat::Text => {
                         let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
                         let mut stream = match engine.infer_stream(request).await {
@@ -1030,6 +1336,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                         };
                         let mut raw_response_text = String::new();
                         let mut finish_reason = None;
+                        let mut latest_usage = None;
                         let mut token_count = 0usize;
                         let mut chunk_count = 0usize;
                         while let Some(chunk) = stream.next().await {
@@ -1067,36 +1374,51 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             }
                             if let Some(usage) = chunk.usage.as_ref() {
                                 token_count = usage.completion_tokens;
+                                latest_usage = Some(usage.clone());
                             }
                             if chunk.finish_reason.is_some() {
                                 finish_reason = chunk.finish_reason;
                             }
                         }
                         clear_first_token_indicator(&mut first_token_indicator);
+                        let raw_response = display_response_text(&raw_response_text);
                         (
-                            display_response_text(&raw_response_text),
+                            raw_response.clone(),
+                            raw_response,
+                            None,
                             finish_reason,
+                            latest_usage,
                             token_count,
                             chunk_count,
                         )
                     }
                     OutputFormat::Jsonl => {
-                        let response = engine.infer(request).await?;
-                        if trace_tokens {
-                            let tokens = response
-                                .tokens
-                                .iter()
-                                .map(|token| token.get())
-                                .collect::<Vec<_>>();
-                            eprintln!("[run-token-trace] turn={turn} tokens={tokens:?}");
-                        }
-                        let content = display_response_text(&response.text);
-                        let chunk_count = usize::from(!content.is_empty());
+                        let stream = engine.infer_stream(request).await?;
+                        let generation = collect_run_stream(
+                            stream,
+                            trace_tokens,
+                            turn,
+                            &run_session_id,
+                            history_epoch,
+                            &request_id_text,
+                        )
+                        .await?;
+                        let raw_response = display_response_text(&generation.raw_text);
+                        let parsed = parse_reasoning_response_for_prompt(
+                            &raw_response,
+                            prompt_opened_thinking,
+                        );
                         (
-                            content,
-                            Some(response.finish_reason),
-                            response.tokens.len(),
-                            chunk_count,
+                            raw_response,
+                            display_response_text(&parsed.content),
+                            parsed
+                                .reasoning
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty()),
+                            generation.finish_reason,
+                            generation.usage,
+                            generation.token_count,
+                            generation.chunk_count,
                         )
                     }
                 };
@@ -1121,11 +1443,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     }
                     OutputFormat::Jsonl => {
                         emit_jsonl_assistant(
+                            &run_session_id,
+                            history_epoch,
+                            &request_id_text,
                             turn,
                             &clean_response,
+                            reasoning.as_deref(),
+                            &history,
                             finish_reason,
+                            usage.as_ref(),
                             token_count,
                             chunk_count,
+                            &raw_response,
                             elapsed_s * 1000.0,
                         );
                     }
@@ -1139,8 +1468,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 // Add to history
                 history.push(("user".to_string(), input.to_string()));
-                if !clean_response.is_empty() {
-                    history.push(("assistant".to_string(), clean_response));
+                if !raw_response.is_empty() {
+                    history.push(("assistant".to_string(), raw_response));
                 }
 
                 // Limit history
@@ -1166,7 +1495,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             eprintln!("{}", "Goodbye!".bright_yellow());
         }
         OutputFormat::Jsonl => {
-            emit_jsonl_exit(exit_reason);
+            emit_jsonl_exit(&run_session_id, history_epoch, exit_reason);
         }
     }
     engine.shutdown().await?;
@@ -2445,6 +2774,76 @@ mod tests {
             &ChatTemplateOptions::default(),
         );
         assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+    }
+
+    #[test]
+    fn jsonl_v2_assistant_binds_reasoning_usage_and_history() {
+        let history = vec![
+            ("user".to_string(), "first".to_string()),
+            (
+                "assistant".to_string(),
+                "<think>why</think>answer".to_string(),
+            ),
+        ];
+        let usage = TokenUsage::new(7, 3);
+        let record = jsonl_assistant_record(
+            "session-1",
+            2,
+            "request-1",
+            1,
+            "answer",
+            Some("why"),
+            &history,
+            Some(FinishReason::EOS),
+            Some(&usage),
+            3,
+            2,
+            "<think>why</think>answer",
+            12.5,
+        );
+        assert_eq!(record["schema_version"], RUN_JSONL_SCHEMA_VERSION);
+        assert_eq!(record["session_id"], "session-1");
+        assert_eq!(record["history_epoch"], 2);
+        assert_eq!(record["request_id"], "request-1");
+        assert_eq!(record["content"], "answer");
+        assert_eq!(record["reasoning"], "why");
+        assert_eq!(record["usage"]["prompt_tokens"], 7);
+        assert_eq!(record["usage"]["completion_tokens"], 3);
+        assert_eq!(record["usage"]["total_tokens"], 10);
+        assert_eq!(record["history_before"]["message_count"], 2);
+        assert_eq!(record["history_before"]["turn_count"], 1);
+        assert_eq!(
+            record["raw_text_sha256"],
+            sha256_text("<think>why</think>answer")
+        );
+    }
+
+    #[test]
+    fn history_evidence_changes_when_reasoning_history_changes() {
+        let first = vec![("assistant".to_string(), "answer".to_string())];
+        let second = vec![(
+            "assistant".to_string(),
+            "<think>why</think>answer".to_string(),
+        )];
+        assert_ne!(
+            history_evidence(&first)["sha256"],
+            history_evidence(&second)["sha256"]
+        );
+    }
+
+    #[test]
+    fn jsonl_v2_delta_preserves_utf8_bytes_and_request_binding() {
+        let record =
+            jsonl_assistant_delta_record("session-1", 3, "request-1", 4, 2, "🙂", Some(9271));
+        assert_eq!(record["event"], "assistant_delta");
+        assert_eq!(record["session_id"], "session-1");
+        assert_eq!(record["history_epoch"], 3);
+        assert_eq!(record["request_id"], "request-1");
+        assert_eq!(record["turn"], 4);
+        assert_eq!(record["index"], 2);
+        assert_eq!(record["raw_text_delta"], "🙂");
+        assert_eq!(record["utf8_bytes"], 4);
+        assert_eq!(record["token_id"], 9271);
     }
 
     #[test]
