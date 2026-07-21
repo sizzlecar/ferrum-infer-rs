@@ -951,11 +951,15 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.safetensors.gptq-marlin-int4")?,
         layout_id: WeightLayoutId::new(if text.is_moe() {
-            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin"
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major"
         } else {
             "weight-layout.qwen3_5.dense_hybrid.gptq_marlin"
         })?,
-        version: ContractVersion::new(2, 0),
+        version: if text.is_moe() {
+            ContractVersion::new(3, 0)
+        } else {
+            ContractVersion::new(2, 0)
+        },
         components,
         tensors,
     })
@@ -1106,31 +1110,19 @@ fn append_safetensors_moe_weight_schema(
         "moe_per_expert_up_proj_qweight",
         moe.num_experts,
     )?;
-    let mut experts = Vec::with_capacity(moe.num_experts);
-    for expert in 0..moe.num_experts {
-        let mut parts = Vec::with_capacity(2);
-        let extents = vec![1, moe.moe_intermediate_size as u64, text.hidden_size as u64];
-        for (partition, source) in [gates[expert], ups[expert]].into_iter().enumerate() {
-            let layout =
-                append_safetensors_source_layout(source, &extents, quantization, components)?;
-            parts.push(CompositeWeightPart {
-                layout: Box::new(layout),
-                logical_offsets: vec![partition as u64, 0, 0],
-                extents: extents.clone(),
-            });
-        }
-        experts.push(PhysicalWeightLayout::Composite { parts });
-    }
-    tensors.push(WeightTensorSpec {
-        id: moe_weight_id(layer_index, MOE_ROUTED_GATE_UP_ROLE)?,
-        dimensions: moe_logical_dimensions(text, MOE_ROUTED_GATE_UP_ROLE)?,
-        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
-        physical_layout: PhysicalWeightLayout::ExpertStack {
-            experts,
-            expert_axis: 0,
-        },
-        required: true,
-    });
+    let routed_gate_up_sources = gates
+        .into_iter()
+        .zip(ups)
+        .flat_map(|(gate, up)| [gate, up])
+        .collect::<Vec<_>>();
+    append_safetensors_gptq_expert_stack(
+        routed_gate_up_sources,
+        moe_weight_id(layer_index, MOE_ROUTED_GATE_UP_ROLE)?,
+        moe_logical_dimensions(text, MOE_ROUTED_GATE_UP_ROLE)?,
+        quantization,
+        components,
+        tensors,
+    )?;
 
     let downs = required_expert_weights(
         config,
@@ -1138,23 +1130,14 @@ fn append_safetensors_moe_weight_schema(
         "moe_per_expert_down_proj_qweight",
         moe.num_experts,
     )?;
-    let down_dimensions = vec![text.hidden_size as u64, moe.moe_intermediate_size as u64];
-    let experts = downs
-        .into_iter()
-        .map(|source| {
-            append_safetensors_source_layout(source, &down_dimensions, quantization, components)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    tensors.push(WeightTensorSpec {
-        id: moe_weight_id(layer_index, MOE_ROUTED_DOWN_ROLE)?,
-        dimensions: moe_logical_dimensions(text, MOE_ROUTED_DOWN_ROLE)?,
-        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
-        physical_layout: PhysicalWeightLayout::ExpertStack {
-            experts,
-            expert_axis: 0,
-        },
-        required: true,
-    });
+    append_safetensors_gptq_expert_stack(
+        downs,
+        moe_weight_id(layer_index, MOE_ROUTED_DOWN_ROLE)?,
+        moe_logical_dimensions(text, MOE_ROUTED_DOWN_ROLE)?,
+        quantization,
+        components,
+        tensors,
+    )?;
 
     append_safetensors_direct_moe_weight(
         config,
@@ -1186,6 +1169,151 @@ fn append_safetensors_moe_weight_schema(
         components,
         tensors,
     )
+}
+
+fn append_safetensors_gptq_expert_stack(
+    sources: Vec<&FamilyWeight>,
+    logical_id: WeightId,
+    logical_dimensions: Vec<u64>,
+    quantization: &Qwen35QuantizationConfig,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    validate_gptq_marlin_config(quantization)?;
+    if logical_dimensions.len() < 3 {
+        return Err(invalid_config(
+            "weights.dimensions",
+            "GPTQ expert stack must expose an expert axis and a matrix",
+        ));
+    }
+    let source_count = logical_dimensions[..logical_dimensions.len() - 2]
+        .iter()
+        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| invalid_config("weights.dimensions", "expert stack size overflows"))?;
+    if usize::try_from(source_count).ok() != Some(sources.len()) {
+        return Err(invalid_config(
+            "weights.dimensions",
+            format!(
+                "GPTQ expert stack {logical_id} requires {source_count} ordered projections, got {}",
+                sources.len()
+            ),
+        ));
+    }
+
+    let source_dimensions = &logical_dimensions[logical_dimensions.len() - 2..];
+    let mut packed_sources = Vec::with_capacity(sources.len() * 3);
+    let mut scale_sources = Vec::with_capacity(sources.len());
+    let mut has_g_idx = None;
+    for source in sources {
+        if source.dimensions != source_dimensions {
+            return Err(invalid_config(
+                "weights.dimensions",
+                format!(
+                    "GPTQ expert stack {logical_id} source {:?} shape {:?} differs from {:?}",
+                    source.role, source.dimensions, source_dimensions
+                ),
+            ));
+        }
+        let FamilyWeightSourceEncoding::Gptq {
+            qweight,
+            scales,
+            qzeros,
+            g_idx,
+        } = &source.source_encoding
+        else {
+            return Err(invalid_config(
+                "weights.source_encoding",
+                format!("GPTQ expert stack {logical_id} contains a non-GPTQ source"),
+            ));
+        };
+        validate_gptq_weight_source(
+            source,
+            qweight,
+            scales,
+            qzeros,
+            g_idx.as_ref(),
+            quantization,
+        )?;
+        match has_g_idx {
+            None => has_g_idx = Some(g_idx.is_some()),
+            Some(expected) if expected != g_idx.is_some() => {
+                return Err(invalid_config(
+                    "weights.source_encoding.g_idx",
+                    format!(
+                        "GPTQ expert stack {logical_id} mixes projections with and without g_idx"
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
+        packed_sources.extend([qweight.external_name.clone(), qzeros.external_name.clone()]);
+        if let Some(g_idx) = g_idx {
+            packed_sources.push(g_idx.external_name.clone());
+        }
+        scale_sources.push(scales.external_name.clone());
+    }
+
+    let spec = gptq_marlin_quantization_spec(quantization)?;
+    let mut packed_dimensions = logical_dimensions.clone();
+    let packed_axis = packed_dimensions.len() - 1;
+    if !packed_dimensions[packed_axis].is_multiple_of(2) {
+        return Err(invalid_config(
+            "weights.dimensions",
+            format!("GPTQ expert stack {logical_id} has an odd packed axis"),
+        ));
+    }
+    packed_dimensions[packed_axis] /= 2;
+    let mut scale_dimensions = logical_dimensions.clone();
+    let group_axis = scale_dimensions.len() - 1;
+    let group_size = quantization.group_size as u64;
+    if !scale_dimensions[group_axis].is_multiple_of(group_size) {
+        return Err(invalid_config(
+            "weights.dimensions",
+            format!("GPTQ expert stack {logical_id} is not group aligned"),
+        ));
+    }
+    scale_dimensions[group_axis] /= group_size;
+
+    let base = logical_id.to_string();
+    let packed_id = WeightId::new(format!("{base}.packed"))?;
+    let scales_id = WeightId::new(format!("{base}.scales"))?;
+    components.push(WeightComponentSpec {
+        id: packed_id.clone(),
+        role: WeightComponentRole::PackedValues,
+        external_names: packed_sources,
+        dimensions: packed_dimensions.clone(),
+        encoding: WeightEncoding::Quantized(spec),
+        required: true,
+    });
+    components.push(WeightComponentSpec {
+        id: scales_id.clone(),
+        role: WeightComponentRole::Scales,
+        external_names: scale_sources,
+        dimensions: scale_dimensions,
+        encoding: WeightEncoding::Dense {
+            element_type: ElementType::F16,
+        },
+        required: true,
+    });
+    tensors.push(WeightTensorSpec {
+        id: logical_id,
+        dimensions: logical_dimensions,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: PhysicalWeightLayout::Quantized {
+            packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+            packed_dimensions,
+            scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+            zero_points: None,
+            axis_indices: None,
+            permutation: None,
+            codebook: None,
+            group_axis: u32::try_from(group_axis)
+                .map_err(|_| invalid_config("weights.dimensions", "GPTQ group axis exceeds u32"))?,
+            group_padding: PhysicalWeightPadding::Exact,
+        },
+        required: true,
+    });
+    Ok(())
 }
 
 fn append_safetensors_direct_moe_weight(
@@ -3088,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_typed_gptq_moe_expert_stacks_in_numeric_order() {
+    fn builds_aggregate_gptq_moe_expert_stacks_in_numeric_order() {
         let config = test_moe_gptq_config();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&serde_json::to_value(&config).unwrap())
@@ -3102,44 +3230,70 @@ mod tests {
             schema.quantization_formats(),
             BTreeSet::from([QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID).unwrap()])
         );
+        assert_eq!(schema.version, ContractVersion::new(3, 0));
+        assert_eq!(
+            schema.layout_id.as_str(),
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major"
+        );
         let routed = schema
             .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
             .unwrap();
-        let PhysicalWeightLayout::ExpertStack {
-            experts,
-            expert_axis,
+        let PhysicalWeightLayout::Quantized {
+            packed_values,
+            packed_dimensions,
+            scales,
+            group_axis,
+            ..
         } = &routed.physical_layout
         else {
-            panic!("routed gate/up must be an expert stack")
+            panic!("routed gate/up must be one aggregate quantized stack")
         };
-        assert_eq!(*expert_axis, 0);
-        assert_eq!(experts.len(), 12);
-        assert!(experts.iter().all(|expert| matches!(
-            expert,
-            PhysicalWeightLayout::Composite { parts }
-                if parts.len() == 2
-                    && parts.iter().all(|part| matches!(
-                        part.layout.as_ref(),
-                        PhysicalWeightLayout::Quantized { .. }
-                    ))
-        )));
+        assert_eq!(routed.dimensions, [12, 2, 16, 16]);
+        assert_eq!(packed_dimensions, &[12, 2, 16, 8]);
+        assert_eq!(*group_axis, 3);
+        let packed = schema
+            .components
+            .iter()
+            .find(|component| component.id == packed_values.component_id)
+            .unwrap();
+        let scale = schema
+            .components
+            .iter()
+            .find(|component| component.id == scales.component_id)
+            .unwrap();
+        assert_eq!(packed.dimensions, [12, 2, 16, 8]);
+        assert_eq!(scale.dimensions, [12, 2, 16, 1]);
+        assert_eq!(packed.external_names.len(), 12 * 2 * 3);
+        assert_eq!(scale.external_names.len(), 12 * 2);
         for expert in 0..12 {
-            let expected =
+            let gate =
                 format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.qweight");
-            let component = schema
-                .components
-                .iter()
-                .find(|component| component.external_names.first() == Some(&expected))
-                .unwrap();
+            let up = format!("model.language_model.layers.0.mlp.experts.{expert}.up_proj.qweight");
+            let packed_offset = expert * 6;
             assert_eq!(
-                component.external_names,
+                packed.external_names[packed_offset..packed_offset + 6],
                 [
-                    expected,
+                    gate.clone(),
                     format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.qzeros"),
                     format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.g_idx"),
+                    up.clone(),
+                    format!("model.language_model.layers.0.mlp.experts.{expert}.up_proj.qzeros"),
+                    format!("model.language_model.layers.0.mlp.experts.{expert}.up_proj.g_idx"),
+                ]
+            );
+            assert_eq!(
+                scale.external_names[expert * 2..expert * 2 + 2],
+                [
+                    gate.replace(".qweight", ".scales"),
+                    up.replace(".qweight", ".scales"),
                 ]
             );
         }
+        let down = schema
+            .tensor(&moe_weight_id(0, MOE_ROUTED_DOWN_ROLE).unwrap())
+            .unwrap();
+        assert_eq!(schema.physical_component_refs(&routed.id).unwrap().len(), 2);
+        assert_eq!(schema.physical_component_refs(&down.id).unwrap().len(), 2);
     }
 
     #[test]
