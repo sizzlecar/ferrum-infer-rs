@@ -2630,6 +2630,27 @@ impl EngineInner {
             .unwrap_or(ProfileEntrypoint::Synthetic)
     }
 
+    fn extend_scheduler_timeline_attributes(
+        &self,
+        attributes: &mut BTreeMap<String, serde_json::Value>,
+    ) {
+        let snapshot = self.scheduler.trace_snapshot();
+        attributes.extend([
+            (
+                "active_sequence_count".to_string(),
+                serde_json::json!(snapshot.active_len),
+            ),
+            (
+                "monotonic_nanos".to_string(),
+                serde_json::json!(inner::scheduler_trace_monotonic_nanos()),
+            ),
+            (
+                "scheduler_snapshot".to_string(),
+                serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null),
+            ),
+        ]);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn trace_resource_event(
         &self,
@@ -2699,12 +2720,14 @@ impl EngineInner {
                 serde_json::json!(underflow_amount),
             );
         }
-        if matches!(action, ResourceAction::Defer) {
-            attributes.insert(
-                "scheduler_snapshot".to_string(),
-                serde_json::to_value(self.scheduler.trace_snapshot())
-                    .unwrap_or(serde_json::Value::Null),
-            );
+        if matches!(
+            action,
+            ResourceAction::RequestOpen
+                | ResourceAction::RequestClose
+                | ResourceAction::Defer
+                | ResourceAction::Reject
+        ) {
+            self.extend_scheduler_timeline_attributes(&mut attributes);
         }
         let timestamp = chrono::Utc::now();
         let mut shape =
@@ -2860,6 +2883,7 @@ impl EngineInner {
                 serde_json::json!(message),
             );
         }
+        self.extend_scheduler_timeline_attributes(&mut attributes);
         let timestamp = chrono::Utc::now();
         let error = message.as_ref().map(|message| ProfileError {
             kind: "resource_owner_close_outstanding".to_string(),

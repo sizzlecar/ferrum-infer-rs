@@ -5505,6 +5505,49 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     assert!(saw("backend_workspace", ResourceAction::Commit));
     assert!(saw("backend_workspace", ResourceAction::Release));
 
+    let events = read_engine_profile_events(&trace_path);
+    let request_open = events
+        .iter()
+        .find(|event| event.phase == "engine_request_open")
+        .expect("request-open timeline event");
+    let request_close = events
+        .iter()
+        .find(|event| event.phase == "engine_request_close")
+        .expect("request-close timeline event");
+    for event in [request_open, request_close] {
+        assert!(event
+            .attributes
+            .get("monotonic_nanos")
+            .and_then(serde_json::Value::as_u64)
+            .is_some());
+        assert!(event
+            .attributes
+            .get("active_sequence_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some());
+        assert!(event
+            .attributes
+            .get("scheduler_snapshot")
+            .and_then(serde_json::Value::as_object)
+            .is_some());
+        assert_eq!(
+            event.attributes["active_sequence_count"],
+            event.attributes["scheduler_snapshot"]["active_len"]
+        );
+    }
+    assert_eq!(
+        request_close.attributes["active_sequence_count"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        request_close.attributes["scheduler_snapshot"]["active_len"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        request_close.attributes["scheduler_snapshot"]["completed_total"],
+        serde_json::json!(1)
+    );
+
     let _ = std::fs::remove_file(trace_path);
 }
 

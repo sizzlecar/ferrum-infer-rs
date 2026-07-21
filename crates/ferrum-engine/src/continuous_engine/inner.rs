@@ -143,7 +143,7 @@ enum ExecutorSchedulerTraceRecord {
     AdmissionQueueObservation(ExecutorAdmissionQueueObservation),
 }
 
-fn scheduler_trace_monotonic_nanos() -> u64 {
+pub(super) fn scheduler_trace_monotonic_nanos() -> u64 {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     ORIGIN
         .get_or_init(Instant::now)
@@ -357,28 +357,14 @@ impl EngineInner {
             return;
         };
         let entrypoint = self.trace_entrypoint();
-        attributes.extend([
-            (
-                "actual_model_smoke".to_string(),
-                serde_json::json!(matches!(
-                    entrypoint,
-                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
-                )),
-            ),
-            (
-                "active_sequence_count".to_string(),
-                serde_json::json!(self.scheduler.active_count()),
-            ),
-            (
-                "monotonic_nanos".to_string(),
-                serde_json::json!(scheduler_trace_monotonic_nanos()),
-            ),
-            (
-                "scheduler_snapshot".to_string(),
-                serde_json::to_value(self.scheduler.trace_snapshot())
-                    .unwrap_or(serde_json::Value::Null),
-            ),
-        ]);
+        attributes.insert(
+            "actual_model_smoke".to_string(),
+            serde_json::json!(matches!(
+                entrypoint,
+                ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+            )),
+        );
+        self.extend_scheduler_timeline_attributes(&mut attributes);
         let timestamp = chrono::Utc::now();
         let event_num = self
             .resource_trace_event_counter
