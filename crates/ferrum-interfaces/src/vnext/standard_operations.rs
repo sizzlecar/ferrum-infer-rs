@@ -20,6 +20,9 @@ pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
 pub const DENSE_LINEAR_F16_CAPABILITY_ID: &str = "capability.operation.dense_linear.f16";
 pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
 pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swiglu.f16";
+pub const ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID: &str = "operation.routed_shared_swiglu_moe";
+pub const ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID: &str =
+    "capability.operation.routed_shared_swiglu_moe.f16";
 pub const RESIDUAL_ADD_OPERATION_ID: &str = "operation.residual_add";
 pub const RESIDUAL_ADD_F16_CAPABILITY_ID: &str = "capability.operation.residual_add.f16";
 pub const GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID: &str =
@@ -463,6 +466,85 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
     Ok(StandardOperationContract { descriptor })
 }
 
+/// A routed SwiGLU expert set plus one sigmoid-gated shared SwiGLU expert.
+///
+/// The operation boundary intentionally owns routing, routed expert execution,
+/// shared expert execution, and the final sum. Providers can choose a
+/// monolithic kernel, overlap the shared path with routed experts, or use a
+/// decomposed fallback without changing the immutable model program. Weight
+/// ordinals and logical stack shapes are part of the stable contract; physical
+/// quantization and expert placement remain weight/provider concerns.
+pub fn routed_shared_swiglu_moe_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("expert_count"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                routed_expert_gate_up_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                routed_expert_down_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![exact(1), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                shared_expert_gate_up_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                shared_expert_down_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("expert_count")?,
+            unsigned_attribute("experts_per_token")?,
+            unsigned_attribute("routed_intermediate_size")?,
+            unsigned_attribute("shared_intermediate_size")?,
+            unconstrained_bool_attribute("normalize_topk")?,
+        ]))?,
+        resources: ResourceRequirements {
+            minimum_value_alignment_bytes: 16,
+            scratch: ResourcePresenceRequirement::Required,
+            binding: ResourcePresenceRequirement::Forbidden,
+            persistent: ResourcePresenceRequirement::Forbidden,
+        },
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(RESIDUAL_ADD_OPERATION_ID)?,
@@ -746,6 +828,35 @@ fn hidden_intermediate_dimensions() -> Vec<DimensionConstraint> {
     ]
 }
 
+fn routed_expert_gate_up_dimensions() -> Vec<DimensionConstraint> {
+    vec![
+        symbol("expert_count"),
+        exact(2),
+        symbol("routed_intermediate_size"),
+        symbol("hidden_size"),
+    ]
+}
+
+fn routed_expert_down_dimensions() -> Vec<DimensionConstraint> {
+    vec![
+        symbol("expert_count"),
+        symbol("hidden_size"),
+        symbol("routed_intermediate_size"),
+    ]
+}
+
+fn shared_expert_gate_up_dimensions() -> Vec<DimensionConstraint> {
+    vec![
+        exact(2),
+        symbol("shared_intermediate_size"),
+        symbol("hidden_size"),
+    ]
+}
+
+fn shared_expert_down_dimensions() -> Vec<DimensionConstraint> {
+    vec![symbol("hidden_size"), symbol("shared_intermediate_size")]
+}
+
 fn no_auxiliary_resources() -> ResourceRequirements {
     ResourceRequirements {
         minimum_value_alignment_bytes: 16,
@@ -1009,6 +1120,74 @@ mod tests {
             contracts[3].descriptor().outputs[0].alias(),
             &AliasPolicy::MayAlias { tensor_index: 0 }
         );
+    }
+
+    #[test]
+    fn routed_shared_moe_contract_keeps_fusion_and_weight_abi_generic() {
+        let contract = routed_shared_swiglu_moe_contract().unwrap();
+        let descriptor = contract.descriptor();
+
+        assert_eq!(
+            descriptor.id.as_str(),
+            ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID
+        );
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(descriptor.inputs.len(), 7);
+        assert_eq!(
+            descriptor.inputs[2].dimensions(),
+            &[
+                symbol("expert_count"),
+                exact(2),
+                symbol("routed_intermediate_size"),
+                symbol("hidden_size"),
+            ]
+        );
+        assert_eq!(
+            descriptor.inputs[3].dimensions(),
+            &[
+                symbol("expert_count"),
+                symbol("hidden_size"),
+                symbol("routed_intermediate_size"),
+            ]
+        );
+        assert_eq!(
+            descriptor.inputs[4].dimensions(),
+            &[exact(1), symbol("hidden_size")]
+        );
+        assert_eq!(
+            descriptor.resources.scratch,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
+            descriptor.resources.persistent,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            descriptor.provider.required_capabilities,
+            BTreeSet::from([
+                CapabilityId::new(ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID).unwrap()
+            ])
+        );
+        for attribute in [
+            "hidden_size",
+            "expert_count",
+            "experts_per_token",
+            "routed_intermediate_size",
+            "shared_intermediate_size",
+            "normalize_topk",
+        ] {
+            assert!(
+                descriptor
+                    .attributes
+                    .entries()
+                    .contains_key(&AttributeId::new(attribute).unwrap()),
+                "missing typed MoE attribute {attribute}"
+            );
+        }
+        assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
+        contract
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
     }
 
     #[test]
