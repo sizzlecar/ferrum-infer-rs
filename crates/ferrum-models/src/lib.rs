@@ -34,6 +34,7 @@ pub mod moe;
 pub mod moe_config;
 pub mod multimodal;
 pub mod qwen35_config;
+#[cfg(any(test, feature = "test-support"))]
 pub mod qwen35_s1;
 pub mod qwen35_weights;
 pub mod registry;
