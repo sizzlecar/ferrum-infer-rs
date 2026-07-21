@@ -5,6 +5,7 @@ constant uint THREADS_PER_GROUP = 256;
 constant uint VALUE_TILE = 16;
 constant uint GATED_DELTA_CHUNK_SIZE = 64;
 constant uint GATED_DELTA_CHUNK_KEY_DIM_LIMIT = 128;
+constant bool GATED_DELTA_CARRY_KEY_DIM_128 [[function_constant(0)]];
 
 struct GatedDeltaParams {
     uint tokens;
@@ -535,15 +536,23 @@ kernel void vnext_gated_delta_chunk_carry_c64(
         const float final_g =
             g[ulong(final_token) * params.value_heads + value_head];
         const float final_decay = exp(final_g);
-        for (uint index = lane; index < VALUE_TILE * params.key_dim;
-             index += THREADS_PER_GROUP) {
-            const uint local_value = index / params.key_dim;
-            const uint key_column = index - local_value * params.key_dim;
-            const uint value_column = value_start + local_value;
-            if (value_column >= params.value_dim) {
-                continue;
+        if (GATED_DELTA_CARRY_KEY_DIM_128
+            && params.key_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT) {
+            // At key_dim=128 each lane owns eight value rows with one shared
+            // key column. Keep those rows in registers so every token decay
+            // and key load is consumed eight times instead of recomputed.
+            constexpr uint ROWS_PER_LANE =
+                (VALUE_TILE * GATED_DELTA_CHUNK_KEY_DIM_LIMIT) / THREADS_PER_GROUP;
+            float updated[ROWS_PER_LANE];
+            bool valid[ROWS_PER_LANE];
+            const uint key_column = lane % GATED_DELTA_CHUNK_KEY_DIM_LIMIT;
+            for (uint slot = 0; slot < ROWS_PER_LANE; ++slot) {
+                const uint index = lane + slot * THREADS_PER_GROUP;
+                const uint local_value = index / GATED_DELTA_CHUNK_KEY_DIM_LIMIT;
+                const uint value_column = value_start + local_value;
+                valid[slot] = value_column < params.value_dim;
+                updated[slot] = valid[slot] ? final_decay * state_tile[index] : 0.0f;
             }
-            float updated = final_decay * state_tile[index];
             for (uint local_token = 0; local_token < chunk_tokens; ++local_token) {
                 const uint token = chunk_start + local_token;
                 const ulong uw_base =
@@ -552,11 +561,48 @@ kernel void vnext_gated_delta_chunk_carry_c64(
                     (ulong(token) * params.key_heads + key_head) * params.key_dim;
                 const float token_g =
                     g[ulong(token) * params.value_heads + value_head];
-                updated += exp(final_g - token_g)
-                    * float(uw[uw_base + value_column])
-                    * key[key_base + key_column];
+                const float weighted_key =
+                    exp(final_g - token_g) * key[key_base + key_column];
+                for (uint slot = 0; slot < ROWS_PER_LANE; ++slot) {
+                    if (valid[slot]) {
+                        const uint index = lane + slot * THREADS_PER_GROUP;
+                        const uint local_value =
+                            index / GATED_DELTA_CHUNK_KEY_DIM_LIMIT;
+                        const uint value_column = value_start + local_value;
+                        updated[slot] += float(uw[uw_base + value_column]) * weighted_key;
+                    }
+                }
             }
-            state_tile[index] = updated;
+            for (uint slot = 0; slot < ROWS_PER_LANE; ++slot) {
+                const uint index = lane + slot * THREADS_PER_GROUP;
+                if (valid[slot]) {
+                    state_tile[index] = updated[slot];
+                }
+            }
+        } else {
+            for (uint index = lane; index < VALUE_TILE * params.key_dim;
+                 index += THREADS_PER_GROUP) {
+                const uint local_value = index / params.key_dim;
+                const uint key_column = index - local_value * params.key_dim;
+                const uint value_column = value_start + local_value;
+                if (value_column >= params.value_dim) {
+                    continue;
+                }
+                float updated = final_decay * state_tile[index];
+                for (uint local_token = 0; local_token < chunk_tokens; ++local_token) {
+                    const uint token = chunk_start + local_token;
+                    const ulong uw_base =
+                        (ulong(token) * params.value_heads + value_head) * uw_width;
+                    const ulong key_base =
+                        (ulong(token) * params.key_heads + key_head) * params.key_dim;
+                    const float token_g =
+                        g[ulong(token) * params.value_heads + value_head];
+                    updated += exp(final_g - token_g)
+                        * float(uw[uw_base + value_column])
+                        * key[key_base + key_column];
+                }
+                state_tile[index] = updated;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

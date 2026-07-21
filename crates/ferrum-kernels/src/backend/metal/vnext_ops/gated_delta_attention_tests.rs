@@ -318,7 +318,6 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     const CHUNK_TOKENS: usize = 145;
     const CHUNK_KEY_HEADS: usize = 2;
     const CHUNK_VALUE_HEADS: usize = 4;
-    const CHUNK_KEY_DIM: usize = 32;
     const CHUNK_VALUE_DIM: usize = 32;
     const STATE_SENTINEL: f32 = 73.25;
 
@@ -328,122 +327,121 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     };
     let pipelines = MetalGatedDeltaPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
-    let mut query = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * CHUNK_KEY_DIM, 0.019, 0.4);
-    let mut key = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * CHUNK_KEY_DIM, 0.031, 0.35);
-    normalize_rows(&mut query, CHUNK_KEY_DIM);
-    normalize_rows(&mut key, CHUNK_KEY_DIM);
-    let value = float_values(
-        CHUNK_TOKENS * CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM,
-        0.023,
-        0.2,
-    );
-    let g = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
-        .map(|index| -0.008 - (index as f32 * 0.017).sin().abs() * 0.025)
-        .collect::<Vec<_>>();
-    let beta = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
-        .map(|index| 0.2 + (index as f32 * 0.013).sin().abs() * 0.6)
-        .collect::<Vec<_>>();
-    let initial_state = float_values(
-        CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM * CHUNK_KEY_DIM,
-        0.011,
-        0.025,
-    );
+    for key_dim in [32, 128] {
+        let mut query = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * key_dim, 0.019, 0.4);
+        let mut key = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * key_dim, 0.031, 0.35);
+        normalize_rows(&mut query, key_dim);
+        normalize_rows(&mut key, key_dim);
+        let value = float_values(
+            CHUNK_TOKENS * CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM,
+            0.023,
+            0.2,
+        );
+        let g = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
+            .map(|index| -0.008 - (index as f32 * 0.017).sin().abs() * 0.025)
+            .collect::<Vec<_>>();
+        let beta = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
+            .map(|index| 0.2 + (index as f32 * 0.013).sin().abs() * 0.6)
+            .collect::<Vec<_>>();
+        let initial_state =
+            float_values(CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM * key_dim, 0.011, 0.025);
 
-    for mapping in [
-        GatedDeltaValueHeadMapping::GroupedByKeyHead,
-        GatedDeltaValueHeadMapping::InterleavedByKeyHead,
-    ] {
-        let shape = ChunkTestShape {
-            tokens: CHUNK_TOKENS,
-            key_heads: CHUNK_KEY_HEADS,
-            value_heads: CHUNK_VALUE_HEADS,
-            key_dim: CHUNK_KEY_DIM,
-            value_dim: CHUNK_VALUE_DIM,
-            mapping,
-        };
-        let (expected_output, expected_state) =
-            recurrent_chunk_oracle(&query, &key, &value, &g, &beta, &initial_state, shape);
-        let (full_output, full_state, full_sentinel) = run_chunked_core(
-            &device,
-            &queue,
-            &pipelines,
-            &query,
-            &key,
-            &value,
-            &g,
-            &beta,
-            &initial_state,
-            shape,
-            STATE_SENTINEL,
-        );
-        assert_close(
-            "chunk/full output",
-            &full_output,
-            &expected_output,
-            CHUNK_CORE_ORACLE_DIAGNOSTIC_MAX_ABS,
-        );
-        assert_close(
-            "chunk/full state",
-            &full_state,
-            &expected_state,
-            CHUNK_STATE_ORACLE_DIAGNOSTIC_MAX_ABS,
-        );
-        assert_eq!(full_sentinel, [STATE_SENTINEL; 16]);
-
-        let split = 73;
-        let first_shape = ChunkTestShape {
-            tokens: split,
-            ..shape
-        };
-        let (mut split_output, split_state, first_sentinel) = run_chunked_core(
-            &device,
-            &queue,
-            &pipelines,
-            row_slice(&query, CHUNK_KEY_HEADS * CHUNK_KEY_DIM, 0..split),
-            row_slice(&key, CHUNK_KEY_HEADS * CHUNK_KEY_DIM, 0..split),
-            row_slice(&value, CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM, 0..split),
-            row_slice(&g, CHUNK_VALUE_HEADS, 0..split),
-            row_slice(&beta, CHUNK_VALUE_HEADS, 0..split),
-            &initial_state,
-            first_shape,
-            STATE_SENTINEL,
-        );
-        assert_eq!(first_sentinel, [STATE_SENTINEL; 16]);
-        let second_shape = ChunkTestShape {
-            tokens: CHUNK_TOKENS - split,
-            ..shape
-        };
-        let (second_output, split_state, second_sentinel) = run_chunked_core(
-            &device,
-            &queue,
-            &pipelines,
-            row_slice(&query, CHUNK_KEY_HEADS * CHUNK_KEY_DIM, split..CHUNK_TOKENS),
-            row_slice(&key, CHUNK_KEY_HEADS * CHUNK_KEY_DIM, split..CHUNK_TOKENS),
-            row_slice(
+        for mapping in [
+            GatedDeltaValueHeadMapping::GroupedByKeyHead,
+            GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+        ] {
+            let shape = ChunkTestShape {
+                tokens: CHUNK_TOKENS,
+                key_heads: CHUNK_KEY_HEADS,
+                value_heads: CHUNK_VALUE_HEADS,
+                key_dim,
+                value_dim: CHUNK_VALUE_DIM,
+                mapping,
+            };
+            let (expected_output, expected_state) =
+                recurrent_chunk_oracle(&query, &key, &value, &g, &beta, &initial_state, shape);
+            let (full_output, full_state, full_sentinel) = run_chunked_core(
+                &device,
+                &queue,
+                &pipelines,
+                &query,
+                &key,
                 &value,
-                CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM,
-                split..CHUNK_TOKENS,
-            ),
-            row_slice(&g, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
-            row_slice(&beta, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
-            &split_state,
-            second_shape,
-            STATE_SENTINEL,
-        );
-        split_output.extend(second_output);
-        assert_eq!(second_sentinel, [STATE_SENTINEL; 16]);
-        assert_close(
-            "chunk split output",
-            &split_output,
-            &full_output,
-            CHUNK_CORE_ORACLE_DIAGNOSTIC_MAX_ABS,
-        );
-        assert_close(
-            "chunk split state",
-            &split_state,
-            &full_state,
-            CHUNK_STATE_ORACLE_DIAGNOSTIC_MAX_ABS,
-        );
+                &g,
+                &beta,
+                &initial_state,
+                shape,
+                STATE_SENTINEL,
+            );
+            assert_close(
+                "chunk/full output",
+                &full_output,
+                &expected_output,
+                CHUNK_CORE_ORACLE_DIAGNOSTIC_MAX_ABS,
+            );
+            assert_close(
+                "chunk/full state",
+                &full_state,
+                &expected_state,
+                CHUNK_STATE_ORACLE_DIAGNOSTIC_MAX_ABS,
+            );
+            assert_eq!(full_sentinel, [STATE_SENTINEL; 16]);
+
+            let split = 73;
+            let first_shape = ChunkTestShape {
+                tokens: split,
+                ..shape
+            };
+            let (mut split_output, split_state, first_sentinel) = run_chunked_core(
+                &device,
+                &queue,
+                &pipelines,
+                row_slice(&query, CHUNK_KEY_HEADS * key_dim, 0..split),
+                row_slice(&key, CHUNK_KEY_HEADS * key_dim, 0..split),
+                row_slice(&value, CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM, 0..split),
+                row_slice(&g, CHUNK_VALUE_HEADS, 0..split),
+                row_slice(&beta, CHUNK_VALUE_HEADS, 0..split),
+                &initial_state,
+                first_shape,
+                STATE_SENTINEL,
+            );
+            assert_eq!(first_sentinel, [STATE_SENTINEL; 16]);
+            let second_shape = ChunkTestShape {
+                tokens: CHUNK_TOKENS - split,
+                ..shape
+            };
+            let (second_output, split_state, second_sentinel) = run_chunked_core(
+                &device,
+                &queue,
+                &pipelines,
+                row_slice(&query, CHUNK_KEY_HEADS * key_dim, split..CHUNK_TOKENS),
+                row_slice(&key, CHUNK_KEY_HEADS * key_dim, split..CHUNK_TOKENS),
+                row_slice(
+                    &value,
+                    CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM,
+                    split..CHUNK_TOKENS,
+                ),
+                row_slice(&g, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
+                row_slice(&beta, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
+                &split_state,
+                second_shape,
+                STATE_SENTINEL,
+            );
+            split_output.extend(second_output);
+            assert_eq!(second_sentinel, [STATE_SENTINEL; 16]);
+            assert_close(
+                "chunk split output",
+                &split_output,
+                &full_output,
+                CHUNK_CORE_ORACLE_DIAGNOSTIC_MAX_ABS,
+            );
+            assert_close(
+                "chunk split state",
+                &split_state,
+                &full_state,
+                CHUNK_STATE_ORACLE_DIAGNOSTIC_MAX_ABS,
+            );
+        }
     }
 }
 
@@ -564,7 +562,13 @@ fn run_chunked_core(
         (shape.tokens * shape.key_heads * GATED_DELTA_CHUNK_SIZE as usize) as u64,
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.chunk_carry);
+    encoder.set_compute_pipeline_state(
+        if shape.key_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as usize {
+            &pipelines.chunk_carry_k128
+        } else {
+            &pipelines.chunk_carry_generic
+        },
+    );
     for (index, buffer) in [
         &*query_buffer,
         &*key_buffer,
