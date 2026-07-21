@@ -24,7 +24,7 @@ use super::{
     estimate_without_workspace, f16_contiguous, implementation_fingerprint, provider_descriptor,
     provider_failure, rational_attribute, shared_full_region, shared_token_region,
     unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q6_K_FORMAT_ID,
-    THREADS_PER_GROUP,
+    Q8_0_FORMAT_ID, THREADS_PER_GROUP,
 };
 
 const SHADER_SOURCE: &str = include_str!("primitives.metal");
@@ -37,12 +37,14 @@ const RESIDUAL_ADD_ESTIMATOR_ID: &str = "resource-estimator.metal.residual_add.f
 
 const EMBEDDING_DENSE_KERNEL: &str = "vnext_embedding_dense_f16";
 const EMBEDDING_Q6_K_KERNEL: &str = "vnext_embedding_q6_k_f16";
+const EMBEDDING_Q8_0_KERNEL: &str = "vnext_embedding_q8_0_f16";
 const RMS_NORM_KERNEL: &str = "vnext_rms_norm_f16";
 const RESIDUAL_ADD_KERNEL: &str = "vnext_residual_add_f16";
 
 pub(super) struct MetalPrimitivePipelines {
     embedding_dense: ComputePipelineState,
     embedding_q6_k: ComputePipelineState,
+    embedding_q8_0: ComputePipelineState,
     rms_norm: ComputePipelineState,
     residual_add: ComputePipelineState,
 }
@@ -73,6 +75,7 @@ impl MetalPrimitivePipelines {
         Ok(Self {
             embedding_dense: pipeline(EMBEDDING_DENSE_KERNEL)?,
             embedding_q6_k: pipeline(EMBEDDING_Q6_K_KERNEL)?,
+            embedding_q8_0: pipeline(EMBEDDING_Q8_0_KERNEL)?,
             rms_norm: pipeline(RMS_NORM_KERNEL)?,
             residual_add: pipeline(RESIDUAL_ADD_KERNEL)?,
         })
@@ -98,7 +101,7 @@ impl MetalTokenEmbeddingProvider {
             TOKEN_EMBEDDING_ESTIMATOR_ID,
             contiguous_bindings(2),
             &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
-            &[Q6_K_FORMAT_ID],
+            &[Q6_K_FORMAT_ID, Q8_0_FORMAT_ID],
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
@@ -257,6 +260,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalResidualAddProvider {
 enum EmbeddingPhysicalFormat {
     DenseF16,
     Q6K,
+    Q8_0,
 }
 
 #[repr(C)]
@@ -402,25 +406,37 @@ fn embedding_weight_format(
             block_padding,
         } => {
             if weight.format_id().as_str() != GGUF_NATIVE_BLOCK_FORMAT_ID
-                || spec.format_id.as_str() != Q6_K_FORMAT_ID
-                || spec.logical_values_per_block != 256
-                || spec.bytes_per_block != 210
                 || *block_axis != 1
                 || block_padding != &PhysicalWeightPadding::Exact
-                || !hidden_size.is_multiple_of(256)
             {
-                return Err("Metal Q6_K embedding physical ABI differs".to_owned());
+                return Err("Metal quantized embedding physical ABI differs".to_owned());
+            }
+            let (format, values_per_block) = match (
+                spec.format_id.as_str(),
+                spec.logical_values_per_block,
+                spec.bytes_per_block,
+            ) {
+                (Q6_K_FORMAT_ID, 256, 210) => (EmbeddingPhysicalFormat::Q6K, 256),
+                (Q8_0_FORMAT_ID, 32, 34) => (EmbeddingPhysicalFormat::Q8_0, 32),
+                _ => {
+                    return Err(
+                        "Metal embedding does not support this quantized block ABI".to_owned()
+                    )
+                }
+            };
+            if !hidden_size.is_multiple_of(values_per_block) {
+                return Err("Metal quantized embedding row has partial blocks".to_owned());
             }
             let metadata = weight
                 .components()
                 .get(*component)
-                .ok_or_else(|| "Metal Q6_K embedding component is absent".to_owned())?;
-            if metadata.physical_dimensions() != [vocabulary_size, hidden_size / 256]
+                .ok_or_else(|| "Metal quantized embedding component is absent".to_owned())?;
+            if metadata.physical_dimensions() != [vocabulary_size, hidden_size / values_per_block]
                 || metadata.encoding() != &WeightEncoding::BlockQuantized(spec.clone())
             {
-                return Err("Metal Q6_K embedding component shape differs".to_owned());
+                return Err("Metal quantized embedding component shape differs".to_owned());
             }
-            (*component, EmbeddingPhysicalFormat::Q6K)
+            (*component, format)
         }
         _ => return Err("Metal token embedding does not support this physical layout".to_owned()),
     };
@@ -686,6 +702,7 @@ fn dispatch_embedding(
     let pipeline = match format {
         EmbeddingPhysicalFormat::DenseF16 => &pipelines.embedding_dense,
         EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k,
+        EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0,
     };
     encoder.set_compute_pipeline_state(pipeline);
     set_region(encoder, 0, table);
@@ -880,8 +897,19 @@ mod tests {
             .unwrap();
         let quantized_bytes = quantized.data().unwrap();
         let table_buffer = shared_buffer(&device, &quantized_bytes);
+        let q8_quantized = QTensor::quantize(&table, GgmlDType::Q8_0).unwrap();
+        let q8_reference = q8_quantized
+            .dequantize(&cpu)
+            .unwrap()
+            .get(2)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let q8_bytes = q8_quantized.data().unwrap();
+        let q8_table_buffer = shared_buffer(&device, &q8_bytes);
         let token_buffer = shared_buffer(&device, &[2_u32, u32::MAX]);
         let embedding_output = output_buffer::<f16>(&device, hidden * 2);
+        let q8_embedding_output = output_buffer::<f16>(&device, hidden * 2);
 
         let rms_input = (0..hidden)
             .map(|index| f16::from_f32((index as f32 + 1.0) / hidden as f32))
@@ -908,6 +936,19 @@ mod tests {
             &table_buffer,
             &token_buffer,
             &embedding_output,
+            EmbeddingParams {
+                token_count: 2,
+                hidden_size: hidden as u32,
+                vocabulary_size: vocabulary as u32,
+            },
+        );
+        dispatch_raw_embedding(
+            &pipelines,
+            encoder,
+            EmbeddingPhysicalFormat::Q8_0,
+            &q8_table_buffer,
+            &token_buffer,
+            &q8_embedding_output,
             EmbeddingParams {
                 token_count: 2,
                 hidden_size: hidden as u32,
@@ -957,6 +998,20 @@ mod tests {
         )
         .expect("reviewed token-embedding numerical contract");
         assert!(embedding[hidden..].iter().all(|value| *value == 0.0));
+
+        let q8_embedding = read_f16(&q8_embedding_output, hidden * 2);
+        for (index, (observed, reference)) in q8_embedding[..hidden]
+            .iter()
+            .zip(q8_reference.iter())
+            .enumerate()
+        {
+            let expected = f16::from_f32(*reference).to_f32();
+            assert!(
+                (*observed - expected).abs() <= 0.002,
+                "Q8_0 token embedding differs at column {index}: observed={observed} expected={expected}"
+            );
+        }
+        assert!(q8_embedding[hidden..].iter().all(|value| *value == 0.0));
 
         let rms = read_f16(&rms_output, hidden);
         let mean_square = rms_input
@@ -1012,6 +1067,7 @@ mod tests {
         encoder.set_compute_pipeline_state(match format {
             EmbeddingPhysicalFormat::DenseF16 => &pipelines.embedding_dense,
             EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k,
+            EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0,
         });
         set_raw(encoder, 0, table);
         set_raw(encoder, 1, token_ids);
