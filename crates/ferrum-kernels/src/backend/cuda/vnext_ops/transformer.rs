@@ -37,6 +37,7 @@ use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 
 mod attention;
 mod causal_attention;
+mod moe_weights;
 
 pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
 pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
