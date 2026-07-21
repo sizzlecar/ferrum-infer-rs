@@ -431,6 +431,13 @@ struct SwiGluParams {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct SwiGluLaunch {
+    gate_up_offset_bytes: u64,
+    activation_offset_bytes: u64,
+    params: SwiGluParams,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct LinearLaunch {
     input_region: usize,
     weight_region: usize,
@@ -1047,11 +1054,7 @@ fn encode_dense_swiglu(
         required_scratch_bytes,
         "Metal dense SwiGLU scratch",
     )?;
-    let swiglu = SwiGluParams {
-        rows: checked_u32(tokens, "Metal dense SwiGLU row count")?,
-        intermediate_size: checked_u32(intermediate_size, "Metal dense SwiGLU intermediate size")?,
-        gate_up_stride: checked_u32(packed_width, "Metal dense SwiGLU packed width")?,
-    };
+    let swiglu = swiglu_launch(0, gate_up_bytes, tokens, intermediate_size, packed_width)?;
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal dense SwiGLU participant count",
@@ -1066,7 +1069,6 @@ fn encode_dense_swiglu(
             &pipelines,
             encoder.compute_encoder(),
             &regions[scratch_region],
-            gate_up_bytes,
             swiglu,
         );
         dispatch_linear(&pipelines, encoder.compute_encoder(), regions, down_launch);
@@ -1234,22 +1236,39 @@ fn dispatch_linear_grid(
     }
 }
 
-fn dispatch_swiglu(
+pub(super) fn swiglu_launch(
+    gate_up_offset_bytes: u64,
+    activation_offset_bytes: u64,
+    rows: u64,
+    intermediate_size: u64,
+    gate_up_stride: u64,
+) -> Result<SwiGluLaunch, String> {
+    Ok(SwiGluLaunch {
+        gate_up_offset_bytes,
+        activation_offset_bytes,
+        params: SwiGluParams {
+            rows: checked_u32(rows, "Metal SwiGLU row count")?,
+            intermediate_size: checked_u32(intermediate_size, "Metal SwiGLU intermediate size")?,
+            gate_up_stride: checked_u32(gate_up_stride, "Metal SwiGLU gate/up stride")?,
+        },
+    })
+}
+
+pub(super) fn dispatch_swiglu(
     pipelines: &MetalLinearPipelines,
     encoder: &ComputeCommandEncoderRef,
     scratch: &MetalBufferRegion,
-    activation_offset_bytes: u64,
-    params: SwiGluParams,
+    launch: SwiGluLaunch,
 ) {
     encoder.set_compute_pipeline_state(&pipelines.swiglu);
-    set_region_offset(encoder, 0, scratch, 0);
-    set_region_offset(encoder, 1, scratch, activation_offset_bytes);
+    set_region_offset(encoder, 0, scratch, launch.gate_up_offset_bytes);
+    set_region_offset(encoder, 1, scratch, launch.activation_offset_bytes);
     encoder.set_bytes(
         2,
         std::mem::size_of::<SwiGluParams>() as u64,
-        &params as *const _ as *const c_void,
+        &launch.params as *const _ as *const c_void,
     );
-    let elements = u64::from(params.rows) * u64::from(params.intermediate_size);
+    let elements = u64::from(launch.params.rows) * u64::from(launch.params.intermediate_size);
     encoder.dispatch_thread_groups(
         MTLSize::new(elements.div_ceil(THREADS_PER_GROUP), 1, 1),
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
@@ -1330,6 +1349,50 @@ pub(super) fn append_shared_matrix_weight(
         .ok_or_else(|| format!("{context} region index overflows"))?;
     regions.extend(prepared.regions);
     Ok(part)
+}
+
+pub(super) fn append_shared_gate_up_weight(
+    regions: &mut Vec<MetalBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    ordinal: u32,
+    intermediate_size: u64,
+    hidden_size: u64,
+    context: &str,
+) -> Result<Vec<PreparedLinearPart>, String> {
+    let first = &invocation.participants()[0];
+    let resolved = resolve_weight(
+        first,
+        binding(first.bindings(), ResolvedValueRole::Input, ordinal)?,
+    )?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = resolve_weight(
+            participant,
+            binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
+        )?;
+        if !same_resolved_weight(&resolved, &candidate) {
+            return Err(format!("{context} participants do not share one weight"));
+        }
+    }
+    let prepared = prepare_gate_up_weight(resolved, intermediate_size, hidden_size)?;
+    let region_base = regions.len();
+    let parts = prepared
+        .parts
+        .into_iter()
+        .map(|part| {
+            Ok(PreparedLinearPart {
+                region: part
+                    .region
+                    .checked_add(region_base)
+                    .ok_or_else(|| format!("{context} region index overflows"))?,
+                ..part
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if parts.is_empty() {
+        return Err(format!("{context} resolved no physical matrix"));
+    }
+    regions.extend(prepared.regions);
+    Ok(parts)
 }
 
 fn prepare_gate_up_weight(
@@ -1519,7 +1582,10 @@ fn physical_matrix_shape_matches(dimensions: &[u64], rows: u64, columns: u64) ->
             == rows.checked_mul(columns)
 }
 
-fn same_resolved_weight(left: &MetalResolvedWeight, right: &MetalResolvedWeight) -> bool {
+pub(super) fn same_resolved_weight(
+    left: &MetalResolvedWeight,
+    right: &MetalResolvedWeight,
+) -> bool {
     left.format_id() == right.format_id()
         && left.logical_dimensions() == right.logical_dimensions()
         && left.logical_element_type() == right.logical_element_type()
