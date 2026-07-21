@@ -21,7 +21,6 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -563,13 +562,27 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
     let model_sources = product_input.model_sources;
+    let prepared_model = model_sources
+        .as_ref()
+        .map(crate::source_resolver::prepare_registered_product_model)
+        .transpose()?
+        .flatten();
     let model_id = crate::source_resolver::public_model_id(&source);
-    let model_definition_for_config =
-        load_run_model_definition(&source, model_sources.as_deref()).await?;
-    if let (Some(selection), Some(definition)) =
-        (gpu_selection.as_mut(), model_definition_for_config.as_ref())
-    {
-        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+    let model_definition_for_config = if prepared_model.is_none() {
+        load_run_model_definition(&source, model_sources.as_deref()).await?
+    } else {
+        None
+    };
+    let model_layer_count = prepared_model
+        .as_ref()
+        .map(|prepared| prepared.descriptor().layer_count())
+        .or_else(|| {
+            model_definition_for_config
+                .as_ref()
+                .map(|definition| definition.num_hidden_layers)
+        });
+    if let (Some(selection), Some(layer_count)) = (gpu_selection.as_mut(), model_layer_count) {
+        if selection.apply_model_layer_count(layer_count)? {
             if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
                 eprintln!("{}", format!("CUDA layer split plan: {plan}").dimmed());
             }
@@ -630,8 +643,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     )?;
     let effective_runtime_config =
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
+    let typed_model_capabilities = prepared_model
+        .as_ref()
+        .map(|prepared| prepared.model_capabilities())
+        .transpose()?;
     let startup_auto_config = run_startup_auto_config(
         &device,
+        typed_model_capabilities,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -669,11 +687,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = match model_sources {
-        Some(sources) => {
-            ferrum_engine::create_product_engine(engine_config, Arc::clone(&sources)).await?
+    let engine = match (prepared_model, model_sources) {
+        (Some(prepared), _) => {
+            ferrum_engine::create_prepared_product_engine(engine_config, prepared).await?
         }
-        None => ferrum_engine::create_default_engine(engine_config).await?,
+        (None, Some(sources)) => {
+            ferrum_engine::create_product_engine(engine_config, sources).await?
+        }
+        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
     };
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
@@ -1890,19 +1911,20 @@ fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
 
 fn run_startup_auto_config(
     device: &ferrum_types::Device,
+    typed_model_capabilities: Option<ModelCapabilities>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
     let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
-    let model = model_definition
-        .map(|definition| {
+    let model = typed_model_capabilities
+        .or_else(|| model_definition.map(|definition| {
             crate::commands::serve::model_capabilities_from_definition_with_weight_bytes_for_hardware(
                 definition,
                 model_weight_bytes,
                 &hardware,
             )
-        })
+        }))
         .unwrap_or_else(ModelCapabilities::unknown);
     let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
     FerrumConfigBuilder::new(runtime_config)
@@ -2309,6 +2331,7 @@ mod tests {
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
+            None,
             None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),

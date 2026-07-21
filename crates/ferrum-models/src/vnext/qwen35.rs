@@ -939,6 +939,7 @@ fn production_descriptor(
     let maximum_sequence_tokens = usize::try_from(config.max_position_embeddings)
         .map_err(|_| "max_position_embeddings exceeds usize".to_owned())?;
     CausalLanguageModelDescriptor::new(
+        "qwen3_5",
         parameter_count,
         text.hidden_size,
         text.num_hidden_layers,

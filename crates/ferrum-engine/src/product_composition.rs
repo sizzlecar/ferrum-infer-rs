@@ -27,7 +27,7 @@ const DEFAULT_SAMPLER_SEED: u64 = 42;
 
 pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
     engine: &EngineConfig,
-    prepared: PreparedProductionModel,
+    prepared: &PreparedProductionModel,
     model_info: ModelInfo,
     runtime: Arc<R>,
     operation_registry: OperationRuntimeRegistry<R>,

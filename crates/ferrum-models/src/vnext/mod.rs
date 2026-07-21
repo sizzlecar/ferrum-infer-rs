@@ -1,15 +1,17 @@
 //! Production model-family packages consumed by the vNext planner and runtime.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    ExternalModelMetadataId, ModelFamilyRegistration, ModelFamilyRegistry, PreparedModelFamily,
-    TypedFamilyRegistration, WeightComponentSource,
+    ElementType, ExternalModelMetadataId, ModelFamilyRegistration, ModelFamilyRegistry,
+    PreparedModelFamily, StateCapacityDemand, StateLifetime, TypedFamilyRegistration,
+    WeightComponentSource,
 };
-use ferrum_types::{DataType, Device, ModelId, ModelInfo, ModelType};
+use ferrum_types::{DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelType};
 use serde_json::Value;
 
 mod hf_metadata;
@@ -182,6 +184,7 @@ pub enum ProductionExecutionKind {
 /// while the package is prepared, before an execution plan is compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CausalLanguageModelDescriptor {
+    architecture: String,
     parameter_count: NonZeroU64,
     hidden_size: NonZeroUsize,
     layer_count: NonZeroUsize,
@@ -196,6 +199,7 @@ pub struct CausalLanguageModelDescriptor {
 impl CausalLanguageModelDescriptor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        architecture: impl Into<String>,
         parameter_count: u64,
         hidden_size: usize,
         layer_count: usize,
@@ -206,6 +210,12 @@ impl CausalLanguageModelDescriptor {
         maximum_sequence_tokens: usize,
         execution_dtype: DataType,
     ) -> ferrum_types::Result<Self> {
+        let architecture = architecture.into();
+        if architecture.trim().is_empty() || architecture.trim() != architecture {
+            return Err(ferrum_types::FerrumError::model(
+                "architecture capability id must be non-empty and canonical",
+            ));
+        }
         let parameter_count = NonZeroU64::new(parameter_count)
             .ok_or_else(|| ferrum_types::FerrumError::model("parameter_count must be positive"))?;
         let hidden_size = NonZeroUsize::new(hidden_size)
@@ -251,6 +261,7 @@ impl CausalLanguageModelDescriptor {
             )));
         }
         Ok(Self {
+            architecture,
             parameter_count,
             hidden_size,
             layer_count,
@@ -261,6 +272,10 @@ impl CausalLanguageModelDescriptor {
             maximum_sequence_tokens,
             execution_dtype,
         })
+    }
+
+    pub fn architecture(&self) -> &str {
+        &self.architecture
     }
 
     pub const fn parameter_count(&self) -> u64 {
@@ -311,6 +326,17 @@ pub struct PreparedProductionModel {
     sources: Arc<ProductionModelSourceBundle>,
 }
 
+impl std::fmt::Debug for PreparedProductionModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedProductionModel")
+            .field("family_id", self.family.family_id())
+            .field("descriptor", &self.descriptor)
+            .field("sources", &self.sources)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PreparedProductionModel {
     pub(super) fn new(
         family: PreparedModelFamily,
@@ -350,6 +376,77 @@ impl PreparedProductionModel {
         ProductionExecutionKind::CausalLanguage
     }
 
+    /// Projects the immutable typed package into startup auto-configuration.
+    /// Fixed sequence state comes directly from the semantic program; token-
+    /// scaled state (for example KV) remains under the plan/runtime capacity
+    /// policy and is deliberately not double-counted here.
+    pub fn model_capabilities(&self) -> ferrum_types::Result<ModelCapabilities> {
+        let estimated_weight_bytes = self
+            .sources
+            .resolved_sources()
+            .weights
+            .files
+            .iter()
+            .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::model("resolved weight byte size overflows u64")
+            })?;
+        let recurrent_state_bytes_per_sequence = self
+            .family
+            .program()
+            .states()
+            .iter()
+            .filter(|state| {
+                state.lifetime == StateLifetime::Sequence
+                    && state.capacity_demand == StateCapacityDemand::FixedPerScope
+            })
+            .try_fold(0_u64, |total, state| {
+                let bytes = state.tensor.byte_len().map_err(|error| {
+                    ferrum_types::FerrumError::model(format!(
+                        "fixed per-sequence state {} has invalid storage size: {error}",
+                        state.id
+                    ))
+                })?;
+                total.checked_add(bytes).ok_or_else(|| {
+                    ferrum_types::FerrumError::model(
+                        "fixed per-sequence state byte size overflows u64",
+                    )
+                })
+            })?;
+        let quantization_formats = self.family.weight_schema().quantization_formats();
+        let quantization = (!quantization_formats.is_empty()).then(|| {
+            quantization_formats
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        });
+        let mut supported_dtypes =
+            BTreeSet::from([data_type_label(self.descriptor.execution_dtype())]);
+        supported_dtypes.extend(
+            self.family
+                .program()
+                .states()
+                .iter()
+                .filter_map(|state| element_type_label(state.tensor.element_type)),
+        );
+
+        Ok(ModelCapabilities {
+            architecture: self.descriptor.architecture().to_owned(),
+            quantization,
+            moe: None,
+            max_context_len: Some(self.descriptor.maximum_sequence_tokens()),
+            num_hidden_layers: Some(self.descriptor.layer_count()),
+            head_dim: Some(self.descriptor.attention_head_dimension()),
+            kv_heads: Some(self.descriptor.kv_head_count()),
+            estimated_weight_bytes: (estimated_weight_bytes > 0).then_some(estimated_weight_bytes),
+            recurrent_state_bytes_per_sequence: (recurrent_state_bytes_per_sequence > 0)
+                .then_some(recurrent_state_bytes_per_sequence),
+            supported_dtypes: supported_dtypes.into_iter().collect(),
+            graph_safe_moe: false,
+        })
+    }
+
     /// Projects typed package facts into the transitional `ModelExecutor`
     /// metadata contract. The family id is descriptive only and never drives
     /// executor selection.
@@ -370,6 +467,23 @@ impl PreparedProductionModel {
             license: None,
             metadata: Default::default(),
         }
+    }
+}
+
+fn data_type_label(data_type: DataType) -> String {
+    data_type.to_string().to_ascii_lowercase()
+}
+
+fn element_type_label(element_type: ElementType) -> Option<String> {
+    match element_type {
+        ElementType::F16 => Some("fp16".to_owned()),
+        ElementType::Bf16 => Some("bf16".to_owned()),
+        ElementType::F32 => Some("fp32".to_owned()),
+        ElementType::Bool
+        | ElementType::U8
+        | ElementType::U32
+        | ElementType::I8
+        | ElementType::I32 => None,
     }
 }
 
@@ -708,28 +822,74 @@ mod tests {
 
     #[test]
     fn causal_language_descriptor_rejects_invalid_runtime_facts() {
+        assert!(CausalLanguageModelDescriptor::new(
+            "test",
+            0,
+            16,
+            2,
+            2,
+            1,
+            4,
+            32,
+            128,
+            DataType::FP16,
+        )
+        .is_err());
+        assert!(CausalLanguageModelDescriptor::new(
+            "test",
+            1,
+            16,
+            2,
+            2,
+            1,
+            0,
+            32,
+            128,
+            DataType::FP16,
+        )
+        .is_err());
+        assert!(CausalLanguageModelDescriptor::new(
+            "test",
+            1,
+            16,
+            2,
+            2,
+            3,
+            4,
+            32,
+            128,
+            DataType::FP16,
+        )
+        .is_err());
+        assert!(CausalLanguageModelDescriptor::new(
+            "test",
+            1,
+            16,
+            2,
+            3,
+            2,
+            4,
+            32,
+            128,
+            DataType::FP16,
+        )
+        .is_err());
+        assert!(CausalLanguageModelDescriptor::new(
+            "test",
+            1,
+            16,
+            2,
+            2,
+            1,
+            4,
+            32,
+            128,
+            DataType::INT8,
+        )
+        .is_err());
         assert!(
-            CausalLanguageModelDescriptor::new(0, 16, 2, 2, 1, 4, 32, 128, DataType::FP16,)
-                .is_err()
-        );
-        assert!(
-            CausalLanguageModelDescriptor::new(1, 16, 2, 2, 1, 0, 32, 128, DataType::FP16,)
-                .is_err()
-        );
-        assert!(
-            CausalLanguageModelDescriptor::new(1, 16, 2, 2, 3, 4, 32, 128, DataType::FP16,)
-                .is_err()
-        );
-        assert!(
-            CausalLanguageModelDescriptor::new(1, 16, 2, 3, 2, 4, 32, 128, DataType::FP16,)
-                .is_err()
-        );
-        assert!(
-            CausalLanguageModelDescriptor::new(1, 16, 2, 2, 1, 4, 32, 128, DataType::INT8,)
-                .is_err()
-        );
-        assert!(
-            CausalLanguageModelDescriptor::new(1, 15, 2, 2, 1, 4, 32, 128, DataType::FP16,).is_ok(),
+            CausalLanguageModelDescriptor::new("test", 1, 15, 2, 2, 1, 4, 32, 128, DataType::FP16,)
+                .is_ok(),
             "hidden width and explicit attention projection width are independent facts"
         );
     }

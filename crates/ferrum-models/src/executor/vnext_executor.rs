@@ -2338,7 +2338,7 @@ impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
     pub fn from_runtime_composition<F>(
-        prepared: PreparedProductionModel,
+        prepared: &PreparedProductionModel,
         info: ModelInfo,
         engine_config: &EngineConfig,
         runtime: Arc<R>,
@@ -2401,8 +2401,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &compile_options,
         )
         .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
-        let resolved_plan =
-            resolve_plan(&prepared, &config.runtime_policy, &catalog, &compilation)?;
+        let resolved_plan = resolve_plan(prepared, &config.runtime_policy, &catalog, &compilation)?;
         if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
             return Err(FerrumError::internal(
                 "product composition returned a different execution plan than the compiler",
