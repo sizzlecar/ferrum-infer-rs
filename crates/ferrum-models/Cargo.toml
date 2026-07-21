@@ -7,6 +7,10 @@ license.workspace = true
 description = "Model architectures (LLaMA, Qwen, BERT) for Ferrum inference"
 readme = "../../README.md"
 
+[[example]]
+name = "w3_qwen35_s1_dump"
+required-features = ["test-support"]
+
 [dependencies]
 # Core dependencies - New architecture
 ferrum-types = { workspace = true }
