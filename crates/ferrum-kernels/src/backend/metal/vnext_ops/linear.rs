@@ -43,9 +43,6 @@ const LAST_TOKEN_ESTIMATOR_ID: &str = "resource-estimator.metal.last_token_dense
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
-const LINEAR_Q4_K_KERNEL: &str = "vnext_linear_q4_k_f16";
-const LINEAR_Q5_K_KERNEL: &str = "vnext_linear_q5_k_f16";
-const LINEAR_Q6_K_KERNEL: &str = "vnext_linear_q6_k_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
 const SWIGLU_KERNEL: &str = "vnext_swiglu_f16";
 
@@ -83,9 +80,12 @@ impl MetalLinearPipelines {
         };
         Ok(Self {
             dense: pipeline(LINEAR_DENSE_KERNEL)?,
-            q4_k: pipeline(LINEAR_Q4_K_KERNEL)?,
-            q5_k: pipeline(LINEAR_Q5_K_KERNEL)?,
-            q6_k: pipeline(LINEAR_Q6_K_KERNEL)?,
+            q4_k: crate::backend::metal::q4_k_gemv_v2::new_f16_batched_pipeline(device)
+                .map_err(MetalDeviceRuntimeError::contract)?,
+            q5_k: crate::backend::metal::q5_k_gemv::new_f16_batched_pipeline(device)
+                .map_err(MetalDeviceRuntimeError::contract)?,
+            q6_k: crate::backend::metal::q6_k_gemv::new_f16_batched_pipeline(device)
+                .map_err(MetalDeviceRuntimeError::contract)?,
             q8_0: pipeline(LINEAR_Q8_0_KERNEL)?,
             swiglu: pipeline(SWIGLU_KERNEL)?,
         })
@@ -305,6 +305,9 @@ fn linear_provider_descriptor(
         implementation_fingerprint(&[
             include_str!("linear.rs").as_bytes(),
             SHADER_SOURCE.as_bytes(),
+            include_str!("../q4_k_gemv_v2.metal").as_bytes(),
+            include_str!("../q5_k_gemv.metal").as_bytes(),
+            include_str!("../q6_k_gemv.metal").as_bytes(),
             provider_id.as_bytes(),
         ]),
     )
@@ -1419,6 +1422,113 @@ mod tests {
     }
 
     #[test]
+    fn shared_k_quant_gemv_honors_batch_offsets_strides_and_tail_rows() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping shared k-quant GEMV ABI test");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let rows = 3_usize;
+        let input_width = 256_usize;
+        let output_width = 5_usize;
+        let output_stride = 11_usize;
+        let output_column_offset = 3_usize;
+        let input_prefix = 7_usize;
+        let output_prefix = 5_usize;
+        let sentinel = f16::from_f32(123.0);
+
+        let input = (0..rows * input_width)
+            .map(|index| f16::from_f32(((index as f32) * 0.013).sin() * 0.2))
+            .collect::<Vec<_>>();
+        let mut prefixed_input = vec![f16::from_f32(-17.0); input_prefix];
+        prefixed_input.extend_from_slice(&input);
+        let input_buffer = shared_buffer(&device, &prefixed_input);
+        let cpu = CandleDevice::Cpu;
+        let input_tensor = Tensor::from_vec(
+            input.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
+            (rows, input_width),
+            &cpu,
+        )
+        .unwrap();
+        let dense = Tensor::from_vec(
+            (0..output_width * input_width)
+                .map(|index| ((index as f32) * 0.0071).cos() * 0.15)
+                .collect::<Vec<_>>(),
+            (output_width, input_width),
+            &cpu,
+        )
+        .unwrap();
+
+        for (dtype, format) in [
+            (GgmlDType::Q4K, LinearPhysicalFormat::Q4K),
+            (GgmlDType::Q5K, LinearPhysicalFormat::Q5K),
+            (GgmlDType::Q6K, LinearPhysicalFormat::Q6K),
+        ] {
+            let quantized = QTensor::quantize(&dense, dtype).unwrap();
+            let reference = input_tensor
+                .matmul(&quantized.dequantize(&cpu).unwrap().transpose(0, 1).unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let weight = shared_buffer(&device, &quantized.data().unwrap());
+            let output_elements = output_prefix + rows * output_stride + output_width;
+            let output_values = vec![sentinel; output_elements];
+            let output = shared_buffer(&device, &output_values);
+            let command = queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            dispatch_raw_linear_with_offsets(
+                &pipelines,
+                encoder,
+                format,
+                &input_buffer,
+                (input_prefix * std::mem::size_of::<f16>()) as u64,
+                &weight,
+                &output,
+                (output_prefix * std::mem::size_of::<f16>()) as u64,
+                LinearParams {
+                    rows: rows as u32,
+                    in_features: input_width as u32,
+                    out_features: output_width as u32,
+                    output_stride: output_stride as u32,
+                    output_column_offset: output_column_offset as u32,
+                },
+            );
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+            let actual = read_f16(&output, output_elements);
+            let mut compact = Vec::with_capacity(rows * output_width);
+            for row in 0..rows {
+                let start = output_prefix + row * output_stride + output_column_offset;
+                compact.extend_from_slice(&actual[start..start + output_width]);
+            }
+            assert_linear_diagnostic_close(&format!("{format:?} strided"), &compact, &reference);
+
+            for (index, value) in actual.iter().enumerate() {
+                let relative = index.saturating_sub(output_prefix);
+                let row = relative / output_stride;
+                let column = relative % output_stride;
+                let written = index >= output_prefix
+                    && row < rows
+                    && column >= output_column_offset
+                    && column < output_column_offset + output_width;
+                if !written {
+                    assert_eq!(
+                        *value,
+                        sentinel.to_f32(),
+                        "{format:?} clobbered index {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_swiglu_uses_packed_gate_then_up_order() {
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping SwiGLU conformance");
@@ -1741,6 +1851,31 @@ mod tests {
         output: &BufferRef,
         params: LinearParams,
     ) {
+        dispatch_raw_linear_with_offsets(
+            pipelines,
+            encoder,
+            format,
+            input,
+            input_offset_bytes,
+            weight,
+            output,
+            0,
+            params,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_raw_linear_with_offsets(
+        pipelines: &MetalLinearPipelines,
+        encoder: &ComputeCommandEncoderRef,
+        format: LinearPhysicalFormat,
+        input: &BufferRef,
+        input_offset_bytes: u64,
+        weight: &BufferRef,
+        output: &BufferRef,
+        output_offset_bytes: u64,
+        params: LinearParams,
+    ) {
         encoder.set_compute_pipeline_state(match format {
             LinearPhysicalFormat::DenseF16 => &pipelines.dense,
             LinearPhysicalFormat::Q4K => &pipelines.q4_k,
@@ -1750,7 +1885,7 @@ mod tests {
         });
         encoder.set_buffer(0, Some(input), input_offset_bytes);
         encoder.set_buffer(1, Some(weight), 0);
-        encoder.set_buffer(2, Some(output), 0);
+        encoder.set_buffer(2, Some(output), output_offset_bytes);
         encoder.set_bytes(
             3,
             std::mem::size_of::<LinearParams>() as u64,
