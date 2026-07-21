@@ -2296,6 +2296,12 @@ impl<'de> Deserialize<'de> for ProviderCompatibilityReport {
 }
 
 impl ProviderCompatibilityReport {
+    fn rejection_summary(&self) -> String {
+        serde_json::to_string(&self.rejected)
+            .map(|rejected| format!("all providers were rejected: {rejected}"))
+            .unwrap_or_else(|_| "all providers were rejected".to_owned())
+    }
+
     fn validate_shape(&self) -> Result<(), VNextError> {
         let compatible = self.compatible_provider_ids.iter().collect::<BTreeSet<_>>();
         let rejected = self
@@ -2345,8 +2351,7 @@ impl ProviderCompatibilityReport {
                 node_id: None,
                 operation_id: self.request.operation_id.to_string(),
                 device_id: device_id.to_string(),
-                reason: "all providers were rejected; inspect the typed compatibility report"
-                    .to_owned(),
+                reason: self.rejection_summary(),
             });
         }
         Ok(())
@@ -2407,8 +2412,7 @@ impl ProviderCompatibilityReport {
             node_id: Some(node_id.to_string()),
             operation_id: self.request.operation_id.to_string(),
             device_id: device_id.to_string(),
-            reason: "all providers were rejected; inspect the typed compatibility report"
-                .to_owned(),
+            reason: self.rejection_summary(),
         })
     }
 }

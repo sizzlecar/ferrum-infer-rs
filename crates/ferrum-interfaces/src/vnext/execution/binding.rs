@@ -241,8 +241,16 @@ pub(super) fn node_weight_requirements(
                 binding.value_id()
             )));
         }
-        weight_formats.insert(weight.format_id().clone());
-        quantization_formats.extend(weight.quantization_formats());
+        let binding_quantization_formats = weight.quantization_formats();
+        // Dense components are provider-visible through their exact resolved
+        // physical binding and do not depend on the enclosing checkpoint
+        // schema. Requiring the schema format here would reject dense weights
+        // (embedding, norms, routers) that legitimately live beside quantized
+        // components in one mixed checkpoint.
+        if !binding_quantization_formats.is_empty() {
+            weight_formats.insert(weight.format_id().clone());
+        }
+        quantization_formats.extend(binding_quantization_formats);
     }
     Ok((weight_formats, quantization_formats))
 }
