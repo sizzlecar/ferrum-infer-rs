@@ -43,6 +43,7 @@ pub mod vnext_runtime;
 // historical `ferrum_kernels::q4_k_gemm::*` and internal `crate::q4_k_*`
 // paths keep working without rippling import updates through the
 // metal_gguf_moe.rs et al. consumers.
+pub(crate) mod k_quant_gemm;
 pub mod moe_post_ops;
 pub mod moe_post_ops_batched;
 pub mod moe_router;

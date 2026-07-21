@@ -16,6 +16,8 @@ use ferrum_interfaces::vnext::{
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
+use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
+
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
     MetalDeviceRuntimeError,
@@ -41,6 +43,7 @@ const DENSE_SWIGLU_ESTIMATOR_ID: &str = "resource-estimator.metal.dense_swiglu.f
 const LAST_TOKEN_PROVIDER_ID: &str = "provider.metal.last_token_dense_linear.f16.native";
 const LAST_TOKEN_ESTIMATOR_ID: &str = "resource-estimator.metal.last_token_dense_linear.f16.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
+const K_QUANT_TILED_GEMM_MIN_ROWS: u32 = 8;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
@@ -48,11 +51,18 @@ const SWIGLU_KERNEL: &str = "vnext_swiglu_f16";
 
 pub(super) struct MetalLinearPipelines {
     dense: ComputePipelineState,
-    q4_k: ComputePipelineState,
-    q5_k: ComputePipelineState,
-    q6_k: ComputePipelineState,
+    q4_k_gemv: ComputePipelineState,
+    q5_k_gemv: ComputePipelineState,
+    q6_k_gemv: ComputePipelineState,
+    k_quant_gemm: MetalKQuantGemmPipelines,
     q8_0: ComputePipelineState,
     swiglu: ComputePipelineState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinearDispatchKind {
+    CooperativeGemv,
+    TiledGemm,
 }
 
 impl MetalLinearPipelines {
@@ -80,15 +90,49 @@ impl MetalLinearPipelines {
         };
         Ok(Self {
             dense: pipeline(LINEAR_DENSE_KERNEL)?,
-            q4_k: crate::backend::metal::q4_k_gemv_v2::new_f16_batched_pipeline(device)
+            q4_k_gemv: crate::backend::metal::q4_k_gemv_v2::new_f16_batched_pipeline(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
-            q5_k: crate::backend::metal::q5_k_gemv::new_f16_batched_pipeline(device)
+            q5_k_gemv: crate::backend::metal::q5_k_gemv::new_f16_batched_pipeline(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
-            q6_k: crate::backend::metal::q6_k_gemv::new_f16_batched_pipeline(device)
+            q6_k_gemv: crate::backend::metal::q6_k_gemv::new_f16_batched_pipeline(device)
+                .map_err(MetalDeviceRuntimeError::contract)?,
+            k_quant_gemm: MetalKQuantGemmPipelines::new(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
             q8_0: pipeline(LINEAR_Q8_0_KERNEL)?,
             swiglu: pipeline(SWIGLU_KERNEL)?,
         })
+    }
+
+    fn linear_pipeline(
+        &self,
+        format: LinearPhysicalFormat,
+        rows: u32,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        let tiled = rows >= K_QUANT_TILED_GEMM_MIN_ROWS;
+        match (format, tiled) {
+            (LinearPhysicalFormat::Q4K, true) => {
+                (&self.k_quant_gemm.q4_k, LinearDispatchKind::TiledGemm)
+            }
+            (LinearPhysicalFormat::Q5K, true) => {
+                (&self.k_quant_gemm.q5_k, LinearDispatchKind::TiledGemm)
+            }
+            (LinearPhysicalFormat::Q6K, true) => {
+                (&self.k_quant_gemm.q6_k, LinearDispatchKind::TiledGemm)
+            }
+            (LinearPhysicalFormat::Q4K, false) => {
+                (&self.q4_k_gemv, LinearDispatchKind::CooperativeGemv)
+            }
+            (LinearPhysicalFormat::Q5K, false) => {
+                (&self.q5_k_gemv, LinearDispatchKind::CooperativeGemv)
+            }
+            (LinearPhysicalFormat::Q6K, false) => {
+                (&self.q6_k_gemv, LinearDispatchKind::CooperativeGemv)
+            }
+            (LinearPhysicalFormat::DenseF16, _) => {
+                (&self.dense, LinearDispatchKind::CooperativeGemv)
+            }
+            (LinearPhysicalFormat::Q8_0, _) => (&self.q8_0, LinearDispatchKind::CooperativeGemv),
+        }
     }
 }
 
@@ -308,6 +352,7 @@ fn linear_provider_descriptor(
             include_str!("../q4_k_gemv_v2.metal").as_bytes(),
             include_str!("../q5_k_gemv.metal").as_bytes(),
             include_str!("../q6_k_gemv.metal").as_bytes(),
+            crate::backend::metal::k_quant_gemm::SHADER_SOURCE.as_bytes(),
             provider_id.as_bytes(),
         ]),
     )
@@ -874,13 +919,8 @@ pub(super) fn dispatch_linear(
     regions: &[MetalBufferRegion],
     launch: LinearLaunch,
 ) {
-    encoder.set_compute_pipeline_state(match launch.format {
-        LinearPhysicalFormat::DenseF16 => &pipelines.dense,
-        LinearPhysicalFormat::Q4K => &pipelines.q4_k,
-        LinearPhysicalFormat::Q5K => &pipelines.q5_k,
-        LinearPhysicalFormat::Q6K => &pipelines.q6_k,
-        LinearPhysicalFormat::Q8_0 => &pipelines.q8_0,
-    });
+    let (pipeline, dispatch_kind) = pipelines.linear_pipeline(launch.format, launch.params.rows);
+    encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(
         encoder,
         0,
@@ -899,14 +939,35 @@ pub(super) fn dispatch_linear(
         std::mem::size_of::<LinearParams>() as u64,
         &launch.params as *const _ as *const c_void,
     );
-    encoder.dispatch_thread_groups(
-        MTLSize::new(
-            u64::from(launch.params.out_features).div_ceil(4),
-            u64::from(launch.params.rows),
-            1,
+    dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+}
+
+fn dispatch_linear_grid(
+    encoder: &ComputeCommandEncoderRef,
+    params: LinearParams,
+    dispatch_kind: LinearDispatchKind,
+) {
+    match dispatch_kind {
+        LinearDispatchKind::CooperativeGemv => encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(params.out_features).div_ceil(4),
+                u64::from(params.rows),
+                1,
+            ),
+            MTLSize::new(32, 2, 1),
         ),
-        MTLSize::new(32, 2, 1),
-    );
+        LinearDispatchKind::TiledGemm => {
+            encoder.set_threadgroup_memory_length(0, 8192);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::from(params.rows).div_ceil(32),
+                    u64::from(params.out_features).div_ceil(64),
+                    1,
+                ),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+    }
 }
 
 fn dispatch_swiglu(
@@ -1529,6 +1590,114 @@ mod tests {
     }
 
     #[test]
+    fn shared_k_quant_tiled_gemm_matches_prefill_shape_and_preserves_output_guards() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping shared K-quant GEMM ABI test");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let rows = 17_usize;
+        let input_width = 256_usize;
+        let output_width = 67_usize;
+        let output_stride = 79_usize;
+        let output_column_offset = 5_usize;
+        let input_prefix = 3_usize;
+        let output_prefix = 7_usize;
+        let sentinel = f16::from_f32(123.0);
+
+        let input = (0..rows * input_width)
+            .map(|index| f16::from_f32(((index as f32) * 0.013).sin() * 0.2))
+            .collect::<Vec<_>>();
+        let mut prefixed_input = vec![f16::from_f32(-17.0); input_prefix];
+        prefixed_input.extend_from_slice(&input);
+        let input_buffer = shared_buffer(&device, &prefixed_input);
+        let cpu = CandleDevice::Cpu;
+        let input_tensor = Tensor::from_vec(
+            input.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
+            (rows, input_width),
+            &cpu,
+        )
+        .unwrap();
+        let dense = Tensor::from_vec(
+            (0..output_width * input_width)
+                .map(|index| ((index as f32) * 0.0071).cos() * 0.15)
+                .collect::<Vec<_>>(),
+            (output_width, input_width),
+            &cpu,
+        )
+        .unwrap();
+
+        for (dtype, format) in [
+            (GgmlDType::Q4K, LinearPhysicalFormat::Q4K),
+            (GgmlDType::Q5K, LinearPhysicalFormat::Q5K),
+            (GgmlDType::Q6K, LinearPhysicalFormat::Q6K),
+        ] {
+            let (_, dispatch_kind) = pipelines.linear_pipeline(format, rows as u32);
+            assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
+            let quantized = QTensor::quantize(&dense, dtype).unwrap();
+            let reference = input_tensor
+                .matmul(&quantized.dequantize(&cpu).unwrap().transpose(0, 1).unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let weight = shared_buffer(&device, &quantized.data().unwrap());
+            let output_elements = output_prefix + rows * output_stride + output_width;
+            let output = shared_buffer(&device, &vec![sentinel; output_elements]);
+            let command = queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            dispatch_raw_linear_with_offsets(
+                &pipelines,
+                encoder,
+                format,
+                &input_buffer,
+                (input_prefix * std::mem::size_of::<f16>()) as u64,
+                &weight,
+                &output,
+                (output_prefix * std::mem::size_of::<f16>()) as u64,
+                LinearParams {
+                    rows: rows as u32,
+                    in_features: input_width as u32,
+                    out_features: output_width as u32,
+                    output_stride: output_stride as u32,
+                    output_column_offset: output_column_offset as u32,
+                },
+            );
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+            let actual = read_f16(&output, output_elements);
+            let mut compact = Vec::with_capacity(rows * output_width);
+            for row in 0..rows {
+                let start = output_prefix + row * output_stride + output_column_offset;
+                compact.extend_from_slice(&actual[start..start + output_width]);
+            }
+            assert_linear_diagnostic_close(&format!("{format:?} tiled"), &compact, &reference);
+
+            for (index, value) in actual.iter().enumerate() {
+                let relative = index.saturating_sub(output_prefix);
+                let row = relative / output_stride;
+                let column = relative % output_stride;
+                let written = index >= output_prefix
+                    && row < rows
+                    && column >= output_column_offset
+                    && column < output_column_offset + output_width;
+                if !written {
+                    assert_eq!(
+                        *value,
+                        sentinel.to_f32(),
+                        "{format:?} tiled GEMM clobbered index {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_swiglu_uses_packed_gate_then_up_order() {
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping SwiGLU conformance");
@@ -1876,13 +2045,8 @@ mod tests {
         output_offset_bytes: u64,
         params: LinearParams,
     ) {
-        encoder.set_compute_pipeline_state(match format {
-            LinearPhysicalFormat::DenseF16 => &pipelines.dense,
-            LinearPhysicalFormat::Q4K => &pipelines.q4_k,
-            LinearPhysicalFormat::Q5K => &pipelines.q5_k,
-            LinearPhysicalFormat::Q6K => &pipelines.q6_k,
-            LinearPhysicalFormat::Q8_0 => &pipelines.q8_0,
-        });
+        let (pipeline, dispatch_kind) = pipelines.linear_pipeline(format, params.rows);
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(input), input_offset_bytes);
         encoder.set_buffer(1, Some(weight), 0);
         encoder.set_buffer(2, Some(output), output_offset_bytes);
@@ -1891,13 +2055,6 @@ mod tests {
             std::mem::size_of::<LinearParams>() as u64,
             &params as *const _ as *const c_void,
         );
-        encoder.dispatch_thread_groups(
-            MTLSize::new(
-                u64::from(params.out_features).div_ceil(4),
-                u64::from(params.rows),
-                1,
-            ),
-            MTLSize::new(32, 2, 1),
-        );
+        dispatch_linear_grid(encoder, params, dispatch_kind);
     }
 }
