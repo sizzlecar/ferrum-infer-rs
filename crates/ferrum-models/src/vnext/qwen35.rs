@@ -5,7 +5,6 @@
 //! executor allocates them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,15 +12,13 @@ use ferrum_interfaces::vnext::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
     ElementType, ExternalModelMetadataId, GatedDeltaDecayParameterization,
     GatedDeltaValueHeadMapping, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
-    ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalStorageLayout,
-    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
-    PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
-    ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
-    SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
-    StateId, StateInitialization, StateLifetime, StateSpec, TemplateMetadata,
-    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
-    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightLayout,
+    PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec,
+    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, SemanticValue, StateCapacityDemand,
+    StateId, StateInitialization, StateLifetime, StateSpec, TypedFamilyRegistration, VNextError,
+    WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding,
+    WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
+    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
@@ -30,12 +27,13 @@ use ferrum_quantization::{GgufWeightComponentSource, SafetensorsArchive};
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig, Qwen35WeightSpec};
 use crate::qwen35_weights::{Qwen35ResolvedWeightSpec, Qwen35WeightInventory};
 
 use super::{
+    hf_metadata::parse_hf_model_semantic_metadata,
+    weight_layout::{contiguous_or_reshaped_binding, dense_or_reshaped_layout},
     CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
     ProductionWeightArtifact,
 };
@@ -44,22 +42,6 @@ pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TemplateInput {
-    template: String,
-    source_file: String,
-    sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpecialTokenInput {
-    bos_token_id: Option<u32>,
-    eos_token_ids: BTreeSet<u32>,
-    pad_token_id: Option<u32>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,8 +74,7 @@ pub struct Qwen35FamilyConfig {
     vocab_size: u64,
     max_position_embeddings: u64,
     rms_norm_epsilon: CanonicalRational,
-    template: TemplateInput,
-    special_tokens: SpecialTokenInput,
+    metadata: ModelSemanticMetadata,
     weight_format: FamilyWeightFormat,
     weights: Vec<FamilyWeight>,
 }
@@ -148,9 +129,9 @@ impl Qwen35FamilyProvider {
                 "vocab_size and max_position_embeddings must be positive",
             ));
         }
-        if config.template.template.is_empty()
-            || config.template.source_file != "tokenizer_config.json"
-            || config.special_tokens.eos_token_ids.is_empty()
+        if config.metadata.template.template.is_empty()
+            || config.metadata.template.source_file != "tokenizer_config.json"
+            || config.metadata.special_tokens.eos_token_ids.is_empty()
             || config.weights.is_empty()
         {
             return Err(invalid_config(
@@ -664,19 +645,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         &self,
         config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: config.template.template.clone(),
-                source_file: config.template.source_file.clone(),
-                sha256: config.template.sha256.clone(),
-            },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: config.special_tokens.bos_token_id,
-                eos_token_ids: config.special_tokens.eos_token_ids.clone(),
-                pad_token_id: config.special_tokens.pad_token_id,
-                collision_policy: collision_policy(&config.special_tokens)?,
-            },
-        })
+        Ok(config.metadata.clone())
     }
 }
 
@@ -731,7 +700,8 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
             id: tensor_id,
             dimensions: logical_dimensions.clone(),
             logical_element_type: element_type,
-            physical_layout: physical_weight_layout(
+            physical_layout: dense_or_reshaped_layout(
+                FAMILY_ID,
                 component_id,
                 &physical_dimensions,
                 &logical_dimensions,
@@ -855,9 +825,12 @@ fn gguf_component_layout(
     logical_dimensions: &[u64],
 ) -> Result<PhysicalWeightLayout, VNextError> {
     match &weight.source_encoding {
-        FamilyWeightSourceEncoding::Dense { .. } => {
-            physical_weight_layout(component_id, &weight.dimensions, logical_dimensions)
-        }
+        FamilyWeightSourceEncoding::Dense { .. } => dense_or_reshaped_layout(
+            FAMILY_ID,
+            component_id,
+            &weight.dimensions,
+            logical_dimensions,
+        ),
         FamilyWeightSourceEncoding::BlockQuantized(spec) => {
             let block_axis = logical_dimensions
                 .len()
@@ -876,7 +849,8 @@ fn gguf_component_layout(
             let mut physical_blocks = weight.dimensions.clone();
             *physical_blocks.last_mut().unwrap() /= block_width;
             Ok(PhysicalWeightLayout::BlockQuantized {
-                blocks: physical_component_binding(
+                blocks: contiguous_or_reshaped_binding(
+                    FAMILY_ID,
                     component_id,
                     &physical_blocks,
                     &logical_blocks,
@@ -888,53 +862,6 @@ fn gguf_component_layout(
             })
         }
     }
-}
-
-fn physical_component_binding(
-    component_id: WeightId,
-    physical_dimensions: &[u64],
-    logical_dimensions: &[u64],
-) -> Result<PhysicalWeightComponentBinding, VNextError> {
-    if physical_dimensions == logical_dimensions {
-        return Ok(PhysicalWeightComponentBinding::exact_contiguous(
-            component_id,
-        ));
-    }
-    let physical_elements = checked_dimension_product(physical_dimensions)?;
-    let logical_elements = checked_dimension_product(logical_dimensions)?;
-    if physical_elements != logical_elements {
-        return Err(invalid_config(
-            "weights.dimensions",
-            "GGUF physical reshape changes the logical element count",
-        ));
-    }
-    Ok(PhysicalWeightComponentBinding {
-        component_id,
-        storage: PhysicalStorageLayout::Strided {
-            strides_in_elements: row_major_strides(logical_dimensions)?,
-            padding: PhysicalWeightPadding::Exact,
-        },
-    })
-}
-
-fn checked_dimension_product(dimensions: &[u64]) -> Result<u64, VNextError> {
-    dimensions.iter().try_fold(1_u64, |total, extent| {
-        total
-            .checked_mul(*extent)
-            .ok_or_else(|| invalid_config("weights.dimensions", "tensor size overflows u64"))
-    })
-}
-
-fn row_major_strides(dimensions: &[u64]) -> Result<Vec<u64>, VNextError> {
-    let mut strides = vec![0_u64; dimensions.len()];
-    let mut stride = 1_u64;
-    for (axis, extent) in dimensions.iter().enumerate().rev() {
-        strides[axis] = stride;
-        stride = stride
-            .checked_mul(*extent)
-            .ok_or_else(|| invalid_config("weights.dimensions", "tensor stride overflows u64"))?;
-    }
-    Ok(strides)
 }
 
 pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
@@ -1046,14 +973,7 @@ fn load_safetensors_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
-        .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
-    let template = tokenizer_config
-        .get("chat_template")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "tokenizer_config.json missing string chat_template".to_owned())?
-        .to_owned();
-    let special_tokens = parse_special_tokens(&hf_config, &tokenizer_config)?;
+    let metadata = parse_hf_model_semantic_metadata(&hf_config, &tokenizer_config_bytes)?;
 
     let inventory = Qwen35WeightInventory::from_names(archive.tensor_names());
     let plan = inventory.detect_prefix_and_resolve(&text)?;
@@ -1083,12 +1003,7 @@ fn load_safetensors_family_config(
         vocab_size,
         max_position_embeddings,
         rms_norm_epsilon,
-        template: TemplateInput {
-            sha256: format!("{:x}", Sha256::digest(&tokenizer_config_bytes)),
-            template,
-            source_file: "tokenizer_config.json".to_owned(),
-        },
-        special_tokens,
+        metadata,
         weight_format: FamilyWeightFormat::SafetensorsDense,
         weights,
     })
@@ -1127,14 +1042,7 @@ fn load_gguf_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
-        .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
-    let template = tokenizer_config
-        .get("chat_template")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "tokenizer_config.json missing string chat_template".to_owned())?
-        .to_owned();
-    let special_tokens = parse_special_tokens(&hf_config, &tokenizer_config)?;
+    let metadata = parse_hf_model_semantic_metadata(&hf_config, tokenizer_config_bytes)?;
 
     let manifest = text.weight_manifest("model.language_model")?;
     let mut weights = Vec::new();
@@ -1163,12 +1071,7 @@ fn load_gguf_family_config(
         vocab_size,
         max_position_embeddings,
         rms_norm_epsilon,
-        template: TemplateInput {
-            sha256: format!("{:x}", Sha256::digest(tokenizer_config_bytes)),
-            template,
-            source_file: "tokenizer_config.json".to_owned(),
-        },
-        special_tokens,
+        metadata,
         weight_format: FamilyWeightFormat::GgufNative,
         weights,
     })
@@ -1412,42 +1315,6 @@ fn logical_weight_dimensions(weight: &FamilyWeight) -> Result<Vec<u64>, VNextErr
     }
 }
 
-fn physical_weight_layout(
-    component_id: WeightId,
-    physical_dimensions: &[u64],
-    logical_dimensions: &[u64],
-) -> Result<PhysicalWeightLayout, VNextError> {
-    if physical_dimensions == logical_dimensions {
-        return Ok(PhysicalWeightLayout::Dense { component_id });
-    }
-    let mut strides_in_elements = vec![0_u64; logical_dimensions.len()];
-    let mut stride = 1_u64;
-    for (axis, extent) in logical_dimensions.iter().enumerate().rev() {
-        strides_in_elements[axis] = stride;
-        stride = stride.checked_mul(*extent).ok_or_else(|| {
-            invalid_config("weights.dimensions", "logical weight stride overflows u64")
-        })?;
-    }
-    let physical_elements = physical_dimensions
-        .iter()
-        .try_fold(1_u64, |total, extent| total.checked_mul(*extent));
-    if physical_elements != Some(stride) {
-        return Err(invalid_config(
-            "weights.dimensions",
-            "physical and logical weight shapes have different element counts",
-        ));
-    }
-    Ok(PhysicalWeightLayout::Stored {
-        component: PhysicalWeightComponentBinding {
-            component_id,
-            storage: PhysicalStorageLayout::Strided {
-                strides_in_elements,
-                padding: PhysicalWeightPadding::Exact,
-            },
-        },
-    })
-}
-
 fn dense_weight_encoding(role: &str) -> Result<WeightEncoding, VNextError> {
     let element_type = materialized_element_type(role);
     if matches!(
@@ -1513,104 +1380,6 @@ fn expected_weight_dimensions(
         }
     };
     Ok(expected)
-}
-
-fn parse_special_tokens(root: &Value, tokenizer: &Value) -> Result<SpecialTokenInput, String> {
-    let bos_token_id = token_id(root, tokenizer, "bos_token")?;
-    let pad_token_id = token_id(root, tokenizer, "pad_token")?;
-    let eos_value = tokenizer
-        .get("eos_token")
-        .or_else(|| root.get("eos_token_id"))
-        .or_else(|| {
-            root.get("text_config")
-                .and_then(|value| value.get("eos_token_id"))
-        })
-        .ok_or_else(|| "model/tokenizer metadata missing eos_token".to_owned())?;
-    let eos_values = eos_value
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_else(|| std::slice::from_ref(eos_value));
-    let eos_token_ids = eos_values
-        .iter()
-        .map(|value| resolve_token_id(value, tokenizer))
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if eos_token_ids.is_empty() {
-        return Err("resolved EOS token set is empty".to_owned());
-    }
-    Ok(SpecialTokenInput {
-        bos_token_id,
-        eos_token_ids,
-        pad_token_id,
-    })
-}
-
-fn token_id(root: &Value, tokenizer: &Value, name: &str) -> Result<Option<u32>, String> {
-    let id_name = format!("{name}_id");
-    tokenizer
-        .get(name)
-        .or_else(|| tokenizer.get(&id_name))
-        .or_else(|| root.get(&id_name))
-        .or_else(|| {
-            root.get("text_config")
-                .and_then(|value| value.get(&id_name))
-        })
-        .filter(|value| !value.is_null())
-        .map(|value| resolve_token_id(value, tokenizer))
-        .transpose()
-}
-
-fn resolve_token_id(value: &Value, tokenizer: &Value) -> Result<u32, String> {
-    if let Some(id) = value.as_u64() {
-        return u32::try_from(id).map_err(|_| format!("token id {id} exceeds u32"));
-    }
-    let content = value
-        .as_str()
-        .or_else(|| value.get("content").and_then(Value::as_str))
-        .ok_or_else(|| format!("unsupported token metadata {value}"))?;
-    tokenizer
-        .get("added_tokens_decoder")
-        .and_then(Value::as_object)
-        .and_then(|tokens| {
-            tokens.iter().find_map(|(id, metadata)| {
-                (metadata.get("content").and_then(Value::as_str) == Some(content)).then_some(id)
-            })
-        })
-        .ok_or_else(|| format!("token {content:?} has no added_tokens_decoder id"))?
-        .parse::<u32>()
-        .map_err(|error| format!("invalid token id for {content:?}: {error}"))
-}
-
-fn collision_policy(tokens: &SpecialTokenInput) -> Result<SpecialTokenCollisionPolicy, VNextError> {
-    let mut allowed = BTreeSet::new();
-    if let Some(bos) = tokens.bos_token_id {
-        if tokens.eos_token_ids.contains(&bos) {
-            allowed.insert(SpecialTokenCollision::new(
-                SpecialTokenRole::Bos,
-                SpecialTokenRole::Eos,
-            )?);
-        }
-        if tokens.pad_token_id == Some(bos) {
-            allowed.insert(SpecialTokenCollision::new(
-                SpecialTokenRole::Bos,
-                SpecialTokenRole::Pad,
-            )?);
-        }
-    }
-    if tokens
-        .pad_token_id
-        .is_some_and(|pad| tokens.eos_token_ids.contains(&pad))
-    {
-        allowed.insert(SpecialTokenCollision::new(
-            SpecialTokenRole::Eos,
-            SpecialTokenRole::Pad,
-        )?);
-    }
-    Ok(SpecialTokenCollisionPolicy::new(allowed))
-}
-
-fn read_json(path: &Path) -> Result<Value, String> {
-    let raw = fs::read_to_string(path).map_err(|error| format!("read {path:?}: {error}"))?;
-    serde_json::from_str(&raw).map_err(|error| format!("parse {path:?}: {error}"))
 }
 
 fn required_u64(value: &Value, key: &str) -> Result<u64, String> {
@@ -1801,7 +1570,8 @@ mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
         gated_delta_recurrent_attention_contract, ModelSourceKind, OperationContract,
-        OriginalModelSource, OriginalModelSources, WeightComponentSource,
+        OriginalModelSource, OriginalModelSources, PhysicalStorageLayout,
+        PhysicalWeightComponentBinding, WeightComponentSource,
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -1903,22 +1673,18 @@ mod tests {
         weights.sort_by(|left, right| {
             (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
         });
-        let template = "{{ messages }}".to_owned();
+        let tokenizer_config = br#"{
+            "chat_template": "{{ messages }}",
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0
+        }"#;
         Qwen35FamilyConfig {
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
             hf_config,
             vocab_size: 32,
             max_position_embeddings: 128,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
-            template: TemplateInput {
-                sha256: format!("{:x}", Sha256::digest(template.as_bytes())),
-                template,
-                source_file: "tokenizer_config.json".to_owned(),
-            },
-            special_tokens: SpecialTokenInput {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-            },
             weight_format: FamilyWeightFormat::SafetensorsDense,
             weights,
         }
