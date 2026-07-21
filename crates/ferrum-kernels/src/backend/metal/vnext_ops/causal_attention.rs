@@ -45,6 +45,7 @@ const ATTENTION_KERNEL: &str = "vnext_causal_attention_f16";
 const PREPARE_PAGE_TABLE_INDEX: u64 = 6;
 const ATTENTION_PAGE_TABLE_INDEX: u64 = 3;
 const SIMD_THREADS: u64 = 32;
+const MAXIMUM_ATTENTION_SIMDGROUPS: u64 = 16;
 const MAXIMUM_HEAD_DIM: u64 = 256;
 const MAXIMUM_KV_PAGES: u64 = 16_384;
 
@@ -54,6 +55,7 @@ pub(super) struct MetalCausalAttentionPipelines {
     prepare_function: Function,
     binding_encoded_length: u64,
     binding_alignment: u64,
+    maximum_attention_simdgroups: u32,
 }
 
 impl MetalCausalAttentionPipelines {
@@ -112,13 +114,22 @@ impl MetalCausalAttentionPipelines {
                 attention.thread_execution_width()
             )));
         }
+        let maximum_attention_simdgroups =
+            (attention.max_total_threads_per_threadgroup() as u64 / SIMD_THREADS)
+                .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS) as u32;
         Ok(Self {
             prepare,
             attention,
             prepare_function,
             binding_encoded_length,
             binding_alignment,
+            maximum_attention_simdgroups,
         })
+    }
+
+    fn attention_simdgroups_for_context(&self, context_positions: u64) -> u32 {
+        let context_limit = u32::try_from(context_positions).unwrap_or(u32::MAX).max(1);
+        self.maximum_attention_simdgroups.min(context_limit)
     }
 
     fn binding_slot_bytes(&self) -> Result<u64, String> {
@@ -346,7 +357,7 @@ impl CausalAttentionShape {
                 MAXIMUM_KV_PAGES
             ));
         }
-        shape.params(1, 0, 1)?;
+        shape.params(1, 0, 1, 1)?;
         Ok(shape)
     }
 
@@ -403,7 +414,13 @@ impl CausalAttentionShape {
         tokens: u64,
         position_start: u64,
         page_count: u64,
+        attention_simdgroups: u32,
     ) -> Result<CausalAttentionParams, String> {
+        if attention_simdgroups == 0
+            || u64::from(attention_simdgroups) > MAXIMUM_ATTENTION_SIMDGROUPS
+        {
+            return Err("Metal causal-attention SIMDgroup count is unsupported".to_owned());
+        }
         let query_head_stride = self
             .head_dim
             .checked_mul(if self.output_gate { 2 } else { 1 })
@@ -437,6 +454,7 @@ impl CausalAttentionShape {
             )?,
             output_gate: u32::from(self.output_gate),
             rope_interleaved: u32::from(self.rope_interleaved),
+            attention_simdgroups,
             epsilon: self.epsilon,
             rope_theta: self.rope_theta,
         })
@@ -459,6 +477,7 @@ struct CausalAttentionParams {
     kv_projection_stride: u32,
     output_gate: u32,
     rope_interleaved: u32,
+    attention_simdgroups: u32,
     epsilon: f32,
     rope_theta: f32,
 }
@@ -797,7 +816,16 @@ fn encode_attention(
                 })?,
                 "Metal causal-attention residual elements",
             )?,
-            params: shape.params(tokens, source.start, page_count_u64)?,
+            params: shape.params(
+                tokens,
+                source.start,
+                page_count_u64,
+                attention.attention_simdgroups_for_context(
+                    source.start.checked_add(tokens).ok_or_else(|| {
+                        "Metal causal-attention context extent overflowed".to_owned()
+                    })?,
+                ),
+            )?,
             query_projection: linear_launch(
                 query_weight,
                 shared.scratch,
@@ -1228,14 +1256,25 @@ fn dispatch_attention(
     );
     set_params(encoder, 4, &launch.params);
     use_pages(encoder, regions, launch);
+    encoder.set_threadgroup_memory_length(0, attention_threadgroup_memory_bytes(&launch.params));
     encoder.dispatch_thread_groups(
         MTLSize::new(
             u64::from(launch.params.tokens),
             u64::from(launch.params.query_heads),
             1,
         ),
-        MTLSize::new(SIMD_THREADS, 1, 1),
+        MTLSize::new(
+            SIMD_THREADS,
+            u64::from(launch.params.attention_simdgroups),
+            1,
+        ),
     );
+}
+
+fn attention_threadgroup_memory_bytes(params: &CausalAttentionParams) -> u64 {
+    let simdgroups = u64::from(params.attention_simdgroups);
+    let values = simdgroups * u64::from(params.head_dim) + 3 * simdgroups;
+    values * std::mem::size_of::<f32>() as u64
 }
 
 fn use_pages(
