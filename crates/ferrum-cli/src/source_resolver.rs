@@ -168,6 +168,12 @@ const GGUF_ALIASES: &[GgufAliasEntry] = &[
         tokenizer_repo: Some("Qwen/Qwen3.5-4B"),
     },
     GgufAliasEntry {
+        aliases: &["qwen3.5:35b-a3b-gguf", "qwen3.5:35b-a3b-q4_k_s"],
+        repo: "unsloth/Qwen3.5-35B-A3B-GGUF",
+        filename: "Qwen3.5-35B-A3B-Q4_K_S.gguf",
+        tokenizer_repo: Some("Qwen/Qwen3.5-35B-A3B"),
+    },
+    GgufAliasEntry {
         aliases: &["qwen3:8b-q4_k_m"],
         repo: "Qwen/Qwen3-8B-GGUF",
         filename: "Qwen3-8B-Q4_K_M.gguf",
@@ -1382,6 +1388,13 @@ mod tests {
             Some((
                 "unsloth/Qwen3.5-4B-GGUF".to_string(),
                 "Qwen3.5-4B-Q4_K_M.gguf".to_string()
+            ))
+        );
+        assert_eq!(
+            resolve_gguf_alias("qwen3.5:35b-a3b-q4_k_s"),
+            Some((
+                "unsloth/Qwen3.5-35B-A3B-GGUF".to_string(),
+                "Qwen3.5-35B-A3B-Q4_K_S.gguf".to_string()
             ))
         );
     }
