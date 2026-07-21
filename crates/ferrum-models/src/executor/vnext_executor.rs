@@ -3784,24 +3784,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             step.bind_all_invocation_work_shape(spans.to_vec())
                 .map_err(|error| FerrumError::backend(error.to_string()))?,
         );
-        let requests = self
-            .resolved_plan
-            .execution_plan()
-            .payload()
-            .nodes()
-            .iter()
-            .map(|node| {
-                InvocationResourceAdmissionRequest::for_all_step_participants(
-                    node.id().clone(),
-                    Arc::clone(&work_shape),
-                    AdmissionFitPolicy::ImmediateOnly,
-                    AdmissionPressureAction::WaitForRelease,
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, VNextError>>()
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        step.try_prepare_submission_wave(requests)
-            .map_err(|error| FerrumError::backend(error.to_string()))
+        step.try_prepare_full_plan_submission_wave(
+            work_shape,
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
     fn prepare_wave(

@@ -827,13 +827,6 @@ where
         self: &Arc<Self>,
         requests: Vec<InvocationResourceAdmissionRequest>,
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
-        let _lifecycle = self.participants[0]
-            .session
-            .resources()
-            .request
-            .plan
-            .resources
-            .read_lifecycle("prepare a step submission wave")?;
         let plan = &self.participants[0].session.resources().request.plan;
         let plan_nodes = plan.nodes();
         if requests.is_empty()
@@ -847,7 +840,6 @@ where
                 "submission wave must cover every plan node exactly once in immutable plan order",
             ));
         }
-
         let fit_policy = requests[0].fit_policy();
         let pressure_action = requests[0].pressure_action();
         if requests.iter().any(|request| {
@@ -857,7 +849,6 @@ where
                 "submission wave nodes require one admission fit and pressure policy",
             ));
         }
-
         let work_shape = Arc::clone(&requests[0].work_shape);
         if requests
             .iter()
@@ -865,6 +856,42 @@ where
         {
             return Err(invalid_resource(
                 "submission wave nodes must share one canonical work authority",
+            ));
+        }
+        self.prepare_full_plan_submission_wave(work_shape, fit_policy, pressure_action)
+    }
+
+    /// Prepares the only production wave topology: every immutable-plan node
+    /// in order over one shared participant/work authority. Callers do not
+    /// rebuild a per-node request vector for topology already committed by the
+    /// plan hash.
+    pub fn try_prepare_full_plan_submission_wave(
+        self: &Arc<Self>,
+        work_shape: Arc<BatchWorkShape>,
+        fit_policy: AdmissionFitPolicy,
+        pressure_action: AdmissionPressureAction,
+    ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
+        self.prepare_full_plan_submission_wave(work_shape, fit_policy, pressure_action)
+    }
+
+    fn prepare_full_plan_submission_wave(
+        self: &Arc<Self>,
+        work_shape: Arc<BatchWorkShape>,
+        fit_policy: AdmissionFitPolicy,
+        pressure_action: AdmissionPressureAction,
+    ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
+        let _lifecycle = self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .resources
+            .read_lifecycle("prepare a step submission wave")?;
+        let plan = &self.participants[0].session.resources().request.plan;
+        let plan_nodes = plan.nodes();
+        if plan_nodes.is_empty() {
+            return Err(invalid_resource(
+                "submission wave requires a non-empty immutable plan",
             ));
         }
         if work_shape.participants().len() != self.participants.len()
@@ -882,10 +909,11 @@ where
         }
         let participant_authority =
             Arc::new(self.prepare_participant_authority(Arc::clone(&work_shape), fit_policy)?);
-        let prepared_nodes = requests
-            .into_iter()
-            .map(|request| {
-                PreparedStepSubmissionNode::new(request.node_id, Arc::clone(&participant_authority))
+        let prepared_nodes = plan_nodes
+            .iter()
+            .enumerate()
+            .map(|(node_index, _node)| {
+                PreparedStepSubmissionNode::new(node_index, Arc::clone(&participant_authority))
             })
             .collect::<Vec<_>>();
         let immediate_shape = work_shape.immediate_shape();
@@ -909,7 +937,7 @@ where
                     .iter()
                     .map(|node| {
                         (
-                            node.node_id.clone(),
+                            node.node_id().clone(),
                             node.work_shape().fingerprint().to_owned(),
                         )
                     })
@@ -923,16 +951,6 @@ where
                 ));
             }
         };
-        let wave_participants = self
-            .participants
-            .iter()
-            .map(|participant| {
-                BatchParticipantAuthority::new(
-                    participant.session.sequence_authority(),
-                    participant.session.request_authority(),
-                )
-            })
-            .collect::<Vec<_>>();
         let logical_capacity = if demand.immediate_claim().is_empty() {
             None
         } else {
@@ -966,14 +984,11 @@ where
                 }
             }
         };
-        let node_work_shapes = prepared_nodes
-            .iter()
-            .map(|node| (node.node_id.clone(), Arc::clone(&work_shape)))
-            .collect();
         let (backing_slices, lane_slot_lease) = prepared_backing.commit().into_parts();
         let claimed_backing = ClaimedSubmissionWaveBacking::new(
-            node_work_shapes,
-            wave_participants,
+            plan.plan_hash().clone(),
+            plan_nodes.len(),
+            Arc::clone(&work_shape),
             demand,
             logical_capacity,
             backing_slices,
@@ -1375,34 +1390,40 @@ where
     R: DeviceRuntime,
 {
     #[derive(Serialize)]
-    struct NodeInput<'a> {
-        node_id: &'a NodeId,
+    struct WaveInput<'a> {
+        domain: &'static str,
+        batch_step_id: BatchStepId,
+        plan_hash: &'a super::PlanHash,
+        node_count: usize,
+        step_backing_fingerprint: &'a str,
+        invocation_backing_fingerprint: &'a str,
         participant_frames: &'a [StepParticipantFrameAssignment],
         work_fingerprint: &'a str,
     }
 
-    #[derive(Serialize)]
-    struct WaveInput<'a> {
-        domain: &'static str,
-        batch_step_id: BatchStepId,
-        step_backing_fingerprint: &'a str,
-        invocation_backing_fingerprint: &'a str,
-        nodes: Vec<NodeInput<'a>>,
+    let first = nodes
+        .first()
+        .ok_or_else(|| invalid_resource("submission wave fingerprint requires plan nodes"))?;
+    if nodes.len() != claimed_backing.node_count()
+        || nodes.iter().enumerate().any(|(node_index, node)| {
+            node.node_index != node_index
+                || !Arc::ptr_eq(&node.participant_authority, &first.participant_authority)
+        })
+        || first.work_shape() != claimed_backing.work_shape()
+    {
+        return Err(invalid_resource(
+            "submission wave topology differs from its shared plan/work authority",
+        ));
     }
-
     let bytes = serde_json::to_vec(&WaveInput {
-        domain: "ferrum.runtime-vnext.step-submission-wave.v2",
+        domain: "ferrum.runtime-vnext.step-submission-wave.v3",
         batch_step_id: step.batch_step_id,
+        plan_hash: claimed_backing.plan_hash(),
+        node_count: claimed_backing.node_count(),
         step_backing_fingerprint: step.claimed_backing.fingerprint(),
         invocation_backing_fingerprint: claimed_backing.fingerprint(),
-        nodes: nodes
-            .iter()
-            .map(|node| NodeInput {
-                node_id: &node.node_id,
-                participant_frames: node.participant_frames(),
-                work_fingerprint: node.work_shape().fingerprint(),
-            })
-            .collect(),
+        participant_frames: first.participant_frames(),
+        work_fingerprint: claimed_backing.work_shape().fingerprint(),
     })
     .map_err(|error| {
         invalid_resource(format!(
@@ -1487,22 +1508,28 @@ where
     R: DeviceRuntime,
 {
     participant_authority: Arc<PreparedParticipantAuthority<R>>,
-    node_id: NodeId,
+    node_index: usize,
 }
 
 impl<R> PreparedStepSubmissionNode<R>
 where
     R: DeviceRuntime,
 {
-    fn new(node_id: NodeId, participant_authority: Arc<PreparedParticipantAuthority<R>>) -> Self {
+    fn new(node_index: usize, participant_authority: Arc<PreparedParticipantAuthority<R>>) -> Self {
         Self {
             participant_authority,
-            node_id,
+            node_index,
         }
     }
 
     pub fn node_id(&self) -> &NodeId {
-        &self.node_id
+        self.participant_authority.participants[0]
+            .request
+            .plan
+            .nodes()
+            .get(self.node_index)
+            .expect("prepared submission node index was derived from the immutable plan")
+            .id()
     }
 
     pub fn participant_count(&self) -> u32 {
@@ -1552,7 +1579,7 @@ where
                 ParticipantNodeKey::new(
                     assignment.participant(),
                     assignment.frame_id(),
-                    self.node_id.clone(),
+                    self.node_id().clone(),
                 )
             })
             .collect()
