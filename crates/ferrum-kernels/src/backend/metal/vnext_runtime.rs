@@ -272,6 +272,7 @@ pub(crate) struct MetalSubmissionEncoder {
     command_buffer: CommandBuffer,
     compute: Option<ComputeCommandEncoder>,
     profile_enabled: bool,
+    command_label: Option<&'static str>,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
 }
@@ -282,6 +283,7 @@ impl MetalSubmissionEncoder {
             command_buffer: command_buffer.to_owned(),
             compute: None,
             profile_enabled,
+            command_label: None,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
         }
@@ -293,7 +295,14 @@ impl MetalSubmissionEncoder {
         }
     }
 
-    fn begin_command(&mut self) {
+    fn begin_command(&mut self, command_label: &'static str) {
+        if self.profile_enabled {
+            // A full-profile run deliberately gives every native command an
+            // encoder boundary so Metal System Trace can attribute GPU time
+            // to the same native_op_id emitted by Ferrum's typed profile.
+            self.end_compute();
+            self.command_label = Some(command_label);
+        }
         self.compute_dispatch_count = 0;
         self.transfer_command_count = 0;
     }
@@ -304,7 +313,11 @@ impl MetalSubmissionEncoder {
 
     pub(crate) fn compute_encoder(&mut self) -> &ComputeCommandEncoderRef {
         if self.compute.is_none() {
-            self.compute = Some(self.command_buffer.new_compute_command_encoder().to_owned());
+            let encoder = self.command_buffer.new_compute_command_encoder().to_owned();
+            if let Some(label) = self.command_label {
+                encoder.set_label(label);
+            }
+            self.compute = Some(encoder);
         }
         self.compute
             .as_deref()
@@ -325,8 +338,11 @@ impl MetalSubmissionEncoder {
             self.transfer_command_count = self.transfer_command_count.saturating_add(1);
         }
         self.end_compute();
-        let encoder =
-            MetalBlitEncoderGuard(self.command_buffer.new_blit_command_encoder().to_owned());
+        let encoder = self.command_buffer.new_blit_command_encoder().to_owned();
+        if let Some(label) = self.command_label {
+            encoder.set_label(label);
+        }
+        let encoder = MetalBlitEncoderGuard(encoder);
         encode(&encoder.0)
     }
 
@@ -912,12 +928,15 @@ impl MetalDeviceRuntime {
 
         let command_buffer = stream.queue.new_command_buffer().to_owned();
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
+        if kernel_attribution {
+            command_buffer.set_label("ferrum.vnext.full_profile");
+        }
         let mut encoder = MetalSubmissionEncoder::new(&command_buffer, kernel_attribution);
         let mut attribution = kernel_attribution.then(|| Vec::with_capacity(entries.len()));
         let enqueue_stage =
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
         for (phase, node_index, command) in &entries {
-            encoder.begin_command();
+            encoder.begin_command(command.operation);
             if let Err(error) = command.encode(&mut encoder) {
                 stream.state.cancel_recording();
                 return Err(DefinitelyNotSubmitted::new(error));
