@@ -318,7 +318,6 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     const CHUNK_TOKENS: usize = 145;
     const CHUNK_KEY_HEADS: usize = 2;
     const CHUNK_VALUE_HEADS: usize = 4;
-    const CHUNK_VALUE_DIM: usize = 32;
     const STATE_SENTINEL: f32 = 73.25;
 
     let Some(device) = Device::system_default() else {
@@ -327,24 +326,19 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     };
     let pipelines = MetalGatedDeltaPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
-    for key_dim in [32, 128] {
+    for (key_dim, value_dim) in [(32, 32), (128, 128)] {
         let mut query = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * key_dim, 0.019, 0.4);
         let mut key = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * key_dim, 0.031, 0.35);
         normalize_rows(&mut query, key_dim);
         normalize_rows(&mut key, key_dim);
-        let value = float_values(
-            CHUNK_TOKENS * CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM,
-            0.023,
-            0.2,
-        );
+        let value = float_values(CHUNK_TOKENS * CHUNK_VALUE_HEADS * value_dim, 0.023, 0.2);
         let g = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
             .map(|index| -0.008 - (index as f32 * 0.017).sin().abs() * 0.025)
             .collect::<Vec<_>>();
         let beta = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
             .map(|index| 0.2 + (index as f32 * 0.013).sin().abs() * 0.6)
             .collect::<Vec<_>>();
-        let initial_state =
-            float_values(CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM * key_dim, 0.011, 0.025);
+        let initial_state = float_values(CHUNK_VALUE_HEADS * value_dim * key_dim, 0.011, 0.025);
 
         for mapping in [
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
@@ -355,7 +349,7 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
                 key_heads: CHUNK_KEY_HEADS,
                 value_heads: CHUNK_VALUE_HEADS,
                 key_dim,
-                value_dim: CHUNK_VALUE_DIM,
+                value_dim,
                 mapping,
             };
             let (expected_output, expected_state) =
@@ -398,7 +392,7 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
                 &pipelines,
                 row_slice(&query, CHUNK_KEY_HEADS * key_dim, 0..split),
                 row_slice(&key, CHUNK_KEY_HEADS * key_dim, 0..split),
-                row_slice(&value, CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM, 0..split),
+                row_slice(&value, CHUNK_VALUE_HEADS * value_dim, 0..split),
                 row_slice(&g, CHUNK_VALUE_HEADS, 0..split),
                 row_slice(&beta, CHUNK_VALUE_HEADS, 0..split),
                 &initial_state,
@@ -416,11 +410,7 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
                 &pipelines,
                 row_slice(&query, CHUNK_KEY_HEADS * key_dim, split..CHUNK_TOKENS),
                 row_slice(&key, CHUNK_KEY_HEADS * key_dim, split..CHUNK_TOKENS),
-                row_slice(
-                    &value,
-                    CHUNK_VALUE_HEADS * CHUNK_VALUE_DIM,
-                    split..CHUNK_TOKENS,
-                ),
+                row_slice(&value, CHUNK_VALUE_HEADS * value_dim, split..CHUNK_TOKENS),
                 row_slice(&g, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
                 row_slice(&beta, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
                 &split_state,
@@ -529,7 +519,12 @@ fn run_chunked_core(
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.chunk_uw);
+    let uses_specialized_uw = uses_chunk_uw_k128_v128(&params);
+    encoder.set_compute_pipeline_state(if uses_specialized_uw {
+        &pipelines.chunk_uw_k128_v128
+    } else {
+        &pipelines.chunk_uw_generic
+    });
     for (index, buffer) in [
         &*key_buffer,
         &*value_buffer,
@@ -544,10 +539,17 @@ fn run_chunked_core(
         set_raw(encoder, index as u64, buffer);
     }
     set_params(encoder, 6, &params);
-    dispatch_elements(
-        encoder,
-        (shape.tokens * shape.value_heads * (shape.value_dim + shape.key_dim)) as u64,
-    );
+    if uses_specialized_uw {
+        encoder.dispatch_thread_groups(
+            MTLSize::new(shape.tokens as u64, shape.value_heads as u64, 1),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    } else {
+        dispatch_elements(
+            encoder,
+            (shape.tokens * shape.value_heads * (shape.value_dim + shape.key_dim)) as u64,
+        );
+    }
 
     encoder.set_compute_pipeline_state(&pipelines.chunk_qk);
     for (index, buffer) in [&*query_buffer, &*key_buffer, &*raw_qk]

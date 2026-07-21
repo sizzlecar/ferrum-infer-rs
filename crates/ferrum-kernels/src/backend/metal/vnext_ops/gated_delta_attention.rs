@@ -50,6 +50,7 @@ const QK_NORM_KERNEL: &str = "vnext_gated_delta_qk_norm_f32";
 const DELTA_KERNEL: &str = "vnext_gated_delta_rule_tiled16_f32_state";
 const CHUNK_KKT_INVERSE_KERNEL: &str = "vnext_gated_delta_chunk_kkt_inverse_c64";
 const CHUNK_UW_KERNEL: &str = "vnext_gated_delta_chunk_uw_c64";
+const CHUNK_UW_K128_V128_KERNEL: &str = "vnext_gated_delta_chunk_uw_c64_k128_v128";
 const CHUNK_QK_KERNEL: &str = "vnext_gated_delta_chunk_qk_c64";
 const CHUNK_CARRY_KERNEL: &str = "vnext_gated_delta_chunk_carry_c64";
 const CHUNK_OUTPUT_KERNEL: &str = "vnext_gated_delta_chunk_output_c64";
@@ -90,7 +91,8 @@ pub(super) struct MetalGatedDeltaPipelines {
     qk_norm: ComputePipelineState,
     delta: ComputePipelineState,
     chunk_kkt_inverse: ComputePipelineState,
-    chunk_uw: ComputePipelineState,
+    chunk_uw_generic: ComputePipelineState,
+    chunk_uw_k128_v128: ComputePipelineState,
     chunk_qk: ComputePipelineState,
     chunk_carry_generic: ComputePipelineState,
     chunk_carry_k128: ComputePipelineState,
@@ -153,7 +155,8 @@ impl MetalGatedDeltaPipelines {
             qk_norm: pipeline(QK_NORM_KERNEL)?,
             delta: pipeline(DELTA_KERNEL)?,
             chunk_kkt_inverse: pipeline(CHUNK_KKT_INVERSE_KERNEL)?,
-            chunk_uw: pipeline(CHUNK_UW_KERNEL)?,
+            chunk_uw_generic: pipeline(CHUNK_UW_KERNEL)?,
+            chunk_uw_k128_v128: pipeline(CHUNK_UW_K128_V128_KERNEL)?,
             chunk_qk: pipeline(CHUNK_QK_KERNEL)?,
             chunk_carry_generic: carry_pipeline(false)?,
             chunk_carry_k128: carry_pipeline(true)?,
@@ -539,6 +542,11 @@ struct GatedDeltaParams {
     scale: f32,
     decay_parameterization: u32,
     value_head_mapping: u32,
+}
+
+const fn uses_chunk_uw_k128_v128(params: &GatedDeltaParams) -> bool {
+    params.key_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as u32
+        && params.value_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as u32
 }
 
 fn text_attribute<'a>(
@@ -1492,7 +1500,12 @@ fn dispatch_chunked_delta_c64(
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.chunk_uw);
+    let uses_specialized_uw = uses_chunk_uw_k128_v128(params);
+    encoder.set_compute_pipeline_state(if uses_specialized_uw {
+        &pipelines.chunk_uw_k128_v128
+    } else {
+        &pipelines.chunk_uw_generic
+    });
     for (index, offset) in [
         launch.key,
         launch.value,
@@ -1507,12 +1520,19 @@ fn dispatch_chunked_delta_c64(
         set_region_offset(encoder, index as u64, scratch, offset);
     }
     set_params(encoder, 6, params);
-    dispatch_elements(
-        encoder,
-        u64::from(params.tokens)
-            * u64::from(params.value_heads)
-            * (u64::from(params.value_dim) + u64::from(params.key_dim)),
-    );
+    if uses_specialized_uw {
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.tokens), u64::from(params.value_heads), 1),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    } else {
+        dispatch_elements(
+            encoder,
+            u64::from(params.tokens)
+                * u64::from(params.value_heads)
+                * (u64::from(params.value_dim) + u64::from(params.key_dim)),
+        );
+    }
 
     encoder.set_compute_pipeline_state(&pipelines.chunk_qk);
     for (index, offset) in [launch.query, launch.key, launch.value]
