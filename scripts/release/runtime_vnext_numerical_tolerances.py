@@ -74,6 +74,7 @@ G08A_REQUIRED_COVERAGE = frozenset(
         "operation.gated_delta_recurrent_attention@4.0.log_rate_grouped",
         "operation.gated_delta_recurrent_attention@4.0.negative_rate_interleaved",
         "operation.last_token_dense_linear@1.0",
+        "operation.last_token_dense_linear@1.1",
         "operation.residual_add@1.0",
         "operation.rms_norm@1.0",
         "operation.token_embedding@1.0",
@@ -142,6 +143,15 @@ TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
         "basis_kind": "checked_in_conformance_test",
         "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
         "test_name": "native_last_token_q6k_linear_selects_final_row_on_real_metal",
+    },
+    "cpu.fp32.rust.packed_last_token_dense_linear_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "e6a47760af0bf9eb3c5acf5c650896c5d93b8c07",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": (
+            "native_packed_last_token_q6k_linear_gathers_and_scatters_on_real_metal"
+        ),
     },
     "cpu.fp32.rust.causal_attention_reference": {
         "oracle_precision": "fp32",
@@ -417,6 +427,30 @@ G08A_COVERAGE_RULES: dict[str, dict[str, Any]] = {
             },
         },
         oracle_identity="cpu.fp32.rust.last_token_dense_linear_reference",
+    ),
+    "operation.last_token_dense_linear@1.1": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.last_token_dense_linear",
+        operation_schema_version="1.1",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="gguf_q6_k",
+        shape_domain={
+            "fixture_id": "last_token_dense_linear.q6_k.packed_gather_scatter",
+            "dimensions": {
+                "hidden_size": 256,
+                "out_features": 64,
+                "participants": 15,
+                "sequence_rows": 36,
+            },
+            "semantics": {
+                "batching": "gather_tiled_gemm_scatter",
+                "selection": "final_row_per_participant",
+                "weight_format": "gguf_q6_k",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.packed_last_token_dense_linear_reference",
     ),
     "operation.causal_paged_attention@2.0.fixed_page_split": _coverage_selector(
         model_scope="operation_contract",
@@ -1477,6 +1511,7 @@ def _self_test() -> None:
         set(state_catalog["coverage"]["missing_required_coverage"])
         | {expected_state_gap}
     )
+    state_catalog["coverage"]["status"] = "foundation_only"
     state_summary = validate_catalog_document(state_catalog)
     _require(
         expected_state_gap in state_summary["missing_required_coverage"],

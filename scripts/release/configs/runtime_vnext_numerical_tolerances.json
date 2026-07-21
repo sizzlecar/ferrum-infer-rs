@@ -613,6 +613,57 @@
     {
       "backend": "metal",
       "basis": {
+        "assertion": "Real Metal packed Q6_K last-token gather, tiled GEMM, and scatter output is checked against a CPU FP32 oracle with max_abs <= 0.002.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": "native_packed_last_token_q6k_linear_gathers_and_scatters_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.9999,
+        "max_abs_max": 0.002,
+        "relative_l2_max": 0.001
+      },
+      "checkpoint_kind": "operation_output",
+      "checkpoint_name": "output",
+      "coverage_markers": [
+        "operation.last_token_dense_linear@1.1"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.last_token_dense_linear",
+      "operation_schema_version": "1.1",
+      "oracle_identity": "cpu.fp32.rust.packed_last_token_dense_linear_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q6_k",
+      "review_commit": "e6a47760af0bf9eb3c5acf5c650896c5d93b8c07",
+      "row_fingerprint": "bc49f573fda4a5eca27e90604294358d7108a610d8dfb0a1d82855b22734dcf6",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 256,
+          "out_features": 64,
+          "participants": 15,
+          "sequence_rows": 36
+        },
+        "fixture_id": "last_token_dense_linear.q6_k.packed_gather_scatter",
+        "semantics": {
+          "batching": "gather_tiled_gemm_scatter",
+          "selection": "final_row_per_participant",
+          "weight_format": "gguf_q6_k"
+        }
+      },
+      "source_commit": "e6a47760af0bf9eb3c5acf5c650896c5d93b8c07",
+      "tolerance_id": "runtime-vnext.metal.last-token-dense-linear.v1_1.operation.fp16.gguf-q6-k.packed-15"
+    },
+    {
+      "backend": "metal",
+      "basis": {
         "assertion": "Real Qwen3.5-4B Q4_K_M Metal layer-3 full-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
         "kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_full_attention_reference.py",
