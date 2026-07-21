@@ -1,8 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    ElementType, VNextError, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
-    WeightEncoding,
+    ElementType, RetainedHostMemoryRegion, StableHostMemory, VNextError, WeightComponentPayload,
+    WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };
 use ferrum_types::{FerrumError, Result};
 
@@ -15,7 +16,7 @@ use crate::safetensors_archive::transcode_dense_bytes;
 /// when their type matches the schema and materialized on a cold-path source
 /// request when the typed execution plan requires another floating-point type.
 pub struct GgufWeightComponentSource {
-    file: GgufFile,
+    file: Arc<GgufFile>,
     source_file: String,
 }
 
@@ -39,7 +40,10 @@ impl GgufWeightComponentSource {
                 path.display()
             ))
         })?;
-        Ok(Self { file, source_file })
+        Ok(Self {
+            file: Arc::new(file),
+            source_file,
+        })
     }
 
     pub fn file(&self) -> &GgufFile {
@@ -174,14 +178,40 @@ impl WeightComponentSource for GgufWeightComponentSource {
             }
         };
 
-        WeightComponentPayload::new(
+        let retained_host_memory =
+            if payload_bytes.as_ptr() == bytes.as_ptr() && payload_bytes.len() == bytes.len() {
+                let (offset_bytes, length_bytes) =
+                    self.file.tensor_byte_range(external_name).ok_or_else(|| {
+                        invalid_component(component, "GGUF tensor byte range is invalid")
+                    })?;
+                Some(RetainedHostMemoryRegion::new(
+                    Arc::clone(&self.file),
+                    offset_bytes,
+                    length_bytes,
+                )?)
+            } else {
+                None
+            };
+        let payload = WeightComponentPayload::new(
             component,
             external_name.clone(),
             self.source_file.clone(),
             component.dimensions.clone(),
             element_type,
             payload_bytes,
-        )
+        )?;
+        match retained_host_memory {
+            Some(retained) => payload.with_retained_host_memory(retained),
+            None => Ok(payload),
+        }
+    }
+}
+
+// SAFETY: GgufFile owns an immutable Mmap whose address and length do not
+// change during its lifetime.
+unsafe impl StableHostMemory for GgufFile {
+    fn stable_bytes(&self) -> &[u8] {
+        self.mmap_bytes()
     }
 }
 

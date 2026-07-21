@@ -1,6 +1,79 @@
 use std::borrow::Cow;
+use std::fmt;
+use std::sync::Arc;
 
 use super::{ElementType, VNextError, WeightComponentSpec, WeightId};
+
+/// Owner for host bytes whose address, length, and contents remain stable for
+/// the lifetime of the owner.
+///
+/// # Safety
+///
+/// Implementations must return the same readable allocation from
+/// [`Self::stable_bytes`] for their entire lifetime. The allocation must not be
+/// mutated while a retained region exists. Device backends may keep a native
+/// no-copy view after the source object that produced a payload has been
+/// dropped.
+pub unsafe trait StableHostMemory: Send + Sync + 'static {
+    fn stable_bytes(&self) -> &[u8];
+}
+
+/// An owned, bounds-checked subregion of stable host memory.
+#[derive(Clone)]
+pub struct RetainedHostMemoryRegion {
+    owner: Arc<dyn StableHostMemory>,
+    offset_bytes: usize,
+    length_bytes: usize,
+}
+
+impl RetainedHostMemoryRegion {
+    pub fn new<T>(
+        owner: Arc<T>,
+        offset_bytes: usize,
+        length_bytes: usize,
+    ) -> Result<Self, VNextError>
+    where
+        T: StableHostMemory,
+    {
+        let end = offset_bytes.checked_add(length_bytes).ok_or_else(|| {
+            VNextError::InvalidExecutionPlan {
+                reason: "retained host-memory range overflows the host address space".to_owned(),
+            }
+        })?;
+        if length_bytes == 0 || end > owner.stable_bytes().len() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "retained host-memory range is empty or exceeds its owner".to_owned(),
+            });
+        }
+        Ok(Self {
+            owner,
+            offset_bytes,
+            length_bytes,
+        })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.owner.stable_bytes()[self.offset_bytes..self.offset_bytes + self.length_bytes]
+    }
+
+    pub const fn offset_bytes(&self) -> usize {
+        self.offset_bytes
+    }
+
+    pub const fn length_bytes(&self) -> usize {
+        self.length_bytes
+    }
+}
+
+impl fmt::Debug for RetainedHostMemoryRegion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedHostMemoryRegion")
+            .field("offset_bytes", &self.offset_bytes)
+            .field("length_bytes", &self.length_bytes)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Validated physical bytes for one model weight component.
 ///
@@ -13,6 +86,7 @@ pub struct WeightComponentPayload<'source> {
     dimensions: Vec<u64>,
     element_type: ElementType,
     bytes: Cow<'source, [u8]>,
+    retained_host_memory: Option<RetainedHostMemoryRegion>,
 }
 
 impl<'source> WeightComponentPayload<'source> {
@@ -78,7 +152,30 @@ impl<'source> WeightComponentPayload<'source> {
             dimensions,
             element_type,
             bytes,
+            retained_host_memory: None,
         })
+    }
+
+    /// Attach the stable owner for an otherwise borrowed payload. Pointer and
+    /// length identity are checked here so a backend cannot accidentally retain
+    /// a different mmap range than the bytes validated against the schema.
+    pub fn with_retained_host_memory(
+        mut self,
+        retained_host_memory: RetainedHostMemoryRegion,
+    ) -> Result<Self, VNextError> {
+        let retained_bytes = retained_host_memory.bytes();
+        if retained_bytes.len() != self.bytes.len()
+            || !std::ptr::eq(retained_bytes.as_ptr(), self.bytes.as_ptr())
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "weight component `{}` retained host-memory region differs from its validated payload",
+                    self.component_id
+                ),
+            });
+        }
+        self.retained_host_memory = Some(retained_host_memory);
+        Ok(self)
     }
 
     pub fn component_id(&self) -> &WeightId {
@@ -112,6 +209,10 @@ impl<'source> WeightComponentPayload<'source> {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn retained_host_memory(&self) -> Option<&RetainedHostMemoryRegion> {
+        self.retained_host_memory.as_ref()
+    }
 }
 
 /// Backend-neutral source of schema-addressed physical weight components.
@@ -128,6 +229,16 @@ pub trait WeightComponentSource: Send + Sync {
 mod tests {
     use super::*;
     use crate::vnext::{BlockQuantizationSpec, WeightComponentRole, WeightEncoding};
+
+    struct StableBytes(Vec<u8>);
+
+    // SAFETY: the Vec is never mutated and owns one fixed allocation until it
+    // is dropped.
+    unsafe impl StableHostMemory for StableBytes {
+        fn stable_bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
 
     fn packed_component() -> WeightComponentSpec {
         WeightComponentSpec {
@@ -212,5 +323,53 @@ mod tests {
         .err()
         .expect("block-grid element count must not be mistaken for byte length");
         assert!(error.to_string().contains("differs from its schema"));
+    }
+
+    #[test]
+    fn retained_region_must_be_the_validated_payload_and_keeps_its_owner_alive() {
+        let component = packed_component();
+        let owner = Arc::new(StableBytes(vec![7_u8; 32]));
+        let retained = RetainedHostMemoryRegion::new(Arc::clone(&owner), 8, 16).unwrap();
+        let payload = WeightComponentPayload::from_ordered_sources(
+            &component,
+            component.external_names.clone(),
+            vec![
+                "model-1.safetensors".to_owned(),
+                "model-2.safetensors".to_owned(),
+            ],
+            component.dimensions.clone(),
+            ElementType::F16,
+            retained.bytes(),
+        )
+        .unwrap()
+        .with_retained_host_memory(retained.clone())
+        .unwrap();
+        let retained = payload.retained_host_memory().unwrap().clone();
+        drop(payload);
+        drop(owner);
+        assert_eq!(retained.bytes(), &[7_u8; 16]);
+
+        let other = Arc::new(StableBytes(vec![7_u8; 16]));
+        let wrong = RetainedHostMemoryRegion::new(other, 0, 16).unwrap();
+        let result = WeightComponentPayload::from_ordered_sources(
+            &component,
+            component.external_names.clone(),
+            vec![
+                "model-1.safetensors".to_owned(),
+                "model-2.safetensors".to_owned(),
+            ],
+            component.dimensions.clone(),
+            ElementType::F16,
+            vec![7_u8; 16],
+        )
+        .unwrap()
+        .with_retained_host_memory(wrong);
+        let error = match result {
+            Ok(_) => panic!("a different allocation must not satisfy retained payload identity"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("retained host-memory region differs"));
     }
 }

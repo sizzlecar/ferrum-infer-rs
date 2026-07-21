@@ -72,6 +72,7 @@ fn mmap_source_returns_exact_dense_and_q4_k_payloads() {
     assert_eq!(dense_payload.dimensions(), [2, 4]);
     assert_eq!(dense_payload.element_type(), ElementType::F32);
     assert_eq!(dense_payload.bytes().len(), 32);
+    assert!(dense_payload.retained_host_memory().is_some());
 
     let quantized = component(
         "component.q4-k",
@@ -87,6 +88,7 @@ fn mmap_source_returns_exact_dense_and_q4_k_payloads() {
     assert_eq!(payload.dimensions(), [2, 1]);
     assert_eq!(payload.element_type(), ElementType::U8);
     assert_eq!(payload.bytes().len(), 288);
+    assert!(payload.retained_host_memory().is_some());
     assert_eq!(
         payload.bytes().as_ptr(),
         source
@@ -122,6 +124,7 @@ fn dense_source_materializes_the_requested_typed_float_payload() {
     assert_eq!(payload.element_type(), ElementType::F16);
     assert_eq!(payload.dimensions(), [2, 4]);
     assert_eq!(payload.bytes().len(), 16);
+    assert!(payload.retained_host_memory().is_none());
     assert_eq!(values, (0..8).map(|value| value as f32).collect::<Vec<_>>());
     assert_ne!(
         payload.bytes().as_ptr(),
