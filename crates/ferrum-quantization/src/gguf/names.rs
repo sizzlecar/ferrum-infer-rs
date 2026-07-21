@@ -131,6 +131,11 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Loaded as flat fp32 buffers; the MoE runtime slices per-expert
         // at forward time.
         "mlp.router" => "ffn_gate_inp",
+        "mlp.gate" if arch == "qwen35" => "ffn_gate_inp",
+        "mlp.shared_expert_gate" if arch == "qwen35" => "ffn_gate_inp_shexp",
+        "mlp.shared_expert.gate_proj" if arch == "qwen35" => "ffn_gate_shexp",
+        "mlp.shared_expert.up_proj" if arch == "qwen35" => "ffn_up_shexp",
+        "mlp.shared_expert.down_proj" if arch == "qwen35" => "ffn_down_shexp",
         "mlp.gate_exps" => "ffn_gate_exps",
         "mlp.up_exps" => "ffn_up_exps",
         "mlp.down_exps" => "ffn_down_exps",
@@ -274,6 +279,34 @@ mod tests {
             assert_eq!(
                 ferrum_to_gguf_with_arch("qwen35", source).as_deref(),
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn maps_qwen35_routed_and_shared_moe_tensors() {
+        let cases = [
+            ("mlp.gate.weight", "ffn_gate_inp.weight"),
+            ("mlp.shared_expert_gate.weight", "ffn_gate_inp_shexp.weight"),
+            (
+                "mlp.shared_expert.gate_proj.weight",
+                "ffn_gate_shexp.weight",
+            ),
+            ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
+            (
+                "mlp.shared_expert.down_proj.weight",
+                "ffn_down_shexp.weight",
+            ),
+            ("mlp.gate_exps.weight", "ffn_gate_exps.weight"),
+            ("mlp.up_exps.weight", "ffn_up_exps.weight"),
+            ("mlp.down_exps.weight", "ffn_down_exps.weight"),
+        ];
+        for (suffix, expected) in cases {
+            let source = format!("model.language_model.layers.7.{suffix}");
+            let expected = format!("blk.7.{expected}");
+            assert_eq!(
+                ferrum_to_gguf_with_arch("qwen35", &source).as_deref(),
+                Some(expected.as_str())
             );
         }
     }
