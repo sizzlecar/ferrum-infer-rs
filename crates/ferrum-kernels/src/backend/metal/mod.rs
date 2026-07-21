@@ -55,6 +55,7 @@ pub mod q4_k_moe_id_gate_up_silu_batched;
 pub mod q4_k_moe_id_gemm;
 pub mod q4_k_moe_id_gemv;
 pub mod q4_k_moe_id_gemv_batched;
+pub mod q5_k_gemv;
 pub mod q6_k_gemm;
 pub mod q6_k_gemv;
 pub mod q6_k_moe_id_gemm;

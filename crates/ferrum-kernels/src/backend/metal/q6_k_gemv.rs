@@ -24,6 +24,7 @@ use metal::{
 
 const SHADER_SRC: &str = include_str!("q6_k_gemv.metal");
 const KERNEL_NAME: &str = "gemv_f32a_q6kw_v2";
+pub(crate) const F16_BATCHED_KERNEL_NAME: &str = "gemv_f16a_q6kw_v2_batched";
 
 /// Q6_K super-block size in bytes (matches llama.cpp's `block_q6_K`).
 pub const Q6_K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
@@ -43,6 +44,18 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
             .new_compute_pipeline_state_with_function(&function)
             .expect("build gemv_f32a_q6kw_v2 pipeline")
     })
+}
+
+pub(crate) fn new_f16_batched_pipeline(device: &Device) -> Result<ComputePipelineState, String> {
+    let library = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .map_err(|error| format!("compile shared Q6_K GEMV library: {error}"))?;
+    let function = library
+        .get_function(F16_BATCHED_KERNEL_NAME, None)
+        .map_err(|error| format!("load shared Q6_K GEMV kernel: {error}"))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| format!("build shared Q6_K GEMV pipeline: {error}"))
 }
 
 /// Dispatch the Q6_K fused GEMV on an existing compute encoder.
