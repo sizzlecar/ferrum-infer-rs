@@ -16,7 +16,10 @@ use ferrum_interfaces::vnext::{
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
-use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
+use metal::{
+    CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, FunctionConstantValues,
+    MTLDataType, MTLSize,
+};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -89,7 +92,8 @@ pub(super) struct MetalGatedDeltaPipelines {
     chunk_kkt_inverse: ComputePipelineState,
     chunk_uw: ComputePipelineState,
     chunk_qk: ComputePipelineState,
-    chunk_carry: ComputePipelineState,
+    chunk_carry_generic: ComputePipelineState,
+    chunk_carry_k128: ComputePipelineState,
     chunk_output: ComputePipelineState,
     gated_norm: ComputePipelineState,
 }
@@ -117,6 +121,30 @@ impl MetalGatedDeltaPipelines {
                     ))
                 })
         };
+        let carry_pipeline = |key_dim_128: bool| {
+            let constants = FunctionConstantValues::new();
+            constants.set_constant_value_at_index(
+                &key_dim_128 as *const bool as *const c_void,
+                MTLDataType::Bool,
+                0,
+            );
+            let function = library
+                .get_function(CHUNK_CARRY_KERNEL, Some(constants))
+                .map_err(|error| {
+                    MetalDeviceRuntimeError::contract(format!(
+                        "load Metal vNext gated-delta {CHUNK_CARRY_KERNEL} \
+                         key_dim_128={key_dim_128}: {error}"
+                    ))
+                })?;
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|error| {
+                    MetalDeviceRuntimeError::contract(format!(
+                        "build Metal vNext gated-delta {CHUNK_CARRY_KERNEL} \
+                         key_dim_128={key_dim_128}: {error}"
+                    ))
+                })
+        };
         Ok(Self {
             prepare_conv: pipeline(PREPARE_CONV_KERNEL)?,
             prepare_gates: pipeline(PREPARE_GATES_KERNEL)?,
@@ -127,7 +155,8 @@ impl MetalGatedDeltaPipelines {
             chunk_kkt_inverse: pipeline(CHUNK_KKT_INVERSE_KERNEL)?,
             chunk_uw: pipeline(CHUNK_UW_KERNEL)?,
             chunk_qk: pipeline(CHUNK_QK_KERNEL)?,
-            chunk_carry: pipeline(CHUNK_CARRY_KERNEL)?,
+            chunk_carry_generic: carry_pipeline(false)?,
+            chunk_carry_k128: carry_pipeline(true)?,
             chunk_output: pipeline(CHUNK_OUTPUT_KERNEL)?,
             gated_norm: pipeline(GATED_NORM_KERNEL)?,
         })
@@ -1498,7 +1527,13 @@ fn dispatch_chunked_delta_c64(
         u64::from(params.tokens) * u64::from(params.key_heads) * u64::from(GATED_DELTA_CHUNK_SIZE),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.chunk_carry);
+    encoder.set_compute_pipeline_state(
+        if params.key_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as u32 {
+            &pipelines.chunk_carry_k128
+        } else {
+            &pipelines.chunk_carry_generic
+        },
+    );
     for (index, offset) in [launch.query, launch.key, launch.g, launch.qkv]
         .into_iter()
         .enumerate()
