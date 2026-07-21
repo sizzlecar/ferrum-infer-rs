@@ -2707,6 +2707,28 @@ async fn shutdown_wakes_an_idle_background_loop() {
 }
 
 #[tokio::test]
+async fn shutdown_signal_retains_wakes_before_wait_registration() {
+    let engine = test_continuous_engine();
+
+    engine.inner.signal_shutdown();
+
+    assert!(engine.inner.shutdown_started.load(Ordering::Acquire));
+    assert!(!engine.inner.is_running.load(Ordering::SeqCst));
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.inner.shutdown_notify.notified(),
+    )
+    .await
+    .expect("shutdown wake must survive registration after the signal");
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.inner.work_notify.notified(),
+    )
+    .await
+    .expect("work wake must survive registration after the signal");
+}
+
+#[tokio::test]
 async fn process_batch_rejects_a_scheduler_item_without_published_sequence_state() {
     let engine = test_continuous_engine_with_config(EngineConfig::default());
     let request = policy_request();

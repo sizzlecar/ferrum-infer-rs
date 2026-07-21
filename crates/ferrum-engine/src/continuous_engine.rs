@@ -2520,6 +2520,18 @@ struct ClientReceiverDropWake {
 }
 
 impl EngineInner {
+    fn signal_shutdown(&self) {
+        self.shutdown_started.store(true, Ordering::Release);
+        self.is_running.store(false, Ordering::SeqCst);
+
+        // The background loop can be between its state check and registering
+        // the async wait. `notify_one` retains a permit across that window;
+        // `notify_waiters` would lose the shutdown signal when no waiter is
+        // registered yet.
+        self.shutdown_notify.notify_one();
+        self.work_notify.notify_one();
+    }
+
     fn structured_output_factory(&self) -> Result<Arc<StructuredOutputFactory>> {
         match self.structured_output_factory.get_or_init(|| {
             StructuredOutputFactory::new_with_model_vocab_size(
@@ -4344,6 +4356,9 @@ impl ContinuousBatchEngine {
                     }
                 }
                 last_iter_end = Some(std::time::Instant::now());
+                if !inner.is_running.load(Ordering::SeqCst) {
+                    break;
+                }
                 match outcome {
                     EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
                     EngineIterationOutcome::Idle => {
@@ -4672,10 +4687,7 @@ impl InferenceEngine for ContinuousBatchEngine {
         info!("Shutting down continuous batch engine");
         let background_loop = {
             let mut background_loop = self.inner.background_loop.lock();
-            self.inner.shutdown_started.store(true, Ordering::Release);
-            self.inner.is_running.store(false, Ordering::SeqCst);
-            self.inner.shutdown_notify.notify_waiters();
-            self.inner.work_notify.notify_waiters();
+            self.inner.signal_shutdown();
             background_loop.take()
         };
 
