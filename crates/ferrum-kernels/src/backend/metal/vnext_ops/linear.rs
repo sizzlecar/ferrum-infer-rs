@@ -2001,6 +2001,75 @@ mod tests {
     }
 
     #[test]
+    fn shared_k_quant_tiled_gemm_supports_width_above_i16_max() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping wide K-quant GEMM ABI test");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let rows = K_QUANT_TILED_GEMM_MIN_ROWS as usize;
+        let input_width = 256_usize;
+        let output_width = i16::MAX as usize + 66;
+        let input = (0..rows * input_width)
+            .map(|index| f16::from_f32(((index as f32) * 0.013).sin() * 0.2))
+            .collect::<Vec<_>>();
+        let cpu = CandleDevice::Cpu;
+        let input_tensor = Tensor::from_vec(
+            input.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
+            (rows, input_width),
+            &cpu,
+        )
+        .unwrap();
+        let dense = Tensor::from_vec(
+            (0..output_width * input_width)
+                .map(|index| ((index as f32) * 0.0071).cos() * 0.15)
+                .collect::<Vec<_>>(),
+            (output_width, input_width),
+            &cpu,
+        )
+        .unwrap();
+        let quantized = QTensor::quantize(&dense, GgmlDType::Q6K).unwrap();
+        let reference = input_tensor
+            .matmul(&quantized.dequantize(&cpu).unwrap().transpose(0, 1).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let input_buffer = shared_buffer(&device, &input);
+        let weight_buffer = shared_buffer(&device, &quantized.data().unwrap());
+        let output = output_buffer::<f16>(&device, rows * output_width);
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        let (_, dispatch_kind) = pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, rows as u32);
+        assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
+        dispatch_raw_linear(
+            &pipelines,
+            encoder,
+            LinearPhysicalFormat::Q6K,
+            &input_buffer,
+            &weight_buffer,
+            &output,
+            LinearParams {
+                rows: rows as u32,
+                in_features: input_width as u32,
+                out_features: output_width as u32,
+                output_stride: output_width as u32,
+                output_column_offset: 0,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        let actual = read_f16(&output, rows * output_width);
+        assert_linear_diagnostic_close("Q6_K wide tiled GEMM", &actual, &reference);
+    }
+
+    #[test]
     fn native_swiglu_uses_packed_gate_then_up_order() {
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping SwiGLU conformance");
