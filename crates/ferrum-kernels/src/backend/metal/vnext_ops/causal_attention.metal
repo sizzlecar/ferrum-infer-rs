@@ -24,6 +24,7 @@ struct VNextCausalAttentionParams {
     uint kv_projection_stride;
     uint output_gate;
     uint rope_interleaved;
+    uint attention_simdgroups;
     float epsilon;
     float rope_theta;
 };
@@ -267,8 +268,10 @@ kernel void vnext_causal_attention_f16(
     device half *output [[buffer(2)]],
     device VNextKvPageTable& page_table [[buffer(3)]],
     constant VNextCausalAttentionParams& params [[buffer(4)]],
+    threadgroup float *shared [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_threadgroup]]) {
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
     const uint token = group.x;
     const uint query_head = group.y;
     if (token >= params.tokens || query_head >= params.query_heads ||
@@ -297,8 +300,8 @@ kernel void vnext_causal_attention_f16(
     float running_max = -INFINITY;
     float running_sum = 0.0f;
     const float attention_scale = rsqrt(float(params.head_dim));
-    for (uint key_position = 0; key_position <= absolute_position;
-         ++key_position) {
+    for (uint key_position = simdgroup; key_position <= absolute_position;
+         key_position += params.attention_simdgroups) {
         float partial_dot = 0.0f;
         for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
             const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
@@ -336,11 +339,62 @@ kernel void vnext_causal_attention_f16(
         running_max = next_max;
     }
 
-    const float inverse_sum = 1.0f / running_sum;
+    threadgroup float *partial_outputs = shared;
+    threadgroup float *partial_maxima =
+        partial_outputs + params.attention_simdgroups * params.head_dim;
+    threadgroup float *partial_sums =
+        partial_maxima + params.attention_simdgroups;
+    threadgroup float *partial_scales =
+        partial_sums + params.attention_simdgroups;
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
         if (dim < params.head_dim) {
-            float value = accumulated[chunk] * inverse_sum;
+            partial_outputs[simdgroup * params.head_dim + dim] =
+                accumulated[chunk];
+        }
+    }
+    if (lane == 0) {
+        partial_maxima[simdgroup] = running_max;
+        partial_sums[simdgroup] = running_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup == 0) {
+        const bool active = lane < params.attention_simdgroups;
+        const float local_maximum =
+            active ? partial_maxima[lane] : -INFINITY;
+        const float global_maximum = simd_max(local_maximum);
+        const float scale =
+            active && !isinf(local_maximum)
+                ? exp(local_maximum - global_maximum)
+                : 0.0f;
+        const float scaled_sum =
+            active ? partial_sums[lane] * scale : 0.0f;
+        const float global_sum = simd_sum(scaled_sum);
+        if (active) {
+            partial_scales[lane] = scale;
+        }
+        if (lane == 0) {
+            partial_sums[0] = global_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup != 0) {
+        return;
+    }
+    const float inverse_sum = 1.0f / partial_sums[0];
+    for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+        const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
+        if (dim < params.head_dim) {
+            float value = 0.0f;
+            for (uint partial = 0; partial < params.attention_simdgroups;
+                 ++partial) {
+                value += partial_outputs
+                             [partial * params.head_dim + dim] *
+                         partial_scales[partial];
+            }
+            value *= inverse_sum;
             if (params.output_gate != 0u) {
                 const ulong gate_index =
                     (ulong)token * (ulong)params.query_projection_stride +

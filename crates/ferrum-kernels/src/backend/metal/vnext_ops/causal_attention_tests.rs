@@ -136,6 +136,169 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
     );
 }
 
+#[test]
+fn parallel_attention_matches_cpu_at_head256_context81_on_real_metal() {
+    const REAL_HEAD_DIM: usize = 256;
+    const REAL_QUERY_HEADS: usize = 16;
+    const REAL_KV_HEADS: usize = 4;
+    const REAL_CONTEXT: usize = 81;
+    const REAL_QUERY_FEATURES: usize = REAL_QUERY_HEADS * REAL_HEAD_DIM;
+    const REAL_QUERY_PROJECTION_FEATURES: usize = 2 * REAL_QUERY_FEATURES;
+    const REAL_KV_FEATURES: usize = REAL_KV_HEADS * REAL_HEAD_DIM;
+
+    let Some(device) = Device::system_default() else {
+        eprintln!("no Metal device; skipping parallel causal-attention conformance");
+        return;
+    };
+    let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    let query = (0..REAL_QUERY_FEATURES)
+        .map(|index| f16::from_f32(((index as f32 * 0.013) + 0.3).sin() * 0.2))
+        .collect::<Vec<_>>();
+    let query_raw = (0..REAL_QUERY_PROJECTION_FEATURES)
+        .map(|index| f16::from_f32(((index as f32 * 0.017) + 0.7).cos() * 0.3))
+        .collect::<Vec<_>>();
+    let page_elements = VNEXT_KV_PAGE_BYTES as usize / std::mem::size_of::<f16>();
+    let state_elements = REAL_CONTEXT * 2 * REAL_KV_FEATURES;
+    let page_count = state_elements.div_ceil(page_elements);
+    let mut state = vec![f16::ZERO; page_count * page_elements];
+    for position in 0..REAL_CONTEXT {
+        for kind in 0..2 {
+            for head in 0..REAL_KV_HEADS {
+                for dim in 0..REAL_HEAD_DIM {
+                    let logical =
+                        (((position * 2 + kind) * REAL_KV_HEADS + head) * REAL_HEAD_DIM) + dim;
+                    let phase = logical as f32 * if kind == 0 { 0.0091 } else { 0.0117 };
+                    state[logical] = f16::from_f32(
+                        if kind == 0 {
+                            phase.cos()
+                        } else {
+                            (phase + 1.7).sin()
+                        } * 0.25,
+                    );
+                }
+            }
+        }
+    }
+    let pages = state
+        .chunks_exact(page_elements)
+        .map(|page| shared_buffer(&device, page))
+        .collect::<Vec<_>>();
+    let query_buffer = shared_buffer(&device, &query);
+    let query_raw_buffer = shared_buffer(&device, &query_raw);
+    let output = output_buffer::<f16>(&device, REAL_QUERY_FEATURES);
+    let argument_buffer = device.new_buffer(
+        pipelines.binding_slot_bytes().unwrap(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    let argument_encoder = pipelines.new_binding_encoder();
+    argument_encoder.set_argument_buffer(&argument_buffer, 0);
+    let page_refs = pages.iter().map(|page| &**page).collect::<Vec<_>>();
+    let page_offsets = vec![0; pages.len()];
+    argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+    let params = CausalAttentionParams {
+        page_elements: page_elements as u32,
+        page_count: page_count as u32,
+        position_start: (REAL_CONTEXT - 1) as u32,
+        tokens: 1,
+        query_heads: REAL_QUERY_HEADS as u32,
+        key_value_heads: REAL_KV_HEADS as u32,
+        head_dim: REAL_HEAD_DIM as u32,
+        rope_dim: REAL_HEAD_DIM as u32,
+        query_projection_stride: REAL_QUERY_PROJECTION_FEATURES as u32,
+        query_head_stride: (2 * REAL_HEAD_DIM) as u32,
+        kv_projection_stride: REAL_KV_FEATURES as u32,
+        output_gate: 1,
+        rope_interleaved: 0,
+        attention_simdgroups: pipelines.attention_simdgroups_for_context(REAL_CONTEXT as u64),
+        epsilon: 1.0e-6,
+        rope_theta: 10_000.0,
+    };
+
+    let command = queue.new_command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipelines.attention);
+    set_raw(encoder, 0, &query_buffer);
+    set_raw(encoder, 1, &query_raw_buffer);
+    set_raw(encoder, 2, &output);
+    encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
+    set_raw_params(encoder, 4, &params);
+    use_raw_pages(encoder, &pages);
+    encoder.set_threadgroup_memory_length(0, attention_threadgroup_memory_bytes(&params));
+    encoder.dispatch_thread_groups(
+        MTLSize::new(1, REAL_QUERY_HEADS as u64, 1),
+        MTLSize::new(
+            SIMD_THREADS,
+            u64::from(pipelines.attention_simdgroups_for_context(REAL_CONTEXT as u64)),
+            1,
+        ),
+    );
+    encoder.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+    assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+    let expected = cpu_paged_attention_head256_context81(&query, &query_raw, &state);
+    let actual = read_f16(&output, REAL_QUERY_FEATURES);
+    // The reviewed catalog test above remains the formal operation contract.
+    assert_close(
+        "parallel head256/context81 causal output",
+        &actual,
+        &expected,
+        0.006,
+    );
+}
+
+fn cpu_paged_attention_head256_context81(
+    query: &[f16],
+    query_raw: &[f16],
+    state: &[f16],
+) -> Vec<f32> {
+    const HEAD_DIM: usize = 256;
+    const QUERY_HEADS: usize = 16;
+    const KV_HEADS: usize = 4;
+    const CONTEXT: usize = 81;
+    let mut output = vec![0.0_f32; QUERY_HEADS * HEAD_DIM];
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    for query_head in 0..QUERY_HEADS {
+        let kv_head = query_head / (QUERY_HEADS / KV_HEADS);
+        let mut scores = (0..CONTEXT)
+            .map(|position| {
+                let key = ((position * 2) * KV_HEADS + kv_head) * HEAD_DIM;
+                (0..HEAD_DIM)
+                    .map(|dim| {
+                        f32::from(query[query_head * HEAD_DIM + dim]) * f32::from(state[key + dim])
+                    })
+                    .sum::<f32>()
+                    * scale
+            })
+            .collect::<Vec<_>>();
+        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denominator = scores
+            .iter_mut()
+            .map(|score| {
+                *score = (*score - maximum).exp();
+                *score
+            })
+            .sum::<f32>();
+        for dim in 0..HEAD_DIM {
+            let context = scores
+                .iter()
+                .enumerate()
+                .map(|(position, score)| {
+                    let value = (((position * 2 + 1) * KV_HEADS + kv_head) * HEAD_DIM) + dim;
+                    score * f32::from(state[value])
+                })
+                .sum::<f32>()
+                / denominator;
+            let gate_index = query_head * 2 * HEAD_DIM + HEAD_DIM + dim;
+            let gate = 1.0 / (1.0 + (-f32::from(query_raw[gate_index])).exp());
+            output[query_head * HEAD_DIM + dim] = context * gate;
+        }
+    }
+    output
+}
+
 fn read_pages(pages: &[Buffer]) -> Vec<f32> {
     pages
         .iter()
@@ -189,6 +352,8 @@ fn run_segment(
         kv_projection_stride: KV_FEATURES as u32,
         output_gate: 1,
         rope_interleaved: 0,
+        attention_simdgroups: pipelines
+            .attention_simdgroups_for_context((position_start + tokens) as u64),
         epsilon: 1.0e-6,
         rope_theta: 10_000.0,
     };
@@ -240,9 +405,14 @@ fn run_segment(
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, &params);
     use_raw_pages(encoder, pages);
+    encoder.set_threadgroup_memory_length(0, attention_threadgroup_memory_bytes(&params));
     encoder.dispatch_thread_groups(
         MTLSize::new(tokens as u64, QUERY_HEADS as u64, 1),
-        MTLSize::new(SIMD_THREADS, 1, 1),
+        MTLSize::new(
+            SIMD_THREADS,
+            u64::from(pipelines.attention_simdgroups_for_context((position_start + tokens) as u64)),
+            1,
+        ),
     );
     encoder.end_encoding();
     command.commit();
