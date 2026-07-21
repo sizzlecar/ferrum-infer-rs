@@ -7,10 +7,10 @@ use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
 use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
-        ExecutorCapabilities, ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
-        ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
-        ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
-        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorBatchPrefillOutcome, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
+        ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
+        ExecutorExecutionCapacityPreemptionAuthority, ExecutorExecutionCapacityPreemptionReceipt,
+        ExecutorExecutionCapacityStage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
         ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
@@ -28,8 +28,13 @@ struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
+    maintenance_gated: bool,
+    available_admissions: AtomicU64,
+    capacity_epoch: AtomicU64,
     admission_probes: AtomicU64,
+    maintenance_calls: AtomicU64,
     prefill_calls: AtomicU64,
+    batch_prefill_calls: AtomicU64,
 }
 
 struct PlanRuntimeChunkedPrefillTestExecutor {
@@ -488,9 +493,50 @@ impl PlanRuntimeAdmissionTestExecutor {
             inner: MockModelExecutor::instant(vocab_size),
             retained: std::sync::Mutex::new(HashSet::new()),
             completions: std::sync::Mutex::new(Vec::new()),
+            maintenance_gated: false,
+            available_admissions: AtomicU64::new(0),
+            capacity_epoch: AtomicU64::new(0),
             admission_probes: AtomicU64::new(0),
+            maintenance_calls: AtomicU64::new(0),
             prefill_calls: AtomicU64::new(0),
+            batch_prefill_calls: AtomicU64::new(0),
         }
+    }
+
+    fn new_with_serial_backing_growth(vocab_size: usize) -> Self {
+        Self {
+            maintenance_gated: true,
+            ..Self::new(vocab_size)
+        }
+    }
+
+    fn new_with_prefill_latency(vocab_size: usize, latency: Duration) -> Self {
+        Self {
+            inner: MockModelExecutor::new(vocab_size, latency, Duration::ZERO),
+            ..Self::new(vocab_size)
+        }
+    }
+
+    fn capacity_epochs(&self) -> ExecutorAdmissionEpochs {
+        ExecutorAdmissionEpochs::new(
+            std::num::NonZeroU64::new(41).unwrap(),
+            0,
+            self.capacity_epoch.load(Ordering::Acquire),
+        )
+    }
+
+    fn capacity_wait_condition(&self) -> ferrum_interfaces::vnext::CapacityWaitCondition {
+        ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+            41,
+            vec![ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
+                ferrum_interfaces::vnext::CapacityAvailabilitySource::Domain(
+                    ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
+                ),
+                self.capacity_epoch.load(Ordering::Acquire) + 1,
+            )
+            .unwrap()],
+        )
+        .unwrap()
     }
 }
 
@@ -509,11 +555,16 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
     }
 
     fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
-        Ok(Some(ExecutorAdmissionEpochs::new(
-            std::num::NonZeroU64::new(41).unwrap(),
-            0,
-            0,
-        )))
+        Ok(Some(self.capacity_epochs()))
+    }
+
+    fn write_execution_capacity_snapshot(
+        &self,
+        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        availability.clear();
+        availability.extend_from_slice(self.capacity_wait_condition().observed());
+        Ok(Some(self.capacity_epochs()))
     }
 
     fn try_admit_prefill(
@@ -529,6 +580,32 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         if !inserted {
             return Err(FerrumError::already_exists("duplicate test admission"));
         }
+        if self.maintenance_gated
+            && self
+                .available_admissions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                    (available > 0).then(|| available - 1)
+                })
+                .is_err()
+        {
+            return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
+                ExecutorPrefillMaintenanceDeferral::new(
+                    input.request_id.clone(),
+                    self.capacity_epochs(),
+                    self.capacity_wait_condition(),
+                    ExecutorPrefillMaintenanceStage::PhysicalBacking,
+                    vec![ExecutorPrefillMaintenanceBlocker::Capacity {
+                        domain_id: Some(1),
+                        kind:
+                            ferrum_interfaces::vnext::CapacityShortfallKind::BackingGrowthRequired,
+                        requested: 4096,
+                        available: 0,
+                        current_total: 0,
+                        maximum_total: 8192,
+                    }],
+                )?,
+            ));
+        }
         Ok(ExecutorPrefillAdmissionDecision::Admitted(
             ExecutorPrefillAdmissionReceipt {
                 request_id: input.request_id.clone(),
@@ -541,6 +618,41 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
             .lock()
             .expect("retained admission mutex poisoned")
             .remove(request_id)
+    }
+
+    fn maintain_prefill_backing(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<ExecutorPrefillMaintenanceOutcome> {
+        if !self
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .remove(request_id)
+        {
+            return Ok(ExecutorPrefillMaintenanceOutcome::NoLongerPending);
+        }
+        self.maintenance_calls.fetch_add(1, Ordering::Relaxed);
+        if self
+            .available_admissions
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.capacity_epoch.fetch_add(1, Ordering::AcqRel);
+            Ok(ExecutorPrefillMaintenanceOutcome::Maintained {
+                current: self.capacity_epochs(),
+                pools_grown: 1,
+                allocated_bytes: 4096,
+                pools_reclaimed: 0,
+                chunks_reclaimed: 0,
+                reclaimed_bytes: 0,
+                rebalance: None,
+            })
+        } else {
+            Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
+                current: self.capacity_epochs(),
+            })
+        }
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
@@ -560,6 +672,36 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         }
         self.prefill_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.prefill(input).await
+    }
+
+    async fn batch_prefill_with_capacity(
+        &self,
+        inputs: &[PrefillInput],
+    ) -> Result<ExecutorBatchPrefillOutcome> {
+        self.batch_prefill_calls.fetch_add(1, Ordering::Relaxed);
+        let mut completions = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let request_id = input
+                .request_id
+                .as_ref()
+                .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
+            if !self
+                .retained
+                .lock()
+                .expect("retained admission mutex poisoned")
+                .remove(request_id)
+            {
+                return Err(FerrumError::internal(
+                    "test batch prefill reached submit without retained admission",
+                ));
+            }
+            let chunk = input
+                .chunk
+                .ok_or_else(|| FerrumError::request_validation("missing typed prefill chunk"))?;
+            let output = self.inner.prefill(input).await?;
+            completions.push(ExecutorPrefillCompletion::exact(output, chunk));
+        }
+        Ok(ExecutorBatchPrefillOutcome::Completed(completions))
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -3703,6 +3845,201 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     let trace = scheduler.trace_snapshot();
     assert_eq!(trace.legacy_waiting_admission_ticks, 0);
     assert!(trace.dynamic_admission_ticks >= 1);
+}
+
+#[tokio::test]
+async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 2;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(128, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+
+    let mut request_ids = Vec::new();
+    for prompt in ["test", "ok"] {
+        let mut request = policy_request();
+        request.prompt = prompt.to_string();
+        request.sampling_params.max_tokens = 2;
+        request
+            .metadata
+            .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
+        scheduler.submit(request.clone()).await.unwrap();
+        let tokens = tokenizer.encode(&request.prompt, true).unwrap();
+        let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request.clone(),
+            tokens.clone(),
+            Some(Arc::clone(&tokenizer)),
+            Some(128),
+        );
+        executor
+            .try_admit_prefill(ExecutorPrefillAdmission::new(
+                &request.id,
+                &tokens,
+                sequence.model_maximum_sequence_tokens(),
+            ))
+            .unwrap();
+        request_ids.push(request.id.clone());
+        engine
+            .inner
+            .sequences
+            .write()
+            .insert(request.id.clone(), sequence);
+    }
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("two admitted prefills should form one scheduler cohort");
+    assert_eq!(batch.requests.len(), 2);
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+    assert!(executor
+        .retained
+        .lock()
+        .expect("retained admission mutex poisoned")
+        .is_empty());
+    let sequences = engine.inner.sequences.read();
+    for request_id in request_ids {
+        let sequence = sequences.get(&request_id).expect("prefilled sequence");
+        assert!(sequence.prefill_complete);
+        assert_eq!(sequence.generated_tokens.len(), 1);
+        assert!(sequence.model_cache_id().is_some());
+    }
+}
+
+#[tokio::test]
+async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 2;
+    config.scheduler.prefill_first_until_active = Some(2);
+    config.batching.max_batch_size = 2;
+    config.batching.max_num_batched_tokens = 16;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(128, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_serial_backing_growth(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+
+    for prompt in ["test", "ok"] {
+        let mut request = policy_request();
+        request.prompt = prompt.to_string();
+        request.sampling_params.max_tokens = 2;
+        request
+            .metadata
+            .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
+        scheduler.submit(request.clone()).await.unwrap();
+        let tokens = tokenizer.encode(&request.prompt, true).unwrap();
+        engine.inner.sequences.write().insert(
+            request.id.clone(),
+            SequenceState::new_with_tokenizer_and_model_vocab_size(
+                request,
+                tokens,
+                Some(Arc::clone(&tokenizer)),
+                Some(128),
+            ),
+        );
+    }
+
+    engine.inner.run_iteration().await.unwrap();
+
+    assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+    assert!(executor
+        .retained
+        .lock()
+        .expect("retained admission mutex poisoned")
+        .is_empty());
+    assert_eq!(scheduler.prefilling_count(), 0);
+    assert_eq!(scheduler.decoding_count(), 2);
+}
+
+#[tokio::test]
+async fn request_publication_lock_is_released_during_device_execution() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 2;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(128, &[("test", 5)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_prefill_latency(
+        128,
+        Duration::from_millis(100),
+    ));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    request
+        .metadata
+        .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
+    scheduler.submit(request.clone()).await.unwrap();
+    let tokens = tokenizer.encode(&request.prompt, true).unwrap();
+    engine.inner.sequences.write().insert(
+        request.id.clone(),
+        SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request,
+            tokens,
+            Some(tokenizer),
+            Some(128),
+        ),
+    );
+
+    let inner = Arc::clone(&engine.inner);
+    let iteration = tokio::spawn(async move { inner.run_iteration().await });
+    tokio::time::timeout(Duration::from_millis(50), async {
+        while executor.prefill_calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("test prefill must enter device execution");
+
+    let publication_guard = tokio::time::timeout(
+        Duration::from_millis(20),
+        engine.inner.iteration_lock.lock(),
+    )
+    .await
+    .expect("request publication must not wait for the device wave");
+    drop(publication_guard);
+    iteration.await.unwrap().unwrap();
 }
 
 #[tokio::test]

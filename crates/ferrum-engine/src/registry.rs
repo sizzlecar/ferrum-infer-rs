@@ -2280,6 +2280,7 @@ mod tests {
             device: Device::CPU,
             component_options: options,
             model_sources: None,
+            prepared_model: None,
         };
 
         assert_eq!(

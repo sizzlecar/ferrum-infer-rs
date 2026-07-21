@@ -16,14 +16,15 @@ use std::time::{Duration, Instant};
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
-    ExecutorBatchDecodeOutcome, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
-    ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
-    ExecutorExecutionCapacityPreemptionAuthority, ExecutorExecutionCapacityPreemptionReceipt,
-    ExecutorExecutionCapacityStage, ExecutorMemoryUsage, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
-    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
-    ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, MemoryRequirements,
-    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
+    ExecutorBatchDecodeOutcome, ExecutorBatchPrefillOutcome, ExecutorCapabilities,
+    ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
+    ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
+    ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
+    ExecutorMemoryUsage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+    ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
+    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorSequenceCompletion,
+    ExecutorState, ExecutorStatus, MemoryRequirements, PlanRuntimeResourceSnapshot, PrefillChunk,
+    PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -1546,6 +1547,15 @@ struct VNextDecodeCandidate<R: DeviceRuntime> {
     next_token: u32,
 }
 
+struct VNextPrefillCandidate<R: DeviceRuntime> {
+    original_index: usize,
+    slot: Arc<VNextPrefillSlot<R>>,
+    sequence: Arc<VNextSequence<R>>,
+    tokens: Vec<u32>,
+    maximum_tokens: usize,
+    planned_chunk: PrefillChunk,
+}
+
 impl<R: DeviceRuntime> VNextSequence<R> {
     fn preempt_for_recompute(&self) -> Result<()> {
         if !self.active.load(Ordering::Acquire) {
@@ -1957,6 +1967,63 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         Ok((slot, sequence))
     }
 
+    fn begin_prefill_batch_execution(
+        &mut self,
+        request_ids: &[RequestId],
+    ) -> Result<Vec<(Arc<VNextPrefillSlot<R>>, Arc<VNextSequence<R>>)>> {
+        let mut prepared = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            if prepared.iter().any(
+                |(slot, _): &(Arc<VNextPrefillSlot<R>>, Arc<VNextSequence<R>>)| {
+                    slot.request_id == *request_id
+                },
+            ) {
+                return Err(FerrumError::request_validation(
+                    "vNext batch prefill inputs contain a duplicate request",
+                ));
+            }
+            let slot = self.prefills.get(request_id).cloned().ok_or_else(|| {
+                FerrumError::request_validation(format!(
+                    "vNext prefill for `{request_id}` has no retained admission authority"
+                ))
+            })?;
+            if slot.cancelled.load(Ordering::Acquire) {
+                return Err(FerrumError::cancelled(format!(
+                    "vNext prefill admission for `{request_id}` is no longer active"
+                )));
+            }
+            let sequence = match &*slot.state.lock() {
+                VNextPrefillSlotState::Ready(sequence) => Arc::clone(sequence),
+                _ => {
+                    return Err(FerrumError::request_validation(format!(
+                        "vNext prefill for `{request_id}` is not ready for batch execution"
+                    )))
+                }
+            };
+            prepared.push((slot, sequence));
+        }
+
+        let mut states = prepared
+            .iter()
+            .map(|(slot, _)| slot.state.lock())
+            .collect::<Vec<_>>();
+        if states.iter().zip(&prepared).any(|(state, (_, sequence))| {
+            !matches!(
+                &**state,
+                VNextPrefillSlotState::Ready(current) if Arc::ptr_eq(current, sequence)
+            )
+        }) {
+            return Err(FerrumError::internal(
+                "vNext prefill authorities changed during atomic batch acquisition",
+            ));
+        }
+        for (state, (_, sequence)) in states.iter_mut().zip(&prepared) {
+            **state = VNextPrefillSlotState::Executing(Arc::clone(sequence));
+        }
+        drop(states);
+        Ok(prepared)
+    }
+
     fn activate(
         &mut self,
         slot: &Arc<VNextPrefillSlot<R>>,
@@ -2023,6 +2090,79 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             )));
         }
         *state = VNextPrefillSlotState::Ready(Arc::clone(sequence));
+        Ok(())
+    }
+
+    fn restore_prefill_batch_ready(
+        &mut self,
+        executions: &[(&Arc<VNextPrefillSlot<R>>, &Arc<VNextSequence<R>>)],
+    ) -> Result<()> {
+        for (slot, sequence) in executions {
+            if slot.cancelled.load(Ordering::Acquire)
+                || !self
+                    .prefills
+                    .get(&slot.request_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, slot))
+                || !matches!(
+                    &*slot.state.lock(),
+                    VNextPrefillSlotState::Executing(current) if Arc::ptr_eq(current, sequence)
+                )
+            {
+                return Err(FerrumError::cancelled(format!(
+                    "vNext batch prefill for `{}` lost its retained authority",
+                    slot.request_id
+                )));
+            }
+        }
+        for (slot, sequence) in executions {
+            *slot.state.lock() = VNextPrefillSlotState::Ready(Arc::clone(sequence));
+        }
+        Ok(())
+    }
+
+    fn commit_prefill_batch_execution(
+        &mut self,
+        executions: &[(&Arc<VNextPrefillSlot<R>>, &Arc<VNextSequence<R>>, bool)],
+    ) -> Result<()> {
+        for (index, (slot, sequence, final_chunk)) in executions.iter().enumerate() {
+            if slot.cancelled.load(Ordering::Acquire)
+                || !self
+                    .prefills
+                    .get(&slot.request_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, slot))
+                || !matches!(
+                    &*slot.state.lock(),
+                    VNextPrefillSlotState::Executing(current) if Arc::ptr_eq(current, sequence)
+                )
+            {
+                return Err(FerrumError::cancelled(format!(
+                    "vNext batch prefill for `{}` lost its retained authority",
+                    slot.request_id
+                )));
+            }
+            if *final_chunk
+                && (self.active.contains_key(&sequence.cache_id)
+                    || executions[..index].iter().any(|(_, prior, prior_final)| {
+                        *prior_final && prior.cache_id == sequence.cache_id
+                    }))
+            {
+                return Err(FerrumError::already_exists(format!(
+                    "vNext cache `{}` raced with another batch prefill",
+                    sequence.cache_id
+                )));
+            }
+        }
+
+        for (slot, sequence, final_chunk) in executions {
+            if *final_chunk {
+                *slot.state.lock() = VNextPrefillSlotState::Terminal;
+                self.prefills.remove(&slot.request_id);
+                self.active
+                    .insert(sequence.cache_id.clone(), Arc::clone(sequence));
+            } else {
+                *slot.state.lock() = VNextPrefillSlotState::Ready(Arc::clone(sequence));
+            }
+        }
         Ok(())
     }
 
@@ -4902,6 +5042,351 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ))
     }
 
+    async fn execute_prefill_batch_with_capacity(
+        &self,
+        inputs: &[PrefillInput],
+    ) -> Result<ExecutorBatchPrefillOutcome> {
+        if inputs.is_empty() {
+            return Ok(ExecutorBatchPrefillOutcome::Completed(Vec::new()));
+        }
+        let started = Instant::now();
+        let mut parsed = Vec::with_capacity(inputs.len());
+        for (original_index, input) in inputs.iter().enumerate() {
+            if input.batch_size() != 1 {
+                return Err(FerrumError::unsupported(
+                    "each vNext batch-prefill input must contain exactly one sequence",
+                ));
+            }
+            let request_id = input.request_id.clone().ok_or_else(|| {
+                FerrumError::request_validation(
+                    "plan-runtime vNext batch prefill requires a typed request_id",
+                )
+            })?;
+            let tokens = common::tensor_to_tokens(&input.input_ids)?;
+            let maximum_tokens = input.maximum_sequence_tokens.ok_or_else(|| {
+                FerrumError::request_validation(
+                    "plan-runtime vNext batch prefill requires maximum_sequence_tokens",
+                )
+            })?;
+            if maximum_tokens < tokens.len() || maximum_tokens > self.maximum_model_tokens {
+                return Err(FerrumError::request_validation(format!(
+                    "request sequence ceiling {maximum_tokens} must cover prompt {} and not exceed {}",
+                    tokens.len(),
+                    self.maximum_model_tokens
+                )));
+            }
+            let planned_chunk = match input.chunk {
+                Some(chunk) => chunk,
+                None => PrefillChunk::new(0, tokens.len(), tokens.len())?,
+            };
+            if planned_chunk.total_prompt_tokens() != tokens.len() {
+                return Err(FerrumError::request_validation(format!(
+                    "vNext batch prefill chunk declares {} prompt tokens for input length {}",
+                    planned_chunk.total_prompt_tokens(),
+                    tokens.len()
+                )));
+            }
+            parsed.push((
+                original_index,
+                request_id,
+                tokens,
+                maximum_tokens,
+                planned_chunk,
+            ));
+        }
+
+        let request_ids = parsed
+            .iter()
+            .map(|(_, request_id, _, _, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        let executions = self
+            .sequences
+            .lock()
+            .begin_prefill_batch_execution(&request_ids)?;
+        let candidates = parsed
+            .into_iter()
+            .zip(executions)
+            .map(
+                |(
+                    (original_index, _request_id, tokens, maximum_tokens, planned_chunk),
+                    (slot, sequence),
+                )| {
+                    VNextPrefillCandidate {
+                        original_index,
+                        slot,
+                        sequence,
+                        tokens,
+                        maximum_tokens,
+                        planned_chunk,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut execution_guards = candidates
+            .iter()
+            .map(|candidate| {
+                VNextPrefillExecutionGuard::new(
+                    &self.sequences,
+                    Arc::clone(&candidate.slot),
+                    Arc::clone(&candidate.sequence),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let batch = ExecutionBatchParticipants::new(
+            candidates
+                .iter()
+                .map(|candidate| Arc::clone(&candidate.sequence.session))
+                .collect(),
+        )
+        .map_err(|error| FerrumError::request_validation(error.to_string()))?;
+        let mut candidates_by_authority = BTreeMap::new();
+        for candidate in candidates {
+            let authority = candidate.sequence.session.sequence_authority();
+            if candidates_by_authority
+                .insert(authority, candidate)
+                .is_some()
+            {
+                return Err(FerrumError::request_validation(
+                    "vNext batch-prefill inputs contain a duplicate sequence",
+                ));
+            }
+        }
+        let candidates = batch
+            .sessions()
+            .iter()
+            .map(|session| {
+                candidates_by_authority
+                    .remove(&session.sequence_authority())
+                    .ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext canonical prefill participant is absent from its input batch",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !candidates_by_authority.is_empty() {
+            return Err(FerrumError::internal(
+                "vNext prefill input is absent from its canonical participant batch",
+            ));
+        }
+
+        let mut operation_guards = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            operation_guards.push(candidate.sequence.operation.lock().await);
+            if candidate.sequence.request_id != candidate.slot.request_id
+                || candidate.sequence.maximum_tokens != candidate.maximum_tokens
+                || *candidate.sequence.tokens.lock() != candidate.tokens
+            {
+                return Err(FerrumError::request_validation(format!(
+                    "vNext batch prefill input for `{}` differs from its admitted work",
+                    candidate.slot.request_id
+                )));
+            }
+            let processed = candidate
+                .sequence
+                .prefill_tokens_processed
+                .load(Ordering::Acquire);
+            if processed != candidate.planned_chunk.tokens_processed() {
+                return Err(FerrumError::request_validation(format!(
+                    "vNext batch prefill chunk for `{}` starts at {}, expected {processed}",
+                    candidate.slot.request_id,
+                    candidate.planned_chunk.tokens_processed()
+                )));
+            }
+        }
+
+        let token_batches = candidates
+            .iter()
+            .map(|candidate| candidate.tokens.clone())
+            .collect::<Vec<_>>();
+        let sequences = candidates
+            .iter()
+            .map(|candidate| Arc::clone(&candidate.sequence))
+            .collect::<Vec<_>>();
+        let mut completed_chunks = candidates
+            .iter()
+            .map(|candidate| candidate.planned_chunk)
+            .collect::<Vec<_>>();
+        let mut capacity_probe_counts = vec![0_u32; candidates.len()];
+
+        let logits = 'capacity: loop {
+            for (index, candidate) in candidates.iter().enumerate() {
+                let completed_chunk = completed_chunks[index];
+                let extension_tokens = &candidate.tokens[..completed_chunk.end()];
+                let extension_span =
+                    TokenSpanWork::from_token_ids(extension_tokens, 0..extension_tokens.len())
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
+                let extension = ResourceWorkShape::single(extension_span)
+                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+                if let VNextExecutionCapacityDecision::Deferred(deferred) =
+                    self.extend_sequence_with_capacity(&candidate.sequence, extension)?
+                {
+                    if let Some(next_tokens) =
+                        deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                    {
+                        capacity_probe_counts[index] =
+                            capacity_probe_counts[index].checked_add(1).ok_or_else(|| {
+                                FerrumError::internal(
+                                    "vNext batch prefill capacity probe count overflow",
+                                )
+                            })?;
+                        self.metrics
+                            .prefill_frontier_narrowings
+                            .fetch_add(1, Ordering::Relaxed);
+                        completed_chunks[index] = PrefillChunk::new(
+                            completed_chunk.tokens_processed(),
+                            next_tokens,
+                            completed_chunk.total_prompt_tokens(),
+                        )?;
+                        continue 'capacity;
+                    }
+                    let authority = candidates
+                        .iter()
+                        .map(|candidate| (&candidate.slot, &candidate.sequence))
+                        .collect::<Vec<_>>();
+                    self.sequences
+                        .lock()
+                        .restore_prefill_batch_ready(&authority)?;
+                    for guard in &mut execution_guards {
+                        guard.disarm();
+                    }
+                    return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(deferred));
+                }
+            }
+
+            let spans = candidates
+                .iter()
+                .zip(&completed_chunks)
+                .map(|(candidate, completed_chunk)| {
+                    TokenSpanWork::from_token_ids(&candidate.tokens, completed_chunk.range())
+                        .map_err(|error| FerrumError::backend(error.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            match self
+                .execute_batch_step(
+                    &batch,
+                    &sequences,
+                    &token_batches,
+                    &spans,
+                    VNextExecutionWaveKind::Prefill,
+                )
+                .await?
+            {
+                VNextExecutionCapacityDecision::Ready(logits) => break logits,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    let mut narrowed = false;
+                    for (index, completed_chunk) in completed_chunks.iter_mut().enumerate() {
+                        let Some(next_tokens) =
+                            deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                        else {
+                            continue;
+                        };
+                        capacity_probe_counts[index] =
+                            capacity_probe_counts[index].checked_add(1).ok_or_else(|| {
+                                FerrumError::internal(
+                                    "vNext batch prefill capacity probe count overflow",
+                                )
+                            })?;
+                        self.metrics
+                            .prefill_frontier_narrowings
+                            .fetch_add(1, Ordering::Relaxed);
+                        *completed_chunk = PrefillChunk::new(
+                            completed_chunk.tokens_processed(),
+                            next_tokens,
+                            completed_chunk.total_prompt_tokens(),
+                        )?;
+                        narrowed = true;
+                    }
+                    if narrowed {
+                        continue 'capacity;
+                    }
+                    let authority = candidates
+                        .iter()
+                        .map(|candidate| (&candidate.slot, &candidate.sequence))
+                        .collect::<Vec<_>>();
+                    self.sequences
+                        .lock()
+                        .restore_prefill_batch_ready(&authority)?;
+                    for guard in &mut execution_guards {
+                        guard.disarm();
+                    }
+                    return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(deferred));
+                }
+            }
+        };
+        if logits.len() != candidates.len() {
+            return Err(FerrumError::internal(format!(
+                "vNext batch prefill returned {} logits rows for {} participants",
+                logits.len(),
+                candidates.len()
+            )));
+        }
+
+        let mut ordered = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        for (((candidate, completed_chunk), capacity_probe_count), logits) in candidates
+            .iter()
+            .zip(&completed_chunks)
+            .zip(&capacity_probe_counts)
+            .zip(logits)
+        {
+            let logits = self.prefill_tensor(logits)?;
+            let cache = self.cache_handle(&candidate.sequence, completed_chunk.end());
+            ordered[candidate.original_index] = Some(ExecutorPrefillCompletion::new(
+                PrefillOutput::new(logits, cache),
+                candidate.planned_chunk,
+                *completed_chunk,
+                *capacity_probe_count,
+            )?);
+        }
+        let outputs = ordered
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    FerrumError::internal(
+                        "vNext batch prefill lost the original participant ordering",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let authority = candidates
+            .iter()
+            .zip(&completed_chunks)
+            .map(|(candidate, completed_chunk)| {
+                (
+                    &candidate.slot,
+                    &candidate.sequence,
+                    completed_chunk.is_final(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (candidate, completed_chunk) in candidates.iter().zip(&completed_chunks) {
+            candidate
+                .sequence
+                .prefill_tokens_processed
+                .store(completed_chunk.end(), Ordering::Release);
+        }
+        self.sequences
+            .lock()
+            .commit_prefill_batch_execution(&authority)?;
+        for guard in &mut execution_guards {
+            guard.disarm();
+        }
+
+        let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
+        self.metrics
+            .prefill_operations
+            .fetch_add(participant_count, Ordering::Relaxed);
+        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.metrics.total_prefill_us.fetch_add(
+            elapsed_us.saturating_mul(participant_count),
+            Ordering::Relaxed,
+        );
+        drop(operation_guards);
+        Ok(ExecutorBatchPrefillOutcome::Completed(outputs))
+    }
+
     fn metrics_snapshot(&self) -> serde_json::Value {
         let pool_status = self
             .plan_resources
@@ -5349,7 +5834,28 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        futures::future::try_join_all(inputs.iter().map(|input| self.prefill(input))).await
+        match self.execute_prefill_batch_with_capacity(inputs).await? {
+            ExecutorBatchPrefillOutcome::Completed(completions) => completions
+                .into_iter()
+                .map(|completion| {
+                    let (output, _, _, _) = completion.into_parts();
+                    Ok(output)
+                })
+                .collect(),
+            ExecutorBatchPrefillOutcome::NotSubmitted(deferred) => {
+                Err(Self::execution_capacity_error(&deferred))
+            }
+            ExecutorBatchPrefillOutcome::Unsupported => Err(FerrumError::internal(
+                "vNext batch prefill returned its own unsupported marker",
+            )),
+        }
+    }
+
+    async fn batch_prefill_with_capacity(
+        &self,
+        inputs: &[PrefillInput],
+    ) -> Result<ExecutorBatchPrefillOutcome> {
+        self.execute_prefill_batch_with_capacity(inputs).await
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {

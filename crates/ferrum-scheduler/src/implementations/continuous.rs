@@ -1041,6 +1041,7 @@ impl ContinuousBatchScheduler {
 
     fn admit_waiting_dynamically(
         &self,
+        maximum_probes: usize,
         maximum_admissions: usize,
         waiting_admission: &mut WaitingAdmissionMode<'_>,
     ) -> Result<AdmissionTickReceipt> {
@@ -1057,7 +1058,7 @@ impl ContinuousBatchScheduler {
         let wake = *wake;
         self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
         let mut waiting = self.waiting_queue.write();
-        let maximum_probes = waiting.len();
+        let maximum_probes = waiting.len().min(maximum_probes);
         let mut events = self.dynamic_admission_events.lock();
         let observer = std::cell::RefCell::new(observer);
         let receipt = waiting
@@ -1280,6 +1281,83 @@ impl ContinuousBatchScheduler {
                 observer: Some(observer),
             },
         )
+    }
+
+    /// Retain dynamically admitted work without constructing an execution
+    /// batch. The engine uses this bounded phase to converge backing growth
+    /// for a fill-first cohort before any participant is submitted. Capacity
+    /// and pressure limits remain scheduler-owned, so preparing a cohort can
+    /// never reserve more request authorities than a normal admission tick.
+    pub fn prepare_dynamic_admission_observed(
+        &self,
+        maximum_admissions: usize,
+        wake: AdmissionWakeSnapshot<'_>,
+        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+    ) -> Result<AdmissionTickReceipt> {
+        let active_capacity = self
+            .config
+            .max_running_requests
+            .saturating_sub(self.active_count());
+        let decode_capacity = self
+            .cb_config
+            .max_decode_batch
+            .saturating_sub(self.decoding_count());
+        let available_slots = active_capacity.min(decode_capacity);
+        let available_slots = self
+            .capacity_backpressure_admit_limit()
+            .map(|limit| available_slots.min(limit))
+            .unwrap_or(available_slots)
+            .min(maximum_admissions);
+        let mut mode = WaitingAdmissionMode::Dynamic {
+            wake,
+            probe,
+            observer: Some(observer),
+        };
+        self.admit_waiting_dynamically(available_slots, available_slots, &mut mode)
+    }
+
+    /// Maximum waiting-prefix width that can join the next fill-first prefill
+    /// batch without exceeding its typed request or token budget. Existing
+    /// admitted prefills consume the budget first; a waiting request that does
+    /// not fit seals the fair prefix instead of reserving unused authority.
+    pub fn fill_first_dynamic_admission_limit(&self, hint: &BatchHint, target: usize) -> usize {
+        let mut remaining_tokens = hint.max_tokens;
+        let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
+        let prefill_queue = self.prefill_queue.read();
+        for request in prefill_queue.iter().take(hint.max_batch_size) {
+            let tokens =
+                self.prefill_budget_tokens(request, None, prefill_step_chunk, remaining_tokens);
+            if tokens == 0 || tokens > remaining_tokens {
+                return 0;
+            }
+            remaining_tokens -= tokens;
+        }
+        drop(prefill_queue);
+
+        let mut limit = target
+            .saturating_sub(self.active_count())
+            .min(hint.max_batch_size);
+        if limit == 0 || remaining_tokens == 0 {
+            return 0;
+        }
+        let waiting = self.waiting_queue.read();
+        let mut admitted_tokens = 0usize;
+        let mut admitted = 0usize;
+        for request in waiting.iter() {
+            if admitted >= limit {
+                break;
+            }
+            let available = remaining_tokens.saturating_sub(admitted_tokens);
+            let tokens = self.prefill_budget_tokens(request, None, prefill_step_chunk, available);
+            if tokens == 0 || tokens > available {
+                break;
+            }
+            admitted_tokens += tokens;
+            admitted += 1;
+        }
+        limit = limit.min(admitted);
+        limit
     }
 
     fn capacity_backpressure_admit_limit(&self) -> Option<usize> {
@@ -2823,7 +2901,7 @@ impl ContinuousBatchScheduler {
                 self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
             }
         } else {
-            self.admit_waiting_dynamically(available_slots, &mut waiting_admission)?;
+            self.admit_waiting_dynamically(usize::MAX, available_slots, &mut waiting_admission)?;
         }
 
         // vLLM's scheduler spends the remaining per-step token budget on
