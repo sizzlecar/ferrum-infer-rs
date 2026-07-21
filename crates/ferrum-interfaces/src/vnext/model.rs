@@ -2023,12 +2023,82 @@ impl CanonicalRational {
         })
     }
 
+    /// Parses a finite base-10 decimal or scientific-notation value without
+    /// routing through binary floating point.
+    pub fn from_decimal_str(raw: &str) -> Result<Self, VNextError> {
+        let normalized = raw.to_ascii_lowercase();
+        let (mantissa, exponent) = match normalized.split_once('e') {
+            Some((mantissa, exponent)) => (
+                mantissa,
+                exponent.parse::<i32>().map_err(|error| {
+                    invalid_decimal_rational(format!("invalid decimal exponent: {error}"))
+                })?,
+            ),
+            None => (normalized.as_str(), 0),
+        };
+        let (negative, mantissa) = if let Some(unsigned) = mantissa.strip_prefix('-') {
+            (true, unsigned)
+        } else {
+            (false, mantissa.strip_prefix('+').unwrap_or(mantissa))
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_decimal_rational(format!(
+                "invalid decimal rational {raw:?}"
+            )));
+        }
+
+        let digits = format!("{whole}{fraction}");
+        let mut magnitude = digits.parse::<u128>().map_err(|error| {
+            invalid_decimal_rational(format!("decimal numerator overflows: {error}"))
+        })?;
+        let fractional_digits = i32::try_from(fraction.len()).map_err(|_| {
+            invalid_decimal_rational("decimal rational has too many fractional digits")
+        })?;
+        let scale = fractional_digits
+            .checked_sub(exponent)
+            .ok_or_else(|| invalid_decimal_rational("decimal rational exponent overflows"))?;
+        let denominator = if scale >= 0 {
+            10_u128
+                .checked_pow(scale as u32)
+                .ok_or_else(|| invalid_decimal_rational("decimal rational denominator overflows"))?
+        } else {
+            magnitude = magnitude
+                .checked_mul(10_u128.checked_pow(scale.unsigned_abs()).ok_or_else(|| {
+                    invalid_decimal_rational("decimal rational numerator scale overflows")
+                })?)
+                .ok_or_else(|| invalid_decimal_rational("decimal rational numerator overflows"))?;
+            1
+        };
+        let signed = if negative {
+            -(i128::try_from(magnitude)
+                .map_err(|_| invalid_decimal_rational("decimal rational numerator exceeds i128"))?)
+        } else {
+            i128::try_from(magnitude)
+                .map_err(|_| invalid_decimal_rational("decimal rational numerator exceeds i128"))?
+        };
+        let numerator = i64::try_from(signed)
+            .map_err(|_| invalid_decimal_rational("decimal rational numerator exceeds i64"))?;
+        let denominator = u64::try_from(denominator)
+            .map_err(|_| invalid_decimal_rational("decimal rational denominator exceeds u64"))?;
+        Self::new(numerator, denominator)
+    }
+
     pub const fn numerator(self) -> i64 {
         self.numerator
     }
 
     pub const fn denominator(self) -> u64 {
         self.denominator
+    }
+}
+
+fn invalid_decimal_rational(reason: impl Into<String>) -> VNextError {
+    VNextError::InvalidExecutionPlan {
+        reason: reason.into(),
     }
 }
 

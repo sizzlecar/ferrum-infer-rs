@@ -1637,66 +1637,14 @@ fn hf_rms_norm_epsilon(hf_config: &Value) -> Result<CanonicalRational, String> {
 }
 
 fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, String> {
-    let value = parse_positive_decimal_rational_unbounded(raw)?;
+    let value = CanonicalRational::from_decimal_str(raw).map_err(|error| error.to_string())?;
+    if value.numerator() <= 0 {
+        return Err("decimal rational must be positive".to_owned());
+    }
     if value.numerator() as u64 > value.denominator() {
         return Err("rms_norm_eps must not exceed one".to_owned());
     }
     Ok(value)
-}
-
-fn parse_positive_decimal_rational_unbounded(raw: &str) -> Result<CanonicalRational, String> {
-    let normalized = raw.to_ascii_lowercase();
-    let (mantissa, exponent) = match normalized.split_once('e') {
-        Some((mantissa, exponent)) => (
-            mantissa,
-            exponent
-                .parse::<i32>()
-                .map_err(|error| format!("invalid decimal exponent: {error}"))?,
-        ),
-        None => (normalized.as_str(), 0),
-    };
-    if mantissa.starts_with('-') {
-        return Err("decimal rational must be positive".to_owned());
-    }
-    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(format!("invalid decimal rational {raw:?}"));
-    }
-    let digits = format!("{whole}{fraction}");
-    let mut numerator = digits
-        .parse::<u128>()
-        .map_err(|error| format!("decimal numerator overflows: {error}"))?;
-    if numerator == 0 {
-        return Err("decimal rational must be positive".to_owned());
-    }
-    let fractional_digits = i32::try_from(fraction.len())
-        .map_err(|_| "rms_norm_eps has too many fractional digits".to_owned())?;
-    let scale = fractional_digits
-        .checked_sub(exponent)
-        .ok_or_else(|| "rms_norm_eps exponent overflows".to_owned())?;
-    let denominator = if scale >= 0 {
-        10_u128
-            .checked_pow(scale as u32)
-            .ok_or_else(|| "rms_norm_eps denominator overflows".to_owned())?
-    } else {
-        numerator = numerator
-            .checked_mul(
-                10_u128
-                    .checked_pow(scale.unsigned_abs())
-                    .ok_or_else(|| "rms_norm_eps numerator scale overflows".to_owned())?,
-            )
-            .ok_or_else(|| "rms_norm_eps numerator overflows".to_owned())?;
-        1
-    };
-    let numerator =
-        i64::try_from(numerator).map_err(|_| "rms_norm_eps numerator exceeds i64".to_owned())?;
-    let denominator = u64::try_from(denominator)
-        .map_err(|_| "rms_norm_eps denominator exceeds u64".to_owned())?;
-    CanonicalRational::new(numerator, denominator).map_err(|error| error.to_string())
 }
 
 fn canonical_positive_f64(value: f64) -> Result<CanonicalRational, VNextError> {
@@ -1706,8 +1654,8 @@ fn canonical_positive_f64(value: f64) -> Result<CanonicalRational, VNextError> {
             "rope theta must be finite and positive",
         ));
     }
-    parse_positive_decimal_rational_unbounded(&value.to_string())
-        .map_err(|reason| invalid_config("rope_theta", reason))
+    CanonicalRational::from_decimal_str(&value.to_string())
+        .map_err(|reason| invalid_config("rope_theta", reason.to_string()))
 }
 
 fn weight_key(weight: &FamilyWeight, prefix: &str) -> String {
