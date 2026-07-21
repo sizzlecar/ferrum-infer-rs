@@ -107,11 +107,12 @@ impl WeightEncoding {
 pub struct WeightComponentSpec {
     pub id: WeightId,
     pub role: WeightComponentRole,
-    /// Ordered checkpoint tensors forming this physical component. One entry
-    /// maps directly to that tensor. Multiple entries must have the component
-    /// shape `[source_count, source_shape...]` and are stacked in this exact
-    /// order by the format source; aliases are resolved by the model family
-    /// before it constructs the typed schema.
+    /// Ordered checkpoint tensors forming this physical component. Dense
+    /// multi-source components use `[source_count, source_shape...]` and stack
+    /// tensors in this exact order. Format adapters may instead define a typed
+    /// source recipe (for example values plus quantization sidecars), but must
+    /// validate every source identity, order, shape, and resulting byte count.
+    /// Aliases are resolved before the model family constructs this schema.
     pub external_names: Vec<String>,
     pub dimensions: Vec<u64>,
     pub encoding: WeightEncoding,
