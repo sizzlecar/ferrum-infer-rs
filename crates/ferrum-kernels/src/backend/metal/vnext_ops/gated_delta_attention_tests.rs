@@ -76,6 +76,24 @@ fn chunk_k_gram_specialization_requires_repeated_k128_heads() {
     assert!(!uses_chunk_k_gram_k128(&params));
 }
 
+#[test]
+fn simd_delta_specialization_is_shape_and_device_capability_driven() {
+    let semantics = TestSemantics {
+        decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+        value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
+    };
+    let mut params = test_params(1, semantics);
+    assert!(supports_simd_delta(&params, 32));
+    assert!(!supports_simd_delta(&params, 16));
+
+    params.key_dim = 96;
+    assert!(supports_simd_delta(&params, 32));
+    params.key_dim = 80;
+    assert!(!supports_simd_delta(&params, 32));
+    params.key_dim = 160;
+    assert!(!supports_simd_delta(&params, 32));
+}
+
 fn assert_recurrent_conformance(semantics: TestSemantics) {
     let Some(device) = Device::system_default() else {
         eprintln!("no Metal device; skipping gated-delta conformance");
