@@ -17,6 +17,7 @@
 
 pub mod llama_family;
 pub mod llama_family_pipeline;
+#[cfg(any(test, feature = "test-support"))]
 pub mod qwen35;
 pub mod qwen3_moe;
 pub mod qwen3_moe_profile;
@@ -27,6 +28,7 @@ pub use llama_family_pipeline::{
     LlamaFamilyPipelineModel, LlamaPipelineMode, LlamaPipelinePlacement, LlamaPipelineStageBridge,
     LlamaPipelineStagePlacement, LlamaPipelineTransport,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use qwen35::{
     Qwen35BackendModel, Qwen35ModelWeights, Qwen35RecurrentStateHandle,
     Qwen35RecurrentStateManager, Qwen35RecurrentStateManagerConfig,
