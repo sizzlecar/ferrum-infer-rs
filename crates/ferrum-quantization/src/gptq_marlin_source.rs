@@ -329,19 +329,21 @@ fn aggregate_axes(
     source_tail: usize,
     label: &str,
 ) -> std::result::Result<(usize, usize), VNextError> {
-    let [expert_count, projections_per_expert, typed_n, typed_tail] =
-        component.dimensions.as_slice()
-    else {
+    if component.dimensions.len() < 3 {
         return Err(invalid_component(
             component,
             format!(
-                "aggregate {label} shape must be [E, P, N, physical_K], got {:?}",
+                "aggregate {label} shape must be [E, projection_axes..., N, physical_K], got {:?}",
                 component.dimensions
             ),
         ));
-    };
+    }
+    let tail_start = component.dimensions.len() - 2;
+    let expert_count = component.dimensions[0];
+    let typed_n = component.dimensions[tail_start];
+    let typed_tail = component.dimensions[tail_start + 1];
     let expected_tail = [source_n as u64, source_tail as u64];
-    if [*typed_n, *typed_tail] != expected_tail {
+    if [typed_n, typed_tail] != expected_tail {
         return Err(invalid_component(
             component,
             format!(
@@ -349,27 +351,33 @@ fn aggregate_axes(
             ),
         ));
     }
+    let projections_per_expert = component.dimensions[1..tail_start]
+        .iter()
+        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| {
+            invalid_component(component, "aggregate projection axis product overflows u64")
+        })?;
     let declared_groups = expert_count
-        .checked_mul(*projections_per_expert)
+        .checked_mul(projections_per_expert)
         .ok_or_else(|| {
             invalid_component(component, "aggregate source group count overflows u64")
         })?;
-    if *expert_count == 0
-        || *projections_per_expert == 0
+    if expert_count == 0
+        || projections_per_expert == 0
         || usize::try_from(declared_groups).ok() != Some(source_group_count)
     {
         return Err(invalid_component(
             component,
             format!(
-                "aggregate {label} prefix E={expert_count}, P={projections_per_expert} must describe {source_group_count} ordered source groups"
+                "aggregate {label} prefix E={expert_count}, projections_per_expert={projections_per_expert} must describe {source_group_count} ordered source groups"
             ),
         ));
     }
     Ok((
-        usize::try_from(*expert_count).map_err(|_| {
+        usize::try_from(expert_count).map_err(|_| {
             invalid_component(component, "aggregate expert count exceeds address space")
         })?,
-        usize::try_from(*projections_per_expert).map_err(|_| {
+        usize::try_from(projections_per_expert).map_err(|_| {
             invalid_component(
                 component,
                 "aggregate projection count exceeds address space",
@@ -867,5 +875,61 @@ mod tests {
         let payload = source.component(&scales).unwrap();
         assert_eq!(payload.bytes(), expected_scales.as_ref());
         assert_eq!(payload.external_names(), scales.external_names);
+    }
+
+    #[test]
+    fn aggregate_experts_without_projection_axis_repack_independently() {
+        let fixture = write_gate_up_fixture();
+        let source = GptqMarlinSafetensorsSource::open(fixture.directory.path()).unwrap();
+        let packed = WeightComponentSpec {
+            id: WeightId::new("component.layer.experts.packed").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![
+                "layer.gate.qweight".to_owned(),
+                "layer.gate.qzeros".to_owned(),
+                "layer.gate.g_idx".to_owned(),
+                "layer.up.qweight".to_owned(),
+                "layer.up.qzeros".to_owned(),
+                "layer.up.g_idx".to_owned(),
+            ],
+            dimensions: vec![2, fixture.n as u64, (fixture.k / 2) as u64],
+            encoding: WeightEncoding::Quantized(quantization()),
+            required: true,
+        };
+        let expected = fixture
+            .qweights
+            .iter()
+            .flat_map(|values| {
+                repack_gptq_to_marlin(values, fixture.k, fixture.n)
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+            })
+            .collect::<Vec<_>>();
+        let payload = source.component(&packed).unwrap();
+        assert_eq!(payload.bytes(), expected);
+        assert_eq!(payload.dimensions(), packed.dimensions);
+
+        let scales = WeightComponentSpec {
+            id: WeightId::new("component.layer.experts.scales").unwrap(),
+            role: WeightComponentRole::Scales,
+            external_names: vec!["layer.gate.scales".to_owned(), "layer.up.scales".to_owned()],
+            dimensions: vec![2, fixture.n as u64, 1],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        };
+        let expected_scales = fixture
+            .scales
+            .iter()
+            .flat_map(|values| {
+                repack_scales_to_marlin(values, 1, fixture.n, 1)
+                    .into_iter()
+                    .flat_map(|value| value.to_bits().to_le_bytes())
+            })
+            .collect::<Vec<_>>();
+        let payload = source.component(&scales).unwrap();
+        assert_eq!(payload.bytes(), expected_scales);
+        assert_eq!(payload.dimensions(), scales.dimensions);
     }
 }
