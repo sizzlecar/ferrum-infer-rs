@@ -172,12 +172,22 @@ fn submission_requests(
 }
 
 fn prepare_wave(
-    plan: &ExecutionPlan,
+    _plan: &ExecutionPlan,
     step: &Arc<StepResourceLease<resource_support::TestRuntime>>,
 ) -> PreparedStepSubmissionWave<resource_support::TestRuntime> {
-    let requests = submission_requests(plan, step);
+    let work_shape = Arc::new(
+        step.bind_all_invocation_work_shape(vec![resource_support::one_token_span()])
+            .unwrap(),
+    );
     for attempt in 0..=3 {
-        match step.try_prepare_submission_wave(requests.clone()).unwrap() {
+        match step
+            .try_prepare_full_plan_submission_wave(
+                Arc::clone(&work_shape),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap()
+        {
             StepSubmissionWaveAdmissionDecision::Prepared(wave) => return wave,
             StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 deferred.maintain().unwrap();
@@ -564,13 +574,13 @@ fn total_order_invocation_scratch_claims_peak_once_for_the_whole_wave() {
         .map(|entry| entry.units().get())
         .sum::<u64>();
     assert_eq!(wave.node_count(), 2);
-    assert_eq!(claimed.node_work_shapes().len(), 2);
+    assert_eq!(claimed.node_count(), 2);
+    assert_eq!(claimed.work_shape(), wave.nodes()[0].work_shape());
     assert!(std::ptr::eq(
         wave.nodes()[0].work_shape(),
         wave.nodes()[1].work_shape()
     ));
-    let claimed_shapes = claimed.node_work_shapes().collect::<Vec<_>>();
-    assert!(std::ptr::eq(claimed_shapes[0].1, claimed_shapes[1].1));
+    assert_eq!(claimed.plan_hash(), plan.plan_hash());
     assert_eq!(immediate_bytes, 96);
     assert_eq!(claimed.physical_claim_count(), 1);
     assert_eq!(claimed.backing_slices().len(), 2);

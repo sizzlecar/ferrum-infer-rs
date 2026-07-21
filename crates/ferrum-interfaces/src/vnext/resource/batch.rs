@@ -6,7 +6,7 @@ use super::{
     DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId, ExecutionLane,
     LaneStableArenaSlotLease, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
     LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
-    PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration,
+    PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash,
     RequestAuthorityId, SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession,
     SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
     SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
@@ -1793,8 +1793,9 @@ pub struct ClaimedSubmissionWaveBacking {
     // Physical extents release before the logical capacity claim.
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     logical_capacity: Option<LogicalBatchCapacityLease>,
-    node_work_shapes: Vec<(NodeId, Arc<BatchWorkShape>)>,
-    participants: Vec<BatchParticipantAuthority>,
+    plan_hash: PlanHash,
+    node_count: usize,
+    work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
     // Occupancy releases only after terminal completion readback drops this claim.
@@ -1803,19 +1804,16 @@ pub struct ClaimedSubmissionWaveBacking {
 
 impl ClaimedSubmissionWaveBacking {
     pub(super) fn new(
-        node_work_shapes: Vec<(NodeId, Arc<BatchWorkShape>)>,
-        participants: Vec<BatchParticipantAuthority>,
+        plan_hash: PlanHash,
+        node_count: usize,
+        work_shape: Arc<BatchWorkShape>,
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
         lane_slot_lease: Option<LaneStableArenaSlotLease>,
     ) -> Result<Self, VNextError> {
-        let unique_nodes = node_work_shapes
-            .iter()
-            .map(|(node_id, _)| node_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        if node_work_shapes.is_empty()
-            || unique_nodes.len() != node_work_shapes.len()
+        let participants = work_shape.participants();
+        if node_count == 0
             || participants.is_empty()
             || participants
                 .windows(2)
@@ -1825,59 +1823,28 @@ impl ClaimedSubmissionWaveBacking {
                 "submission wave backing requires ordered unique nodes and participants",
             ));
         }
-        let participant_is_in_wave = |candidate: &BatchParticipantAuthority| {
-            participants
-                .binary_search_by_key(&candidate.canonical_key(), |participant| {
-                    participant.canonical_key()
-                })
-                .is_ok()
-        };
-        if node_work_shapes.iter().any(|(_, work_shape)| {
-            work_shape
-                .participants()
-                .iter()
-                .any(|participant| !participant_is_in_wave(participant))
-        }) || participants.iter().any(|participant| {
-            !node_work_shapes.iter().any(|(_, work_shape)| {
-                work_shape
-                    .participants()
-                    .iter()
-                    .any(|candidate| candidate.canonical_key() == participant.canonical_key())
-            })
-        }) {
-            return Err(invalid_resource(
-                "submission wave work does not map exactly onto its participant authority",
-            ));
-        }
         validate_backing_claim(&backing_slices, &demand)?;
-        if !logical_capacity_matches(&logical_capacity, &demand, &participants, &backing_slices) {
+        if !logical_capacity_matches(&logical_capacity, &demand, participants, &backing_slices) {
             return Err(invalid_resource(
                 "submission wave capacity differs from its participants or evaluated demand",
             ));
         }
 
         #[derive(Serialize)]
-        struct NodeInput<'a> {
-            node_id: &'a NodeId,
-            work_fingerprint: &'a str,
-        }
-        #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
-            nodes: Vec<NodeInput<'a>>,
+            plan_hash: &'a PlanHash,
+            node_count: usize,
+            work_fingerprint: &'a str,
             demand: &'a AdmissionDemand,
             backing: Vec<&'a LogicalBackingSliceEvidence>,
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v2",
-            nodes: node_work_shapes
-                .iter()
-                .map(|(node_id, work_shape)| NodeInput {
-                    node_id,
-                    work_fingerprint: work_shape.fingerprint(),
-                })
-                .collect(),
+            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v3",
+            plan_hash: &plan_hash,
+            node_count,
+            work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
             backing: backing_slices
                 .iter()
@@ -1902,8 +1869,9 @@ impl ClaimedSubmissionWaveBacking {
         Ok(Self {
             backing_slices,
             logical_capacity,
-            node_work_shapes,
-            participants,
+            plan_hash,
+            node_count,
+            work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
             _lane_slot_lease: lane_slot_lease,
@@ -1918,14 +1886,20 @@ impl ClaimedSubmissionWaveBacking {
         self.logical_capacity.as_ref()
     }
 
-    pub fn node_work_shapes(&self) -> impl ExactSizeIterator<Item = (&NodeId, &BatchWorkShape)> {
-        self.node_work_shapes
-            .iter()
-            .map(|(node_id, work_shape)| (node_id, work_shape.as_ref()))
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.plan_hash
+    }
+
+    pub const fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.work_shape.as_ref()
     }
 
     pub fn participants(&self) -> &[BatchParticipantAuthority] {
-        &self.participants
+        self.work_shape.participants()
     }
 
     pub fn demand(&self) -> &AdmissionDemand {
