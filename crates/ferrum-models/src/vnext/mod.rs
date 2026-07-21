@@ -12,8 +12,10 @@ use ferrum_interfaces::vnext::{
 use ferrum_types::{DataType, Device, ModelId, ModelInfo, ModelType};
 use serde_json::Value;
 
+mod hf_metadata;
 pub mod qwen35;
 pub mod source;
+mod weight_layout;
 
 pub use source::{ProductionModelSourceBundle, ProductionWeightArtifact};
 
