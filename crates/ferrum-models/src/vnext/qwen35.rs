@@ -1,4 +1,4 @@
-//! Typed Qwen3.5 dense-hybrid model package for the production vNext path.
+//! Typed Qwen3.5 hybrid dense/MoE model package for the production vNext path.
 //!
 //! Preparation reads configuration, tokenizer metadata, and typed weight
 //! headers only. Tensor payloads remain untouched until the selected backend
@@ -12,25 +12,33 @@ use ferrum_interfaces::vnext::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
     ElementType, ExternalModelMetadataId, GatedDeltaDecayParameterization,
     GatedDeltaValueHeadMapping, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
-    ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightLayout,
-    PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec,
-    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, SemanticValue, StateCapacityDemand,
-    StateId, StateInitialization, StateLifetime, StateSpec, TypedFamilyRegistration, VNextError,
-    WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding,
-    WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
-    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightComponentBinding,
+    PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode,
+    ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
+    QuantizationPacking, QuantizationSpec, ResolvedTensorLayout, SemanticValue,
+    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
+    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
-use ferrum_quantization::{GgufWeightComponentSource, SafetensorsArchive};
+use ferrum_quantization::{
+    GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
+    GPTQ_MARLIN_INT4_FORMAT_ID,
+};
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig, Qwen35WeightSpec};
-use crate::qwen35_weights::{Qwen35ResolvedWeightSpec, Qwen35WeightInventory};
+use crate::qwen35_config::{
+    Qwen35LayerType, Qwen35QuantizationConfig, Qwen35TextConfig, Qwen35WeightSpec,
+};
+use crate::qwen35_weights::{
+    Qwen35ResolvedWeightSource, Qwen35ResolvedWeightSpec, Qwen35WeightInventory,
+};
 
 use super::{
     hf_metadata::parse_hf_model_semantic_metadata,
@@ -39,8 +47,9 @@ use super::{
     ProductionWeightArtifact,
 };
 
-pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
+pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
+pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
 const MOE_ROUTER_ROLE: &str = "moe_router";
@@ -54,6 +63,7 @@ const MOE_SHARED_DOWN_ROLE: &str = "moe_shared_down";
 #[serde(deny_unknown_fields)]
 struct FamilyWeight {
     layer_index: Option<u32>,
+    expert_index: Option<u32>,
     role: String,
     external_name: String,
     dimensions: Vec<u64>,
@@ -61,9 +71,25 @@ struct FamilyWeight {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyGptqTensor {
+    external_name: String,
+    dimensions: Vec<u64>,
+    element_type: ElementType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum FamilyWeightSourceEncoding {
-    Dense { element_type: ElementType },
+    Dense {
+        element_type: ElementType,
+    },
+    Gptq {
+        qweight: FamilyGptqTensor,
+        scales: FamilyGptqTensor,
+        qzeros: FamilyGptqTensor,
+        g_idx: Option<FamilyGptqTensor>,
+    },
     BlockQuantized(BlockQuantizationSpec),
 }
 
@@ -71,6 +97,7 @@ enum FamilyWeightSourceEncoding {
 #[serde(rename_all = "snake_case")]
 enum FamilyWeightFormat {
     SafetensorsDense,
+    SafetensorsGptqMarlin,
     GgufNative,
 }
 
@@ -112,16 +139,30 @@ impl Qwen35FamilyProvider {
                 "typed epsilon differs from Hugging Face metadata",
             ));
         }
-        if text.quantization.is_some() {
-            let reason = match config.weight_format {
-                FamilyWeightFormat::SafetensorsDense => {
-                    "raw safetensors quantization requires the typed GPTQ source adapter"
-                }
-                FamilyWeightFormat::GgufNative => {
-                    "GGUF physical quantization must not be duplicated in Hugging Face metadata"
-                }
-            };
-            return Err(invalid_config("hf_config.quantization_config", reason));
+        match (config.weight_format, text.quantization.as_ref()) {
+            (FamilyWeightFormat::SafetensorsDense, None)
+            | (FamilyWeightFormat::GgufNative, None) => {}
+            (FamilyWeightFormat::SafetensorsGptqMarlin, Some(quantization)) => {
+                validate_gptq_marlin_config(quantization)?;
+            }
+            (FamilyWeightFormat::SafetensorsDense, Some(_)) => {
+                return Err(invalid_config(
+                    "hf_config.quantization_config",
+                    "raw safetensors quantization requires the typed GPTQ source adapter",
+                ));
+            }
+            (FamilyWeightFormat::SafetensorsGptqMarlin, None) => {
+                return Err(invalid_config(
+                    "hf_config.quantization_config",
+                    "the GPTQ Marlin source requires explicit Hugging Face quantization metadata",
+                ));
+            }
+            (FamilyWeightFormat::GgufNative, Some(_)) => {
+                return Err(invalid_config(
+                    "hf_config.quantization_config",
+                    "GGUF physical quantization must not be duplicated in Hugging Face metadata",
+                ));
+            }
         }
         if text.mamba_ssm_dtype != DataType::FP32 {
             return Err(invalid_config(
@@ -153,8 +194,11 @@ impl Qwen35FamilyProvider {
                 || weight.external_name.is_empty()
                 || weight.dimensions.is_empty()
                 || weight.dimensions.contains(&0)
-                || !external_names.insert(weight.external_name.clone())
-                || !logical_keys.insert((weight.layer_index, weight.role.clone()))
+                || !logical_keys.insert((
+                    weight.layer_index,
+                    weight.expert_index,
+                    weight.role.clone(),
+                ))
             {
                 return Err(invalid_config(
                     "weights",
@@ -166,7 +210,18 @@ impl Qwen35FamilyProvider {
                     if matches!(
                         element_type,
                         ElementType::F16 | ElementType::Bf16 | ElementType::F32
-                    ) => {}
+                    ) =>
+                {
+                    if !external_names.insert(weight.external_name.clone()) {
+                        return Err(invalid_config(
+                            "weights",
+                            format!(
+                                "checkpoint tensor {:?} is referenced more than once",
+                                weight.external_name
+                            ),
+                        ));
+                    }
+                }
                 FamilyWeightSourceEncoding::BlockQuantized(spec) => {
                     spec.validate()?;
                     let block_width = u64::from(spec.logical_values_per_block);
@@ -183,6 +238,15 @@ impl Qwen35FamilyProvider {
                             ),
                         ));
                     }
+                    if !external_names.insert(weight.external_name.clone()) {
+                        return Err(invalid_config(
+                            "weights",
+                            format!(
+                                "checkpoint tensor {:?} is referenced more than once",
+                                weight.external_name
+                            ),
+                        ));
+                    }
                 }
                 FamilyWeightSourceEncoding::Dense { element_type } => {
                     return Err(invalid_config(
@@ -192,6 +256,37 @@ impl Qwen35FamilyProvider {
                             weight.role
                         ),
                     ));
+                }
+                FamilyWeightSourceEncoding::Gptq {
+                    qweight,
+                    scales,
+                    qzeros,
+                    g_idx,
+                } => {
+                    validate_gptq_weight_source(
+                        weight,
+                        qweight,
+                        scales,
+                        qzeros,
+                        g_idx.as_ref(),
+                        text.quantization.as_ref().ok_or_else(|| {
+                            invalid_config(
+                                "hf_config.quantization_config",
+                                "GPTQ weight has no typed quantization metadata",
+                            )
+                        })?,
+                    )?;
+                    for source in [qweight, scales, qzeros].into_iter().chain(g_idx.iter()) {
+                        if !external_names.insert(source.external_name.clone()) {
+                            return Err(invalid_config(
+                                "weights",
+                                format!(
+                                    "GPTQ sidecar {:?} is referenced more than once",
+                                    source.external_name
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
             let expected_dimensions = expected_weight_dimensions(&text, config.vocab_size, weight)?;
@@ -219,32 +314,22 @@ impl Qwen35FamilyProvider {
                         "safetensors dense packages cannot contain block-quantized components",
                     ));
                 }
-                let inventory = Qwen35WeightInventory::from_names(
-                    config
-                        .weights
-                        .iter()
-                        .map(|weight| weight.external_name.clone()),
-                );
-                let resolved = inventory
-                    .detect_prefix_and_resolve(&text)
-                    .map_err(|reason| invalid_config("weights", reason))?;
-                let expected =
-                    resolved_weight_keys(&resolved.global_tensors, None, text.tie_word_embeddings)
-                        .chain(resolved.layers.iter().flat_map(|layer| {
-                            resolved_weight_keys(
-                                &layer.tensors,
-                                Some(layer.layer_index as u32),
-                                text.tie_word_embeddings,
-                            )
-                        }))
-                        .collect::<BTreeSet<_>>();
-                let actual = resolved_weight_keys_from_config(config);
-                if actual != expected {
+                validate_safetensors_manifest(&text, config, "dense")?;
+            }
+            FamilyWeightFormat::SafetensorsGptqMarlin => {
+                if config.weights.iter().any(|weight| {
+                    matches!(
+                        weight.source_encoding,
+                        FamilyWeightSourceEncoding::BlockQuantized(_)
+                    )
+                }) {
                     return Err(invalid_config(
-                        "weights",
-                        "resolved tensors do not exactly match the supported dense Qwen3.5 manifest",
+                        "weights.source_encoding",
+                        "safetensors GPTQ packages cannot contain GGUF block components",
                     ));
                 }
+                validate_safetensors_manifest(&text, config, "GPTQ")?;
+                validate_canonical_gptq_moe_representation(&text, config)?;
             }
             FamilyWeightFormat::GgufNative => validate_gguf_manifest(&text, config)?,
         }
@@ -260,8 +345,13 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     }
 
     fn external_metadata_ids(&self) -> BTreeSet<ExternalModelMetadataId> {
-        BTreeSet::from([ExternalModelMetadataId::new(EXTERNAL_METADATA_ID)
-            .expect("Qwen3.5 external metadata id is static and valid")])
+        [EXTERNAL_METADATA_ID, MOE_EXTERNAL_METADATA_ID]
+            .into_iter()
+            .map(|metadata_id| {
+                ExternalModelMetadataId::new(metadata_id)
+                    .expect("Qwen3.5 external metadata ids are static and valid")
+            })
+            .collect()
     }
 
     fn validate_config_identity(
@@ -289,7 +379,12 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         config: &Self::Config,
     ) -> Result<ExternalModelMetadataId, VNextError> {
         self.validate_config_identity(raw, config)?;
-        ExternalModelMetadataId::new(EXTERNAL_METADATA_ID)
+        let text = Self::text_config(config)?;
+        ExternalModelMetadataId::new(if text.is_moe() {
+            MOE_EXTERNAL_METADATA_ID
+        } else {
+            EXTERNAL_METADATA_ID
+        })
     }
 
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
@@ -302,6 +397,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
         match config.weight_format {
             FamilyWeightFormat::SafetensorsDense => safetensors_weight_schema(config),
+            FamilyWeightFormat::SafetensorsGptqMarlin => safetensors_gptq_weight_schema(config),
             FamilyWeightFormat::GgufNative => gguf_weight_schema(config),
         }
     }
@@ -425,7 +521,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         initialization: StateInitialization::Zero,
                     });
                     let (decay_parameterization, value_head_mapping) = match config.weight_format {
-                        FamilyWeightFormat::SafetensorsDense => (
+                        FamilyWeightFormat::SafetensorsDense
+                        | FamilyWeightFormat::SafetensorsGptqMarlin => (
                             GatedDeltaDecayParameterization::LogRate,
                             GatedDeltaValueHeadMapping::GroupedByKeyHead,
                         ),
@@ -776,6 +873,398 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
     })
 }
 
+fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+    let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config)
+        .map_err(|reason| invalid_config("hf_config", reason))?;
+    let quantization = text.quantization.as_ref().ok_or_else(|| {
+        invalid_config(
+            "hf_config.quantization_config",
+            "GPTQ Marlin schema requires typed quantization metadata",
+        )
+    })?;
+    validate_gptq_marlin_config(quantization)?;
+
+    let mut components = Vec::with_capacity(config.weights.len() * 2);
+    let mut tensors = Vec::with_capacity(config.weights.len());
+    for weight in &config.weights {
+        if is_moe_source_role(&weight.role) || weight.role == "mlp_up" {
+            continue;
+        }
+        if weight.role == "mlp_gate" {
+            let layer_index = weight.layer_index.ok_or_else(|| {
+                invalid_config("weights.mlp_gate", "dense gate weight has no layer")
+            })?;
+            let up = required_weight(config, Some(layer_index), "mlp_up")?;
+            let logical_dimensions = packed_gate_up_dimensions(weight, up)?;
+            let partition_dimensions = vec![1, logical_dimensions[1], logical_dimensions[2]];
+            let mut parts = Vec::with_capacity(2);
+            for (partition, source) in [weight, up].into_iter().enumerate() {
+                let layout = append_safetensors_source_layout(
+                    source,
+                    &partition_dimensions,
+                    quantization,
+                    &mut components,
+                )?;
+                parts.push(CompositeWeightPart {
+                    layout: Box::new(layout),
+                    logical_offsets: vec![partition as u64, 0, 0],
+                    extents: partition_dimensions.clone(),
+                });
+            }
+            tensors.push(WeightTensorSpec {
+                id: packed_gate_up_weight_id(layer_index)?,
+                dimensions: logical_dimensions,
+                logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+                physical_layout: PhysicalWeightLayout::Composite { parts },
+                required: true,
+            });
+            continue;
+        }
+
+        let logical_dimensions = logical_weight_dimensions(weight)?;
+        let layout = append_safetensors_source_layout(
+            weight,
+            &logical_dimensions,
+            quantization,
+            &mut components,
+        )?;
+        tensors.push(WeightTensorSpec {
+            id: weight_id(weight)?,
+            dimensions: logical_dimensions,
+            logical_element_type: materialized_element_type(&weight.role),
+            physical_layout: layout,
+            required: true,
+        });
+    }
+    if text.is_moe() {
+        for layer_index in 0..text.num_hidden_layers {
+            append_safetensors_moe_weight_schema(
+                config,
+                &text,
+                quantization,
+                layer_index as u32,
+                &mut components,
+                &mut tensors,
+            )?;
+        }
+    }
+    Ok(WeightSchema {
+        format_id: WeightFormatId::new("weight-format.safetensors.gptq-marlin-int4")?,
+        layout_id: WeightLayoutId::new(if text.is_moe() {
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin"
+        } else {
+            "weight-layout.qwen3_5.dense_hybrid.gptq_marlin"
+        })?,
+        version: ContractVersion::new(2, 0),
+        components,
+        tensors,
+    })
+}
+
+fn append_safetensors_source_layout(
+    weight: &FamilyWeight,
+    logical_dimensions: &[u64],
+    quantization: &Qwen35QuantizationConfig,
+    components: &mut Vec<WeightComponentSpec>,
+) -> Result<PhysicalWeightLayout, VNextError> {
+    match &weight.source_encoding {
+        FamilyWeightSourceEncoding::Dense { .. } => {
+            let component = WeightComponentSpec {
+                id: component_id(weight)?,
+                role: WeightComponentRole::Values,
+                external_names: vec![weight.external_name.clone()],
+                dimensions: weight.dimensions.clone(),
+                encoding: dense_weight_encoding(&weight.role)?,
+                required: true,
+            };
+            let layout = dense_or_reshaped_layout(
+                FAMILY_ID,
+                component.id.clone(),
+                &weight.dimensions,
+                logical_dimensions,
+            )?;
+            components.push(component);
+            Ok(layout)
+        }
+        FamilyWeightSourceEncoding::Gptq {
+            qweight,
+            scales,
+            qzeros,
+            g_idx,
+        } => {
+            validate_gptq_weight_source(
+                weight,
+                qweight,
+                scales,
+                qzeros,
+                g_idx.as_ref(),
+                quantization,
+            )?;
+            if logical_dimensions.len() < 2
+                || logical_dimensions[logical_dimensions.len() - 2..] != weight.dimensions
+                || logical_dimensions[..logical_dimensions.len() - 2]
+                    .iter()
+                    .any(|extent| *extent != 1)
+            {
+                return Err(invalid_config(
+                    "weights.dimensions",
+                    format!(
+                        "GPTQ source role {:?} cannot represent logical shape {logical_dimensions:?}",
+                        weight.role
+                    ),
+                ));
+            }
+            let spec = gptq_marlin_quantization_spec(quantization)?;
+            let mut packed_dimensions = logical_dimensions.to_vec();
+            let packed_axis = packed_dimensions.len() - 1;
+            packed_dimensions[packed_axis] /= 2;
+            let mut scale_dimensions = logical_dimensions.to_vec();
+            let group_axis = scale_dimensions.len() - 1;
+            scale_dimensions[group_axis] /= quantization.group_size as u64;
+
+            let base = component_id(weight)?.to_string();
+            let packed_id = WeightId::new(format!("{base}.packed"))?;
+            let scales_id = WeightId::new(format!("{base}.scales"))?;
+            let mut packed_sources =
+                vec![qweight.external_name.clone(), qzeros.external_name.clone()];
+            if let Some(g_idx) = g_idx {
+                packed_sources.push(g_idx.external_name.clone());
+            }
+            components.push(WeightComponentSpec {
+                id: packed_id.clone(),
+                role: WeightComponentRole::PackedValues,
+                external_names: packed_sources,
+                dimensions: packed_dimensions.clone(),
+                encoding: WeightEncoding::Quantized(spec),
+                required: true,
+            });
+            components.push(WeightComponentSpec {
+                id: scales_id.clone(),
+                role: WeightComponentRole::Scales,
+                external_names: vec![scales.external_name.clone()],
+                dimensions: scale_dimensions,
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+                required: true,
+            });
+            Ok(PhysicalWeightLayout::Quantized {
+                packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+                packed_dimensions,
+                scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+                zero_points: None,
+                axis_indices: None,
+                permutation: None,
+                codebook: None,
+                group_axis: u32::try_from(group_axis).map_err(|_| {
+                    invalid_config("weights.dimensions", "GPTQ group axis exceeds u32")
+                })?,
+                group_padding: PhysicalWeightPadding::Exact,
+            })
+        }
+        FamilyWeightSourceEncoding::BlockQuantized(_) => Err(invalid_config(
+            "weights.source_encoding",
+            "GGUF block quantization cannot enter the safetensors GPTQ schema",
+        )),
+    }
+}
+
+fn append_safetensors_moe_weight_schema(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+    quantization: &Qwen35QuantizationConfig,
+    layer_index: u32,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    append_safetensors_direct_moe_weight(
+        config,
+        text,
+        quantization,
+        layer_index,
+        MOE_ROUTER_ROLE,
+        MOE_ROUTER_ROLE,
+        components,
+        tensors,
+    )?;
+
+    let moe = text.moe.as_ref().ok_or_else(|| {
+        invalid_config(
+            "hf_config.text_config",
+            "MoE schema requested for dense model",
+        )
+    })?;
+    let gates = required_expert_weights(
+        config,
+        layer_index,
+        "moe_per_expert_gate_proj_qweight",
+        moe.num_experts,
+    )?;
+    let ups = required_expert_weights(
+        config,
+        layer_index,
+        "moe_per_expert_up_proj_qweight",
+        moe.num_experts,
+    )?;
+    let mut experts = Vec::with_capacity(moe.num_experts);
+    for expert in 0..moe.num_experts {
+        let mut parts = Vec::with_capacity(2);
+        let extents = vec![1, moe.moe_intermediate_size as u64, text.hidden_size as u64];
+        for (partition, source) in [gates[expert], ups[expert]].into_iter().enumerate() {
+            let layout =
+                append_safetensors_source_layout(source, &extents, quantization, components)?;
+            parts.push(CompositeWeightPart {
+                layout: Box::new(layout),
+                logical_offsets: vec![partition as u64, 0, 0],
+                extents: extents.clone(),
+            });
+        }
+        experts.push(PhysicalWeightLayout::Composite { parts });
+    }
+    tensors.push(WeightTensorSpec {
+        id: moe_weight_id(layer_index, MOE_ROUTED_GATE_UP_ROLE)?,
+        dimensions: moe_logical_dimensions(text, MOE_ROUTED_GATE_UP_ROLE)?,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: PhysicalWeightLayout::ExpertStack {
+            experts,
+            expert_axis: 0,
+        },
+        required: true,
+    });
+
+    let downs = required_expert_weights(
+        config,
+        layer_index,
+        "moe_per_expert_down_proj_qweight",
+        moe.num_experts,
+    )?;
+    let down_dimensions = vec![text.hidden_size as u64, moe.moe_intermediate_size as u64];
+    let experts = downs
+        .into_iter()
+        .map(|source| {
+            append_safetensors_source_layout(source, &down_dimensions, quantization, components)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    tensors.push(WeightTensorSpec {
+        id: moe_weight_id(layer_index, MOE_ROUTED_DOWN_ROLE)?,
+        dimensions: moe_logical_dimensions(text, MOE_ROUTED_DOWN_ROLE)?,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: PhysicalWeightLayout::ExpertStack {
+            experts,
+            expert_axis: 0,
+        },
+        required: true,
+    });
+
+    append_safetensors_direct_moe_weight(
+        config,
+        text,
+        quantization,
+        layer_index,
+        "moe_shared_expert_gate",
+        MOE_SHARED_GATE_ROLE,
+        components,
+        tensors,
+    )?;
+    append_safetensors_composite_moe_weight(
+        config,
+        text,
+        quantization,
+        layer_index,
+        ["moe_shared_expert_gate_proj", "moe_shared_expert_up_proj"],
+        MOE_SHARED_GATE_UP_ROLE,
+        components,
+        tensors,
+    )?;
+    append_safetensors_direct_moe_weight(
+        config,
+        text,
+        quantization,
+        layer_index,
+        "moe_shared_expert_down_proj",
+        MOE_SHARED_DOWN_ROLE,
+        components,
+        tensors,
+    )
+}
+
+fn append_safetensors_direct_moe_weight(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+    quantization: &Qwen35QuantizationConfig,
+    layer_index: u32,
+    source_role: &str,
+    logical_role: &str,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    let source = required_weight(config, Some(layer_index), source_role)?;
+    let dimensions = moe_logical_dimensions(text, logical_role)?;
+    let layout = append_safetensors_source_layout(source, &dimensions, quantization, components)?;
+    tensors.push(WeightTensorSpec {
+        id: moe_weight_id(layer_index, logical_role)?,
+        dimensions,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: layout,
+        required: true,
+    });
+    Ok(())
+}
+
+fn append_safetensors_composite_moe_weight(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+    quantization: &Qwen35QuantizationConfig,
+    layer_index: u32,
+    source_roles: [&str; 2],
+    logical_role: &str,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    let dimensions = moe_logical_dimensions(text, logical_role)?;
+    let mut extents = dimensions.clone();
+    extents[0] = 1;
+    let mut parts = Vec::with_capacity(2);
+    for (partition, role) in source_roles.into_iter().enumerate() {
+        let source = required_weight(config, Some(layer_index), role)?;
+        let layout = append_safetensors_source_layout(source, &extents, quantization, components)?;
+        let mut offsets = vec![0_u64; dimensions.len()];
+        offsets[0] = partition as u64;
+        parts.push(CompositeWeightPart {
+            layout: Box::new(layout),
+            logical_offsets: offsets,
+            extents: extents.clone(),
+        });
+    }
+    tensors.push(WeightTensorSpec {
+        id: moe_weight_id(layer_index, logical_role)?,
+        dimensions,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: PhysicalWeightLayout::Composite { parts },
+        required: true,
+    });
+    Ok(())
+}
+
+fn gptq_marlin_quantization_spec(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<QuantizationSpec, VNextError> {
+    validate_gptq_marlin_config(quantization)?;
+    Ok(QuantizationSpec {
+        format_id: QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID)?,
+        bits_per_weight: 4,
+        group_size: u32::try_from(quantization.group_size).map_err(|_| {
+            invalid_config(
+                "hf_config.quantization_config.group_size",
+                "GPTQ group size exceeds u32",
+            )
+        })?,
+        packing: QuantizationPacking::Tiled,
+        scale_type: ElementType::F16,
+        zero_point_type: None,
+    })
+}
+
 fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
     let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config)
         .map_err(|reason| invalid_config("hf_config", reason))?;
@@ -1010,6 +1499,12 @@ fn gguf_component_spec(weight: &FamilyWeight) -> Result<WeightComponentSpec, VNe
                 WeightEncoding::BlockQuantized(spec.clone()),
             )
         }
+        FamilyWeightSourceEncoding::Gptq { .. } => {
+            return Err(invalid_config(
+                "weights.source_encoding",
+                "GPTQ components cannot enter the GGUF schema",
+            ));
+        }
     };
     Ok(WeightComponentSpec {
         id: component_id(weight)?,
@@ -1063,6 +1558,10 @@ fn gguf_component_layout(
                 block_padding: PhysicalWeightPadding::Exact,
             })
         }
+        FamilyWeightSourceEncoding::Gptq { .. } => Err(invalid_config(
+            "weights.source_encoding",
+            "GPTQ components cannot enter the GGUF schema",
+        )),
     }
 }
 
@@ -1081,7 +1580,11 @@ pub fn prepare_from_sources(
             let weights = SafetensorsArchive::open(weight_root)?;
             let config = load_safetensors_family_config(&sources, &weights)
                 .map_err(ferrum_types::FerrumError::model)?;
-            finish_preparation(sources, weights, config)
+            if config.weight_format == FamilyWeightFormat::SafetensorsGptqMarlin {
+                finish_preparation(sources, GptqMarlinSafetensorsSource::new(weights), config)
+            } else {
+                finish_preparation(sources, weights, config)
+            }
         }
         ProductionWeightArtifact::GgufFile(path) => {
             let weights = GgufWeightComponentSource::open(path)?;
@@ -1162,11 +1665,8 @@ fn load_safetensors_family_config(
     let hf_config: Value = serde_json::from_slice(sources.config_json())
         .map_err(|error| format!("parse semantic config.json: {error}"))?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
-    if text.is_moe() {
-        return Err("safetensors Qwen3.5 MoE requires the typed GPTQ source adapter".to_owned());
-    }
-    if text.quantization.is_some() {
-        return Err("the dense vNext Qwen3.5 package does not accept quantized weights".to_owned());
+    if let Some(quantization) = &text.quantization {
+        validate_gptq_marlin_config(quantization).map_err(|error| error.to_string())?;
     }
 
     let text_value = hf_config.get("text_config").unwrap_or(&hf_config);
@@ -1198,7 +1698,11 @@ fn load_safetensors_family_config(
         )?;
     }
     weights.sort_by(|left, right| {
-        (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
+        (left.layer_index, left.role.as_str(), left.expert_index).cmp(&(
+            right.layer_index,
+            right.role.as_str(),
+            right.expert_index,
+        ))
     });
 
     Ok(Qwen35FamilyConfig {
@@ -1207,7 +1711,11 @@ fn load_safetensors_family_config(
         max_position_embeddings,
         rms_norm_epsilon,
         metadata,
-        weight_format: FamilyWeightFormat::SafetensorsDense,
+        weight_format: if text.quantization.is_some() {
+            FamilyWeightFormat::SafetensorsGptqMarlin
+        } else {
+            FamilyWeightFormat::SafetensorsDense
+        },
         weights,
     })
 }
@@ -1266,7 +1774,11 @@ fn load_gguf_family_config(
         )?;
     }
     weights.sort_by(|left, right| {
-        (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
+        (left.layer_index, left.role.as_str(), left.expert_index).cmp(&(
+            right.layer_index,
+            right.role.as_str(),
+            right.expert_index,
+        ))
     });
 
     Ok(Qwen35FamilyConfig {
@@ -1318,6 +1830,7 @@ fn append_gguf_weights(
             .collect::<Vec<_>>();
         output.push(FamilyWeight {
             layer_index,
+            expert_index: None,
             role: spec.role.clone(),
             external_name,
             dimensions,
@@ -1371,63 +1884,332 @@ fn append_resolved_weights(
         .iter()
         .filter(|weight| weight.present && !(tied_embeddings && weight.role == "lm_head"))
     {
-        let tensor = weights
-            .tensor(&weight.name)
-            .map_err(|error| error.to_string())?;
-        let source_element_type = tensor.element_type().ok_or_else(|| {
+        let source = weight.source.as_ref().ok_or_else(|| {
             format!(
-                "resolved dense Qwen3.5 tensor {:?} has unsupported dtype {:?}",
-                weight.name,
-                tensor.dtype()
+                "resolved Qwen3.5 tensor {:?} has no typed source bundle",
+                weight.name
             )
         })?;
-        if !matches!(
-            source_element_type,
-            ElementType::F16 | ElementType::Bf16 | ElementType::F32
-        ) {
-            return Err(format!(
-                "resolved dense Qwen3.5 tensor {:?} must have a floating-point source dtype, got {source_element_type:?}",
-                weight.name
-            ));
-        }
+        let (external_name, dimensions, source_encoding) = match source {
+            Qwen35ResolvedWeightSource::Dense { values } => {
+                let tensor = weights.tensor(values).map_err(|error| error.to_string())?;
+                let source_element_type = tensor.element_type().ok_or_else(|| {
+                    format!(
+                        "resolved dense Qwen3.5 tensor {values:?} has unsupported dtype {:?}",
+                        tensor.dtype()
+                    )
+                })?;
+                if !matches!(
+                    source_element_type,
+                    ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                ) {
+                    return Err(format!(
+                        "resolved dense Qwen3.5 tensor {values:?} must have a floating-point source dtype, got {source_element_type:?}"
+                    ));
+                }
+                (
+                    values.clone(),
+                    tensor.shape().to_vec(),
+                    FamilyWeightSourceEncoding::Dense {
+                        element_type: source_element_type,
+                    },
+                )
+            }
+            Qwen35ResolvedWeightSource::Gptq {
+                qweight,
+                scales,
+                qzeros,
+                g_idx,
+            } => {
+                let qweight_source = family_gptq_tensor(weights, qweight)?;
+                let scales_source = family_gptq_tensor(weights, scales)?;
+                let qzeros_source = family_gptq_tensor(weights, qzeros)?;
+                let g_idx_source = g_idx
+                    .as_deref()
+                    .map(|name| family_gptq_tensor(weights, name))
+                    .transpose()?;
+                let [packed_k, n] = qweight_source.dimensions.as_slice() else {
+                    return Err(format!(
+                        "resolved GPTQ qweight {qweight:?} must have shape [K/8, N]"
+                    ));
+                };
+                let k = packed_k
+                    .checked_mul(8)
+                    .ok_or_else(|| format!("GPTQ qweight {qweight:?} K dimension overflows"))?;
+                (
+                    qweight.clone(),
+                    vec![*n, k],
+                    FamilyWeightSourceEncoding::Gptq {
+                        qweight: qweight_source,
+                        scales: scales_source,
+                        qzeros: qzeros_source,
+                        g_idx: g_idx_source,
+                    },
+                )
+            }
+        };
         output.push(FamilyWeight {
             layer_index,
+            expert_index: weight.expert_index,
             role: weight.role.clone(),
-            external_name: weight.name.clone(),
-            dimensions: tensor.shape().to_vec(),
-            source_encoding: FamilyWeightSourceEncoding::Dense {
-                element_type: source_element_type,
-            },
+            external_name,
+            dimensions,
+            source_encoding,
         });
     }
     Ok(())
+}
+
+fn family_gptq_tensor(
+    weights: &SafetensorsArchive,
+    external_name: &str,
+) -> Result<FamilyGptqTensor, String> {
+    let tensor = weights
+        .tensor(external_name)
+        .map_err(|error| error.to_string())?;
+    let element_type = tensor.element_type().ok_or_else(|| {
+        format!(
+            "resolved GPTQ tensor {external_name:?} has unsupported dtype {:?}",
+            tensor.dtype()
+        )
+    })?;
+    Ok(FamilyGptqTensor {
+        external_name: external_name.to_owned(),
+        dimensions: tensor.shape().to_vec(),
+        element_type,
+    })
 }
 
 fn resolved_weight_keys<'a>(
     resolved: &'a [Qwen35ResolvedWeightSpec],
     layer_index: Option<u32>,
     tied_embeddings: bool,
-) -> impl Iterator<Item = (Option<u32>, String, String)> + 'a {
+) -> impl Iterator<Item = (Option<u32>, Option<u32>, String, String)> + 'a {
     resolved
         .iter()
         .filter(move |weight| weight.present && !(tied_embeddings && weight.role == "lm_head"))
-        .map(move |weight| (layer_index, weight.role.clone(), weight.name.clone()))
+        .map(move |weight| {
+            (
+                layer_index,
+                weight.expert_index,
+                weight.role.clone(),
+                weight.name.clone(),
+            )
+        })
 }
 
 fn resolved_weight_keys_from_config(
     config: &Qwen35FamilyConfig,
-) -> BTreeSet<(Option<u32>, String, String)> {
+) -> BTreeSet<(Option<u32>, Option<u32>, String, String)> {
     config
         .weights
         .iter()
         .map(|weight| {
             (
                 weight.layer_index,
+                weight.expert_index,
                 weight.role.clone(),
                 weight.external_name.clone(),
             )
         })
         .collect()
+}
+
+fn validate_gptq_marlin_config(quantization: &Qwen35QuantizationConfig) -> Result<(), VNextError> {
+    if quantization.quant_method != "gptq"
+        || quantization.bits != 4
+        || quantization.group_size == 0
+        || !quantization.group_size.is_power_of_two()
+        || quantization.desc_act
+        || !quantization.sym
+    {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "typed Marlin requires GPTQ INT4, power-of-two group_size, sym=true, and desc_act=false",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gptq_weight_source(
+    weight: &FamilyWeight,
+    qweight: &FamilyGptqTensor,
+    scales: &FamilyGptqTensor,
+    qzeros: &FamilyGptqTensor,
+    g_idx: Option<&FamilyGptqTensor>,
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<(), VNextError> {
+    validate_gptq_marlin_config(quantization)?;
+    let qweight_stem = qweight
+        .external_name
+        .strip_suffix(".qweight")
+        .unwrap_or_default();
+    if weight.external_name != qweight.external_name
+        || qweight_stem.is_empty()
+        || scales.external_name != format!("{qweight_stem}.scales")
+        || qzeros.external_name != format!("{qweight_stem}.qzeros")
+        || g_idx.is_some_and(|source| source.external_name != format!("{qweight_stem}.g_idx"))
+        || qweight.element_type != ElementType::I32
+        || qzeros.element_type != ElementType::I32
+        || !matches!(
+            scales.element_type,
+            ElementType::F16 | ElementType::Bf16 | ElementType::F32
+        )
+    {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            format!(
+                "role {:?} has an invalid GPTQ sidecar identity or dtype",
+                weight.role
+            ),
+        ));
+    }
+    let [packed_k, n] = qweight.dimensions.as_slice() else {
+        return Err(invalid_config(
+            "weights.source_encoding.qweight.dimensions",
+            "GPTQ qweight must have shape [K/8, N]",
+        ));
+    };
+    let k = packed_k
+        .checked_mul(8)
+        .ok_or_else(|| invalid_config("weights.dimensions", "GPTQ K dimension overflows"))?;
+    let group_size = quantization.group_size as u64;
+    if k % 16 != 0
+        || *n % 16 != 0
+        || !k.is_multiple_of(group_size)
+        || weight.dimensions != [*n, k]
+        || scales.dimensions != [k / group_size, *n]
+        || qzeros.dimensions != [k / group_size, *n / 8]
+        || !n.is_multiple_of(8)
+    {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            format!(
+                "role {:?} GPTQ headers do not form a Marlin-aligned [N, K] matrix",
+                weight.role
+            ),
+        ));
+    }
+    if let Some(g_idx) = g_idx {
+        if !g_idx.external_name.ends_with(".g_idx")
+            || g_idx.element_type != ElementType::I32
+            || g_idx.dimensions != [k]
+        {
+            return Err(invalid_config(
+                "weights.source_encoding.g_idx",
+                format!("role {:?} has an invalid GPTQ g_idx header", weight.role),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn family_source_external_names(config: &Qwen35FamilyConfig) -> Vec<String> {
+    config
+        .weights
+        .iter()
+        .flat_map(|weight| match &weight.source_encoding {
+            FamilyWeightSourceEncoding::Gptq {
+                qweight,
+                scales,
+                qzeros,
+                g_idx,
+            } => [qweight, scales, qzeros]
+                .into_iter()
+                .chain(g_idx.iter())
+                .map(|source| source.external_name.clone())
+                .collect::<Vec<_>>(),
+            FamilyWeightSourceEncoding::Dense { .. }
+            | FamilyWeightSourceEncoding::BlockQuantized(_) => {
+                vec![weight.external_name.clone()]
+            }
+        })
+        .collect()
+}
+
+fn validate_safetensors_manifest(
+    text: &Qwen35TextConfig,
+    config: &Qwen35FamilyConfig,
+    label: &str,
+) -> Result<(), VNextError> {
+    let inventory = Qwen35WeightInventory::from_names(family_source_external_names(config));
+    let resolved = inventory
+        .detect_prefix_and_resolve(text)
+        .map_err(|reason| invalid_config("weights", reason))?;
+    let expected = resolved_weight_keys(&resolved.global_tensors, None, text.tie_word_embeddings)
+        .chain(resolved.layers.iter().flat_map(|layer| {
+            resolved_weight_keys(
+                &layer.tensors,
+                Some(layer.layer_index as u32),
+                text.tie_word_embeddings,
+            )
+        }))
+        .collect::<BTreeSet<_>>();
+    let actual = resolved_weight_keys_from_config(config);
+    if actual != expected {
+        return Err(invalid_config(
+            "weights",
+            format!("resolved tensors do not exactly match the supported {label} Qwen3.5 manifest"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_gptq_moe_representation(
+    text: &Qwen35TextConfig,
+    config: &Qwen35FamilyConfig,
+) -> Result<(), VNextError> {
+    let Some(moe) = text.moe.as_ref() else {
+        return Ok(());
+    };
+    const CANONICAL_ROUTED_ROLES: [&str; 3] = [
+        "moe_per_expert_gate_proj_qweight",
+        "moe_per_expert_up_proj_qweight",
+        "moe_per_expert_down_proj_qweight",
+    ];
+    const ALTERNATE_ROUTED_ROLES: [&str; 8] = [
+        "moe_stacked_gate_proj",
+        "moe_stacked_up_proj",
+        "moe_stacked_down_proj",
+        "moe_fused_gate_up_proj",
+        "moe_fused_down_proj",
+        "moe_per_expert_gate_proj",
+        "moe_per_expert_up_proj",
+        "moe_per_expert_down_proj",
+    ];
+
+    for layer_index in 0..text.num_hidden_layers {
+        let layer_index = layer_index as u32;
+        if let Some(weight) = config.weights.iter().find(|weight| {
+            weight.layer_index == Some(layer_index)
+                && ALTERNATE_ROUTED_ROLES.contains(&weight.role.as_str())
+        }) {
+            return Err(invalid_config(
+                "weights",
+                format!(
+                    "Qwen3.5 GPTQ MoE layer {layer_index} mixes canonical per-expert qweight sources with alternate routed role {:?}",
+                    weight.role
+                ),
+            ));
+        }
+        for role in CANONICAL_ROUTED_ROLES {
+            let weights = required_expert_weights(config, layer_index, role, moe.num_experts)?;
+            if weights.iter().any(|weight| {
+                !matches!(
+                    weight.source_encoding,
+                    FamilyWeightSourceEncoding::Gptq { .. }
+                )
+            }) {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "Qwen3.5 GPTQ MoE layer {layer_index} role {role:?} must use typed GPTQ sources for every expert"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_gguf_manifest(
@@ -1464,7 +2246,7 @@ fn validate_gguf_manifest(
             }
             continue;
         };
-        let key = (layer_index, spec.role.clone(), external_name);
+        let key = (layer_index, None, spec.role.clone(), external_name);
         if spec.required {
             required.insert(key.clone());
         }
@@ -1532,6 +2314,34 @@ fn required_weight<'a>(
         .iter()
         .find(|weight| weight.layer_index == layer_index && weight.role == role)
         .ok_or_else(|| invalid_config("weights", format!("missing role {role:?}")))
+}
+
+fn required_expert_weights<'a>(
+    config: &'a Qwen35FamilyConfig,
+    layer_index: u32,
+    role: &str,
+    expert_count: usize,
+) -> Result<Vec<&'a FamilyWeight>, VNextError> {
+    let mut weights = config
+        .weights
+        .iter()
+        .filter(|weight| weight.layer_index == Some(layer_index) && weight.role == role)
+        .collect::<Vec<_>>();
+    weights.sort_by_key(|weight| weight.expert_index);
+    if weights.len() != expert_count
+        || weights
+            .iter()
+            .enumerate()
+            .any(|(expert, weight)| weight.expert_index != u32::try_from(expert).ok())
+    {
+        return Err(invalid_config(
+            "weights",
+            format!(
+                "layer {layer_index} role {role:?} must contain exactly experts 0..{expert_count} in numeric order"
+            ),
+        ));
+    }
+    Ok(weights)
 }
 
 fn is_moe_source_role(role: &str) -> bool {
@@ -1686,7 +2496,17 @@ fn expected_weight_dimensions(
             vec![vec![experts, routed, hidden]]
         }
         "moe_stacked_down_proj" => vec![vec![experts, hidden, routed]],
-        "moe_shared_expert_gate" => vec![vec![hidden]],
+        "moe_per_expert_gate_proj"
+        | "moe_per_expert_up_proj"
+        | "moe_per_expert_gate_proj_qweight"
+        | "moe_per_expert_up_proj_qweight" => vec![vec![routed, hidden]],
+        "moe_per_expert_down_proj" | "moe_per_expert_down_proj_qweight" => {
+            vec![vec![hidden, routed]]
+        }
+        // HF stores the scalar shared-expert gate as `nn.Linear(H, 1)` while
+        // GGUF may squeeze the leading singleton axis. The logical schema is
+        // always `[1, H]`; `dense_or_reshaped_layout` handles the GGUF form.
+        "moe_shared_expert_gate" => vec![vec![1, hidden], vec![hidden]],
         "moe_shared_expert_gate_proj" | "moe_shared_expert_up_proj" => {
             vec![vec![shared, hidden]]
         }
@@ -1747,7 +2567,11 @@ fn canonical_positive_f64(value: f64) -> Result<CanonicalRational, VNextError> {
 }
 
 fn weight_key(weight: &FamilyWeight, prefix: &str) -> String {
-    scoped_weight_key(weight.layer_index, &weight.role, prefix)
+    let key = scoped_weight_key(weight.layer_index, &weight.role, prefix);
+    match weight.expert_index {
+        Some(expert) => format!("{key}.expert.{expert}"),
+        None => key,
+    }
 }
 
 fn scoped_weight_key(layer_index: Option<u32>, role: &str, prefix: &str) -> String {
@@ -1936,7 +2760,15 @@ mod tests {
                 hidden,
                 text.moe.as_ref().unwrap().moe_intermediate_size as u64,
             ],
-            "moe_shared_expert_gate" => vec![hidden],
+            "moe_per_expert_gate_proj_qweight" | "moe_per_expert_up_proj_qweight" => vec![
+                text.moe.as_ref().unwrap().moe_intermediate_size as u64,
+                hidden,
+            ],
+            "moe_per_expert_down_proj_qweight" => vec![
+                hidden,
+                text.moe.as_ref().unwrap().moe_intermediate_size as u64,
+            ],
+            "moe_shared_expert_gate" => vec![1, hidden],
             "moe_shared_expert_gate_proj" | "moe_shared_expert_up_proj" => vec![
                 text.moe.as_ref().unwrap().shared_expert_intermediate_size as u64,
                 hidden,
@@ -1984,6 +2816,7 @@ mod tests {
         for spec in manifest.global_tensors.iter().filter(|spec| spec.required) {
             let mut weight = FamilyWeight {
                 layer_index: None,
+                expert_index: None,
                 role: spec.role.clone(),
                 external_name: spec.name.clone(),
                 dimensions: vec![1],
@@ -1998,6 +2831,7 @@ mod tests {
             for spec in layer.tensors.iter().filter(|spec| spec.required) {
                 let mut weight = FamilyWeight {
                     layer_index: Some(layer.layer_index as u32),
+                    expert_index: None,
                     role: spec.role.clone(),
                     external_name: spec.name.clone(),
                     dimensions: vec![1],
@@ -2076,6 +2910,7 @@ mod tests {
             let external_name = ferrum_to_gguf_with_arch("qwen35moe", &spec.name).unwrap();
             let mut weight = FamilyWeight {
                 layer_index: None,
+                expert_index: None,
                 role: spec.role.clone(),
                 external_name,
                 dimensions: vec![1],
@@ -2091,6 +2926,7 @@ mod tests {
                 let external_name = ferrum_to_gguf_with_arch("qwen35moe", &spec.name).unwrap();
                 let mut weight = FamilyWeight {
                     layer_index: Some(layer.layer_index as u32),
+                    expert_index: None,
                     role: spec.role.clone(),
                     external_name,
                     dimensions: vec![1],
@@ -2122,12 +2958,247 @@ mod tests {
         }
     }
 
+    fn test_moe_gptq_config() -> Qwen35FamilyConfig {
+        let mut config = test_moe_gguf_config();
+        let text_config = config
+            .hf_config
+            .get_mut("text_config")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        text_config.insert("num_experts".to_owned(), Value::from(12));
+        text_config.insert("moe_intermediate_size".to_owned(), Value::from(16));
+        text_config.insert(
+            "shared_expert_intermediate_size".to_owned(),
+            Value::from(16),
+        );
+        text_config.insert(
+            "quantization_config".to_owned(),
+            serde_json::json!({
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 16,
+                "desc_act": false,
+                "sym": true
+            }),
+        );
+        let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config).unwrap();
+        let manifest = text.weight_manifest("model.language_model").unwrap();
+        let mut weights = Vec::new();
+        for (layer_index, spec) in manifest
+            .global_tensors
+            .iter()
+            .map(|spec| (None, spec))
+            .chain(manifest.layers.iter().flat_map(|layer| {
+                layer
+                    .tensors
+                    .iter()
+                    .map(move |spec| (Some(layer.layer_index as u32), spec))
+            }))
+            .filter(|(_, spec)| spec.required)
+        {
+            let mut weight = FamilyWeight {
+                layer_index,
+                expert_index: None,
+                role: spec.role.clone(),
+                external_name: spec.name.clone(),
+                dimensions: vec![1],
+                source_encoding: FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+            };
+            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weights.push(weight);
+        }
+        for layer in &manifest.layers {
+            for spec in layer.tensors.iter().filter(|spec| {
+                matches!(
+                    spec.role.as_str(),
+                    "moe_per_expert_gate_proj_qweight"
+                        | "moe_per_expert_up_proj_qweight"
+                        | "moe_per_expert_down_proj_qweight"
+                )
+            }) {
+                for expert in 0..text.moe.as_ref().unwrap().num_experts {
+                    let external_name = spec.name.replace('*', &expert.to_string());
+                    let mut weight = FamilyWeight {
+                        layer_index: Some(layer.layer_index as u32),
+                        expert_index: Some(expert as u32),
+                        role: spec.role.clone(),
+                        external_name: external_name.clone(),
+                        dimensions: vec![1],
+                        source_encoding: FamilyWeightSourceEncoding::Dense {
+                            element_type: ElementType::F16,
+                        },
+                    };
+                    weight.dimensions = test_weight_dimensions(&text, &weight);
+                    let [n, k] = weight.dimensions.as_slice() else {
+                        panic!("test GPTQ expert source must be a matrix")
+                    };
+                    let stem = external_name.strip_suffix(".qweight").unwrap();
+                    weight.source_encoding = FamilyWeightSourceEncoding::Gptq {
+                        qweight: FamilyGptqTensor {
+                            external_name: external_name.clone(),
+                            dimensions: vec![k / 8, *n],
+                            element_type: ElementType::I32,
+                        },
+                        scales: FamilyGptqTensor {
+                            external_name: format!("{stem}.scales"),
+                            dimensions: vec![k / 16, *n],
+                            element_type: ElementType::F16,
+                        },
+                        qzeros: FamilyGptqTensor {
+                            external_name: format!("{stem}.qzeros"),
+                            dimensions: vec![k / 16, n / 8],
+                            element_type: ElementType::I32,
+                        },
+                        g_idx: Some(FamilyGptqTensor {
+                            external_name: format!("{stem}.g_idx"),
+                            dimensions: vec![*k],
+                            element_type: ElementType::I32,
+                        }),
+                    };
+                    weights.push(weight);
+                }
+            }
+        }
+        weights.sort_by(|left, right| {
+            (left.layer_index, left.role.as_str(), left.expert_index).cmp(&(
+                right.layer_index,
+                right.role.as_str(),
+                right.expert_index,
+            ))
+        });
+        config.metadata = parse_hf_model_semantic_metadata(
+            &config.hf_config,
+            br#"{
+                "chat_template": "{{ messages }}",
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "pad_token_id": 0
+            }"#,
+        )
+        .unwrap();
+        config.weight_format = FamilyWeightFormat::SafetensorsGptqMarlin;
+        config.weights = weights;
+        config
+    }
+
+    #[test]
+    fn builds_typed_gptq_moe_expert_stacks_in_numeric_order() {
+        let config = test_moe_gptq_config();
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(&config).unwrap())
+            .unwrap();
+        let schema = prepared.weight_schema();
+        assert_eq!(
+            schema.format_id.as_str(),
+            "weight-format.safetensors.gptq-marlin-int4"
+        );
+        assert_eq!(
+            schema.quantization_formats(),
+            BTreeSet::from([QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID).unwrap()])
+        );
+        let routed = schema
+            .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        let PhysicalWeightLayout::ExpertStack {
+            experts,
+            expert_axis,
+        } = &routed.physical_layout
+        else {
+            panic!("routed gate/up must be an expert stack")
+        };
+        assert_eq!(*expert_axis, 0);
+        assert_eq!(experts.len(), 12);
+        assert!(experts.iter().all(|expert| matches!(
+            expert,
+            PhysicalWeightLayout::Composite { parts }
+                if parts.len() == 2
+                    && parts.iter().all(|part| matches!(
+                        part.layout.as_ref(),
+                        PhysicalWeightLayout::Quantized { .. }
+                    ))
+        )));
+        for expert in 0..12 {
+            let expected =
+                format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.qweight");
+            let component = schema
+                .components
+                .iter()
+                .find(|component| component.external_names.first() == Some(&expected))
+                .unwrap();
+            assert_eq!(
+                component.external_names,
+                [
+                    expected,
+                    format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.qzeros"),
+                    format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.g_idx"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_gptq_moe_expert_identity_drift() {
+        let mut config = test_moe_gptq_config();
+        let mut swapped = 0;
+        for weight in config.weights.iter_mut().filter(|weight| {
+            weight.layer_index == Some(0) && weight.role == "moe_per_expert_gate_proj_qweight"
+        }) {
+            match weight.expert_index {
+                Some(0) => {
+                    weight.expert_index = Some(1);
+                    swapped += 1;
+                }
+                Some(1) => {
+                    weight.expert_index = Some(0);
+                    swapped += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(swapped, 2);
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("expert index must remain bound to its checkpoint tensor name");
+        assert!(error.to_string().contains("manifest"), "{error}");
+    }
+
+    #[test]
+    fn rejects_mixed_gptq_moe_routed_representations() {
+        let mut config = test_moe_gptq_config();
+        config.weights.push(FamilyWeight {
+            layer_index: Some(0),
+            expert_index: None,
+            role: "moe_stacked_gate_proj".to_owned(),
+            external_name: "model.language_model.layers.0.mlp.gate_exps.weight".to_owned(),
+            dimensions: vec![12, 16, 16],
+            source_encoding: FamilyWeightSourceEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+        });
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("GPTQ MoE must reject multiple routed weight representations");
+        assert!(
+            error.to_string().contains("mixes canonical per-expert"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn prepares_sparse_moe_program_with_routed_shared_contract() {
         let config = test_moe_gguf_config();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&serde_json::to_value(&config).unwrap())
             .unwrap();
+        assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
+        assert_eq!(
+            prepared.external_metadata_id().as_str(),
+            MOE_EXTERNAL_METADATA_ID
+        );
         let nodes = &prepared.program().blocks()[0].nodes;
         let moe_nodes = nodes
             .iter()
