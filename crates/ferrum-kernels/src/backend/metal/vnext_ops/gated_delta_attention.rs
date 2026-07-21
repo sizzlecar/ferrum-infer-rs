@@ -48,6 +48,7 @@ const COLLECT_CONV_STATE_KERNEL: &str = "vnext_gated_delta_collect_conv_state_f1
 const COPY_F16_KERNEL: &str = "vnext_gated_delta_copy_f16";
 const QK_NORM_KERNEL: &str = "vnext_gated_delta_qk_norm_f32";
 const DELTA_KERNEL: &str = "vnext_gated_delta_rule_tiled16_f32_state";
+const CHUNK_K_GRAM_K128_KERNEL: &str = "vnext_gated_delta_chunk_k_gram_c64_k128";
 const CHUNK_KKT_INVERSE_KERNEL: &str = "vnext_gated_delta_chunk_kkt_inverse_c64";
 const CHUNK_UW_KERNEL: &str = "vnext_gated_delta_chunk_uw_c64";
 const CHUNK_UW_K128_V128_KERNEL: &str = "vnext_gated_delta_chunk_uw_c64_k128_v128";
@@ -90,7 +91,9 @@ pub(super) struct MetalGatedDeltaPipelines {
     copy_f16: ComputePipelineState,
     qk_norm: ComputePipelineState,
     delta: ComputePipelineState,
-    chunk_kkt_inverse: ComputePipelineState,
+    chunk_k_gram_k128: ComputePipelineState,
+    chunk_kkt_inverse_generic: ComputePipelineState,
+    chunk_kkt_inverse_precomputed_gram: ComputePipelineState,
     chunk_uw_generic: ComputePipelineState,
     chunk_uw_k128_v128: ComputePipelineState,
     chunk_qk: ComputePipelineState,
@@ -147,6 +150,30 @@ impl MetalGatedDeltaPipelines {
                     ))
                 })
         };
+        let kkt_pipeline = |precomputed_gram: bool| {
+            let constants = FunctionConstantValues::new();
+            constants.set_constant_value_at_index(
+                &precomputed_gram as *const bool as *const c_void,
+                MTLDataType::Bool,
+                1,
+            );
+            let function = library
+                .get_function(CHUNK_KKT_INVERSE_KERNEL, Some(constants))
+                .map_err(|error| {
+                    MetalDeviceRuntimeError::contract(format!(
+                        "load Metal vNext gated-delta {CHUNK_KKT_INVERSE_KERNEL} \
+                         precomputed_gram={precomputed_gram}: {error}"
+                    ))
+                })?;
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|error| {
+                    MetalDeviceRuntimeError::contract(format!(
+                        "build Metal vNext gated-delta {CHUNK_KKT_INVERSE_KERNEL} \
+                         precomputed_gram={precomputed_gram}: {error}"
+                    ))
+                })
+        };
         Ok(Self {
             prepare_conv: pipeline(PREPARE_CONV_KERNEL)?,
             prepare_gates: pipeline(PREPARE_GATES_KERNEL)?,
@@ -154,7 +181,9 @@ impl MetalGatedDeltaPipelines {
             copy_f16: pipeline(COPY_F16_KERNEL)?,
             qk_norm: pipeline(QK_NORM_KERNEL)?,
             delta: pipeline(DELTA_KERNEL)?,
-            chunk_kkt_inverse: pipeline(CHUNK_KKT_INVERSE_KERNEL)?,
+            chunk_k_gram_k128: pipeline(CHUNK_K_GRAM_K128_KERNEL)?,
+            chunk_kkt_inverse_generic: kkt_pipeline(false)?,
+            chunk_kkt_inverse_precomputed_gram: kkt_pipeline(true)?,
             chunk_uw_generic: pipeline(CHUNK_UW_KERNEL)?,
             chunk_uw_k128_v128: pipeline(CHUNK_UW_K128_V128_KERNEL)?,
             chunk_qk: pipeline(CHUNK_QK_KERNEL)?,
@@ -547,6 +576,11 @@ struct GatedDeltaParams {
 const fn uses_chunk_uw_k128_v128(params: &GatedDeltaParams) -> bool {
     params.key_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as u32
         && params.value_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as u32
+}
+
+const fn uses_chunk_k_gram_k128(params: &GatedDeltaParams) -> bool {
+    params.key_dim == GATED_DELTA_CHUNK_KEY_DIM_LIMIT as u32
+        && params.value_heads > params.key_heads
 }
 
 fn text_attribute<'a>(
@@ -1487,10 +1521,36 @@ fn dispatch_chunked_delta_c64(
     let params = &launch.params;
     let chunks = u64::from(params.tokens).div_ceil(u64::from(GATED_DELTA_CHUNK_SIZE));
 
-    encoder.set_compute_pipeline_state(&pipelines.chunk_kkt_inverse);
-    for (index, offset) in [launch.key, launch.g, launch.beta, launch.core]
-        .into_iter()
-        .enumerate()
+    let uses_precomputed_gram = uses_chunk_k_gram_k128(params);
+    if uses_precomputed_gram {
+        encoder.set_compute_pipeline_state(&pipelines.chunk_k_gram_k128);
+        for (index, offset) in [launch.key, launch.qkv].into_iter().enumerate() {
+            set_region_offset(encoder, index as u64, scratch, offset);
+        }
+        set_params(encoder, 2, params);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(chunks, u64::from(params.key_heads), 1),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    }
+
+    encoder.set_compute_pipeline_state(if uses_precomputed_gram {
+        &pipelines.chunk_kkt_inverse_precomputed_gram
+    } else {
+        &pipelines.chunk_kkt_inverse_generic
+    });
+    for (index, offset) in [
+        if uses_precomputed_gram {
+            launch.qkv
+        } else {
+            launch.key
+        },
+        launch.g,
+        launch.beta,
+        launch.core,
+    ]
+    .into_iter()
+    .enumerate()
     {
         set_region_offset(encoder, index as u64, scratch, offset);
     }

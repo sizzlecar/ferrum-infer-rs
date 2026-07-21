@@ -59,6 +59,23 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
     }
 }
 
+#[test]
+fn chunk_k_gram_specialization_requires_repeated_k128_heads() {
+    let semantics = TestSemantics {
+        decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+        value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
+    };
+    let mut params = test_params(64, semantics);
+    assert!(uses_chunk_k_gram_k128(&params));
+
+    params.value_heads = params.key_heads;
+    assert!(!uses_chunk_k_gram_k128(&params));
+
+    params.value_heads = VALUE_HEADS as u32;
+    params.key_dim = 64;
+    assert!(!uses_chunk_k_gram_k128(&params));
+}
+
 fn assert_recurrent_conformance(semantics: TestSemantics) {
     let Some(device) = Device::system_default() else {
         eprintln!("no Metal device; skipping gated-delta conformance");
@@ -316,8 +333,6 @@ fn launch_extent_validation_rejects_msl_uint_overflow() {
 #[test]
 fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     const CHUNK_TOKENS: usize = 145;
-    const CHUNK_KEY_HEADS: usize = 2;
-    const CHUNK_VALUE_HEADS: usize = 4;
     const STATE_SENTINEL: f32 = 73.25;
 
     let Some(device) = Device::system_default() else {
@@ -326,19 +341,21 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     };
     let pipelines = MetalGatedDeltaPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
-    for (key_dim, value_dim) in [(32, 32), (128, 128)] {
-        let mut query = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * key_dim, 0.019, 0.4);
-        let mut key = float_values(CHUNK_TOKENS * CHUNK_KEY_HEADS * key_dim, 0.031, 0.35);
+    for (key_heads, value_heads, key_dim, value_dim) in
+        [(2, 4, 32, 32), (2, 4, 128, 128), (2, 2, 128, 128)]
+    {
+        let mut query = float_values(CHUNK_TOKENS * key_heads * key_dim, 0.019, 0.4);
+        let mut key = float_values(CHUNK_TOKENS * key_heads * key_dim, 0.031, 0.35);
         normalize_rows(&mut query, key_dim);
         normalize_rows(&mut key, key_dim);
-        let value = float_values(CHUNK_TOKENS * CHUNK_VALUE_HEADS * value_dim, 0.023, 0.2);
-        let g = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
+        let value = float_values(CHUNK_TOKENS * value_heads * value_dim, 0.023, 0.2);
+        let g = (0..CHUNK_TOKENS * value_heads)
             .map(|index| -0.008 - (index as f32 * 0.017).sin().abs() * 0.025)
             .collect::<Vec<_>>();
-        let beta = (0..CHUNK_TOKENS * CHUNK_VALUE_HEADS)
+        let beta = (0..CHUNK_TOKENS * value_heads)
             .map(|index| 0.2 + (index as f32 * 0.013).sin().abs() * 0.6)
             .collect::<Vec<_>>();
-        let initial_state = float_values(CHUNK_VALUE_HEADS * value_dim * key_dim, 0.011, 0.025);
+        let initial_state = float_values(value_heads * value_dim * key_dim, 0.011, 0.025);
 
         for mapping in [
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
@@ -346,8 +363,8 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
         ] {
             let shape = ChunkTestShape {
                 tokens: CHUNK_TOKENS,
-                key_heads: CHUNK_KEY_HEADS,
-                value_heads: CHUNK_VALUE_HEADS,
+                key_heads,
+                value_heads,
                 key_dim,
                 value_dim,
                 mapping,
@@ -390,11 +407,11 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
                 &device,
                 &queue,
                 &pipelines,
-                row_slice(&query, CHUNK_KEY_HEADS * key_dim, 0..split),
-                row_slice(&key, CHUNK_KEY_HEADS * key_dim, 0..split),
-                row_slice(&value, CHUNK_VALUE_HEADS * value_dim, 0..split),
-                row_slice(&g, CHUNK_VALUE_HEADS, 0..split),
-                row_slice(&beta, CHUNK_VALUE_HEADS, 0..split),
+                row_slice(&query, key_heads * key_dim, 0..split),
+                row_slice(&key, key_heads * key_dim, 0..split),
+                row_slice(&value, value_heads * value_dim, 0..split),
+                row_slice(&g, value_heads, 0..split),
+                row_slice(&beta, value_heads, 0..split),
                 &initial_state,
                 first_shape,
                 STATE_SENTINEL,
@@ -408,11 +425,11 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
                 &device,
                 &queue,
                 &pipelines,
-                row_slice(&query, CHUNK_KEY_HEADS * key_dim, split..CHUNK_TOKENS),
-                row_slice(&key, CHUNK_KEY_HEADS * key_dim, split..CHUNK_TOKENS),
-                row_slice(&value, CHUNK_VALUE_HEADS * value_dim, split..CHUNK_TOKENS),
-                row_slice(&g, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
-                row_slice(&beta, CHUNK_VALUE_HEADS, split..CHUNK_TOKENS),
+                row_slice(&query, key_heads * key_dim, split..CHUNK_TOKENS),
+                row_slice(&key, key_heads * key_dim, split..CHUNK_TOKENS),
+                row_slice(&value, value_heads * value_dim, split..CHUNK_TOKENS),
+                row_slice(&g, value_heads, split..CHUNK_TOKENS),
+                row_slice(&beta, value_heads, split..CHUNK_TOKENS),
                 &split_state,
                 second_shape,
                 STATE_SENTINEL,
@@ -502,10 +519,40 @@ fn run_chunked_core(
 
     let command = queue.new_command_buffer();
     let encoder = command.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipelines.chunk_kkt_inverse);
-    for (index, buffer) in [&*key_buffer, &*g_buffer, &*beta_buffer, &*inverse]
-        .into_iter()
-        .enumerate()
+    let uses_precomputed_gram = uses_chunk_k_gram_k128(&params);
+    if uses_precomputed_gram {
+        encoder.set_compute_pipeline_state(&pipelines.chunk_k_gram_k128);
+        for (index, buffer) in [&*key_buffer, &*uw].into_iter().enumerate() {
+            set_raw(encoder, index as u64, buffer);
+        }
+        set_params(encoder, 2, &params);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                (shape.tokens as u64).div_ceil(u64::from(GATED_DELTA_CHUNK_SIZE)),
+                shape.key_heads as u64,
+                1,
+            ),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    }
+
+    encoder.set_compute_pipeline_state(if uses_precomputed_gram {
+        &pipelines.chunk_kkt_inverse_precomputed_gram
+    } else {
+        &pipelines.chunk_kkt_inverse_generic
+    });
+    for (index, buffer) in [
+        if uses_precomputed_gram {
+            &*uw
+        } else {
+            &*key_buffer
+        },
+        &*g_buffer,
+        &*beta_buffer,
+        &*inverse,
+    ]
+    .into_iter()
+    .enumerate()
     {
         set_raw(encoder, index as u64, buffer);
     }

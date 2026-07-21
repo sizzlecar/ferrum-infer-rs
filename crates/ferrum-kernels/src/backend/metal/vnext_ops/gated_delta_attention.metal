@@ -6,6 +6,7 @@ constant uint VALUE_TILE = 16;
 constant uint GATED_DELTA_CHUNK_SIZE = 64;
 constant uint GATED_DELTA_CHUNK_KEY_DIM_LIMIT = 128;
 constant bool GATED_DELTA_CARRY_KEY_DIM_128 [[function_constant(0)]];
+constant bool GATED_DELTA_KKT_PRECOMPUTED_GRAM [[function_constant(1)]];
 
 struct GatedDeltaParams {
     uint tokens;
@@ -290,8 +291,50 @@ kernel void vnext_gated_delta_rule_tiled16_f32_state(
     }
 }
 
-kernel void vnext_gated_delta_chunk_kkt_inverse_c64(
+kernel void vnext_gated_delta_chunk_k_gram_c64_k128(
     device const float * key [[buffer(0)]],
+    device float * gram [[buffer(1)]],
+    constant GatedDeltaParams & params [[buffer(2)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint chunk_start = group.x * GATED_DELTA_CHUNK_SIZE;
+    const uint key_head = group.y;
+    if (chunk_start >= params.tokens || key_head >= params.key_heads
+        || params.key_dim != GATED_DELTA_CHUNK_KEY_DIM_LIMIT) {
+        return;
+    }
+    const uint chunk_tokens = min(GATED_DELTA_CHUNK_SIZE, params.tokens - chunk_start);
+    for (uint index = lane;
+         index < GATED_DELTA_CHUNK_SIZE * GATED_DELTA_CHUNK_SIZE;
+         index += THREADS_PER_GROUP) {
+        const uint row = index / GATED_DELTA_CHUNK_SIZE;
+        const uint column = index - row * GATED_DELTA_CHUNK_SIZE;
+        if (row >= chunk_tokens) {
+            continue;
+        }
+        float dot = 0.0f;
+        if (column < row) {
+            const uint row_token = chunk_start + row;
+            const uint column_token = chunk_start + column;
+            const ulong row_base =
+                (ulong(row_token) * params.key_heads + key_head)
+                    * GATED_DELTA_CHUNK_KEY_DIM_LIMIT;
+            const ulong column_base =
+                (ulong(column_token) * params.key_heads + key_head)
+                    * GATED_DELTA_CHUNK_KEY_DIM_LIMIT;
+            for (uint key_column = 0;
+                 key_column < GATED_DELTA_CHUNK_KEY_DIM_LIMIT;
+                 ++key_column) {
+                dot += key[row_base + key_column] * key[column_base + key_column];
+            }
+        }
+        gram[(ulong(chunk_start + row) * params.key_heads + key_head)
+            * GATED_DELTA_CHUNK_SIZE + column] = dot;
+    }
+}
+
+kernel void vnext_gated_delta_chunk_kkt_inverse_c64(
+    device const float * key_or_gram [[buffer(0)]],
     device float * g [[buffer(1)]],
     device const float * beta [[buffer(2)]],
     device half * inverse [[buffer(3)]],
@@ -300,7 +343,9 @@ kernel void vnext_gated_delta_chunk_kkt_inverse_c64(
     uint lane [[thread_index_in_threadgroup]]) {
     const uint chunk_start = group.x * GATED_DELTA_CHUNK_SIZE;
     const uint value_head = group.y;
-    if (chunk_start >= params.tokens || value_head >= params.value_heads) {
+    if (chunk_start >= params.tokens || value_head >= params.value_heads
+        || (GATED_DELTA_KKT_PRECOMPUTED_GRAM
+            && params.key_dim != GATED_DELTA_CHUNK_KEY_DIM_LIMIT)) {
         return;
     }
     const uint chunk_tokens = min(GATED_DELTA_CHUNK_SIZE, params.tokens - chunk_start);
@@ -330,13 +375,21 @@ kernel void vnext_gated_delta_chunk_kkt_inverse_c64(
         if (row < chunk_tokens && column < row) {
             const uint row_token = chunk_start + row;
             const uint column_token = chunk_start + column;
-            const ulong row_base =
-                (ulong(row_token) * params.key_heads + key_head) * params.key_dim;
-            const ulong column_base =
-                (ulong(column_token) * params.key_heads + key_head) * params.key_dim;
             float dot = 0.0f;
-            for (uint key_column = 0; key_column < params.key_dim; ++key_column) {
-                dot += key[row_base + key_column] * key[column_base + key_column];
+            if (GATED_DELTA_KKT_PRECOMPUTED_GRAM) {
+                dot = key_or_gram[
+                    (ulong(row_token) * params.key_heads + key_head)
+                        * GATED_DELTA_CHUNK_SIZE
+                    + column];
+            } else {
+                const ulong row_base =
+                    (ulong(row_token) * params.key_heads + key_head) * params.key_dim;
+                const ulong column_base =
+                    (ulong(column_token) * params.key_heads + key_head) * params.key_dim;
+                for (uint key_column = 0; key_column < params.key_dim; ++key_column) {
+                    dot += key_or_gram[row_base + key_column]
+                        * key_or_gram[column_base + key_column];
+                }
             }
             const float row_g =
                 g[ulong(row_token) * params.value_heads + value_head];
