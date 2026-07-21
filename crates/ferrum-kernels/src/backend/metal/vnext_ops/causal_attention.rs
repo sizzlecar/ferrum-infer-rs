@@ -32,7 +32,7 @@ use super::{
     binding, checked_u32, contract_error, ensure_invocation, f16_contiguous,
     implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
     rational_attribute, shared_binding_region, shared_full_region, shared_scratch_region,
-    token_binding_is_shared, unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID,
+    shared_token_region, token_binding_is_shared, unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID,
     GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID,
     VALUE_ALIGNMENT_BYTES, VNEXT_KV_PAGE_BYTES,
 };
@@ -589,6 +589,22 @@ struct ParticipantLaunch {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct PackedLaunch {
+    input: usize,
+    output: usize,
+    normalized: u64,
+    projected: u64,
+    tokens: u32,
+    hidden_size: u32,
+    residual_elements: u32,
+    epsilon: f32,
+    query_projection: LinearLaunch,
+    key_projection: LinearLaunch,
+    value_projection: LinearLaunch,
+    output_projection: LinearLaunch,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PageBinding {
     first_page_region: usize,
     page_count: usize,
@@ -825,17 +841,105 @@ fn encode_attention(
         });
     }
 
-    for launch in &launches {
+    let packed = if input_shared && output_shared && launches.len() > 1 {
+        let input = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        let output = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        let packed = PackedLaunch {
+            input,
+            output,
+            normalized: layout.normalized,
+            projected: layout.projected,
+            tokens: checked_u32(total_tokens, "Metal packed causal-attention token count")?,
+            hidden_size: checked_u32(
+                shape.hidden_size,
+                "Metal packed causal-attention hidden size",
+            )?,
+            residual_elements: checked_u32(
+                total_tokens.checked_mul(shape.hidden_size).ok_or_else(|| {
+                    "Metal packed causal-attention residual element count overflows".to_owned()
+                })?,
+                "Metal packed causal-attention residual elements",
+            )?,
+            epsilon: shape.epsilon,
+            query_projection: linear_launch(
+                query_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.query_projection_features,
+                layout.normalized,
+                layout.query_raw,
+            )?,
+            key_projection: linear_launch(
+                key_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.kv_features,
+                layout.normalized,
+                layout.key_raw,
+            )?,
+            value_projection: linear_launch(
+                value_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.kv_features,
+                layout.normalized,
+                layout.value_raw,
+            )?,
+            output_projection: linear_launch(
+                output_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.query_features,
+                shape.hidden_size,
+                layout.context,
+                layout.projected,
+            )?,
+        };
         validate_launch_regions(
             &regions,
             &[
-                launch.query_projection,
-                launch.key_projection,
-                launch.value_projection,
-                launch.output_projection,
+                packed.query_projection,
+                packed.key_projection,
+                packed.value_projection,
+                packed.output_projection,
             ],
         )?;
-    }
+        Some(packed)
+    } else {
+        for launch in &launches {
+            validate_launch_regions(
+                &regions,
+                &[
+                    launch.query_projection,
+                    launch.key_projection,
+                    launch.value_projection,
+                    launch.output_projection,
+                ],
+            )?;
+        }
+        None
+    };
 
     let argument_encoder = attention.new_binding_encoder();
     let binding_command = MetalDeviceCommand::operation(
@@ -852,29 +956,45 @@ fn encode_attention(
         "Metal causal-attention participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let dispatch_count = (launches.len() as u64).saturating_mul(8);
+    let packed_enabled = packed.is_some();
+    let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled);
     let compute_command = MetalDeviceCommand::operation(
         "vnext_causal_paged_attention",
         regions,
         move |encoder, regions| {
             encoder.record_compute_dispatches(dispatch_count);
-            for launch in &launches {
-                enqueue_attention(
+            if let Some(packed) = packed.as_ref() {
+                enqueue_packed_attention(
                     &attention,
                     &linear,
                     &primitives,
                     encoder.compute_encoder(),
                     regions,
                     shared,
-                    launch,
+                    packed,
+                    &launches,
                 );
+            } else {
+                for launch in &launches {
+                    enqueue_attention(
+                        &attention,
+                        &linear,
+                        &primitives,
+                        encoder.compute_encoder(),
+                        regions,
+                        shared,
+                        launch,
+                    );
+                }
             }
             Ok(())
         },
     )
     .map_err(|error| error.to_string())?
     .with_work_shape(
-        if participant_count == 1 {
+        if packed_enabled {
+            DeviceBatchingForm::Packed
+        } else if participant_count == 1 {
             DeviceBatchingForm::Scalar
         } else {
             DeviceBatchingForm::ParticipantLoop
@@ -885,6 +1005,15 @@ fn encode_attention(
     .map_err(|error| error.to_string())?;
 
     Ok(EncodedDeviceOperation::compute(compute_command).with_dynamic_binding(binding_command))
+}
+
+fn physical_dispatch_count(participant_count: usize, packed: bool) -> u64 {
+    let participants = participant_count as u64;
+    if packed {
+        participants.saturating_mul(2).saturating_add(6)
+    } else {
+        participants.saturating_mul(8)
+    }
 }
 
 fn encode_page_bindings(
@@ -991,6 +1120,55 @@ fn enqueue_attention(
         &regions[launch.output],
         0,
         launch.residual_elements,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_packed_attention(
+    attention: &MetalCausalAttentionPipelines,
+    linear: &MetalLinearPipelines,
+    primitives: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    shared: SharedRegions,
+    packed: &PackedLaunch,
+    participants: &[ParticipantLaunch],
+) {
+    let scratch = &regions[shared.scratch];
+    dispatch_rms_norm_at(
+        primitives,
+        encoder,
+        &regions[packed.input],
+        0,
+        &regions[shared.input_norm],
+        scratch,
+        packed.normalized,
+        packed.tokens,
+        packed.hidden_size,
+        packed.epsilon,
+    );
+    for projection in [
+        packed.query_projection,
+        packed.key_projection,
+        packed.value_projection,
+    ] {
+        dispatch_linear(linear, encoder, regions, projection);
+    }
+    for participant in participants {
+        dispatch_prepare(attention, encoder, regions, shared, participant);
+        dispatch_attention(attention, encoder, regions, shared, participant);
+    }
+    dispatch_linear(linear, encoder, regions, packed.output_projection);
+    dispatch_residual_add_at(
+        primitives,
+        encoder,
+        &regions[packed.input],
+        0,
+        scratch,
+        packed.projected,
+        &regions[packed.output],
+        0,
+        packed.residual_elements,
     );
 }
 
@@ -1354,6 +1532,13 @@ mod shape_tests {
             ScratchLayout::new(shape, 3).unwrap().required_bytes,
             3 * shape.scratch_bytes_per_token().unwrap()
         );
+    }
+
+    #[test]
+    fn packed_dispatch_count_keeps_only_sequence_local_kernels_per_participant() {
+        assert_eq!(physical_dispatch_count(1, false), 8);
+        assert_eq!(physical_dispatch_count(4, false), 32);
+        assert_eq!(physical_dispatch_count(4, true), 14);
     }
 }
 
