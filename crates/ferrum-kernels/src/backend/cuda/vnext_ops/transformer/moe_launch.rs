@@ -1,5 +1,7 @@
 //! Raw CUDA launches owned by the routed/shared SwiGLU MoE provider.
 
+use std::sync::Arc;
+
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 
@@ -238,7 +240,7 @@ pub(super) fn zero_region(
 }
 
 fn load_function(
-    module: &cudarc::driver::CudaModule,
+    module: &Arc<cudarc::driver::CudaModule>,
     name: &'static str,
     operation: &'static str,
 ) -> Result<CudaFunction, CudaDeviceRuntimeError> {
