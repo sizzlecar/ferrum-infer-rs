@@ -402,7 +402,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         output_layout: HostTransferLayout,
         timing_mode: DeviceTimingMode,
     ) -> Result<LaneReadback, LaneReadbackError<R::Error>> {
-        let timing_started = (timing_mode == DeviceTimingMode::Completion).then(Instant::now);
+        let timing_started = timing_mode.completion_enabled().then(Instant::now);
         let output_bytes = output_layout
             .byte_len()
             .map_err(LaneReadbackError::Contract)?;
@@ -855,12 +855,13 @@ impl CompletionFenceTiming {
     ) -> Self {
         let device_execution = match (timing_mode, device_execution) {
             (DeviceTimingMode::Off, _) => DeviceTimingMeasurement::NotRequested,
-            (DeviceTimingMode::Completion, DeviceTimingMeasurement::NotRequested) => {
-                DeviceTimingMeasurement::Unavailable(
-                    DeviceTimingUnavailableReason::BackendUnsupported,
-                )
-            }
-            (DeviceTimingMode::Completion, measurement) => measurement,
+            (
+                DeviceTimingMode::Completion | DeviceTimingMode::Kernel,
+                DeviceTimingMeasurement::NotRequested,
+            ) => DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendUnsupported,
+            ),
+            (DeviceTimingMode::Completion | DeviceTimingMode::Kernel, measurement) => measurement,
         };
         Self {
             timing_mode,
@@ -1928,8 +1929,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 timing_mode,
                 ..
             } if blocking => {
-                let wait_started =
-                    (*timing_mode == DeviceTimingMode::Completion).then(Instant::now);
+                let wait_started = timing_mode.completion_enabled().then(Instant::now);
                 match catch_unwind(AssertUnwindSafe(|| lane.wait_fence(fence))) {
                     Ok(Ok(terminal)) => {
                         let wait_timing = match wait_started {
@@ -1983,7 +1983,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                         batch_identity,
                         terminal,
                         *timing_mode,
-                        if *timing_mode == DeviceTimingMode::Completion {
+                        if timing_mode.completion_enabled() {
                             DeviceTimingMeasurement::Measured(0)
                         } else {
                             DeviceTimingMeasurement::NotRequested
@@ -2692,8 +2692,10 @@ impl CompletionReadbackReceipt {
         completion: OperationCompletionReceipt,
         disposition: CompletionReadbackDisposition,
     ) -> Self {
-        let readback_timing = (completion.fence_timing().timing_mode()
-            == DeviceTimingMode::Completion)
+        let readback_timing = completion
+            .fence_timing()
+            .timing_mode()
+            .completion_enabled()
             .then(|| readback_timing_for_disposition(&disposition));
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
@@ -2765,8 +2767,11 @@ impl CompletionReadbackBatchReceipt {
         completion: OperationCompletionReceipt,
         dispositions: Vec<CompletionReadbackDisposition>,
     ) -> Self {
-        let readback_timings =
-            (completion.fence_timing().timing_mode() == DeviceTimingMode::Completion).then(|| {
+        let readback_timings = completion
+            .fence_timing()
+            .timing_mode()
+            .completion_enabled()
+            .then(|| {
                 dispositions
                     .iter()
                     .map(readback_timing_for_disposition)

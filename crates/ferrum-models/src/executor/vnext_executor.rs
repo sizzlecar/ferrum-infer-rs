@@ -1740,7 +1740,10 @@ impl<R: DeviceRuntime> KvCacheHandle for VNextKvCacheHandle<R> {
 }
 
 enum DispatchOutcome<R: DeviceRuntime> {
-    Submitted(CompletionHandle<R>),
+    Submitted {
+        completion: CompletionHandle<R>,
+        attribution: Option<BoundDeviceSubmissionAttribution>,
+    },
     QuiescentFailure(String),
     SubmissionIndeterminate {
         message: String,
@@ -3117,6 +3120,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn device_timing_mode(&self) -> DeviceTimingMode {
         match self.device_timing_mode.load(Ordering::Acquire) {
+            value if value == DeviceTimingMode::Kernel as u8 => DeviceTimingMode::Kernel,
             value if value == DeviceTimingMode::Completion as u8 => DeviceTimingMode::Completion,
             _ => DeviceTimingMode::Off,
         }
@@ -4025,6 +4029,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &self.lane,
                         &self.reaper,
                     )
+                    .map(ProfiledSubmissionHandle::into_parts)
                 } else {
                     OperationDispatch::encode_and_submit_wave_with_inputs(
                         self.providers.providers(),
@@ -4037,12 +4042,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &self.lane,
                         &self.reaper,
                     )
+                    .map(|completion| (completion, None))
                 }
             };
             match submission {
-                Ok(completion) => {
+                Ok((completion, attribution)) => {
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
-                    return DispatchOutcome::Submitted(completion);
+                    return DispatchOutcome::Submitted {
+                        completion,
+                        attribution,
+                    };
                 }
                 Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry })
                     if retries < MAX_DEFINITELY_NOT_SUBMITTED_RETRIES =>
@@ -4256,8 +4265,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let _phase_timing = phase_timing.host_encode_submit.start();
             self.dispatch_participant_wave(participants, wave, kind)
         };
+        let mut attribution_event_error = None;
         let completion = match dispatch {
-            DispatchOutcome::Submitted(completion) => completion,
+            DispatchOutcome::Submitted {
+                completion,
+                attribution,
+            } => {
+                if kind == VNextExecutionWaveKind::Prefill {
+                    if let Some(attribution) = attribution.as_ref() {
+                        let sink = self.event_sink.read().clone();
+                        if let Some(sink) = sink {
+                            if let Err(error) =
+                                sink.record_device_submission_attribution(attribution)
+                            {
+                                attribution_event_error = Some(error.to_string());
+                            }
+                        }
+                    }
+                }
+                completion
+            }
             DispatchOutcome::QuiescentFailure(message) => {
                 return Err(self.abort_step(step, message).await)
             }
@@ -4319,7 +4346,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
-        let mut execution_event_error = None;
+        let mut execution_event_error = attribution_event_error;
         for participant in participants {
             if let Some(events) = &participant.sequence.events {
                 if let Err(error) = events.lock().submitted(completion.receipt()) {

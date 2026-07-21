@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_contract, AttributeId, BatchedOperationInvocation,
+    causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
     ElementType, EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
@@ -847,10 +847,17 @@ fn encode_attention(
     )
     .map_err(|error| error.to_string())?;
 
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal causal-attention participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let dispatch_count = (launches.len() as u64).saturating_mul(8);
     let compute_command = MetalDeviceCommand::operation(
         "vnext_causal_paged_attention",
         regions,
         move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatch_count);
             for launch in &launches {
                 enqueue_attention(
                     &attention,
@@ -864,6 +871,16 @@ fn encode_attention(
             }
             Ok(())
         },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::ParticipantLoop
+        },
+        participant_count,
+        token_count,
     )
     .map_err(|error| error.to_string())?;
 

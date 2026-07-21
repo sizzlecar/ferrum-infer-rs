@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
-    BatchedOperationInvocation, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
-    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedTensorLayout, ResolvedValueRole, VNextError, WeightEncoding,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole, VNextError,
+    WeightEncoding, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -474,12 +474,31 @@ fn encode_dense_linear(
         }
     }
     validate_launch_regions(&regions, &launches)?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal dense linear participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let dispatch_count = launches.len() as u64;
     MetalDeviceCommand::operation("vnext_dense_linear", regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(dispatch_count);
         for launch in &launches {
             dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
         }
         Ok(())
     })
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else if dispatch_count == 1 {
+            DeviceBatchingForm::Packed
+        } else {
+            DeviceBatchingForm::ParticipantLoop
+        },
+        participant_count,
+        token_count,
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -559,15 +578,32 @@ fn encode_last_token_dense_linear(
         )?);
     }
     validate_launch_regions(&regions, &launches)?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal last-token linear participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let dispatch_count = launches.len() as u64;
     MetalDeviceCommand::operation(
         "vnext_last_token_dense_linear",
         regions,
         move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatch_count);
             for launch in &launches {
                 dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
             }
             Ok(())
         },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::ParticipantLoop
+        },
+        participant_count,
+        token_count,
     )
     .map_err(|error| error.to_string())
 }
@@ -704,7 +740,13 @@ fn encode_dense_swiglu(
         intermediate_size: checked_u32(intermediate_size, "Metal dense SwiGLU intermediate size")?,
         gate_up_stride: checked_u32(packed_width, "Metal dense SwiGLU packed width")?,
     };
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal dense SwiGLU participant count",
+    )?;
+    let dispatch_count = gate_launches.len() as u64 + 2;
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(dispatch_count);
         for launch in &gate_launches {
             dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
         }
@@ -718,6 +760,16 @@ fn encode_dense_swiglu(
         dispatch_linear(&pipelines, encoder.compute_encoder(), regions, down_launch);
         Ok(())
     })
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::Packed
+        },
+        participant_count,
+        tokens,
+    )
     .map_err(|error| error.to_string())
 }
 

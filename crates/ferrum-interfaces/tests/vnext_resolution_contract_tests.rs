@@ -657,8 +657,8 @@ fn resolved_model_plan_requires_trusted_completion_retention() {
         &fixture.policy,
     )
     .with_completion_retention(retention);
-    let plan = ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &trusted_retention)
-        .unwrap();
+    let plan =
+        ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &trusted_retention).unwrap();
     let restored =
         ResolvedModelPlan::from_json_validated(&plan.to_json().unwrap(), &trusted_retention)
             .unwrap();

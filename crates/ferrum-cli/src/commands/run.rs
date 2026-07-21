@@ -1787,6 +1787,11 @@ fn run_startup_cli_runtime_entries(
     gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
+    entries.push(RuntimeConfigEntry::new(
+        "FERRUM_PROFILE_DETAIL",
+        cmd.profile_detail.as_str(),
+        RuntimeConfigSource::Cli,
+    ));
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
         "FERRUM_KV_DTYPE",
@@ -2133,6 +2138,26 @@ mod tests {
         assert!(entry("FERRUM_PROFILE_ENTRYPOINT")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
+    }
+
+    #[test]
+    fn run_full_profile_detail_reaches_typed_engine_config() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Full;
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+
+        engine
+            .apply_runtime_config_snapshot(&effective)
+            .expect("full profile detail should apply");
+
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Full
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    DeviceBatchingForm, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
     GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProviderWorkspaceRequirement,
@@ -815,10 +815,17 @@ fn encode_attention(
             ],
         )?;
     }
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal gated-delta participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let dispatch_count = (launches.len() as u64).saturating_mul(14);
     MetalDeviceCommand::operation(
         "vnext_gated_delta_recurrent_attention",
         regions,
         move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatch_count);
             for launch in &launches {
                 enqueue_attention(
                     &attention,
@@ -833,6 +840,16 @@ fn encode_attention(
             }
             Ok(())
         },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::ParticipantLoop
+        },
+        participant_count,
+        token_count,
     )
     .map_err(|error| error.to_string())
 }
