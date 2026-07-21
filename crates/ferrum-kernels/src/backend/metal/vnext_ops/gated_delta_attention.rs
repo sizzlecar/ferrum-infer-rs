@@ -30,7 +30,7 @@ use super::{
     binding, checked_u32, contiguous_bindings, contiguous_region, contiguous_token_region,
     ensure_invocation, f16_contiguous, implementation_fingerprint, invalid_plan,
     provider_descriptor, provider_failure, rational_attribute, shared_full_region,
-    shared_scratch_region, token_binding_is_shared, unsigned_attribute,
+    shared_scratch_region, shared_token_region, token_binding_is_shared, unsigned_attribute,
     DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
     Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
 };
@@ -554,6 +554,19 @@ struct ParticipantLaunch {
     output_projection: LinearLaunch,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PackedLaunch {
+    input: usize,
+    output: usize,
+    residual_elements: u32,
+    params: GatedDeltaParams,
+    qkv_projection: LinearLaunch,
+    z_projection: LinearLaunch,
+    b_projection: LinearLaunch,
+    a_projection: LinearLaunch,
+    output_projection: LinearLaunch,
+}
+
 fn encode_attention(
     attention: Arc<MetalGatedDeltaPipelines>,
     linear: Arc<MetalLinearPipelines>,
@@ -803,31 +816,127 @@ fn encode_attention(
             output_projection,
         });
     }
-    for launch in &launches {
+    let packed = if input_shared && output_shared && launches.len() > 1 {
+        shape.validate_launch_extents(total_tokens)?;
+        let input = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        let output = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        let packed = PackedLaunch {
+            input,
+            output,
+            residual_elements: checked_u32(
+                checked_product(&[total_tokens, shape.hidden_size])?,
+                "Metal packed gated-delta residual elements",
+            )?,
+            params: shape.params(total_tokens)?,
+            qkv_projection: linear_launch(
+                qkv_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.qkv_features,
+                layout.normalized,
+                layout.qkv,
+            )?,
+            z_projection: linear_launch(
+                z_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.value_features,
+                layout.normalized,
+                layout.z,
+            )?,
+            b_projection: linear_launch(
+                b_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.value_heads,
+                layout.normalized,
+                layout.b,
+            )?,
+            a_projection: linear_launch(
+                a_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.hidden_size,
+                shape.value_heads,
+                layout.normalized,
+                layout.a,
+            )?,
+            output_projection: linear_launch(
+                output_weight,
+                shared.scratch,
+                shared.scratch,
+                total_tokens,
+                shape.value_features,
+                shape.hidden_size,
+                layout.qkv,
+                layout.normalized,
+            )?,
+        };
         validate_launch_regions(
             &regions,
             &[
-                launch.qkv_projection,
-                launch.z_projection,
-                launch.b_projection,
-                launch.a_projection,
-                launch.output_projection,
+                packed.qkv_projection,
+                packed.z_projection,
+                packed.b_projection,
+                packed.a_projection,
+                packed.output_projection,
             ],
         )?;
-    }
+        Some(packed)
+    } else {
+        for launch in &launches {
+            validate_launch_regions(
+                &regions,
+                &[
+                    launch.qkv_projection,
+                    launch.z_projection,
+                    launch.b_projection,
+                    launch.a_projection,
+                    launch.output_projection,
+                ],
+            )?;
+        }
+        None
+    };
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal gated-delta participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let dispatch_count = (launches.len() as u64).saturating_mul(14);
+    let packed_enabled = packed.is_some();
+    let dispatch_count = if packed_enabled {
+        (launches.len() as u64).saturating_mul(4).saturating_add(10)
+    } else {
+        (launches.len() as u64).saturating_mul(14)
+    };
     MetalDeviceCommand::operation(
         "vnext_gated_delta_recurrent_attention",
         regions,
         move |encoder, regions| {
             encoder.record_compute_dispatches(dispatch_count);
-            for launch in &launches {
-                enqueue_attention(
+            if let Some(packed) = packed.as_ref() {
+                enqueue_packed_attention(
                     &attention,
                     &linear,
                     &primitives,
@@ -835,15 +944,31 @@ fn encode_attention(
                     regions,
                     shared,
                     layout,
-                    launch,
+                    packed,
+                    &launches,
                 );
+            } else {
+                for launch in &launches {
+                    enqueue_attention(
+                        &attention,
+                        &linear,
+                        &primitives,
+                        encoder.compute_encoder(),
+                        regions,
+                        shared,
+                        layout,
+                        launch,
+                    );
+                }
             }
             Ok(())
         },
     )
     .map_err(|error| error.to_string())?
     .with_work_shape(
-        if participant_count == 1 {
+        if packed_enabled {
+            DeviceBatchingForm::Packed
+        } else if participant_count == 1 {
             DeviceBatchingForm::Scalar
         } else {
             DeviceBatchingForm::ParticipantLoop
@@ -886,7 +1011,19 @@ fn enqueue_attention(
     ] {
         dispatch_linear(linear, encoder, regions, projection);
     }
-    dispatch_prepare(attention, encoder, regions, shared, layout, launch);
+    dispatch_prepare_conv_and_state(attention, encoder, regions, shared, layout, launch);
+    dispatch_prepare_gates(
+        attention,
+        encoder,
+        scratch,
+        regions,
+        shared,
+        launch.a,
+        launch.b,
+        launch.g,
+        launch.beta,
+        &launch.params,
+    );
     dispatch_qk_norm(attention, encoder, scratch, launch);
     dispatch_delta(
         attention,
@@ -910,7 +1047,96 @@ fn enqueue_attention(
     );
 }
 
-fn dispatch_prepare(
+#[allow(clippy::too_many_arguments)]
+fn enqueue_packed_attention(
+    attention: &MetalGatedDeltaPipelines,
+    linear: &MetalLinearPipelines,
+    primitives: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    shared: SharedRegions,
+    layout: ScratchLayout,
+    packed: &PackedLaunch,
+    participants: &[ParticipantLaunch],
+) {
+    let scratch = &regions[shared.scratch];
+    dispatch_rms_norm_at(
+        primitives,
+        encoder,
+        &regions[packed.input],
+        0,
+        &regions[shared.input_norm],
+        scratch,
+        layout.normalized,
+        packed.params.tokens,
+        packed.params.hidden_size,
+        packed.params.epsilon,
+    );
+    for projection in [
+        packed.qkv_projection,
+        packed.z_projection,
+        packed.b_projection,
+        packed.a_projection,
+    ] {
+        dispatch_linear(linear, encoder, regions, projection);
+    }
+    dispatch_prepare_gates(
+        attention,
+        encoder,
+        scratch,
+        regions,
+        shared,
+        layout.a,
+        layout.b,
+        layout.g,
+        layout.beta,
+        &packed.params,
+    );
+    for participant in participants {
+        dispatch_prepare_conv_and_state(attention, encoder, regions, shared, layout, participant);
+    }
+    dispatch_qk_norm_at(
+        attention,
+        encoder,
+        scratch,
+        layout.query,
+        layout.key,
+        &packed.params,
+    );
+    for participant in participants {
+        dispatch_delta(
+            attention,
+            encoder,
+            scratch,
+            &regions[participant.delta_state],
+            participant,
+        );
+    }
+    dispatch_gated_norm_at(
+        attention,
+        encoder,
+        scratch,
+        &regions[shared.norm],
+        layout.core,
+        layout.z,
+        layout.qkv,
+        &packed.params,
+    );
+    dispatch_linear(linear, encoder, regions, packed.output_projection);
+    dispatch_residual_add_at(
+        primitives,
+        encoder,
+        &regions[packed.input],
+        0,
+        scratch,
+        layout.normalized,
+        &regions[packed.output],
+        0,
+        packed.residual_elements,
+    );
+}
+
+fn dispatch_prepare_conv_and_state(
     pipelines: &MetalGatedDeltaPipelines,
     encoder: &ComputeCommandEncoderRef,
     regions: &[MetalBufferRegion],
@@ -932,19 +1158,6 @@ fn dispatch_prepare(
         u64::from(launch.params.tokens) * u64::from(launch.params.qkv_features),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.prepare_gates);
-    set_region_offset(encoder, 0, scratch, launch.a);
-    set_region_offset(encoder, 1, scratch, launch.b);
-    set_region_offset(encoder, 2, &regions[shared.a_log], 0);
-    set_region_offset(encoder, 3, &regions[shared.dt_bias], 0);
-    set_region_offset(encoder, 4, scratch, launch.g);
-    set_region_offset(encoder, 5, scratch, launch.beta);
-    set_params(encoder, 6, &launch.params);
-    dispatch_elements(
-        encoder,
-        u64::from(launch.params.tokens) * u64::from(launch.params.value_heads),
-    );
-
     encoder.set_compute_pipeline_state(&pipelines.collect_conv_state);
     set_region_offset(encoder, 0, scratch, launch.qkv);
     set_region_offset(encoder, 1, &regions[launch.conv_state], 0);
@@ -964,23 +1177,64 @@ fn dispatch_prepare(
     dispatch_elements(encoder, state_elements);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_prepare_gates(
+    pipelines: &MetalGatedDeltaPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    scratch: &MetalBufferRegion,
+    regions: &[MetalBufferRegion],
+    shared: SharedRegions,
+    a: u64,
+    b: u64,
+    g: u64,
+    beta: u64,
+    params: &GatedDeltaParams,
+) {
+    encoder.set_compute_pipeline_state(&pipelines.prepare_gates);
+    set_region_offset(encoder, 0, scratch, a);
+    set_region_offset(encoder, 1, scratch, b);
+    set_region_offset(encoder, 2, &regions[shared.a_log], 0);
+    set_region_offset(encoder, 3, &regions[shared.dt_bias], 0);
+    set_region_offset(encoder, 4, scratch, g);
+    set_region_offset(encoder, 5, scratch, beta);
+    set_params(encoder, 6, params);
+    dispatch_elements(
+        encoder,
+        u64::from(params.tokens) * u64::from(params.value_heads),
+    );
+}
+
 fn dispatch_qk_norm(
     pipelines: &MetalGatedDeltaPipelines,
     encoder: &ComputeCommandEncoderRef,
     scratch: &MetalBufferRegion,
     launch: &ParticipantLaunch,
 ) {
+    dispatch_qk_norm_at(
+        pipelines,
+        encoder,
+        scratch,
+        launch.query,
+        launch.key,
+        &launch.params,
+    );
+}
+
+fn dispatch_qk_norm_at(
+    pipelines: &MetalGatedDeltaPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    scratch: &MetalBufferRegion,
+    query: u64,
+    key: u64,
+    params: &GatedDeltaParams,
+) {
     encoder.set_compute_pipeline_state(&pipelines.qk_norm);
-    set_region_offset(encoder, 0, scratch, launch.query);
-    set_region_offset(encoder, 1, scratch, launch.key);
-    set_params(encoder, 2, &launch.params);
+    set_region_offset(encoder, 0, scratch, query);
+    set_region_offset(encoder, 1, scratch, key);
+    set_params(encoder, 2, params);
     encoder.set_threadgroup_memory_length(0, 16 * std::mem::size_of::<f32>() as u64);
     encoder.dispatch_thread_groups(
-        MTLSize::new(
-            u64::from(launch.params.tokens) * u64::from(launch.params.key_heads),
-            1,
-            1,
-        ),
+        MTLSize::new(u64::from(params.tokens) * u64::from(params.key_heads), 1, 1),
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
     );
 }
@@ -1025,16 +1279,39 @@ fn dispatch_gated_norm(
     weight: &MetalBufferRegion,
     launch: &ParticipantLaunch,
 ) {
+    dispatch_gated_norm_at(
+        pipelines,
+        encoder,
+        scratch,
+        weight,
+        launch.core,
+        launch.z,
+        launch.qkv,
+        &launch.params,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_gated_norm_at(
+    pipelines: &MetalGatedDeltaPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    scratch: &MetalBufferRegion,
+    weight: &MetalBufferRegion,
+    core: u64,
+    z: u64,
+    output: u64,
+    params: &GatedDeltaParams,
+) {
     encoder.set_compute_pipeline_state(&pipelines.gated_norm);
-    set_region_offset(encoder, 0, scratch, launch.core);
-    set_region_offset(encoder, 1, scratch, launch.z);
+    set_region_offset(encoder, 0, scratch, core);
+    set_region_offset(encoder, 1, scratch, z);
     set_region_offset(encoder, 2, weight, 0);
-    set_region_offset(encoder, 3, scratch, launch.qkv);
-    set_params(encoder, 4, &launch.params);
+    set_region_offset(encoder, 3, scratch, output);
+    set_params(encoder, 4, params);
     encoder.set_threadgroup_memory_length(0, 8 * std::mem::size_of::<f32>() as u64);
     encoder.dispatch_thread_groups(
         MTLSize::new(
-            u64::from(launch.params.tokens) * u64::from(launch.params.value_heads),
+            u64::from(params.tokens) * u64::from(params.value_heads),
             1,
             1,
         ),
