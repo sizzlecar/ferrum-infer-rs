@@ -7,11 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    ElementType, ExternalModelMetadataId, ModelFamilyRegistration, ModelFamilyRegistry,
-    PreparedModelFamily, StateCapacityDemand, StateLifetime, TypedFamilyRegistration,
-    WeightComponentSource,
+    AttributeId, ElementType, ExternalModelMetadataId, ModelFamilyRegistration,
+    ModelFamilyRegistry, PreparedModelFamily, ProgramNode, SemanticValue, StateCapacityDemand,
+    StateLifetime, TypedFamilyRegistration, WeightComponentSource,
+    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
-use ferrum_types::{DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelType};
+use ferrum_types::{
+    DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelType, MoeCapabilities,
+};
 use serde_json::Value;
 
 mod hf_metadata;
@@ -26,7 +29,7 @@ type PrepareModel =
 type CreateFamilyRegistration = fn() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>>;
 
 struct ModelLoaderRegistration {
-    external_metadata_id: &'static str,
+    external_metadata_ids: &'static [&'static str],
     gguf_architectures: &'static [&'static str],
     execution_kind: ProductionExecutionKind,
     allows_legacy_reference: bool,
@@ -35,8 +38,11 @@ struct ModelLoaderRegistration {
 }
 
 const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
-    external_metadata_id: qwen35::EXTERNAL_METADATA_ID,
-    gguf_architectures: &["qwen35"],
+    external_metadata_ids: &[
+        qwen35::EXTERNAL_METADATA_ID,
+        qwen35::MOE_EXTERNAL_METADATA_ID,
+    ],
+    gguf_architectures: &["qwen35", "qwen35moe"],
     execution_kind: ProductionExecutionKind::CausalLanguage,
     allows_legacy_reference: cfg!(any(test, feature = "test-support")),
     prepare: qwen35::prepare_from_sources,
@@ -110,10 +116,6 @@ const LEGACY_MODELS: &[LegacyModelRegistration] = &[
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen3MoeForCausalLM",
         allows_legacy_reference: false,
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.Qwen3_5MoeForConditionalGeneration",
-        allows_legacy_reference: cfg!(any(test, feature = "test-support")),
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Gemma3ForCausalLM",
@@ -430,11 +432,12 @@ impl PreparedProductionModel {
                 .iter()
                 .filter_map(|state| element_type_label(state.tensor.element_type)),
         );
+        let moe = moe_capabilities_from_program(&self.family)?;
 
         Ok(ModelCapabilities {
             architecture: self.descriptor.architecture().to_owned(),
             quantization,
-            moe: None,
+            moe,
             max_context_len: Some(self.descriptor.maximum_sequence_tokens()),
             num_hidden_layers: Some(self.descriptor.layer_count()),
             head_dim: Some(self.descriptor.attention_head_dimension()),
@@ -468,6 +471,75 @@ impl PreparedProductionModel {
             metadata: Default::default(),
         }
     }
+}
+
+fn moe_capabilities_from_program(
+    family: &PreparedModelFamily,
+) -> ferrum_types::Result<Option<MoeCapabilities>> {
+    let mut capabilities = None;
+    for node in family
+        .program()
+        .blocks()
+        .iter()
+        .flat_map(|block| &block.nodes)
+        .filter(|node| node.operation_id.as_str() == ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID)
+    {
+        let current = MoeCapabilities {
+            num_experts: required_positive_node_attribute(node, "expert_count")?,
+            experts_per_token: required_positive_node_attribute(node, "experts_per_token")?,
+            moe_intermediate_size: Some(required_positive_node_attribute(
+                node,
+                "routed_intermediate_size",
+            )?),
+        };
+        if current.experts_per_token > current.num_experts {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "MoE program node {} routes {} experts per token from only {} experts",
+                node.id, current.experts_per_token, current.num_experts
+            )));
+        }
+        if capabilities
+            .as_ref()
+            .is_some_and(|expected| expected != &current)
+        {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "MoE program node {} has capabilities inconsistent with earlier layers",
+                node.id
+            )));
+        }
+        capabilities = Some(current);
+    }
+    Ok(capabilities)
+}
+
+fn required_positive_node_attribute(
+    node: &ProgramNode,
+    attribute: &str,
+) -> ferrum_types::Result<usize> {
+    let attribute_id = AttributeId::new(attribute).map_err(|error| {
+        ferrum_types::FerrumError::internal(format!(
+            "standard MoE attribute id {attribute:?} is invalid: {error}"
+        ))
+    })?;
+    let Some(SemanticValue::Unsigned(value)) = node.attributes.get(&attribute_id) else {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "MoE program node {} lacks unsigned attribute {attribute:?}",
+            node.id
+        )));
+    };
+    let value = usize::try_from(*value).map_err(|_| {
+        ferrum_types::FerrumError::model(format!(
+            "MoE program node {} attribute {attribute:?} exceeds usize",
+            node.id
+        ))
+    })?;
+    if value == 0 {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "MoE program node {} attribute {attribute:?} must be positive",
+            node.id
+        )));
+    }
+    Ok(value)
 }
 
 fn data_type_label(data_type: DataType) -> String {
@@ -616,9 +688,11 @@ pub fn resolve_registered_model_from_sources(
 fn resolve_registered_model(
     external_metadata_id: ExternalModelMetadataId,
 ) -> ferrum_types::Result<ProductionModelRegistration> {
-    let mut loaders = MODEL_LOADERS
-        .iter()
-        .filter(|registration| registration.external_metadata_id == external_metadata_id.as_str());
+    let mut loaders = MODEL_LOADERS.iter().filter(|registration| {
+        registration
+            .external_metadata_ids
+            .contains(&external_metadata_id.as_str())
+    });
     let loader = loaders.next();
     if loaders.next().is_some() {
         return Err(ferrum_types::FerrumError::internal(format!(
@@ -723,11 +797,12 @@ mod tests {
         let mut ids = std::collections::BTreeSet::new();
         let mut gguf_architectures = std::collections::BTreeSet::new();
         for registration in MODEL_LOADERS {
-            assert!(
-                ids.insert(registration.external_metadata_id),
-                "duplicate vNext registration {}",
-                registration.external_metadata_id
-            );
+            for external_metadata_id in registration.external_metadata_ids {
+                assert!(
+                    ids.insert(*external_metadata_id),
+                    "duplicate vNext registration {external_metadata_id}"
+                );
+            }
             for architecture in registration.gguf_architectures {
                 assert!(
                     gguf_architectures.insert(*architecture),
@@ -747,6 +822,9 @@ mod tests {
     #[test]
     fn migrated_gguf_architecture_requires_typed_product_sources() {
         assert!(gguf_architecture_requires_typed_product_sources("qwen35"));
+        assert!(gguf_architecture_requires_typed_product_sources(
+            "qwen35moe"
+        ));
         assert!(!gguf_architecture_requires_typed_product_sources("qwen3"));
     }
 
@@ -759,6 +837,30 @@ mod tests {
             .resolve_external(&metadata)
             .unwrap();
         assert_eq!(registration.family_id().as_str(), qwen35::FAMILY_ID);
+        let moe_metadata = ExternalModelMetadataId::new(qwen35::MOE_EXTERNAL_METADATA_ID).unwrap();
+        let moe_registration = (&registry as &dyn ModelFamilyRegistry)
+            .resolve_external(&moe_metadata)
+            .unwrap();
+        assert_eq!(moe_registration.family_id().as_str(), qwen35::FAMILY_ID);
+    }
+
+    #[test]
+    fn qwen35_moe_metadata_resolves_to_vnext_product_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+
+        let registration = resolve_registered_model_from_dir(directory.path())
+            .unwrap()
+            .into_required()
+            .unwrap();
+        assert_eq!(
+            registration.external_metadata_id().as_str(),
+            qwen35::MOE_EXTERNAL_METADATA_ID
+        );
     }
 
     #[test]

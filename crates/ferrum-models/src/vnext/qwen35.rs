@@ -1644,7 +1644,11 @@ fn production_descriptor(
     let maximum_sequence_tokens = usize::try_from(config.max_position_embeddings)
         .map_err(|_| "max_position_embeddings exceeds usize".to_owned())?;
     CausalLanguageModelDescriptor::new(
-        "qwen3_5",
+        if text.is_moe() {
+            "qwen3_5_moe"
+        } else {
+            "qwen3_5"
+        },
         parameter_count,
         text.hidden_size,
         text.num_hidden_layers,
@@ -3191,9 +3195,19 @@ mod tests {
     #[test]
     fn prepares_sparse_moe_program_with_routed_shared_contract() {
         let config = test_moe_gguf_config();
+        let descriptor = production_descriptor(&config).unwrap();
+        assert_eq!(descriptor.architecture(), "qwen3_5_moe");
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&serde_json::to_value(&config).unwrap())
             .unwrap();
+        assert_eq!(
+            crate::vnext::moe_capabilities_from_program(&prepared).unwrap(),
+            Some(ferrum_types::MoeCapabilities {
+                num_experts: 4,
+                experts_per_token: 2,
+                moe_intermediate_size: Some(8),
+            })
+        );
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
         assert_eq!(
             prepared.external_metadata_id().as_str(),
@@ -3283,6 +3297,7 @@ mod tests {
     fn prepares_dense_hybrid_program_and_rejects_shape_drift() {
         let config = test_config();
         let descriptor = production_descriptor(&config).unwrap();
+        assert_eq!(descriptor.architecture(), "qwen3_5");
         assert_eq!(descriptor.hidden_size(), 16);
         assert_eq!(descriptor.layer_count(), 4);
         assert_eq!(descriptor.attention_head_count(), 2);
@@ -3303,6 +3318,10 @@ mod tests {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&raw)
             .unwrap();
+        assert_eq!(
+            crate::vnext::moe_capabilities_from_program(&prepared).unwrap(),
+            None
+        );
 
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
         assert_eq!(prepared.program().blocks()[0].nodes.len(), 19);
