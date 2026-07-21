@@ -23,13 +23,15 @@ use axum::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
-    FinishReason, InferenceRequest, InferenceResponse, ModelId, Priority, ProcessMemoryObservation,
-    ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
-    ProfileStatus, ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction,
-    ResourceTraceEvent, RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId,
-    TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    has_unclosed_thinking_block, parse_reasoning_response,
+    parse_reasoning_response_started_in_think, EngineMetrics, EngineStatus, FerrumConfigBuilder,
+    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceRequest, InferenceResponse,
+    ModelId, ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
+    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
+    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
+    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
+    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -55,8 +57,6 @@ const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
 const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
-const THINK_START_TAG: &str = "<think>";
-const THINK_END_TAG: &str = "</think>";
 const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
@@ -3227,14 +3227,6 @@ fn single_function_tool(tools: &[ChatTool]) -> Option<&ChatTool> {
     function_tools.next().is_none().then_some(tool)
 }
 
-fn has_unclosed_thinking_block(prompt: &str) -> bool {
-    match (prompt.rfind(THINK_START_TAG), prompt.rfind(THINK_END_TAG)) {
-        (Some(start), Some(end)) => start > end,
-        (Some(_), None) => true,
-        _ => false,
-    }
-}
-
 fn should_defer_reasoning_stream_delta(text: &str) -> bool {
     let candidate = text.trim_start_matches(['\r', '\n']);
     if candidate.is_empty() {
@@ -3251,76 +3243,6 @@ fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
     }
     *sent_len = text.len();
     String::new()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedReasoningResponse {
-    content: String,
-    reasoning: Option<String>,
-}
-
-/// Parse generated text whose think block was OPENED BY THE PROMPT —
-/// R1-distill-style templates append `<think>\n` to the rendered prompt,
-/// so the generation never contains the start tag. Without this, the
-/// in-flight thinking streams as content deltas until `</think>` arrives.
-fn parse_reasoning_response_started_in_think(text: &str) -> ParsedReasoningResponse {
-    if text.contains(THINK_START_TAG) {
-        // Model re-opened a think block itself — defer to the normal parse.
-        return parse_reasoning_response(text);
-    }
-    let Some(end) = text.find(THINK_END_TAG) else {
-        return ParsedReasoningResponse {
-            content: String::new(),
-            reasoning: (!text.is_empty()).then(|| text.to_string()),
-        };
-    };
-    let reasoning = text[..end].to_string();
-    let content = text[end + THINK_END_TAG.len()..]
-        .trim_start_matches(['\r', '\n'])
-        .to_string();
-    ParsedReasoningResponse {
-        content,
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-    }
-}
-
-fn parse_reasoning_response(text: &str) -> ParsedReasoningResponse {
-    let Some(start) = text.find(THINK_START_TAG) else {
-        if let Some(end) = text.find(THINK_END_TAG) {
-            let reasoning = text[..end].to_string();
-            let content = text[end + THINK_END_TAG.len()..]
-                .trim_start_matches(['\r', '\n'])
-                .to_string();
-            return ParsedReasoningResponse {
-                content,
-                reasoning: (!reasoning.is_empty()).then_some(reasoning),
-            };
-        }
-        return ParsedReasoningResponse {
-            content: text.to_string(),
-            reasoning: None,
-        };
-    };
-
-    let before = &text[..start];
-    let after_start = &text[start + THINK_START_TAG.len()..];
-    let Some(end) = after_start.find(THINK_END_TAG) else {
-        return ParsedReasoningResponse {
-            content: before.to_string(),
-            reasoning: Some(after_start.to_string()),
-        };
-    };
-
-    let reasoning = after_start[..end].to_string();
-    let after_end = &after_start[end + THINK_END_TAG.len()..];
-    let mut content = String::new();
-    content.push_str(before);
-    content.push_str(after_end.trim_start_matches(['\r', '\n']));
-
-    ParsedReasoningResponse {
-        content,
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-    }
 }
 
 fn chat_api_response_from_parsed_generated_text(
