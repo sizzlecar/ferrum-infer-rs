@@ -139,8 +139,14 @@ static inline void gemm_f16a_kquant_tiled(
 
     const int output_start = int(threadgroup_position.y) * TILE_OUTPUT_ROWS;
     const int input_start = int(threadgroup_position.x) * TILE_INPUT_ROWS;
-    const short output_count = min(short(p.out_features - uint(output_start)), TILE_OUTPUT_ROWS);
-    const short input_count = min(short(p.rows - uint(input_start)), TILE_INPUT_ROWS);
+    const short output_count = short(min(
+        p.out_features - uint(output_start),
+        uint(TILE_OUTPUT_ROWS)
+    ));
+    const short input_count = short(min(
+        p.rows - uint(input_start),
+        uint(TILE_INPUT_ROWS)
+    ));
     const short weight_row = min(
         short(thread_index / WEIGHT_LOADERS_PER_ROW), short(output_count - 1)
     );
