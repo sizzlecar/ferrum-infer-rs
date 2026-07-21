@@ -354,7 +354,7 @@ pub(super) fn provider_descriptor(
             .fingerprint()
             .map_err(contract_error)?,
         provider_fingerprint,
-        ContractVersion::new(1, 0),
+        contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([capability]),
         BTreeSet::from([WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?]),
