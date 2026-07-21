@@ -1234,6 +1234,19 @@ pub enum ExecutorPrefillOutcome {
     Deferred(ExecutorExecutionCapacityDeferral),
 }
 
+/// Transactional result of attempting one physical prefill batch.
+///
+/// `NotSubmitted` proves that no participant in the batch reached provider
+/// encode or device submission. The caller may therefore retry a narrower
+/// partition or the existing per-request capacity path without duplicating
+/// model work. `Unsupported` keeps the optimization optional for legacy
+/// executors while plan-runtime implementations provide the real batch edge.
+pub enum ExecutorBatchPrefillOutcome {
+    Completed(Vec<ExecutorPrefillCompletion>),
+    NotSubmitted(ExecutorExecutionCapacityDeferral),
+    Unsupported,
+}
+
 /// Stage that must advance before a plan-runtime prefill can be admitted.
 ///
 /// This is scheduler evidence, not allocator authority. The executor retains
@@ -1652,6 +1665,19 @@ pub trait ModelExecutor: Send + Sync {
             outputs.push(self.prefill(input).await?);
         }
         Ok(outputs)
+    }
+
+    /// Attempt one physical, capacity-aware prefill batch.
+    ///
+    /// Implementations must either complete every input in original order or
+    /// return `NotSubmitted` after restoring every retained prefill authority
+    /// to a retryable state. Partial device submission is an ordinary error,
+    /// never a `NotSubmitted` result.
+    async fn batch_prefill_with_capacity(
+        &self,
+        _inputs: &[PrefillInput],
+    ) -> Result<ExecutorBatchPrefillOutcome> {
+        Ok(ExecutorBatchPrefillOutcome::Unsupported)
     }
 
     /// Execute decode phase (generate next token)

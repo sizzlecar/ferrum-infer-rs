@@ -1175,6 +1175,117 @@ impl EngineInner {
         }
     }
 
+    fn prepare_dynamic_admission_round(
+        &self,
+        maximum_admissions: usize,
+    ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
+        let mut maintenance = Vec::new();
+        let mut availability = self.dynamic_admission_availability.lock();
+        let epochs = self
+            .model_executor
+            .write_execution_capacity_snapshot(&mut availability)?
+            .ok_or_else(|| {
+                FerrumError::scheduler("plan runtime did not expose typed admission epochs")
+            })?;
+        let wake_epochs = AdmissionWakeEpochs::new(
+            epochs.coordinator_id,
+            epochs.release_epoch,
+            epochs.capacity_epoch,
+            0,
+        );
+        let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
+        let capture_trace = self.scheduler_trace_jsonl.is_some();
+        let records = std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new());
+        let mut probe = |request: &InferenceRequest| {
+            let result = self.probe_executor_prefill_admission(request, capture_trace);
+            if let Some(deferral) = result.maintenance {
+                maintenance.push(deferral);
+            }
+            if let Some(trace) = result.trace {
+                records
+                    .borrow_mut()
+                    .push(ExecutorSchedulerTraceRecord::PrefillAdmission(trace));
+            }
+            result.outcome
+        };
+        let prepared =
+            self.scheduler.prepare_dynamic_admission_observed(
+                maximum_admissions,
+                wake,
+                &mut probe,
+                &mut |observation| {
+                    records.borrow_mut().push(
+                        ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
+                    )
+                },
+            );
+        drop(probe);
+        drop(availability);
+
+        for record in records.into_inner() {
+            match record {
+                ExecutorSchedulerTraceRecord::PrefillAdmission(trace) => {
+                    self.trace_executor_prefill_admission(trace);
+                }
+                ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation) => {
+                    self.trace_executor_admission_queue_observation(observation);
+                }
+            }
+        }
+        match prepared {
+            Ok(receipt) => Ok((receipt.admitted(), maintenance)),
+            Err(error) => {
+                for deferral in &maintenance {
+                    self.model_executor
+                        .cancel_prefill_admission(deferral.request_id());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Fill-first is allowed to delay decode until its active target, so form
+    /// that target's retained admission cohort before constructing a physical
+    /// batch. Each round performs one bounded maintenance attempt per deferred
+    /// request and then re-probes against fresh typed capacity evidence.
+    async fn prepare_plan_runtime_prefill_cohort(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+    ) -> Result<bool> {
+        let Some(configured_target) = self.config.scheduler.prefill_first_until_active else {
+            return Ok(false);
+        };
+        let target = configured_target
+            .min(hint.max_batch_size)
+            .min(self.config.scheduler.max_running_requests);
+        if target <= 1 {
+            return Ok(false);
+        }
+
+        let mut progressed = false;
+        for _ in 0..=target {
+            let desired = self
+                .scheduler
+                .fill_first_dynamic_admission_limit(hint, target);
+            if desired == 0 || self.scheduler.waiting_count() == 0 {
+                break;
+            }
+            let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired)?;
+            progressed |= admitted > 0;
+            self.complete_typed_admission_failures().await?;
+            if maintenance.is_empty() {
+                break;
+            }
+            progressed = true;
+            self.execute_executor_prefill_maintenance(maintenance);
+            self.complete_typed_admission_failures().await?;
+        }
+
+        let active = self.scheduler.active_count();
+        let waiting = self.scheduler.waiting_count();
+        Ok(progressed && active > 0 && active < target && waiting == 0)
+    }
+
     async fn complete_typed_admission_failures(&self) -> Result<()> {
         for (request_id, error) in self.scheduler.take_admission_failures() {
             warn!(
@@ -1383,6 +1494,9 @@ impl EngineInner {
 
     /// Run one iteration: ask the scheduler for a batch, then process it.
     pub(super) async fn run_iteration(&self) -> Result<EngineIterationOutcome> {
+        let lock_wait_start = Instant::now();
+        let iteration_guard = self.iteration_lock.lock().await;
+        self.record_iteration_lock_wait(lock_wait_start.elapsed());
         self.cancel_abandoned_requests().await?;
 
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
@@ -1425,9 +1539,12 @@ impl EngineInner {
         let nb_prof = self.runtime_config.next_batch_prof;
         let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
-        let mut prefill_maintenance = Vec::new();
         let plan_runtime_managed = self.model_executor.execution_resource_authority()
             == ExecutionResourceAuthority::PlanRuntime;
+        if plan_runtime_managed && self.prepare_plan_runtime_prefill_cohort(&hint).await? {
+            return Ok(EngineIterationOutcome::Progressed);
+        }
+        let mut prefill_maintenance = Vec::new();
         let nb_result = if plan_runtime_managed {
             let mut availability = self.dynamic_admission_availability.lock();
             let epochs = self
@@ -1606,6 +1723,10 @@ impl EngineInner {
             batch.size()
         );
 
+        // Request publication only needs to be atomic with planning. The
+        // selected batch owns its request authorities, so new ingress may be
+        // published while the device executes this wave.
+        drop(iteration_guard);
         let process_t0 = Instant::now();
         let r = self.process_batch(&batch).await;
         let process_elapsed = process_t0.elapsed();

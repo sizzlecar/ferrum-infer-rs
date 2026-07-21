@@ -2,8 +2,9 @@
 //!
 //! Iteration-level continuous batching: each step processes a mixed batch of
 //! prefill and decode requests selected by the scheduler.  Multiple callers
-//! can submit requests concurrently — an `iteration_lock` serializes the
-//! actual engine steps so each batch is processed exactly once.
+//! can submit requests concurrently. An `iteration_lock` makes publication
+//! atomic with planning, while the single background driver owns device-wave
+//! execution.
 
 use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
@@ -2479,7 +2480,9 @@ struct EngineInner {
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
     is_running: AtomicBool,
     shutdown_notify: Arc<Notify>,
-    /// Ensures only one iteration step runs at a time.
+    /// Serializes request publication with cancellation and BatchPlan
+    /// construction. Device execution deliberately runs after this guard is
+    /// released so new user requests can enter while a wave is in flight.
     iteration_lock: tokio::sync::Mutex<()>,
     /// Wakes callers or a background loop when new work is submitted.
     work_notify: Arc<Notify>,
@@ -4335,16 +4338,11 @@ impl ContinuousBatchEngine {
                 } else {
                     None
                 };
-                let outcome = {
-                    let lock_wait_start = Instant::now();
-                    let _guard = inner.iteration_lock.lock().await;
-                    inner.record_iteration_lock_wait(lock_wait_start.elapsed());
-                    match inner.run_iteration().await {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            warn!("Iteration error: {}", error);
-                            EngineIterationOutcome::Progressed
-                        }
+                let outcome = match inner.run_iteration().await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        warn!("Iteration error: {}", error);
+                        EngineIterationOutcome::Progressed
                     }
                 };
                 if prof {
