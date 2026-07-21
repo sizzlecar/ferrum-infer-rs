@@ -3,6 +3,9 @@ using namespace metal;
 
 constant uint THREADS_PER_GROUP = 256;
 constant uint VALUE_TILE = 16;
+constant uint SIMD_DELTA_WIDTH = 32;
+constant uint SIMD_DELTA_ROWS_PER_GROUP = 4;
+constant uint SIMD_DELTA_MAX_COLUMNS_PER_LANE = 4;
 constant uint GATED_DELTA_CHUNK_SIZE = 64;
 constant uint GATED_DELTA_CHUNK_KEY_DIM_LIMIT = 128;
 constant bool GATED_DELTA_CARRY_KEY_DIM_128 [[function_constant(0)]];
@@ -288,6 +291,70 @@ kernel void vnext_gated_delta_rule_tiled16_f32_state(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void vnext_gated_delta_rule_simd_f32_state(
+    device const float * query [[buffer(0)]],
+    device const float * key [[buffer(1)]],
+    device const float * value [[buffer(2)]],
+    device const float * g [[buffer(3)]],
+    device const float * beta [[buffer(4)]],
+    device float * state [[buffer(5)]],
+    device float * output [[buffer(6)]],
+    constant GatedDeltaParams & params [[buffer(7)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint value_column = group.x * SIMD_DELTA_ROWS_PER_GROUP + simd_group;
+    const uint value_head = group.y;
+    if (value_head >= params.value_heads || value_column >= params.value_dim
+        || params.key_dim == 0 || params.key_dim > 128
+        || params.key_dim % SIMD_DELTA_WIDTH != 0) {
+        return;
+    }
+    const uint repeat = params.value_heads / params.key_heads;
+    const uint key_head = params.value_head_mapping == 0
+        ? value_head / repeat
+        : value_head % params.key_heads;
+    const uint columns_per_lane = params.key_dim / SIMD_DELTA_WIDTH;
+    const ulong state_base =
+        (ulong(value_head) * params.value_dim + value_column) * params.key_dim;
+    float local[SIMD_DELTA_MAX_COLUMNS_PER_LANE];
+    for (uint column = 0; column < columns_per_lane; ++column) {
+        local[column] = state[state_base + simd_lane * columns_per_lane + column];
+    }
+
+    for (uint token = 0; token < params.tokens; ++token) {
+        const uint gate_index = token * params.value_heads + value_head;
+        const float decay = exp(g[gate_index]);
+        const ulong qk_base =
+            (ulong(token) * params.key_heads + key_head) * params.key_dim;
+        float predicted = 0.0f;
+        for (uint column = 0; column < columns_per_lane; ++column) {
+            const uint key_column = simd_lane * columns_per_lane + column;
+            local[column] *= decay;
+            predicted += local[column] * key[qk_base + key_column];
+        }
+        predicted = simd_sum(predicted);
+        const ulong value_index =
+            (ulong(token) * params.value_heads + value_head) * params.value_dim
+            + value_column;
+        const float delta = (value[value_index] - predicted) * beta[gate_index];
+        float result = 0.0f;
+        for (uint column = 0; column < columns_per_lane; ++column) {
+            const uint key_column = simd_lane * columns_per_lane + column;
+            local[column] += key[qk_base + key_column] * delta;
+            result += local[column] * query[qk_base + key_column];
+        }
+        result = simd_sum(result);
+        if (simd_lane == 0) {
+            output[value_index] = result * params.scale;
+        }
+    }
+
+    for (uint column = 0; column < columns_per_lane; ++column) {
+        state[state_base + simd_lane * columns_per_lane + column] = local[column];
     }
 }
 

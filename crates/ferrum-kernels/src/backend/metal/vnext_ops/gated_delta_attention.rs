@@ -48,6 +48,7 @@ const COLLECT_CONV_STATE_KERNEL: &str = "vnext_gated_delta_collect_conv_state_f1
 const COPY_F16_KERNEL: &str = "vnext_gated_delta_copy_f16";
 const QK_NORM_KERNEL: &str = "vnext_gated_delta_qk_norm_f32";
 const DELTA_KERNEL: &str = "vnext_gated_delta_rule_tiled16_f32_state";
+const SIMD_DELTA_KERNEL: &str = "vnext_gated_delta_rule_simd_f32_state";
 const CHUNK_K_GRAM_K128_KERNEL: &str = "vnext_gated_delta_chunk_k_gram_c64_k128";
 const CHUNK_KKT_INVERSE_KERNEL: &str = "vnext_gated_delta_chunk_kkt_inverse_c64";
 const CHUNK_UW_KERNEL: &str = "vnext_gated_delta_chunk_uw_c64";
@@ -59,6 +60,9 @@ const GATED_NORM_KERNEL: &str = "vnext_gated_delta_gated_norm_f16";
 const CONV_STATE_ELEMENT_TYPE: ElementType = ElementType::F16;
 const DELTA_STATE_ELEMENT_TYPE: ElementType = ElementType::F32;
 const VALUE_TILE: u64 = 16;
+const SIMD_DELTA_WIDTH: u64 = 32;
+const SIMD_DELTA_ROWS_PER_GROUP: u64 = 4;
+const SIMD_DELTA_MAX_KEY_DIM: u32 = 128;
 const GATED_DELTA_CHUNK_SIZE: u32 = 64;
 const GATED_DELTA_CHUNK_KEY_DIM_LIMIT: u64 = 128;
 const GATED_DELTA_CHUNK_INITIAL_CROSSOVER_TOKENS: u64 = 64;
@@ -91,6 +95,7 @@ pub(super) struct MetalGatedDeltaPipelines {
     copy_f16: ComputePipelineState,
     qk_norm: ComputePipelineState,
     delta: ComputePipelineState,
+    simd_delta: ComputePipelineState,
     chunk_k_gram_k128: ComputePipelineState,
     chunk_kkt_inverse_generic: ComputePipelineState,
     chunk_kkt_inverse_precomputed_gram: ComputePipelineState,
@@ -181,6 +186,7 @@ impl MetalGatedDeltaPipelines {
             copy_f16: pipeline(COPY_F16_KERNEL)?,
             qk_norm: pipeline(QK_NORM_KERNEL)?,
             delta: pipeline(DELTA_KERNEL)?,
+            simd_delta: pipeline(SIMD_DELTA_KERNEL)?,
             chunk_k_gram_k128: pipeline(CHUNK_K_GRAM_K128_KERNEL)?,
             chunk_kkt_inverse_generic: kkt_pipeline(false)?,
             chunk_kkt_inverse_precomputed_gram: kkt_pipeline(true)?,
@@ -1485,7 +1491,15 @@ fn dispatch_recurrent_delta(
     state: &MetalBufferRegion,
     launch: &ParticipantLaunch,
 ) {
-    encoder.set_compute_pipeline_state(&pipelines.delta);
+    let use_simd_delta = supports_simd_delta(
+        &launch.params,
+        pipelines.simd_delta.thread_execution_width(),
+    );
+    encoder.set_compute_pipeline_state(if use_simd_delta {
+        &pipelines.simd_delta
+    } else {
+        &pipelines.delta
+    });
     for (index, offset) in [
         launch.query,
         launch.key,
@@ -1501,14 +1515,32 @@ fn dispatch_recurrent_delta(
     set_region_offset(encoder, 5, state, 0);
     set_region_offset(encoder, 6, scratch, launch.core);
     set_params(encoder, 7, &launch.params);
-    encoder.dispatch_thread_groups(
-        MTLSize::new(
-            u64::from(launch.params.value_dim).div_ceil(VALUE_TILE),
-            u64::from(launch.params.value_heads),
-            1,
-        ),
-        MTLSize::new(THREADS_PER_GROUP, 1, 1),
-    );
+    if use_simd_delta {
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(launch.params.value_dim).div_ceil(SIMD_DELTA_ROWS_PER_GROUP),
+                u64::from(launch.params.value_heads),
+                1,
+            ),
+            MTLSize::new(SIMD_DELTA_WIDTH * SIMD_DELTA_ROWS_PER_GROUP, 1, 1),
+        );
+    } else {
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(launch.params.value_dim).div_ceil(VALUE_TILE),
+                u64::from(launch.params.value_heads),
+                1,
+            ),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    }
+}
+
+fn supports_simd_delta(params: &GatedDeltaParams, thread_execution_width: u64) -> bool {
+    thread_execution_width == SIMD_DELTA_WIDTH
+        && params.key_dim > 0
+        && params.key_dim <= SIMD_DELTA_MAX_KEY_DIM
+        && u64::from(params.key_dim).is_multiple_of(SIMD_DELTA_WIDTH)
 }
 
 fn dispatch_chunked_delta_c64(
