@@ -145,8 +145,8 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
     );
 }
 
-/// Build a stacked `MarlinWeight` whose `qweight` is in **vLLM marlin
-/// tile format** (NOT IST-DASLab Marlin format). For each expert we
+/// Build a stacked `MarlinWeight` whose `qweight` is in the shared
+/// IST-DASLab/vLLM Marlin INT4 tile format. For each expert we
 /// repack the raw GPTQ qweight via `ferrum_vllm_gptq_marlin_repack`
 /// and concatenate into one stacked buffer. Scales are concatenated
 /// after the same Marlin scale permutation used by the vLLM kernel.

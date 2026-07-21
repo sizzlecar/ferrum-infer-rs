@@ -796,9 +796,9 @@ impl BackendQuantMarlin for CudaBackend {
             .iter()
             .any(|qz| !marlin_qzeros_are_symmetric_code7(qz));
 
-        // vLLM marlin_moe_wna16 path: stacked weight in vLLM Marlin tile
-        // format (NOT IST-DASLab). Run gptq_marlin_repack per expert,
-        // permute scales with the same _scale_perm IST-DASLab uses.
+        // vLLM marlin_moe_wna16 path: stacked weight in the shared
+        // IST-DASLab/vLLM Marlin INT4 tile ABI. Run the device repack per
+        // expert and permute scales with the same _scale_perm.
         // Non-symmetric GPTQ qzeros require this path because the standard
         // IST-DASLab Marlin wrapper only handles the symmetric uint4b8
         // zero-point bias. FERRUM_VLLM_MOE=1 remains an opt-in for

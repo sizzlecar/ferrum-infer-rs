@@ -2,7 +2,9 @@
 //!
 //! These transforms are cold-path CPU work. Keeping them outside the CUDA
 //! backend lets typed checkpoint sources prepare the same physical ABI before
-//! plan-owned device storage is initialized.
+//! plan-owned device storage is initialized. For INT4 without activation-order
+//! permutation, the packed output is byte-for-byte equivalent to vLLM's
+//! `gptq_marlin_repack` 16-by-64 tile ABI.
 
 use rayon::prelude::*;
 
@@ -49,7 +51,8 @@ pub fn permute_gptq_qweight_rows(
     packed
 }
 
-/// Repack `[K/8, N]` GPTQ INT4 words into the IST-DASLab Marlin tile ABI.
+/// Repack `[K/8, N]` GPTQ INT4 words into the shared IST-DASLab/vLLM Marlin
+/// 16-by-64 tile ABI.
 pub fn repack_gptq_to_marlin(qweight_gptq: &[i32], k: usize, n: usize) -> Vec<i32> {
     let mut unpacked = vec![0_u8; k * n];
     unpacked
@@ -176,6 +179,46 @@ fn marlin_weight_permutation() -> Vec<usize> {
 mod tests {
     use super::*;
 
+    fn vllm_int4_repack_reference(qweight: &[i32], k: usize, n: usize) -> Vec<i32> {
+        assert_eq!(k % 16, 0);
+        assert_eq!(n % 64, 0);
+        assert_eq!(qweight.len(), (k / 8) * n);
+
+        let mut output = vec![0_i32; (k * n) / 8];
+        let pack_order = [0_usize, 2, 4, 6, 1, 3, 5, 7];
+        for k_tile in 0..k / 16 {
+            for n_tile in 0..n / 64 {
+                let output_base = (k_tile * (n / 64) + n_tile) * (16 * 64 / 8);
+                for warp in 0..4 {
+                    for thread in 0..32 {
+                        let tensor_core_column = thread / 4;
+                        let tensor_core_row = (thread % 4) * 2;
+                        let column = n_tile * 64 + warp * 16 + tensor_core_column;
+                        let mut values = [0_u32; 8];
+                        for (slot, row_offset) in [0_usize, 1, 8, 9].into_iter().enumerate() {
+                            let row = k_tile * 16 + tensor_core_row + row_offset;
+                            let word = qweight[(row / 8) * n + column] as u32;
+                            values[slot] = (word >> ((row % 8) * 4)) & 0x0f;
+                        }
+                        for (slot, row_offset) in [0_usize, 1, 8, 9].into_iter().enumerate() {
+                            let row = k_tile * 16 + tensor_core_row + row_offset;
+                            let word = qweight[(row / 8) * n + column + 8] as u32;
+                            values[slot + 4] = (word >> ((row % 8) * 4)) & 0x0f;
+                        }
+                        let packed = pack_order
+                            .into_iter()
+                            .enumerate()
+                            .fold(0_u32, |word, (lane, source)| {
+                                word | (values[source] << (lane * 4))
+                            });
+                        output[output_base + thread * 4 + warp] = packed as i32;
+                    }
+                }
+            }
+        }
+        output
+    }
+
     #[test]
     fn marlin_repack_preserves_expected_storage_lengths() {
         let k = 128;
@@ -187,6 +230,24 @@ mod tests {
         assert_eq!(
             repack_scales_to_marlin(&scales, k, n, k).len(),
             scales.len()
+        );
+    }
+
+    #[test]
+    fn marlin_repack_matches_vllm_int4_tile_abi() {
+        let k = 128;
+        let n = 256;
+        let qweight = (0..(k / 8) * n)
+            .map(|index| {
+                (index as u32)
+                    .wrapping_mul(0x9e37_79b9)
+                    .rotate_left((index % 31) as u32) as i32
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            repack_gptq_to_marlin(&qweight, k, n),
+            vllm_int4_repack_reference(&qweight, k, n)
         );
     }
 }

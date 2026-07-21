@@ -57,10 +57,17 @@ impl GptqMarlinSafetensorsSource {
                 "packed GPTQ values require ordered qweight and qzeros sources",
             ));
         };
-        if !qweight_name.ends_with(".qweight") || !qzeros_name.ends_with(".qzeros") {
+        let qweight_stem = qweight_name.strip_suffix(".qweight").unwrap_or_default();
+        if qweight_stem.is_empty()
+            || qzeros_name != &format!("{qweight_stem}.qzeros")
+            || component
+                .external_names
+                .get(2)
+                .is_some_and(|name| name != &format!("{qweight_stem}.g_idx"))
+        {
             return Err(invalid_component(
                 component,
-                "packed GPTQ source order must be qweight, qzeros, then optional g_idx",
+                "packed GPTQ sources must share one stem and be ordered qweight, qzeros, then optional g_idx",
             ));
         }
         if component.external_names.len() > 3
@@ -117,7 +124,13 @@ impl GptqMarlinSafetensorsSource {
         }
 
         let qzeros = self.tensor(component, qzeros_name)?;
-        validate_symmetric_qzeros(component, &qzeros, k, n, quantization.group_size as usize)?;
+        validate_symmetric_qzeros_shape(
+            component,
+            &qzeros,
+            k,
+            n,
+            quantization.group_size as usize,
+        )?;
         if let Some(g_idx_name) = component.external_names.get(2) {
             let g_idx = self.tensor(component, g_idx_name)?;
             validate_canonical_g_idx(component, &g_idx, k, quantization.group_size as usize)?;
@@ -270,7 +283,7 @@ fn validate_marlin_quantization(
     Ok(())
 }
 
-fn validate_symmetric_qzeros(
+fn validate_symmetric_qzeros_shape(
     component: &WeightComponentSpec,
     qzeros: &SafetensorsTensor<'_>,
     k: usize,
@@ -288,13 +301,10 @@ fn validate_symmetric_qzeros(
             ),
         ));
     }
-    let words = decode_i32(qzeros.bytes(), component, "qzeros")?;
-    if words.iter().any(|word| *word as u32 != 0x7777_7777) {
-        return Err(invalid_component(
-            component,
-            "qzeros is not the canonical symmetric GPTQ zero-point encoding",
-        ));
-    }
+    // `sym=true` selects Marlin's fixed uint4b8 bias. GPTQ writers use more
+    // than one historical qzeros convention even though the sidecar is not
+    // consumed for symmetric inference, so its contents must not define the
+    // physical ABI. Identity, dtype, and shape remain strict.
     Ok(())
 }
 
@@ -469,7 +479,7 @@ mod tests {
 
     #[test]
     fn repacks_valid_symmetric_gptq_components_once_at_source_boundary() {
-        let directory = write_fixture(0x7777_7777);
+        let directory = write_fixture(0x8888_8888_u32 as i32);
         let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
         let packed = packed_component();
         let payload = source.component(&packed).unwrap();
@@ -492,13 +502,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_noncanonical_symmetric_zero_points() {
-        let directory = write_fixture(0);
-        let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
-        let error = source
-            .component(&packed_component())
-            .err()
-            .expect("invalid qzeros must be rejected");
-        assert!(error.to_string().contains("canonical symmetric"), "{error}");
+    fn symmetric_qzeros_convention_does_not_change_marlin_payload() {
+        let code7 = write_fixture(0x7777_7777);
+        let code8 = write_fixture(0x8888_8888_u32 as i32);
+        let source7 = GptqMarlinSafetensorsSource::open(code7.path()).unwrap();
+        let source8 = GptqMarlinSafetensorsSource::open(code8.path()).unwrap();
+        let component = packed_component();
+
+        assert_eq!(
+            source7.component(&component).unwrap().bytes(),
+            source8.component(&component).unwrap().bytes()
+        );
     }
 }
