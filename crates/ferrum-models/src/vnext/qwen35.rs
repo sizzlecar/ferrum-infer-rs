@@ -20,7 +20,8 @@ use ferrum_interfaces::vnext::{
     WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
     CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
 use ferrum_quantization::{GgufWeightComponentSource, SafetensorsArchive};
@@ -42,6 +43,12 @@ pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
+const MOE_ROUTER_ROLE: &str = "moe_router";
+const MOE_ROUTED_GATE_UP_ROLE: &str = "moe_routed_gate_up";
+const MOE_ROUTED_DOWN_ROLE: &str = "moe_routed_down";
+const MOE_SHARED_GATE_ROLE: &str = "moe_shared_gate";
+const MOE_SHARED_GATE_UP_ROLE: &str = "moe_shared_gate_up";
+const MOE_SHARED_DOWN_ROLE: &str = "moe_shared_down";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,17 +112,16 @@ impl Qwen35FamilyProvider {
                 "typed epsilon differs from Hugging Face metadata",
             ));
         }
-        if text.is_moe() {
-            return Err(invalid_config(
-                "hf_config.text_config.model_type",
-                "the first production slice accepts dense Qwen3.5 only",
-            ));
-        }
         if text.quantization.is_some() {
-            return Err(invalid_config(
-                "hf_config.quantization_config",
-                "the dense Qwen3.5 family package does not accept quantized weights",
-            ));
+            let reason = match config.weight_format {
+                FamilyWeightFormat::SafetensorsDense => {
+                    "raw safetensors quantization requires the typed GPTQ source adapter"
+                }
+                FamilyWeightFormat::GgufNative => {
+                    "GGUF physical quantization must not be duplicated in Hugging Face metadata"
+                }
+            };
+            return Err(invalid_config("hf_config.quantization_config", reason));
         }
         if text.mamba_ssm_dtype != DataType::FP32 {
             return Err(invalid_config(
@@ -304,6 +310,9 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let text = Self::text_config(config)?;
         let mut weight_refs = Vec::with_capacity(config.weights.len());
         for weight in &config.weights {
+            if is_moe_source_role(&weight.role) {
+                continue;
+            }
             if weight.role == "mlp_up" {
                 continue;
             }
@@ -329,6 +338,11 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         materialized_element_type(&weight.role),
                     ),
                 });
+            }
+        }
+        if text.moe.is_some() {
+            for layer_index in 0..text.num_hidden_layers {
+                weight_refs.extend(moe_weight_references(&text, layer_index as u32)?);
             }
         }
 
@@ -554,32 +568,67 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 ]),
             });
 
-            let intermediate_size = text.dense_intermediate_size.ok_or_else(|| {
-                invalid_config(
-                    "hf_config.text_config.intermediate_size",
-                    "missing dense FFN size",
-                )
-            })?;
             let mlp_output = value_id(format!("value.layer.{layer_index}.mlp"))?;
+            let (feed_forward_operation, feed_forward_inputs, feed_forward_attributes) =
+                if let Some(moe) = &text.moe {
+                    (
+                        ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+                        vec![
+                            normalized,
+                            moe_weight_value_id(layer_index as u32, MOE_ROUTER_ROLE)?,
+                            moe_weight_value_id(layer_index as u32, MOE_ROUTED_GATE_UP_ROLE)?,
+                            moe_weight_value_id(layer_index as u32, MOE_ROUTED_DOWN_ROLE)?,
+                            moe_weight_value_id(layer_index as u32, MOE_SHARED_GATE_ROLE)?,
+                            moe_weight_value_id(layer_index as u32, MOE_SHARED_GATE_UP_ROLE)?,
+                            moe_weight_value_id(layer_index as u32, MOE_SHARED_DOWN_ROLE)?,
+                        ],
+                        BTreeMap::from([
+                            attribute("hidden_size", text.hidden_size as u64)?,
+                            attribute("expert_count", moe.num_experts as u64)?,
+                            attribute("experts_per_token", moe.num_experts_per_tok as u64)?,
+                            attribute(
+                                "routed_intermediate_size",
+                                moe.moe_intermediate_size as u64,
+                            )?,
+                            attribute(
+                                "shared_intermediate_size",
+                                moe.shared_expert_intermediate_size as u64,
+                            )?,
+                            attribute("normalize_topk", moe.norm_topk_prob)?,
+                        ]),
+                    )
+                } else {
+                    let intermediate_size = text.dense_intermediate_size.ok_or_else(|| {
+                        invalid_config(
+                            "hf_config.text_config.intermediate_size",
+                            "missing dense FFN size",
+                        )
+                    })?;
+                    (
+                        DENSE_SWIGLU_OPERATION_ID,
+                        vec![
+                            normalized,
+                            packed_gate_up_value_id(layer_index as u32)?,
+                            weight_value_id(required_weight(
+                                config,
+                                Some(layer_index as u32),
+                                "mlp_down",
+                            )?)?,
+                        ],
+                        BTreeMap::from([
+                            attribute("hidden_size", text.hidden_size as u64)?,
+                            attribute("intermediate_size", intermediate_size as u64)?,
+                        ]),
+                    )
+                };
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.feed_forward"))?,
-                operation_id: operation_id(DENSE_SWIGLU_OPERATION_ID)?,
+                operation_id: operation_id(feed_forward_operation)?,
                 required_version: ContractVersion::new(1, 0),
-                work: ProgramNodeWorkSpec::tokens(normalized.clone(), 0),
-                inputs: vec![
-                    normalized,
-                    packed_gate_up_value_id(layer_index as u32)?,
-                    weight_value_id(required_weight(
-                        config,
-                        Some(layer_index as u32),
-                        "mlp_down",
-                    )?)?,
-                ],
+                work: ProgramNodeWorkSpec::tokens(feed_forward_inputs[0].clone(), 0),
+                inputs: feed_forward_inputs,
                 outputs: vec![mlp_output.clone()],
-                attributes: BTreeMap::from([
-                    attribute("hidden_size", text.hidden_size as u64)?,
-                    attribute("intermediate_size", intermediate_size as u64)?,
-                ]),
+                attributes: feed_forward_attributes,
             });
 
             let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
@@ -650,6 +699,15 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
 }
 
 fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+    if Qwen35TextConfig::from_hf_config_value(&config.hf_config)
+        .map_err(|reason| invalid_config("hf_config", reason))?
+        .is_moe()
+    {
+        return Err(invalid_config(
+            "weight_format",
+            "safetensors MoE requires the typed GPTQ source adapter",
+        ));
+    }
     let mut components = Vec::with_capacity(config.weights.len());
     let mut tensors = Vec::with_capacity(config.weights.len());
     for weight in &config.weights {
@@ -719,9 +777,14 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
 }
 
 fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+    let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config)
+        .map_err(|reason| invalid_config("hf_config", reason))?;
     let mut components = Vec::with_capacity(config.weights.len());
     let mut tensors = Vec::with_capacity(config.weights.len());
     for weight in &config.weights {
+        if is_moe_source_role(&weight.role) {
+            continue;
+        }
         if weight.role == "mlp_up" {
             continue;
         }
@@ -771,13 +834,152 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
             required: true,
         });
     }
+    if text.moe.is_some() {
+        for layer_index in 0..text.num_hidden_layers {
+            append_gguf_moe_weight_schema(
+                config,
+                &text,
+                layer_index as u32,
+                &mut components,
+                &mut tensors,
+            )?;
+        }
+    }
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.gguf.native-block")?,
-        layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.gguf.native")?,
-        version: ContractVersion::new(1, 0),
+        layout_id: WeightLayoutId::new(if text.is_moe() {
+            "weight-layout.qwen3_5.hybrid_moe.gguf.native"
+        } else {
+            "weight-layout.qwen3_5.dense_hybrid.gguf.native"
+        })?,
+        version: if text.is_moe() {
+            ContractVersion::new(2, 0)
+        } else {
+            ContractVersion::new(1, 0)
+        },
         components,
         tensors,
     })
+}
+
+fn append_gguf_moe_weight_schema(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+    layer_index: u32,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    let source = |role| required_weight(config, Some(layer_index), role);
+
+    append_gguf_direct_logical_weight(
+        source(MOE_ROUTER_ROLE)?,
+        moe_weight_id(layer_index, MOE_ROUTER_ROLE)?,
+        moe_logical_dimensions(text, MOE_ROUTER_ROLE)?,
+        components,
+        tensors,
+    )?;
+    append_gguf_composite_logical_weight(
+        [
+            source("moe_stacked_gate_proj")?,
+            source("moe_stacked_up_proj")?,
+        ],
+        moe_weight_id(layer_index, MOE_ROUTED_GATE_UP_ROLE)?,
+        moe_logical_dimensions(text, MOE_ROUTED_GATE_UP_ROLE)?,
+        1,
+        components,
+        tensors,
+    )?;
+    append_gguf_direct_logical_weight(
+        source("moe_stacked_down_proj")?,
+        moe_weight_id(layer_index, MOE_ROUTED_DOWN_ROLE)?,
+        moe_logical_dimensions(text, MOE_ROUTED_DOWN_ROLE)?,
+        components,
+        tensors,
+    )?;
+    append_gguf_direct_logical_weight(
+        source("moe_shared_expert_gate")?,
+        moe_weight_id(layer_index, MOE_SHARED_GATE_ROLE)?,
+        moe_logical_dimensions(text, MOE_SHARED_GATE_ROLE)?,
+        components,
+        tensors,
+    )?;
+    append_gguf_composite_logical_weight(
+        [
+            source("moe_shared_expert_gate_proj")?,
+            source("moe_shared_expert_up_proj")?,
+        ],
+        moe_weight_id(layer_index, MOE_SHARED_GATE_UP_ROLE)?,
+        moe_logical_dimensions(text, MOE_SHARED_GATE_UP_ROLE)?,
+        0,
+        components,
+        tensors,
+    )?;
+    append_gguf_direct_logical_weight(
+        source("moe_shared_expert_down_proj")?,
+        moe_weight_id(layer_index, MOE_SHARED_DOWN_ROLE)?,
+        moe_logical_dimensions(text, MOE_SHARED_DOWN_ROLE)?,
+        components,
+        tensors,
+    )
+}
+
+fn append_gguf_direct_logical_weight(
+    source: &FamilyWeight,
+    logical_id: WeightId,
+    logical_dimensions: Vec<u64>,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    let component = gguf_component_spec(source)?;
+    let layout = gguf_component_layout(source, component.id.clone(), &logical_dimensions)?;
+    components.push(component);
+    tensors.push(WeightTensorSpec {
+        id: logical_id,
+        dimensions: logical_dimensions,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: layout,
+        required: true,
+    });
+    Ok(())
+}
+
+fn append_gguf_composite_logical_weight(
+    sources: [&FamilyWeight; 2],
+    logical_id: WeightId,
+    logical_dimensions: Vec<u64>,
+    partition_axis: usize,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    if logical_dimensions.get(partition_axis).copied() != Some(2) {
+        return Err(invalid_config(
+            "weights.moe_composite",
+            "MoE gate/up logical tensor must expose exactly two ordered partitions",
+        ));
+    }
+    let mut part_dimensions = logical_dimensions.clone();
+    part_dimensions[partition_axis] = 1;
+    let mut parts = Vec::with_capacity(2);
+    for (partition, source) in sources.into_iter().enumerate() {
+        let component = gguf_component_spec(source)?;
+        let layout = gguf_component_layout(source, component.id.clone(), &part_dimensions)?;
+        let mut logical_offsets = vec![0_u64; logical_dimensions.len()];
+        logical_offsets[partition_axis] = partition as u64;
+        parts.push(CompositeWeightPart {
+            layout: Box::new(layout),
+            logical_offsets,
+            extents: part_dimensions.clone(),
+        });
+        components.push(component);
+    }
+    tensors.push(WeightTensorSpec {
+        id: logical_id,
+        dimensions: logical_dimensions,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: PhysicalWeightLayout::Composite { parts },
+        required: true,
+    });
+    Ok(())
 }
 
 fn gguf_component_spec(weight: &FamilyWeight) -> Result<WeightComponentSpec, VNextError> {
@@ -961,7 +1163,7 @@ fn load_safetensors_family_config(
         .map_err(|error| format!("parse semantic config.json: {error}"))?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
     if text.is_moe() {
-        return Err("the first vNext Qwen3.5 production slice requires the dense model".to_owned());
+        return Err("safetensors Qwen3.5 MoE requires the typed GPTQ source adapter".to_owned());
     }
     if text.quantization.is_some() {
         return Err("the dense vNext Qwen3.5 package does not accept quantized weights".to_owned());
@@ -1017,9 +1219,6 @@ fn load_gguf_family_config(
     let hf_config: Value = serde_json::from_slice(sources.config_json())
         .map_err(|error| format!("parse semantic config.json: {error}"))?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
-    if text.is_moe() {
-        return Err("the first vNext Qwen3.5 production slice requires the dense model".to_owned());
-    }
     if text.quantization.is_some() {
         return Err(
             "GGUF physical quantization must not be duplicated in Hugging Face semantic metadata"
@@ -1030,9 +1229,10 @@ fn load_gguf_family_config(
         .file()
         .architecture()
         .map_err(|error| format!("read GGUF architecture: {error}"))?;
-    if architecture != "qwen35" {
+    let expected_architecture = gguf_architecture(&text);
+    if architecture != expected_architecture {
         return Err(format!(
-            "Qwen3.5 family package requires GGUF architecture qwen35, got {architecture:?}"
+            "Qwen3.5 family package requires GGUF architecture {expected_architecture:?}, got {architecture:?}"
         ));
     }
 
@@ -1052,6 +1252,7 @@ fn load_gguf_family_config(
         &manifest.global_tensors,
         None,
         text.tie_word_embeddings,
+        expected_architecture,
         source,
     )?;
     for layer in &manifest.layers {
@@ -1060,6 +1261,7 @@ fn load_gguf_family_config(
             &layer.tensors,
             Some(layer.layer_index as u32),
             text.tie_word_embeddings,
+            expected_architecture,
             source,
         )?;
     }
@@ -1083,18 +1285,22 @@ fn append_gguf_weights(
     specs: &[Qwen35WeightSpec],
     layer_index: Option<u32>,
     tied_embeddings: bool,
+    architecture: &str,
     source: &GgufWeightComponentSource,
 ) -> Result<(), String> {
     for spec in specs
         .iter()
         .filter(|spec| !(tied_embeddings && spec.role == "lm_head"))
     {
-        let external_name = ferrum_to_gguf_with_arch("qwen35", &spec.name).ok_or_else(|| {
-            format!(
-                "Qwen3.5 GGUF has no typed name mapping for role {:?} source {:?}",
-                spec.role, spec.name
-            )
-        })?;
+        let Some(external_name) = ferrum_to_gguf_with_arch(architecture, &spec.name) else {
+            if spec.required {
+                return Err(format!(
+                    "Qwen3.5 GGUF has no typed name mapping for required role {:?} source {:?}",
+                    spec.role, spec.name
+                ));
+            }
+            continue;
+        };
         let Some(info) = source.file().tensor_info(&external_name) else {
             if spec.required {
                 return Err(format!(
@@ -1228,6 +1434,7 @@ fn validate_gguf_manifest(
     text: &Qwen35TextConfig,
     config: &Qwen35FamilyConfig,
 ) -> Result<(), VNextError> {
+    let architecture = gguf_architecture(text);
     let manifest = text
         .weight_manifest("model.language_model")
         .map_err(|reason| invalid_config("weights", reason))?;
@@ -1245,15 +1452,18 @@ fn validate_gguf_manifest(
         }))
         .filter(|(_, spec)| !(text.tie_word_embeddings && spec.role == "lm_head"))
     {
-        let external_name = ferrum_to_gguf_with_arch("qwen35", &spec.name).ok_or_else(|| {
-            invalid_config(
-                "weights",
-                format!(
-                    "GGUF has no typed name mapping for role {:?} source {:?}",
-                    spec.role, spec.name
-                ),
-            )
-        })?;
+        let Some(external_name) = ferrum_to_gguf_with_arch(architecture, &spec.name) else {
+            if spec.required {
+                return Err(invalid_config(
+                    "weights",
+                    format!(
+                        "GGUF has no typed name mapping for required role {:?} source {:?}",
+                        spec.role, spec.name
+                    ),
+                ));
+            }
+            continue;
+        };
         let key = (layer_index, spec.role.clone(), external_name);
         if spec.required {
             required.insert(key.clone());
@@ -1264,10 +1474,41 @@ fn validate_gguf_manifest(
     if !required.is_subset(&actual) || !actual.is_subset(&allowed) {
         return Err(invalid_config(
             "weights",
-            "resolved GGUF tensors do not exactly match the supported dense Qwen3.5 manifest",
+            "resolved GGUF tensors do not exactly match the supported Qwen3.5 manifest",
         ));
     }
+    if text.is_moe() {
+        for layer_index in 0..text.num_hidden_layers {
+            for role in [
+                MOE_ROUTER_ROLE,
+                "moe_stacked_gate_proj",
+                "moe_stacked_up_proj",
+                "moe_stacked_down_proj",
+                "moe_shared_expert_gate",
+                "moe_shared_expert_gate_proj",
+                "moe_shared_expert_up_proj",
+                "moe_shared_expert_down_proj",
+            ] {
+                required_weight(config, Some(layer_index as u32), role).map_err(|_| {
+                    invalid_config(
+                        "weights",
+                        format!(
+                            "Qwen3.5 MoE GGUF layer {layer_index} lacks canonical source role {role:?}"
+                        ),
+                    )
+                })?;
+            }
+        }
+    }
     Ok(())
+}
+
+fn gguf_architecture(text: &Qwen35TextConfig) -> &'static str {
+    if text.is_moe() {
+        "qwen35moe"
+    } else {
+        "qwen35"
+    }
 }
 
 fn layer_weights(
@@ -1291,6 +1532,69 @@ fn required_weight<'a>(
         .iter()
         .find(|weight| weight.layer_index == layer_index && weight.role == role)
         .ok_or_else(|| invalid_config("weights", format!("missing role {role:?}")))
+}
+
+fn is_moe_source_role(role: &str) -> bool {
+    role.starts_with("moe_")
+}
+
+fn moe_logical_dimensions(text: &Qwen35TextConfig, role: &str) -> Result<Vec<u64>, VNextError> {
+    let moe = text.moe.as_ref().ok_or_else(|| {
+        invalid_config(
+            "hf_config.text_config.model_type",
+            "MoE logical weight requested for a dense configuration",
+        )
+    })?;
+    let hidden = text.hidden_size as u64;
+    let experts = moe.num_experts as u64;
+    let routed = moe.moe_intermediate_size as u64;
+    let shared = moe.shared_expert_intermediate_size as u64;
+    match role {
+        MOE_ROUTER_ROLE => Ok(vec![experts, hidden]),
+        MOE_ROUTED_GATE_UP_ROLE => Ok(vec![experts, 2, routed, hidden]),
+        MOE_ROUTED_DOWN_ROLE => Ok(vec![experts, hidden, routed]),
+        MOE_SHARED_GATE_ROLE => Ok(vec![1, hidden]),
+        MOE_SHARED_GATE_UP_ROLE => Ok(vec![2, shared, hidden]),
+        MOE_SHARED_DOWN_ROLE => Ok(vec![hidden, shared]),
+        _ => Err(invalid_config(
+            "weights.role",
+            format!("unknown Qwen3.5 MoE logical weight role {role:?}"),
+        )),
+    }
+}
+
+fn moe_weight_references(
+    text: &Qwen35TextConfig,
+    layer_index: u32,
+) -> Result<Vec<WeightReference>, VNextError> {
+    [
+        MOE_ROUTER_ROLE,
+        MOE_ROUTED_GATE_UP_ROLE,
+        MOE_ROUTED_DOWN_ROLE,
+        MOE_SHARED_GATE_ROLE,
+        MOE_SHARED_GATE_UP_ROLE,
+        MOE_SHARED_DOWN_ROLE,
+    ]
+    .into_iter()
+    .map(|role| {
+        Ok(WeightReference {
+            weight_id: moe_weight_id(layer_index, role)?,
+            value_id: moe_weight_value_id(layer_index, role)?,
+            tensor: tensor_spec(
+                moe_logical_dimensions(text, role)?,
+                DENSE_MATERIALIZED_ELEMENT_TYPE,
+            ),
+        })
+    })
+    .collect()
+}
+
+fn moe_weight_id(layer_index: u32, role: &str) -> Result<WeightId, VNextError> {
+    WeightId::new(scoped_weight_key(Some(layer_index), role, "weight"))
+}
+
+fn moe_weight_value_id(layer_index: u32, role: &str) -> Result<ProgramValueId, VNextError> {
+    ProgramValueId::new(scoped_weight_key(Some(layer_index), role, "value.weight"))
 }
 
 fn materialized_element_type(role: &str) -> ElementType {
@@ -1352,6 +1656,10 @@ fn expected_weight_dimensions(
     let full_query = text.full_attention_q_proj_total_dim() as u64;
     let full_query_without_gate = text.full_attention_query_total_dim() as u64;
     let full_kv = text.full_attention_kv_total_dim() as u64;
+    let moe = text.moe.as_ref();
+    let experts = moe.map_or(0, |config| config.num_experts as u64);
+    let routed = moe.map_or(0, |config| config.moe_intermediate_size as u64);
+    let shared = moe.map_or(0, |config| config.shared_expert_intermediate_size as u64);
     let expected = match weight.role.as_str() {
         "embed_tokens" | "lm_head" => vec![vec![vocab_size, hidden]],
         "final_norm" | "input_layernorm" | "post_attention_layernorm" => {
@@ -1373,6 +1681,16 @@ fn expected_weight_dimensions(
         "self_attn_q_norm" | "self_attn_k_norm" => vec![vec![text.head_dim as u64]],
         "mlp_gate" | "mlp_up" => vec![vec![intermediate, hidden]],
         "mlp_down" => vec![vec![hidden, intermediate]],
+        MOE_ROUTER_ROLE => vec![vec![experts, hidden]],
+        "moe_stacked_gate_proj" | "moe_stacked_up_proj" => {
+            vec![vec![experts, routed, hidden]]
+        }
+        "moe_stacked_down_proj" => vec![vec![experts, hidden, routed]],
+        "moe_shared_expert_gate" => vec![vec![hidden]],
+        "moe_shared_expert_gate_proj" | "moe_shared_expert_up_proj" => {
+            vec![vec![shared, hidden]]
+        }
+        "moe_shared_expert_down_proj" => vec![vec![hidden, shared]],
         role => {
             return Err(invalid_config(
                 "weights.role",
@@ -1570,9 +1888,9 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        gated_delta_recurrent_attention_contract, ModelSourceKind, OperationContract,
-        OriginalModelSource, OriginalModelSources, PhysicalStorageLayout,
-        PhysicalWeightComponentBinding, WeightComponentSource,
+        gated_delta_recurrent_attention_contract, routed_shared_swiglu_moe_contract,
+        ModelSourceKind, OperationContract, OriginalModelSource, OriginalModelSources,
+        PhysicalStorageLayout, PhysicalWeightComponentBinding, WeightComponentSource,
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -1607,6 +1925,26 @@ mod tests {
             "self_attn_k" | "self_attn_v" => vec![full_kv, hidden],
             "self_attn_o" => vec![hidden, full_query],
             "self_attn_q_norm" | "self_attn_k_norm" => vec![text.head_dim as u64],
+            MOE_ROUTER_ROLE => vec![text.moe.as_ref().unwrap().num_experts as u64, hidden],
+            "moe_stacked_gate_proj" | "moe_stacked_up_proj" => vec![
+                text.moe.as_ref().unwrap().num_experts as u64,
+                text.moe.as_ref().unwrap().moe_intermediate_size as u64,
+                hidden,
+            ],
+            "moe_stacked_down_proj" => vec![
+                text.moe.as_ref().unwrap().num_experts as u64,
+                hidden,
+                text.moe.as_ref().unwrap().moe_intermediate_size as u64,
+            ],
+            "moe_shared_expert_gate" => vec![hidden],
+            "moe_shared_expert_gate_proj" | "moe_shared_expert_up_proj" => vec![
+                text.moe.as_ref().unwrap().shared_expert_intermediate_size as u64,
+                hidden,
+            ],
+            "moe_shared_expert_down_proj" => vec![
+                hidden,
+                text.moe.as_ref().unwrap().shared_expert_intermediate_size as u64,
+            ],
             role => panic!("test has no dimensions for Qwen3.5 role {role:?}"),
         }
     }
@@ -1689,6 +2027,185 @@ mod tests {
             weight_format: FamilyWeightFormat::SafetensorsDense,
             weights,
         }
+    }
+
+    fn test_moe_gguf_config() -> Qwen35FamilyConfig {
+        let hf_config = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 4,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention"
+                ],
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
+                "head_dim": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8,
+                "shared_expert_intermediate_size": 12,
+                "norm_topk_prob": true,
+                "tie_word_embeddings": true,
+                "vocab_size": 32,
+                "max_position_embeddings": 128
+            }
+        });
+        let text = Qwen35TextConfig::from_hf_config_value(&hf_config).unwrap();
+        let manifest = text.weight_manifest("model.language_model").unwrap();
+        let include = |spec: &&Qwen35WeightSpec| {
+            spec.required
+                || matches!(
+                    spec.role.as_str(),
+                    "moe_stacked_gate_proj" | "moe_stacked_up_proj" | "moe_stacked_down_proj"
+                )
+        };
+        let mut weights = Vec::new();
+        for spec in manifest.global_tensors.iter().filter(include) {
+            let external_name = ferrum_to_gguf_with_arch("qwen35moe", &spec.name).unwrap();
+            let mut weight = FamilyWeight {
+                layer_index: None,
+                role: spec.role.clone(),
+                external_name,
+                dimensions: vec![1],
+                source_encoding: FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+            };
+            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weights.push(weight);
+        }
+        for layer in &manifest.layers {
+            for spec in layer.tensors.iter().filter(include) {
+                let external_name = ferrum_to_gguf_with_arch("qwen35moe", &spec.name).unwrap();
+                let mut weight = FamilyWeight {
+                    layer_index: Some(layer.layer_index as u32),
+                    role: spec.role.clone(),
+                    external_name,
+                    dimensions: vec![1],
+                    source_encoding: FamilyWeightSourceEncoding::Dense {
+                        element_type: ElementType::F16,
+                    },
+                };
+                weight.dimensions = test_weight_dimensions(&text, &weight);
+                weights.push(weight);
+            }
+        }
+        weights.sort_by(|left, right| {
+            (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
+        });
+        let tokenizer_config = br#"{
+            "chat_template": "{{ messages }}",
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0
+        }"#;
+        Qwen35FamilyConfig {
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
+            hf_config,
+            vocab_size: 32,
+            max_position_embeddings: 128,
+            rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
+            weight_format: FamilyWeightFormat::GgufNative,
+            weights,
+        }
+    }
+
+    #[test]
+    fn prepares_sparse_moe_program_with_routed_shared_contract() {
+        let config = test_moe_gguf_config();
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(&config).unwrap())
+            .unwrap();
+        let nodes = &prepared.program().blocks()[0].nodes;
+        let moe_nodes = nodes
+            .iter()
+            .filter(|node| node.operation_id.as_str() == ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(moe_nodes.len(), 4);
+        assert!(!nodes
+            .iter()
+            .any(|node| node.operation_id.as_str() == DENSE_SWIGLU_OPERATION_ID));
+
+        let contract = routed_shared_swiglu_moe_contract().unwrap();
+        let first = moe_nodes[0];
+        assert_eq!(first.required_version, ContractVersion::new(1, 0));
+        assert_eq!(first.inputs.len(), contract.descriptor().inputs.len());
+        assert_eq!(
+            first
+                .inputs
+                .iter()
+                .skip(1)
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "value.weight.layer.0.moe_router",
+                "value.weight.layer.0.moe_routed_gate_up",
+                "value.weight.layer.0.moe_routed_down",
+                "value.weight.layer.0.moe_shared_gate",
+                "value.weight.layer.0.moe_shared_gate_up",
+                "value.weight.layer.0.moe_shared_down",
+            ]
+        );
+        for (attribute_id, expected) in [
+            ("hidden_size", SemanticValue::Unsigned(16)),
+            ("expert_count", SemanticValue::Unsigned(4)),
+            ("experts_per_token", SemanticValue::Unsigned(2)),
+            ("routed_intermediate_size", SemanticValue::Unsigned(8)),
+            ("shared_intermediate_size", SemanticValue::Unsigned(12)),
+            ("normalize_topk", SemanticValue::Bool(true)),
+        ] {
+            assert_eq!(
+                first
+                    .attributes
+                    .get(&AttributeId::new(attribute_id).unwrap()),
+                Some(&expected)
+            );
+        }
+
+        let logical_shapes = [
+            (MOE_ROUTER_ROLE, vec![4, 16]),
+            (MOE_ROUTED_GATE_UP_ROLE, vec![4, 2, 8, 16]),
+            (MOE_ROUTED_DOWN_ROLE, vec![4, 16, 8]),
+            (MOE_SHARED_GATE_ROLE, vec![1, 16]),
+            (MOE_SHARED_GATE_UP_ROLE, vec![2, 12, 16]),
+            (MOE_SHARED_DOWN_ROLE, vec![16, 12]),
+        ];
+        for (role, dimensions) in logical_shapes {
+            let weight_id = moe_weight_id(0, role).unwrap();
+            let program_weight = prepared
+                .program()
+                .weights()
+                .iter()
+                .find(|weight| weight.weight_id == weight_id)
+                .unwrap();
+            assert_eq!(program_weight.tensor.dimensions, dimensions);
+            let schema_weight = prepared.weight_schema().tensor(&weight_id).unwrap();
+            assert_eq!(schema_weight.dimensions, dimensions);
+        }
+        let routed_gate_up = prepared
+            .weight_schema()
+            .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        assert!(matches!(
+            routed_gate_up.physical_layout,
+            PhysicalWeightLayout::Composite { ref parts } if parts.len() == 2
+        ));
+        assert_eq!(
+            prepared.weight_schema().layout_id.as_str(),
+            "weight-layout.qwen3_5.hybrid_moe.gguf.native"
+        );
     }
 
     #[test]
@@ -2255,5 +2772,81 @@ mod tests {
                     .to_owned()
             ))
         );
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5-35B-A3B semantic metadata and Q4_K_S GGUF"]
+    fn prepares_real_qwen35_moe_gguf_with_typed_logical_stacks() {
+        let semantic_root = std::env::var("FERRUM_TEST_QWEN35_MOE_SEMANTIC_DIR")
+            .expect("FERRUM_TEST_QWEN35_MOE_SEMANTIC_DIR");
+        let gguf_path = std::env::var("FERRUM_TEST_QWEN35_MOE_GGUF_PATH")
+            .expect("FERRUM_TEST_QWEN35_MOE_GGUF_PATH");
+        let semantic = OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: semantic_root.clone(),
+            requested_revision: None,
+        };
+        let weights = OriginalModelSource {
+            kind: ModelSourceKind::LocalFile,
+            location: gguf_path.clone(),
+            requested_revision: None,
+        };
+        let sources = Arc::new(
+            ProductionModelSourceBundle::open(
+                &semantic_root,
+                &semantic_root,
+                ProductionWeightArtifact::gguf_file(&gguf_path),
+                OriginalModelSources {
+                    semantic: semantic.clone(),
+                    tokenizer: semantic,
+                    weights,
+                },
+            )
+            .unwrap(),
+        );
+        let prepared = prepare_from_sources(sources).unwrap();
+        let schema = prepared.family().weight_schema();
+        assert_eq!(
+            prepared.family().program().blocks()[0]
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.operation_id.as_str() == ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID
+                })
+                .count(),
+            40
+        );
+        assert_eq!(
+            schema
+                .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
+                .unwrap()
+                .dimensions,
+            [256, 2, 512, 2048]
+        );
+        assert_eq!(
+            schema
+                .tensor(&moe_weight_id(0, MOE_ROUTED_DOWN_ROLE).unwrap())
+                .unwrap()
+                .dimensions,
+            [256, 2048, 512]
+        );
+        let routed_gate_up = schema
+            .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        assert!(matches!(
+            routed_gate_up.physical_layout,
+            PhysicalWeightLayout::Composite { ref parts }
+                if parts.len() == 2
+                    && parts[0].extents == [256, 1, 512, 2048]
+                    && parts[1].extents == [256, 1, 512, 2048]
+        ));
+        let routed_gate = schema
+            .components
+            .iter()
+            .find(|component| component.external_names == ["blk.0.ffn_gate_exps.weight"])
+            .unwrap();
+        let first = prepared.weights().component(routed_gate).unwrap();
+        let second = prepared.weights().component(routed_gate).unwrap();
+        assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
     }
 }
