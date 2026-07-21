@@ -3,6 +3,7 @@ using namespace metal;
 
 constant uint THREADS_PER_GROUP = 256;
 constant uint QK_K = 256;
+constant uint QK8_0 = 32;
 
 struct EmbeddingParams {
     uint token_count;
@@ -25,6 +26,11 @@ struct block_q6_K {
     uchar qh[QK_K / 4];
     char scales[QK_K / 16];
     half d;
+};
+
+struct block_q8_0 {
+    half d;
+    char qs[QK8_0];
 };
 
 static inline float q6_k_value(device const block_q6_K & block, uint index) {
@@ -100,6 +106,30 @@ kernel void vnext_embedding_q6_k_f16(
     const uint blocks_per_row = params.hidden_size / QK_K;
     const ulong block_index = ulong(token_id) * blocks_per_row + column / QK_K;
     output[output_index] = half(q6_k_value(table[block_index], column % QK_K));
+}
+
+kernel void vnext_embedding_q8_0_f16(
+    device const block_q8_0 * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) {
+        return;
+    }
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    if (token_id >= params.vocabulary_size) {
+        output[output_index] = half(0.0h);
+        return;
+    }
+    const uint blocks_per_row = params.hidden_size / QK8_0;
+    const ulong block_index = ulong(token_id) * blocks_per_row + column / QK8_0;
+    const block_q8_0 block = table[block_index];
+    output[output_index] = half(float(block.d) * float(block.qs[column % QK8_0]));
 }
 
 kernel void vnext_rms_norm_f16(
