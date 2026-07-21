@@ -22,6 +22,7 @@ rayon = { workspace = true }
 sha2 = "0.10"
 cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "f16", "nvrtc", "cuda-version-from-build-system"], optional = true }
 metal = { version = "0.31", optional = true }
+libc = "0.2"
 
 [build-dependencies]
 bindgen_cuda = "0.1.6"

@@ -5,24 +5,25 @@
 //! and the returned fence retains all buffers and staging storage until Metal
 //! reports a quiescent terminal state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::{c_void, CStr};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use ferrum_interfaces::vnext::{
-    BufferDescriptor, BufferRequest, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
+    BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
     DeviceCommandPhase, DeviceDescriptor, DeviceErrorReport, DeviceExecutionPath,
     DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceRuntime,
     DeviceSubmissionAttribution, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
     DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
     DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, RetainedHostMemoryRegion,
+    StaticWeightImportSession, StreamState, VNextError, WeightComponentPayload,
 };
 use metal::objc::runtime::{Object, BOOL, YES};
 use metal::objc::{msg_send, sel, sel_impl};
@@ -169,13 +170,40 @@ struct MetalAllocation {
     base: Buffer,
     aligned_offset_bytes: u64,
     requested_bytes: u64,
+    // The Metal handle must be released before its no-copy host allocation.
+    _retained_host_memory: Option<RetainedHostMemoryRegion>,
+}
+
+struct MetalStaticWeightSegment {
+    logical_start_bytes: u64,
+    logical_end_bytes: u64,
+    allocation: Arc<MetalAllocation>,
+}
+
+struct MetalStaticWeightResidency {
+    set: Option<super::residency::MetalResidencySet>,
+}
+
+struct MetalStaticWeightBacking {
+    // End residency before releasing the segment buffers and their mmap owners.
+    _residency: Arc<MetalStaticWeightResidency>,
+    segments: Box<[MetalStaticWeightSegment]>,
+}
+
+struct MetalStaticWeightArena {
+    sealed: OnceLock<MetalStaticWeightBacking>,
+}
+
+enum MetalDeviceBufferBacking {
+    Contiguous(Arc<MetalAllocation>),
+    StaticWeights(Arc<MetalStaticWeightArena>),
 }
 
 /// One core-owned Metal allocation with its exact admitted descriptor.
 pub struct MetalDeviceBuffer {
     descriptor: BufferDescriptor,
     runtime_instance: u64,
-    allocation: Arc<MetalAllocation>,
+    backing: MetalDeviceBufferBacking,
 }
 
 impl fmt::Debug for MetalDeviceBuffer {
@@ -189,6 +217,16 @@ impl fmt::Debug for MetalDeviceBuffer {
 }
 
 impl MetalDeviceBuffer {
+    #[cfg(test)]
+    fn contiguous_allocation(&self) -> &Arc<MetalAllocation> {
+        match &self.backing {
+            MetalDeviceBufferBacking::Contiguous(allocation) => allocation,
+            MetalDeviceBufferBacking::StaticWeights(_) => {
+                panic!("test requested a contiguous allocation from a static-weight arena")
+            }
+        }
+    }
+
     fn region(&self, range: Range<u64>) -> Result<MetalBufferRegion, MetalDeviceRuntimeError> {
         self.region_with_retention(range, None)
     }
@@ -206,21 +244,51 @@ impl MetalDeviceBuffer {
         range: Range<u64>,
         core_retention: Option<DeviceBufferRetention>,
     ) -> Result<MetalBufferRegion, MetalDeviceRuntimeError> {
-        if range.start >= range.end
-            || range.end > self.descriptor.size_bytes
-            || range.end > self.allocation.requested_bytes
-        {
+        if range.start >= range.end || range.end > self.descriptor.size_bytes {
             return Err(MetalDeviceRuntimeError::contract(
                 "Metal buffer region is empty or outside its admitted allocation",
             ));
         }
-        let offset_bytes = self
-            .allocation
+        let (allocation, logical_start_bytes) = match &self.backing {
+            MetalDeviceBufferBacking::Contiguous(allocation) => {
+                if range.end > allocation.requested_bytes {
+                    return Err(MetalDeviceRuntimeError::contract(
+                        "Metal buffer region exceeds its physical allocation",
+                    ));
+                }
+                (Arc::clone(allocation), 0)
+            }
+            MetalDeviceBufferBacking::StaticWeights(arena) => {
+                let backing = arena.sealed.get().ok_or_else(|| {
+                    MetalDeviceRuntimeError::contract(
+                        "Metal static-weight arena is not sealed for execution",
+                    )
+                })?;
+                let position = backing
+                    .segments
+                    .partition_point(|segment| segment.logical_start_bytes <= range.start);
+                let segment = position
+                    .checked_sub(1)
+                    .and_then(|index| backing.segments.get(index))
+                    .filter(|segment| {
+                        range.start >= segment.logical_start_bytes
+                            && range.end <= segment.logical_end_bytes
+                    })
+                    .ok_or_else(|| {
+                        MetalDeviceRuntimeError::contract(
+                            "Metal static-weight range crosses or misses an imported component",
+                        )
+                    })?;
+                (Arc::clone(&segment.allocation), segment.logical_start_bytes)
+            }
+        };
+        let relative_offset = range.start - logical_start_bytes;
+        let offset_bytes = allocation
             .aligned_offset_bytes
-            .checked_add(range.start)
+            .checked_add(relative_offset)
             .ok_or_else(|| MetalDeviceRuntimeError::contract("Metal buffer offset overflows"))?;
         Ok(MetalBufferRegion {
-            allocation: Arc::clone(&self.allocation),
+            allocation,
             _core_retention: core_retention,
             runtime_instance: self.runtime_instance,
             offset_bytes,
@@ -228,6 +296,265 @@ impl MetalDeviceBuffer {
             element_type: self.descriptor.element_type,
         })
     }
+}
+
+struct PendingMetalStaticWeightArena {
+    arena: Arc<MetalStaticWeightArena>,
+    segments: Vec<MetalStaticWeightSegment>,
+}
+
+struct MetalStaticWeightImport<'runtime> {
+    device: metal::Device,
+    runtime_instance: u64,
+    _permit: MutexGuard<'runtime, ()>,
+    residency: Arc<MetalStaticWeightResidency>,
+    arenas: BTreeMap<usize, PendingMetalStaticWeightArena>,
+}
+
+impl<'runtime> MetalStaticWeightImport<'runtime> {
+    fn new(
+        device: metal::Device,
+        runtime_instance: u64,
+        permit: MutexGuard<'runtime, ()>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let set = super::residency::MetalResidencySet::new(&device)
+            .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?;
+        Ok(Self {
+            device,
+            runtime_instance,
+            _permit: permit,
+            residency: Arc::new(MetalStaticWeightResidency { set }),
+            arenas: BTreeMap::new(),
+        })
+    }
+}
+
+impl StaticWeightImportSession<MetalDeviceBuffer, MetalDeviceRuntimeError>
+    for MetalStaticWeightImport<'_>
+{
+    fn import_component(
+        &mut self,
+        payload: &WeightComponentPayload<'_>,
+        destination: &MetalDeviceBuffer,
+        destination_offset_bytes: u64,
+    ) -> Result<(), MetalDeviceRuntimeError> {
+        if destination.runtime_instance != self.runtime_instance
+            || destination.descriptor.usage != BufferUsage::Weights
+            || destination.descriptor.element_type != payload.element_type()
+        {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static-weight import destination differs from the runtime or payload",
+            ));
+        }
+        let length_bytes = u64::try_from(payload.bytes().len()).map_err(|_| {
+            MetalDeviceRuntimeError::contract("Metal static-weight payload exceeds u64")
+        })?;
+        if !destination_offset_bytes.is_multiple_of(destination.descriptor.alignment_bytes) {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static-weight component offset violates its admitted alignment",
+            ));
+        }
+        let logical_end_bytes = checked_end(
+            destination_offset_bytes,
+            length_bytes,
+            destination.descriptor.size_bytes,
+            "Metal static-weight import",
+        )?;
+        let MetalDeviceBufferBacking::StaticWeights(arena) = &destination.backing else {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static-weight import requires a logical weight arena",
+            ));
+        };
+        if arena.sealed.get().is_some() {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static-weight arena is already sealed",
+            ));
+        }
+        let allocation = metal_static_weight_allocation(
+            &self.device,
+            payload,
+            destination.descriptor.alignment_bytes,
+        )?;
+        let key = Arc::as_ptr(arena) as usize;
+        self.arenas
+            .entry(key)
+            .or_insert_with(|| PendingMetalStaticWeightArena {
+                arena: Arc::clone(arena),
+                segments: Vec::new(),
+            })
+            .segments
+            .push(MetalStaticWeightSegment {
+                logical_start_bytes: destination_offset_bytes,
+                logical_end_bytes,
+                allocation,
+            });
+        Ok(())
+    }
+
+    fn seal(mut self: Box<Self>) -> Result<(), MetalDeviceRuntimeError> {
+        if self.arenas.is_empty() {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static-weight import contains no arenas",
+            ));
+        }
+        let mut prepared = Vec::with_capacity(self.arenas.len());
+        for (_, mut pending) in std::mem::take(&mut self.arenas) {
+            if pending.arena.sealed.get().is_some() || pending.segments.is_empty() {
+                return Err(MetalDeviceRuntimeError::contract(
+                    "Metal static-weight arena is already sealed or empty",
+                ));
+            }
+            pending
+                .segments
+                .sort_by_key(|segment| segment.logical_start_bytes);
+            if pending
+                .segments
+                .windows(2)
+                .any(|pair| pair[0].logical_end_bytes > pair[1].logical_start_bytes)
+            {
+                return Err(MetalDeviceRuntimeError::contract(
+                    "Metal static-weight component ranges overlap",
+                ));
+            }
+            prepared.push((pending.arena, pending.segments.into_boxed_slice()));
+        }
+
+        if let Some(set) = &self.residency.set {
+            for (_, segments) in &prepared {
+                for segment in segments.iter() {
+                    set.add_allocation(&segment.allocation.base);
+                }
+            }
+            let _ = set.commit_and_request();
+        }
+        for (arena, segments) in prepared {
+            let backing = MetalStaticWeightBacking {
+                _residency: Arc::clone(&self.residency),
+                segments,
+            };
+            if arena.sealed.set(backing).is_err() {
+                unreachable!("Metal static-weight publication is single-threaded and prevalidated");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn metal_static_weight_allocation(
+    device: &metal::DeviceRef,
+    payload: &WeightComponentPayload<'_>,
+    required_alignment_bytes: u64,
+) -> Result<Arc<MetalAllocation>, MetalDeviceRuntimeError> {
+    let required_alignment = usize::try_from(required_alignment_bytes).map_err(|_| {
+        MetalDeviceRuntimeError::contract("Metal static-weight alignment exceeds usize")
+    })?;
+    if required_alignment == 0 || !required_alignment.is_power_of_two() {
+        return Err(MetalDeviceRuntimeError::contract(
+            "Metal static-weight alignment is not a non-zero power of two",
+        ));
+    }
+    if let Some(retained) = payload.retained_host_memory() {
+        let page_size = system_page_size()?;
+        let owner = retained.owner_bytes();
+        let owner_start = owner.as_ptr() as usize;
+        let owner_end = owner_start.checked_add(owner.len());
+        let region_start = retained.bytes().as_ptr() as usize;
+        let region_end = region_start.checked_add(retained.length_bytes());
+        if owner_start.is_multiple_of(page_size) && region_start.is_multiple_of(required_alignment)
+        {
+            if let (Some(owner_end), Some(region_end)) = (owner_end, region_end) {
+                let aligned_start = region_start / page_size * page_size;
+                let aligned_end = region_end
+                    .checked_add(page_size - 1)
+                    .map(|end| end / page_size * page_size);
+                if let Some(aligned_end) = aligned_end {
+                    if aligned_start >= owner_start && aligned_end <= owner_end {
+                        let aligned_len = aligned_end - aligned_start;
+                        let base = device.new_buffer_with_bytes_no_copy(
+                            aligned_start as *const c_void,
+                            aligned_len as u64,
+                            MTLResourceOptions::StorageModeShared,
+                            None,
+                        );
+                        if base.length() == aligned_len as u64 {
+                            return Ok(Arc::new(MetalAllocation {
+                                base,
+                                aligned_offset_bytes: (region_start - aligned_start) as u64,
+                                requested_bytes: retained.length_bytes() as u64,
+                                _retained_host_memory: Some(retained.clone()),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let bytes = payload.bytes();
+    let length_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        MetalDeviceRuntimeError::contract("Metal static-weight payload exceeds u64")
+    })?;
+    let extra_alignment = required_alignment_bytes - 1;
+    let allocation_bytes = length_bytes.checked_add(extra_alignment).ok_or_else(|| {
+        MetalDeviceRuntimeError::contract("Metal static-weight allocation size overflows")
+    })?;
+    let base = device.new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
+    let base_address = base.contents() as usize;
+    if base_address == 0 {
+        return Err(MetalDeviceRuntimeError::contract(
+            "Metal static-weight allocation returned a null host address",
+        ));
+    }
+    let aligned_address = base_address
+        .checked_add(required_alignment - 1)
+        .map(|address| address & !(required_alignment - 1))
+        .ok_or_else(|| {
+            MetalDeviceRuntimeError::contract("Metal static-weight aligned address overflows")
+        })?;
+    let aligned_offset_bytes = u64::try_from(aligned_address - base_address).map_err(|_| {
+        MetalDeviceRuntimeError::contract("Metal static-weight aligned offset exceeds u64")
+    })?;
+    let admitted_end = aligned_offset_bytes
+        .checked_add(length_bytes)
+        .ok_or_else(|| {
+            MetalDeviceRuntimeError::contract("Metal static-weight admitted range overflows")
+        })?;
+    if admitted_end > base.length() {
+        return Err(MetalDeviceRuntimeError::contract(
+            "Metal static-weight allocation cannot satisfy admitted alignment",
+        ));
+    }
+    let aligned_offset = usize::try_from(aligned_offset_bytes).map_err(|_| {
+        MetalDeviceRuntimeError::contract("Metal static-weight aligned offset exceeds usize")
+    })?;
+    // SAFETY: the admitted range was checked against the shared Metal buffer,
+    // and the source payload remains borrowed for the duration of this copy.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            base.contents().cast::<u8>().add(aligned_offset),
+            bytes.len(),
+        );
+    }
+    Ok(Arc::new(MetalAllocation {
+        base,
+        aligned_offset_bytes,
+        requested_bytes: length_bytes,
+        _retained_host_memory: None,
+    }))
+}
+
+fn system_page_size() -> Result<usize, MetalDeviceRuntimeError> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = usize::try_from(page_size).map_err(|_| {
+        MetalDeviceRuntimeError::contract("host page size is unavailable for Metal no-copy import")
+    })?;
+    if !page_size.is_power_of_two() {
+        return Err(MetalDeviceRuntimeError::contract(
+            "host page size is not a power of two",
+        ));
+    }
+    Ok(page_size)
 }
 
 /// Owned physical Metal range retained by an encoded command and its fence.
@@ -775,6 +1102,7 @@ pub struct MetalDeviceRuntime {
     descriptor: DeviceDescriptor,
     runtime_instance: u64,
     device: metal::Device,
+    static_weight_import_gate: Mutex<()>,
 }
 
 impl fmt::Debug for MetalDeviceRuntime {
@@ -811,6 +1139,7 @@ impl MetalDeviceRuntime {
             descriptor,
             runtime_instance,
             device,
+            static_weight_import_gate: Mutex::new(()),
         })
     }
 
@@ -822,6 +1151,24 @@ impl MetalDeviceRuntime {
         &self,
         request: &BufferRequest,
     ) -> Result<MetalDeviceBuffer, MetalDeviceRuntimeError> {
+        let descriptor = BufferDescriptor {
+            resource_id: request.resource_id().clone(),
+            size_bytes: request.size_bytes(),
+            alignment_bytes: request.alignment_bytes(),
+            usage: request.usage(),
+            element_type: request.element_type(),
+        };
+        if request.usage() == BufferUsage::Weights {
+            return Ok(MetalDeviceBuffer {
+                descriptor,
+                runtime_instance: self.runtime_instance,
+                backing: MetalDeviceBufferBacking::StaticWeights(Arc::new(
+                    MetalStaticWeightArena {
+                        sealed: OnceLock::new(),
+                    },
+                )),
+            });
+        }
         let extra_alignment = request.alignment_bytes().checked_sub(1).ok_or_else(|| {
             MetalDeviceRuntimeError::contract("Metal allocation alignment is zero")
         })?;
@@ -854,19 +1201,14 @@ impl MetalDeviceRuntime {
             ));
         }
         Ok(MetalDeviceBuffer {
-            descriptor: BufferDescriptor {
-                resource_id: request.resource_id().clone(),
-                size_bytes: request.size_bytes(),
-                alignment_bytes: request.alignment_bytes(),
-                usage: request.usage(),
-                element_type: request.element_type(),
-            },
+            descriptor,
             runtime_instance: self.runtime_instance,
-            allocation: Arc::new(MetalAllocation {
+            backing: MetalDeviceBufferBacking::Contiguous(Arc::new(MetalAllocation {
                 base,
                 aligned_offset_bytes,
                 requested_bytes: request.size_bytes(),
-            }),
+                _retained_host_memory: None,
+            })),
         })
     }
 
@@ -1055,6 +1397,30 @@ impl DeviceRuntime for MetalDeviceRuntime {
         buffer.descriptor.clone()
     }
 
+    fn begin_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        let permit = match self.static_weight_import_gate.try_lock() {
+            Ok(permit) => permit,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Some(Err(MetalDeviceRuntimeError::contract(
+                    "another Metal static-weight import transaction is active",
+                )))
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Some(Err(MetalDeviceRuntimeError::contract(
+                    "Metal static-weight import gate is poisoned",
+                )))
+            }
+        };
+        Some(
+            MetalStaticWeightImport::new(self.device.clone(), self.runtime_instance, permit)
+                .map(|import| Box::new(import) as Box<_>),
+        )
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         let id = NEXT_STREAM_INSTANCE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -1086,6 +1452,11 @@ impl DeviceRuntime for MetalDeviceRuntime {
     ) -> Result<Self::Command, Self::Error> {
         self.validate_buffer(source)?;
         self.validate_buffer(destination)?;
+        if destination.descriptor.usage == BufferUsage::Weights {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static weights are immutable after import",
+            ));
+        }
         region
             .validate_bounds(&source.descriptor, &destination.descriptor)
             .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?;
@@ -1129,6 +1500,11 @@ impl DeviceRuntime for MetalDeviceRuntime {
         destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
         self.validate_buffer(destination)?;
+        if destination.descriptor.usage == BufferUsage::Weights {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static weights must use the import transaction",
+            ));
+        }
         source_layout
             .validate_bytes(source.len())
             .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?;
@@ -1178,6 +1554,11 @@ impl DeviceRuntime for MetalDeviceRuntime {
         length_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
         self.validate_buffer(destination)?;
+        if destination.descriptor.usage == BufferUsage::Weights {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal static weights must use the import transaction",
+            ));
+        }
         let destination_end = checked_end(
             destination_offset_bytes,
             length_bytes,
@@ -1367,8 +1748,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        BufferUsage, DynamicStorageAllocator, DynamicStorageView, ResourceId,
+        BufferUsage, DynamicStorageAllocator, DynamicStorageView, ResourceId, StableHostMemory,
+        WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightId,
     };
+    use std::ptr::NonNull;
 
     fn runtime() -> MetalDeviceRuntime {
         MetalDeviceRuntime::new(MetalDeviceRuntimeConfig {
@@ -1395,6 +1778,96 @@ mod tests {
         .expect("buffer request")
     }
 
+    fn weight_buffer_request(resource: &str, size_bytes: u64) -> BufferRequest {
+        BufferRequest::new(
+            ResourceId::new(resource).expect("resource id"),
+            size_bytes,
+            64,
+            BufferUsage::Weights,
+            ElementType::U8,
+        )
+        .expect("weight buffer request")
+    }
+
+    fn weight_component(id: &str, external_name: &str, size_bytes: usize) -> WeightComponentSpec {
+        WeightComponentSpec {
+            id: WeightId::new(id).expect("weight id"),
+            role: WeightComponentRole::Values,
+            external_names: vec![external_name.to_owned()],
+            dimensions: vec![size_bytes as u64],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::U8,
+            },
+            required: true,
+        }
+    }
+
+    fn weight_payload<'a>(
+        component: &WeightComponentSpec,
+        bytes: &'a [u8],
+    ) -> WeightComponentPayload<'a> {
+        WeightComponentPayload::new(
+            component,
+            component.external_names[0].clone(),
+            "model.gguf",
+            component.dimensions.clone(),
+            ElementType::U8,
+            bytes,
+        )
+        .expect("weight payload")
+    }
+
+    fn region_bytes(region: &MetalBufferRegion) -> &[u8] {
+        let start = usize::try_from(region.offset_bytes()).expect("region offset");
+        let length = usize::try_from(region.length_bytes()).expect("region length");
+        // SAFETY: MetalBufferRegion retains the allocation and validates that
+        // this exact byte range is within it.
+        unsafe { std::slice::from_raw_parts(region.buffer().contents().add(start).cast(), length) }
+    }
+
+    struct PageMemory {
+        pointer: NonNull<u8>,
+        length: usize,
+    }
+
+    impl PageMemory {
+        fn new(length: usize) -> Self {
+            let pointer = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    length,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(pointer, libc::MAP_FAILED);
+            let pointer = NonNull::new(pointer.cast::<u8>()).expect("mmap pointer");
+            for index in 0..length {
+                unsafe { pointer.as_ptr().add(index).write((index % 251) as u8) };
+            }
+            Self { pointer, length }
+        }
+    }
+
+    impl Drop for PageMemory {
+        fn drop(&mut self) {
+            let result = unsafe { libc::munmap(self.pointer.as_ptr().cast(), self.length) };
+            assert_eq!(result, 0);
+        }
+    }
+
+    unsafe impl Send for PageMemory {}
+    unsafe impl Sync for PageMemory {}
+
+    // SAFETY: the mmap is fixed-size and is never mutated after construction.
+    unsafe impl StableHostMemory for PageMemory {
+        fn stable_bytes(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.length) }
+        }
+    }
+
     fn compute_entries(
         commands: Vec<MetalDeviceCommand>,
     ) -> Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)> {
@@ -1413,8 +1886,9 @@ mod tests {
         let destination = runtime
             .allocate_request(&buffer_request("resource/destination"))
             .expect("destination allocation");
-        let source_address = source.allocation.base.contents() as usize
-            + usize::try_from(source.allocation.aligned_offset_bytes).expect("aligned offset");
+        let source_allocation = source.contiguous_allocation();
+        let source_address = source_allocation.base.contents() as usize
+            + usize::try_from(source_allocation.aligned_offset_bytes).expect("aligned offset");
         assert_eq!(source_address % 64, 0);
         let mut stream = runtime.create_stream().expect("stream");
         assert_eq!(runtime.stream_state(&stream), StreamState::Ready);
@@ -1463,6 +1937,160 @@ mod tests {
             )
             .expect("readback");
         assert_eq!(output, [1, 2, 0, 0, 0, 6, 7, 8]);
+    }
+
+    #[test]
+    fn static_weight_import_publishes_sorted_component_regions_atomically() {
+        let runtime = runtime();
+        let weights = runtime
+            .allocate_request(&weight_buffer_request("resource/weights", 80))
+            .expect("logical weight arena");
+        let left = weight_component("component.left", "left.weight", 8);
+        let right = weight_component("component.right", "right.weight", 8);
+        let left_bytes = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let right_bytes = [11_u8, 12, 13, 14, 15, 16, 17, 18];
+        let left_payload = weight_payload(&left, &left_bytes);
+        let right_payload = weight_payload(&right, &right_bytes);
+        let mut import = runtime
+            .begin_static_weight_import()
+            .expect("Metal import support")
+            .expect("Metal import session");
+        assert!(
+            runtime
+                .begin_static_weight_import()
+                .expect("Metal import support")
+                .is_err(),
+            "one runtime must not admit concurrent import transactions"
+        );
+        import
+            .import_component(&right_payload, &weights, 64)
+            .expect("right component");
+        import
+            .import_component(&left_payload, &weights, 0)
+            .expect("left component");
+        assert!(
+            weights.region(0..8).is_err(),
+            "unsealed arena must be hidden"
+        );
+        import.seal().expect("seal weight import");
+        assert!(
+            runtime
+                .begin_static_weight_import()
+                .expect("Metal import support")
+                .is_ok(),
+            "sealing must release the runtime import permit"
+        );
+
+        assert_eq!(region_bytes(&weights.region(0..8).unwrap()), left_bytes);
+        assert_eq!(region_bytes(&weights.region(64..72).unwrap()), right_bytes);
+        assert!(weights.region(8..64).is_err(), "padding is not a tensor");
+        assert!(
+            weights.region(4..68).is_err(),
+            "one binding cannot cross tensors"
+        );
+        assert!(runtime
+            .encode_upload(
+                &left_bytes,
+                HostTransferLayout::new(ElementType::U8, 8).unwrap(),
+                &weights,
+                0,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn failed_static_weight_import_does_not_publish_and_can_be_retried() {
+        let runtime = runtime();
+        let weights = runtime
+            .allocate_request(&weight_buffer_request("resource/retry-weights", 16))
+            .expect("logical weight arena");
+        let component = weight_component("component.retry", "retry.weight", 8);
+        let bytes = [3_u8; 8];
+        let payload = weight_payload(&component, &bytes);
+        let mut overlapping = runtime
+            .begin_static_weight_import()
+            .unwrap()
+            .expect("first import session");
+        overlapping.import_component(&payload, &weights, 0).unwrap();
+        overlapping.import_component(&payload, &weights, 0).unwrap();
+        assert!(overlapping.seal().is_err());
+        assert!(weights.region(0..8).is_err());
+
+        let mut retry = runtime
+            .begin_static_weight_import()
+            .unwrap()
+            .expect("retry import session");
+        assert!(retry.import_component(&payload, &weights, 9).is_err());
+        retry.import_component(&payload, &weights, 0).unwrap();
+        retry.seal().expect("retry seal");
+        assert_eq!(region_bytes(&weights.region(0..8).unwrap()), bytes);
+    }
+
+    #[test]
+    fn static_weight_no_copy_region_retains_page_owner_after_source_drop() {
+        let runtime = runtime();
+        let weights = runtime
+            .allocate_request(&weight_buffer_request("resource/mmap-weights", 8))
+            .expect("logical weight arena");
+        let page_size = system_page_size().expect("page size");
+        let owner = Arc::new(PageMemory::new(page_size));
+        let retained = RetainedHostMemoryRegion::new(Arc::clone(&owner), 128, 8).unwrap();
+        let component = weight_component("component.mmap", "mmap.weight", 8);
+        let payload = weight_payload(&component, retained.bytes())
+            .with_retained_host_memory(retained.clone())
+            .unwrap();
+        let expected = payload.bytes().to_vec();
+        let mut import = runtime
+            .begin_static_weight_import()
+            .unwrap()
+            .expect("Metal import session");
+        import.import_component(&payload, &weights, 0).unwrap();
+        import.seal().unwrap();
+        let region = weights.region(0..8).unwrap();
+        assert!(region.allocation._retained_host_memory.is_some());
+        drop(payload);
+        drop(retained);
+        drop(owner);
+        assert_eq!(region_bytes(&region), expected);
+    }
+
+    #[test]
+    fn static_weight_import_copies_retained_regions_without_a_safe_native_view() {
+        let runtime = runtime();
+        let page_size = system_page_size().expect("page size");
+        for (suffix, owner_length, region_offset) in [
+            ("misaligned", page_size, 1_usize),
+            ("partial-tail-page", page_size + 8, page_size),
+        ] {
+            let weights = runtime
+                .allocate_request(&weight_buffer_request(&format!("resource/{suffix}"), 8))
+                .expect("logical weight arena");
+            let owner = Arc::new(PageMemory::new(owner_length));
+            let retained =
+                RetainedHostMemoryRegion::new(Arc::clone(&owner), region_offset, 8).unwrap();
+            let component = weight_component(
+                &format!("component.{suffix}"),
+                &format!("{suffix}.weight"),
+                8,
+            );
+            let payload = weight_payload(&component, retained.bytes())
+                .with_retained_host_memory(retained.clone())
+                .unwrap();
+            let expected = payload.bytes().to_vec();
+            let mut import = runtime
+                .begin_static_weight_import()
+                .unwrap()
+                .expect("Metal import session");
+            import.import_component(&payload, &weights, 0).unwrap();
+            import.seal().unwrap();
+            let region = weights.region(0..8).unwrap();
+            assert!(region.allocation._retained_host_memory.is_none());
+            let address = region.buffer().contents() as usize + region.offset_bytes() as usize;
+            assert_eq!(address % 64, 0);
+            drop(payload);
+            drop(owner);
+            assert_eq!(region_bytes(&region), expected);
+        }
     }
 
     #[test]

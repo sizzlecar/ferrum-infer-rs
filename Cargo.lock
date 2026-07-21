@@ -1493,6 +1493,7 @@ dependencies = [
  "ferrum-native-ops",
  "ferrum-types",
  "half",
+ "libc",
  "metal 0.31.0",
  "rayon",
  "serde",

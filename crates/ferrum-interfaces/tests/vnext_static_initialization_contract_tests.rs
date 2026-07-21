@@ -159,6 +159,51 @@ fn static_initialization_uploads_schema_components_before_handoff() {
 }
 
 #[test]
+fn static_initialization_seals_backend_weight_import_without_upload_commands() {
+    let (resolved, plan, runtime, trace) = test_plan();
+    trace.lock().unwrap().static_weight_import_enabled = true;
+    let family = &resolved.parts().prepared_family;
+    let expected_imported_bytes = family
+        .weight_schema()
+        .components
+        .iter()
+        .map(|component| component.physical_bytes().unwrap())
+        .try_fold(0_u64, u64::checked_add)
+        .unwrap();
+
+    let initialized = committed_transaction(&plan, Arc::clone(&runtime), "import")
+        .initialize_static(
+            family,
+            &plan,
+            &ZeroWeightSource,
+            StaticInitializationPolicy::new(8, 2).unwrap(),
+        )
+        .unwrap();
+    let receipt = initialized.receipt();
+    assert_eq!(receipt.uploaded_component_count(), 0);
+    assert_eq!(receipt.uploaded_bytes(), 0);
+    assert_eq!(receipt.upload_command_count(), 0);
+    assert_eq!(
+        receipt.imported_component_count(),
+        family.weight_schema().components.len()
+    );
+    assert_eq!(receipt.imported_bytes(), expected_imported_bytes);
+    assert_eq!(receipt.submission_batch_count(), 0);
+    {
+        let trace = trace.lock().unwrap();
+        assert_eq!(trace.static_weight_import_begin_calls, 1);
+        assert_eq!(trace.static_weight_import_seal_calls, 1);
+        assert_eq!(
+            trace.imported_component_count,
+            family.weight_schema().components.len()
+        );
+        assert_eq!(trace.imported_bytes, expected_imported_bytes);
+        assert_eq!(trace.submit_calls, 0);
+    }
+    close(handoff(initialized));
+}
+
+#[test]
 fn fence_wait_panic_requires_stream_recovery_before_retry() {
     let (resolved, plan, runtime, trace) = test_plan();
     trace.lock().unwrap().fence_behavior = FenceBehavior::Panic;
