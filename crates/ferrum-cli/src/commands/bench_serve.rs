@@ -259,6 +259,15 @@ pub(super) fn parse_slo(s: &str) -> std::result::Result<Slo, String> {
 struct OpenAiStreamChunk {
     choices: Option<Vec<OpenAiStreamChoice>>,
     usage: Option<OpenAiUsage>,
+    error: Option<OpenAiStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamError {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,6 +564,18 @@ impl StreamState {
     fn handle_payload(&mut self, payload: &str) -> std::result::Result<(), String> {
         let chunk: OpenAiStreamChunk =
             serde_json::from_str(payload).map_err(|e| format!("{e}: {payload}"))?;
+        if let Some(error) = chunk.error {
+            return Err(format!(
+                "OpenAI stream error type={} code={} message={}",
+                error.error_type.as_deref().unwrap_or("unknown"),
+                error
+                    .code
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "null".to_owned()),
+                error.message
+            ));
+        }
         if let Some(usage) = chunk.usage {
             if let Some(tokens) = usage.completion_tokens {
                 self.usage_completion_tokens = Some(tokens);
@@ -2170,6 +2191,23 @@ mod tests {
         assert_eq!(
             record.output_token_count_source,
             OutputTokenCountSource::StreamChunks
+        );
+    }
+
+    #[test]
+    fn openai_error_sse_event_fails_even_when_done_follows() {
+        let record = parse_sse_chunks([concat!(
+            "data: {\"error\":{\"message\":\"decode failed\",",
+            "\"type\":\"internal_server_error\",\"param\":null,\"code\":null}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()]);
+
+        assert!(!record.success);
+        assert_eq!(record.quality_issues.malformed_stream, 1);
+        assert_eq!(
+            record.itl_evidence.eligibility,
+            ItlEligibility::RequestFailed
         );
     }
 
