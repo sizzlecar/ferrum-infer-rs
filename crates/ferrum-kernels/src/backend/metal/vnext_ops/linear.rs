@@ -1625,6 +1625,10 @@ mod tests {
         "runtime-vnext.metal.last-token-dense-linear.v1.operation.fp16.gguf-q6-k.final-row";
     const LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT: &str =
         "5dc080fb15a72c886acf83fc02877265f57359cf1c28c424a6cc1148cb256056";
+    const PACKED_LAST_TOKEN_LINEAR_TOLERANCE_ID: &str =
+        "runtime-vnext.metal.last-token-dense-linear.v1_1.operation.fp16.gguf-q6-k.packed-15";
+    const PACKED_LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT: &str =
+        "bc49f573fda4a5eca27e90604294358d7108a610d8dfb0a1d82855b22734dcf6";
 
     fn shared_buffer<T>(device: &Device, values: &[T]) -> metal::Buffer {
         device.new_buffer_with_data(
@@ -2415,8 +2419,8 @@ mod tests {
             &reference,
             &[participant_count, output_width],
             numerical_tolerance::LogicalDtype::Fp16,
-            LAST_TOKEN_LINEAR_TOLERANCE_ID,
-            LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
+            PACKED_LAST_TOKEN_LINEAR_TOLERANCE_ID,
+            PACKED_LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed packed last-token dense-linear numerical contract");
     }
