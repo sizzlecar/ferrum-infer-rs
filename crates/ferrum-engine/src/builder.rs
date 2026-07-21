@@ -496,7 +496,6 @@ fn default_recurrent_state_manager(
     let total_batch_slots = config
         .runtime
         .recurrent_state_max_slots
-        .or(config.runtime.qwen35_linear_state_max_slots)
         .unwrap_or(usize::MAX);
     #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
     if _component_config
@@ -950,38 +949,6 @@ mod tests {
         let stats = manager.stats();
         assert_eq!(stats.total_batch_slots, 2);
         assert_eq!(stats.used_batch_slots, 2);
-        assert_eq!(stats.allocation_failures, 1);
-    }
-
-    #[test]
-    fn test_builder_cuda_recurrent_state_manager_accepts_legacy_qwen35_slot_cap() {
-        let mut config = EngineConfig::default();
-        config.backend.device = Device::CUDA(0);
-        config.runtime.qwen35_linear_state_max_slots = Some(1);
-        let component_config = ComponentConfig::from_engine_config(&config);
-        let manager = default_recurrent_state_manager(&config, &component_config)
-            .expect("cuda product path should install admission recurrent-state manager");
-        let spec = |request_id| RecurrentStateSpec {
-            request_id,
-            num_layers: 1,
-            tensors: vec![RecurrentStateTensorSpec::new(
-                0,
-                "delta_state",
-                vec![1, 1, 1],
-                DataType::FP32,
-            )],
-            device: Device::CUDA(0),
-            max_batch_slots: 1,
-        };
-
-        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
-        let err = tokio_test::block_on(manager.allocate(&spec(RequestId::new())))
-            .expect_err("second recurrent allocation should exceed the one-slot legacy cap");
-
-        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
-        let stats = manager.stats();
-        assert_eq!(stats.total_batch_slots, 1);
-        assert_eq!(stats.used_batch_slots, 1);
         assert_eq!(stats.allocation_failures, 1);
     }
 

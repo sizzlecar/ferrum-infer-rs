@@ -190,12 +190,6 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub recurrent_state_max_slots: Option<usize>,
 
-    /// Legacy Qwen3.5 linear recurrent-state slot-pool size, equivalent to
-    /// `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS`. Prefer
-    /// `recurrent_state_max_slots` for new configs.
-    #[serde(default)]
-    pub qwen35_linear_state_max_slots: Option<usize>,
-
     /// Scheduler/model max batched-token budget, equivalent to
     /// `FERRUM_MAX_BATCHED_TOKENS`.
     #[serde(default)]
@@ -382,11 +376,6 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_RECURRENT_STATE_MAX_SLOTS",
             self.recurrent_state_max_slots,
-        );
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
-            self.qwen35_linear_state_max_slots,
         );
         push_usize_entry(
             &mut entries,

@@ -519,7 +519,6 @@ impl ResolvedFerrumConfig {
     fn selected_recurrent_state_max_slots(&self) -> Option<usize> {
         self.selected_usize("recurrent_state_max_slots")
             .or_else(|| self.runtime_usize("FERRUM_RECURRENT_STATE_MAX_SLOTS"))
-            .or_else(|| self.runtime_usize("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"))
     }
 
     fn selected_graph_mode(&self) -> Option<String> {
@@ -748,14 +747,12 @@ impl FerrumConfigBuilder {
             self.default_recurrent_state_max_slots(&max_sequences);
         let recurrent_state_max_slots = if default_recurrent_state_max_slots.is_some()
             || self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some()
-            || self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_some()
         {
             let default = default_recurrent_state_max_slots
                 .as_ref()
                 .unwrap_or(&max_sequences);
-            Some(self.usize_value_with_legacy_alias(
+            Some(self.usize_value(
                 "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
                 default.value,
                 default.source,
             )?)
@@ -894,9 +891,7 @@ impl FerrumConfigBuilder {
             }
         }
         if let Some(slots) = recurrent_state_max_slots.as_ref() {
-            if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_none()
-                && self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_none()
-            {
+            if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_none() {
                 runtime_config.upsert(
                     "FERRUM_RECURRENT_STATE_MAX_SLOTS",
                     slots.value.to_string(),
@@ -1206,26 +1201,6 @@ impl FerrumConfigBuilder {
                 source_key: None,
             }),
         }
-    }
-
-    fn usize_value_with_legacy_alias(
-        &self,
-        primary_key: &str,
-        legacy_key: &str,
-        default: usize,
-        default_source: AutoConfigSource,
-    ) -> Result<ResolvedValue<usize>, AutoConfigError> {
-        if self.entry(primary_key).is_some() {
-            return self.usize_value(primary_key, default, default_source);
-        }
-        if self.entry(legacy_key).is_some() {
-            return self.usize_value(legacy_key, default, default_source);
-        }
-        Ok(ResolvedValue {
-            value: default,
-            source: default_source,
-            source_key: None,
-        })
     }
 
     fn optional_usize_value(
@@ -1621,8 +1596,6 @@ impl FerrumConfigBuilder {
             if recurrent_slots > limit {
                 let key = if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
                     "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-                } else if self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_some() {
-                    "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"
                 } else {
                     "FERRUM_PAGED_MAX_SEQS"
                 };
@@ -2946,13 +2919,13 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_state_budget_accepts_legacy_qwen35_slot_alias() {
+    fn recurrent_state_budget_ignores_removed_qwen35_slot_alias() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
         let resolved = FerrumConfigBuilder::new(snapshot(&[
             ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "7"),
         ]))
         .with_model_capabilities(synthetic_tight_recurrent_state_model())
         .with_hardware_capabilities(hardware)
@@ -2965,15 +2938,13 @@ mod tests {
             .find(|decision| decision.selection == "recurrent_state_max_slots")
             .expect("missing recurrent_state_max_slots decision");
         assert_eq!(decision.selected, "16");
-        assert_eq!(
-            decision.source_key.as_deref(),
-            Some("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
-        );
+        assert_eq!(decision.source, AutoConfigSource::MemoryProfile);
+        assert_eq!(decision.source_key, None);
         assert!(resolved
             .runtime_config
             .entries
             .iter()
-            .any(|entry| entry.key == "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"
+            .any(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
                 && entry.effective_value == "16"));
     }
 
