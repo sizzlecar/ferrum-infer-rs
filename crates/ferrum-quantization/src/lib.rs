@@ -19,6 +19,7 @@
 pub mod dense;
 pub mod gguf;
 pub mod gptq;
+pub mod gptq_marlin_source;
 pub mod loader;
 pub mod lora;
 pub mod native_safetensors;
@@ -29,6 +30,7 @@ pub mod traits;
 pub use dense::DenseLinear;
 pub use gguf::{GgufFile, GgufLinear, GgufLoader, GgufWeightComponentSource};
 pub use gptq::{GptqLinear, StackedExpertLinear};
+pub use gptq_marlin_source::{GptqMarlinSafetensorsSource, GPTQ_MARLIN_INT4_FORMAT_ID};
 pub use loader::{PrefixedLoader, WeightLoader};
 pub use lora::LoraLinearRef;
 pub use native_safetensors::NativeSafetensorsLoader;
