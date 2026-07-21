@@ -257,6 +257,36 @@ fn affine_dense_encoding_wire_preserves_transform_identity() {
     );
 }
 
+#[test]
+fn canonical_rational_parses_decimal_without_binary_rounding() {
+    assert_eq!(
+        CanonicalRational::from_decimal_str("0.000001").unwrap(),
+        CanonicalRational::new(1, 1_000_000).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("1e-6").unwrap(),
+        CanonicalRational::new(1, 1_000_000).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("-0.125").unwrap(),
+        CanonicalRational::new(-1, 8).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("12.5e2").unwrap(),
+        CanonicalRational::new(1_250, 1).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("0").unwrap(),
+        CanonicalRational::new(0, 1).unwrap()
+    );
+    for invalid in ["", ".5", "1e", "1e2e3", "nan", "1e999"] {
+        assert!(
+            CanonicalRational::from_decimal_str(invalid).is_err(),
+            "{invalid:?} must fail closed"
+        );
+    }
+}
+
 struct RejectingRegistry;
 
 impl ModelFamilyRegistry for RejectingRegistry {
