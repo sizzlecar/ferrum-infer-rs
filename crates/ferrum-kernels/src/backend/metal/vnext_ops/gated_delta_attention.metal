@@ -3,6 +3,8 @@ using namespace metal;
 
 constant uint THREADS_PER_GROUP = 256;
 constant uint VALUE_TILE = 16;
+constant uint GATED_DELTA_CHUNK_SIZE = 64;
+constant uint GATED_DELTA_CHUNK_KEY_DIM_LIMIT = 128;
 
 struct GatedDeltaParams {
     uint tokens;
@@ -285,6 +287,329 @@ kernel void vnext_gated_delta_rule_tiled16_f32_state(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+kernel void vnext_gated_delta_chunk_kkt_inverse_c64(
+    device const float * key [[buffer(0)]],
+    device float * g [[buffer(1)]],
+    device const float * beta [[buffer(2)]],
+    device half * inverse [[buffer(3)]],
+    constant GatedDeltaParams & params [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint chunk_start = group.x * GATED_DELTA_CHUNK_SIZE;
+    const uint value_head = group.y;
+    if (chunk_start >= params.tokens || value_head >= params.value_heads) {
+        return;
+    }
+    const uint chunk_tokens = min(GATED_DELTA_CHUNK_SIZE, params.tokens - chunk_start);
+    const uint repeat = params.value_heads / params.key_heads;
+    const uint key_head = params.value_head_mapping == 0
+        ? value_head / repeat
+        : value_head % params.key_heads;
+    threadgroup float kkt[GATED_DELTA_CHUNK_SIZE * GATED_DELTA_CHUNK_SIZE];
+
+    if (lane == 0) {
+        float cumulative = 0.0f;
+        for (uint row = 0; row < chunk_tokens; ++row) {
+            const ulong gate_index =
+                ulong(chunk_start + row) * params.value_heads + value_head;
+            cumulative += g[gate_index];
+            g[gate_index] = cumulative;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint index = lane;
+         index < GATED_DELTA_CHUNK_SIZE * GATED_DELTA_CHUNK_SIZE;
+         index += THREADS_PER_GROUP) {
+        const uint row = index / GATED_DELTA_CHUNK_SIZE;
+        const uint column = index - row * GATED_DELTA_CHUNK_SIZE;
+        float coefficient = 0.0f;
+        if (row < chunk_tokens && column < row) {
+            const uint row_token = chunk_start + row;
+            const uint column_token = chunk_start + column;
+            const ulong row_base =
+                (ulong(row_token) * params.key_heads + key_head) * params.key_dim;
+            const ulong column_base =
+                (ulong(column_token) * params.key_heads + key_head) * params.key_dim;
+            float dot = 0.0f;
+            for (uint key_column = 0; key_column < params.key_dim; ++key_column) {
+                dot += key[row_base + key_column] * key[column_base + key_column];
+            }
+            const float row_g =
+                g[ulong(row_token) * params.value_heads + value_head];
+            const float column_g =
+                g[ulong(column_token) * params.value_heads + value_head];
+            coefficient =
+                beta[ulong(row_token) * params.value_heads + value_head]
+                * exp(row_g - column_g) * dot;
+        }
+        kkt[index] = coefficient;
+        if (row < chunk_tokens) {
+            const ulong inverse_index =
+                (ulong(chunk_start + row) * params.value_heads + value_head)
+                    * GATED_DELTA_CHUNK_SIZE
+                + column;
+            inverse[inverse_index] = half(row == column ? 1.0f : 0.0f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    // Invert the unit-lower matrix row by row. Previous rows are deliberately
+    // stored as half, matching the FLA contract's solve output precision.
+    for (uint row = 1; row < chunk_tokens; ++row) {
+        if (lane < row) {
+            const uint column = lane;
+            float sum = 0.0f;
+            for (uint inner = column; inner < row; ++inner) {
+                const ulong previous_index =
+                    (ulong(chunk_start + inner) * params.value_heads + value_head)
+                        * GATED_DELTA_CHUNK_SIZE
+                    + column;
+                sum += kkt[row * GATED_DELTA_CHUNK_SIZE + inner]
+                    * float(inverse[previous_index]);
+            }
+            const ulong output_index =
+                (ulong(chunk_start + row) * params.value_heads + value_head)
+                    * GATED_DELTA_CHUNK_SIZE
+                + column;
+            inverse[output_index] = half(-sum);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+kernel void vnext_gated_delta_chunk_uw_c64(
+    device const float * key [[buffer(0)]],
+    device const float * value [[buffer(1)]],
+    device const float * g [[buffer(2)]],
+    device const float * beta [[buffer(3)]],
+    device const half * inverse [[buffer(4)]],
+    device half * uw [[buffer(5)]],
+    constant GatedDeltaParams & params [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint row_width = params.value_dim + params.key_dim;
+    const ulong total =
+        ulong(params.tokens) * params.value_heads * row_width;
+    if (ulong(index) >= total) {
+        return;
+    }
+    const uint component = index % row_width;
+    const uint row = index / row_width;
+    const uint value_head = row % params.value_heads;
+    const uint token = row / params.value_heads;
+    const uint chunk_start =
+        (token / GATED_DELTA_CHUNK_SIZE) * GATED_DELTA_CHUNK_SIZE;
+    const uint local_row = token - chunk_start;
+    const uint repeat = params.value_heads / params.key_heads;
+    const uint key_head = params.value_head_mapping == 0
+        ? value_head / repeat
+        : value_head % params.key_heads;
+    float result = 0.0f;
+    for (uint local_column = 0; local_column <= local_row; ++local_column) {
+        const uint source_token = chunk_start + local_column;
+        const float solve = float(inverse[
+            (ulong(token) * params.value_heads + value_head)
+                * GATED_DELTA_CHUNK_SIZE
+            + local_column]);
+        const float source_beta =
+            beta[ulong(source_token) * params.value_heads + value_head];
+        if (component < params.value_dim) {
+            result += solve * source_beta * value[
+                (ulong(source_token) * params.value_heads + value_head)
+                    * params.value_dim
+                + component];
+        } else {
+            const uint key_column = component - params.value_dim;
+            const float source_g =
+                g[ulong(source_token) * params.value_heads + value_head];
+            result += solve * source_beta * exp(source_g) * key[
+                (ulong(source_token) * params.key_heads + key_head) * params.key_dim
+                + key_column];
+        }
+    }
+    uw[index] = half(result);
+}
+
+kernel void vnext_gated_delta_chunk_qk_c64(
+    device const float * query [[buffer(0)]],
+    device const float * key [[buffer(1)]],
+    device half * raw_qk [[buffer(2)]],
+    constant GatedDeltaParams & params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    const ulong total = ulong(params.tokens) * params.key_heads * GATED_DELTA_CHUNK_SIZE;
+    if (ulong(index) >= total) {
+        return;
+    }
+    const uint local_column = index % GATED_DELTA_CHUNK_SIZE;
+    const uint row = index / GATED_DELTA_CHUNK_SIZE;
+    const uint key_head = row % params.key_heads;
+    const uint token = row / params.key_heads;
+    const uint chunk_start =
+        (token / GATED_DELTA_CHUNK_SIZE) * GATED_DELTA_CHUNK_SIZE;
+    const uint local_row = token - chunk_start;
+    float dot = 0.0f;
+    if (local_column <= local_row) {
+        const uint source_token = chunk_start + local_column;
+        const ulong query_base =
+            (ulong(token) * params.key_heads + key_head) * params.key_dim;
+        const ulong key_base =
+            (ulong(source_token) * params.key_heads + key_head) * params.key_dim;
+        for (uint key_column = 0; key_column < params.key_dim; ++key_column) {
+            dot += query[query_base + key_column] * key[key_base + key_column];
+        }
+    }
+    raw_qk[index] = half(dot);
+}
+
+kernel void vnext_gated_delta_chunk_carry_c64(
+    device const float * query [[buffer(0)]],
+    device const float * key [[buffer(1)]],
+    device const float * g [[buffer(2)]],
+    device half * uw [[buffer(3)]],
+    device float * state [[buffer(4)]],
+    device float * output [[buffer(5)]],
+    constant GatedDeltaParams & params [[buffer(6)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint value_start = group.x * VALUE_TILE;
+    const uint value_head = group.y;
+    if (value_start >= params.value_dim || value_head >= params.value_heads
+        || params.key_dim > GATED_DELTA_CHUNK_KEY_DIM_LIMIT) {
+        return;
+    }
+    const uint repeat = params.value_heads / params.key_heads;
+    const uint key_head = params.value_head_mapping == 0
+        ? value_head / repeat
+        : value_head % params.key_heads;
+    const uint uw_width = params.value_dim + params.key_dim;
+    threadgroup float state_tile[VALUE_TILE * GATED_DELTA_CHUNK_KEY_DIM_LIMIT];
+
+    for (uint index = lane; index < VALUE_TILE * params.key_dim;
+         index += THREADS_PER_GROUP) {
+        const uint local_value = index / params.key_dim;
+        const uint key_column = index - local_value * params.key_dim;
+        const uint value_column = value_start + local_value;
+        state_tile[index] = value_column < params.value_dim
+            ? state[(ulong(value_head) * params.value_dim + value_column) * params.key_dim
+                + key_column]
+            : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint chunk_start = 0; chunk_start < params.tokens;
+         chunk_start += GATED_DELTA_CHUNK_SIZE) {
+        const uint chunk_tokens = min(GATED_DELTA_CHUNK_SIZE, params.tokens - chunk_start);
+        for (uint item = lane; item < chunk_tokens * VALUE_TILE;
+             item += THREADS_PER_GROUP) {
+            const uint local_token = item / VALUE_TILE;
+            const uint local_value = item - local_token * VALUE_TILE;
+            const uint value_column = value_start + local_value;
+            if (value_column >= params.value_dim) {
+                continue;
+            }
+            const uint token = chunk_start + local_token;
+            const ulong uw_base =
+                (ulong(token) * params.value_heads + value_head) * uw_width;
+            const ulong q_base =
+                (ulong(token) * params.key_heads + key_head) * params.key_dim;
+            float state_prediction = 0.0f;
+            float state_output = 0.0f;
+            const uint state_base = local_value * params.key_dim;
+            for (uint key_column = 0; key_column < params.key_dim; ++key_column) {
+                const float current = state_tile[state_base + key_column];
+                state_prediction +=
+                    float(uw[uw_base + params.value_dim + key_column]) * current;
+                state_output += query[q_base + key_column] * current;
+            }
+            uw[uw_base + value_column] =
+                half(float(uw[uw_base + value_column]) - state_prediction);
+            output[(ulong(token) * params.value_heads + value_head) * params.value_dim
+                + value_column] = exp(g[ulong(token) * params.value_heads + value_head])
+                * state_output * params.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        const uint final_token = chunk_start + chunk_tokens - 1;
+        const float final_g =
+            g[ulong(final_token) * params.value_heads + value_head];
+        const float final_decay = exp(final_g);
+        for (uint index = lane; index < VALUE_TILE * params.key_dim;
+             index += THREADS_PER_GROUP) {
+            const uint local_value = index / params.key_dim;
+            const uint key_column = index - local_value * params.key_dim;
+            const uint value_column = value_start + local_value;
+            if (value_column >= params.value_dim) {
+                continue;
+            }
+            float updated = final_decay * state_tile[index];
+            for (uint local_token = 0; local_token < chunk_tokens; ++local_token) {
+                const uint token = chunk_start + local_token;
+                const ulong uw_base =
+                    (ulong(token) * params.value_heads + value_head) * uw_width;
+                const ulong key_base =
+                    (ulong(token) * params.key_heads + key_head) * params.key_dim;
+                const float token_g =
+                    g[ulong(token) * params.value_heads + value_head];
+                updated += exp(final_g - token_g)
+                    * float(uw[uw_base + value_column])
+                    * key[key_base + key_column];
+            }
+            state_tile[index] = updated;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint index = lane; index < VALUE_TILE * params.key_dim;
+         index += THREADS_PER_GROUP) {
+        const uint local_value = index / params.key_dim;
+        const uint key_column = index - local_value * params.key_dim;
+        const uint value_column = value_start + local_value;
+        if (value_column < params.value_dim) {
+            state[(ulong(value_head) * params.value_dim + value_column) * params.key_dim
+                + key_column] = state_tile[index];
+        }
+    }
+}
+
+kernel void vnext_gated_delta_chunk_output_c64(
+    device const half * raw_qk [[buffer(0)]],
+    device const float * g [[buffer(1)]],
+    device const half * uw [[buffer(2)]],
+    device float * output [[buffer(3)]],
+    constant GatedDeltaParams & params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const ulong total = ulong(params.tokens) * params.value_heads * params.value_dim;
+    if (ulong(index) >= total) {
+        return;
+    }
+    const uint value_column = index % params.value_dim;
+    const uint row = index / params.value_dim;
+    const uint value_head = row % params.value_heads;
+    const uint token = row / params.value_heads;
+    const uint repeat = params.value_heads / params.key_heads;
+    const uint key_head = params.value_head_mapping == 0
+        ? value_head / repeat
+        : value_head % params.key_heads;
+    const uint chunk_start =
+        (token / GATED_DELTA_CHUNK_SIZE) * GATED_DELTA_CHUNK_SIZE;
+    const uint local_row = token - chunk_start;
+    const uint uw_width = params.value_dim + params.key_dim;
+    const float token_g = g[ulong(token) * params.value_heads + value_head];
+    float block_output = 0.0f;
+    const ulong qk_base =
+        (ulong(token) * params.key_heads + key_head) * GATED_DELTA_CHUNK_SIZE;
+    for (uint local_column = 0; local_column <= local_row; ++local_column) {
+        const uint source_token = chunk_start + local_column;
+        const float source_g =
+            g[ulong(source_token) * params.value_heads + value_head];
+        const ulong uw_base =
+            (ulong(source_token) * params.value_heads + value_head) * uw_width;
+        block_output += exp(token_g - source_g) * float(raw_qk[qk_base + local_column])
+            * float(uw[uw_base + value_column]);
+    }
+    output[index] += block_output * params.scale;
 }
 
 kernel void vnext_gated_delta_gated_norm_f16(
