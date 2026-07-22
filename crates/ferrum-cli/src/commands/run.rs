@@ -482,9 +482,9 @@ pub struct RunCommand {
     pub disable_thinking: bool,
 
     /// Disable CLI context shift. By default, `ferrum run` keeps the REPL
-    /// alive by dropping the oldest history before shrinking this turn's output
-    /// budget, then clamps only when the current turn itself leaves too little
-    /// room in KV.
+    /// alive by shrinking this turn's output budget before dropping history.
+    /// Oldest complete turns are removed only when the rendered prompt itself
+    /// no longer fits in KV.
     #[arg(long)]
     pub no_context_shift: bool,
 
@@ -1892,10 +1892,6 @@ fn build_run_prompt_plan(
 
         if prompt_tokens < kv_capacity {
             let remaining = kv_capacity - prompt_tokens;
-            if base_sampling.max_tokens > remaining && history_start < history.len() {
-                history_start = next_context_shift_history_start(history, history_start);
-                continue;
-            }
             let mut sampling_params = base_sampling.clone();
             let max_tokens_clamped_from = if sampling_params.max_tokens > remaining {
                 let old = sampling_params.max_tokens;
@@ -3023,19 +3019,21 @@ mod tests {
     }
 
     #[test]
-    fn context_shift_drops_history_before_clamping_output_budget() {
+    fn context_shift_clamps_output_before_dropping_history() {
         let mut cmd = test_run_cmd();
-        cmd.max_tokens = 32;
+        cmd.max_tokens = 1024;
         let budget = whitespace_budget(64);
-        let medium = std::iter::repeat_n("old", 12).collect::<Vec<_>>().join(" ");
         let history = vec![
-            ("user".to_string(), medium.clone()),
-            ("assistant".to_string(), medium),
+            (
+                "user".to_string(),
+                "Remember the identifier G00-c03-001-OK.".to_string(),
+            ),
+            ("assistant".to_string(), "ACKNOWLEDGED".to_string()),
         ];
         let options = default_template_options();
         let plan = build_run_prompt_plan(
             &history,
-            "demo",
+            "What identifier did I ask you to remember?",
             None,
             "tinyllama",
             None,
@@ -3045,10 +3043,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.dropped_history_messages, 2);
-        assert_eq!(plan.dropped_history_turns, 1);
-        assert_eq!(plan.max_tokens_clamped_from, None);
-        assert_eq!(plan.sampling_params.max_tokens, 32);
+        let prompt_tokens = plan.prompt_tokens.unwrap();
+        assert!(prompt_tokens < 64);
+        assert!(plan.prompt.contains("G00-c03-001-OK"));
+        assert_eq!(plan.dropped_history_messages, 0);
+        assert_eq!(plan.dropped_history_turns, 0);
+        assert_eq!(plan.max_tokens_clamped_from, Some(1024));
+        assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
     }
 
     #[test]
