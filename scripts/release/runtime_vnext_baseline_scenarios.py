@@ -116,6 +116,14 @@ SERVE_ISOLATION_BOUNDARIES = frozenset({"C09"})
 EXPECTATION_SELECTOR_FIELDS = ("scenario_id", "variant", "preset", "entrypoint", "case_id")
 EXPECTED_STATUSES = {"pass", "known-fail", "blocked", "discovery-required"}
 C03_CONTRACT_ID = "c03-exact-identifier-v2"
+C09_NOT_ADMITTED_SAFE = "not_admitted_safe"
+C09_ADMITTED_RELEASED = "admitted_released"
+C09_TERMINAL_OUTCOMES = frozenset(
+    {C09_NOT_ADMITTED_SAFE, C09_ADMITTED_RELEASED}
+)
+C09_ADMISSION_TIMEOUT_SEC = 5.0
+C09_NOT_ADMITTED_OBSERVATION_SEC = 0.25
+C09_TRACE_TIMEOUT_SEC = 5.0
 C17_MARKERS = {
     "chinese": "中文正确",
     "emoji": "🙂🚀",
@@ -1279,10 +1287,11 @@ def validate_assertions(scenario_id: str, raw: Any, *, case_count: int) -> None:
         require(assertions.get("conversation_count") == 6, "C07 must execute six isolated conversations")
         require(assertions.get("history_turn_count") == 30, "C07 must execute thirty history-carrying turns")
     elif scenario_id == "C09":
-        require(assertions.get("released_count") == case_count, "C09 cancel/timeout/disconnect release coverage incomplete")
+        require(assertions.get("admitted_released_count") == case_count, "C09 admitted cancel/timeout/disconnect release coverage incomplete")
+        require(assertions.get("not_admitted_safe_count") == 0, "C09 contains safe but unexercised pre-admission aborts")
         require(assertions.get("post_capacity_success_count") == case_count, "C09 post-cancel capacity recovery incomplete")
-        ticks = assertions.get("max_scheduler_ticks_to_release")
-        wall = assertions.get("max_wall_sec_to_release")
+        ticks = assertions.get("max_scheduler_ticks_to_terminal")
+        wall = assertions.get("max_wall_sec_to_terminal")
         require(isinstance(ticks, int) and not isinstance(ticks, bool) and 0 <= ticks <= 2, "C09 release must occur within 2 scheduler ticks")
         require(isinstance(wall, (int, float)) and not isinstance(wall, bool) and 0 <= wall <= 5, "C09 release must occur within 5 seconds")
     elif scenario_id in {"C10", "C11", "C12", "C13"}:
@@ -1616,6 +1625,74 @@ def validate_case_output(
         return
     if scenario_id == "C09":
         require(statuses[0] == 499 and statuses[-1] == 200, f"{label} must record client abort followed by successful recovery")
+        require(
+            exchanges[0].get("status_source") == "runner_client_abort",
+            f"{label} synthetic client-abort status source is missing",
+        )
+        abort_response = require_object(exchanges[0].get("response"), f"{label}.abort.response")
+        require(
+            abort_response.get("client_abort") == variant
+            and abort_response.get("admission_observed") is True
+            and isinstance(abort_response.get("admission_request_id"), str),
+            f"{label} client abort did not reach runtime admission",
+        )
+        require(
+            abort_response.get("admission_request_id")
+            == observed.get("cancel_request_id"),
+            f"{label} admission barrier is not bound to the cancelled request",
+        )
+        expected_trigger = {
+            "cancel": "socket_shutdown",
+            "timeout": "client_deadline_expired",
+            "disconnect": "tcp_reset",
+        }[variant]
+        require(
+            abort_response.get("abort_trigger") == expected_trigger,
+            f"{label} did not exercise the requested {variant} transport trigger",
+        )
+        recovery_request = require_object(exchanges[-1].get("request"), f"{label}.recovery.request")
+        recovery_metadata = require_object(
+            recovery_request.get("metadata"), f"{label}.recovery.metadata"
+        )
+        require(
+            recovery_request.get("max_tokens")
+            == require_object(exchanges[0].get("request"), f"{label}.abort.request").get("max_tokens"),
+            f"{label} recovery request changed the declared capacity budget",
+        )
+        require(
+            recovery_request.get("messages")
+            == [
+                {
+                    "role": "user",
+                    "content": f"Return the exact marker {observed.get('expected_marker')} and no other text.",
+                }
+            ]
+            and recovery_metadata.get("g00_recovery") is True
+            and "ignore_eos" not in recovery_request
+            and "stop" not in recovery_request
+            and "stream" not in recovery_request
+            and "stream_options" not in recovery_request,
+            f"{label} recovery request is not the canonical known-answer probe",
+        )
+        recovery_response = require_object(exchanges[-1].get("response"), f"{label}.recovery.response")
+        recovery_message, recovery_content = response_message(recovery_response, f"{label}.recovery")
+        recovery_choice = require_object(
+            require_list(recovery_response.get("choices"), f"{label}.recovery.choices")[0],
+            f"{label}.recovery.choice",
+        )
+        recovery_usage = require_object(recovery_response.get("usage"), f"{label}.recovery.usage")
+        require(
+            recovery_content == observed.get("expected_marker")
+            and recovery_choice.get("finish_reason") in {"stop", "eos"}
+            and require_count(
+                recovery_usage.get("completion_tokens"),
+                f"{label}.recovery.usage.completion_tokens",
+                minimum=1,
+            )
+            > 0
+            and recovery_message.get("role") == "assistant",
+            f"{label} recovery request did not complete with the expected output",
+        )
     else:
         require(all(status == 200 for status in statuses), f"{label} expected HTTP 200")
     if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
@@ -1699,9 +1776,24 @@ def validate_case_output(
             require(choice.get("finish_reason") in {"stop", "eos"} and 0 < completion_tokens < 64, f"{label} natural EOS case did not end before its cap")
         return
     if scenario_id == "C09":
-        require_count(observed.get("scheduler_ticks_to_release"), f"{label}.scheduler_ticks_to_release") <= 2
-        wall = observed.get("wall_sec_to_release")
+        require(
+            observed.get("cancel_resource_outcome") == C09_ADMITTED_RELEASED
+            and observed.get("cancel_safety") == "safe"
+            and observed.get("cancel_coverage") == "exercised",
+            f"{label} did not exercise an admitted cancellation with terminal release",
+        )
+        require(observed.get("trace_visibility_proven") is True, f"{label} trace visibility was not proven")
+        require(observed.get("trace_contract_error") is None, f"{label} trace contract is invalid")
+        require_count(observed.get("scheduler_ticks_to_terminal"), f"{label}.scheduler_ticks_to_terminal") <= 2
+        wall = observed.get("wall_sec_to_terminal")
         require(isinstance(wall, (int, float)) and not isinstance(wall, bool) and 0 <= wall <= 5, f"{label} release wall time exceeds 5s")
+        for balance_field in ("cancel_resource_balance", "recovery_resource_balance"):
+            balance = require_object(observed.get(balance_field), f"{label}.{balance_field}")
+            require(
+                balance.get("leaked_resource_count") == 0
+                and balance.get("underflow_count") == 0,
+                f"{label} {balance_field} is not balanced",
+            )
         require(observed.get("post_capacity_success") is True, f"{label} capacity was not recovered")
     if scenario_id == "C18":
         requested = require_count(observed.get("requested_concurrency"), f"{label}.requested_concurrency", minimum=1)
@@ -2335,18 +2427,32 @@ def validate_case_evidence(
             trace = require_object(trace_raw, f"case {case_id}.scheduler_trace_rows[{index}]")
             raw_trace = require_object(trace.get("raw"), f"case {case_id}.scheduler_trace_rows[{index}].raw")
             require(trace.get("raw_sha256") == canonical_json_sha256(raw_trace), f"case {case_id} scheduler trace raw SHA mismatch")
+            if scenario_id == "C09":
+                require(
+                    trace.get("collection_phase") in {"abort_window", "recovery_window"},
+                    f"case {case_id} scheduler trace collection phase is invalid",
+                )
             observed_ns = require_count(trace.get("collector_observed_monotonic_ns"), f"case {case_id}.scheduler_trace_rows[{index}].collector_observed_monotonic_ns", minimum=1)
             require(spawn["started_monotonic_ns"] <= observed_ns <= spawn["finished_monotonic_ns"], f"case {case_id} scheduler trace observation is outside case window")
         if scheduler_success_derivation_required(case["status"]):
             if scenario_id == "C09":
-                released, derived_ticks, release_ns = trace_released(trace_rows)
-                require(released and release_ns is not None, f"case {case_id} scheduler trace never proves release")
                 exchanges = require_list(transcript_object.get("exchanges"), f"case {case_id}.exchanges")
-                abort_start_ns = require_count(require_object(exchanges[0], f"case {case_id}.exchange[0]").get("started_monotonic_ns"), f"case {case_id}.abort_start_ns", minimum=1)
-                derived_wall = (release_ns - abort_start_ns) / 1e9
-                require(observed.get("scheduler_ticks_to_release") == derived_ticks, f"case {case_id} release tick count is not derived from trace")
-                wall = observed.get("wall_sec_to_release")
-                require(isinstance(wall, (int, float)) and abs(float(wall) - derived_wall) <= 0.02, f"case {case_id} release wall time is not derived from trace")
+                require(len(exchanges) == 2, f"case {case_id} must contain abort and recovery exchanges")
+                derived = c09_terminal_outcome(
+                    trace_rows,
+                    require_object(exchanges[0], f"case {case_id}.exchange[0]"),
+                    require_object(exchanges[1], f"case {case_id}.exchange[1]"),
+                )
+                for field, expected_value in derived.items():
+                    require(
+                        observed.get(field) == expected_value,
+                        f"case {case_id} {field} is not derived from typed trace evidence",
+                    )
+                require(
+                    derived["cancel_resource_outcome"] == C09_ADMITTED_RELEASED
+                    and observed.get("trace_contract_error") is None,
+                    f"case {case_id} did not prove admitted cancellation release",
+                )
             else:
                 requested = require_count(
                     observed.get("requested_concurrency"),
@@ -3943,6 +4049,22 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
             payload.update({"max_tokens": 8, "stop": [], "ignore_eos": True})
         else:
             payload["max_tokens"] = 64
+    if scenario_id == "C09":
+        payload["messages"] = [
+            {
+                "role": "user",
+                "content": "Write 512 numbered one-word items without stopping early.",
+            }
+        ]
+        payload.update(
+            {
+                "max_tokens": 512,
+                "ignore_eos": True,
+                "stop": [],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        )
     if scenario_id in {"C10", "C11", "C12"}:
         payload["messages"] = [{"role": "user", "content": "Use lookup_weather for Paris."}]
         payload["tools"] = [
@@ -4227,15 +4349,38 @@ def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int
     with path.open("rb") as handle:
         handle.seek(offset)
         payload = handle.read()
-        new_offset = handle.tell()
+    last_newline = payload.rfind(b"\n")
+    if last_newline < 0:
+        return [], offset
+    complete_payload = payload[: last_newline + 1]
+    new_offset = offset + last_newline + 1
+    try:
+        text = complete_payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ScenarioError(
+            f"scheduler trace contains invalid UTF-8 at byte {offset + exc.start}"
+        ) from exc
     rows: list[dict[str, Any]] = []
-    for line in payload.decode("utf-8", "replace").splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
+    consumed = offset
+    for line_number, line in enumerate(text.splitlines(keepends=True), start=1):
+        encoded = line.encode("utf-8")
+        line_offset = consumed
+        consumed += len(encoded)
+        stripped = line.rstrip("\r\n")
+        if not stripped:
             continue
-        if isinstance(value, dict):
-            rows.append(value)
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ScenarioError(
+                f"scheduler trace contains invalid JSONL at byte {line_offset} "
+                f"(chunk line {line_number})"
+            ) from exc
+        require(
+            isinstance(value, dict),
+            f"scheduler trace row at byte {line_offset} must be a JSON object",
+        )
+        rows.append(value)
     return rows, new_offset
 
 
@@ -4355,6 +4500,7 @@ def validate_c18_resource_balance_summary(
     *,
     expected_request_count: int,
     label: str,
+    require_non_request_resources: bool = True,
 ) -> dict[str, Any]:
     summary = require_object(raw, label)
     require(summary.get("schema_version") == SCHEMA_VERSION, f"{label}.schema_version mismatch")
@@ -4367,14 +4513,15 @@ def validate_c18_resource_balance_summary(
     require_count(
         summary.get("balanced_owner_resource_count"),
         f"{label}.balanced_owner_resource_count",
-        minimum=expected_request_count * 2,
+        minimum=expected_request_count * (2 if require_non_request_resources else 1),
     )
     require_count(summary.get("defer_count"), f"{label}.defer_count")
     for field in ("reject_count", "leaked_resource_count", "underflow_count"):
         require(summary.get(field) == 0, f"{label}.{field} must be 0")
     triplets = require_object(summary.get("resource_triplets"), f"{label}.resource_triplets")
     require("request_slot" in triplets, f"{label} lacks request_slot accounting")
-    require(len(triplets) >= 2, f"{label} lacks non-request resource accounting")
+    if require_non_request_resources:
+        require(len(triplets) >= 2, f"{label} lacks non-request resource accounting")
     for resource_kind, raw_counts in triplets.items():
         counts = require_object(raw_counts, f"{label}.resource_triplets.{resource_kind}")
         require(
@@ -4409,6 +4556,8 @@ def c18_resource_balance(
     trace_rows: list[dict[str, Any]],
     *,
     expected_request_count: int,
+    require_non_request_resources: bool = True,
+    label: str = "C18 resource balance",
 ) -> dict[str, Any]:
     lifecycle_actions = {"reserve", "commit", "release", "rollback"}
     states: dict[tuple[str, str, str], dict[str, int]] = {}
@@ -4545,7 +4694,8 @@ def c18_resource_balance(
     )
     require(reject_count == 0, "C18 resource trace contains a rejected request")
     require("request_slot" in resource_summary, "C18 resource trace lacks request-slot accounting")
-    require(len(resource_summary) >= 2, "C18 resource trace lacks non-request resource accounting")
+    if require_non_request_resources:
+        require(len(resource_summary) >= 2, "C18 resource trace lacks non-request resource accounting")
     for key, state in states.items():
         require(
             reserved_balance(state) == 0 and committed_balance(state) == 0,
@@ -4565,7 +4715,8 @@ def c18_resource_balance(
     return validate_c18_resource_balance_summary(
         summary,
         expected_request_count=expected_request_count,
-        label="C18 resource balance",
+        label=label,
+        require_non_request_resources=require_non_request_resources,
     )
 
 
@@ -4694,22 +4845,289 @@ def c18_fixture_trace_rows(
     return rows
 
 
-def trace_released(rows: list[dict[str, Any]]) -> tuple[bool, int, int | None]:
-    active_seen = False
-    ticks = 0
-    for row in rows:
-        values = nested_activity_values(row)
-        if not values:
-            continue
-        current = max(values)
-        if current > 0:
-            active_seen = True
-            ticks = 0
-        elif active_seen:
-            ticks += 1
-            observed_ns = row.get("collector_observed_monotonic_ns")
-            return True, ticks, observed_ns if isinstance(observed_ns, int) else None
-    return False, ticks, None
+def c09_terminal_outcome(
+    rows: list[dict[str, Any]],
+    abort_exchange: dict[str, Any],
+    recovery_exchange: dict[str, Any],
+) -> dict[str, Any]:
+    abort_start_ns = require_count(
+        abort_exchange.get("started_monotonic_ns"),
+        "C09 abort.started_monotonic_ns",
+        minimum=1,
+    )
+    abort_finish_ns = require_count(
+        abort_exchange.get("finished_monotonic_ns"),
+        "C09 abort.finished_monotonic_ns",
+        minimum=abort_start_ns,
+    )
+    recovery_start_ns = require_count(
+        recovery_exchange.get("started_monotonic_ns"),
+        "C09 recovery.started_monotonic_ns",
+        minimum=abort_finish_ns,
+    )
+
+    by_collection_phase: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {
+        "abort_window": [],
+        "recovery_window": [],
+    }
+    for index, row_raw in enumerate(rows):
+        row = require_object(row_raw, f"C09 trace[{index}]")
+        collection_phase = row.get("collection_phase")
+        require(
+            collection_phase in by_collection_phase,
+            f"C09 trace[{index}] collection phase is invalid",
+        )
+        raw = require_object(row.get("raw"), f"C09 trace[{index}].raw")
+        observed_ns = require_count(
+            row.get("collector_observed_monotonic_ns"),
+            f"C09 trace[{index}].collector_observed_monotonic_ns",
+            minimum=abort_start_ns,
+        )
+        if collection_phase == "abort_window":
+            require(
+                observed_ns <= recovery_start_ns,
+                f"C09 trace[{index}] abort row was observed after recovery started",
+            )
+        else:
+            require(
+                observed_ns >= recovery_start_ns,
+                f"C09 trace[{index}] recovery row predates recovery start",
+            )
+        by_collection_phase[collection_phase].append((row, raw))
+
+    def lifecycle_rows(
+        collection_phase: str,
+    ) -> tuple[dict[str, list[tuple[dict[str, Any], dict[str, Any]]]], set[str]]:
+        lifecycles: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        resource_request_ids: set[str] = set()
+        for row, raw in by_collection_phase[collection_phase]:
+            request_id = raw.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            phase = raw.get("phase")
+            if phase in {
+                "engine_request_open",
+                "engine_request_close",
+                "engine_client_disconnect_detected",
+                "engine_client_disconnect_released",
+                "engine_client_disconnect_release_failed",
+            }:
+                lifecycles.setdefault(request_id, []).append((row, raw))
+            resource = raw.get("resource")
+            if (
+                isinstance(resource, dict)
+                and resource.get("owner_kind") == "request"
+                and resource.get("action")
+                in {
+                    "request_open",
+                    "reserve",
+                    "commit",
+                    "release",
+                    "rollback",
+                    "reject",
+                    "request_close",
+                }
+            ):
+                resource_request_ids.add(request_id)
+        return lifecycles, resource_request_ids
+
+    def phase_rows(
+        lifecycle: list[tuple[dict[str, Any], dict[str, Any]]], phase: str
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        return [item for item in lifecycle if item[1].get("phase") == phase]
+
+    def require_clean_close(
+        request_id: str,
+        lifecycle: list[tuple[dict[str, Any], dict[str, Any]]],
+        request_rows: list[dict[str, Any]],
+        label: str,
+    ) -> dict[str, Any]:
+        opens = phase_rows(lifecycle, "engine_request_open")
+        closes = phase_rows(lifecycle, "engine_request_close")
+        require(len(opens) == 1, f"{label} must contain exactly one request_open")
+        require(len(closes) == 1, f"{label} must contain exactly one request_close")
+        close = closes[0][1]
+        attributes = require_object(close.get("attributes"), f"{label}.request_close.attributes")
+        outstanding_kinds = attributes.get("resource_owner_outstanding_kinds")
+        require(
+            close.get("status") == "ok"
+            and close.get("error") is None
+            and attributes.get("resource_owner_outstanding_count") == 0
+            and (outstanding_kinds is None or outstanding_kinds == []),
+            f"{label} closed with outstanding resources",
+        )
+        resource = require_object(close.get("resource"), f"{label}.request_close.resource")
+        require(
+            resource.get("owner_id") == request_id
+            and resource.get("action") == "request_close",
+            f"{label} request_close owner binding mismatch",
+        )
+        return c18_resource_balance(
+            request_rows,
+            expected_request_count=1,
+            require_non_request_resources=False,
+            label=f"{label} resource balance",
+        )
+
+    def rows_for_request(collection_phase: str, request_id: str) -> list[dict[str, Any]]:
+        return [
+            row
+            for row, raw in by_collection_phase[collection_phase]
+            if raw.get("request_id") == request_id
+        ]
+
+    def event_monotonic_ns(
+        event: tuple[dict[str, Any], dict[str, Any]], label: str
+    ) -> int:
+        attributes = require_object(event[1].get("attributes"), f"{label}.attributes")
+        return require_count(
+            attributes.get("monotonic_nanos"), f"{label}.monotonic_nanos", minimum=1
+        )
+
+    abort_lifecycles, abort_resource_ids = lifecycle_rows("abort_window")
+    recovery_lifecycles, recovery_resource_ids = lifecycle_rows("recovery_window")
+    require(
+        len(recovery_lifecycles) == 1 and len(recovery_resource_ids) == 1,
+        "C09 recovery trace must contain exactly one request lifecycle",
+    )
+    recovery_request_id = next(iter(recovery_lifecycles))
+    require(
+        recovery_resource_ids == {recovery_request_id},
+        "C09 recovery resource events are not bound to its request lifecycle",
+    )
+    recovery_resource_balance = require_clean_close(
+        recovery_request_id,
+        recovery_lifecycles[recovery_request_id],
+        rows_for_request("recovery_window", recovery_request_id),
+        "C09 recovery",
+    )
+
+    if not abort_lifecycles and not abort_resource_ids:
+        return {
+            "cancel_resource_outcome": C09_NOT_ADMITTED_SAFE,
+            "cancel_safety": "safe",
+            "cancel_coverage": "not_exercised",
+            "cancel_request_id": None,
+            "recovery_request_id": recovery_request_id,
+            "scheduler_ticks_to_terminal": None,
+            "wall_sec_to_terminal": None,
+            "trace_visibility_proven": True,
+            "cancel_resource_balance": None,
+            "recovery_resource_balance": recovery_resource_balance,
+        }
+
+    require(
+        len(abort_lifecycles) == 1 and len(abort_resource_ids) == 1,
+        "C09 abort trace must contain zero or one request lifecycle",
+    )
+    cancel_request_id = next(iter(abort_lifecycles))
+    require(
+        abort_resource_ids == {cancel_request_id},
+        "C09 abort resource events are not bound to its request lifecycle",
+    )
+    lifecycle = abort_lifecycles[cancel_request_id]
+    require(
+        cancel_request_id != recovery_request_id,
+        "C09 cancel and recovery reused one request id",
+    )
+    cancel_resource_balance = require_clean_close(
+        cancel_request_id,
+        lifecycle,
+        rows_for_request("abort_window", cancel_request_id),
+        "C09 admitted cancel",
+    )
+    detected = phase_rows(lifecycle, "engine_client_disconnect_detected")
+    released = phase_rows(lifecycle, "engine_client_disconnect_released")
+    failed = phase_rows(lifecycle, "engine_client_disconnect_release_failed")
+    require(
+        len(detected) == 1 and len(released) == 1 and not failed,
+        "C09 admitted cancel lacks one detected/released disconnect pair",
+    )
+    detected_raw = detected[0][1]
+    release_row, release_raw = released[0]
+    detected_attributes = require_object(
+        detected_raw.get("attributes"), "C09 disconnect detected.attributes"
+    )
+    release_attributes = require_object(
+        release_raw.get("attributes"), "C09 disconnect release.attributes"
+    )
+    require(
+        detected_raw.get("status") == "ok"
+        and detected_raw.get("error") is None
+        and detected_raw.get("correlation_id") == cancel_request_id
+        and detected_attributes.get("terminal_state") == "pending_release",
+        "C09 disconnect detection event is invalid",
+    )
+    require(
+        release_raw.get("status") == "ok"
+        and release_raw.get("error") is None
+        and release_raw.get("correlation_id") == cancel_request_id
+        and release_attributes.get("terminal_state") == "released"
+        and release_attributes.get("scheduler_cancel_result") == "cancelled",
+        "C09 disconnect release event is not a successful terminal release",
+    )
+    detected_shape = require_object(
+        detected_raw.get("shape"), "C09 disconnect detected.shape"
+    )
+    shape = require_object(release_raw.get("shape"), "C09 disconnect release.shape")
+    detected_iteration = require_count(
+        detected_shape.get("scheduler_iteration"),
+        "C09 disconnect detected.scheduler_iteration",
+    )
+    require(
+        shape.get("detected_scheduler_iteration") == detected_iteration,
+        "C09 disconnect release detected iteration mismatch",
+    )
+    terminal_iteration = require_count(
+        shape.get("terminal_scheduler_iteration"),
+        "C09 disconnect release.terminal_scheduler_iteration",
+        minimum=detected_iteration,
+    )
+    ticks = require_count(
+        shape.get("scheduler_tick_delta"),
+        "C09 disconnect release.scheduler_tick_delta",
+    )
+    require(
+        terminal_iteration - detected_iteration == ticks and ticks <= 2,
+        "C09 disconnect release exceeded or misreported scheduler ticks",
+    )
+    detected_ns = event_monotonic_ns(detected[0], "C09 disconnect detected")
+    close_event = phase_rows(lifecycle, "engine_request_close")[0]
+    close_ns = event_monotonic_ns(close_event, "C09 request close")
+    released_ns = event_monotonic_ns(released[0], "C09 disconnect release")
+    require(
+        detected_ns <= close_ns <= released_ns,
+        "C09 disconnect terminal event does not follow resource close",
+    )
+    detected_wall_ns = require_count(
+        detected_raw.get("ts_unix_nanos"), "C09 disconnect detected.ts_unix_nanos", minimum=1
+    )
+    released_wall_ns = require_count(
+        release_raw.get("ts_unix_nanos"), "C09 disconnect release.ts_unix_nanos", minimum=detected_wall_ns
+    )
+    wall_sec = (released_wall_ns - detected_wall_ns) / 1e9
+    require(wall_sec <= 5, "C09 disconnect release exceeded five seconds")
+    release_observed_ns = require_count(
+        release_row.get("collector_observed_monotonic_ns"),
+        "C09 disconnect release.collector_observed_monotonic_ns",
+        minimum=abort_finish_ns,
+    )
+    require(
+        release_observed_ns <= recovery_start_ns,
+        "C09 admitted cancel was not released before the recovery request",
+    )
+    return {
+        "cancel_resource_outcome": C09_ADMITTED_RELEASED,
+        "cancel_safety": "safe",
+        "cancel_coverage": "exercised",
+        "cancel_request_id": cancel_request_id,
+        "recovery_request_id": recovery_request_id,
+        "scheduler_ticks_to_terminal": ticks,
+        "wall_sec_to_terminal": wall_sec,
+        "trace_visibility_proven": True,
+        "cancel_resource_balance": cancel_resource_balance,
+        "recovery_resource_balance": recovery_resource_balance,
+    }
 
 
 def typed_admission_cap(config_path: Path) -> int:
@@ -4787,7 +5205,14 @@ def validate_actual_effective_config(
     return config
 
 
-def aborted_http_exchange(base_url: str, payload: dict[str, Any], variant: str) -> dict[str, Any]:
+def aborted_http_exchange(
+    base_url: str,
+    payload: dict[str, Any],
+    variant: str,
+    *,
+    scheduler_trace_path: Path,
+    trace_offset: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     parsed = urllib.parse.urlsplit(base_url)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = (
@@ -4796,27 +5221,72 @@ def aborted_http_exchange(base_url: str, payload: dict[str, Any], variant: str) 
     ).encode("ascii") + body
     started_at = iso_now()
     started_ns = time.monotonic_ns()
-    with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 80), timeout=2) as sock:
+    trace_rows: list[dict[str, Any]] = []
+    admitted_request_id: str | None = None
+    abort_trigger = "not_admitted"
+    sock = socket.create_connection(
+        (parsed.hostname or "127.0.0.1", parsed.port or 80), timeout=2
+    )
+    try:
         sock.sendall(request)
+        deadline = time.monotonic() + C09_ADMISSION_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
+            observed_ns = time.monotonic_ns()
+            trace_rows.extend(
+                {
+                    "raw": row,
+                    "collection_phase": "abort_window",
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
+                for row in fresh
+            )
+            opened = {
+                row["raw"].get("request_id")
+                for row in trace_rows
+                if row["raw"].get("phase") == "engine_request_open"
+                and isinstance(row["raw"].get("request_id"), str)
+            }
+            require(len(opened) <= 1, "C09 admission window contains multiple requests")
+            if opened:
+                admitted_request_id = next(iter(opened))
+                break
+            time.sleep(0.01)
         if variant == "timeout":
-            sock.settimeout(0.01)
-            try:
-                sock.recv(1)
-            except (TimeoutError, socket.timeout):
-                pass
+            time.sleep(0.01)
+            abort_trigger = "client_deadline_expired"
         elif variant == "cancel":
-            sock.shutdown(socket.SHUT_WR)
-    return {
+            abort_trigger = "socket_shutdown"
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                abort_trigger = "peer_closed"
+        else:
+            require(variant == "disconnect", f"unsupported C09 abort variant {variant!r}")
+            abort_trigger = "tcp_reset"
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        sock.close()
+    finished_ns = time.monotonic_ns()
+    exchange = {
         "request": payload,
         "status": 499,
+        "status_source": "runner_client_abort",
         "response_headers": {},
-        "response": {"client_abort": variant},
+        "response": {
+            "client_abort": variant,
+            "abort_trigger": abort_trigger,
+            "admission_observed": admitted_request_id is not None,
+            "admission_request_id": admitted_request_id,
+        },
         "response_raw": "",
         "started_at": started_at,
         "finished_at": iso_now(),
         "started_monotonic_ns": started_ns,
-        "finished_monotonic_ns": time.monotonic_ns(),
+        "finished_monotonic_ns": finished_ns,
     }
+    return exchange, trace_rows, trace_offset
 
 
 def run_case_prompts(case: dict[str, Any]) -> list[str]:
@@ -5621,6 +6091,23 @@ def serve_case_request(
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
     payload = case_http_payload(case, case["model_key"])
+    recovery_payload: dict[str, Any] | None = None
+    if case["scenario_id"] == "C09":
+        recovery_payload = copy.deepcopy(payload)
+        recovery_payload["messages"] = [
+            {
+                "role": "user",
+                "content": f"Return the exact marker {expected_case_text(case)} and no other text.",
+            }
+        ]
+        recovery_payload.pop("ignore_eos", None)
+        recovery_payload.pop("stop", None)
+        recovery_payload.pop("stream", None)
+        recovery_payload.pop("stream_options", None)
+        recovery_payload["metadata"] = {
+            **recovery_payload.get("metadata", {}),
+            "g00_recovery": True,
+        }
     input_path = case_root / "input.json"
     write_json(input_path, payload)
     requested = int(case["concurrency_cell"]["requested_concurrency"]) if case["concurrency_cell"] else 1
@@ -5629,36 +6116,93 @@ def serve_case_request(
     trace_offset = scheduler_trace_path.stat().st_size if scheduler_trace_path.is_file() else 0
     runtime_log_start_offset = server.stderr_path.stat().st_size if server.stderr_path.is_file() else 0
     trace_rows: list[dict[str, Any]] = []
-    release_ticks = 0
-    released = False
-    release_observed_ns: int | None = None
-    release_wall = 0.0
+    c09_outcome: dict[str, Any] | None = None
+    c09_trace_contract_error: str | None = None
     history_construction_errors: list[dict[str, Any]] = []
     concurrency_identities: list[dict[str, Any]] = []
     if case["scenario_id"] == "C09":
-        abort_started = time.monotonic()
-        aborted = aborted_http_exchange(base_url, copy.deepcopy(payload), case["variant"])
-        deadline = abort_started + 5.0
+        aborted, trace_rows, trace_offset = aborted_http_exchange(
+            base_url,
+            copy.deepcopy(payload),
+            case["variant"],
+            scheduler_trace_path=scheduler_trace_path,
+            trace_offset=trace_offset,
+        )
+        abort_response = require_object(aborted.get("response"), f"case {case_id}.abort.response")
+        admitted_request_id = abort_response.get("admission_request_id")
+        deadline = time.monotonic() + (
+            C09_TRACE_TIMEOUT_SEC
+            if isinstance(admitted_request_id, str)
+            else C09_NOT_ADMITTED_OBSERVATION_SEC
+        )
         while time.monotonic() < deadline:
             fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
             observed_ns = time.monotonic_ns()
             trace_rows.extend(
-                {"raw": row, "collector_observed_monotonic_ns": observed_ns, "raw_sha256": canonical_json_sha256(row)}
+                {
+                    "raw": row,
+                    "collection_phase": "abort_window",
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
                 for row in fresh
             )
-            released, release_ticks, release_observed_ns = trace_released(trace_rows)
-            if released:
+            terminal_phases = {
+                row["raw"].get("phase")
+                for row in trace_rows
+                if row["raw"].get("request_id") == admitted_request_id
+            }
+            disconnect_terminal = bool(
+                {
+                    "engine_client_disconnect_released",
+                    "engine_client_disconnect_release_failed",
+                }
+                & terminal_phases
+            )
+            if (
+                isinstance(admitted_request_id, str)
+                and "engine_request_close" in terminal_phases
+                and disconnect_terminal
+            ):
                 break
             time.sleep(0.02)
-        release_wall = (
-            (release_observed_ns - aborted["started_monotonic_ns"]) / 1e9
-            if released and release_observed_ns is not None
-            else time.monotonic() - abort_started
-        )
-        recovery_payload = copy.deepcopy(payload)
-        recovery_payload["metadata"] = {**recovery_payload.get("metadata", {}), "g00_recovery": True}
+        require(recovery_payload is not None, "C09 recovery payload is missing")
         recovery, _ = http_exchange(base_url, recovery_payload, timeout_sec)
         results = [(aborted, {}), (recovery, {})]
+        recovery_deadline = time.monotonic() + C09_TRACE_TIMEOUT_SEC
+        while time.monotonic() < recovery_deadline:
+            fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
+            observed_ns = time.monotonic_ns()
+            trace_rows.extend(
+                {
+                    "raw": row,
+                    "collection_phase": "recovery_window",
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
+                for row in fresh
+            )
+            try:
+                c09_outcome = c09_terminal_outcome(trace_rows, aborted, recovery)
+            except ScenarioError as exc:
+                c09_trace_contract_error = str(exc)
+            else:
+                c09_trace_contract_error = None
+                break
+            time.sleep(0.02)
+        if c09_outcome is None:
+            c09_outcome = {
+                "cancel_resource_outcome": "unproven",
+                "cancel_safety": "unproven",
+                "cancel_coverage": "invalid",
+                "cancel_request_id": admitted_request_id,
+                "recovery_request_id": None,
+                "scheduler_ticks_to_terminal": None,
+                "wall_sec_to_terminal": None,
+                "trace_visibility_proven": False,
+                "cancel_resource_balance": None,
+                "recovery_resource_balance": None,
+            }
     elif case["scenario_id"] == "C18":
         concurrency_identities = c18_request_identities(case_id, requested)
         concurrent_payloads = [
@@ -5838,10 +6382,11 @@ def serve_case_request(
             }
         )
     if case["scenario_id"] == "C09":
+        require(c09_outcome is not None, "C09 terminal outcome was not collected")
         observed.update(
             {
-                "scheduler_ticks_to_release": release_ticks if released else 999,
-                "wall_sec_to_release": release_wall,
+                **c09_outcome,
+                "trace_contract_error": c09_trace_contract_error,
                 "post_capacity_success": len(exchanges) == 2 and exchanges[-1]["status"] == 200,
             }
         )
@@ -6823,6 +7368,36 @@ def execute_manifest(
         blocked = sum(case["status"] == "blocked" for case in results)
         status = "blocked" if blocked else "known-fail" if known else "pass"
         assertions = selftest_assertions(scenario_id, len(results)) if status == "pass" else {"expected_failure_count": known + blocked, "unexpected_count": 0}
+        if scenario_id == "C09" and status == "pass":
+            assertions.update(
+                {
+                    "admitted_released_count": sum(
+                        case["observed"].get("cancel_resource_outcome")
+                        == C09_ADMITTED_RELEASED
+                        for case in results
+                    ),
+                    "not_admitted_safe_count": sum(
+                        case["observed"].get("cancel_resource_outcome")
+                        == C09_NOT_ADMITTED_SAFE
+                        for case in results
+                    ),
+                    "post_capacity_success_count": sum(
+                        case["observed"].get("post_capacity_success") is True
+                        for case in results
+                    ),
+                    "max_scheduler_ticks_to_terminal": max(
+                        require_count(
+                            case["observed"].get("scheduler_ticks_to_terminal"),
+                            f"{case['case_id']}.scheduler_ticks_to_terminal",
+                        )
+                        for case in results
+                    ),
+                    "max_wall_sec_to_terminal": max(
+                        float(case["observed"]["wall_sec_to_terminal"])
+                        for case in results
+                    ),
+                }
+            )
         if scenario_id == "C18":
             shape["concurrency_cells"] = [
                 {
@@ -6917,7 +7492,15 @@ def selftest_assertions(scenario_id: str, case_count: int) -> dict[str, Any]:
     elif scenario_id == "C07":
         values.update({"conversation_count": 6, "history_turn_count": 30})
     elif scenario_id == "C09":
-        values.update({"released_count": case_count, "post_capacity_success_count": case_count, "max_scheduler_ticks_to_release": 2, "max_wall_sec_to_release": 5.0})
+        values.update(
+            {
+                "admitted_released_count": case_count,
+                "not_admitted_safe_count": 0,
+                "post_capacity_success_count": case_count,
+                "max_scheduler_ticks_to_terminal": 2,
+                "max_wall_sec_to_terminal": 5.0,
+            }
+        )
     elif scenario_id in {"C10", "C11", "C12", "C13"}:
         values["tool_success_count"] = case_count
         if scenario_id == "C12":
@@ -7519,9 +8102,38 @@ def make_case_fixture(
         elif scenario_id == "C21" and variant == "required-tool":
             exchanges = [{"request": input_value, "status": 200, "response": copy.deepcopy(response)} for _ in range(2)]
         if scenario_id == "C09":
+            recovery_request = copy.deepcopy(input_value)
+            recovery_request["messages"] = [
+                {
+                    "role": "user",
+                    "content": f"Return the exact marker {marker} and no other text.",
+                }
+            ]
+            recovery_request.pop("ignore_eos", None)
+            recovery_request.pop("stop", None)
+            recovery_request.pop("stream", None)
+            recovery_request.pop("stream_options", None)
+            recovery_request["metadata"] = {
+                **recovery_request.get("metadata", {}),
+                "g00_recovery": True,
+            }
             exchanges = [
-                {"request": input_value, "status": 499, "response": {"client_abort": variant}},
-                {"request": input_value, "status": 200, "response": response},
+                {
+                    "request": input_value,
+                    "status": 499,
+                    "status_source": "runner_client_abort",
+                    "response": {
+                        "client_abort": variant,
+                        "abort_trigger": {
+                            "cancel": "socket_shutdown",
+                            "timeout": "client_deadline_expired",
+                            "disconnect": "tcp_reset",
+                        }[variant],
+                        "admission_observed": True,
+                        "admission_request_id": f"{case_id}-cancel",
+                    },
+                },
+                {"request": recovery_request, "status": 200, "response": response},
             ]
         transcript = {
             "case_id": case_id,
@@ -7557,7 +8169,28 @@ def make_case_fixture(
                 }
             )
         if scenario_id == "C09":
-            observed.update({"scheduler_ticks_to_release": 2, "wall_sec_to_release": 0.25, "post_capacity_success": True})
+            observed.update(
+                {
+                    "cancel_resource_outcome": C09_ADMITTED_RELEASED,
+                    "cancel_safety": "safe",
+                    "cancel_coverage": "exercised",
+                    "cancel_request_id": f"{case_id}-cancel",
+                    "recovery_request_id": f"{case_id}-recovery",
+                    "scheduler_ticks_to_terminal": 1,
+                    "wall_sec_to_terminal": 0.001,
+                    "trace_visibility_proven": True,
+                    "trace_contract_error": None,
+                    "cancel_resource_balance": {
+                        "leaked_resource_count": 0,
+                        "underflow_count": 0,
+                    },
+                    "recovery_resource_balance": {
+                        "leaked_resource_count": 0,
+                        "underflow_count": 0,
+                    },
+                    "post_capacity_success": True,
+                }
+            )
         if scenario_id == "C18":
             require(concurrency_cell is not None, "C18 fixture requires a concurrency cell")
             require(concurrency_identities is not None, "C18 fixture request identities are missing")
@@ -8070,15 +8703,24 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         finally:
             if getattr(self, "g00_traced", False):
-                self.server.request_finished(self.g00_trace_request_id)
+                self.server.request_finished(
+                    self.g00_trace_request_id,
+                    disconnected=getattr(self, "g00_disconnected", False),
+                )
 
     def send_json(self, status, value):
         body = json.dumps(value, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            if getattr(self, "g00_abort_expected", False):
+                self.g00_disconnected = True
+            raise
 
     def do_GET(self):
         if self.path == "/health":
@@ -8103,7 +8745,15 @@ class Handler(BaseHTTPRequestHandler):
             checksum = str(metadata.get("g00_concurrency_checksum", ""))
             marker = f"G00-{case_id}-R{request_index:03d}-{checksum}-OK"
         self.g00_case_id = case_id
-        self.g00_trace_request_id = f"{case_id}-request-{request_index:03d}" if scenario == "C18" else case_id
+        if scenario == "C18":
+            self.g00_trace_request_id = f"{case_id}-request-{request_index:03d}"
+        elif scenario == "C09":
+            suffix = "recovery" if metadata.get("g00_recovery") else "cancel"
+            self.g00_trace_request_id = f"{case_id}-{suffix}"
+        else:
+            self.g00_trace_request_id = case_id
+        self.g00_abort_expected = scenario == "C09" and not metadata.get("g00_recovery")
+        self.g00_disconnected = False
         self.g00_traced = True
         self.server.request_started(self.g00_trace_request_id)
         if scenario in {"C09", "C18"}:
@@ -8127,11 +8777,23 @@ class Handler(BaseHTTPRequestHandler):
             chunks.append({"id": f"chatcmpl-{case_id}", "choices": [], "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}})
             body = "".join("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
             raw = body.encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "text/event-stream")
-            self.send_header("content-length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                if scenario == "C09":
+                    for offset in range(0, len(raw), 32):
+                        self.wfile.write(raw[offset : offset + 32])
+                        self.wfile.flush()
+                        time.sleep(0.005)
+                else:
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                if self.g00_abort_expected:
+                    self.g00_disconnected = True
+                raise
             return
         message = {"role": "assistant", "content": marker}
         finish = "stop"
@@ -8184,26 +8846,34 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         return
 
-    def trace(self, request_id, phase, resource):
+    def trace(self, request_id, phase, resource=None, *, shape=None, attributes=None):
         if self.trace_path is None:
             return
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         monotonic_nanos = time.monotonic_ns()
         event = {
+            "ts_unix_nanos": time.time_ns(),
             "event_id": f"fixture-{phase}-{request_id}-{monotonic_nanos}",
             "phase": phase,
             "request_id": request_id,
+            "correlation_id": request_id,
             "status": "ok",
             "error": None,
-            "resource": {
-                "owner_kind": "request",
-                "owner_id": request_id,
-                **resource,
-            },
+            "resource": (
+                {
+                    "owner_kind": "request",
+                    "owner_id": request_id,
+                    **resource,
+                }
+                if resource is not None
+                else None
+            ),
+            "shape": shape or {},
             "attributes": {
                 "monotonic_nanos": monotonic_nanos,
                 "active_sequence_count": self.active,
                 "scheduler_snapshot": {"active_len": self.active},
+                **(attributes or {}),
             },
         }
         with self.trace_path.open("a") as handle:
@@ -8218,12 +8888,46 @@ class Server(ThreadingHTTPServer):
             self.trace(request_id, "plan_runtime_workspace_reserve", {"resource_kind": "backend_workspace", "action": "reserve", "amount": 1, "before": 0, "after": 1, "capacity": 32})
             self.trace(request_id, "plan_runtime_workspace_commit", {"resource_kind": "backend_workspace", "action": "commit", "amount": 1, "before": 0, "after": 1, "capacity": 32})
 
-    def request_finished(self, request_id):
+    def request_finished(self, request_id, *, disconnected=False):
         with self.trace_lock:
+            if disconnected:
+                self.trace(
+                    request_id,
+                    "engine_client_disconnect_detected",
+                    shape={"scheduler_iteration": 10},
+                    attributes={
+                        "disconnect_reason": "client_receiver_closed",
+                        "terminal_state": "pending_release",
+                    },
+                )
             self.trace(request_id, "plan_runtime_workspace_release", {"resource_kind": "backend_workspace", "action": "release", "amount": 1, "before": 1, "after": 0, "capacity": 32})
             self.trace(request_id, "engine_request_slot_release", {"resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0})
             self.active = max(0, self.active - 1)
-            self.trace(request_id, "engine_request_close", {"resource_kind": "request_slot", "action": "request_close"})
+            self.trace(
+                request_id,
+                "engine_request_close",
+                {"resource_kind": "request_slot", "action": "request_close"},
+                attributes={
+                    "resource_owner_outstanding_count": 0,
+                    "resource_owner_outstanding_kinds": [],
+                    "resource_owner_close_summary": [],
+                },
+            )
+            if disconnected:
+                self.trace(
+                    request_id,
+                    "engine_client_disconnect_released",
+                    shape={
+                        "detected_scheduler_iteration": 10,
+                        "terminal_scheduler_iteration": 11,
+                        "scheduler_tick_delta": 1,
+                    },
+                    attributes={
+                        "disconnect_reason": "client_receiver_closed",
+                        "scheduler_cancel_result": "cancelled",
+                        "terminal_state": "released",
+                    },
+                )
 
 
 def serve_mode(argv):
@@ -8708,6 +9412,258 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
 
 def self_test() -> int:
     validate_c17_markers()
+
+    def c09_fixture_request_rows(
+        request_id: str,
+        collection_phase: str,
+        base_ns: int,
+        *,
+        disconnected: bool,
+        scheduler_tick_delta: int = 1,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        event_index = 0
+
+        def append(
+            phase: str,
+            resource: dict[str, Any] | None = None,
+            *,
+            shape: dict[str, Any] | None = None,
+            attributes: dict[str, Any] | None = None,
+        ) -> None:
+            nonlocal event_index
+            event_index += 1
+            monotonic_ns = base_ns + event_index * 1_000_000
+            raw = {
+                "ts_unix_nanos": 1_700_000_000_000_000_000 + monotonic_ns,
+                "event_id": f"fixture-{request_id}-{event_index}",
+                "phase": phase,
+                "request_id": request_id,
+                "correlation_id": request_id,
+                "status": "ok",
+                "error": None,
+                "resource": (
+                    {
+                        "owner_kind": "request",
+                        "owner_id": request_id,
+                        **resource,
+                    }
+                    if resource is not None
+                    else None
+                ),
+                "shape": shape or {},
+                "attributes": {
+                    "monotonic_nanos": monotonic_ns,
+                    **(attributes or {}),
+                },
+            }
+            rows.append(
+                {
+                    "raw": raw,
+                    "collection_phase": collection_phase,
+                    "collector_observed_monotonic_ns": monotonic_ns,
+                    "raw_sha256": canonical_json_sha256(raw),
+                }
+            )
+
+        append(
+            "engine_request_open",
+            {"resource_kind": "request_slot", "action": "request_open"},
+        )
+        append(
+            "engine_request_slot_reserve",
+            {
+                "resource_kind": "request_slot",
+                "action": "reserve",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+            },
+        )
+        append(
+            "engine_request_slot_commit",
+            {
+                "resource_kind": "request_slot",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+            },
+        )
+        append(
+            "plan_runtime_workspace_reserve",
+            {
+                "resource_kind": "backend_workspace",
+                "action": "reserve",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 32,
+            },
+        )
+        append(
+            "plan_runtime_workspace_commit",
+            {
+                "resource_kind": "backend_workspace",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 32,
+            },
+        )
+        if disconnected:
+            append(
+                "engine_client_disconnect_detected",
+                shape={"scheduler_iteration": 10},
+                attributes={"terminal_state": "pending_release"},
+            )
+        append(
+            "plan_runtime_workspace_release",
+            {
+                "resource_kind": "backend_workspace",
+                "action": "release",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+                "capacity": 32,
+            },
+        )
+        append(
+            "engine_request_slot_release",
+            {
+                "resource_kind": "request_slot",
+                "action": "release",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+            },
+        )
+        append(
+            "engine_request_close",
+            {"resource_kind": "request_slot", "action": "request_close"},
+            attributes={
+                "resource_owner_outstanding_count": 0,
+                "resource_owner_outstanding_kinds": [],
+            },
+        )
+        if disconnected:
+            append(
+                "engine_client_disconnect_released",
+                shape={
+                    "detected_scheduler_iteration": 10,
+                    "terminal_scheduler_iteration": 10 + scheduler_tick_delta,
+                    "scheduler_tick_delta": scheduler_tick_delta,
+                },
+                attributes={
+                    "scheduler_cancel_result": "cancelled",
+                    "terminal_state": "released",
+                },
+            )
+        return rows
+
+    abort_exchange = {
+        "started_monotonic_ns": 9_998_000_000,
+        "finished_monotonic_ns": 9_999_000_000,
+    }
+    recovery_exchange = {
+        "started_monotonic_ns": 10_050_000_000,
+        "finished_monotonic_ns": 10_100_000_000,
+    }
+    admitted_rows = [
+        *c09_fixture_request_rows(
+            "c09-cancel", "abort_window", 10_000_000_000, disconnected=True
+        ),
+        *c09_fixture_request_rows(
+            "c09-recovery", "recovery_window", 10_060_000_000, disconnected=False
+        ),
+    ]
+    admitted_outcome = c09_terminal_outcome(
+        admitted_rows, abort_exchange, recovery_exchange
+    )
+    require(
+        admitted_outcome["cancel_resource_outcome"] == C09_ADMITTED_RELEASED
+        and admitted_outcome["cancel_coverage"] == "exercised",
+        "C09 admitted cancellation fixture did not reach released terminal state",
+    )
+    pre_admission_outcome = c09_terminal_outcome(
+        c09_fixture_request_rows(
+            "c09-recovery", "recovery_window", 10_060_000_000, disconnected=False
+        ),
+        abort_exchange,
+        recovery_exchange,
+    )
+    require(
+        pre_admission_outcome["cancel_resource_outcome"] == C09_NOT_ADMITTED_SAFE
+        and pre_admission_outcome["cancel_coverage"] == "not_exercised"
+        and pre_admission_outcome["scheduler_ticks_to_terminal"] is None,
+        "C09 pre-admission abort was incorrectly counted as release coverage",
+    )
+
+    def expect_c09_reject(rows: list[dict[str, Any]], label: str) -> None:
+        try:
+            c09_terminal_outcome(rows, abort_exchange, recovery_exchange)
+        except ScenarioError:
+            return
+        raise AssertionError(f"C09 {label} fixture unexpectedly passed")
+
+    expect_c09_reject(
+        [
+            row
+            for row in admitted_rows
+            if row["raw"].get("phase") != "engine_client_disconnect_released"
+        ],
+        "missing disconnect release",
+    )
+    tick_overrun_rows = copy.deepcopy(admitted_rows)
+    next(
+        row
+        for row in tick_overrun_rows
+        if row["raw"].get("phase") == "engine_client_disconnect_released"
+    )["raw"]["shape"]["scheduler_tick_delta"] = 3
+    expect_c09_reject(tick_overrun_rows, "scheduler tick overrun")
+    duplicate_release_rows = copy.deepcopy(admitted_rows)
+    duplicate_release = copy.deepcopy(
+        next(
+            row
+            for row in duplicate_release_rows
+            if row["raw"].get("phase") == "plan_runtime_workspace_release"
+            and row["collection_phase"] == "abort_window"
+        )
+    )
+    duplicate_release_rows.insert(7, duplicate_release)
+    expect_c09_reject(duplicate_release_rows, "duplicate resource release")
+    expect_c09_reject(
+        [
+            row
+            for row in admitted_rows
+            if not (
+                row["collection_phase"] == "recovery_window"
+                and row["raw"].get("phase") == "engine_request_close"
+            )
+        ],
+        "missing recovery close",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-jsonl-tail-") as tmp:
+        trace_path = Path(tmp) / "trace.jsonl"
+        first = json.dumps({"row": 1}).encode("utf-8") + b"\n"
+        second = json.dumps({"row": 2}).encode("utf-8") + b"\n"
+        trace_path.write_bytes(first + second[:5])
+        rows, offset = read_jsonl_since(trace_path, 0)
+        require(rows == [{"row": 1}] and offset == len(first), "JSONL reader consumed a partial row")
+        with trace_path.open("ab") as handle:
+            handle.write(second[5:])
+        rows, offset = read_jsonl_since(trace_path, offset)
+        require(rows == [{"row": 2}] and offset == len(first) + len(second), "JSONL reader lost a completed tail row")
+        trace_path.write_bytes(b"{invalid}\n")
+        try:
+            read_jsonl_since(trace_path, 0)
+        except ScenarioError as exc:
+            require("invalid JSONL" in str(exc), f"invalid JSONL rejection drifted: {exc}")
+        else:
+            raise AssertionError("JSONL reader silently skipped a complete invalid row")
+
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-c17-normalization-") as tmp:
         stdout_path = Path(tmp) / "stdout.jsonl"
         nfd_marker = "e\u0301"
