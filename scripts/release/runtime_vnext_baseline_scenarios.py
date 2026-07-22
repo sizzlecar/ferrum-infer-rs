@@ -1504,7 +1504,13 @@ def validate_case_output(
                 )
             ready = [row for row in rows if row.get("event") == "ready"]
             require(len(ready) == 1, f"{label} C01 must record exactly one runtime model-resolution event")
-            require(ready[0].get("model") == observed.get("requested_model"), f"{label} runtime resolved a different model argument")
+            expected_identity = require_object(
+                require_object(input_document.get("resolution_probe"), f"{label}.resolution_probe").get("expected_source_identity"),
+                f"{label}.resolution_probe.expected_source_identity",
+            )
+            require(ready[0].get("requested_model") == observed.get("requested_model"), f"{label} ready event lost the raw requested model")
+            require(ready[0].get("resolved_model") == expected_identity.get("resolved_model"), f"{label} ready event resolved model differs from the locked public identity")
+            require(ready[0].get("model") == ready[0].get("resolved_model"), f"{label} ready event exposed a machine-local request path as its public model")
         if scenario_id == "C19":
             require(len(assistants) == 2, f"{label} thinking run must carry a two-turn history")
             users = [row for row in rows if row.get("event") == "user"]
@@ -3361,17 +3367,12 @@ def build_c01_resolution_probe(
     }
     core_fields = {"architectures", "model_type", "text_config", "torch_dtype", "transformers_version"}
     unknown_fields = sorted(str(key) for key in config_document if key not in core_fields)
-    runtime_binding = {
-        "semantic_repo": semantic["repo"],
-        "semantic_revision": semantic["revision"],
-        "config_container_sha256": semantic["files"]["config.json"],
-        "template_source": chat["source"],
-        "template_repo": selected_source["repo"],
-        "template_revision": selected_source["revision"],
-        "template_path": chat["path"],
-        "template_container_sha256": chat["container_sha256"],
-        "template_content_sha256": chat["content_sha256"],
-    }
+    expected_source_identity = build_expected_product_source_identity(
+        model_arg=model_arg,
+        sources=sources,
+        semantic_root=semantic_root,
+        tokenizer_root=tokenizer_root,
+    )
     return {
         "available": True,
         "requested_model": model_arg,
@@ -3406,8 +3407,159 @@ def build_c01_resolution_probe(
             "tokens": special_tokens,
             "eos_token_ids": eos_ids,
         },
-        "runtime_binding": runtime_binding,
+        "expected_source_identity": expected_source_identity,
         "expected_runtime_architectures": sorted(EXPECTED_ARCHITECTURES[model_key]),
+    }
+
+
+def selected_product_source_files(
+    root: Path,
+    locked_files: dict[str, str],
+    selected_paths: list[str],
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for relative_path in sorted(selected_paths):
+        require(relative_path in locked_files, f"{label} selected file is absent from models.lock: {relative_path}")
+        path = root / relative_path
+        require(path.is_file(), f"{label} selected file is absent: {relative_path}")
+        require(file_sha256(path) == locked_files[relative_path], f"{label} selected file SHA differs from models.lock: {relative_path}")
+        rows.append(
+            {
+                "relative_path": relative_path,
+                "size_bytes": path.stat().st_size,
+                "sha256": locked_files[relative_path],
+            }
+        )
+    require(rows, f"{label} selected no source files")
+    return rows
+
+
+def build_expected_product_source_identity(
+    *,
+    model_arg: str,
+    sources: dict[str, Any],
+    semantic_root: Path,
+    tokenizer_root: Path,
+) -> dict[str, Any]:
+    semantic = require_object(sources.get("semantic_source"), "C01 semantic source")
+    tokenizer = sources.get("tokenizer_source")
+    token_source = semantic if tokenizer is None else require_object(tokenizer, "C01 tokenizer source")
+    chat = require_object(sources.get("chat_template"), "C01 chat template")
+    weight_repo = require_string(sources.get("weight_repo"), "C01 weight repo")
+    weight_revision = require_git_sha(sources.get("weight_revision"), "C01 weight revision")
+    weight_files = require_object(sources.get("weight_files"), "C01 weight files")
+    model_path = Path(model_arg).expanduser().absolute()
+    weight_root = model_path if model_path.is_dir() else model_path.parent
+    tokenizer_names = [
+        name
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "special_tokens_map.json",
+            "chat_template.json",
+            "chat_template.jinja",
+        )
+        if name in token_source["files"] and (tokenizer_root / name).is_file()
+    ]
+    weight_names = [
+        name
+        for name in weight_files
+        if name.endswith((".safetensors", ".gguf"))
+        or name in {"model.safetensors.index.json", "config.json"}
+    ]
+    semantic_files = selected_product_source_files(
+        semantic_root,
+        semantic["files"],
+        ["config.json"],
+        label="C01 semantic identity",
+    )
+    tokenizer_files = selected_product_source_files(
+        tokenizer_root,
+        token_source["files"],
+        tokenizer_names,
+        label="C01 tokenizer identity",
+    )
+    resolved_weight_files = selected_product_source_files(
+        weight_root,
+        weight_files,
+        weight_names,
+        label="C01 weight identity",
+    )
+    template_path = require_string(chat.get("path"), "C01 chat template path")
+    template_container_sha256 = require_sha256(chat.get("container_sha256"), "C01 chat template container SHA")
+    template_content_sha256 = require_sha256(chat.get("content_sha256"), "C01 chat template content SHA")
+    weight_config = next(
+        (row for row in resolved_weight_files if row["relative_path"] == "config.json"),
+        None,
+    )
+    return {
+        "schema_version": 1,
+        "requested_model": model_arg,
+        "resolved_model": weight_repo,
+        "original_sources": {
+            "semantic": {
+                "kind": "local_directory",
+                "location": str(semantic_root),
+                "requested_revision": None,
+            },
+            "tokenizer": {
+                "kind": "local_directory",
+                "location": str(tokenizer_root),
+                "requested_revision": None,
+            },
+            "weights": {
+                "kind": "local_directory" if model_path.is_dir() else "local_file",
+                "location": model_arg,
+                "requested_revision": None,
+            },
+        },
+        "resolved_sources": {
+            "semantic": {
+                "canonical_location": semantic["repo"],
+                "resolved_revision": semantic["revision"],
+                "files": semantic_files,
+            },
+            "tokenizer": {
+                "canonical_location": token_source["repo"],
+                "resolved_revision": token_source["revision"],
+                "files": tokenizer_files,
+            },
+            "weights": {
+                "canonical_location": weight_repo,
+                "resolved_revision": weight_revision,
+                "files": resolved_weight_files,
+            },
+        },
+        "semantic_config": {
+            "role": "semantic",
+            "source_file": "config.json",
+            "container_sha256": semantic["files"]["config.json"],
+        },
+        "tokenizer": {
+            "role": "tokenizer",
+            "source_file": "tokenizer.json",
+            "container_sha256": token_source["files"]["tokenizer.json"],
+        },
+        "template": {
+            "role": "tokenizer",
+            "source_file": template_path,
+            "container_sha256": template_container_sha256,
+            "content_sha256": template_content_sha256,
+        },
+        **(
+            {
+                "weight_config": {
+                    "role": "weights",
+                    "source_file": "config.json",
+                    "container_sha256": weight_config["sha256"],
+                }
+            }
+            if weight_config is not None
+            else {}
+        ),
     }
 
 
@@ -3452,9 +3604,9 @@ def validate_c01_resolution_probe(
         runtime_architecture = require_string(runtime.get("architecture"), f"{label}.actual_config.model_capabilities.architecture")
         require(runtime_architecture in EXPECTED_ARCHITECTURES[model_key], f"{label} runtime architecture did not preserve the resolved model family")
         require("llama" not in runtime_architecture.lower(), f"{label} runtime silently fell back to Llama")
-        runtime_binding = require_object(probe.get("runtime_binding"), f"{label}.resolution_probe.runtime_binding")
-        actual_binding = require_object(actual_config.get("resolution_evidence"), f"{label}.actual_config.resolution_evidence")
-        require(actual_binding == runtime_binding, f"{label} runtime did not expose the selected config/template source identities")
+        expected_identity = require_object(probe.get("expected_source_identity"), f"{label}.resolution_probe.expected_source_identity")
+        actual_identity = require_object(actual_config.get("resolution_evidence"), f"{label}.actual_config.resolution_evidence")
+        require(actual_identity == expected_identity, f"{label} runtime product source identity differs from the locked role-specific sources")
 
 
 def validate_c01_negative_probe(
@@ -4655,6 +4807,8 @@ def run_product_argv(
     binary_path: Path,
     model_arg: str,
     backend: str,
+    semantic_root: Path,
+    tokenizer_root: Path,
     actual_config: Path,
     run_extra_args: list[str],
     resident: bool,
@@ -4668,6 +4822,10 @@ def run_product_argv(
         backend,
         "--output-format",
         "jsonl",
+        "--semantic-source",
+        str(semantic_root),
+        "--tokenizer-source",
+        str(tokenizer_root),
     ]
     if not resident and len(prompts) == 1:
         argv.extend(["--prompt", prompts[0]])
@@ -5018,6 +5176,10 @@ def execute_c01_unknown_fixture(
         str(binary_path),
         "run",
         str(invocation_model),
+        "--semantic-source",
+        str(fixture_root),
+        "--tokenizer-source",
+        str(fixture_root),
         "--backend",
         backend,
         "--output-format",
@@ -5131,6 +5293,8 @@ def run_case_command(
         binary_path=binary_path,
         model_arg=model_arg,
         backend=backend,
+        semantic_root=semantic_root,
+        tokenizer_root=tokenizer_root,
         actual_config=actual_config,
         run_extra_args=run_extra_args,
         resident=False,
@@ -5722,6 +5886,7 @@ def locked_execution_sources(models_lock: dict[str, Any], model_key: str, backen
     matching = [require_object(row, "models.lock model") for row in models if isinstance(row, dict) and row.get("key") == model_key]
     require(len(matching) == 1, f"models.lock must contain exactly one {model_key} entry")
     lane = require_object(require_object(matching[0].get("lanes"), f"models.lock.{model_key}.lanes").get(backend), f"models.lock.{model_key}.{backend}")
+    weight_repo = require_string(lane.get("repo"), f"models.lock.{model_key}.{backend}.repo")
     weight_revision = require_git_sha(lane.get("revision"), f"models.lock.{model_key}.{backend}.revision")
     weight_files = normalized_source_files(lane.get("files"), f"models.lock.{model_key}.{backend}.files")
     semantic = require_object(lane.get("semantic_source"), f"models.lock.{model_key}.{backend}.semantic_source")
@@ -5758,6 +5923,7 @@ def locked_execution_sources(models_lock: dict[str, Any], model_key: str, backen
     require(selected["files"].get(chat_normalized["path"]) == chat_normalized["container_sha256"], "models.lock chat template container is not bound to selected source")
     return {
         "weight_format": require_string(lane.get("format"), f"models.lock.{model_key}.{backend}.format"),
+        "weight_repo": weight_repo,
         "weight_revision": weight_revision,
         "weight_files": weight_files,
         "semantic_source": semantic_normalized,
@@ -6018,6 +6184,8 @@ def execute_manifest(
             binary_path=binary_path,
             model_arg=execution["model_arg"],
             backend=manifest["backend"],
+            semantic_root=validated["semantic_root"],
+            tokenizer_root=validated["tokenizer_root"],
             actual_config=actual_config,
             run_extra_args=execution["run_extra_args"],
             resident=True,
@@ -6077,6 +6245,10 @@ def execute_manifest(
             str(serve_config),
             "--scheduler-trace-jsonl",
             str(scheduler_trace),
+            "--semantic-source",
+            str(validated["semantic_root"]),
+            "--tokenizer-source",
+            str(validated["tokenizer_root"]),
             *execution["serve_extra_args"],
         ]
         return {
@@ -6308,9 +6480,21 @@ def execute_manifest(
                 require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
             )
             expectation = row["expectation"]
+            expectation_error: str | None = None
             if not discover:
-                require(status == expectation["expected_status"], f"case {row['case_id']} unexpected status: expected {expectation['expected_status']}, observed {status}")
-                require(failure_class == expectation["failure_class"], f"case {row['case_id']} failure class drift: expected {expectation['failure_class']}, observed {failure_class}")
+                expectation_failures: list[str] = []
+                if status != expectation["expected_status"]:
+                    expectation_failures.append(
+                        f"unexpected status: expected {expectation['expected_status']}, observed {status}"
+                    )
+                if failure_class != expectation["failure_class"]:
+                    expectation_failures.append(
+                        f"failure class drift: expected {expectation['failure_class']}, observed {failure_class}"
+                    )
+                if expectation_failures:
+                    if checker_error:
+                        expectation_failures.append(f"checker: {checker_error}")
+                    expectation_error = f"case {row['case_id']} " + "; ".join(expectation_failures)
             command_spec_path = case_root / "command-spec.json"
             write_json(
                 command_spec_path,
@@ -6329,7 +6513,7 @@ def execute_manifest(
             )
             checker_path = case_root / "checker.log"
             checker_path.write_text(
-                f"case={row['case_id']} observed_status={status} failure_class={failure_class or 'none'} checker_error={checker_error or 'none'}\n",
+                f"case={row['case_id']} observed_status={status} failure_class={failure_class or 'none'} checker_error={checker_error or 'none'} expectation_error={expectation_error or 'none'}\n",
                 encoding="utf-8",
             )
             envelope_path = case_root / "execution-envelope.json"
@@ -6400,7 +6584,12 @@ def execute_manifest(
                     **({"http_transcript": existing_artifact_ref(root, transcript_path, "http-transcript")} if transcript_path else {}),
                 },
                 "observed": observed,
-                "checks": {"execution_envelope": True, "model_binding": True, "scenario_oracle": status == "pass"},
+                "checks": {
+                    "execution_envelope": True,
+                    "model_binding": True,
+                    "scenario_oracle": status == "pass",
+                    "expectation_match": expectation_error is None,
+                },
             }
             if status != "pass":
                 case_document["checks"]["scenario_oracle"] = False
@@ -6409,6 +6598,8 @@ def execute_manifest(
             ref = existing_artifact_ref(root, case_path, "raw-json")
             case_refs_by_scenario[row["scenario_id"]].append(ref)
             case_results[row["scenario_id"]].append(case_document)
+            if expectation_error is not None:
+                raise ScenarioError(expectation_error)
     finally:
         if active_run_session is not None:
             active_run_session.stop()
@@ -6874,16 +7065,15 @@ def make_case_fixture(
                     "tokens": {"bos_token": "<s>", "eos_token": "</s>"},
                     "eos_token_ids": [1],
                 },
-                "runtime_binding": {
-                    "semantic_repo": "internal/fixture",
-                    "semantic_revision": "1" * 40,
-                    "config_container_sha256": config_digest,
-                    "template_source": "semantic_source",
-                    "template_repo": "internal/fixture",
-                    "template_revision": "1" * 40,
-                    "template_path": "tokenizer_config.json",
-                    "template_container_sha256": template_digest,
-                    "template_content_sha256": template_digest,
+                "expected_source_identity": {
+                    "schema_version": 1,
+                    "requested_model": base["model_path"],
+                    "resolved_model": base["model_key"],
+                    "original_sources": {},
+                    "resolved_sources": {},
+                    "semantic_config": {},
+                    "tokenizer": {},
+                    "template": {},
                 },
                 "expected_runtime_architectures": sorted(EXPECTED_ARCHITECTURES[base["model_key"]]),
             }
@@ -6989,7 +7179,17 @@ def make_case_fixture(
     if entrypoint == "run":
         assistant_count = 3 if scenario_id == "C03" else 2 if scenario_id == "C19" else 1
         session_id = f"fixture-session-{case_id}"
-        rows: list[dict[str, Any]] = [{"event": "ready", "session_id": session_id, "history_epoch": 0, "model": base["model_key"], "backend": base["backend"]}]
+        rows: list[dict[str, Any]] = [
+            {
+                "event": "ready",
+                "session_id": session_id,
+                "history_epoch": 0,
+                "model": base["model_key"],
+                "requested_model": base["model_path"],
+                "resolved_model": base["model_key"],
+                "backend": base["backend"],
+            }
+        ]
         turn_indices = range(assistant_count)
         history: list[list[str]] = []
         for turn in turn_indices:
@@ -7581,14 +7781,24 @@ def value_after(argv, name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
 
 
+def product_identity(argv):
+    model_path = Path(argv[1])
+    identity_path = (model_path if model_path.is_dir() else model_path.parent) / "g00-resolution-identity.json"
+    if identity_path.is_file():
+        return json.loads(identity_path.read_text())
+    return {
+        "requested_model": argv[1],
+        "resolved_model": argv[1],
+    }
+
+
 def write_config(argv, entrypoint):
     raw = value_after(argv, "--effective-config-json")
     if raw:
         path = Path(raw)
         path.parent.mkdir(parents=True, exist_ok=True)
         backend = value_after(argv, "--backend", "auto")
-        identity_path = Path(argv[1]) / "g00-resolution-identity.json"
-        resolution_evidence = json.loads(identity_path.read_text()) if identity_path.is_file() else None
+        resolution_evidence = product_identity(argv)
         path.write_text(json.dumps({
             "schema_version": 1,
             "entrypoint": entrypoint,
@@ -7678,10 +7888,12 @@ def resident_run_mode(argv):
     turn = 0
     request_index = 0
     remembered_marker = None
+    identity = product_identity(argv)
     print(json.dumps({
         "schema_version": 1, "event": "ready", "session_id": session_id,
-        "history_epoch": 0, "model": argv[1], "requested_model": argv[1],
-        "resolved_model": argv[1], "backend": value_after(argv, "--backend", "auto"),
+        "history_epoch": 0, "model": identity["resolved_model"],
+        "requested_model": identity["requested_model"],
+        "resolved_model": identity["resolved_model"], "backend": value_after(argv, "--backend", "auto"),
     }), flush=True)
     for raw in sys.stdin:
         prompt = raw.rstrip("\r\n")
@@ -7740,7 +7952,8 @@ def run_mode(argv):
         "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
     ] if scenario == "C03" else [f"Return the exact marker {marker}-H{turn + 1}." for turn in range(turns)] if scenario == "C19" else ["fixture input"]
     session_id = f"fixture-session-{os.getpid()}"
-    print(json.dumps({"schema_version": 1, "event": "ready", "session_id": session_id, "history_epoch": 0, "model": argv[1], "requested_model": argv[1], "resolved_model": argv[1], "backend": value_after(argv, "--backend", "auto")}))
+    identity = product_identity(argv)
+    print(json.dumps({"schema_version": 1, "event": "ready", "session_id": session_id, "history_epoch": 0, "model": identity["resolved_model"], "requested_model": identity["requested_model"], "resolved_model": identity["resolved_model"], "backend": value_after(argv, "--backend", "auto")}))
     history = []
     remembered_marker = None
     for turn, prompt in enumerate(prompts):
@@ -7999,19 +8212,85 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
     weight_sha = file_sha256(weight_path)
     semantic_repo = "internal/fixture-semantic"
     semantic_revision = "3" * 40
+    weight_repo = "internal/fixture-weights"
+    weight_revision = "1" * 40
     template_text = read_json(tokenizer_path)["chat_template"]
-    runtime_binding = {
-        "semantic_repo": semantic_repo,
-        "semantic_revision": semantic_revision,
-        "config_container_sha256": file_sha256(config_path),
-        "template_source": "semantic_source",
-        "template_repo": semantic_repo,
-        "template_revision": semantic_revision,
-        "template_path": "tokenizer_config.json",
-        "template_container_sha256": file_sha256(tokenizer_path),
-        "template_content_sha256": hashlib.sha256(template_text.encode("utf-8")).hexdigest(),
+    template_content_sha256 = hashlib.sha256(template_text.encode("utf-8")).hexdigest()
+    runtime_identity = {
+        "schema_version": 1,
+        "requested_model": str(model_dir),
+        "resolved_model": weight_repo,
+        "original_sources": {
+            "semantic": {
+                "kind": "local_directory",
+                "location": str(model_dir.resolve()),
+                "requested_revision": None,
+            },
+            "tokenizer": {
+                "kind": "local_directory",
+                "location": str(model_dir.resolve()),
+                "requested_revision": None,
+            },
+            "weights": {
+                "kind": "local_directory",
+                "location": str(model_dir),
+                "requested_revision": None,
+            },
+        },
+        "resolved_sources": {
+            "semantic": {
+                "canonical_location": semantic_repo,
+                "resolved_revision": semantic_revision,
+                "files": [
+                    {
+                        "relative_path": "config.json",
+                        "size_bytes": config_path.stat().st_size,
+                        "sha256": file_sha256(config_path),
+                    }
+                ],
+            },
+            "tokenizer": {
+                "canonical_location": semantic_repo,
+                "resolved_revision": semantic_revision,
+                "files": [
+                    {
+                        "relative_path": path.name,
+                        "size_bytes": path.stat().st_size,
+                        "sha256": file_sha256(path),
+                    }
+                    for path in (tokenizer_json_path, tokenizer_path)
+                ],
+            },
+            "weights": {
+                "canonical_location": weight_repo,
+                "resolved_revision": weight_revision,
+                "files": [
+                    {
+                        "relative_path": weight_path.name,
+                        "size_bytes": weight_path.stat().st_size,
+                        "sha256": weight_sha,
+                    }
+                ],
+            },
+        },
+        "semantic_config": {
+            "role": "semantic",
+            "source_file": "config.json",
+            "container_sha256": file_sha256(config_path),
+        },
+        "tokenizer": {
+            "role": "tokenizer",
+            "source_file": "tokenizer.json",
+            "container_sha256": file_sha256(tokenizer_json_path),
+        },
+        "template": {
+            "role": "tokenizer",
+            "source_file": "tokenizer_config.json",
+            "container_sha256": file_sha256(tokenizer_path),
+            "content_sha256": template_content_sha256,
+        },
     }
-    write_json(model_dir / "g00-resolution-identity.json", runtime_binding)
+    write_json(model_dir / "g00-resolution-identity.json", runtime_identity)
     write_json(
         models_lock,
         {
@@ -8021,7 +8300,8 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
                     "key": "m3-qwen3-30b-a3b",
                     "lanes": {
                         "cuda": {
-                            "revision": "1" * 40,
+                            "repo": weight_repo,
+                            "revision": weight_revision,
                             "format": "gptq_int4",
                             "files": [{"path": "weights.gguf", "sha256": weight_sha}],
                             "semantic_source": {
@@ -8040,7 +8320,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
                                 "path": "tokenizer_config.json",
                                 "json_pointer": "/chat_template",
                                 "container_sha256": file_sha256(tokenizer_path),
-                                "content_sha256": runtime_binding["template_content_sha256"],
+                                "content_sha256": template_content_sha256,
                             },
                         }
                     },
@@ -8722,6 +9002,36 @@ def self_test() -> int:
         else:
             raise AssertionError("execution manifest accepted mutated model bytes")
         fixture_weight.write_bytes(fixture_weight_bytes)
+
+        failure_root = Path(tmp) / "unexpected-status-artifacts"
+        failure_root.mkdir()
+        failure_manifest = make_execution_fixture_manifest(failure_root)
+        failure_identity_path = Path(failure_manifest["execution"]["model_arg"]) / "g00-resolution-identity.json"
+        failure_identity = read_json(failure_identity_path)
+        failure_identity["resolved_model"] = "internal/unexpected-model"
+        write_json(failure_identity_path, failure_identity)
+        try:
+            execute_manifest(
+                failure_manifest,
+                failure_root,
+                failure_root / "unexpected-status-report.json",
+                discover=False,
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require("unexpected status" in str(exc), f"unexpected-status fixture failed for the wrong reason: {exc}")
+        else:
+            raise AssertionError("unexpected-status fixture incorrectly completed")
+        failed_case_root = failure_root / "correctness/m3-qwen3-30b-a3b/cuda/scenarios/C01/cases/c01-001"
+        for artifact_name in ("command-spec.json", "checker.log", "execution-envelope.json", "case.json"):
+            require((failed_case_root / artifact_name).is_file(), f"unexpected-status fixture lost {artifact_name}")
+        failed_case = read_json(failed_case_root / "case.json")
+        require(
+            failed_case["status"] == "known-fail"
+            and failed_case["checks"].get("expectation_match") is False,
+            "unexpected-status fixture did not preserve its observed failure",
+        )
+
         candidate_catalog = validate_expectations_catalog(
             candidate_expectations_catalog(FROZEN_LEGACY_SHA),
             expected_contract=G08_EXECUTION_CONTRACT,

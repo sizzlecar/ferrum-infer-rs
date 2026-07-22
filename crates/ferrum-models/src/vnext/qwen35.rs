@@ -1828,8 +1828,7 @@ fn load_safetensors_family_config(
     sources: &ProductionModelSourceBundle,
     archive: &SafetensorsArchive,
 ) -> Result<Qwen35FamilyConfig, String> {
-    let hf_config: Value = serde_json::from_slice(sources.config_json())
-        .map_err(|error| format!("parse semantic config.json: {error}"))?;
+    let hf_config = compose_safetensors_hf_config(sources)?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
     if let Some(quantization) = &text.quantization {
         validate_gptq_marlin_config(quantization).map_err(|error| error.to_string())?;
@@ -1884,6 +1883,49 @@ fn load_safetensors_family_config(
         },
         weights,
     })
+}
+
+fn compose_safetensors_hf_config(sources: &ProductionModelSourceBundle) -> Result<Value, String> {
+    let mut semantic: Value = serde_json::from_slice(sources.config_json())
+        .map_err(|error| format!("parse semantic config.json: {error}"))?;
+    let semantic_root = semantic
+        .as_object_mut()
+        .ok_or_else(|| "semantic config.json root must be an object".to_owned())?;
+    let semantic_quantization = semantic_root
+        .get("text_config")
+        .and_then(Value::as_object)
+        .and_then(|text| text.get("quantization_config"))
+        .or_else(|| semantic_root.get("quantization_config"))
+        .filter(|value| !value.is_null())
+        .cloned();
+    let physical_quantization = sources
+        .weight_config_json()
+        .map(|bytes| {
+            serde_json::from_slice::<Value>(bytes)
+                .map_err(|error| format!("parse physical weight config.json: {error}"))
+        })
+        .transpose()?
+        .as_ref()
+        .and_then(|physical| {
+            physical
+                .get("text_config")
+                .and_then(Value::as_object)
+                .and_then(|text| text.get("quantization_config"))
+                .or_else(|| physical.get("quantization_config"))
+        })
+        .filter(|value| !value.is_null())
+        .cloned();
+
+    match (semantic_quantization, physical_quantization) {
+        (Some(semantic_value), Some(physical_value)) if semantic_value != physical_value => {
+            return Err("semantic and physical weight quantization_config values differ".to_owned())
+        }
+        (None, Some(physical_value)) => {
+            semantic_root.insert("quantization_config".to_owned(), physical_value);
+        }
+        (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
+    }
+    Ok(semantic)
 }
 
 fn load_gguf_family_config(
@@ -2883,11 +2925,107 @@ mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
         gated_delta_recurrent_attention_contract, routed_shared_swiglu_moe_contract,
-        ModelSourceKind, OperationContract, OriginalModelSource, OriginalModelSources,
-        PhysicalStorageLayout, PhysicalWeightComponentBinding, WeightComponentSource,
+        ModelArtifactSourceRole, ModelSourceKind, OperationContract, OriginalModelSource,
+        OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
+        WeightComponentSource,
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    fn source_bundle_with_weight_config(
+        semantic_config: &serde_json::Value,
+        weight_config: &serde_json::Value,
+    ) -> ProductionModelSourceBundle {
+        let root = tempfile::tempdir().unwrap().keep();
+        let semantic = root.join("semantic");
+        let tokenizer = root.join("tokenizer");
+        let weights = root.join("weights");
+        std::fs::create_dir_all(&semantic).unwrap();
+        std::fs::create_dir_all(&tokenizer).unwrap();
+        std::fs::create_dir_all(&weights).unwrap();
+        std::fs::write(
+            semantic.join("config.json"),
+            serde_json::to_vec(semantic_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(tokenizer.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(
+            tokenizer.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            weights.join("config.json"),
+            serde_json::to_vec(weight_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(weights.join("model.safetensors"), b"fixture-weights").unwrap();
+        let original = |location: &str| OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: location.to_owned(),
+            requested_revision: None,
+        };
+        ProductionModelSourceBundle::open(
+            &semantic,
+            &tokenizer,
+            ProductionWeightArtifact::safetensors_directory(&weights),
+            OriginalModelSources {
+                semantic: original("semantic"),
+                tokenizer: original("tokenizer"),
+                weights: original("weights"),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn safetensors_physical_quantization_metadata_is_separate_from_semantics() {
+        let semantic = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "text_config": {"model_type": "qwen3_5_moe_text"}
+        });
+        let quantization = serde_json::json!({
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "desc_act": false,
+            "sym": true
+        });
+        let bundle = source_bundle_with_weight_config(
+            &semantic,
+            &serde_json::json!({"quantization_config": quantization}),
+        );
+        let composed = compose_safetensors_hf_config(&bundle).unwrap();
+        assert_eq!(composed["quantization_config"], quantization);
+        assert!(semantic.get("quantization_config").is_none());
+        assert!(bundle
+            .fingerprint(ModelArtifactSourceRole::Weights, "config.json")
+            .is_some());
+    }
+
+    #[test]
+    fn conflicting_semantic_and_physical_quantization_metadata_fails_closed() {
+        let semantic = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "quantization_config": {
+                "quant_method": "gptq", "bits": 4, "group_size": 64,
+                "desc_act": false, "sym": true
+            },
+            "text_config": {"model_type": "qwen3_5_moe_text"}
+        });
+        let bundle = source_bundle_with_weight_config(
+            &semantic,
+            &serde_json::json!({
+                "quantization_config": {
+                    "quant_method": "gptq", "bits": 4, "group_size": 128,
+                    "desc_act": false, "sym": true
+                }
+            }),
+        );
+        assert!(compose_safetensors_hf_config(&bundle)
+            .unwrap_err()
+            .contains("values differ"));
+    }
 
     fn test_weight_dimensions(text: &Qwen35TextConfig, weight: &FamilyWeight) -> Vec<u64> {
         let hidden = text.hidden_size as u64;
