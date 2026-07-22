@@ -5284,6 +5284,7 @@ def run_case_command(
     locked_sources: dict[str, Any],
     semantic_root: Path,
     tokenizer_root: Path,
+    prepared_c01_resolution_probe: dict[str, Any] | None,
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
     marker = expected_case_text(case)
@@ -5307,12 +5308,12 @@ def run_case_command(
         else {"case_id": case_id, "stdin": stdin_text, "argv": argv}
     )
     if case["scenario_id"] == "C01":
-        input_document["resolution_probe"] = build_c01_resolution_probe(
-            model_arg,
-            case["model_key"],
-            sources=locked_sources,
-            semantic_root=semantic_root,
-            tokenizer_root=tokenizer_root,
+        require(
+            prepared_c01_resolution_probe is not None,
+            "C01 prepared resolution probe is missing",
+        )
+        input_document["resolution_probe"] = copy.deepcopy(
+            prepared_c01_resolution_probe
         )
     write_json(input_path, input_document)
     stdout_path = case_root / "stdout.log"
@@ -5429,6 +5430,7 @@ def run_case_resident(
     semantic_root: Path,
     tokenizer_root: Path,
     timeout_sec: float,
+    prepared_c01_resolution_probe: dict[str, Any] | None,
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
     marker = expected_case_text(case)
@@ -5445,12 +5447,12 @@ def run_case_resident(
         }
     )
     if case["scenario_id"] == "C01":
-        input_document["resolution_probe"] = build_c01_resolution_probe(
-            argv[2],
-            case["model_key"],
-            sources=locked_sources,
-            semantic_root=semantic_root,
-            tokenizer_root=tokenizer_root,
+        require(
+            prepared_c01_resolution_probe is not None,
+            "C01 prepared resolution probe is missing",
+        )
+        input_document["resolution_probe"] = copy.deepcopy(
+            prepared_c01_resolution_probe
         )
     write_json(input_path, input_document)
     started_at = iso_now()
@@ -6115,6 +6117,20 @@ def execute_manifest(
     unresolved = [row for row in rows if row["expectation"]["expected_status"] == "discovery-required"]
     if unresolved and not discover:
         raise ScenarioError(f"canonical collection refused: {len(unresolved)} cases remain discovery-required; run --discover first")
+    # The manifest has already bound and hashed every selected source file. C01
+    # cases carry independent copies of one immutable probe instead of rereading
+    # the complete weight snapshot for every case.
+    prepared_c01_resolution_probe = (
+        build_c01_resolution_probe(
+            validated["execution"]["model_arg"],
+            manifest["model_key"],
+            sources=validated["sources"],
+            semantic_root=validated["semantic_root"],
+            tokenizer_root=validated["tokenizer_root"],
+        )
+        if any(row["scenario_id"] == "C01" for row in rows)
+        else None
+    )
     invocation_started = iso_now()
     invocation_start_ns = time.monotonic_ns()
     input_manifest_path = executor_root / "scenario-execution-manifest.snapshot.json"
@@ -6342,6 +6358,7 @@ def execute_manifest(
                         semantic_root=validated["semantic_root"],
                         tokenizer_root=validated["tokenizer_root"],
                         timeout_sec=float(execution["case_timeout_sec"]),
+                        prepared_c01_resolution_probe=prepared_c01_resolution_probe,
                     )
                     execution_process_receipt = invocation_process_receipt
                     product_process_receipt = active_run_session.process_receipt
@@ -6370,6 +6387,7 @@ def execute_manifest(
                         locked_sources=validated["sources"],
                         semantic_root=validated["semantic_root"],
                         tokenizer_root=validated["tokenizer_root"],
+                        prepared_c01_resolution_probe=prepared_c01_resolution_probe,
                     )
                     execution_process_receipt = extra["process_receipt"]
                     product_process_receipt = extra["process_receipt"]
