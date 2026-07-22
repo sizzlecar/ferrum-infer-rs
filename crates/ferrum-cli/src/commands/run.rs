@@ -2746,6 +2746,33 @@ mod tests {
     }
 
     #[test]
+    fn run_thinking_options_preserve_model_default_and_explicit_overrides() {
+        let template = ModelChatTemplate::new(
+            "{% if enable_thinking is defined %}{{ enable_thinking }}{% endif %}",
+            "thinking-template",
+        );
+        let mut cmd = test_run_cmd();
+
+        assert_eq!(
+            build_chat_template_options(&cmd, Some(&template)).enable_thinking,
+            None
+        );
+
+        cmd.enable_thinking = true;
+        assert_eq!(
+            build_chat_template_options(&cmd, Some(&template)).enable_thinking,
+            Some(true)
+        );
+
+        cmd.enable_thinking = false;
+        cmd.disable_thinking = true;
+        assert_eq!(
+            build_chat_template_options(&cmd, Some(&template)).enable_thinking,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn run_metadata_forbids_initial_thinking_start_when_template_disables_thinking() {
         let metadata = run_request_metadata(
             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
