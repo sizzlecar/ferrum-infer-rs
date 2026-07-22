@@ -1,4 +1,4 @@
-// Shared tiled prefill GEMM for GGUF K-quant weights and F16 activations.
+// Shared tiled prefill GEMM for GGUF block-quantized weights and F16 activations.
 // The 64x32 output tile and simdgroup matrix layout follow llama.cpp's
 // kernel_mul_mm family; the ABI is Ferrum's backend-neutral LinearParams.
 
@@ -29,6 +29,11 @@ struct block_q6_K {
     uchar qh[QK_K / 4];
     int8_t scales[QK_K / 16];
     half d;
+};
+
+struct block_q8_0 {
+    half d;
+    char qs[32];
 };
 
 struct KQuantGemmParams {
@@ -116,15 +121,30 @@ static inline void dequantize_q6_K(
     }
 }
 
+template <typename type4x4>
+static inline void dequantize_q8_0(
+    device const block_q8_0 * xb,
+    short il,
+    thread type4x4 & reg
+) {
+    device const char * q = xb->qs + 16 * il;
+    const float d = float(xb->d);
+    FOR_UNROLL (int i = 0; i < 16; ++i) {
+        reg[i / 4][i % 4] = d * float(q[i]);
+    }
+}
+
 constant short TILE_OUTPUT_ROWS = 64;
 constant short TILE_INPUT_ROWS = 32;
 constant short TILE_K = 32;
 constant short WEIGHT_LOADERS_PER_ROW = 2;
 constant short INPUT_LOADERS_PER_ROW = 4;
-constant short DEQUANT_TILES_PER_BLOCK = 16;
-
-template <typename block_q, void (*dequantize)(device const block_q *, short, thread half4x4 &)>
-static inline void gemm_f16a_kquant_tiled(
+template <
+    typename block_q,
+    short dequant_tiles_per_block,
+    void (*dequantize)(device const block_q *, short, thread half4x4 &)
+>
+static inline void gemm_f16a_quant_tiled(
     device const half * input,
     device const block_q * weight,
     device half * output,
@@ -156,10 +176,10 @@ static inline void gemm_f16a_kquant_tiled(
     const short dequant_tile0 = short(thread_index) % WEIGHT_LOADERS_PER_ROW;
     short dequant_tile = dequant_tile0;
 
-    const int blocks_per_row = int(p.in_features / QK_K);
+    const int blocks_per_row = int(p.in_features / (16 * dequant_tiles_per_block));
     device const block_q * x = weight
         + (output_start + weight_row) * blocks_per_row
-        + dequant_tile0 / DEQUANT_TILES_PER_BLOCK;
+        + dequant_tile0 / dequant_tiles_per_block;
     const short input_column = 8 * (short(thread_index) % INPUT_LOADERS_PER_ROW);
     device const half * y = input
         + ulong(input_start + input_row) * p.in_features + input_column;
@@ -196,7 +216,7 @@ static inline void gemm_f16a_kquant_tiled(
         *(threadgroup half2x4 *)(input_tile + 64 * input_block + 8 * input_local_y) =
             input_values;
 
-        dequant_tile = dequant_tile + 2 < DEQUANT_TILES_PER_BLOCK
+        dequant_tile = dequant_tile + 2 < dequant_tiles_per_block
             ? dequant_tile + 2
             : dequant_tile % 2;
         if (dequant_tile < 2) {
@@ -265,7 +285,7 @@ kernel void gemm_f16a_q4kw_tiled(
     uint3 position [[threadgroup_position_in_grid]],
     ushort thread_index [[thread_index_in_threadgroup]],
     ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
-    gemm_f16a_kquant_tiled<block_q4_K, dequantize_q4_K>(
+    gemm_f16a_quant_tiled<block_q4_K, 16, dequantize_q4_K>(
         input, weight, output, p, shmem, position, thread_index, simdgroup_index
     );
 }
@@ -279,7 +299,7 @@ kernel void gemm_f16a_q5kw_tiled(
     uint3 position [[threadgroup_position_in_grid]],
     ushort thread_index [[thread_index_in_threadgroup]],
     ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
-    gemm_f16a_kquant_tiled<block_q5_K, dequantize_q5_K>(
+    gemm_f16a_quant_tiled<block_q5_K, 16, dequantize_q5_K>(
         input, weight, output, p, shmem, position, thread_index, simdgroup_index
     );
 }
@@ -293,7 +313,21 @@ kernel void gemm_f16a_q6kw_tiled(
     uint3 position [[threadgroup_position_in_grid]],
     ushort thread_index [[thread_index_in_threadgroup]],
     ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
-    gemm_f16a_kquant_tiled<block_q6_K, dequantize_q6_K>(
+    gemm_f16a_quant_tiled<block_q6_K, 16, dequantize_q6_K>(
+        input, weight, output, p, shmem, position, thread_index, simdgroup_index
+    );
+}
+
+kernel void gemm_f16a_q8_0w_tiled(
+    device const half * input [[buffer(0)]],
+    device const block_q8_0 * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant KQuantGemmParams & p [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 position [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    gemm_f16a_quant_tiled<block_q8_0, 2, dequantize_q8_0>(
         input, weight, output, p, shmem, position, thread_index, simdgroup_index
     );
 }
