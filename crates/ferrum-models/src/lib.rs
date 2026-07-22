@@ -49,8 +49,6 @@ pub mod weight_format;
 
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
-#[cfg(any(test, feature = "test-support"))]
-pub use executor::Qwen35W3Executor;
 pub use executor::{
     BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
     VNextExecutorConfig, VNextModelExecutor, WhisperModelExecutor,

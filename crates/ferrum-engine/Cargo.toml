@@ -88,8 +88,6 @@ harness = false
 
 [features]
 default = []
-# Test-only legacy adapter retained for Qwen3.5 MoE reference fixtures; sunset=G08B.
-legacy-qwen35-reference-test = ["ferrum-models/test-support"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "ferrum-models/accelerate"]
 cuda = [
     "candle-core/cuda",

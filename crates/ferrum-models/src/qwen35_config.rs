@@ -134,32 +134,6 @@ pub struct Qwen35TextConfig {
 }
 
 impl Qwen35TextConfig {
-    pub fn from_model_definition(def: &crate::definition::ModelDefinition) -> Result<Self, String> {
-        if !matches!(
-            def.architecture,
-            crate::registry::Architecture::Qwen35 | crate::registry::Architecture::Qwen35Moe
-        ) {
-            return Err(format!(
-                "model definition architecture {:?} is not Qwen3.5/Qwen3.6",
-                def.architecture
-            ));
-        }
-        let parsed = Self::from_hf_config_value(&def.extra_params)?;
-        if parsed.hidden_size != def.hidden_size {
-            return Err(format!(
-                "Qwen3.5 text hidden_size {} does not match ModelDefinition hidden_size {}",
-                parsed.hidden_size, def.hidden_size
-            ));
-        }
-        if parsed.num_hidden_layers != def.num_hidden_layers {
-            return Err(format!(
-                "Qwen3.5 text num_hidden_layers {} does not match ModelDefinition num_hidden_layers {}",
-                parsed.num_hidden_layers, def.num_hidden_layers
-            ));
-        }
-        Ok(parsed)
-    }
-
     pub fn from_hf_config_str(raw: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(raw).map_err(|err| err.to_string())?;
         Self::from_hf_config_value(&value)

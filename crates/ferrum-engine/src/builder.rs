@@ -378,7 +378,7 @@ impl EngineBuilder {
                         .await?
                 };
                 let recurrent_state_manager = custom_recurrent_state_manager
-                    .or_else(|| default_recurrent_state_manager(&config, &component_config));
+                    .or_else(|| default_recurrent_state_manager(&config));
                 (Some(kv_cache), recurrent_state_manager)
             }
         };
@@ -491,28 +491,11 @@ impl EngineBuilder {
 
 fn default_recurrent_state_manager(
     config: &EngineConfig,
-    _component_config: &ComponentConfig,
 ) -> Option<Arc<dyn RecurrentStateManager + Send + Sync>> {
     let total_batch_slots = config
         .runtime
         .recurrent_state_max_slots
         .unwrap_or(usize::MAX);
-    #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
-    if _component_config
-        .get_option::<bool>("qwen35_reference")
-        .unwrap_or(false)
-    {
-        return Some(
-            Arc::new(ferrum_models::models::Qwen35RecurrentStateManager::<
-                ferrum_kernels::backend::cpu::CpuBackend,
-            >::new(
-                ferrum_models::models::Qwen35RecurrentStateManagerConfig {
-                    total_memory_bytes: usize::MAX,
-                    total_batch_slots,
-                },
-            )) as Arc<dyn RecurrentStateManager + Send + Sync>,
-        );
-    }
     Some(
         Arc::new(crate::recurrent_state::InMemoryRecurrentStateManager::new(
             crate::recurrent_state::InMemoryRecurrentStateConfig {
@@ -883,49 +866,11 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_qwen35_reference_uses_typed_recurrent_state_manager() {
-        let mut config = EngineConfig::default();
-        config.backend.device = Device::CPU;
-        config.runtime.recurrent_state_max_slots = Some(4);
-        config.backend.backend_options.insert(
-            "qwen35_reference".to_string(),
-            serde_json::Value::Bool(true),
-        );
-        let component_config = ComponentConfig::from_engine_config(&config);
-        let manager = default_recurrent_state_manager(&config, &component_config)
-            .expect("qwen35 reference CPU path should install a recurrent-state manager");
-        let spec = RecurrentStateSpec {
-            request_id: RequestId::new(),
-            num_layers: 2,
-            tensors: vec![RecurrentStateTensorSpec::new(
-                0,
-                "delta_state",
-                vec![1, 1, 1],
-                DataType::FP32,
-            )],
-            device: Device::CPU,
-            max_batch_slots: 1,
-        };
-
-        let handle = tokio_test::block_on(manager.allocate(&spec)).unwrap();
-
-        assert!(
-            handle
-                .as_any()
-                .is::<ferrum_models::models::Qwen35RecurrentStateHandle<
-                    ferrum_kernels::backend::cpu::CpuBackend,
-                >>(),
-            "qwen35 reference should allocate typed Qwen35 recurrent-state handles"
-        );
-    }
-
-    #[test]
     fn test_builder_cuda_recurrent_state_manager_uses_recurrent_state_slot_cap() {
         let mut config = EngineConfig::default();
         config.backend.device = Device::CUDA(0);
         config.runtime.recurrent_state_max_slots = Some(2);
-        let component_config = ComponentConfig::from_engine_config(&config);
-        let manager = default_recurrent_state_manager(&config, &component_config)
+        let manager = default_recurrent_state_manager(&config)
             .expect("cuda product path should install admission recurrent-state manager");
         let spec = |request_id| RecurrentStateSpec {
             request_id,

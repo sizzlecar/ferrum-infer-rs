@@ -22,15 +22,9 @@ pub enum Architecture {
     Llama,
     Qwen2,
     Qwen3,
-    /// Qwen3.5 dense text family. This is a W3 Gated-DeltaNet architecture,
-    /// not the dense Qwen3 attention-only decoder.
-    Qwen35,
     /// Qwen3-MoE family (Qwen3-30B-A3B and friends). Distinct from Qwen3
     /// because the FFN per layer is replaced by a router + N experts.
     Qwen3Moe,
-    /// Qwen3.5/Qwen3.6 MoE text family. It combines Gated-DeltaNet/full
-    /// attention layers with routed experts and a shared expert.
-    Qwen35Moe,
     /// Gemma 3 text family (1B–27B): LlamaFamilyModel with 5:1
     /// local/global attention scheduling, dual RoPE tables, GeGLU,
     /// sandwich norms and Gemma RMSNorm conventions. The vision tower of
@@ -52,11 +46,7 @@ impl Architecture {
             "llama" | "llamaforcausallm" => Architecture::Llama,
             "qwen2" | "qwen2forcausallm" => Architecture::Qwen2,
             "qwen3" | "qwen3forcausallm" => Architecture::Qwen3,
-            "qwen3_5" | "qwen3_5_text" | "qwen3_5forconditionalgeneration" => Architecture::Qwen35,
             "qwen3_moe" | "qwen3moe" | "qwen3moeforcausallm" => Architecture::Qwen3Moe,
-            "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_5moeforconditionalgeneration" => {
-                Architecture::Qwen35Moe
-            }
             "gemma3" | "gemma3_text" | "gemma3forcausallm" | "gemma3forconditionalgeneration" => {
                 Architecture::Gemma3
             }
@@ -344,19 +334,6 @@ mod tests {
             Architecture::Llama
         );
         assert_eq!(Architecture::from_str("qwen2"), Architecture::Qwen2);
-        assert_eq!(Architecture::from_str("qwen3_5"), Architecture::Qwen35);
-        assert_eq!(
-            Architecture::from_str("Qwen3_5ForConditionalGeneration"),
-            Architecture::Qwen35
-        );
-        assert_eq!(
-            Architecture::from_str("qwen3_5_moe"),
-            Architecture::Qwen35Moe
-        );
-        assert_eq!(
-            Architecture::from_str("Qwen3_5MoeForConditionalGeneration"),
-            Architecture::Qwen35Moe
-        );
         assert_eq!(Architecture::from_str("mistral"), Architecture::Mistral);
         assert_eq!(Architecture::from_str("phi"), Architecture::Phi);
         assert_eq!(Architecture::from_str("gpt2"), Architecture::GPT2);

@@ -1386,7 +1386,6 @@ dependencies = [
  "reqwest",
  "rexpect",
  "rstest",
- "safetensors 0.4.5",
  "serde",
  "serde_json",
  "serde_yaml",
