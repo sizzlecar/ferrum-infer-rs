@@ -537,6 +537,16 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.95")]
     pub top_p: f32,
 
+    /// Minimum probability cutoff relative to the most likely token.
+    /// A value of 0 disables min-p filtering.
+    #[arg(long, default_value = "0.0")]
+    pub min_p: f32,
+
+    /// Presence penalty applied to tokens that already occurred in the
+    /// request. Qwen3.5 recommends 1.5 for general thinking workloads.
+    #[arg(long, default_value = "0.0")]
+    pub presence_penalty: f32,
+
     /// Repetition penalty applied to logits before sampling. >1 discourages
     /// repeats, <1 encourages, 1.0 disables. Defaults to 1.1 (OpenAI/llama.cpp
     /// standard) because the chat default is greedy (temperature 0): greedy
@@ -1788,6 +1798,8 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
         } else {
             Some(cmd.top_k)
         },
+        min_p: (cmd.min_p != 0.0).then_some(cmd.min_p),
+        presence_penalty: cmd.presence_penalty,
         repetition_penalty: cmd.repeat_penalty,
         stop_sequences,
         seed: cmd.seed,
@@ -2342,6 +2354,8 @@ mod tests {
             bench_mode: false,
             top_k: 50,
             top_p: 0.95,
+            min_p: 0.0,
+            presence_penalty: 0.0,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
             seed: None,
@@ -2894,6 +2908,37 @@ mod tests {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
         assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+    }
+
+    #[test]
+    fn run_propagates_min_p_and_presence_penalty() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+
+        let parsed = TestCli::parse_from([
+            "ferrum",
+            "qwen3.5",
+            "--temperature",
+            "1.0",
+            "--min-p",
+            "0.05",
+            "--presence-penalty",
+            "1.5",
+        ]);
+        let params = build_sampling_params(&parsed.run);
+        assert_eq!(params.min_p, Some(0.05));
+        assert_eq!(params.presence_penalty, 1.5);
+        params
+            .validate()
+            .expect("official sampling controls must validate");
+
+        let disabled = TestCli::parse_from(["ferrum", "qwen3.5", "--min-p", "0.0"]);
+        assert_eq!(build_sampling_params(&disabled.run).min_p, None);
     }
 
     #[test]
