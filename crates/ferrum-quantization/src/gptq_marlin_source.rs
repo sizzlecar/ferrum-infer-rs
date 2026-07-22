@@ -11,7 +11,9 @@ use ferrum_interfaces::vnext::{
     ElementType, QuantizationSpec, VNextError, WeightComponentPayload, WeightComponentRole,
     WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };
-use ferrum_kernels::marlin_repack::{repack_gptq_to_marlin, repack_scales_to_marlin};
+#[cfg(test)]
+use ferrum_kernels::marlin_repack::repack_gptq_to_marlin;
+use ferrum_kernels::marlin_repack::{repack_gptq_to_marlin_bytes_into, repack_scales_to_marlin};
 use ferrum_types::Result;
 use half::f16;
 use safetensors::Dtype;
@@ -109,8 +111,18 @@ impl GptqMarlinSafetensorsSource {
                 projections.push(decode_i32(qweight.bytes(), component, "qweight")?);
             }
             let fused = concatenate_equal_width_rows(&projections, k / 8, n);
-            let repacked = repack_gptq_to_marlin(&fused, k, fused_n);
-            bytes.extend_from_slice(encode_i32(repacked).as_ref());
+            let start = bytes.len();
+            let byte_length = fused
+                .len()
+                .checked_mul(std::mem::size_of::<i32>())
+                .ok_or_else(|| {
+                    invalid_component(component, "repacked qweight byte length overflows")
+                })?;
+            let end = start.checked_add(byte_length).ok_or_else(|| {
+                invalid_component(component, "aggregate qweight byte length overflows")
+            })?;
+            bytes.resize(end, 0);
+            repack_gptq_to_marlin_bytes_into(&fused, k, fused_n, &mut bytes[start..end]);
         }
         debug_assert_eq!(groups.len(), expert_count * projections_per_expert);
         WeightComponentPayload::from_ordered_sources(
@@ -548,15 +560,6 @@ fn decode_i32(
         .collect())
 }
 
-fn encode_i32(values: Vec<i32>) -> Cow<'static, [u8]> {
-    Cow::Owned(
-        values
-            .into_iter()
-            .flat_map(i32::to_le_bytes)
-            .collect::<Vec<_>>(),
-    )
-}
-
 fn decode_f16(
     bytes: &[u8],
     component: &WeightComponentSpec,
@@ -830,7 +833,10 @@ mod tests {
             required: true,
         };
         let raw_fused = concatenate_equal_width_rows(&fixture.qweights, fixture.k / 8, fixture.n);
-        let expected = encode_i32(repack_gptq_to_marlin(&raw_fused, fixture.k, fixture.n * 2));
+        let expected = repack_gptq_to_marlin(&raw_fused, fixture.k, fixture.n * 2)
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
         let independently_repacked = fixture
             .qweights
             .iter()
@@ -840,9 +846,9 @@ mod tests {
                     .flat_map(i32::to_le_bytes)
             })
             .collect::<Vec<_>>();
-        assert_ne!(expected.as_ref(), independently_repacked);
+        assert_ne!(expected, independently_repacked);
         let payload = source.component(&packed).unwrap();
-        assert_eq!(payload.bytes(), expected.as_ref());
+        assert_eq!(payload.bytes(), expected);
         assert_eq!(payload.external_names(), packed.external_names);
 
         let scales = WeightComponentSpec {
