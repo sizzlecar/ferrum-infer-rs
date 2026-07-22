@@ -1119,6 +1119,131 @@ impl DeviceExecutionTiming {
     }
 }
 
+/// One backend-counter interval relative to the first sampled command in an
+/// exact submission. Intervals remain in a device elapsed-time domain; they
+/// must not be subtracted from host timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecutionIntervalKind {
+    Compute,
+    Transfer,
+}
+
+impl DeviceExecutionIntervalKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compute => "compute",
+            Self::Transfer => "transfer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceExecutionInterval {
+    kind: DeviceExecutionIntervalKind,
+    start_offset_ns: u64,
+    end_offset_ns: u64,
+}
+
+impl DeviceExecutionInterval {
+    pub fn new(
+        kind: DeviceExecutionIntervalKind,
+        start_offset_ns: u64,
+        end_offset_ns: u64,
+    ) -> Option<Self> {
+        (end_offset_ns > start_offset_ns).then_some(Self {
+            kind,
+            start_offset_ns,
+            end_offset_ns,
+        })
+    }
+
+    pub const fn kind(self) -> DeviceExecutionIntervalKind {
+        self.kind
+    }
+
+    pub const fn start_offset_ns(self) -> u64 {
+        self.start_offset_ns
+    }
+
+    pub const fn end_offset_ns(self) -> u64 {
+        self.end_offset_ns
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.end_offset_ns - self.start_offset_ns
+    }
+}
+
+/// Backend-counter timing for one command entry in a core-owned submission.
+/// A command may own multiple physical encoder intervals, for example a
+/// gather-compute-scatter implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceCommandExecutionTiming {
+    command_index: u32,
+    intervals: Box<[DeviceExecutionInterval]>,
+    elapsed_ns: u64,
+}
+
+impl DeviceCommandExecutionTiming {
+    pub fn new(command_index: u32, intervals: Vec<DeviceExecutionInterval>) -> Option<Self> {
+        if intervals.is_empty()
+            || intervals
+                .windows(2)
+                .any(|pair| pair[0].end_offset_ns() > pair[1].start_offset_ns())
+        {
+            return None;
+        }
+        let elapsed_ns = intervals.iter().try_fold(0_u64, |total, interval| {
+            total.checked_add(interval.elapsed_ns())
+        })?;
+        Some(Self {
+            command_index,
+            intervals: intervals.into_boxed_slice(),
+            elapsed_ns,
+        })
+    }
+
+    pub const fn command_index(&self) -> u32 {
+        self.command_index
+    }
+
+    pub fn intervals(&self) -> &[DeviceExecutionInterval] {
+        &self.intervals
+    }
+
+    pub fn elapsed_ns(&self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
+/// Terminal backend-counter evidence for one exact submission. Command rows
+/// are ordered by the core-issued command index and can be joined to
+/// `DeviceSubmissionAttribution` without parsing backend labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionExecutionTiming {
+    commands: Box<[DeviceCommandExecutionTiming]>,
+}
+
+impl DeviceSubmissionExecutionTiming {
+    pub fn new(commands: Vec<DeviceCommandExecutionTiming>) -> Option<Self> {
+        if commands.is_empty()
+            || commands
+                .windows(2)
+                .any(|pair| pair[0].command_index() >= pair[1].command_index())
+        {
+            return None;
+        }
+        Some(Self {
+            commands: commands.into_boxed_slice(),
+        })
+    }
+
+    pub fn commands(&self) -> &[DeviceCommandExecutionTiming] {
+        &self.commands
+    }
+}
+
 /// A terminal and its optional backend clock evidence are inseparable. This
 /// prevents timing from being queried before the exact fence proves quiescence.
 #[derive(Debug, Serialize)]
@@ -1126,6 +1251,7 @@ impl DeviceExecutionTiming {
 pub struct DeviceTerminalReceipt<E> {
     terminal: DeviceTerminal<E>,
     execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+    submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
 }
 
 impl<E> DeviceTerminalReceipt<E> {
@@ -1133,6 +1259,7 @@ impl<E> DeviceTerminalReceipt<E> {
         Self {
             terminal,
             execution_timing: DeviceTimingMeasurement::NotRequested,
+            submission_timing: DeviceTimingMeasurement::NotRequested,
         }
     }
 
@@ -1143,6 +1270,19 @@ impl<E> DeviceTerminalReceipt<E> {
         Self {
             terminal,
             execution_timing,
+            submission_timing: DeviceTimingMeasurement::NotRequested,
+        }
+    }
+
+    pub fn profiled_with_submission_timing(
+        terminal: DeviceTerminal<E>,
+        execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+        submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    ) -> Self {
+        Self {
+            terminal,
+            execution_timing,
+            submission_timing,
         }
     }
 
@@ -1154,13 +1294,20 @@ impl<E> DeviceTerminalReceipt<E> {
         &self.execution_timing
     }
 
+    pub const fn submission_timing(
+        &self,
+    ) -> &DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        &self.submission_timing
+    }
+
     pub fn into_parts(
         self,
     ) -> (
         DeviceTerminal<E>,
         DeviceTimingMeasurement<DeviceExecutionTiming>,
+        DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
     ) {
-        (self.terminal, self.execution_timing)
+        (self.terminal, self.execution_timing, self.submission_timing)
     }
 }
 
@@ -1353,6 +1500,7 @@ pub enum DeviceCommandPhase {
 /// labels and counters carry observation only and grant no execution authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceNativeWorkAttribution {
+    command_index: u32,
     node_index: Option<u32>,
     command_phase: DeviceCommandPhase,
     native_op_id: &'static str,
@@ -1367,6 +1515,7 @@ pub struct DeviceNativeWorkAttribution {
 impl DeviceNativeWorkAttribution {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        command_index: u32,
         node_index: Option<u32>,
         command_phase: DeviceCommandPhase,
         native_op_id: &'static str,
@@ -1384,6 +1533,7 @@ impl DeviceNativeWorkAttribution {
             return None;
         }
         Some(Self {
+            command_index,
             node_index,
             command_phase,
             native_op_id,
@@ -1394,6 +1544,10 @@ impl DeviceNativeWorkAttribution {
             compute_dispatch_count,
             transfer_command_count,
         })
+    }
+
+    pub const fn command_index(&self) -> u32 {
+        self.command_index
     }
 
     pub const fn node_index(&self) -> Option<u32> {
@@ -1440,7 +1594,14 @@ pub struct DeviceSubmissionAttribution {
 
 impl DeviceSubmissionAttribution {
     pub fn new(commands: Vec<DeviceNativeWorkAttribution>) -> Option<Self> {
-        (!commands.is_empty()).then(|| Self {
+        if commands.is_empty()
+            || commands
+                .windows(2)
+                .any(|pair| pair[0].command_index() >= pair[1].command_index())
+        {
+            return None;
+        }
+        Some(Self {
             commands: commands.into_boxed_slice(),
         })
     }
@@ -1848,6 +2009,47 @@ pub fn classify_device_error<R: DeviceRuntime + ?Sized>(
         });
     }
     IdentifiedFailure::new(identity, runtime.describe_error(error)?.into_failure())
+}
+
+#[cfg(test)]
+mod execution_timing_tests {
+    use super::*;
+
+    #[test]
+    fn command_timing_requires_positive_ordered_nonoverlapping_intervals() {
+        assert!(
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 10).is_none()
+        );
+        assert!(
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 11, 10).is_none()
+        );
+
+        let first =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 20).unwrap();
+        let adjacent =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 20, 30).unwrap();
+        let overlapping =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 19, 30).unwrap();
+        assert!(DeviceCommandExecutionTiming::new(0, vec![first, adjacent]).is_some());
+        assert!(DeviceCommandExecutionTiming::new(0, vec![first, overlapping]).is_none());
+    }
+
+    #[test]
+    fn submission_timing_requires_strict_command_order() {
+        let command = |command_index| {
+            DeviceCommandExecutionTiming::new(
+                command_index,
+                vec![
+                    DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 0, 1)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(0), command(2)]).is_some());
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(1), command(1)]).is_none());
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(2), command(1)]).is_none());
+    }
 }
 
 #[cfg(test)]

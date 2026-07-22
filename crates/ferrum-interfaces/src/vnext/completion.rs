@@ -14,11 +14,12 @@ use super::{
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
     DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceRuntime, DeviceSubmissionTimingSink, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
-    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
-    NodeId, PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
+    DeviceReusableExecutionPreparation, DeviceRuntime, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId,
+    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
+    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave, ResourceId, StreamState,
+    VNextError,
 };
 
 mod readback_collection;
@@ -918,6 +919,7 @@ pub struct OperationCompletionReceipt {
     submission: SubmittedOperationReceipt,
     disposition: OperationCompletionDisposition,
     fence_timing: CompletionFenceTiming,
+    submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
     participants: Vec<OperationParticipantCompletionReceipt>,
     fingerprint: String,
 }
@@ -927,6 +929,7 @@ impl OperationCompletionReceipt {
         submission: SubmittedOperationReceipt,
         disposition: OperationCompletionDisposition,
         fence_timing: CompletionFenceTiming,
+        submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
     ) -> Result<Self, VNextError> {
         let participant_dispositions = match &disposition {
             OperationCompletionDisposition::Succeeded => submission
@@ -989,6 +992,7 @@ impl OperationCompletionReceipt {
             submission,
             disposition,
             fence_timing,
+            submission_timing,
             participants,
             fingerprint,
         })
@@ -1004,6 +1008,12 @@ impl OperationCompletionReceipt {
 
     pub const fn fence_timing(&self) -> CompletionFenceTiming {
         self.fence_timing
+    }
+
+    pub const fn submission_timing(
+        &self,
+    ) -> &DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        &self.submission_timing
     }
 
     pub fn participants(&self) -> &[OperationParticipantCompletionReceipt] {
@@ -2034,7 +2044,9 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 }
             }
         }
-        if let FenceObservation::Terminal(mut disposition, fence_timing) = observation {
+        if let FenceObservation::Terminal(mut disposition, fence_timing, submission_timing) =
+            observation
+        {
             let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
             let CompletionRecord::InFlight {
                 resources,
@@ -2069,12 +2081,16 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
             drop(guard);
             self.remove_exact(slot_id, &record);
-            return OperationCompletionReceipt::new(receipt, disposition, fence_timing).map(
-                |completion| BoundCompletionObservation::Terminal {
-                    completion,
-                    terminal,
-                },
-            );
+            return OperationCompletionReceipt::new(
+                receipt,
+                disposition,
+                fence_timing,
+                submission_timing,
+            )
+            .map(|completion| BoundCompletionObservation::Terminal {
+                completion,
+                terminal,
+            });
         }
         Ok(match observation {
             FenceObservation::Pending => BoundCompletionObservation::Pending,
@@ -2091,7 +2107,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             FenceObservation::Quarantined(receipt) => {
                 BoundCompletionObservation::Quarantined(receipt)
             }
-            FenceObservation::Terminal(_, _) => {
+            FenceObservation::Terminal(_, _, _) => {
                 unreachable!("terminal observation returned through the reaping branch")
             }
         })
@@ -2224,7 +2240,11 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
 
 enum FenceObservation {
     Pending,
-    Terminal(OperationCompletionDisposition, CompletionFenceTiming),
+    Terminal(
+        OperationCompletionDisposition,
+        CompletionFenceTiming,
+        DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    ),
     Indeterminate(Vec<IdentifiedFailure>),
     ContractIndeterminate(VNextError),
     SubmissionIndeterminate,
@@ -2239,8 +2259,17 @@ fn terminal_observation<R: DeviceRuntime>(
     timing_mode: DeviceTimingMode,
     blocking_wait_host_ns: DeviceTimingMeasurement<u64>,
 ) -> FenceObservation {
-    let (terminal, device_execution) = terminal.into_parts();
+    let (terminal, device_execution, submission_timing) = terminal.into_parts();
     let timing = CompletionFenceTiming::new(timing_mode, device_execution, blocking_wait_host_ns);
+    let submission_timing = match (timing_mode, submission_timing) {
+        (DeviceTimingMode::Off | DeviceTimingMode::Completion, _) => {
+            DeviceTimingMeasurement::NotRequested
+        }
+        (DeviceTimingMode::Kernel, DeviceTimingMeasurement::NotRequested) => {
+            DeviceTimingMeasurement::Unavailable(DeviceTimingUnavailableReason::BackendUnsupported)
+        }
+        (DeviceTimingMode::Kernel, measurement) => measurement,
+    };
     let descriptor_is_stable = catch_unwind(AssertUnwindSafe(|| {
         lane.current_descriptor_matches_snapshot()
     }))
@@ -2253,6 +2282,7 @@ fn terminal_observation<R: DeviceRuntime>(
                 ),
             ),
             timing,
+            submission_timing,
         );
     }
     FenceObservation::Terminal(
@@ -2268,6 +2298,7 @@ fn terminal_observation<R: DeviceRuntime>(
             }
         },
         timing,
+        submission_timing,
     )
 }
 
