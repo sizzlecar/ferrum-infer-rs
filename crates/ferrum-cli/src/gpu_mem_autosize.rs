@@ -210,9 +210,9 @@ fn auto_size_kv_blocks_with_pool_copies_for_snapshot(
 /// CLI usage profile: which presets the autosizer should consider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoSizeProfile {
-    /// `ferrum serve` — many concurrent requests. Prioritise batch
-    /// width (max_seqs) over per-seq context length. Bench scripts
-    /// also use this profile.
+    /// `ferrum serve` — many concurrent requests. Admission width and
+    /// per-request logical context are resolved independently over the shared
+    /// physical KV block pool. Bench scripts also use this profile.
     Server,
     /// `ferrum run` — single interactive user, multi-turn chat. Trade
     /// max_seqs for KV_CAPACITY so a long conversation doesn't crash
@@ -236,7 +236,8 @@ struct ModelAutoSizeHints {
 #[derive(Clone, Copy, Debug)]
 struct ModelAutoSizeDefaults {
     max_batched_tokens: usize,
-    presets: &'static [(usize, usize)],
+    max_sequences: usize,
+    max_sequence_tokens: usize,
     kv_block_floor: usize,
 }
 
@@ -326,13 +327,15 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     result.print_summary();
     let max_blocks = result.max_blocks.max(defaults.kv_block_floor);
 
-    // Dynamic paged-KV sizing: the physical pool is `KV_MAX_BLOCKS`.
-    // Picks the largest (max_seqs, KV_CAP) tuple whose per-sequence table
-    // can fit in the global block budget. Multiple sequences share that pool
-    // on demand; they do not each reserve KV_CAPACITY at startup.
-    //   Server: prioritise wide batch (c=16/32) over context.
-    //   Chat:   single user, multi-turn -- pile budget into context.
-    let (max_seqs_clamped, kv_capacity) = select_paged_pool_preset(defaults.presets, max_blocks);
+    // `KV_MAX_BLOCKS` is the physical authority. Logical sequence capacity
+    // does not reserve that many blocks per admitted sequence; requests borrow
+    // blocks on demand and admission applies backpressure when the shared pool
+    // cannot satisfy the next step.
+    let (max_seqs_clamped, kv_capacity) = select_dynamic_paged_pool_shape(
+        defaults.max_sequences,
+        defaults.max_sequence_tokens,
+        max_blocks,
+    );
 
     let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
@@ -384,33 +387,10 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     );
 }
 
-const SERVER_PRESETS: &[(usize, usize)] = &[
-    // (max_seqs, KV_CAPACITY tokens)
-    (32, 2048), // best — INT4 8B on 24 GB usually lands here
-    (32, 1024), // FP16 8B at util=1.0
-    (32, 512),  // FP16 8B at util=0.95
-    (16, 2048), // long-context narrow batch
-    (16, 1024),
-    (16, 512), // last that supports c=16
-    (8, 1024), // <c=16 only
-    (8, 512),
-];
-
-// 16384 fits a long thinking-mode reply + ~20 conversation turns before
-// /clear. max_seqs=2 leaves a slot for any internal use; single-user CLI
-// never needs more.
-const CHAT_PRESETS: &[(usize, usize)] = &[
-    (2, 16384),
-    (2, 8192),
-    (2, 4096),
-    (1, 16384),
-    (1, 8192),
-    (1, 4096),
-    (1, 2048),
-];
-
-const TIGHT_RECURRENT_STATE_SERVER_PRESETS: &[(usize, usize)] =
-    &[(16, 512), (8, 512), (4, 512), (1, 512)];
+const MAX_AUTOSIZED_SEQUENCE_TOKENS: usize = 16_384;
+const DEFAULT_SERVER_MAX_SEQUENCES: usize = 32;
+const TIGHT_RECURRENT_STATE_SERVER_MAX_SEQUENCES: usize = 16;
+const CHAT_MAX_SEQUENCES: usize = 2;
 
 fn model_auto_size_defaults(
     model_class: ModelAutoSizeClass,
@@ -420,27 +400,27 @@ fn model_auto_size_defaults(
         (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Server) => {
             ModelAutoSizeDefaults {
                 max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
-                presets: TIGHT_RECURRENT_STATE_SERVER_PRESETS,
+                max_sequences: TIGHT_RECURRENT_STATE_SERVER_MAX_SEQUENCES,
+                max_sequence_tokens: MAX_AUTOSIZED_SEQUENCE_TOKENS,
                 kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
             }
         }
         (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
             max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
-            // Recurrent scratch pressure constrains aggregate prefill, not the
-            // logical per-sequence block table. Chat can use the dynamic KV
-            // pool's full context ladder without reserving that capacity for
-            // every sequence up front.
-            presets: CHAT_PRESETS,
+            max_sequences: CHAT_MAX_SEQUENCES,
+            max_sequence_tokens: MAX_AUTOSIZED_SEQUENCE_TOKENS,
             kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
         },
         (ModelAutoSizeClass::Generic, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
             max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
-            presets: SERVER_PRESETS,
+            max_sequences: DEFAULT_SERVER_MAX_SEQUENCES,
+            max_sequence_tokens: MAX_AUTOSIZED_SEQUENCE_TOKENS,
             kv_block_floor: 0,
         },
         (ModelAutoSizeClass::Generic, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
             max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
-            presets: CHAT_PRESETS,
+            max_sequences: CHAT_MAX_SEQUENCES,
+            max_sequence_tokens: MAX_AUTOSIZED_SEQUENCE_TOKENS,
             kv_block_floor: 0,
         },
     }
@@ -531,18 +511,18 @@ fn ceil_div_usize(value: usize, divisor: usize) -> usize {
     value.div_ceil(divisor)
 }
 
-fn select_paged_pool_preset(presets: &[(usize, usize)], max_blocks: usize) -> (usize, usize) {
-    if let Some((seqs, cap)) = presets.iter().copied().find(|(_, cap_tokens)| {
-        let bps = ceil_div_usize(*cap_tokens, PAGED_BLOCK_SIZE as usize).max(1);
-        bps <= max_blocks
-    }) {
-        return (seqs, cap);
-    }
-
-    // Budget too tight for any preset's per-seq table. Keep the narrowest
-    // preset's concurrency shape and cap a single sequence to the pool.
-    let seqs = presets.last().map(|(seqs, _)| *seqs).unwrap_or(1);
-    (seqs, max_blocks.max(1) * PAGED_BLOCK_SIZE as usize)
+fn select_dynamic_paged_pool_shape(
+    max_sequences: usize,
+    max_sequence_tokens: usize,
+    max_blocks: usize,
+) -> (usize, usize) {
+    let physical_blocks = max_blocks.max(1);
+    let sequences = max_sequences.max(1).min(physical_blocks);
+    let physical_tokens = physical_blocks.saturating_mul(PAGED_BLOCK_SIZE as usize);
+    let sequence_tokens = max_sequence_tokens
+        .max(PAGED_BLOCK_SIZE as usize)
+        .min(physical_tokens);
+    (sequences, sequence_tokens)
 }
 
 fn weight_budget_shard_count(snapshot: &RuntimeConfigSnapshot) -> u64 {
@@ -713,19 +693,16 @@ mod tests {
     }
 
     #[test]
-    fn paged_pool_preset_keeps_concurrency_with_dynamic_block_pool() {
+    fn paged_pool_shape_decouples_admission_width_from_sequence_capacity() {
         assert_eq!(
-            select_paged_pool_preset(&[(32, 512), (8, 512)], 338),
-            (32, 512)
+            select_dynamic_paged_pool_shape(32, 16_384, 338),
+            (32, 5_408)
         );
         assert_eq!(
-            select_paged_pool_preset(&[(32, 512), (16, 512)], 2048),
-            (32, 512)
+            select_dynamic_paged_pool_shape(32, 16_384, 2_048),
+            (32, 16_384)
         );
-        assert_eq!(
-            select_paged_pool_preset(&[(32, 2048), (8, 1024)], 64),
-            (8, 1024)
-        );
+        assert_eq!(select_dynamic_paged_pool_shape(32, 16_384, 8), (8, 128));
     }
 
     #[test]
@@ -771,8 +748,12 @@ mod tests {
         );
         assert_eq!(server.kv_block_floor, TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR);
         assert_eq!(
-            select_paged_pool_preset(server.presets, server.kv_block_floor),
-            (16, 512)
+            select_dynamic_paged_pool_shape(
+                server.max_sequences,
+                server.max_sequence_tokens,
+                server.kv_block_floor,
+            ),
+            (16, 4096)
         );
 
         let chat = model_auto_size_defaults(class, AutoSizeProfile::Chat);
@@ -782,7 +763,11 @@ mod tests {
         );
         assert_eq!(chat.kv_block_floor, TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR);
         assert_eq!(
-            select_paged_pool_preset(chat.presets, chat.kv_block_floor),
+            select_dynamic_paged_pool_shape(
+                chat.max_sequences,
+                chat.max_sequence_tokens,
+                chat.kv_block_floor,
+            ),
             (2, 4096)
         );
     }
@@ -831,7 +816,8 @@ mod tests {
         let generic =
             model_auto_size_defaults(ModelAutoSizeClass::Generic, AutoSizeProfile::Server);
         assert_eq!(generic.max_batched_tokens, DEFAULT_MAX_BATCHED_TOKENS);
-        assert_eq!(generic.presets, SERVER_PRESETS);
+        assert_eq!(generic.max_sequences, DEFAULT_SERVER_MAX_SEQUENCES);
+        assert_eq!(generic.max_sequence_tokens, MAX_AUTOSIZED_SEQUENCE_TOKENS);
         assert_eq!(generic.kv_block_floor, 0);
     }
 
