@@ -230,16 +230,15 @@ where
             }
         }
         let mut options = OpenOptions::new();
-        options.create(true).write(true);
-        match mode {
-            JsonlJournalOpenMode::Truncate => {
-                options.truncate(true);
-            }
-            JsonlJournalOpenMode::Append => {
-                options.append(true);
-            }
-        }
+        // Truncate controls only the initial file state. Every journal write
+        // must still append at the current EOF so a startup record written
+        // through another descriptor cannot be overwritten by this worker's
+        // stale file offset.
+        options.create(true).append(true);
         let file = options.open(&path)?;
+        if mode == JsonlJournalOpenMode::Truncate {
+            file.set_len(0)?;
+        }
         let (sender, receiver) = sync_channel(config.queue_capacity);
         let failure = Arc::new(JournalFailure::new());
         let worker_failure = Arc::clone(&failure);
@@ -491,6 +490,30 @@ mod tests {
             .map(|value| value["ordinal"].as_u64().unwrap())
             .collect();
         assert_eq!(ordinals, vec![1, 2, 3]);
+        drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn truncate_journal_appends_after_an_external_startup_record() {
+        let path = temp_path("external-startup-record");
+        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let mut startup_writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(startup_writer, r#"{{"source":"startup"}}"#).unwrap();
+        startup_writer.flush().unwrap();
+
+        journal
+            .enqueue(serde_json::json!({"source": "engine"}))
+            .unwrap();
+        journal.flush().unwrap();
+
+        assert_eq!(
+            read_values(&path),
+            vec![
+                serde_json::json!({"source": "startup"}),
+                serde_json::json!({"source": "engine"}),
+            ]
+        );
         drop(journal);
         let _ = std::fs::remove_file(path);
     }
