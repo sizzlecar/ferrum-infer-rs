@@ -59,6 +59,43 @@ const MOE_SHARED_GATE_ROLE: &str = "moe_shared_gate";
 const MOE_SHARED_GATE_UP_ROLE: &str = "moe_shared_gate_up";
 const MOE_SHARED_DOWN_ROLE: &str = "moe_shared_down";
 
+pub(super) fn validate_semantic_config(
+    expected_metadata_id: &ExternalModelMetadataId,
+    raw: &[u8],
+) -> ferrum_types::Result<()> {
+    let text = preflight_semantic_config(raw).map_err(ferrum_types::FerrumError::model)?;
+    let expected_moe = match expected_metadata_id.as_str() {
+        EXTERNAL_METADATA_ID => false,
+        MOE_EXTERNAL_METADATA_ID => true,
+        other => {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "Qwen3.5 semantic validator received unowned metadata identity {other}"
+            )))
+        }
+    };
+    if text.is_moe() != expected_moe {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "Qwen3.5 semantic text layout {} does not match registered metadata identity {expected_metadata_id}",
+            text.text_model_type
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_semantic_config(raw: &[u8]) -> Result<Qwen35TextConfig, String> {
+    let hf_config: Value = serde_json::from_slice(raw)
+        .map_err(|error| format!("parse semantic config.json: {error}"))?;
+    let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
+    if let Some(quantization) = &text.quantization {
+        validate_gptq_marlin_config(quantization).map_err(|error| error.to_string())?;
+    }
+    let text_value = hf_config.get("text_config").unwrap_or(&hf_config);
+    required_u64(text_value, "vocab_size")?;
+    required_u64(text_value, "max_position_embeddings")?;
+    hf_rms_norm_epsilon(&hf_config)?;
+    Ok(text)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FamilyWeight {
@@ -1728,15 +1765,14 @@ fn gguf_component_layout(
 }
 
 pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
-    let sources = Arc::new(ProductionModelSourceBundle::open_colocated_safetensors(
-        model_dir,
-    )?);
+    let sources = Arc::new(super::open_registered_colocated_safetensors(model_dir)?);
     prepare_from_sources(sources)
 }
 
-pub fn prepare_from_sources(
+pub(super) fn prepare_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
 ) -> ferrum_types::Result<PreparedProductionModel> {
+    preflight_semantic_config(sources.config_json()).map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
         ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
             let weights = SafetensorsArchive::open(weight_root)?;
@@ -2976,6 +3012,54 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn semantic_preflight_precedes_safetensors_archive_open() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.json"),
+            br#"{
+                "architectures":["Qwen3_5MoeForConditionalGeneration"],
+                "model_type":"qwen3_5_moe",
+                "text_config":{"model_type":"unsupported_nested_layout"}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(
+            root.path().join("model.safetensors"),
+            b"not-a-safetensors-archive",
+        )
+        .unwrap();
+        let original = OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: root.path().display().to_string(),
+            requested_revision: None,
+        };
+        let sources = Arc::new(
+            ProductionModelSourceBundle::open(
+                root.path(),
+                root.path(),
+                ProductionWeightArtifact::safetensors_directory(root.path()),
+                OriginalModelSources {
+                    semantic: original.clone(),
+                    tokenizer: original.clone(),
+                    weights: original,
+                },
+            )
+            .unwrap(),
+        );
+
+        let error = match prepare_from_sources(sources) {
+            Ok(_) => panic!("invalid nested semantics unexpectedly reached preparation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("unsupported Qwen3.5 text model_type"),
+            "{error}"
+        );
+        assert!(!error.contains("safetensors archive"), "{error}");
     }
 
     #[test]
