@@ -67,6 +67,9 @@ RUNTIME_VNEXT_S1_CUDA_CAPACITY = REPO_ROOT / "scripts/release/runtime_vnext_s1_c
 RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
     REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_decode_capacity.py"
 )
+RUNTIME_VNEXT_G08B_CUDA_MATRIX_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py"
+)
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 OPENAI_TOOL_CALL_REGRESSION = REPO_ROOT / "scripts/release/openai_tool_call_regression.py"
@@ -606,6 +609,21 @@ def test_runtime_vnext_s1_cuda_decode_capacity_selftest() -> None:
     )
 
 
+def test_runtime_vnext_g08b_cuda_matrix_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08B_CUDA_MATRIX_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_bounded_command_selftest() -> None:
     ok = run([sys.executable, str(BOUNDED_COMMAND), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -895,6 +913,7 @@ def main() -> int:
     test_runtime_vnext_s1_cuda_basic_collector_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()
     test_runtime_vnext_s1_cuda_decode_capacity_selftest()
+    test_runtime_vnext_g08b_cuda_matrix_checkpoint_selftest()
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()

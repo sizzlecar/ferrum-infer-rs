@@ -53,6 +53,7 @@ LANES = (
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
     "vnext-s1-cuda-decode-capacity",
+    "vnext-g08b-cuda",
     "unit",
     "metal",
     "cuda-smoke",
@@ -943,6 +944,28 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s1-cuda-decode-capacity",
+        )
+    if lane == "vnext-g08b-cuda":
+        if args.g08b_artifact_root is None:
+            raise GateError("vnext-g08b-cuda requires --g08b-artifact-root")
+        if args.g08b_scenario_report is None:
+            raise GateError("vnext-g08b-cuda requires --g08b-scenario-report")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py",
+                "--artifact-root",
+                str(args.g08b_artifact_root.resolve()),
+                "--scenario-report",
+                str(args.g08b_scenario_report.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g08b-cuda",
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
@@ -6725,6 +6748,41 @@ def self_test() -> int:
             dry_manifest["child_pass_line"] == source_pass_line("unit", dry_out),
             dry_manifest,
         )
+        g08b_root = root / "g08b-artifact-root"
+        g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
+        g08b_out = root / "g08b-cuda-dry-run"
+        g08b_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g08b-cuda",
+                "--g08b-artifact-root",
+                str(g08b_root),
+                "--g08b-scenario-report",
+                str(g08b_report),
+                "--out",
+                str(g08b_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(g08b_dry.returncode == 0, g08b_dry.stderr or g08b_dry.stdout)
+        g08b_manifest = json.loads((g08b_out / "gate.manifest.json").read_text())
+        require_selftest(g08b_manifest["status"] == "dry-run", g08b_manifest)
+        require_selftest(g08b_manifest["lane"] == "vnext-g08b-cuda", g08b_manifest)
+        require_selftest(
+            g08b_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py",
+                "--artifact-root",
+                str(g08b_root.resolve()),
+                "--scenario-report",
+                str(g08b_report.resolve()),
+                "--out",
+                str(g08b_out.resolve()),
+            ],
+            g08b_manifest,
+        )
         unit_root = root / "unit-bounded-provenance"
         bounded_root = unit_root / "unit-bounded"
         bounded_root.mkdir(parents=True)
@@ -7624,6 +7682,8 @@ def main() -> int:
     parser.add_argument("--g00a", type=Path)
     parser.add_argument("--g00f", type=Path)
     parser.add_argument("--s1-artifact", type=Path)
+    parser.add_argument("--g08b-artifact-root", type=Path)
+    parser.add_argument("--g08b-scenario-report", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
