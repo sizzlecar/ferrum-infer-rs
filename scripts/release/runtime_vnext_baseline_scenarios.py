@@ -55,8 +55,12 @@ C20_REMOTE_MEDIA_URL = (
     f"{FROZEN_LEGACY_SHA}/docs/bench/framework-validation-2026-05-25/m3_layerwise.png"
 )
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G00 SCENARIOS PASS"
+CANDIDATE_PASS_PREFIX = "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS"
 SCHEMA_VERSION = 1
+LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
+G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
+EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CASE_ID_RE = re.compile(r"^c(?:0[1-9]|1[0-9]|2[01])-[0-9]{3}$")
@@ -352,9 +356,87 @@ def frozen_tree_sha() -> str:
     return tree
 
 
-def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
+def execution_contract(data: dict[str, Any], label: str) -> str:
+    contract = data.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+    require(contract in EXECUTION_CONTRACTS, f"{label}.execution_contract is invalid")
+    return str(contract)
+
+
+def pass_prefix_for_contract(contract: str) -> str:
+    require(contract in EXECUTION_CONTRACTS, "execution contract is invalid")
+    return CANDIDATE_PASS_PREFIX if contract == G08_EXECUTION_CONTRACT else PASS_PREFIX
+
+
+def candidate_expectations_catalog(source_git_sha: str) -> dict[str, Any]:
+    require_git_sha(source_git_sha, "candidate expectations source_git_sha")
+    goals = {
+        "m1-qwen35-4b": "G08A",
+        "m2-qwen35-35b-a3b": "G08B",
+        "m3-qwen3-30b-a3b": "G08C",
+    }
+    lanes: dict[str, Any] = {}
+    for model_key, goal in goals.items():
+        for backend in ("cuda", "metal"):
+            lanes[f"{model_key}/{backend}"] = {
+                "rules": [
+                    {
+                        "selector": {
+                            "scenario_id": "*",
+                            "variant": "*",
+                            "preset": "*",
+                            "entrypoint": "*",
+                            "case_id": "*",
+                        },
+                        "expected_status": "pass",
+                        "failure_class": None,
+                        "downstream_goal": goal,
+                        "owner": "runtime-vnext-model-matrix",
+                        "evidence_basis": "G08 candidate execution requires every C01-C21 case to pass.",
+                        "next_action": "Reject the candidate on the first failed product-path case.",
+                    }
+                ]
+            }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "execution_contract": G08_EXECUTION_CONTRACT,
+        "catalog_id": "runtime-vnext-g08-model-matrix",
+        "source_git_sha": source_git_sha,
+        "status_vocabulary": {
+            "pass": "Candidate behavior satisfies the case oracle.",
+            "known-fail": "Forbidden for G08 candidate evidence.",
+            "blocked": "Forbidden for G08 candidate evidence.",
+            "discovery-required": "Forbidden for G08 candidate evidence.",
+        },
+        "resolution_policy": {
+            "wildcard": "*",
+            "selector_order": list(EXPECTATION_SELECTOR_FIELDS),
+        },
+        "blocked_lane_policy": {
+            "allowed_lane_failure_classes": BLOCKED_LANE_FAILURE_CLASSES,
+            "forbidden_lanes": [
+                "m1-qwen35-4b/cuda",
+                "m2-qwen35-35b-a3b/cuda",
+                "m3-qwen3-30b-a3b/cuda",
+                "m3-qwen3-30b-a3b/metal",
+            ],
+        },
+        "lanes": lanes,
+    }
+
+
+def validate_expectations_catalog(
+    catalog: dict[str, Any],
+    *,
+    expected_contract: str | None = None,
+) -> dict[str, Any]:
+    contract = execution_contract(catalog, "expectations catalog")
+    if expected_contract is not None:
+        require(contract == expected_contract, "expectations catalog execution contract mismatch")
     require(catalog.get("schema_version") == SCHEMA_VERSION, "legacy expectations schema_version mismatch")
-    require(catalog.get("source_git_sha") == FROZEN_LEGACY_SHA, "legacy expectations source SHA mismatch")
+    if contract == LEGACY_EXECUTION_CONTRACT:
+        require(catalog.get("source_git_sha") == FROZEN_LEGACY_SHA, "legacy expectations source SHA mismatch")
+    else:
+        require_git_sha(catalog.get("source_git_sha"), "candidate expectations source SHA")
     vocabulary = require_object(catalog.get("status_vocabulary"), "legacy expectations status_vocabulary")
     require(set(vocabulary) == EXPECTED_STATUSES, "legacy expectations status vocabulary mismatch")
     policy = require_object(catalog.get("resolution_policy"), "legacy expectations resolution_policy")
@@ -411,6 +493,8 @@ def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
                 require(case_id[:3].upper() == scenario, f"{label} case_id selector does not belong to its scenario")
             status = rule.get("expected_status")
             require(status in EXPECTED_STATUSES, f"{label} expected_status invalid")
+            if contract == G08_EXECUTION_CONTRACT:
+                require(status == "pass", f"{label} G08 candidate expectation must declare pass")
             if status == "blocked":
                 require(
                     BLOCKED_LANE_FAILURE_CLASSES.get(lane_key) == rule.get("failure_class"),
@@ -463,10 +547,19 @@ def resolve_expectation(
 
 
 def canonical_expectations_sha256() -> str:
-    validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
+    validate_expectations_catalog(
+        read_json(EXPECTATIONS_PATH),
+        expected_contract=LEGACY_EXECUTION_CONTRACT,
+    )
     checked_in = git_bytes(["show", f"HEAD:{EXPECTATIONS_REPO_PATH}"])
     require(checked_in == EXPECTATIONS_PATH.read_bytes(), "legacy expectations differ from checked-in blob")
     return hashlib.sha256(checked_in).hexdigest()
+
+
+def candidate_expectations_bytes(source_git_sha: str) -> bytes:
+    catalog = candidate_expectations_catalog(source_git_sha)
+    validate_expectations_catalog(catalog, expected_contract=G08_EXECUTION_CONTRACT)
+    return (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def canonical_runner_identity() -> dict[str, Any]:
@@ -578,12 +671,35 @@ def validate_artifact_ref(
     return path, kind, parsed
 
 
-def validate_source_identity(data: dict[str, Any], label: str) -> None:
-    require(data.get("source_git_sha") == FROZEN_LEGACY_SHA, f"{label}.source_git_sha is not the frozen legacy SHA")
-    require(data.get("source_tree_sha") == frozen_tree_sha(), f"{label}.source_tree_sha mismatch")
+def validate_source_identity(
+    data: dict[str, Any],
+    label: str,
+    *,
+    allow_internal_fixture: bool = False,
+) -> str:
+    contract = execution_contract(data, label)
+    source_git_sha = require_git_sha(data.get("source_git_sha"), f"{label}.source_git_sha")
+    source_tree_sha = require_git_sha(data.get("source_tree_sha"), f"{label}.source_tree_sha")
+    if contract == LEGACY_EXECUTION_CONTRACT:
+        require(source_git_sha == FROZEN_LEGACY_SHA, f"{label}.source_git_sha is not the frozen legacy SHA")
+        require(source_tree_sha == frozen_tree_sha(), f"{label}.source_tree_sha mismatch")
+    else:
+        expected_tree = require_git_sha(
+            git_text(["rev-parse", f"{source_git_sha}^{{tree}}"]),
+            f"{label}.source_tree_sha",
+        )
+        require(source_tree_sha == expected_tree, f"{label}.source_tree_sha mismatch")
+        if not allow_internal_fixture:
+            current_sha = require_git_sha(git_text(["rev-parse", "HEAD"]), f"{label}.current_git_sha")
+            require(source_git_sha == current_sha, f"{label}.source_git_sha is not the current candidate SHA")
+            require(
+                not git_text(["status", "--short", "--untracked-files=all"]),
+                f"{label} candidate worktree must be clean",
+            )
     dirty = require_object(data.get("dirty_status"), f"{label}.dirty_status")
-    require(dirty.get("is_dirty") is False, f"{label} dirty legacy source is forbidden")
+    require(dirty.get("is_dirty") is False, f"{label} dirty source is forbidden")
     require(dirty.get("status_short") == [], f"{label}.dirty_status.status_short must be empty")
+    return contract
 
 
 def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[str, Any]:
@@ -647,7 +763,15 @@ def validate_effective_config(
     path, _, parsed = validate_artifact_ref(root, raw, "scenario_report.effective_config", allowed_kinds={"raw-json"})
     config = require_object(parsed, "scenario_report.effective_config JSON")
     require(config.get("schema_version") == SCHEMA_VERSION, "effective config schema_version mismatch")
-    validate_source_identity(config, "effective_config")
+    config_contract = validate_source_identity(
+        config,
+        "effective_config",
+        allow_internal_fixture=bool(expected.get("allow_internal_fixture")),
+    )
+    require(
+        config_contract == expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT),
+        "effective_config.execution_contract mismatch",
+    )
     for key in (
         "models_lock_sha256",
         "binary_sha256",
@@ -867,7 +991,14 @@ def validate_assertions(scenario_id: str, raw: Any, *, case_count: int) -> None:
         require(assertions.get("serve_stream_count") == 4 and assertions.get("strict_schema_count") == 4 and assertions.get("json_object_count") == 4, "C21 serve subgroup coverage incomplete")
 
 
-def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, require_pass: bool = True) -> None:
+def validate_concurrency_cells(
+    backend: str,
+    raw: Any,
+    *,
+    case_count: int,
+    require_pass: bool = True,
+    require_resource_balance: bool = False,
+) -> None:
     cells = require_list(raw, "C18.concurrency_cells")
     expected = {1, 4, 16, 32} if backend == "cuda" else {1, 4, 16}
     seen: set[int] = set()
@@ -939,6 +1070,12 @@ def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, requi
             coverage = require_object(timeline.get("request_transition_coverage"), f"C18.c{requested}.request_transition_coverage")
             require(coverage == {"expected": requested, "open": requested, "close": requested, "active_count": requested * 2}, f"C18.c{requested} request transition coverage incomplete")
             require_count(timeline.get("activity_observation_count"), f"C18.c{requested}.activity_observation_count", minimum=1)
+            if require_resource_balance:
+                validate_c18_resource_balance_summary(
+                    cell.get("resource_balance"),
+                    expected_request_count=requested,
+                    label=f"C18.c{requested}.resource_balance",
+                )
             if requested == max(expected):
                 require(active >= floor, f"C18.c{requested} max-active is below floor")
                 require(duty >= 0.80, f"C18.c{requested} active duty-cycle is below 0.80")
@@ -950,6 +1087,9 @@ def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, requi
                 require_count(floor, f"C18.c{requested}.active_floor")
             timeline = cell.get("active_timeline")
             require(timeline is None or isinstance(timeline, dict), f"C18.c{requested}.active_timeline invalid")
+        if not require_resource_balance:
+            resource_balance = cell.get("resource_balance")
+            require(resource_balance is None or isinstance(resource_balance, dict), f"C18.c{requested}.resource_balance invalid")
         for field in ("error_count", "bad_output_count", "crosstalk_count", "bad_checksum_count", "server_500_count", "panic_count", "oom_count"):
             value = require_count(cell.get(field), f"C18.c{requested}.{field}")
             if require_pass:
@@ -1013,6 +1153,7 @@ def validate_case_output(
     input_document: dict[str, Any] | None = None,
     actual_config: dict[str, Any] | None = None,
     artifact_root: Path | None = None,
+    require_c18_resource_balance: bool = False,
 ) -> None:
     stdout_text = stdout_path.read_text(encoding="utf-8")
     require(not any(marker in stdout_text.lower() for marker in BLOCKER_MARKERS), f"{label} stdout contains bad output")
@@ -1277,6 +1418,20 @@ def validate_case_output(
             raise ScenarioError(f"{label} C18 active timeline is invalid: {exc}") from exc
         require(observed.get("active_timeline") == timeline, f"{label} C18 active timeline summary is not replayable")
         require(active == timeline["observed_max_active"], f"{label} C18 max-active differs from timeline")
+        if require_c18_resource_balance:
+            resource_balance = c18_resource_balance(
+                require_list(transcript.get("scheduler_trace_rows"), f"{label}.scheduler_trace_rows"),
+                expected_request_count=requested,
+            )
+            require(
+                observed.get("resource_balance") == resource_balance,
+                f"{label} C18 resource balance is not replayable",
+            )
+            validate_c18_resource_balance_summary(
+                resource_balance,
+                expected_request_count=requested,
+                label=f"{label}.resource_balance",
+            )
         return
     if responses:
         final_response = responses[-1]
@@ -1709,6 +1864,15 @@ def validate_case_evidence(
                 require(observed.get("active_timeline_error") is None, f"case {case_id} active timeline records an error")
                 require(observed.get("active_timeline") == timeline, f"case {case_id} active timeline is not derived from trace")
                 require(observed.get("observed_max_active") == timeline["observed_max_active"], f"case {case_id} observed max-active is not derived from timeline")
+                if expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT) == G08_EXECUTION_CONTRACT:
+                    resource_balance = c18_resource_balance(
+                        trace_rows,
+                        expected_request_count=requested,
+                    )
+                    require(
+                        observed.get("resource_balance") == resource_balance,
+                        f"case {case_id} resource balance is not derived from trace",
+                    )
                 required_client = 32 if expected["backend"] == "cuda" else 16
                 if requested == required_client:
                     lane_floor = REQUIRED_ACTIVE_FLOORS[(expected["model_key"], expected["backend"])]
@@ -1729,6 +1893,10 @@ def validate_case_evidence(
             input_document=input_document,
             actual_config=actual_config,
             artifact_root=root,
+            require_c18_resource_balance=(
+                expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+                == G08_EXECUTION_CONTRACT
+            ),
         )
     )
     if case["status"] == "pass":
@@ -1819,7 +1987,16 @@ def validate_scenario(
     elif expected_id == "C07":
         require(dimensions.get("requests") >= 6 and dimensions.get("rounds_per_request") >= 5, "C07 must cover 6 requests x 5 rounds")
     if expected_id == "C18":
-        validate_concurrency_cells(expected["backend"], scenario.get("concurrency_cells"), case_count=count, require_pass=scenario["status"] == "pass")
+        validate_concurrency_cells(
+            expected["backend"],
+            scenario.get("concurrency_cells"),
+            case_count=count,
+            require_pass=scenario["status"] == "pass",
+            require_resource_balance=(
+                expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+                == G08_EXECUTION_CONTRACT
+            ),
+        )
     else:
         require("concurrency_cells" not in scenario, f"scenario {expected_id} must not fabricate concurrency cells")
     if scenario["status"] == "pass":
@@ -1910,8 +2087,9 @@ def validate_scenario(
     require(derived_presets == scenario["presets"], f"scenario {expected_id} presets are not derived from cases")
     require(derived_unpreset == scenario["unpreset_count"], f"scenario {expected_id} unpreset count is not derived from cases")
     if expected_id == "C18" and scenario["status"] == "pass":
-        derived_cells = [
-            {
+        derived_cells = []
+        for row in case_rows:
+            derived_cell = {
                 "requested_concurrency": row["observed"]["requested_concurrency"],
                 "case_count": 1,
                 "passed_count": 1,
@@ -1936,8 +2114,9 @@ def validate_scenario(
                     )
                 },
             }
-            for row in case_rows
-        ]
+            if expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT) == G08_EXECUTION_CONTRACT:
+                derived_cell["resource_balance"] = row["observed"]["resource_balance"]
+            derived_cells.append(derived_cell)
         require(
             scenario["concurrency_cells"] == derived_cells,
             "scenario C18 concurrency cells are not derived from case evidence",
@@ -2108,7 +2287,11 @@ def validate_report_document(
     require(report.get("schema_version") == SCHEMA_VERSION, "scenario_report.schema_version mismatch")
     require(report.get("status") == "pass", "scenario_report.status must be pass")
     reject_forbidden_markers(report, "scenario_report", allow_internal_fixture=allow_internal_fixture)
-    validate_source_identity(report, "scenario_report")
+    contract = validate_source_identity(
+        report,
+        "scenario_report",
+        allow_internal_fixture=allow_internal_fixture,
+    )
     model_key = require_string(report.get("model_key"), "scenario_report.model_key")
     require(model_key in {"m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}, "scenario_report.model_key is not primary")
     backend = require_string(report.get("backend"), "scenario_report.backend")
@@ -2139,6 +2322,8 @@ def validate_report_document(
             "hardware_id",
         )
     }
+    expected["execution_contract"] = contract
+    expected["allow_internal_fixture"] = allow_internal_fixture
     if "model_path" in report:
         expected["model_path"] = report["model_path"]
     _, effective_config_sha256 = validate_effective_config(root, report.get("effective_config"), expected=expected)
@@ -2149,23 +2334,40 @@ def validate_report_document(
         "scenario_report.expectations_catalog",
         allowed_kinds={"raw-json"},
     )
-    expectations_catalog = validate_expectations_catalog(require_object(expectations_parsed, "scenario_report expectations catalog JSON"))
+    expectations_catalog = validate_expectations_catalog(
+        require_object(expectations_parsed, "scenario_report expectations catalog JSON"),
+        expected_contract=contract,
+    )
     require(file_sha256(expectations_path) == report["expectations_catalog_sha256"], "scenario_report expectations catalog binding mismatch")
     if not allow_internal_fixture:
-        require(report["expectations_catalog_sha256"] == canonical_expectations_sha256(), "scenario_report expectations catalog is not the checked-in contract")
+        expected_expectations_sha = (
+            hashlib.sha256(candidate_expectations_bytes(report["source_git_sha"])).hexdigest()
+            if contract == G08_EXECUTION_CONTRACT
+            else canonical_expectations_sha256()
+        )
+        require(
+            report["expectations_catalog_sha256"] == expected_expectations_sha,
+            "scenario_report expectations catalog is not the canonical execution contract",
+        )
     expected["expectations_catalog"] = expectations_catalog
     expected["expectations_catalog_sha256"] = report["expectations_catalog_sha256"]
     binary_path, _, _ = validate_artifact_ref(root, report.get("binary_artifact"), "scenario_report.binary_artifact", allowed_kinds={"binary"})
     require(file_sha256(binary_path) == report["binary_sha256"], "scenario_report binary artifact binding mismatch")
     models_lock_path, _, _ = validate_artifact_ref(root, report.get("models_lock"), "scenario_report.models_lock", allowed_kinds={"raw-json"})
     require(file_sha256(models_lock_path) == report["models_lock_sha256"], "scenario_report models.lock binding mismatch")
-    validate_runner_identity(report.get("runner"), allow_internal_fixture=allow_internal_fixture)
+    runner_identity = validate_runner_identity(report.get("runner"), allow_internal_fixture=allow_internal_fixture)
+    if contract == G08_EXECUTION_CONTRACT and not allow_internal_fixture:
+        require(
+            runner_identity["git_sha"] == report["source_git_sha"],
+            "G08 candidate source SHA differs from its runner SHA",
+        )
     invocation_ref = report.get("executor_invocation")
     if not allow_internal_fixture or invocation_ref is not None:
         _, _, invocation_parsed = validate_artifact_ref(root, invocation_ref, "scenario_report.executor_invocation", allowed_kinds={"raw-json"})
         invocation = require_object(invocation_parsed, "scenario_report executor invocation JSON")
         require(invocation.get("runner_path") == RUNNER_REPO_PATH, "executor invocation runner path mismatch")
         require(invocation.get("runner_sha256") == report["runner"]["sha256"], "executor invocation runner SHA mismatch")
+        require(invocation.get("execution_contract", LEGACY_EXECUTION_CONTRACT) == contract, "executor invocation execution contract mismatch")
         require(invocation.get("mode") == "canonical", "canonical report was not produced by canonical executor mode")
         invocation_argv = require_list(invocation.get("argv"), "executor invocation argv")
         require(str(RUNNER_PATH) in invocation_argv and "--manifest" in invocation_argv and "--artifact-root" in invocation_argv and "--out" in invocation_argv, "executor invocation argv incomplete")
@@ -2199,7 +2401,12 @@ def validate_report_document(
         require(start_ns <= receipt_ns <= finish_ns, "executor invocation receipt monotonic time is outside invocation window")
         manifest_snapshot, _, _ = validate_artifact_ref(root, invocation.get("manifest_snapshot"), "executor invocation manifest snapshot", allowed_kinds={"raw-json"})
         require(file_sha256(manifest_snapshot) == invocation.get("manifest_sha256"), "executor invocation manifest SHA mismatch")
-        snapshot = validate_execution_manifest(require_object(read_json(manifest_snapshot), "executor invocation manifest snapshot"), root)
+        snapshot = validate_execution_manifest(
+            require_object(read_json(manifest_snapshot), "executor invocation manifest snapshot"),
+            root,
+            allow_internal_fixture=allow_internal_fixture,
+        )
+        require(snapshot["execution_contract"] == contract, "executor invocation manifest execution contract differs from report")
         for key in ("source_git_sha", "source_tree_sha", "models_lock_sha256", "binary_sha256", "model_key", "backend", "model_revision", "model_files", "hardware_id"):
             require(read_json(manifest_snapshot).get(key) == report.get(key), f"executor invocation manifest {key} differs from report")
         require(snapshot["execution"]["model_arg"] == report.get("model_path"), "executor invocation manifest model path differs from report")
@@ -2278,11 +2485,12 @@ def validate_report_document(
     _, _, pair_registry_raw = validate_artifact_ref(root, report.get("pair_registry"), "scenario_report.pair_registry", allowed_kinds={"raw-json"})
     expected_pair_registry = build_pair_registry(case_rows_by_scenario, model_key=model_key, backend=backend)
     require(pair_registry_raw == expected_pair_registry, "scenario_report pair registry is not derived from persisted paired inputs")
-    expected_pass_prefix = f"{PASS_PREFIX}: "
+    pass_prefix = pass_prefix_for_contract(contract)
+    expected_pass_prefix = f"{pass_prefix}: "
     pass_line = require_string(report.get("pass_line"), "scenario_report.pass_line")
     require(pass_line.startswith(expected_pass_prefix), f"scenario_report.pass_line must start with {expected_pass_prefix}")
     collected_path = require_string(report.get("artifact_path"), "scenario_report.artifact_path")
-    require(pass_line == f"{PASS_PREFIX}: {collected_path}", "scenario_report.pass_line does not match collected artifact path")
+    require(pass_line == f"{pass_prefix}: {collected_path}", "scenario_report.pass_line does not match collected artifact path")
     if require_current_output_path:
         require(report_path is not None, "current output path validation requires report_path")
         require(collected_path == str(report_path.resolve()), "scenario_report.artifact_path does not match current output path")
@@ -2307,9 +2515,11 @@ def collect_manifest(
     )
     report["schema_version"] = SCHEMA_VERSION
     report["status"] = "pass"
+    contract = execution_contract(report, "scenario report")
+    report["execution_contract"] = contract
     report["runner"] = internal_fixture_runner_identity() if allow_internal_fixture else canonical_runner_identity()
     report["artifact_path"] = str(out)
-    report["pass_line"] = f"{PASS_PREFIX}: {out}"
+    report["pass_line"] = f"{pass_prefix_for_contract(contract)}: {out}"
     attach_pair_registry(report, root)
     validate_report_document(
         report,
@@ -3265,6 +3475,225 @@ def c18_completion_summary(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def validate_c18_resource_balance_summary(
+    raw: Any,
+    *,
+    expected_request_count: int,
+    label: str,
+) -> dict[str, Any]:
+    summary = require_object(raw, label)
+    require(summary.get("schema_version") == SCHEMA_VERSION, f"{label}.schema_version mismatch")
+    require_count(summary.get("resource_event_count"), f"{label}.resource_event_count", minimum=1)
+    require(
+        require_count(summary.get("request_lifecycle_count"), f"{label}.request_lifecycle_count")
+        == expected_request_count,
+        f"{label}.request_lifecycle_count mismatch",
+    )
+    require_count(
+        summary.get("balanced_owner_resource_count"),
+        f"{label}.balanced_owner_resource_count",
+        minimum=expected_request_count * 2,
+    )
+    require_count(summary.get("defer_count"), f"{label}.defer_count")
+    for field in ("reject_count", "leaked_resource_count", "underflow_count"):
+        require(summary.get(field) == 0, f"{label}.{field} must be 0")
+    triplets = require_object(summary.get("resource_triplets"), f"{label}.resource_triplets")
+    require("request_slot" in triplets, f"{label} lacks request_slot accounting")
+    require(len(triplets) >= 2, f"{label} lacks non-request resource accounting")
+    for resource_kind, raw_counts in triplets.items():
+        counts = require_object(raw_counts, f"{label}.resource_triplets.{resource_kind}")
+        require(
+            set(counts) == {"reserve", "commit", "release", "rollback"},
+            f"{label}.resource_triplets.{resource_kind} fields mismatch",
+        )
+        for action, value in counts.items():
+            require_count(value, f"{label}.resource_triplets.{resource_kind}.{action}")
+        require(
+            counts["reserve"] == counts["release"] + counts["rollback"],
+            f"{label}.{resource_kind} reservation terminal balance mismatch",
+        )
+        require(
+            counts["commit"] == counts["release"],
+            f"{label}.{resource_kind} commit terminal balance mismatch",
+        )
+    request_slot = require_object(triplets["request_slot"], f"{label}.resource_triplets.request_slot")
+    require(
+        request_slot
+        == {
+            "reserve": expected_request_count,
+            "commit": expected_request_count,
+            "release": expected_request_count,
+            "rollback": 0,
+        },
+        f"{label}.request_slot does not cover every request exactly once",
+    )
+    return summary
+
+
+def c18_resource_balance(
+    trace_rows: list[dict[str, Any]],
+    *,
+    expected_request_count: int,
+) -> dict[str, Any]:
+    lifecycle_actions = {"reserve", "commit", "release", "rollback"}
+    states: dict[tuple[str, str, str], dict[str, int]] = {}
+    request_actions: dict[str, dict[str, int]] = {}
+    resource_summary: dict[str, dict[str, int]] = {}
+    resource_event_count = 0
+    defer_count = 0
+    reject_count = 0
+
+    def reserved_balance(state: dict[str, int]) -> int:
+        return state["reserved"] - state["released"] - state["rolled_back"]
+
+    def committed_balance(state: dict[str, int]) -> int:
+        return state["committed"] - state["released"]
+
+    for index, row in enumerate(trace_rows):
+        raw = require_object(row.get("raw", row), f"C18 resource trace[{index}].raw")
+        resource = raw.get("resource")
+        if not isinstance(resource, dict):
+            continue
+        resource_event_count += 1
+        require(raw.get("status") in {None, "ok"}, f"C18 resource trace[{index}] status is not ok")
+        require(raw.get("error") is None, f"C18 resource trace[{index}] contains an error")
+        request_id = require_string(raw.get("request_id"), f"C18 resource trace[{index}].request_id")
+        owner_kind = require_string(resource.get("owner_kind"), f"C18 resource trace[{index}].owner_kind")
+        owner_id = require_string(resource.get("owner_id"), f"C18 resource trace[{index}].owner_id")
+        resource_kind = require_string(resource.get("resource_kind"), f"C18 resource trace[{index}].resource_kind")
+        action = require_string(resource.get("action"), f"C18 resource trace[{index}].action")
+        require(
+            action
+            in {
+                "request_open",
+                "request_close",
+                "reserve",
+                "commit",
+                "release",
+                "rollback",
+                "defer",
+                "reject",
+                "capacity_snapshot",
+            },
+            f"C18 resource trace[{index}] action is invalid",
+        )
+        require(
+            resource.get("underflow_amount") in {None, 0}
+            and resource.get("error_kind") is None
+            and resource.get("resource_error_kind") is None,
+            f"C18 resource trace[{index}] contains underflow/error evidence",
+        )
+        if action in {"request_open", "request_close"}:
+            require(
+                owner_kind == "request" and owner_id == request_id and resource_kind == "request_slot",
+                f"C18 resource trace[{index}] request lifecycle identity mismatch",
+            )
+            counts = request_actions.setdefault(request_id, {"request_open": 0, "request_close": 0})
+            counts[action] += 1
+            if action == "request_close":
+                for (state_owner_kind, state_owner_id, state_resource_kind), state in states.items():
+                    if state_owner_kind == owner_kind and state_owner_id == owner_id:
+                        require(
+                            reserved_balance(state) == 0
+                            and committed_balance(state) == 0,
+                            f"C18 request {request_id} closed with outstanding {state_resource_kind}",
+                        )
+            continue
+        if action == "defer":
+            defer_count += 1
+            continue
+        if action == "reject":
+            reject_count += 1
+            continue
+        if action == "capacity_snapshot":
+            require_count(resource.get("capacity"), f"C18 resource trace[{index}].capacity", minimum=1)
+            continue
+        require(action in lifecycle_actions, f"C18 resource trace[{index}] lifecycle action invalid")
+        amount = require_count(resource.get("amount"), f"C18 resource trace[{index}].amount", minimum=1)
+        before = require_count(resource.get("before"), f"C18 resource trace[{index}].before")
+        after = require_count(resource.get("after"), f"C18 resource trace[{index}].after")
+        key = (owner_kind, owner_id, resource_kind)
+        state = states.setdefault(
+            key,
+            {"reserved": 0, "committed": 0, "released": 0, "rolled_back": 0},
+        )
+        if action == "reserve":
+            expected_before = reserved_balance(state)
+            state["reserved"] += amount
+            expected_after = reserved_balance(state)
+        elif action == "commit":
+            expected_before = committed_balance(state)
+            state["committed"] += amount
+            expected_after = committed_balance(state)
+            require(
+                committed_balance(state) <= reserved_balance(state),
+                f"C18 commit exceeds live reserve for {key}",
+            )
+        elif action == "release":
+            expected_before = committed_balance(state)
+            require(amount <= expected_before, f"C18 release underflow for {key}")
+            require(amount <= reserved_balance(state), f"C18 release exceeds live reserve for {key}")
+            state["released"] += amount
+            expected_after = committed_balance(state)
+        else:
+            expected_before = reserved_balance(state)
+            require(
+                amount <= expected_before - committed_balance(state),
+                f"C18 rollback exceeds uncommitted reserve for {key}",
+            )
+            state["rolled_back"] += amount
+            expected_after = reserved_balance(state)
+        require(
+            before == expected_before and after == expected_after,
+            f"C18 resource transition mismatch for {key}: expected {expected_before}->{expected_after}, got {before}->{after}",
+        )
+        capacity = resource.get("capacity")
+        if capacity is not None:
+            capacity = require_count(capacity, f"C18 resource trace[{index}].capacity", minimum=1)
+            global_outstanding = sum(
+                max(reserved_balance(candidate), 0)
+                for candidate_key, candidate in states.items()
+                if candidate_key[2] == resource_kind
+            )
+            require(global_outstanding <= capacity, f"C18 {resource_kind} exceeds typed capacity")
+        bucket = resource_summary.setdefault(
+            resource_kind,
+            {"reserve": 0, "commit": 0, "release": 0, "rollback": 0},
+        )
+        bucket[action] += amount
+
+    require(resource_event_count > 0, "C18 scheduler trace contains no resource events")
+    require(
+        len(request_actions) == expected_request_count
+        and all(counts == {"request_open": 1, "request_close": 1} for counts in request_actions.values()),
+        "C18 request resource lifecycle coverage is incomplete",
+    )
+    require(reject_count == 0, "C18 resource trace contains a rejected request")
+    require("request_slot" in resource_summary, "C18 resource trace lacks request-slot accounting")
+    require(len(resource_summary) >= 2, "C18 resource trace lacks non-request resource accounting")
+    for key, state in states.items():
+        require(
+            reserved_balance(state) == 0 and committed_balance(state) == 0,
+            f"C18 resource trace ended with outstanding resources for {key}",
+        )
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "resource_event_count": resource_event_count,
+        "request_lifecycle_count": len(request_actions),
+        "balanced_owner_resource_count": len(states),
+        "defer_count": defer_count,
+        "reject_count": reject_count,
+        "leaked_resource_count": 0,
+        "underflow_count": 0,
+        "resource_triplets": dict(sorted(resource_summary.items())),
+    }
+    return validate_c18_resource_balance_summary(
+        summary,
+        expected_request_count=expected_request_count,
+        label="C18 resource balance",
+    )
+
+
 def c18_runtime_failure_summary(evidence: Any) -> dict[str, int]:
     item = require_object(evidence, "C18 runtime log evidence")
     text = item.get("text")
@@ -3300,13 +3729,25 @@ def c18_fixture_trace_rows(
     rows: list[dict[str, Any]] = []
     timestamp = 1_000_000_000
 
-    def append_event(request_index: int, phase: str, active: int) -> None:
+    def append_event(
+        request_index: int,
+        phase: str,
+        active: int,
+        resource: dict[str, Any],
+    ) -> None:
         nonlocal timestamp
         request_id = f"{case_id}-request-{request_index:03d}"
         event = {
             "event_id": f"fixture-{phase}-{request_id}",
             "phase": phase,
             "request_id": request_id,
+            "status": "ok",
+            "error": None,
+            "resource": {
+                "owner_kind": "request",
+                "owner_id": request_id,
+                **resource,
+            },
             "attributes": {
                 "monotonic_nanos": timestamp,
                 "active_sequence_count": active,
@@ -3323,17 +3764,57 @@ def c18_fixture_trace_rows(
         timestamp += 1_000
 
     for request_index in range(requested_concurrency):
+        active = min(request_index + 1, typed_active_cap)
         append_event(
             request_index,
             "engine_request_open",
-            min(request_index + 1, typed_active_cap),
+            active,
+            {"resource_kind": "request_slot", "action": "request_open"},
+        )
+        append_event(
+            request_index,
+            "engine_request_slot_reserve",
+            active,
+            {"resource_kind": "request_slot", "action": "reserve", "amount": 1, "before": 0, "after": 1},
+        )
+        append_event(
+            request_index,
+            "engine_request_slot_commit",
+            active,
+            {"resource_kind": "request_slot", "action": "commit", "amount": 1, "before": 0, "after": 1},
+        )
+        append_event(
+            request_index,
+            "plan_runtime_workspace_reserve",
+            active,
+            {"resource_kind": "backend_workspace", "action": "reserve", "amount": 1, "before": 0, "after": 1, "capacity": typed_active_cap},
+        )
+        append_event(
+            request_index,
+            "plan_runtime_workspace_commit",
+            active,
+            {"resource_kind": "backend_workspace", "action": "commit", "amount": 1, "before": 0, "after": 1, "capacity": typed_active_cap},
+        )
+        append_event(
+            request_index,
+            "plan_runtime_workspace_release",
+            active,
+            {"resource_kind": "backend_workspace", "action": "release", "amount": 1, "before": 1, "after": 0, "capacity": typed_active_cap},
         )
     timestamp += 1_000_000
     for request_index in range(requested_concurrency):
+        active = min(requested_concurrency - request_index, typed_active_cap)
+        append_event(
+            request_index,
+            "engine_request_slot_release",
+            active,
+            {"resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0},
+        )
         append_event(
             request_index,
             "engine_request_close",
             min(requested_concurrency - request_index - 1, typed_active_cap),
+            {"resource_kind": "request_slot", "action": "request_close"},
         )
     return rows
 
@@ -3915,6 +4396,7 @@ def serve_case_request(
     server: ProductServer,
     scheduler_trace_path: Path,
     effective_config_path: Path,
+    require_c18_resource_balance: bool,
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
     payload = case_http_payload(case, case["model_key"])
@@ -4160,6 +4642,11 @@ def serve_case_request(
             )
         except ActiveTimelineError as exc:
             active_timeline_error = str(exc)
+        resource_balance = (
+            c18_resource_balance(trace_rows, expected_request_count=requested)
+            if require_c18_resource_balance
+            else None
+        )
         observed.update(
             {
                 "requested_concurrency": requested,
@@ -4171,6 +4658,7 @@ def serve_case_request(
                 "active_timeline": active_timeline,
                 "active_timeline_error": active_timeline_error,
                 "request_identities": concurrency_identities,
+                **({"resource_balance": resource_balance} if require_c18_resource_balance else {}),
                 **completion,
                 **isolation,
                 **runtime_failures,
@@ -4193,6 +4681,7 @@ def classify_execution_outcome(
     input_path: Path,
     actual_config_path: Path,
     artifact_root: Path,
+    require_c18_resource_balance: bool,
 ) -> tuple[str, str | None, str | None]:
     if returncode != 0:
         stderr_text = (stdout_path.parent / "stderr.log").read_text(encoding="utf-8", errors="replace").lower()
@@ -4212,6 +4701,7 @@ def classify_execution_outcome(
             input_document=read_json(input_path),
             actual_config=read_json(actual_config_path),
             artifact_root=artifact_root,
+            require_c18_resource_balance=require_c18_resource_balance,
         )
     )
     if output_error is not None:
@@ -4314,9 +4804,18 @@ def validate_local_model_arg(raw: Any, weight_files: dict[str, str], label: str)
     return supplied
 
 
-def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
+def validate_execution_manifest(
+    manifest: dict[str, Any],
+    root: Path,
+    *,
+    allow_internal_fixture: bool = False,
+) -> dict[str, Any]:
     require(not ({"runner", "commands", "scenarios", "pass_line", "status", "artifact_path"} & set(manifest)), "execution manifest must not contain prebuilt report fields")
-    validate_source_identity(manifest, "execution_manifest")
+    contract = validate_source_identity(
+        manifest,
+        "execution_manifest",
+        allow_internal_fixture=allow_internal_fixture,
+    )
     for key in ("model_key", "backend", "model_revision", "hardware_id"):
         require_string(manifest.get(key), f"execution_manifest.{key}")
     require(manifest["model_key"] in {"m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}, "execution manifest model_key invalid")
@@ -4332,7 +4831,13 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
     require(file_sha256(binary_path) == require_sha256(manifest.get("binary_sha256"), "execution_manifest.binary_sha256"), "execution manifest binary SHA mismatch")
     require(file_sha256(models_lock_path) == require_sha256(manifest.get("models_lock_sha256"), "execution_manifest.models_lock_sha256"), "execution manifest models.lock SHA mismatch")
     effective_path, _, effective = validate_artifact_ref(root, manifest.get("effective_config"), "execution_manifest.effective_config", allowed_kinds={"raw-json"})
-    require_object(effective, "execution_manifest effective config")
+    effective_document = require_object(effective, "execution_manifest effective config")
+    effective_contract = validate_source_identity(
+        effective_document,
+        "execution_manifest effective config",
+        allow_internal_fixture=allow_internal_fixture,
+    )
+    require(effective_contract == contract, "execution manifest effective config contract mismatch")
     execution = require_object(manifest.get("execution"), "execution_manifest.execution")
     require(set(execution) >= {"model_arg", "semantic_source_root", "host", "port", "startup_timeout_sec", "case_timeout_sec", "run_extra_args", "serve_extra_args"}, "execution manifest execution fields incomplete")
     require_string(execution.get("model_arg"), "execution_manifest.execution.model_arg")
@@ -4356,6 +4861,7 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
     else:
         tokenizer_root = validate_local_source_root(execution.get("tokenizer_source_root"), sources["tokenizer_source"], "execution_manifest.execution.tokenizer_source_root")
     return {
+        "execution_contract": contract,
         "binary_path": binary_path,
         "models_lock_path": models_lock_path,
         "effective_path": effective_path,
@@ -4380,15 +4886,40 @@ def execute_manifest(
     require(discovery_scenario in {None, "C03"}, "only the versioned C03 contract supports scoped discovery")
     root = root.resolve()
     out = out.resolve()
-    validated = validate_execution_manifest(manifest, root)
+    validated = validate_execution_manifest(
+        manifest,
+        root,
+        allow_internal_fixture=allow_internal_fixture,
+    )
+    contract = validated["execution_contract"]
+    require(
+        contract == LEGACY_EXECUTION_CONTRACT or not discover,
+        "G08 candidate execution does not support discovery mode",
+    )
     lane_root = root / "correctness" / manifest["model_key"] / manifest["backend"]
     executor_root = lane_root / "commands"
-    catalog = internal_expectations_catalog() if allow_internal_fixture else validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
-    catalog_bytes = (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8") if allow_internal_fixture else EXPECTATIONS_PATH.read_bytes()
-    expectations_path = root / "legacy-correctness-expectations.json"
+    if contract == G08_EXECUTION_CONTRACT:
+        catalog_bytes = candidate_expectations_bytes(manifest["source_git_sha"])
+        catalog = validate_expectations_catalog(
+            require_object(json.loads(catalog_bytes), "candidate expectations catalog"),
+            expected_contract=contract,
+        )
+        expectations_name = "g08-model-matrix-expectations.json"
+    elif allow_internal_fixture:
+        catalog = internal_expectations_catalog()
+        catalog_bytes = (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        expectations_name = "legacy-correctness-expectations.json"
+    else:
+        catalog = validate_expectations_catalog(
+            read_json(EXPECTATIONS_PATH),
+            expected_contract=contract,
+        )
+        catalog_bytes = EXPECTATIONS_PATH.read_bytes()
+        expectations_name = "legacy-correctness-expectations.json"
+    expectations_path = root / expectations_name
     expectations_path.write_bytes(catalog_bytes)
     expectations_sha = file_sha256(expectations_path)
-    if not allow_internal_fixture:
+    if not allow_internal_fixture and contract == LEGACY_EXECUTION_CONTRACT:
         require(expectations_sha == canonical_expectations_sha256(), "execution used a non-canonical expectations catalog")
     rows = planned_case_rows(manifest["model_key"], manifest["backend"], catalog)
     if discovery_scenario is not None:
@@ -4430,6 +4961,7 @@ def execute_manifest(
         role="scenario-executor",
     )
     invocation = {
+        "execution_contract": contract,
         "runner_path": RUNNER_REPO_PATH,
         "runner_sha256": file_sha256(RUNNER_PATH),
         "argv": invocation_argv,
@@ -4570,6 +5102,7 @@ def execute_manifest(
                     server=server,
                     scheduler_trace_path=active_serve_session["scheduler_trace"],
                     effective_config_path=active_serve_session["config"],
+                    require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
                 )
                 actual_config = active_serve_session["config"]
                 execution_process_receipt = invocation_process_receipt
@@ -4606,6 +5139,7 @@ def execute_manifest(
                 input_path=input_path,
                 actual_config_path=actual_config,
                 artifact_root=root,
+                require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
             )
             expectation = row["expectation"]
             if not discover:
@@ -4833,6 +5367,11 @@ def execute_manifest(
                     "observed_max_active": case["observed"]["observed_max_active"],
                     "active_timeline": case["observed"]["active_timeline"],
                     "active_timeline_error": case["observed"]["active_timeline_error"],
+                    **(
+                        {"resource_balance": case["observed"]["resource_balance"]}
+                        if contract == G08_EXECUTION_CONTRACT
+                        else {}
+                    ),
                     **{
                         field: case["observed"][field]
                         for field in (
@@ -4879,6 +5418,7 @@ def execute_manifest(
     report = {
         **{key: manifest[key] for key in ("source_git_sha", "source_tree_sha", "dirty_status", "models_lock_sha256", "binary_sha256", "model_key", "backend", "model_revision", "model_files", "hardware_id", "binary_artifact", "models_lock", "effective_config")},
         "schema_version": SCHEMA_VERSION,
+        "execution_contract": contract,
         "status": "pass",
         "model_path": execution["model_arg"],
         "runner": internal_fixture_runner_identity() if allow_internal_fixture else canonical_runner_identity(),
@@ -4888,7 +5428,7 @@ def execute_manifest(
         "commands": commands,
         "scenarios": scenarios,
         "artifact_path": str(out),
-        "pass_line": f"{PASS_PREFIX}: {out}",
+        "pass_line": f"{pass_prefix_for_contract(contract)}: {out}",
     }
     attach_pair_registry(report, root)
     validate_report_document(report, root, report_path=out, allow_internal_fixture=allow_internal_fixture, require_current_output_path=True)
@@ -6013,7 +6553,7 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         return
 
-    def trace(self, request_id, phase):
+    def trace(self, request_id, phase, resource):
         if self.trace_path is None:
             return
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6022,6 +6562,13 @@ class Server(ThreadingHTTPServer):
             "event_id": f"fixture-{phase}-{request_id}-{monotonic_nanos}",
             "phase": phase,
             "request_id": request_id,
+            "status": "ok",
+            "error": None,
+            "resource": {
+                "owner_kind": "request",
+                "owner_id": request_id,
+                **resource,
+            },
             "attributes": {
                 "monotonic_nanos": monotonic_nanos,
                 "active_sequence_count": self.active,
@@ -6034,12 +6581,18 @@ class Server(ThreadingHTTPServer):
     def request_started(self, request_id):
         with self.trace_lock:
             self.active += 1
-            self.trace(request_id, "engine_request_open")
+            self.trace(request_id, "engine_request_open", {"resource_kind": "request_slot", "action": "request_open"})
+            self.trace(request_id, "engine_request_slot_reserve", {"resource_kind": "request_slot", "action": "reserve", "amount": 1, "before": 0, "after": 1})
+            self.trace(request_id, "engine_request_slot_commit", {"resource_kind": "request_slot", "action": "commit", "amount": 1, "before": 0, "after": 1})
+            self.trace(request_id, "plan_runtime_workspace_reserve", {"resource_kind": "backend_workspace", "action": "reserve", "amount": 1, "before": 0, "after": 1, "capacity": 32})
+            self.trace(request_id, "plan_runtime_workspace_commit", {"resource_kind": "backend_workspace", "action": "commit", "amount": 1, "before": 0, "after": 1, "capacity": 32})
 
     def request_finished(self, request_id):
         with self.trace_lock:
+            self.trace(request_id, "plan_runtime_workspace_release", {"resource_kind": "backend_workspace", "action": "release", "amount": 1, "before": 1, "after": 0, "capacity": 32})
+            self.trace(request_id, "engine_request_slot_release", {"resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0})
             self.active = max(0, self.active - 1)
-            self.trace(request_id, "engine_request_close")
+            self.trace(request_id, "engine_request_close", {"resource_kind": "request_slot", "action": "request_close"})
 
 
 def serve_mode(argv):
@@ -6675,6 +7228,7 @@ def self_test() -> int:
         except ScenarioError as exc:
             require(
                 "expectations catalog is not the checked-in contract" in str(exc)
+                or "expectations catalog is not the canonical execution contract" in str(exc)
                 or "legacy expectations differ from checked-in blob" in str(exc)
                 or "fixture runner is forbidden" in str(exc)
                 or "exists on disk, but not in 'HEAD'" in str(exc),
@@ -6704,13 +7258,83 @@ def self_test() -> int:
         else:
             raise AssertionError("execution manifest accepted mutated model bytes")
         fixture_weight.write_bytes(fixture_weight_bytes)
+        candidate_catalog = validate_expectations_catalog(
+            candidate_expectations_catalog(FROZEN_LEGACY_SHA),
+            expected_contract=G08_EXECUTION_CONTRACT,
+        )
+        candidate_rows = planned_case_rows(
+            "m2-qwen35-35b-a3b",
+            "cuda",
+            candidate_catalog,
+        )
+        require(
+            len(candidate_rows) == 703
+            and {row["expectation"]["expected_status"] for row in candidate_rows} == {"pass"},
+            "G08 candidate catalog does not require all 703 M2 CUDA cases to pass",
+        )
+        hostile_candidate_catalog = copy.deepcopy(candidate_catalog)
+        hostile_candidate_catalog["lanes"]["m2-qwen35-35b-a3b/cuda"]["rules"][0].update(
+            {
+                "expected_status": "known-fail",
+                "failure_class": "c18-contract-violation",
+            }
+        )
+        try:
+            validate_expectations_catalog(
+                hostile_candidate_catalog,
+                expected_contract=G08_EXECUTION_CONTRACT,
+            )
+        except ScenarioError as exc:
+            require(
+                "candidate expectation must declare pass" in str(exc),
+                f"G08 candidate known-fail mutation used unexpected rejection: {exc}",
+            )
+        else:
+            raise AssertionError("G08 candidate catalog accepted a known-fail expectation")
+        candidate_manifest = copy.deepcopy(execution_manifest)
+        candidate_manifest["execution_contract"] = G08_EXECUTION_CONTRACT
+        candidate_effective_path = execution_root / "candidate-effective-config.json"
+        candidate_effective = read_json(
+            execution_root / candidate_manifest["effective_config"]["path"]
+        )
+        candidate_effective["execution_contract"] = G08_EXECUTION_CONTRACT
+        write_json(candidate_effective_path, candidate_effective)
+        candidate_manifest["effective_config"] = existing_artifact_ref(
+            execution_root,
+            candidate_effective_path,
+            "raw-json",
+        )
+        validated_candidate = validate_execution_manifest(
+            candidate_manifest,
+            execution_root,
+            allow_internal_fixture=True,
+        )
+        require(
+            validated_candidate["execution_contract"] == G08_EXECUTION_CONTRACT,
+            "G08 candidate execution manifest lost its explicit contract",
+        )
+        try:
+            execute_manifest(
+                candidate_manifest,
+                execution_root,
+                execution_root / "candidate-discovery.json",
+                discover=True,
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require(
+                "does not support discovery mode" in str(exc),
+                f"G08 candidate discovery mutation used unexpected rejection: {exc}",
+            )
+        else:
+            raise AssertionError("G08 candidate execution accepted discovery mode")
         execution_out = execution_root / "correctness/m3-qwen3-30b-a3b/cuda/scenario-report.json"
         hostile_key = "FERRUM_HOSTILE_PARENT_SWITCH"
         previous_hostile = os.environ.get(hostile_key)
         os.environ[hostile_key] = "must-not-reach-product"
         try:
             execution_report = execute_manifest(
-                execution_manifest,
+                candidate_manifest,
                 execution_root,
                 execution_out,
                 discover=False,
@@ -7116,6 +7740,37 @@ def self_test() -> int:
             expect_execution_report_reject(mutation_root, candidate, "timeline max-active mismatch")
             rejected_mutations.add("c18-fabricated-max-active")
 
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c18-resource-release") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(
+                candidate,
+                mutation_root,
+                scenario_index=17,
+                case_index=3,
+            )
+            envelope = read_json(envelope_path)
+            transcript = read_json(mutation_root / case["artifacts"]["http_transcript"]["path"])
+            release_row = next(
+                row
+                for row in transcript["scheduler_trace_rows"]
+                if row["raw"].get("resource", {}).get("resource_kind") == "request_slot"
+                and row["raw"].get("resource", {}).get("action") == "release"
+            )
+            release_row["raw"]["resource"]["after"] = 1
+            release_row["raw_sha256"] = canonical_json_sha256(release_row["raw"])
+            persist_transcript_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path,
+                envelope,
+                transcript,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "resource transition mismatch")
+            rejected_mutations.add("c18-forged-resource-release")
+
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-invocation-time") as (mutation_root, candidate):
             invocation_path = mutation_root / candidate["executor_invocation"]["path"]
             invocation = read_json(invocation_path)
@@ -7366,6 +8021,7 @@ def self_test() -> int:
             "escaped-product-process-group",
             "c09-missing-scheduler-trace",
             "c18-fabricated-max-active",
+            "c18-forged-resource-release",
             "invocation-disjoint-time",
             "unrelated-manifest-snapshot",
             "wrong-product-argv-model",
