@@ -41,12 +41,23 @@ except ModuleNotFoundError:
         derive_active_timeline,
     )
 
+try:
+    from jsonl_product_session import JsonlProductSession, JsonlSessionError, SessionCase
+except ModuleNotFoundError:
+    from scripts.release.jsonl_product_session import (
+        JsonlProductSession,
+        JsonlSessionError,
+        SessionCase,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = Path(__file__).resolve()
 RUNNER_REPO_PATH = RUNNER_PATH.relative_to(REPO_ROOT).as_posix()
 ACTIVE_TIMELINE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_active_timeline.py"
 ACTIVE_TIMELINE_REPO_PATH = ACTIVE_TIMELINE_PATH.relative_to(REPO_ROOT).as_posix()
+JSONL_SESSION_PATH = REPO_ROOT / "scripts/release/jsonl_product_session.py"
+JSONL_SESSION_REPO_PATH = JSONL_SESSION_PATH.relative_to(REPO_ROOT).as_posix()
 EXPECTATIONS_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json"
 EXPECTATIONS_REPO_PATH = EXPECTATIONS_PATH.relative_to(REPO_ROOT).as_posix()
 FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
@@ -605,28 +616,36 @@ def canonical_runner_identity() -> dict[str, Any]:
     blob_sha = require_git_sha(git_text(["rev-parse", f"HEAD:{RUNNER_REPO_PATH}"]), "runner.git_blob_sha")
     checked_in = git_bytes(["show", f"HEAD:{RUNNER_REPO_PATH}"])
     require(checked_in == RUNNER_PATH.read_bytes(), "scenario runner differs from its checked-in blob")
-    dependency_blob_sha = require_git_sha(
-        git_text(["rev-parse", f"HEAD:{ACTIVE_TIMELINE_REPO_PATH}"]),
-        "runner.dependencies[0].git_blob_sha",
-    )
-    dependency_checked_in = git_bytes(["show", f"HEAD:{ACTIVE_TIMELINE_REPO_PATH}"])
-    require(
-        dependency_checked_in == ACTIVE_TIMELINE_PATH.read_bytes(),
-        "active timeline dependency differs from its checked-in blob",
-    )
+    dependencies = []
+    for index, (path, repo_path) in enumerate(
+        (
+            (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
+            (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
+        )
+    ):
+        dependency_blob_sha = require_git_sha(
+            git_text(["rev-parse", f"HEAD:{repo_path}"]),
+            f"runner.dependencies[{index}].git_blob_sha",
+        )
+        dependency_checked_in = git_bytes(["show", f"HEAD:{repo_path}"])
+        require(
+            dependency_checked_in == path.read_bytes(),
+            f"runner dependency {repo_path} differs from its checked-in blob",
+        )
+        dependencies.append(
+            {
+                "path": repo_path,
+                "git_blob_sha": dependency_blob_sha,
+                "sha256": hashlib.sha256(dependency_checked_in).hexdigest(),
+            }
+        )
     return {
         "path": RUNNER_REPO_PATH,
         "git_sha": git_sha,
         "source_tree_sha": tree_sha,
         "git_blob_sha": blob_sha,
         "sha256": hashlib.sha256(checked_in).hexdigest(),
-        "dependencies": [
-            {
-                "path": ACTIVE_TIMELINE_REPO_PATH,
-                "git_blob_sha": dependency_blob_sha,
-                "sha256": hashlib.sha256(dependency_checked_in).hexdigest(),
-            }
-        ],
+        "dependencies": dependencies,
         "dirty_status": {"is_dirty": False, "status_short": []},
     }
 
@@ -640,10 +659,14 @@ def internal_fixture_runner_identity() -> dict[str, Any]:
         "sha256": file_sha256(RUNNER_PATH),
         "dependencies": [
             {
-                "path": ACTIVE_TIMELINE_REPO_PATH,
+                "path": path,
                 "git_blob_sha": "0" * 40,
-                "sha256": file_sha256(ACTIVE_TIMELINE_PATH),
+                "sha256": file_sha256(file_path),
             }
+            for file_path, path in (
+                (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
+                (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
+            )
         ],
         "dirty_status": {"is_dirty": False, "status_short": []},
         "internal_fixture": True,
@@ -956,32 +979,43 @@ def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[
     require(runner.get("sha256") == expected_sha256, "scenario_report runner SHA256 mismatch")
     require(file_sha256(RUNNER_PATH) == expected_sha256, "scenario_report runner does not match the current gate contract")
     dependencies = require_list(runner.get("dependencies"), "scenario_report.runner.dependencies")
-    require(len(dependencies) == 1, "scenario_report runner must bind exactly one dependency")
-    dependency = require_object(dependencies[0], "scenario_report.runner.dependencies[0]")
-    require(
-        dependency.get("path") == ACTIVE_TIMELINE_REPO_PATH,
-        "scenario_report runner active timeline dependency path mismatch",
-    )
-    dependency_blob = require_git_sha(
-        git_text(["rev-parse", f"{runner_git_sha}:{ACTIVE_TIMELINE_REPO_PATH}"]),
-        "scenario_report.runner.dependencies[0].git_blob_sha",
+    expected_dependencies = (
+        (ACTIVE_TIMELINE_REPO_PATH, ACTIVE_TIMELINE_PATH),
+        (JSONL_SESSION_REPO_PATH, JSONL_SESSION_PATH),
     )
     require(
-        dependency.get("git_blob_sha") == dependency_blob,
-        "scenario_report runner active timeline dependency git blob mismatch",
+        len(dependencies) == len(expected_dependencies),
+        "scenario_report runner dependency count mismatch",
     )
-    dependency_checked_in = git_bytes(
-        ["show", f"{runner_git_sha}:{ACTIVE_TIMELINE_REPO_PATH}"]
-    )
-    dependency_sha256 = hashlib.sha256(dependency_checked_in).hexdigest()
-    require(
-        dependency.get("sha256") == dependency_sha256,
-        "scenario_report runner active timeline dependency SHA256 mismatch",
-    )
-    require(
-        file_sha256(ACTIVE_TIMELINE_PATH) == dependency_sha256,
-        "scenario_report active timeline dependency does not match the current gate contract",
-    )
+    for index, ((repo_path, local_path), dependency_raw) in enumerate(
+        zip(expected_dependencies, dependencies, strict=True)
+    ):
+        dependency = require_object(
+            dependency_raw,
+            f"scenario_report.runner.dependencies[{index}]",
+        )
+        require(
+            dependency.get("path") == repo_path,
+            f"scenario_report runner dependency {index} path mismatch",
+        )
+        dependency_blob = require_git_sha(
+            git_text(["rev-parse", f"{runner_git_sha}:{repo_path}"]),
+            f"scenario_report.runner.dependencies[{index}].git_blob_sha",
+        )
+        require(
+            dependency.get("git_blob_sha") == dependency_blob,
+            f"scenario_report runner dependency {index} git blob mismatch",
+        )
+        dependency_checked_in = git_bytes(["show", f"{runner_git_sha}:{repo_path}"])
+        dependency_sha256 = hashlib.sha256(dependency_checked_in).hexdigest()
+        require(
+            dependency.get("sha256") == dependency_sha256,
+            f"scenario_report runner dependency {index} SHA256 mismatch",
+        )
+        require(
+            file_sha256(local_path) == dependency_sha256,
+            f"scenario_report runner dependency {index} does not match current gate contract",
+        )
     return runner
 
 
@@ -1035,6 +1069,38 @@ def validate_command(
     require(len(argv) >= 3 and all(isinstance(part, str) and part for part in argv), f"{label}.argv must include ferrum, entrypoint, and model/config args")
     require(Path(argv[0]).name == "ferrum", f"{label}.argv must execute ferrum")
     require(argv[1] == entrypoint, f"{label}.argv must have exact ferrum {entrypoint} command shape")
+    execution_mode = command.get("execution_mode")
+    resident_mode = entrypoint == "run" and execution_mode == "resident-jsonl"
+    if expected.get("execution_contract") == G08_EXECUTION_CONTRACT and entrypoint == "run":
+        require(resident_mode, f"{label} G08 run command must use resident-jsonl")
+    if resident_mode:
+        group_key = require_list(command.get("group_key"), f"{label}.group_key")
+        require(all(isinstance(value, str) and value for value in group_key), f"{label}.group_key must contain non-empty strings")
+        case_count = require_count(command.get("case_count"), f"{label}.case_count", minimum=1)
+        case_ids = require_list(command.get("case_ids"), f"{label}.case_ids")
+        require(
+            len(case_ids) == case_count
+            and len(set(case_ids)) == case_count
+            and all(isinstance(value, str) and CASE_ID_RE.fullmatch(value) for value in case_ids),
+            f"{label}.case_ids must be unique canonical case ids",
+        )
+        preset_aliases = require_list(command.get("preset_aliases"), f"{label}.preset_aliases")
+        require(
+            preset_aliases == sorted(set(preset_aliases))
+            and all(value in {"<none>", "P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"} for value in preset_aliases),
+            f"{label}.preset_aliases invalid",
+        )
+        validate_artifact_ref(
+            root,
+            command.get("wire_receipt"),
+            f"{label}.wire_receipt",
+            allowed_kinds={"raw-json"},
+        )
+    else:
+        require(
+            not ({"group_key", "case_count", "case_ids", "preset_aliases", "wire_receipt"} & set(command)),
+            f"{label} non-resident command contains resident metadata",
+        )
     if "binary_path" in expected:
         require(Path(argv[0]).resolve() == expected["binary_path"], f"{label}.argv binary is not the bound binary artifact")
         require(argv[2] == expected.get("model_path"), f"{label}.argv model path is not the bound execution model")
@@ -1442,13 +1508,26 @@ def validate_case_output(
         if scenario_id == "C19":
             require(len(assistants) == 2, f"{label} thinking run must carry a two-turn history")
             users = [row for row in rows if row.get("event") == "user"]
-            require(len(users) == 2 and [row.get("turn") for row in users] == [1, 2], f"{label} thinking run history turns are incomplete")
+            require(len(users) == 2 and [row.get("turn") for row in users] == [0, 1], f"{label} thinking run history turns are incomplete")
+            require([row.get("turn") for row in assistants] == [0, 1], f"{label} thinking assistant turn sequence is incomplete")
             reasoning_expected = bool(observed.get("reasoning_expected"))
             for index, assistant in enumerate(assistants):
                 reasoning = assistant.get("reasoning")
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} assistant[{index}] reasoning mode mismatch")
                 require("<think>" not in str(assistant.get("content")) and "</think>" not in str(assistant.get("content")), f"{label} reasoning leaked into final content")
-            require(assistants[1].get("history_turns_seen") == 1, f"{label} second thinking turn did not carry prior assistant history")
+            for record_label, record, expected_messages, expected_turns in (
+                ("first user", users[0], 0, 0),
+                ("first assistant", assistants[0], 0, 0),
+                ("second user", users[1], 2, 1),
+                ("second assistant", assistants[1], 2, 1),
+            ):
+                history = require_object(record.get("history_before"), f"{label}.{record_label}.history_before")
+                require(
+                    history.get("message_count") == expected_messages
+                    and history.get("turn_count") == expected_turns,
+                    f"{label} {record_label} did not carry the real product history contract",
+                )
+                require_sha256(history.get("sha256"), f"{label}.{record_label}.history_before.sha256")
         if scenario_id == "C17":
             expected_text = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
             require(assistants[-1].get("content") == expected_text, f"{label} Unicode run content mismatch")
@@ -1760,6 +1839,132 @@ def scheduler_success_derivation_required(case_status: str) -> bool:
     return case_status == "pass"
 
 
+def validate_resident_case_receipt(
+    root: Path,
+    raw_ref: Any,
+    *,
+    case: dict[str, Any],
+    command_id: str,
+    argv: list[str],
+    input_path: Path,
+    stdout_path: Path,
+) -> dict[str, Any]:
+    case_id = require_string(case.get("case_id"), "resident case id")
+    _, _, parsed = validate_artifact_ref(
+        root,
+        raw_ref,
+        f"case {case_id}.resident_case_receipt",
+        allowed_kinds={"raw-json"},
+    )
+    receipt = require_object(parsed, f"case {case_id}.resident_case_receipt JSON")
+    require(receipt.get("schema_version") == SCHEMA_VERSION, f"case {case_id} resident receipt schema mismatch")
+    require(receipt.get("transport") == "resident-jsonl-v1", f"case {case_id} resident transport mismatch")
+    require(receipt.get("case_id") == case_id, f"case {case_id} resident receipt binding mismatch")
+    require(receipt.get("command_id") == command_id, f"case {case_id} resident command binding mismatch")
+    require(receipt.get("argv_sha256") == canonical_json_sha256(argv), f"case {case_id} resident argv binding mismatch")
+    prompt_descriptor = {
+        "case_id": case_id,
+        "scenario_id": case["scenario_id"],
+        "ordinal": case["ordinal"],
+        "variant": case["variant"],
+        "preset": case.get("preset"),
+        "model_key": case["model_identity"]["model_key"],
+    }
+    prompts = run_case_prompts(prompt_descriptor)
+    require(receipt.get("prompts") == prompts, f"case {case_id} resident prompts mismatch")
+    require(receipt.get("prompts_sha256") == canonical_json_sha256(prompts), f"case {case_id} resident prompt SHA mismatch")
+    require(receipt.get("stdout_sha256") == file_sha256(stdout_path), f"case {case_id} resident stdout SHA mismatch")
+    require(receipt.get("input_sha256") == file_sha256(input_path), f"case {case_id} resident input SHA mismatch")
+    ready_receipt = require_object(receipt.get("ready_event"), f"case {case_id}.resident.ready_event")
+    require(ready_receipt.get("event") == "ready", f"case {case_id} resident ready event missing")
+    session_id = require_string(ready_receipt.get("session_id"), f"case {case_id}.resident.session_id")
+    require(ready_receipt.get("history_epoch") == 0, f"case {case_id} resident ready epoch mismatch")
+    case_receipt = require_object(receipt.get("case"), f"case {case_id}.resident.case")
+    started_ns = require_count(case_receipt.get("started_monotonic_ns"), f"case {case_id}.resident.started", minimum=1)
+    finished_ns = require_count(case_receipt.get("finished_monotonic_ns"), f"case {case_id}.resident.finished", minimum=1)
+    require(finished_ns > started_ns, f"case {case_id} resident monotonic window invalid")
+    duration = case_receipt.get("duration_sec")
+    require(
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration > 0
+        and abs(float(duration) - (finished_ns - started_ns) / 1e9) <= max(0.05, float(duration) * 0.05),
+        f"case {case_id} resident duration mismatch",
+    )
+    read_start = require_count(case_receipt.get("wire_read_start"), f"case {case_id}.resident.wire_read_start")
+    read_end = require_count(case_receipt.get("wire_read_end"), f"case {case_id}.resident.wire_read_end")
+    require(read_end >= read_start, f"case {case_id} resident wire read range invalid")
+    event_receipts = [
+        require_object(value, f"case {case_id}.resident.events[{index}]")
+        for index, value in enumerate(require_list(case_receipt.get("events"), f"case {case_id}.resident.events"))
+    ]
+    require(event_receipts, f"case {case_id} resident case has no events")
+    raw_lines = stdout_path.read_bytes().splitlines(keepends=True)
+    require(len(raw_lines) == len(event_receipts) + 1, f"case {case_id} resident stdout/event count mismatch")
+    all_receipts = [ready_receipt, *event_receipts]
+    rows: list[dict[str, Any]] = []
+    for index, (line, event_receipt) in enumerate(zip(raw_lines, all_receipts, strict=True)):
+        require(line.endswith(b"\n"), f"case {case_id} resident stdout line {index} is not newline terminated")
+        require(event_receipt.get("raw_line_bytes") == len(line), f"case {case_id} resident line {index} byte count mismatch")
+        require(event_receipt.get("raw_line_sha256") == hashlib.sha256(line).hexdigest(), f"case {case_id} resident line {index} SHA mismatch")
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ScenarioError(f"case {case_id} resident stdout line {index} is invalid UTF-8 JSON: {exc}") from exc
+        row = require_object(row, f"case {case_id}.resident.stdout[{index}]")
+        for field in ("event", "session_id", "history_epoch", "request_id", "turn"):
+            require(row.get(field) == event_receipt.get(field), f"case {case_id} resident line {index} {field} receipt mismatch")
+        rows.append(row)
+    require(rows[0].get("event") == "ready" and rows[0].get("session_id") == session_id, f"case {case_id} resident stdout lacks bound ready event")
+    events = rows[1:]
+    require(events[0].get("event") == "history_reset", f"case {case_id} resident case must begin with one reset")
+    require(sum(row.get("event") == "history_reset" for row in events) == 1, f"case {case_id} resident reset count mismatch")
+    epochs = {row.get("history_epoch") for row in events}
+    require(len(epochs) == 1, f"case {case_id} resident events cross history epochs")
+    epoch = next(iter(epochs))
+    require(isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0, f"case {case_id} resident history epoch invalid")
+    require(all(row.get("session_id") == session_id for row in events), f"case {case_id} resident session identity drift")
+    reset_after = require_object(events[0].get("history_after"), f"case {case_id}.resident.history_after")
+    require(reset_after.get("message_count") == 0 and reset_after.get("turn_count") == 0, f"case {case_id} resident reset did not clear history")
+    cursor = 1
+    request_ids: list[str] = []
+    for turn, prompt in enumerate(prompts):
+        require(cursor < len(events), f"case {case_id} resident turn {turn} lacks user event")
+        user = events[cursor]
+        cursor += 1
+        require(user.get("event") == "user" and user.get("turn") == turn and user.get("content") == prompt, f"case {case_id} resident user turn {turn} mismatch")
+        request_id = require_string(user.get("request_id"), f"case {case_id}.resident.turn[{turn}].request_id")
+        require(request_id not in request_ids, f"case {case_id} resident request id reused")
+        request_ids.append(request_id)
+        delta_index = 0
+        while cursor < len(events) and events[cursor].get("event") == "assistant_delta":
+            delta = events[cursor]
+            require(delta.get("request_id") == request_id and delta.get("turn") == turn, f"case {case_id} resident delta binding mismatch")
+            require(delta.get("index") == delta_index, f"case {case_id} resident delta index is not contiguous")
+            delta_index += 1
+            cursor += 1
+        require(cursor < len(events), f"case {case_id} resident turn {turn} lacks terminal assistant")
+        assistant = events[cursor]
+        cursor += 1
+        require(assistant.get("event") == "assistant" and assistant.get("request_id") == request_id and assistant.get("turn") == turn, f"case {case_id} resident assistant turn {turn} mismatch")
+    require(cursor == len(events), f"case {case_id} resident case has unowned trailing events")
+    require(case_receipt.get("request_ids") == request_ids, f"case {case_id} resident request id summary mismatch")
+    require(case_receipt.get("history_epochs") == [epoch], f"case {case_id} resident epoch summary mismatch")
+    event_indexes = [require_count(value.get("event_index"), f"case {case_id}.resident.event_index") for value in event_receipts]
+    require(event_indexes == list(range(event_indexes[0], event_indexes[-1] + 1)), f"case {case_id} resident event indexes are not contiguous")
+    return {
+        "case_id": case_id,
+        "command_id": command_id,
+        "session_id": session_id,
+        "history_epoch": epoch,
+        "wire_read_start": read_start,
+        "wire_read_end": read_end,
+        "events": event_receipts,
+        "started_monotonic_ns": started_ns,
+        "finished_monotonic_ns": finished_ns,
+    }
+
+
 def validate_case_evidence(
     root: Path,
     raw_ref: Any,
@@ -1805,6 +2010,8 @@ def validate_case_evidence(
     command_id = require_string(case.get("command_id"), f"case {case_id}.command_id")
     require(command_id in commands, f"case {case_id} references unknown command {command_id}")
     require(commands[command_id]["entrypoint"] == entrypoint, f"case {case_id} command {command_id} entrypoint mismatch")
+    command_raw = commands[command_id]["raw"]
+    resident_mode = entrypoint == "run" and command_raw.get("execution_mode") == "resident-jsonl"
     variant = require_string(case.get("variant"), f"case {case_id}.variant")
     preset = case.get("preset")
     require(preset is None or preset in {"P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"}, f"case {case_id} preset invalid")
@@ -1813,8 +2020,11 @@ def validate_case_evidence(
     argv_raw = require_list(execution.get("argv"), f"case {case_id}.execution.argv")
     require(len(argv_raw) >= 3 and all(isinstance(part, str) and part for part in argv_raw), f"case {case_id} argv invalid")
     argv = tuple(argv_raw)
-    require(argv not in used_argv, f"case {case_id} argv is not unique")
-    used_argv.add(argv)
+    if resident_mode:
+        require(argv_raw == command_raw.get("argv"), f"case {case_id} resident argv differs from command {command_id}")
+    else:
+        require(argv not in used_argv, f"case {case_id} argv is not unique")
+        used_argv.add(argv)
     if entrypoint == "run":
         require(Path(argv[0]).name == "ferrum" and argv[1] == "run", f"case {case_id} must execute ferrum run")
     else:
@@ -1871,6 +2081,8 @@ def validate_case_evidence(
     required_artifacts = {"input", "stdout", "stderr", "effective_config"}
     if entrypoint == "serve":
         required_artifacts.add("http_transcript")
+    if resident_mode:
+        required_artifacts.add("resident_case_receipt")
     require(set(artifacts) == required_artifacts, f"case {case_id} artifact set mismatch")
     resolved: dict[str, tuple[Path, Any | None]] = {}
     for name, ref in artifacts.items():
@@ -1880,6 +2092,7 @@ def validate_case_evidence(
             "stderr": {"stderr-log", "checker-log"},
             "effective_config": {"raw-json"},
             "http_transcript": {"http-transcript", "raw-json"},
+            "resident_case_receipt": {"raw-json"},
         }[name]
         path, _, artifact_parsed = validate_artifact_ref(root, ref, f"case {case_id}.artifacts.{name}", allowed_kinds=allowed)
         if name != "effective_config":
@@ -1906,6 +2119,19 @@ def validate_case_evidence(
             input_document == c03_input_document(case_id, marker, list(argv)),
             f"case {case_id} persisted input differs from the versioned C03 contract",
         )
+    resident_validation = (
+        validate_resident_case_receipt(
+            root,
+            artifacts["resident_case_receipt"],
+            case=case,
+            command_id=command_id,
+            argv=list(argv),
+            input_path=resolved["input"][0],
+            stdout_path=resolved["stdout"][0],
+        )
+        if resident_mode
+        else None
+    )
     require(file_sha256(resolved["effective_config"][0]) == expected["effective_config_sha256"], f"case {case_id} effective config mismatch")
     actual_config: dict[str, Any] | None = None
     envelope_ref = case.get("execution_envelope")
@@ -1930,7 +2156,7 @@ def validate_case_evidence(
         require(envelope_document.get("child_environment_sha256") == child_environment_sha, f"case {case_id} child environment SHA mismatch")
         require(command_spec.get("child_environment_sha256") == child_environment_sha, f"case {case_id} command spec environment binding mismatch")
         spawn = require_object(envelope_document.get("spawn"), f"case {case_id}.spawn")
-        expected_mode = "subprocess" if entrypoint == "run" else "in-process-http"
+        expected_mode = "resident-jsonl" if resident_mode else "subprocess" if entrypoint == "run" else "in-process-http"
         require(spawn.get("mode") == expected_mode and command_spec.get("execution_mode") == expected_mode, f"case {case_id} execution mode mismatch")
         for key in ("id", "argv", "started_at", "finished_at", "duration_sec", "returncode"):
             require(spawn.get(key) == execution.get(key), f"case {case_id} spawn.{key} mismatch")
@@ -1958,10 +2184,10 @@ def validate_case_evidence(
             label=f"case {case_id}.execution_process_receipt",
             pid=spawn["pid"],
             pgid=spawn["pgid"],
-            argv=expected["invocation_argv"] if entrypoint == "serve" else list(argv),
-            role="scenario-executor" if entrypoint == "serve" else "ferrum-run",
-            expected_ppid=None if entrypoint == "serve" else expected["invocation_pid"],
-            expected_environment=None if entrypoint == "serve" else child_environment,
+            argv=expected["invocation_argv"] if entrypoint == "serve" or resident_mode else list(argv),
+            role="scenario-executor" if entrypoint == "serve" or resident_mode else "ferrum-run",
+            expected_ppid=None if entrypoint == "serve" or resident_mode else expected["invocation_pid"],
+            expected_environment=None if entrypoint == "serve" or resident_mode else child_environment,
         )
         product_receipt = validate_process_receipt(
             root,
@@ -1974,7 +2200,7 @@ def validate_case_evidence(
             expected_ppid=expected["invocation_pid"],
             expected_environment=child_environment,
         )
-        if entrypoint == "serve":
+        if entrypoint == "serve" or resident_mode:
             command_receipt_path, _, _ = validate_artifact_ref(
                 root,
                 commands[command_id]["raw"].get("process_receipt"),
@@ -2009,8 +2235,26 @@ def validate_case_evidence(
             require(product_process.get("argv") == product_argv and product_process.get("state_during_case") == "running", f"case {case_id} serve product process binding mismatch")
             ready_at = parse_timestamp(product_process.get("ready_at"), f"case {case_id}.product_process.ready_at")
             require(product_started <= ready_at <= started and finished >= started, f"case {case_id} request window is outside server ready window")
+        elif resident_mode:
+            require(envelope_document.get("http_transcript") is None, f"case {case_id} resident run envelope contains HTTP transcript")
+            require(envelope_document.get("product_argv") == list(argv), f"case {case_id} resident run product argv mismatch")
+            require(product_process.get("argv") == list(argv), f"case {case_id} resident product process argv mismatch")
+            require(product_process.get("state_during_case") == "running", f"case {case_id} resident product was not running")
+            ready_at = parse_timestamp(product_process.get("ready_at"), f"case {case_id}.product_process.ready_at")
+            require(product_started <= ready_at <= started < finished, f"case {case_id} resident case is outside product ready window")
+            envelope_resident_path, _, _ = validate_artifact_ref(
+                root,
+                envelope_document.get("resident_case_receipt"),
+                f"case {case_id}.envelope.resident_case_receipt",
+                allowed_kinds={"raw-json"},
+            )
+            require(
+                envelope_resident_path == resolved["resident_case_receipt"][0],
+                f"case {case_id} resident receipt differs from envelope",
+            )
         else:
             require(envelope_document.get("http_transcript") is None, f"case {case_id} run envelope contains HTTP transcript")
+            require(envelope_document.get("resident_case_receipt") is None, f"case {case_id} subprocess run envelope contains resident receipt")
             require(envelope_document.get("product_argv") == list(argv), f"case {case_id} run product argv mismatch")
             require(product_process.get("argv") == list(argv), f"case {case_id} run product process argv mismatch")
             product_finished = parse_timestamp(product_process.get("finished_at"), f"case {case_id}.product_process.finished_at")
@@ -2138,6 +2382,7 @@ def validate_case_evidence(
         require(output_error is not None or returncode != 0, f"case {case_id} blocked outcome lacks failure evidence")
     return {
         "case_id": case_id,
+        "scenario_id": scenario_id,
         "entrypoint": entrypoint,
         "variant": variant,
         "preset": preset,
@@ -2149,6 +2394,7 @@ def validate_case_evidence(
         "ordinal": ordinal,
         "started_at": started,
         "finished_at": finished,
+        "resident": resident_validation,
     }
 
 
@@ -2507,6 +2753,128 @@ def attach_pair_registry(report: dict[str, Any], root: Path) -> None:
     report["pair_registry"] = existing_artifact_ref(root, path, "raw-json")
 
 
+def validate_resident_run_commands(
+    root: Path,
+    commands: dict[str, dict[str, Any]],
+    case_rows_by_scenario: dict[str, list[dict[str, Any]]],
+    *,
+    model_key: str,
+) -> None:
+    expected_run_ids = [f"actual-run-{index:02d}" for index in range(1, 6)]
+    run_commands = [commands[command_id]["raw"] for command_id in expected_run_ids]
+    run_cases = [
+        case
+        for rows in case_rows_by_scenario.values()
+        for case in rows
+        if case["entrypoint"] == "run"
+    ]
+    require(len(run_cases) == 97, f"G08 resident run corpus must contain 97 cases, got {len(run_cases)}")
+    cases_by_id = {case["case_id"]: case for case in run_cases}
+    require(len(cases_by_id) == len(run_cases), "G08 resident run case ids are not unique")
+    covered_case_ids: list[str] = []
+    session_ids: set[str] = set()
+    pids: set[int] = set()
+    previous_finished_at: datetime | None = None
+    for command_index, (command_id, command) in enumerate(zip(expected_run_ids, run_commands, strict=True), start=1):
+        require(command.get("execution_mode") == "resident-jsonl", f"{command_id} is not resident-jsonl")
+        case_ids = require_list(command.get("case_ids"), f"{command_id}.case_ids")
+        command_cases = [cases_by_id.get(case_id) for case_id in case_ids]
+        require(all(case is not None for case in command_cases), f"{command_id} references a non-run case")
+        typed_cases = [require_object(case, f"{command_id}.case") for case in command_cases]
+        require(command.get("case_count") == len(typed_cases), f"{command_id} case count mismatch")
+        covered_case_ids.extend(case_ids)
+        derived_aliases = sorted({case.get("preset") or "<none>" for case in typed_cases})
+        require(command.get("preset_aliases") == derived_aliases, f"{command_id} preset aliases are not derived from cases")
+        derived_keys = {
+            resident_run_group_key(
+                {
+                    "model_key": model_key,
+                    "scenario_id": case["scenario_id"],
+                    "variant": case["variant"],
+                    "preset": case.get("preset"),
+                }
+            )
+            for case in typed_cases
+        }
+        require(len(derived_keys) == 1, f"{command_id} mixes resident option groups")
+        derived_key = next(iter(derived_keys))
+        require(command.get("group_key") == list(derived_key), f"{command_id} group key is not derived from cases")
+        require(all(case.get("resident") is not None for case in typed_cases), f"{command_id} contains a non-resident case")
+        _, _, wire_raw = validate_artifact_ref(
+            root,
+            command.get("wire_receipt"),
+            f"{command_id}.wire_receipt",
+            allowed_kinds={"raw-json"},
+        )
+        wire_receipt = require_object(wire_raw, f"{command_id}.wire_receipt JSON")
+        require(wire_receipt.get("schema_version") == SCHEMA_VERSION, f"{command_id} wire receipt schema mismatch")
+        require(wire_receipt.get("transport") == "resident-jsonl-v1", f"{command_id} wire transport mismatch")
+        require(wire_receipt.get("command_id") == command_id, f"{command_id} wire command binding mismatch")
+        require(wire_receipt.get("argv_sha256") == canonical_json_sha256(command["argv"]), f"{command_id} wire argv mismatch")
+        require(wire_receipt.get("group_key") == list(derived_key), f"{command_id} wire group key mismatch")
+        require(wire_receipt.get("case_count") == len(typed_cases), f"{command_id} wire case count mismatch")
+        require(wire_receipt.get("case_ids") == case_ids, f"{command_id} wire case order mismatch")
+        require(wire_receipt.get("preset_aliases") == derived_aliases, f"{command_id} wire preset aliases mismatch")
+        require(wire_receipt.get("controlled_stop") is True, f"{command_id} was not stopped through /bye")
+        pid = require_count(wire_receipt.get("pid"), f"{command_id}.pid", minimum=1)
+        pids.add(pid)
+        ready = require_object(wire_receipt.get("ready_event"), f"{command_id}.ready_event")
+        exit_event = require_object(wire_receipt.get("exit_event"), f"{command_id}.exit_event")
+        require(ready.get("event") == "ready" and exit_event.get("event") == "exit", f"{command_id} ready/exit boundary mismatch")
+        session_id = require_string(ready.get("session_id"), f"{command_id}.session_id")
+        require(exit_event.get("session_id") == session_id, f"{command_id} exit session id drift")
+        session_ids.add(session_id)
+        wire = require_object(wire_receipt.get("wire"), f"{command_id}.wire")
+        reads = [require_object(value, f"{command_id}.wire.reads[{index}]") for index, value in enumerate(require_list(wire.get("reads"), f"{command_id}.wire.reads"))]
+        require(wire.get("read_count") == len(reads), f"{command_id} wire read count mismatch")
+        require([read.get("read_index") for read in reads] == list(range(len(reads))), f"{command_id} wire read indexes are not contiguous")
+        events = [require_object(value, f"{command_id}.wire.events[{index}]") for index, value in enumerate(require_list(wire.get("events"), f"{command_id}.wire.events"))]
+        require(wire.get("event_count") == len(events), f"{command_id} wire event count mismatch")
+        require([event.get("event_index") for event in events] == list(range(len(events))), f"{command_id} wire event indexes are not contiguous")
+        combined_case_events = [
+            event
+            for case in typed_cases
+            for event in require_object(case["resident"], f"{command_id}.resident") ["events"]
+        ]
+        require(events == [ready, *combined_case_events, exit_event], f"{command_id} wire contains missing, duplicate, or unowned events")
+        epochs = [require_object(case["resident"], f"{command_id}.resident")["history_epoch"] for case in typed_cases]
+        require(epochs == list(range(1, len(typed_cases) + 1)), f"{command_id} history epochs are not strictly monotonic")
+        ranges = [
+            (
+                require_object(case["resident"], f"{command_id}.resident")["wire_read_start"],
+                require_object(case["resident"], f"{command_id}.resident")["wire_read_end"],
+            )
+            for case in typed_cases
+        ]
+        require(all(0 <= start <= end <= len(reads) for start, end in ranges), f"{command_id} case wire range exceeds command reads")
+        require(all(left[1] <= right[0] for left, right in zip(ranges, ranges[1:])), f"{command_id} case wire ranges overlap")
+        command_stdout_path, _, _ = validate_artifact_ref(root, command.get("stdout"), f"{command_id}.stdout", allowed_kinds={"stdout-log"})
+        command_lines = command_stdout_path.read_bytes().splitlines(keepends=True)
+        require(len(command_lines) == len(events), f"{command_id} command stdout/event count mismatch")
+        require(
+            all(
+                event.get("raw_line_bytes") == len(line)
+                and event.get("raw_line_sha256") == hashlib.sha256(line).hexdigest()
+                for line, event in zip(command_lines, events, strict=True)
+            ),
+            f"{command_id} command stdout differs from wire receipts",
+        )
+        command_started_at = parse_timestamp(command.get("started_at"), f"{command_id}.started_at")
+        command_finished_at = parse_timestamp(command.get("finished_at"), f"{command_id}.finished_at")
+        require(
+            all(command_started_at <= case["started_at"] < case["finished_at"] <= command_finished_at for case in typed_cases),
+            f"{command_id} case window escapes resident command",
+        )
+        if previous_finished_at is not None:
+            require(previous_finished_at <= command_started_at, f"{command_id} overlaps the previous resident run command")
+        previous_finished_at = command_finished_at
+        require(command_index == int(command_id.rsplit("-", 1)[1]), f"{command_id} generation order mismatch")
+    require(covered_case_ids == [case_id for command in run_commands for case_id in command["case_ids"]], "resident command case order drift")
+    require(set(covered_case_ids) == set(cases_by_id) and len(covered_case_ids) == len(cases_by_id), "resident commands do not partition the run corpus")
+    require(len(session_ids) == 5, "G08 resident commands reused a product session identity")
+    require(len(pids) == 5, "G08 resident commands did not use five distinct product processes")
+
+
 def validate_report_document(
     report: dict[str, Any],
     root: Path,
@@ -2711,10 +3079,22 @@ def validate_report_document(
             used_argv=used_argv,
         )
     if invocation_ref is not None:
-        require(
-            set(commands) == {"actual-run", "actual-serve-01", "actual-serve-02"},
-            "canonical report must contain one run command and exactly two C09-isolated serve sessions",
+        expected_run_ids = (
+            {f"actual-run-{index:02d}" for index in range(1, 6)}
+            if contract == G08_EXECUTION_CONTRACT
+            else {"actual-run"}
         )
+        require(
+            set(commands) == expected_run_ids | {"actual-serve-01", "actual-serve-02"},
+            "canonical report command topology mismatch",
+        )
+        if contract == G08_EXECUTION_CONTRACT:
+            validate_resident_run_commands(
+                root,
+                commands,
+                case_rows_by_scenario,
+                model_key=model_key,
+            )
         first_serve = commands["actual-serve-01"]["raw"]
         second_serve = commands["actual-serve-02"]["raw"]
         first_finished_at = parse_timestamp(first_serve.get("finished_at"), "first isolated serve command finished_at")
@@ -2727,15 +3107,26 @@ def validate_report_document(
         require(first_receipt.get("pid") != second_receipt.get("pid"), "C09 isolation reused the same serve process")
         for scenario_id, scenario_raw in zip(SCENARIO_IDS, scenarios_raw):
             scenario = require_object(scenario_raw, f"scenario {scenario_id}")
-            expected_command_ids = {"actual-run"} if "run" in required_entrypoints(scenario_id) else set()
+            expected_command_ids = {
+                case["command_id"]
+                for case in case_rows_by_scenario[scenario_id]
+                if case["entrypoint"] == "run"
+            }
+            if contract == LEGACY_EXECUTION_CONTRACT and "run" in required_entrypoints(scenario_id):
+                require(expected_command_ids == {"actual-run"}, f"scenario {scenario_id} legacy run command drift")
             if "serve" in required_entrypoints(scenario_id):
                 expected_command_ids.add("actual-serve-01" if int(scenario_id[1:]) <= 9 else "actual-serve-02")
             require(
                 set(require_list(scenario.get("command_ids"), f"scenario {scenario_id}.command_ids")) == expected_command_ids,
                 f"scenario {scenario_id} violates the C09 serve isolation boundary",
             )
-        serve_command = first_serve
-        serve_started_at = parse_timestamp(serve_command.get("started_at"), "scenario_report serve command started_at")
+        serve_started_at = parse_timestamp(first_serve.get("started_at"), "scenario_report serve command started_at")
+        if contract == G08_EXECUTION_CONTRACT:
+            last_run_finished_at = max(
+                parse_timestamp(commands[command_id]["raw"].get("finished_at"), f"{command_id}.finished_at")
+                for command_id in expected_run_ids
+            )
+            require(last_run_finished_at <= serve_started_at, "serve started before all resident run sessions stopped")
         for case in (case for rows in case_rows_by_scenario.values() for case in rows if case.get("entrypoint") == "run"):
             require(case["finished_at"] <= serve_started_at, f"case {case.get('case_id')} overlapped the resident serve model")
     _, _, pair_registry_raw = validate_artifact_ref(root, report.get("pair_registry"), "scenario_report.pair_registry", allowed_kinds={"raw-json"})
@@ -4209,6 +4600,88 @@ def aborted_http_exchange(base_url: str, payload: dict[str, Any], variant: str) 
     }
 
 
+def run_case_prompts(case: dict[str, Any]) -> list[str]:
+    marker = expected_case_text(case)
+    if case["scenario_id"] == "C03":
+        return c03_user_turns(marker)
+    if case["scenario_id"] == "C19":
+        soft_suffix = ""
+        if case["variant"] in {"soft-think", "soft-think-misuse"}:
+            soft_suffix = " /think"
+        elif case["variant"] in {"soft-no-think", "soft-no-think-misuse"}:
+            soft_suffix = " /no_think"
+        return [
+            f"Return the exact marker {marker}-H1.{soft_suffix}",
+            f"Using our prior exchange, return the exact marker {marker}-H2.",
+        ]
+    return [
+        "Write at least 512 numbered one-word items, then end naturally."
+        if case["scenario_id"] == "C04"
+        else f"Return the exact marker {marker} and no other text."
+    ]
+
+
+def run_case_option_args(case: dict[str, Any]) -> tuple[list[str], bool | str | None]:
+    values = preset_values(case["model_key"], case["preset"])
+    argv: list[str] = []
+    for flag, key in (
+        ("--temperature", "temperature"),
+        ("--top-p", "top_p"),
+        ("--top-k", "top_k"),
+        ("--seed", "seed"),
+        ("--max-tokens", "max_tokens"),
+        ("--repeat-penalty", "repetition_penalty"),
+    ):
+        if key in values:
+            argv.extend([flag, str(values[key])])
+    thinking: bool | str | None = values.get("enable_thinking")
+    if case["scenario_id"] == "C19":
+        if case["variant"] == "hard-thinking":
+            thinking = True
+        elif case["variant"] == "hard-no-thinking":
+            thinking = False
+        else:
+            thinking = "model-default"
+    if thinking is True:
+        argv.append("--enable-thinking")
+    elif thinking is False:
+        argv.append("--disable-thinking")
+    return argv, thinking
+
+
+def run_product_argv(
+    case: dict[str, Any],
+    *,
+    binary_path: Path,
+    model_arg: str,
+    backend: str,
+    actual_config: Path,
+    run_extra_args: list[str],
+    resident: bool,
+) -> tuple[list[str], list[str], bool | str | None]:
+    prompts = run_case_prompts(case)
+    argv = [
+        str(binary_path),
+        "run",
+        model_arg,
+        "--backend",
+        backend,
+        "--output-format",
+        "jsonl",
+    ]
+    if not resident and len(prompts) == 1:
+        argv.extend(["--prompt", prompts[0]])
+    option_args, thinking = run_case_option_args(case)
+    argv.extend(option_args)
+    argv.extend(["--effective-config-json", str(actual_config), *run_extra_args])
+    return argv, prompts, thinking
+
+
+def resident_run_group_key(case: dict[str, Any]) -> tuple[str, ...]:
+    option_args, _ = run_case_option_args(case)
+    return tuple(option_args)
+
+
 class ProductServer:
     def __init__(
         self,
@@ -4298,6 +4771,167 @@ class ProductServer:
             "ready_monotonic_ns": getattr(self, "ready_monotonic_ns", None),
             "finished_monotonic_ns": self.finished_monotonic_ns,
             "process_returncode": self.process_returncode,
+            "child_environment": self.child_environment,
+            "child_environment_sha256": canonical_json_sha256(self.child_environment),
+        }
+
+
+class ProductRunSession:
+    def __init__(
+        self,
+        *,
+        command_id: str,
+        argv: list[str],
+        stdout_path: Path,
+        stderr_path: Path,
+        artifact_root: Path,
+        receipt_path: Path,
+        wire_receipt_path: Path,
+        timeout_sec: float,
+        actual_config_path: Path,
+        group_key: tuple[str, ...],
+    ) -> None:
+        self.command_id = command_id
+        self.argv = argv
+        self.stdout_path = stdout_path
+        self.stderr_path = stderr_path
+        self.wire_receipt_path = wire_receipt_path
+        self.actual_config_path = actual_config_path
+        self.group_key = group_key
+        self.child_environment = sanitized_child_environment()
+        self.started_at = iso_now()
+        self.started_monotonic_ns = time.monotonic_ns()
+        self.case_count = 0
+        self.case_ids: list[str] = []
+        self.preset_aliases: set[str] = set()
+        self.stopped = False
+        try:
+            self.session = JsonlProductSession(
+                argv=argv,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_sec=timeout_sec,
+                env=self.child_environment,
+            )
+        except JsonlSessionError as exc:
+            raise ScenarioError(f"{command_id} failed to become ready: {exc}") from exc
+        self.ready_at = iso_now()
+        self.ready_monotonic_ns = self.session.ready_event.received_monotonic_ns
+        self.pid = self.session.proc.pid
+        self.pgid = os.getpgid(self.pid)
+        self.process_receipt = capture_process_receipt(
+            artifact_root,
+            receipt_path,
+            pid=self.pid,
+            pgid=self.pgid,
+            argv=argv,
+            role="ferrum-run",
+            environment=self.child_environment,
+        )
+        require(
+            actual_config_path.is_file() and actual_config_path.stat().st_size > 0,
+            f"{command_id} did not emit its actual effective config before ready",
+        )
+
+    def run_case(
+        self,
+        prompts: list[str],
+        *,
+        case_id: str,
+        preset: str | None,
+    ) -> SessionCase:
+        if self.stopped:
+            raise ScenarioError(f"{self.command_id} cannot execute after stop")
+        require(case_id not in self.case_ids, f"{self.command_id} duplicate resident case {case_id}")
+        try:
+            result = self.session.run_case(prompts)
+        except JsonlSessionError as exc:
+            self.abort()
+            raise ScenarioError(f"{self.command_id} resident case failed: {exc}") from exc
+        self.case_count += 1
+        self.case_ids.append(case_id)
+        self.preset_aliases.add(preset or "<none>")
+        return result
+
+    def abort(self) -> None:
+        if self.stopped:
+            return
+        self.session.terminate()
+        self.finished_monotonic_ns = time.monotonic_ns()
+        self.finished_at = iso_now()
+        self.process_returncode = self.session.proc.returncode
+        self.stopped = True
+        self._persist_wire_receipt(exit_event=None, controlled=False)
+        self._ensure_logs()
+
+    def stop(self) -> None:
+        if self.stopped:
+            return
+        try:
+            exit_event = self.session.stop()
+        except JsonlSessionError as exc:
+            self.abort()
+            raise ScenarioError(f"{self.command_id} controlled stop failed: {exc}") from exc
+        self.finished_monotonic_ns = time.monotonic_ns()
+        self.finished_at = iso_now()
+        self.process_returncode = self.session.proc.returncode
+        self.stopped = True
+        self._persist_wire_receipt(exit_event=exit_event.receipt(), controlled=True)
+        self._ensure_logs()
+        require(self.process_returncode == 0, f"{self.command_id} exited nonzero")
+
+    def _persist_wire_receipt(
+        self,
+        *,
+        exit_event: dict[str, Any] | None,
+        controlled: bool,
+    ) -> None:
+        write_json(
+            self.wire_receipt_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "transport": "resident-jsonl-v1",
+                "command_id": self.command_id,
+                "argv_sha256": canonical_json_sha256(self.argv),
+                "group_key": list(self.group_key),
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "ready_event": self.session.ready_event.receipt(),
+                "exit_event": exit_event,
+                "controlled_stop": controlled,
+                "case_count": self.case_count,
+                "case_ids": self.case_ids,
+                "preset_aliases": sorted(self.preset_aliases),
+                "wire": self.session.wire_receipt(),
+            },
+        )
+
+    def _ensure_logs(self) -> None:
+        for path, label in ((self.stdout_path, "stdout"), (self.stderr_path, "stderr")):
+            if not path.exists() or path.stat().st_size == 0:
+                path.write_text(
+                    f"ferrum resident run {label} capture was empty; collector observed controlled shutdown\n",
+                    encoding="utf-8",
+                )
+
+    def envelope(self) -> dict[str, Any]:
+        require(self.stopped, f"{self.command_id} envelope requested before stop")
+        return {
+            "argv": self.argv,
+            "pid": self.pid,
+            "pgid": self.pgid,
+            "started_at": self.started_at,
+            "ready_at": self.ready_at,
+            "finished_at": self.finished_at,
+            "started_monotonic_ns": self.started_monotonic_ns,
+            "ready_monotonic_ns": self.ready_monotonic_ns,
+            "finished_monotonic_ns": self.finished_monotonic_ns,
+            "process_returncode": self.process_returncode,
+            "execution_mode": "resident-jsonl",
+            "group_key": list(self.group_key),
+            "case_count": self.case_count,
+            "case_ids": list(self.case_ids),
+            "preset_aliases": sorted(self.preset_aliases),
             "child_environment": self.child_environment,
             "child_environment_sha256": canonical_json_sha256(self.child_environment),
         }
@@ -4492,46 +5126,16 @@ def run_case_command(
     case_id = case["case_id"]
     marker = expected_case_text(case)
     actual_config = case_root / "actual-effective-config.json"
-    values = preset_values(case["model_key"], case["preset"])
-    argv = [str(binary_path), "run", model_arg, "--backend", backend, "--output-format", "jsonl"]
-    if case["scenario_id"] == "C03":
-        stdin_text = "\n".join(c03_user_turns(marker)) + "\n"
-    elif case["scenario_id"] == "C19":
-        soft_suffix = ""
-        if case["variant"] in {"soft-think", "soft-think-misuse"}:
-            soft_suffix = " /think"
-        elif case["variant"] in {"soft-no-think", "soft-no-think-misuse"}:
-            soft_suffix = " /no_think"
-        stdin_text = "\n".join(
-            [
-                f"Return the exact marker {marker}-H1.{soft_suffix}",
-                f"Using our prior exchange, return the exact marker {marker}-H2.",
-            ]
-        ) + "\n"
-    else:
-        prompt = (
-            "Write at least 512 numbered one-word items, then end naturally."
-            if case["scenario_id"] == "C04"
-            else f"Return the exact marker {marker} and no other text."
-        )
-        argv.extend(["--prompt", prompt])
-        stdin_text = ""
-    for flag, key in (("--temperature", "temperature"), ("--top-p", "top_p"), ("--top-k", "top_k"), ("--seed", "seed"), ("--max-tokens", "max_tokens"), ("--repeat-penalty", "repetition_penalty")):
-        if key in values:
-            argv.extend([flag, str(values[key])])
-    thinking = values.get("enable_thinking")
-    if case["scenario_id"] == "C19":
-        if case["variant"] == "hard-thinking":
-            thinking = True
-        elif case["variant"] == "hard-no-thinking":
-            thinking = False
-        else:
-            thinking = "model-default"
-    if thinking is True:
-        argv.append("--enable-thinking")
-    elif thinking is False:
-        argv.append("--disable-thinking")
-    argv.extend(["--effective-config-json", str(actual_config), *run_extra_args])
+    argv, prompts, thinking = run_product_argv(
+        case,
+        binary_path=binary_path,
+        model_arg=model_arg,
+        backend=backend,
+        actual_config=actual_config,
+        run_extra_args=run_extra_args,
+        resident=False,
+    )
+    stdin_text = "\n".join(prompts) + "\n" if len(prompts) > 1 else ""
     input_path = case_root / "input.json"
     input_document: dict[str, Any] = (
         c03_input_document(case_id, marker, argv)
@@ -4648,6 +5252,133 @@ def run_case_command(
         "observed": observed,
         "process_receipt": process_receipt,
         "child_environment": child_environment,
+    }
+
+
+def run_case_resident(
+    root: Path,
+    case: dict[str, Any],
+    *,
+    session: ProductRunSession,
+    case_root: Path,
+    locked_sources: dict[str, Any],
+    semantic_root: Path,
+    tokenizer_root: Path,
+    timeout_sec: float,
+) -> tuple[list[str], dict[str, Any], Path, Path, Path, dict[str, Any]]:
+    case_id = case["case_id"]
+    marker = expected_case_text(case)
+    prompts = run_case_prompts(case)
+    argv = list(session.argv)
+    input_path = case_root / "input.json"
+    input_document: dict[str, Any] = (
+        c03_input_document(case_id, marker, argv)
+        if case["scenario_id"] == "C03"
+        else {
+            "case_id": case_id,
+            "stdin": "\n".join(prompts) + "\n",
+            "argv": argv,
+        }
+    )
+    if case["scenario_id"] == "C01":
+        input_document["resolution_probe"] = build_c01_resolution_probe(
+            argv[2],
+            case["model_key"],
+            sources=locked_sources,
+            semantic_root=semantic_root,
+            tokenizer_root=tokenizer_root,
+        )
+    write_json(input_path, input_document)
+    started_at = iso_now()
+    result = session.run_case(
+        prompts,
+        case_id=case_id,
+        preset=case.get("preset"),
+    )
+    finished_at = iso_now()
+    stdout_path = case_root / "stdout.log"
+    stderr_path = case_root / "stderr.log"
+    stdout_path.write_bytes(result.jsonl_bytes(session.session.ready_event))
+    stderr_path.write_text(
+        f"case {case_id} executed in controlled resident command {session.command_id}; shared stderr is bound by the command receipt\n",
+        encoding="utf-8",
+    )
+    if case["scenario_id"] == "C01" and case["variant"] == "unknown-fail-closed":
+        input_document["negative_probe"] = execute_c01_unknown_fixture(
+            root,
+            case,
+            binary_path=Path(argv[0]),
+            backend=require_string(case.get("backend"), f"case {case_id}.backend"),
+            semantic_root=semantic_root,
+            tokenizer_root=tokenizer_root,
+            weight_format=require_string(locked_sources.get("weight_format"), "C01 locked weight format"),
+            child_environment=session.child_environment,
+            timeout_sec=timeout_sec,
+            case_root=case_root,
+        )
+        write_json(input_path, input_document)
+    case_receipt_path = case_root / "resident-case-receipt.json"
+    result_receipt = result.receipt()
+    write_json(
+        case_receipt_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "transport": "resident-jsonl-v1",
+            "case_id": case_id,
+            "command_id": session.command_id,
+            "argv_sha256": canonical_json_sha256(argv),
+            "prompts": prompts,
+            "prompts_sha256": canonical_json_sha256(prompts),
+            "ready_event": session.session.ready_event.receipt(),
+            "case": result_receipt,
+            "stdout_sha256": file_sha256(stdout_path),
+            "input_sha256": file_sha256(input_path),
+        },
+    )
+    envelope = {
+        "id": f"exec-{case_id}",
+        "mode": "resident-jsonl",
+        "argv": argv,
+        "pid": os.getpid(),
+        "pgid": os.getpgid(0),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "started_monotonic_ns": result.started_monotonic_ns,
+        "finished_monotonic_ns": result.finished_monotonic_ns,
+        "duration_sec": (result.finished_monotonic_ns - result.started_monotonic_ns) / 1_000_000_000,
+        "returncode": 0,
+        "timed_out": False,
+        "child_environment": session.child_environment,
+        "child_environment_sha256": canonical_json_sha256(session.child_environment),
+    }
+    observed = {"case_id": case_id, "expected_marker": marker}
+    if case["scenario_id"] == "C03":
+        observed["contract_id"] = C03_CONTRACT_ID
+    if case["scenario_id"] == "C01":
+        observed.update(
+            {
+                "model_key": case["model_key"],
+                "model_files": case["model_files"],
+                "requested_model": argv[2],
+                "ordinal": int(case["ordinal"]),
+            }
+        )
+    if case["scenario_id"] == "C19":
+        _, thinking = run_case_option_args(case)
+        observed.update(
+            {
+                "thinking_mode": case["variant"],
+                "model_key": case["model_key"],
+                "reasoning_expected": thinking_reasoning_expected(case["model_key"], case["variant"]),
+                "history_turn_count": 2,
+            }
+        )
+    return argv, envelope, input_path, stdout_path, stderr_path, {
+        "actual_config": session.actual_config_path,
+        "observed": observed,
+        "process_receipt": session.process_receipt,
+        "child_environment": session.child_environment,
+        "resident_case_receipt": existing_artifact_ref(root, case_receipt_path, "raw-json"),
     }
 
 
@@ -5271,6 +6002,62 @@ def execute_manifest(
     active_serve_session: dict[str, Any] | None = None
     serve_sessions: list[dict[str, Any]] = []
     server_error: str | None = None
+    active_run_session: ProductRunSession | None = None
+    active_run_group_key: tuple[str, ...] | None = None
+    run_sessions: list[dict[str, Any]] = []
+
+    def run_session_spec(
+        generation: int,
+        row: dict[str, Any],
+        group_key: tuple[str, ...],
+    ) -> dict[str, Any]:
+        stem = f"run-{generation:02d}"
+        actual_config = lane_root / f"commands/{stem}.actual-effective-config.json"
+        argv, _, _ = run_product_argv(
+            row,
+            binary_path=binary_path,
+            model_arg=execution["model_arg"],
+            backend=manifest["backend"],
+            actual_config=actual_config,
+            run_extra_args=execution["run_extra_args"],
+            resident=True,
+        )
+        require(
+            resident_run_group_key(row) == group_key,
+            f"resident run group {generation} option key drift",
+        )
+        return {
+            "command_id": f"actual-run-{generation:02d}",
+            "generation": generation,
+            "group_key": group_key,
+            "argv": argv,
+            "stdout": lane_root / f"commands/{stem}.stdout.log",
+            "stderr": lane_root / f"commands/{stem}.stderr.log",
+            "config": actual_config,
+            "receipt": lane_root / f"commands/{stem}.process-receipt.json",
+            "wire_receipt": lane_root / f"commands/{stem}.wire-receipt.json",
+        }
+
+    def start_run_session(
+        row: dict[str, Any],
+        group_key: tuple[str, ...],
+    ) -> ProductRunSession:
+        session_spec = run_session_spec(len(run_sessions) + 1, row, group_key)
+        session = ProductRunSession(
+            command_id=session_spec["command_id"],
+            argv=session_spec["argv"],
+            stdout_path=session_spec["stdout"],
+            stderr_path=session_spec["stderr"],
+            artifact_root=root,
+            receipt_path=session_spec["receipt"],
+            wire_receipt_path=session_spec["wire_receipt"],
+            timeout_sec=float(execution["case_timeout_sec"]),
+            actual_config_path=session_spec["config"],
+            group_key=group_key,
+        )
+        session_spec["session"] = session
+        run_sessions.append(session_spec)
+        return session
 
     def serve_session_spec(generation: int) -> dict[str, Any]:
         stem = f"serve-{generation:02d}"
@@ -5330,38 +6117,106 @@ def execute_manifest(
     first_run_record: dict[str, Any] | None = None
     last_serve_scenario: str | None = None
     try:
-        execution_rows = sorted(rows, key=lambda row: 0 if row["entrypoint"] == "run" else 1)
-        for row in execution_rows:
-            row = {
+        bound_rows = [
+            {
                 **row,
                 "model_key": manifest["model_key"],
                 "model_files": manifest["model_files"],
                 "backend": manifest["backend"],
             }
+            for row in rows
+        ]
+        if contract == G08_EXECUTION_CONTRACT:
+            grouped_run_rows: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+            serve_rows: list[dict[str, Any]] = []
+            for row in bound_rows:
+                if row["entrypoint"] == "run":
+                    grouped_run_rows.setdefault(resident_run_group_key(row), []).append(row)
+                else:
+                    serve_rows.append(row)
+            require(
+                len(grouped_run_rows) == 5,
+                f"G08 candidate run corpus must resolve to exactly five resident option groups, got {len(grouped_run_rows)}",
+            )
+            execution_rows = [
+                row
+                for group_rows in grouped_run_rows.values()
+                for row in group_rows
+            ] + serve_rows
+        else:
+            execution_rows = sorted(
+                bound_rows,
+                key=lambda row: 0 if row["entrypoint"] == "run" else 1,
+            )
+        for row in execution_rows:
             case_root = lane_root / "scenarios" / row["scenario_id"] / "cases" / row["case_id"]
             case_root.mkdir(parents=True, exist_ok=True)
             transcript_path: Path | None = None
             if row["entrypoint"] == "run":
-                argv, envelope, input_path, stdout_path, stderr_path, extra = run_case_command(
-                    root,
-                    row,
-                    binary_path=binary_path,
-                    model_arg=execution["model_arg"],
-                    backend=manifest["backend"],
-                    run_extra_args=execution["run_extra_args"],
-                    timeout_sec=float(execution["case_timeout_sec"]),
-                    case_root=case_root,
-                    locked_sources=validated["sources"],
-                    semantic_root=validated["semantic_root"],
-                    tokenizer_root=validated["tokenizer_root"],
-                )
+                if contract == G08_EXECUTION_CONTRACT:
+                    group_key = resident_run_group_key(row)
+                    if active_run_group_key != group_key:
+                        if active_run_session is not None:
+                            active_run_session.stop()
+                        active_run_session = start_run_session(row, group_key)
+                        active_run_group_key = group_key
+                    require(active_run_session is not None, "resident run session was not started")
+                    argv, envelope, input_path, stdout_path, stderr_path, extra = run_case_resident(
+                        root,
+                        row,
+                        session=active_run_session,
+                        case_root=case_root,
+                        locked_sources=validated["sources"],
+                        semantic_root=validated["semantic_root"],
+                        tokenizer_root=validated["tokenizer_root"],
+                        timeout_sec=float(execution["case_timeout_sec"]),
+                    )
+                    execution_process_receipt = invocation_process_receipt
+                    product_process_receipt = active_run_session.process_receipt
+                    command_id = active_run_session.command_id
+                    product_argv = active_run_session.argv
+                    product_process = {
+                        "argv": active_run_session.argv,
+                        "pid": active_run_session.pid,
+                        "pgid": active_run_session.pgid,
+                        "started_at": active_run_session.started_at,
+                        "ready_at": active_run_session.ready_at,
+                        "started_monotonic_ns": active_run_session.started_monotonic_ns,
+                        "ready_monotonic_ns": active_run_session.ready_monotonic_ns,
+                        "state_during_case": "running",
+                    }
+                else:
+                    argv, envelope, input_path, stdout_path, stderr_path, extra = run_case_command(
+                        root,
+                        row,
+                        binary_path=binary_path,
+                        model_arg=execution["model_arg"],
+                        backend=manifest["backend"],
+                        run_extra_args=execution["run_extra_args"],
+                        timeout_sec=float(execution["case_timeout_sec"]),
+                        case_root=case_root,
+                        locked_sources=validated["sources"],
+                        semantic_root=validated["semantic_root"],
+                        tokenizer_root=validated["tokenizer_root"],
+                    )
+                    execution_process_receipt = extra["process_receipt"]
+                    product_process_receipt = extra["process_receipt"]
+                    command_id = "actual-run"
+                    product_argv = argv
+                    product_process = {
+                        "argv": argv,
+                        "pid": envelope["pid"],
+                        "pgid": envelope["pgid"],
+                        "started_at": envelope["started_at"],
+                        "finished_at": envelope["finished_at"],
+                        "started_monotonic_ns": envelope["started_monotonic_ns"],
+                        "finished_monotonic_ns": envelope["finished_monotonic_ns"],
+                        "returncode": envelope["returncode"],
+                    }
                 observed = extra["observed"]
                 actual_config = extra["actual_config"]
-                execution_process_receipt = extra["process_receipt"]
-                product_process_receipt = extra["process_receipt"]
                 child_environment = extra["child_environment"]
-                command_id = "actual-run"
-                if first_run_record is None:
+                if contract == LEGACY_EXECUTION_CONTRACT and first_run_record is None:
                     first_run_record = {
                         "argv": argv,
                         "envelope": envelope,
@@ -5370,6 +6225,10 @@ def execute_manifest(
                         "process_receipt": extra["process_receipt"],
                     }
             else:
+                if active_run_session is not None:
+                    active_run_session.stop()
+                    active_run_session = None
+                    active_run_group_key = None
                 if (
                     server is not None
                     and last_serve_scenario in SERVE_ISOLATION_BOUNDARIES
@@ -5399,6 +6258,17 @@ def execute_manifest(
                 product_process_receipt = server.process_receipt
                 child_environment = server.child_environment
                 command_id = active_serve_session["command_id"]
+                product_argv = active_serve_session["argv"]
+                product_process = {
+                    "argv": active_serve_session["argv"],
+                    "pid": server.pid,
+                    "pgid": server.pgid,
+                    "started_at": server.started_at,
+                    "ready_at": server.ready_at,
+                    "started_monotonic_ns": server.started_monotonic_ns,
+                    "ready_monotonic_ns": server.ready_monotonic_ns,
+                    "state_during_case": "running",
+                }
                 last_serve_scenario = row["scenario_id"]
             elif row["entrypoint"] == "serve":
                 require(active_serve_session is not None, "failed serve session metadata missing")
@@ -5419,6 +6289,12 @@ def execute_manifest(
                 product_process_receipt = None
                 child_environment = sanitized_child_environment()
                 command_id = active_serve_session["command_id"]
+                product_argv = active_serve_session["argv"]
+                product_process = {
+                    "argv": active_serve_session["argv"],
+                    "state_during_case": "startup-failed",
+                    "failure": server_error,
+                }
                 last_serve_scenario = row["scenario_id"]
             status, failure_class, checker_error = classify_execution_outcome(
                 row,
@@ -5467,30 +6343,9 @@ def execute_manifest(
                 "product_process_receipt": product_process_receipt,
                 "child_environment": child_environment,
                 "child_environment_sha256": canonical_json_sha256(child_environment),
-                "product_argv": argv if row["entrypoint"] == "run" else active_serve_session["argv"],
-                "product_process": (
-                    {
-                        "argv": argv,
-                        "pid": envelope["pid"],
-                        "pgid": envelope["pgid"],
-                        "started_at": envelope["started_at"],
-                        "finished_at": envelope["finished_at"],
-                        "started_monotonic_ns": envelope["started_monotonic_ns"],
-                        "finished_monotonic_ns": envelope["finished_monotonic_ns"],
-                        "returncode": envelope["returncode"],
-                    }
-                    if row["entrypoint"] == "run"
-                    else ({
-                        "argv": active_serve_session["argv"],
-                        "pid": server.pid,
-                        "pgid": server.pgid,
-                        "started_at": server.started_at,
-                        "ready_at": server.ready_at,
-                        "started_monotonic_ns": server.started_monotonic_ns,
-                        "ready_monotonic_ns": server.ready_monotonic_ns,
-                        "state_during_case": "running",
-                    } if server is not None else {"argv": active_serve_session["argv"], "state_during_case": "startup-failed", "failure": server_error})
-                ),
+                "product_argv": product_argv,
+                "product_process": product_process,
+                "resident_case_receipt": extra.get("resident_case_receipt") if row["entrypoint"] == "run" else None,
                 "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
                 "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
                 "http_transcript": existing_artifact_ref(root, transcript_path, "http-transcript") if transcript_path else None,
@@ -5537,6 +6392,11 @@ def execute_manifest(
                     "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
                     "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
                     "effective_config": manifest["effective_config"],
+                    **(
+                        {"resident_case_receipt": extra["resident_case_receipt"]}
+                        if row["entrypoint"] == "run" and envelope["mode"] == "resident-jsonl"
+                        else {}
+                    ),
                     **({"http_transcript": existing_artifact_ref(root, transcript_path, "http-transcript")} if transcript_path else {}),
                 },
                 "observed": observed,
@@ -5550,6 +6410,8 @@ def execute_manifest(
             case_refs_by_scenario[row["scenario_id"]].append(ref)
             case_results[row["scenario_id"]].append(case_document)
     finally:
+        if active_run_session is not None:
+            active_run_session.stop()
         if server is not None:
             server.stop()
     for scenario_id in SCENARIO_IDS:
@@ -5593,25 +6455,74 @@ def execute_manifest(
         return discovery
     require(serve_sessions, f"canonical serve session unavailable: {server_error}")
     require(len(serve_sessions) == 2, "canonical serve collection must isolate post-C09 scenarios in a second server session")
-    require(first_run_record is not None, "canonical run produced no execution record")
+    if contract == G08_EXECUTION_CONTRACT:
+        require(len(run_sessions) == 5, "G08 candidate must persist exactly five resident run sessions")
+        require(
+            all(session_spec["session"].stopped for session_spec in run_sessions),
+            "G08 candidate resident run session remained active",
+        )
+    else:
+        require(first_run_record is not None, "canonical run produced no execution record")
     effective_sha = file_sha256(validated["effective_path"])
     commands = []
-    command_sources = [
-        ("actual-run", "run", first_run_record["argv"], first_run_record["envelope"], first_run_record["stdout"], first_run_record["stderr"], first_run_record["process_receipt"]),
-        *[
-            (
-                session["command_id"],
-                "serve",
-                session["argv"],
-                session["server"].envelope(),
-                session["stdout"],
-                session["stderr"],
-                session["server"].process_receipt,
+    command_sources: list[dict[str, Any]] = []
+    if contract == G08_EXECUTION_CONTRACT:
+        for session_spec in run_sessions:
+            run_session = session_spec["session"]
+            command_sources.append(
+                {
+                    "id": session_spec["command_id"],
+                    "entrypoint": "run",
+                    "argv": session_spec["argv"],
+                    "times": run_session.envelope(),
+                    "stdout": session_spec["stdout"],
+                    "stderr": session_spec["stderr"],
+                    "process_receipt": run_session.process_receipt,
+                    "extra": {
+                        "execution_mode": "resident-jsonl",
+                        "group_key": list(session_spec["group_key"]),
+                        "case_count": run_session.case_count,
+                        "case_ids": list(run_session.case_ids),
+                        "preset_aliases": sorted(run_session.preset_aliases),
+                        "wire_receipt": existing_artifact_ref(
+                            root,
+                            session_spec["wire_receipt"],
+                            "raw-json",
+                        ),
+                    },
+                }
             )
-            for session in serve_sessions
-        ],
-    ]
-    for command_id, entrypoint, argv, times, stdout_path, stderr_path, process_receipt in command_sources:
+    else:
+        command_sources.append(
+            {
+                "id": "actual-run",
+                "entrypoint": "run",
+                "argv": first_run_record["argv"],
+                "times": first_run_record["envelope"],
+                "stdout": first_run_record["stdout"],
+                "stderr": first_run_record["stderr"],
+                "process_receipt": first_run_record["process_receipt"],
+                "extra": {},
+            }
+        )
+    command_sources.extend(
+        {
+            "id": session["command_id"],
+            "entrypoint": "serve",
+            "argv": session["argv"],
+            "times": session["server"].envelope(),
+            "stdout": session["stdout"],
+            "stderr": session["stderr"],
+            "process_receipt": session["server"].process_receipt,
+            "extra": {},
+        }
+        for session in serve_sessions
+    )
+    for source in command_sources:
+        command_id = source["id"]
+        entrypoint = source["entrypoint"]
+        argv = source["argv"]
+        times = source["times"]
         duration = (parse_timestamp(times["finished_at"], "command finished") - parse_timestamp(times["started_at"], "command started")).total_seconds()
         commands.append(
             {
@@ -5628,10 +6539,11 @@ def execute_manifest(
                 "duration_sec": max(duration, 1e-6),
                 "env": times["child_environment"],
                 "env_sha256": times["child_environment_sha256"],
-                "process_receipt": process_receipt,
+                "process_receipt": source["process_receipt"],
                 "returncode": 0,
-                "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
-                "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
+                "stdout": existing_artifact_ref(root, source["stdout"], "stdout-log"),
+                "stderr": existing_artifact_ref(root, source["stderr"], "stderr-log"),
+                **source["extra"],
             }
         )
     scenarios = []
@@ -6076,20 +6988,32 @@ def make_case_fixture(
     write_json(root / input_rel, input_value)
     if entrypoint == "run":
         assistant_count = 3 if scenario_id == "C03" else 2 if scenario_id == "C19" else 1
-        rows: list[dict[str, Any]] = [{"event": "ready", "model": base["model_key"], "backend": base["backend"]}]
-        turn_indices = range(3) if scenario_id == "C03" else range(1, assistant_count + 1)
+        session_id = f"fixture-session-{case_id}"
+        rows: list[dict[str, Any]] = [{"event": "ready", "session_id": session_id, "history_epoch": 0, "model": base["model_key"], "backend": base["backend"]}]
+        turn_indices = range(assistant_count)
+        history: list[list[str]] = []
         for turn in turn_indices:
             if scenario_id == "C03":
                 content = c03_expected_assistant_turns(marker)[turn]
                 user_content = c03_user_turns(marker)[turn]
             else:
-                content = f"{marker}-H{turn}" if scenario_id == "C19" else marker
+                content = f"{marker}-H{turn + 1}" if scenario_id == "C19" else marker
                 user_content = input_value["prompt"]
-            rows.append({"event": "user", "turn": turn, "content": user_content})
+            history_before = {
+                "message_count": len(history),
+                "turn_count": sum(role == "user" for role, _ in history),
+                "sha256": hashlib.sha256(json.dumps(history, separators=(",", ":")).encode()).hexdigest(),
+            }
+            request_id = f"{session_id}-request-{turn + 1:04d}"
+            rows.append({"event": "user", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": user_content, "history_before": history_before})
             assistant_row = {
                     "event": "assistant",
+                    "session_id": session_id,
+                    "history_epoch": 0,
+                    "request_id": request_id,
                     "turn": turn,
                     "content": content,
+                    "history_before": history_before,
                     "finish_reason": "eos",
                     "n_tokens": 512 if scenario_id == "C04" else 4,
                     "chunk_count": 512 if scenario_id == "C04" else 2,
@@ -6098,9 +7022,9 @@ def make_case_fixture(
             if scenario_id == "C19":
                 if thinking_reasoning_expected(base["model_key"], variant):
                     assistant_row["reasoning"] = f"fixture reasoning turn {turn}"
-                assistant_row["history_turns_seen"] = turn - 1
             rows.append(assistant_row)
-        rows.append({"event": "exit", "reason": "complete"})
+            history.extend([["user", user_content], ["assistant", content]])
+        rows.append({"event": "exit", "session_id": session_id, "history_epoch": 0, "reason": "complete"})
         stdout_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
         transcript_ref = None
         argv = run_argv
@@ -6642,6 +7566,7 @@ def expect_reject(report: dict[str, Any], root: Path, name: str, mutate: Callabl
 def write_fake_ferrum(path: Path) -> None:
     source = r'''#!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -6677,6 +7602,116 @@ def write_config(argv, entrypoint):
         }) + "\n")
 
 
+def history_evidence(history):
+    encoded = json.dumps(history, ensure_ascii=False, separators=(",", ":")).encode()
+    return {
+        "message_count": len(history),
+        "turn_count": sum(role == "user" for role, _ in history),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def reasoning_enabled(argv, prompt):
+    if "--disable-thinking" in argv or prompt.rstrip().endswith("/no_think"):
+        return False
+    case_match = re.search(r"G00-c19-(\d{3})-OK", prompt)
+    if case_match and int(case_match.group(1)) >= 17:
+        return False
+    return True
+
+
+def response_for_prompt(prompt, history, remembered_marker):
+    if "Remember this identifier for later:" in prompt:
+        remembered = re.search(r"(G00-c03-\d{3}-OK)", prompt).group(1)
+        return "ACKNOWLEDGED", remembered
+    if prompt == "Reply with exactly CONTINUE.":
+        return "CONTINUE", remembered_marker
+    if prompt.startswith("What identifier did I ask"):
+        return remembered_marker, remembered_marker
+    marker_match = re.search(r"(G00-c\d\d-\d{3}-OK)(?:-H([12]))?", prompt)
+    if marker_match:
+        marker = marker_match.group(1)
+        history_suffix = marker_match.group(2)
+        return (f"{marker}-H{history_suffix}" if history_suffix else marker), remembered_marker
+    if "512 numbered one-word items" in prompt:
+        return " ".join(f"{index}.item" for index in range(1, 513)), remembered_marker
+    for marker in ("中文正确", "🙂🚀", "e\u0301"):
+        if marker in prompt:
+            return marker, remembered_marker
+    return "fixture-output", remembered_marker
+
+
+def emit_session_turn(argv, session_id, history_epoch, turn, prompt, history, remembered_marker, request_index):
+    request_id = f"{session_id}-request-{request_index:04d}"
+    evidence = history_evidence(history)
+    print(json.dumps({
+        "schema_version": 1, "event": "user", "session_id": session_id,
+        "history_epoch": history_epoch, "request_id": request_id, "turn": turn,
+        "content": prompt, "history_before": evidence,
+    }, ensure_ascii=False), flush=True)
+    content, remembered_marker = response_for_prompt(prompt, history, remembered_marker)
+    print(json.dumps({
+        "schema_version": 1, "event": "assistant_delta", "session_id": session_id,
+        "history_epoch": history_epoch, "request_id": request_id, "turn": turn,
+        "index": 0, "raw_text_delta": content, "utf8_bytes": len(content.encode()), "token_id": 1,
+    }, ensure_ascii=False), flush=True)
+    is_long = "512 numbered one-word items" in prompt
+    row = {
+        "schema_version": 1, "event": "assistant", "session_id": session_id,
+        "history_epoch": history_epoch, "request_id": request_id, "turn": turn,
+        "content": content, "reasoning": None, "history_before": evidence,
+        "finish_reason": "eos", "usage": None,
+        "n_tokens": 512 if is_long else 4, "chunk_count": 512 if is_long else 2,
+        "raw_text_sha256": hashlib.sha256(content.encode()).hexdigest(), "ms": 1.0,
+    }
+    if "G00-c19-" in prompt and reasoning_enabled(argv, prompt):
+        row["reasoning"] = f"fixture reasoning turn {turn}"
+    print(json.dumps(row, ensure_ascii=False), flush=True)
+    history.extend([["user", prompt], ["assistant", content]])
+    return remembered_marker
+
+
+def resident_run_mode(argv):
+    session_id = f"fixture-session-{os.getpid()}"
+    history_epoch = 0
+    history = []
+    turn = 0
+    request_index = 0
+    remembered_marker = None
+    print(json.dumps({
+        "schema_version": 1, "event": "ready", "session_id": session_id,
+        "history_epoch": 0, "model": argv[1], "requested_model": argv[1],
+        "resolved_model": argv[1], "backend": value_after(argv, "--backend", "auto"),
+    }), flush=True)
+    for raw in sys.stdin:
+        prompt = raw.rstrip("\r\n")
+        if prompt == "/clear":
+            before = history_evidence(history)
+            history.clear()
+            history_epoch += 1
+            turn = 0
+            remembered_marker = None
+            print(json.dumps({
+                "schema_version": 1, "event": "history_reset", "session_id": session_id,
+                "history_epoch": history_epoch, "turn": 0,
+                "history_before": before, "history_after": history_evidence(history),
+            }), flush=True)
+            continue
+        if prompt == "/bye":
+            print(json.dumps({
+                "schema_version": 1, "event": "exit", "session_id": session_id,
+                "history_epoch": history_epoch, "reason": "bye",
+            }), flush=True)
+            return 0
+        request_index += 1
+        remembered_marker = emit_session_turn(
+            argv, session_id, history_epoch, turn, prompt, history,
+            remembered_marker, request_index,
+        )
+        turn += 1
+    return 1
+
+
 def run_mode(argv):
     model_path = Path(argv[1])
     model_config = (model_path if model_path.is_dir() else model_path.parent) / "config.json"
@@ -6690,34 +7725,36 @@ def run_mode(argv):
     write_config(argv, "run")
     config = value_after(argv, "--effective-config-json", "")
     match = re.search(r"/(c\d\d-\d{3})/actual-effective-config", config)
-    case_id = match.group(1) if match else "c02-001"
+    if match is None:
+        return resident_run_mode(argv)
+    case_id = match.group(1)
     scenario = case_id[:3].upper()
     ordinal = int(case_id.rsplit("-", 1)[1])
     marker = "中文正确" if scenario == "C17" and ordinal <= 20 else "🙂🚀" if scenario == "C17" and ordinal <= 40 else "e\u0301" if scenario == "C17" else f"G00-{case_id}-OK"
     if scenario == "C06":
         marker = f"G00-c05-{ordinal:03d}-OK"
     turns = 3 if scenario == "C03" else 2 if scenario == "C19" else 1
-    turn_indices = range(3) if scenario == "C03" else range(1, turns + 1)
-    print(json.dumps({"event": "ready", "model": argv[1], "backend": value_after(argv, "--backend", "auto")}))
-    for turn in turn_indices:
-        if scenario == "C03":
-            user_content = [
-                f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
-                "Reply with exactly CONTINUE.",
-                "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
-            ][turn]
-            content = ["ACKNOWLEDGED", "CONTINUE", marker][turn]
+    prompts = [
+        f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
+        "Reply with exactly CONTINUE.",
+        "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
+    ] if scenario == "C03" else [f"Return the exact marker {marker}-H{turn + 1}." for turn in range(turns)] if scenario == "C19" else ["fixture input"]
+    session_id = f"fixture-session-{os.getpid()}"
+    print(json.dumps({"schema_version": 1, "event": "ready", "session_id": session_id, "history_epoch": 0, "model": argv[1], "requested_model": argv[1], "resolved_model": argv[1], "backend": value_after(argv, "--backend", "auto")}))
+    history = []
+    remembered_marker = None
+    for turn, prompt in enumerate(prompts):
+        if scenario not in {"C03", "C19"}:
+            content = marker
+            request_id = f"{session_id}-request-{turn + 1:04d}"
+            evidence = history_evidence(history)
+            print(json.dumps({"schema_version": 1, "event": "user", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": prompt, "history_before": evidence}))
+            row = {"schema_version": 1, "event": "assistant", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": content, "reasoning": None, "history_before": evidence, "finish_reason": "eos", "n_tokens": 512 if scenario == "C04" else 4, "chunk_count": 512 if scenario == "C04" else 2, "ms": 1.0}
+            print(json.dumps(row, ensure_ascii=False))
+            history.extend([["user", prompt], ["assistant", content]])
         else:
-            user_content = "fixture input"
-            content = f"{marker}-H{turn}" if scenario == "C19" else marker
-        print(json.dumps({"event": "user", "turn": turn, "content": user_content}))
-        row = {"event": "assistant", "turn": turn, "content": content, "finish_reason": "eos", "n_tokens": 512 if scenario == "C04" else 4, "chunk_count": 512 if scenario == "C04" else 2, "ms": 1.0}
-        if scenario == "C19":
-            if "--disable-thinking" not in argv and not (scenario == "C19" and ordinal >= 17):
-                row["reasoning"] = f"fixture reasoning turn {turn}"
-            row["history_turns_seen"] = turn - 1
-        print(json.dumps(row))
-    print(json.dumps({"event": "exit", "reason": "complete"}))
+            remembered_marker = emit_session_turn(argv, session_id, 0, turn, prompt, history, remembered_marker, turn + 1)
+    print(json.dumps({"schema_version": 1, "event": "exit", "session_id": session_id, "history_epoch": 0, "reason": "complete"}))
     return 0
 
 
@@ -7280,6 +8317,14 @@ def persist_input_mutation(
     command_spec["input_sha256"] = file_sha256(input_path)
     write_json(command_spec_path, command_spec)
     update_ref_sha(envelope["command_spec"], root)
+    resident_ref = case["artifacts"].get("resident_case_receipt")
+    if resident_ref is not None:
+        resident_path = root / resident_ref["path"]
+        resident = read_json(resident_path)
+        resident["input_sha256"] = file_sha256(input_path)
+        write_json(resident_path, resident)
+        update_ref_sha(resident_ref, root)
+        update_ref_sha(envelope["resident_case_receipt"], root)
     persist_execution_case_mutation(root, scenario, raw_path, raw, case_path, case, envelope_path=envelope_path, envelope=envelope)
 
 
@@ -7802,9 +8847,15 @@ def self_test() -> int:
             require_current_output_path=True,
         )
         execution_commands = {command["id"]: command for command in execution_report["commands"]}
+        expected_run_commands = {f"actual-run-{index:02d}" for index in range(1, 6)}
         require(
-            set(execution_commands) == {"actual-run", "actual-serve-01", "actual-serve-02"},
-            "execution fixture did not persist both C09-isolated serve sessions",
+            set(execution_commands) == expected_run_commands | {"actual-serve-01", "actual-serve-02"},
+            "execution fixture did not persist five run and two C09-isolated serve sessions",
+        )
+        require(
+            [execution_commands[f"actual-run-{index:02d}"]["case_count"] for index in range(1, 6)]
+            == [20, 63, 10, 2, 2],
+            "execution fixture resident run partition drifted",
         )
         first_serve_receipt = read_json(execution_root / execution_commands["actual-serve-01"]["process_receipt"]["path"])
         second_serve_receipt = read_json(execution_root / execution_commands["actual-serve-02"]["process_receipt"]["path"])
@@ -7818,11 +8869,15 @@ def self_test() -> int:
         invocation_ref = require_object(execution_report.get("executor_invocation"), "execution fixture invocation ref")
         require(str(invocation_ref.get("path", "")).startswith(executor_prefix), "executor invocation is not lane-local")
         invocation_document = read_json(execution_root / invocation_ref["path"])
-        run_receipt = read_json(execution_root / execution_commands["actual-run"]["process_receipt"]["path"])
+        run_receipts = [
+            read_json(execution_root / execution_commands[command_id]["process_receipt"]["path"])
+            for command_id in sorted(expected_run_commands)
+        ]
+        require(len({receipt["pid"] for receipt in run_receipts}) == 5, "execution fixture reused a resident run product pid")
         require(
             all(
                 receipt["pgid"] == invocation_document["pgid"]
-                for receipt in (run_receipt, first_serve_receipt, second_serve_receipt)
+                for receipt in (*run_receipts, first_serve_receipt, second_serve_receipt)
             ),
             "execution fixture product escaped the bounded executor process group",
         )
@@ -7907,6 +8962,13 @@ def self_test() -> int:
         expect_execution_report_reject(execution_root, candidate, "environment differs from process receipt")
         rejected_mutations.add("command-receipt-environment-divergence")
 
+        candidate = copy.deepcopy(execution_report)
+        candidate["commands"][0]["wire_receipt"] = copy.deepcopy(
+            candidate["commands"][1]["wire_receipt"]
+        )
+        expect_execution_report_reject(execution_root, candidate, "wire command binding mismatch")
+        rejected_mutations.add("resident-wire-cross-command-binding")
+
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c14-command-binding") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=13)
             envelope = read_json(envelope_path)
@@ -7933,14 +8995,17 @@ def self_test() -> int:
             input_path = mutation_root / case["artifacts"]["input"]["path"]
             input_document = read_json(input_path)
             input_document.pop("resolution_probe")
-            write_json(input_path, input_document)
-            update_ref_sha(case["artifacts"]["input"], mutation_root)
-            command_spec_path = mutation_root / envelope["command_spec"]["path"]
-            command_spec = read_json(command_spec_path)
-            command_spec["input_sha256"] = file_sha256(input_path)
-            write_json(command_spec_path, command_spec)
-            update_ref_sha(envelope["command_spec"], mutation_root)
-            persist_execution_case_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path=envelope_path, envelope=envelope)
+            persist_input_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path,
+                envelope,
+                input_document,
+            )
             expect_execution_report_reject(mutation_root, candidate, "resolution_probe")
             rejected_mutations.add("c01-missing-resolution-probe")
 
@@ -8447,6 +9512,7 @@ def self_test() -> int:
 
         required_rejections = {
             "command-receipt-environment-divergence",
+            "resident-wire-cross-command-binding",
             "post-c09-case-old-process-binding",
             "c01-missing-resolution-probe",
             "c01-negative-tokenizer-drift",
