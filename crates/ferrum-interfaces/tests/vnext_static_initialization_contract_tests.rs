@@ -138,6 +138,17 @@ fn static_initialization_uploads_schema_components_before_handoff() {
     );
     assert_eq!(receipt.uploaded_bytes(), expected_uploaded_bytes);
     assert_eq!(receipt.upload_command_count(), 2);
+    assert_eq!(receipt.imported_component_count(), 0);
+    assert_eq!(receipt.device_import_duration_us(), 0);
+    assert_eq!(receipt.import_seal_duration_us(), 0);
+    assert!(receipt.total_duration_us() >= receipt.source_materialization_duration_us());
+    assert!(receipt.total_duration_us() >= receipt.device_encode_duration_us());
+    assert!(receipt.total_duration_us() >= receipt.submission_wait_duration_us());
+    assert!(receipt.slowest_component_id().is_some());
+    assert!(
+        receipt.source_materialization_duration_us()
+            >= receipt.slowest_component_materialization_duration_us()
+    );
     assert_eq!(
         receipt.source_files(),
         &BTreeSet::from(["model.safetensors".to_owned()])
@@ -189,6 +200,10 @@ fn static_initialization_seals_backend_weight_import_without_upload_commands() {
     );
     assert_eq!(receipt.imported_bytes(), expected_imported_bytes);
     assert_eq!(receipt.submission_batch_count(), 0);
+    assert_eq!(receipt.submission_wait_duration_us(), 0);
+    assert!(receipt.slowest_component_id().is_some());
+    assert!(receipt.total_duration_us() >= receipt.device_import_duration_us());
+    assert!(receipt.total_duration_us() >= receipt.import_seal_duration_us());
     {
         let trace = trace.lock().unwrap();
         assert_eq!(trace.static_weight_import_begin_calls, 1);
