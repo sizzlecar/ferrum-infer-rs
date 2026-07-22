@@ -55,7 +55,7 @@ use uuid::Uuid;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
-const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
+const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 4096;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
@@ -2820,6 +2820,32 @@ enum EffectiveChatOutputContract {
     Text,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatOutputBudget {
+    AutoCeiling(u32),
+    Explicit(u32),
+}
+
+impl ChatOutputBudget {
+    fn resolve(request: &ChatCompletionsRequest) -> Self {
+        request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .map(Self::Explicit)
+            .unwrap_or(Self::AutoCeiling(DEFAULT_COMPLETION_MAX_TOKENS))
+    }
+
+    const fn ceiling(self) -> u32 {
+        match self {
+            Self::AutoCeiling(value) | Self::Explicit(value) => value,
+        }
+    }
+
+    const fn is_auto(self) -> bool {
+        matches!(self, Self::AutoCeiling(_))
+    }
+}
+
 impl EffectiveChatOutputContract {
     fn resolve(request: &ChatCompletionsRequest) -> Self {
         if tool_choice_required(request) {
@@ -2882,6 +2908,7 @@ fn convert_chat_request_with_template_model(
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
     let output_contract = EffectiveChatOutputContract::resolve(request);
+    let output_budget = ChatOutputBudget::resolve(request);
     let forced_response_format = forced_tool_choice_response_format(request);
     let hard_tool_call_contract = forced_response_format.is_some();
     let requested_response_format = output_contract
@@ -2944,7 +2971,7 @@ fn convert_chat_request_with_template_model(
     if request.ignore_eos.unwrap_or(false) {
         metadata.insert("ferrum_ignore_eos".to_string(), serde_json::json!(true));
     }
-    if request.max_completion_tokens.is_none() && request.max_tokens.is_none() {
+    if output_budget.is_auto() {
         metadata.insert(
             DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
             serde_json::json!(true),
@@ -2989,7 +3016,7 @@ fn convert_chat_request_with_template_model(
         model_id: ModelId(request.model.clone()),
         prompt,
         sampling_params: SamplingParams {
-            max_tokens: chat_completion_max_tokens(request) as usize,
+            max_tokens: output_budget.ceiling() as usize,
             temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
             top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
             top_k: request
@@ -3378,13 +3405,6 @@ fn api_chat_request(
             }
         }),
     }
-}
-
-fn chat_completion_max_tokens(request: &ChatCompletionsRequest) -> u32 {
-    request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or(DEFAULT_COMPLETION_MAX_TOKENS)
 }
 
 fn api_chat_message(message: &ChatMessage) -> ferrum_types::ApiChatMessage {
@@ -7823,6 +7843,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_omitted_output_budget_uses_auto_ceiling() {
+        let (router, engine) = router_with_capturing_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(request.sampling_params.max_tokens, 4096);
+        assert_eq!(
+            request.metadata.get(DEFAULT_MAX_TOKENS_METADATA_KEY),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
     async fn chat_accepts_stop_string_and_max_completion_tokens() {
         let (router, engine) = router_with_capturing_llm();
         let response = post_json(
@@ -7842,6 +7884,9 @@ mod tests {
         let request = engine.last_request();
         let defaults = default_chat_sampling_params();
         assert_eq!(request.sampling_params.max_tokens, 3);
+        assert!(!request
+            .metadata
+            .contains_key(DEFAULT_MAX_TOKENS_METADATA_KEY));
         assert_eq!(request.sampling_params.temperature, defaults.temperature);
         assert_eq!(
             request.sampling_params.repetition_penalty,

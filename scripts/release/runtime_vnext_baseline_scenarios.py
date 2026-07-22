@@ -3918,6 +3918,8 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
         "stop",
     ):
         if key in values:
+            if key == "max_tokens" and values.get("output_budget_mode") == "auto-ceiling":
+                continue
             payload[key] = values[key]
     if isinstance(values.get("template_kwargs"), dict) and values["template_kwargs"]:
         payload["chat_template_kwargs"] = values["template_kwargs"]
@@ -9325,6 +9327,44 @@ def self_test() -> int:
         )
         for receipt_path in execution_root.rglob("*process-receipt.json"):
             require(hostile_key not in receipt_path.read_text(encoding="utf-8"), f"hostile environment leaked into {receipt_path}")
+        for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"):
+            for preset_name in ("P_THINKING", "P_OFFICIAL_DEFAULT"):
+                preset = preset_values(model_key, preset_name)
+                require(
+                    preset.get("output_budget_mode") == "auto-ceiling"
+                    and preset.get("max_tokens") == 4096,
+                    f"{model_key} {preset_name} must use the 4096 auto ceiling",
+                )
+            c19_default = {
+                **next(
+                    row
+                    for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                    if row["scenario_id"] == "C19" and row["variant"] == "default-thinking"
+                ),
+                "model_key": model_key,
+            }
+            c19_argv, _ = run_case_option_args(c19_default)
+            require("--max-tokens" in c19_argv, f"{model_key} C19 run omitted auto ceiling")
+            require(
+                c19_argv[c19_argv.index("--max-tokens") + 1] == "4096",
+                f"{model_key} C19 run changed the auto ceiling",
+            )
+            require(
+                "max_tokens" not in case_http_payload(c19_default, model_key),
+                f"{model_key} C19 serve serialized the auto ceiling as an explicit limit",
+            )
+            c21_serve = {
+                **next(
+                    row
+                    for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                    if row["scenario_id"] == "C21" and row["entrypoint"] == "serve"
+                ),
+                "model_key": model_key,
+            }
+            require(
+                "max_tokens" not in case_http_payload(c21_serve, model_key),
+                f"{model_key} C21 serve serialized the official auto ceiling as an explicit limit",
+            )
         for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
             require(
                 preset_values(model_key, "P_THINKING")["max_tokens"] == 4096,
@@ -9373,7 +9413,13 @@ def self_test() -> int:
                     preset_argv[preset_argv.index(flag) + 1] == str(expected_value),
                     f"{model_key} P_THINKING run changed {key}",
                 )
-                require(preset_payload.get(key) == expected_value, f"{model_key} P_THINKING serve omitted or changed {key}")
+                if key == "max_tokens":
+                    require(
+                        key not in preset_payload,
+                        f"{model_key} P_THINKING serve serialized the auto ceiling as explicit",
+                    )
+                else:
+                    require(preset_payload.get(key) == expected_value, f"{model_key} P_THINKING serve omitted or changed {key}")
             for variant, expected_override in expected_overrides.items():
                 case = {
                     **next(row for row in c19_rows if row["variant"] == variant),
