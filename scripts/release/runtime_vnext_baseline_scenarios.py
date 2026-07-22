@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -115,6 +116,11 @@ SERVE_ISOLATION_BOUNDARIES = frozenset({"C09"})
 EXPECTATION_SELECTOR_FIELDS = ("scenario_id", "variant", "preset", "entrypoint", "case_id")
 EXPECTED_STATUSES = {"pass", "known-fail", "blocked", "discovery-required"}
 C03_CONTRACT_ID = "c03-exact-identifier-v2"
+C17_MARKERS = {
+    "chinese": "中文正确",
+    "emoji": "🙂🚀",
+    "combining": "x\u0301",
+}
 BLOCKED_LANE_FAILURE_CLASSES = {
     "m1-qwen35-4b/metal": "legacy-model-backend-unsupported",
     "m2-qwen35-35b-a3b/metal": "legacy-model-backend-unsupported",
@@ -212,6 +218,19 @@ def require_count(value: Any, label: str, *, minimum: int = 0) -> int:
     require(isinstance(value, int) and not isinstance(value, bool), f"{label} must be an integer")
     require(value >= minimum, f"{label} must be >= {minimum}")
     return value
+
+
+def validate_c17_markers() -> None:
+    require(set(C17_MARKERS) == {"chinese", "emoji", "combining"}, "C17 marker classes drifted")
+    combining = C17_MARKERS["combining"]
+    require(
+        unicodedata.normalize("NFC", combining) == combining,
+        "C17 combining marker must be stable under tokenizer NFC normalization",
+    )
+    require(
+        any(unicodedata.combining(character) > 0 for character in combining),
+        "C17 combining marker must contain a combining scalar",
+    )
 
 
 def require_sha256(value: Any, label: str) -> str:
@@ -3260,7 +3279,8 @@ def case_marker(case_id: str) -> str:
 
 def expected_case_text(case: dict[str, Any]) -> str:
     if case["scenario_id"] == "C17":
-        return {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "e\u0301"}[case["variant"]]
+        validate_c17_markers()
+        return C17_MARKERS[case["variant"]]
     if case["scenario_id"] == "C06":
         return case_marker(f"c05-{int(case['ordinal']):03d}")
     return case_marker(case["case_id"])
@@ -7795,6 +7815,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+C17_MARKERS = {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "x\u0301"}
+
+
 def value_after(argv, name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
 
@@ -7863,7 +7886,7 @@ def response_for_prompt(prompt, history, remembered_marker):
         return (f"{marker}-H{history_suffix}" if history_suffix else marker), remembered_marker
     if "512 numbered one-word items" in prompt:
         return " ".join(f"{index}.item" for index in range(1, 513)), remembered_marker
-    for marker in ("中文正确", "🙂🚀", "e\u0301"):
+    for marker in C17_MARKERS.values():
         if marker in prompt:
             return marker, remembered_marker
     return "fixture-output", remembered_marker
@@ -7960,7 +7983,11 @@ def run_mode(argv):
     case_id = match.group(1)
     scenario = case_id[:3].upper()
     ordinal = int(case_id.rsplit("-", 1)[1])
-    marker = "中文正确" if scenario == "C17" and ordinal <= 20 else "🙂🚀" if scenario == "C17" and ordinal <= 40 else "e\u0301" if scenario == "C17" else f"G00-{case_id}-OK"
+    marker = (
+        C17_MARKERS[("chinese" if ordinal <= 20 else "emoji" if ordinal <= 40 else "combining")]
+        if scenario == "C17"
+        else f"G00-{case_id}-OK"
+    )
     if scenario == "C06":
         marker = f"G00-c05-{ordinal:03d}-OK"
     turns = 3 if scenario == "C03" else 2 if scenario == "C19" else 1
@@ -8025,7 +8052,7 @@ class Handler(BaseHTTPRequestHandler):
         case_id = metadata.get("g00_case_id", "c05-001")
         scenario = metadata.get("g00_scenario_id", "C05")
         variant = metadata.get("g00_variant", "known-answer")
-        marker = {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "e\u0301"}.get(variant, f"G00-{case_id}-OK") if scenario == "C17" else f"G00-{case_id}-OK"
+        marker = C17_MARKERS.get(variant, f"G00-{case_id}-OK") if scenario == "C17" else f"G00-{case_id}-OK"
         if scenario == "C06":
             marker = f"G00-c05-{int(metadata.get('g00_ordinal', 1)):03d}-OK"
         request_index = int(metadata.get("g00_concurrency_request_index", 0))
@@ -8636,6 +8663,43 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
 
 
 def self_test() -> int:
+    validate_c17_markers()
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-c17-normalization-") as tmp:
+        stdout_path = Path(tmp) / "stdout.jsonl"
+        nfd_marker = "e\u0301"
+        nfc_marker = unicodedata.normalize("NFC", nfd_marker)
+        require(nfc_marker != nfd_marker, "C17 normalization negative fixture must differ by bytes")
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "event": "assistant",
+                    "content": nfc_marker,
+                    "finish_reason": "stop",
+                    "n_tokens": 2,
+                    "chunk_count": 2,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        normalization_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C17",
+                "combining",
+                "run",
+                stdout_path,
+                None,
+                {"expected_marker": nfd_marker},
+                "c17-normalization-negative",
+            )
+        )
+        require(
+            isinstance(normalization_failure, ScenarioError)
+            and "Unicode run content mismatch" in str(normalization_failure),
+            "C17 exact-byte oracle accepted canonically equivalent but byte-distinct output",
+        )
     json_failure = capture_case_output_error(lambda: json.loads(""))
     scenario_failure = capture_case_output_error(lambda: require(False, "case-output scenario failure"))
     no_failure = capture_case_output_error(lambda: None)
