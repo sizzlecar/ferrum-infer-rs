@@ -87,6 +87,32 @@ impl PlanNodeResolution {
         required_capabilities: BTreeSet<CapabilityId>,
         preferred_provider: Option<ProviderId>,
     ) -> Result<Self, VNextError> {
+        let prepared_family_fingerprint = family.fingerprint()?;
+        Self::resolve_with_family_fingerprint(
+            family,
+            &prepared_family_fingerprint,
+            catalog,
+            policy,
+            registry,
+            node_id,
+            values,
+            required_capabilities,
+            preferred_provider,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolve_with_family_fingerprint<P: RuntimePolicy>(
+        family: &PreparedModelFamily,
+        prepared_family_fingerprint: &str,
+        catalog: &CapabilityCatalog,
+        policy: &P,
+        registry: &OperationPlanningHandle<'_>,
+        node_id: NodeId,
+        values: Vec<ResolvedValueBinding>,
+        required_capabilities: BTreeSet<CapabilityId>,
+        preferred_provider: Option<ProviderId>,
+    ) -> Result<Self, VNextError> {
         policy.validate()?;
         validate_active_sequence_ceiling(policy.maximum_active_sequences())?;
         validate_scheduled_token_ceiling(policy.maximum_scheduled_tokens())?;
@@ -188,6 +214,7 @@ impl PlanNodeResolution {
             }
             let estimator_input_fingerprint = provider_resource_estimator_input_fingerprint(
                 family,
+                prepared_family_fingerprint,
                 operation,
                 program_node,
                 provider_id,

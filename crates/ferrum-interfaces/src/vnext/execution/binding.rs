@@ -27,12 +27,18 @@ pub(super) struct ProviderEstimatorInputMaterial<'a> {
 /// a serialized execution plan during validation.
 pub(crate) fn provider_resource_estimator_input_fingerprint(
     family: &PreparedModelFamily,
+    prepared_family_fingerprint: &str,
     operation: &OperationDescriptor,
     node: &ProgramNode,
     provider_id: &ProviderId,
     values: &[ResolvedValueBinding],
     required_capabilities: &BTreeSet<CapabilityId>,
 ) -> Result<String, VNextError> {
+    if !is_canonical_sha256(prepared_family_fingerprint) {
+        return Err(invalid_plan(
+            "prepared family fingerprint is not a canonical SHA-256 digest",
+        ));
+    }
     let (required_weight_formats, required_quantization_formats) =
         node_weight_requirements(family, values)?;
     let effective_required_capabilities = operation
@@ -41,11 +47,10 @@ pub(crate) fn provider_resource_estimator_input_fingerprint(
         .union(required_capabilities)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let prepared_family_fingerprint = family.fingerprint()?;
     let operation_fingerprint = operation.fingerprint()?;
     canonical_fingerprint(
         &ProviderEstimatorInputMaterial {
-            prepared_family_fingerprint: &prepared_family_fingerprint,
+            prepared_family_fingerprint,
             operation_fingerprint: &operation_fingerprint,
             node_id: &node.id,
             operation_id: &node.operation_id,
