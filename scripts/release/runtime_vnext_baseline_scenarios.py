@@ -61,6 +61,41 @@ SCHEMA_VERSION = 1
 LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
 EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
+CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
+CANDIDATE_BUILD_COMMANDS = {
+    "cuda": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--jobs",
+        "4",
+        "-p",
+        "ferrum-cli",
+        "--bin",
+        "ferrum",
+        "--features",
+        "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
+    ],
+    "metal": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--jobs",
+        "4",
+        "-p",
+        "ferrum-cli",
+        "--bin",
+        "ferrum",
+        "--features",
+        "metal",
+    ],
+}
+CANDIDATE_BUILD_PROBES = {
+    "cuda": {"cargo", "rustc", "nvcc", "nvidia_smi"},
+    "metal": {"cargo", "rustc", "xcodebuild", "system_profiler"},
+}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CASE_ID_RE = re.compile(r"^c(?:0[1-9]|1[0-9]|2[01])-[0-9]{3}$")
@@ -647,6 +682,7 @@ def validate_artifact_ref(
     label: str,
     *,
     allowed_kinds: set[str] | None = None,
+    allow_empty: bool = False,
 ) -> tuple[Path, str, Any | None]:
     ref = require_object(raw, label)
     kind = require_string(ref.get("kind"), f"{label}.kind")
@@ -654,7 +690,7 @@ def validate_artifact_ref(
         require(kind in allowed_kinds, f"{label}.kind {kind!r} is not allowed")
     path = artifact_path(root, ref.get("path"), f"{label}.path")
     require(path.is_file(), f"{label} missing artifact: {path}")
-    require(path.stat().st_size > 0, f"{label} artifact is empty: {path}")
+    require(allow_empty or path.stat().st_size > 0, f"{label} artifact is empty: {path}")
     expected = require_sha256(ref.get("sha256"), f"{label}.sha256")
     require(file_sha256(path) == expected, f"{label} artifact SHA256 mismatch")
     parsed: Any | None = None
@@ -665,7 +701,7 @@ def validate_artifact_ref(
             raise ScenarioError(f"{label} does not contain valid UTF-8 JSON: {exc}") from exc
         require(isinstance(parsed, (dict, list)) and bool(parsed), f"{label} JSON must be a non-empty object or array")
     elif kind in LOG_KINDS:
-        require(path.stat().st_size >= 16, f"{label} log is too small to be credible evidence")
+        require(allow_empty or path.stat().st_size >= 16, f"{label} log is too small to be credible evidence")
         text = path.read_text(encoding="utf-8", errors="replace").lower()
         require(not any(marker in text for marker in BLOCKER_MARKERS), f"{label} log contains a release blocker")
     return path, kind, parsed
@@ -700,6 +736,201 @@ def validate_source_identity(
     require(dirty.get("is_dirty") is False, f"{label} dirty source is forbidden")
     require(dirty.get("status_short") == [], f"{label}.dirty_status.status_short must be empty")
     return contract
+
+
+def validate_candidate_build_receipt(
+    root: Path,
+    raw: Any,
+    *,
+    expected: dict[str, Any],
+    allow_internal_fixture: bool,
+) -> tuple[dict[str, Any], Path, str, Path]:
+    receipt_path, _, parsed = validate_artifact_ref(
+        root,
+        raw,
+        "candidate binary build receipt",
+        allowed_kinds={"raw-json"},
+    )
+    receipt = require_object(parsed, "candidate binary build receipt JSON")
+    require(receipt.get("schema_version") == SCHEMA_VERSION, "candidate build receipt schema_version mismatch")
+    require(receipt.get("artifact_type") == CANDIDATE_BUILD_RECEIPT_TYPE, "candidate build receipt artifact_type mismatch")
+    require(receipt.get("status") == "pass", "candidate build receipt status must be pass")
+    require(
+        validate_source_identity(
+            receipt,
+            "candidate binary build receipt",
+            allow_internal_fixture=allow_internal_fixture,
+        )
+        == G08_EXECUTION_CONTRACT,
+        "candidate build receipt execution contract mismatch",
+    )
+    for key in ("source_git_sha", "source_tree_sha", "hardware_id"):
+        require(receipt.get(key) == expected.get(key), f"candidate build receipt {key} mismatch")
+    backend = require_string(expected.get("backend"), "candidate build expected backend")
+    require(backend in CANDIDATE_BUILD_COMMANDS, "candidate build expected backend is unsupported")
+    require(receipt.get("backend") == backend, "candidate build receipt backend mismatch")
+    build_command = CANDIDATE_BUILD_COMMANDS[backend]
+    require(receipt.get("command") == build_command, "candidate build command is not canonical")
+    require(receipt.get("returncode") == 0, "candidate build returncode must be 0")
+    recorded_artifact_root = Path(
+        require_string(receipt.get("artifact_root"), "candidate build artifact_root")
+    )
+    recorded_repository_root = Path(
+        require_string(receipt.get("repository_root"), "candidate build repository_root")
+    )
+    require(recorded_artifact_root.is_absolute(), "candidate build artifact_root must be absolute")
+    require(recorded_repository_root.is_absolute(), "candidate build repository_root must be absolute")
+    source_observations = require_object(
+        receipt.get("source_observations"),
+        "candidate build source_observations",
+    )
+    require(set(source_observations) == {"before", "after"}, "candidate build source observations must contain before/after")
+    for phase in ("before", "after"):
+        observation = require_object(
+            source_observations.get(phase),
+            f"candidate build source_observations.{phase}",
+        )
+        require(
+            observation
+            == {
+                "source_git_sha": receipt["source_git_sha"],
+                "source_tree_sha": receipt["source_tree_sha"],
+                "dirty_status": {"is_dirty": False, "status_short": []},
+            },
+            f"candidate build source observation {phase} is not the bound clean source",
+        )
+    started = parse_timestamp(receipt.get("started_at"), "candidate build started_at")
+    finished = parse_timestamp(receipt.get("finished_at"), "candidate build finished_at")
+    require(finished > started, "candidate build time window is not positive")
+    duration = receipt.get("duration_sec")
+    actual_duration = (finished - started).total_seconds()
+    require(
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and math.isfinite(float(duration))
+        and float(duration) > 0
+        and abs(float(duration) - actual_duration) <= max(0.1, actual_duration * 0.01),
+        "candidate build duration does not match timestamps",
+    )
+    binary_path, _, _ = validate_artifact_ref(
+        root,
+        receipt.get("binary_artifact"),
+        "candidate build binary",
+        allowed_kinds={"binary"},
+    )
+    binary_sha = require_sha256(receipt.get("binary_sha256"), "candidate build binary_sha256")
+    require(file_sha256(binary_path) == binary_sha, "candidate build binary SHA mismatch")
+    require(binary_sha == expected.get("binary_sha256"), "candidate build binary differs from execution manifest")
+    if "binary_path" in expected:
+        require(binary_path == expected["binary_path"], "candidate build binary path differs from execution manifest")
+
+    bounded_path, _, bounded_raw = validate_artifact_ref(
+        root,
+        receipt.get("bounded_receipt"),
+        "candidate build bounded receipt",
+        allowed_kinds={"raw-json"},
+    )
+    bounded = require_object(bounded_raw, "candidate build bounded receipt JSON")
+    require(bounded.get("schema") == "ferrum.bounded-command-receipt.v1", "candidate build bounded receipt schema mismatch")
+    require(bounded.get("command") == build_command, "candidate bounded build command mismatch")
+    require(
+        Path(require_string(bounded.get("cwd"), "candidate bounded build cwd"))
+        == recorded_repository_root,
+        "candidate bounded build cwd differs from the recorded repository root",
+    )
+    require(bounded.get("status") == "pass" and bounded.get("rc") == 0, "candidate bounded build did not pass")
+    require(bounded.get("reason") == "command_completed", "candidate bounded build completion reason mismatch")
+    require(bounded.get("sampling_error_count") == 0 and bounded.get("sampling_errors") == [], "candidate bounded build contains sampling errors")
+    require(bounded.get("violation") is None, "candidate bounded build records a resource violation")
+    termination = require_object(bounded.get("termination"), "candidate bounded build termination")
+    require(
+        termination.get("signals") == [] and termination.get("errors") == [],
+        "candidate bounded build required termination or cleanup recovery",
+    )
+    require_count(bounded.get("pid"), "candidate bounded build pid", minimum=1)
+    require_count(bounded.get("pgid"), "candidate bounded build pgid", minimum=1)
+    bounded_started = parse_timestamp(bounded.get("started_at"), "candidate bounded build started_at")
+    bounded_finished = parse_timestamp(bounded.get("ended_at"), "candidate bounded build ended_at")
+    require(bounded_started == started and bounded_finished == finished, "candidate build and bounded receipt windows differ")
+    bounded_duration = bounded.get("duration_seconds")
+    require(
+        isinstance(bounded_duration, (int, float))
+        and not isinstance(bounded_duration, bool)
+        and math.isfinite(float(bounded_duration))
+        and abs(float(bounded_duration) - actual_duration) <= max(0.1, actual_duration * 0.01),
+        "candidate bounded build duration does not match timestamps",
+    )
+    cleanup = require_object(bounded.get("cleanup"), "candidate bounded build cleanup")
+    require(cleanup.get("process_group_gone") is True, "candidate bounded build process group was not cleaned up")
+    limits = require_object(bounded.get("limits"), "candidate bounded build limits")
+    wall_timeout = limits.get("wall_timeout_seconds")
+    require(
+        isinstance(wall_timeout, (int, float))
+        and not isinstance(wall_timeout, bool)
+        and math.isfinite(float(wall_timeout))
+        and 0 < float(wall_timeout) <= 2700,
+        "candidate build wall timeout exceeds 45 minutes",
+    )
+    require(
+        require_count(limits.get("max_processes"), "candidate build max_processes", minimum=1) <= 64
+        and require_count(limits.get("max_group_threads"), "candidate build max_group_threads", minimum=1) <= 256
+        and require_count(limits.get("max_per_process_threads"), "candidate build max_per_process_threads", minimum=1) <= 64,
+        "candidate build process/thread limit is unsafe",
+    )
+    require_count(bounded.get("successful_samples"), "candidate bounded build successful_samples", minimum=1)
+    peaks = require_object(bounded.get("peaks"), "candidate bounded build peaks")
+    require(
+        require_count(peaks.get("processes"), "candidate build peak processes")
+        <= limits["max_processes"]
+        and require_count(peaks.get("group_threads"), "candidate build peak group threads")
+        <= limits["max_group_threads"]
+        and require_count(peaks.get("per_process_threads"), "candidate build peak per-process threads")
+        <= limits["max_per_process_threads"],
+        "candidate bounded build peaks exceed its limits",
+    )
+    build_log_bytes = 0
+    for name in ("stdout", "stderr"):
+        log_path, _, _ = validate_artifact_ref(
+            root,
+            receipt.get(name),
+            f"candidate build {name}",
+            allowed_kinds={f"{name}-log"},
+            allow_empty=True,
+        )
+        build_log_bytes += log_path.stat().st_size
+        bounded_identity = require_object(bounded.get(name), f"candidate bounded build {name}")
+        recorded_log_path = Path(
+            require_string(
+                bounded_identity.get("path"),
+                f"candidate bounded build {name}.path",
+            )
+        )
+        require(recorded_log_path.is_absolute(), f"candidate bounded build {name} path must be absolute")
+        try:
+            recorded_relative = recorded_log_path.relative_to(recorded_artifact_root)
+        except ValueError as exc:
+            raise ScenarioError(
+                f"candidate bounded build {name} path escapes the recorded artifact root"
+            ) from exc
+        require(
+            recorded_relative.as_posix()
+            == require_string(receipt[name].get("path"), f"candidate build {name}.path"),
+            f"candidate bounded build {name} relative path mismatch",
+        )
+        require(bounded_identity.get("sha256") == file_sha256(log_path), f"candidate bounded build {name} SHA mismatch")
+        require(bounded_identity.get("size_bytes") == log_path.stat().st_size, f"candidate bounded build {name} size mismatch")
+    require(build_log_bytes >= 16, "candidate bounded build stdout/stderr are both empty")
+    probes = require_object(receipt.get("probe_artifacts"), "candidate build probe_artifacts")
+    require(set(probes) == CANDIDATE_BUILD_PROBES[backend], "candidate build probe artifact set mismatch")
+    for name, ref in probes.items():
+        probe_path, _, _ = validate_artifact_ref(
+            root,
+            ref,
+            f"candidate build probe {name}",
+            allowed_kinds={"runtime-log"},
+        )
+        require(probe_path.read_text(encoding="utf-8", errors="strict").strip(), f"candidate build probe {name} is empty")
+    return receipt, receipt_path, file_sha256(receipt_path), binary_path
 
 
 def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[str, Any]:
@@ -2353,6 +2584,21 @@ def validate_report_document(
     expected["expectations_catalog_sha256"] = report["expectations_catalog_sha256"]
     binary_path, _, _ = validate_artifact_ref(root, report.get("binary_artifact"), "scenario_report.binary_artifact", allowed_kinds={"binary"})
     require(file_sha256(binary_path) == report["binary_sha256"], "scenario_report binary artifact binding mismatch")
+    if contract == G08_EXECUTION_CONTRACT:
+        validate_candidate_build_receipt(
+            root,
+            report.get("binary_build_receipt"),
+            expected={
+                **expected,
+                "binary_path": binary_path,
+            },
+            allow_internal_fixture=allow_internal_fixture,
+        )
+    else:
+        require(
+            "binary_build_receipt" not in report,
+            "legacy scenario report must not contain a candidate build receipt",
+        )
     models_lock_path, _, _ = validate_artifact_ref(root, report.get("models_lock"), "scenario_report.models_lock", allowed_kinds={"raw-json"})
     require(file_sha256(models_lock_path) == report["models_lock_sha256"], "scenario_report models.lock binding mismatch")
     runner_identity = validate_runner_identity(report.get("runner"), allow_internal_fixture=allow_internal_fixture)
@@ -2401,14 +2647,24 @@ def validate_report_document(
         require(start_ns <= receipt_ns <= finish_ns, "executor invocation receipt monotonic time is outside invocation window")
         manifest_snapshot, _, _ = validate_artifact_ref(root, invocation.get("manifest_snapshot"), "executor invocation manifest snapshot", allowed_kinds={"raw-json"})
         require(file_sha256(manifest_snapshot) == invocation.get("manifest_sha256"), "executor invocation manifest SHA mismatch")
+        snapshot_document = require_object(
+            read_json(manifest_snapshot),
+            "executor invocation manifest snapshot",
+        )
         snapshot = validate_execution_manifest(
-            require_object(read_json(manifest_snapshot), "executor invocation manifest snapshot"),
+            snapshot_document,
             root,
             allow_internal_fixture=allow_internal_fixture,
         )
         require(snapshot["execution_contract"] == contract, "executor invocation manifest execution contract differs from report")
         for key in ("source_git_sha", "source_tree_sha", "models_lock_sha256", "binary_sha256", "model_key", "backend", "model_revision", "model_files", "hardware_id"):
-            require(read_json(manifest_snapshot).get(key) == report.get(key), f"executor invocation manifest {key} differs from report")
+            require(snapshot_document.get(key) == report.get(key), f"executor invocation manifest {key} differs from report")
+        if contract == G08_EXECUTION_CONTRACT:
+            require(
+                snapshot_document.get("binary_build_receipt")
+                == report.get("binary_build_receipt"),
+                "executor invocation manifest build receipt differs from report",
+            )
         require(snapshot["execution"]["model_arg"] == report.get("model_path"), "executor invocation manifest model path differs from report")
         expected.update(
             {
@@ -2538,10 +2794,19 @@ def artifact_ref(root: Path, rel: str, kind: str, text: str) -> dict[str, str]:
     return {"kind": kind, "path": rel, "sha256": file_sha256(path)}
 
 
-def existing_artifact_ref(root: Path, path: Path, kind: str) -> dict[str, str]:
+def existing_artifact_ref(
+    root: Path,
+    path: Path,
+    kind: str,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, str]:
     resolved = path.resolve()
     rel = resolved.relative_to(root.resolve()).as_posix()
-    require(resolved.is_file() and resolved.stat().st_size > 0, f"cannot reference empty artifact {resolved}")
+    require(
+        resolved.is_file() and (allow_empty or resolved.stat().st_size > 0),
+        f"cannot reference empty artifact {resolved}",
+    )
     return {"kind": kind, "path": rel, "sha256": file_sha256(resolved)}
 
 
@@ -4828,8 +5093,31 @@ def validate_execution_manifest(
         require_sha256(digest, f"execution_manifest.model_files[{path}]")
     binary_path, _, _ = validate_artifact_ref(root, manifest.get("binary_artifact"), "execution_manifest.binary_artifact", allowed_kinds={"binary"})
     models_lock_path, _, models_lock_document = validate_artifact_ref(root, manifest.get("models_lock"), "execution_manifest.models_lock", allowed_kinds={"raw-json"})
-    require(file_sha256(binary_path) == require_sha256(manifest.get("binary_sha256"), "execution_manifest.binary_sha256"), "execution manifest binary SHA mismatch")
-    require(file_sha256(models_lock_path) == require_sha256(manifest.get("models_lock_sha256"), "execution_manifest.models_lock_sha256"), "execution manifest models.lock SHA mismatch")
+    binary_sha256 = require_sha256(manifest.get("binary_sha256"), "execution_manifest.binary_sha256")
+    models_lock_sha256 = require_sha256(manifest.get("models_lock_sha256"), "execution_manifest.models_lock_sha256")
+    require(file_sha256(binary_path) == binary_sha256, "execution manifest binary SHA mismatch")
+    require(file_sha256(models_lock_path) == models_lock_sha256, "execution manifest models.lock SHA mismatch")
+    build_receipt_path: Path | None = None
+    build_receipt_sha256: str | None = None
+    if contract == G08_EXECUTION_CONTRACT:
+        _, build_receipt_path, build_receipt_sha256, _ = validate_candidate_build_receipt(
+            root,
+            manifest.get("binary_build_receipt"),
+            expected={
+                "source_git_sha": manifest["source_git_sha"],
+                "source_tree_sha": manifest["source_tree_sha"],
+                "hardware_id": manifest["hardware_id"],
+                "backend": manifest["backend"],
+                "binary_sha256": binary_sha256,
+                "binary_path": binary_path,
+            },
+            allow_internal_fixture=allow_internal_fixture,
+        )
+    else:
+        require(
+            "binary_build_receipt" not in manifest,
+            "legacy execution manifest must not contain a candidate build receipt",
+        )
     effective_path, _, effective = validate_artifact_ref(root, manifest.get("effective_config"), "execution_manifest.effective_config", allowed_kinds={"raw-json"})
     effective_document = require_object(effective, "execution_manifest effective config")
     effective_contract = validate_source_identity(
@@ -4863,6 +5151,8 @@ def validate_execution_manifest(
     return {
         "execution_contract": contract,
         "binary_path": binary_path,
+        "build_receipt_path": build_receipt_path,
+        "build_receipt_sha256": build_receipt_sha256,
         "models_lock_path": models_lock_path,
         "effective_path": effective_path,
         "execution": execution,
@@ -5430,6 +5720,8 @@ def execute_manifest(
         "artifact_path": str(out),
         "pass_line": f"{pass_prefix_for_contract(contract)}: {out}",
     }
+    if contract == G08_EXECUTION_CONTRACT:
+        report["binary_build_receipt"] = manifest["binary_build_receipt"]
     attach_pair_registry(report, root)
     validate_report_document(report, root, report_path=out, allow_internal_fixture=allow_internal_fixture, require_current_output_path=True)
     return report
@@ -6760,6 +7052,133 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
     }
 
 
+def make_candidate_build_receipt_fixture(
+    root: Path,
+    manifest: dict[str, Any],
+) -> dict[str, str]:
+    backend = require_string(manifest.get("backend"), "candidate build fixture backend")
+    build_root = root / "build/candidate"
+    stdout_path = build_root / "stdout.log"
+    stderr_path = build_root / "stderr.log"
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.write_bytes(b"")
+    stderr_path.write_text(
+        "candidate fixture build diagnostic stream remained clean\n",
+        encoding="utf-8",
+    )
+    stdout_ref = existing_artifact_ref(
+        root,
+        stdout_path,
+        "stdout-log",
+        allow_empty=True,
+    )
+    stderr_ref = existing_artifact_ref(root, stderr_path, "stderr-log")
+    probe_text = {
+        "cargo": "cargo fixture version 1.0.0\n",
+        "rustc": "rustc fixture version 1.0.0\n",
+        "nvcc": "nvcc fixture release 12.4\n",
+        "nvidia_smi": "NVIDIA RTX 4090 fixture inventory\n",
+        "xcodebuild": "Xcode fixture version 16.0\n",
+        "system_profiler": "Apple GPU fixture inventory\n",
+    }
+    probes = {
+        name: artifact_ref(
+            root,
+            f"build/candidate/{name}.log",
+            "runtime-log",
+            probe_text[name],
+        )
+        for name in sorted(CANDIDATE_BUILD_PROBES[backend])
+    }
+    started_at = "2026-01-01T00:00:00Z"
+    ended_at = "2026-01-01T00:00:05Z"
+    bounded_path = build_root / "bounded-command-receipt.json"
+    write_json(
+        bounded_path,
+        {
+            "schema": "ferrum.bounded-command-receipt.v1",
+            "command": CANDIDATE_BUILD_COMMANDS[backend],
+            "cwd": str(REPO_ROOT),
+            "pid": 4242,
+            "pgid": 4242,
+            "limits": {
+                "wall_timeout_seconds": 2700.0,
+                "max_processes": 64,
+                "max_group_threads": 256,
+                "max_per_process_threads": 64,
+                "sample_interval_seconds": 0.05,
+                "max_sampling_errors": 3,
+                "term_grace_seconds": 1.0,
+            },
+            "peaks": {
+                "processes": 4,
+                "group_threads": 12,
+                "per_process_threads": 4,
+                "per_process_threads_pid": 4242,
+            },
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_seconds": 5.0,
+            "reason": "command_completed",
+            "rc": 0,
+            "status": "pass",
+            "successful_samples": 5,
+            "sampling_error_count": 0,
+            "sampling_errors": [],
+            "violation": None,
+            "termination": {"signals": [], "errors": []},
+            "cleanup": {"process_group_gone": True},
+            "stdout": {
+                "path": str(stdout_path.resolve()),
+                "sha256": stdout_ref["sha256"],
+                "size_bytes": stdout_path.stat().st_size,
+            },
+            "stderr": {
+                "path": str(stderr_path.resolve()),
+                "sha256": stderr_ref["sha256"],
+                "size_bytes": stderr_path.stat().st_size,
+            },
+        },
+    )
+    receipt_path = build_root / "candidate-build-receipt.json"
+    write_json(
+        receipt_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "artifact_type": CANDIDATE_BUILD_RECEIPT_TYPE,
+            "status": "pass",
+            "execution_contract": G08_EXECUTION_CONTRACT,
+            "source_git_sha": manifest["source_git_sha"],
+            "source_tree_sha": manifest["source_tree_sha"],
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "hardware_id": manifest["hardware_id"],
+            "backend": backend,
+            "artifact_root": str(root.resolve()),
+            "repository_root": str(REPO_ROOT),
+            "source_observations": {
+                phase: {
+                    "source_git_sha": manifest["source_git_sha"],
+                    "source_tree_sha": manifest["source_tree_sha"],
+                    "dirty_status": {"is_dirty": False, "status_short": []},
+                }
+                for phase in ("before", "after")
+            },
+            "command": CANDIDATE_BUILD_COMMANDS[backend],
+            "returncode": 0,
+            "started_at": started_at,
+            "finished_at": ended_at,
+            "duration_sec": 5.0,
+            "binary_artifact": manifest["binary_artifact"],
+            "binary_sha256": manifest["binary_sha256"],
+            "bounded_receipt": existing_artifact_ref(root, bounded_path, "raw-json"),
+            "stdout": stdout_ref,
+            "stderr": stderr_ref,
+            "probe_artifacts": probes,
+        },
+    )
+    return existing_artifact_ref(root, receipt_path, "raw-json")
+
+
 @contextmanager
 def execution_report_mutation_fixture(
     source_root: Path,
@@ -7304,6 +7723,10 @@ def self_test() -> int:
             candidate_effective_path,
             "raw-json",
         )
+        candidate_manifest["binary_build_receipt"] = make_candidate_build_receipt_fixture(
+            execution_root,
+            candidate_manifest,
+        )
         validated_candidate = validate_execution_manifest(
             candidate_manifest,
             execution_root,
@@ -7313,6 +7736,31 @@ def self_test() -> int:
             validated_candidate["execution_contract"] == G08_EXECUTION_CONTRACT,
             "G08 candidate execution manifest lost its explicit contract",
         )
+        hostile_build_receipt = read_json(
+            execution_root / candidate_manifest["binary_build_receipt"]["path"]
+        )
+        hostile_build_receipt["command"] = ["cargo", "build"]
+        hostile_build_receipt_path = execution_root / "build/candidate/hostile-build-receipt.json"
+        write_json(hostile_build_receipt_path, hostile_build_receipt)
+        hostile_candidate_manifest = copy.deepcopy(candidate_manifest)
+        hostile_candidate_manifest["binary_build_receipt"] = existing_artifact_ref(
+            execution_root,
+            hostile_build_receipt_path,
+            "raw-json",
+        )
+        try:
+            validate_execution_manifest(
+                hostile_candidate_manifest,
+                execution_root,
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require(
+                "build command is not canonical" in str(exc),
+                f"G08 candidate build receipt mutation used unexpected rejection: {exc}",
+            )
+        else:
+            raise AssertionError("G08 candidate execution accepted an unbound build command")
         try:
             execute_manifest(
                 candidate_manifest,
