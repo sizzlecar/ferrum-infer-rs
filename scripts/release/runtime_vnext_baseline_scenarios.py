@@ -8043,6 +8043,7 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--execute", action="store_true")
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--discover-scenario", choices=("C03",))
     parser.add_argument("--self-test", action="store_true")
@@ -8051,6 +8052,8 @@ def main() -> int:
         return self_test()
     if args.discover_scenario is not None and not args.discover:
         parser.error("--discover-scenario requires --discover")
+    if args.execute and args.discover:
+        parser.error("--execute and --discover are mutually exclusive")
     if args.manifest is None or args.artifact_root is None or args.out is None:
         parser.error("--manifest, --artifact-root, and --out are required")
     root = args.artifact_root.resolve()
@@ -8063,15 +8066,26 @@ def main() -> int:
                 manifest,
                 root,
                 out,
-                discover=True,
+                discover=args.discover,
                 discovery_scenario=args.discover_scenario,
             )
-            if args.discover
+            if args.execute or args.discover
             else collect_manifest(manifest, root, out)
         )
         write_json(out, report)
     except (ScenarioError, ValueError) as exc:
-        print(f"FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL: {args.out}: {exc}", file=sys.stderr)
+        manifest_value = locals().get("manifest")
+        contract = (
+            manifest_value.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+            if isinstance(manifest_value, dict)
+            else LEGACY_EXECUTION_CONTRACT
+        )
+        fail_prefix = (
+            "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS FAIL"
+            if contract == G08_EXECUTION_CONTRACT
+            else "FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL"
+        )
+        print(f"{fail_prefix}: {args.out}: {exc}", file=sys.stderr)
         return 1
     if args.discover:
         print(f"FERRUM RUNTIME VNEXT G00 SCENARIOS DISCOVERY COMPLETE: {out}")
