@@ -33,10 +33,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from runtime_vnext_active_timeline import ActiveTimelineError, derive_active_timeline
+except ModuleNotFoundError:
+    from scripts.release.runtime_vnext_active_timeline import (
+        ActiveTimelineError,
+        derive_active_timeline,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = Path(__file__).resolve()
 RUNNER_REPO_PATH = RUNNER_PATH.relative_to(REPO_ROOT).as_posix()
+ACTIVE_TIMELINE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_active_timeline.py"
+ACTIVE_TIMELINE_REPO_PATH = ACTIVE_TIMELINE_PATH.relative_to(REPO_ROOT).as_posix()
 EXPECTATIONS_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json"
 EXPECTATIONS_REPO_PATH = EXPECTATIONS_PATH.relative_to(REPO_ROOT).as_posix()
 FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
@@ -71,6 +81,15 @@ BLOCKER_MARKERS = (
     "<unk>",
     "[pad",
 )
+C18_PANIC_RE = re.compile(
+    r"(?:thread .{0,120} panicked|panicked at|fatal runtime error:|panic!\s*\()",
+    re.IGNORECASE,
+)
+C18_OOM_RE = re.compile(
+    r"(?:out[ -]of[ -]memory|\bcuda\s+oom\b|\bmetal\s+oom\b|"
+    r"memory allocation (?:failed|failure)|allocator exhaustion)",
+    re.IGNORECASE,
+)
 CHILD_ENV_ALLOWLIST = frozenset(
     {
         "CUDA_HOME",
@@ -104,6 +123,14 @@ EXPECTED_ARCHITECTURES = {
     "m1-qwen35-4b": {"qwen3_5", "qwen3_5_text"},
     "m2-qwen35-35b-a3b": {"qwen3_5_moe", "qwen3_5_moe_text"},
     "m3-qwen3-30b-a3b": {"qwen3", "qwen3_moe"},
+}
+REQUIRED_ACTIVE_FLOORS = {
+    ("m1-qwen35-4b", "cuda"): 32,
+    ("m1-qwen35-4b", "metal"): 16,
+    ("m2-qwen35-35b-a3b", "cuda"): 16,
+    ("m2-qwen35-35b-a3b", "metal"): 4,
+    ("m3-qwen3-30b-a3b", "cuda"): 32,
+    ("m3-qwen3-30b-a3b", "metal"): 16,
 }
 
 
@@ -450,12 +477,28 @@ def canonical_runner_identity() -> dict[str, Any]:
     blob_sha = require_git_sha(git_text(["rev-parse", f"HEAD:{RUNNER_REPO_PATH}"]), "runner.git_blob_sha")
     checked_in = git_bytes(["show", f"HEAD:{RUNNER_REPO_PATH}"])
     require(checked_in == RUNNER_PATH.read_bytes(), "scenario runner differs from its checked-in blob")
+    dependency_blob_sha = require_git_sha(
+        git_text(["rev-parse", f"HEAD:{ACTIVE_TIMELINE_REPO_PATH}"]),
+        "runner.dependencies[0].git_blob_sha",
+    )
+    dependency_checked_in = git_bytes(["show", f"HEAD:{ACTIVE_TIMELINE_REPO_PATH}"])
+    require(
+        dependency_checked_in == ACTIVE_TIMELINE_PATH.read_bytes(),
+        "active timeline dependency differs from its checked-in blob",
+    )
     return {
         "path": RUNNER_REPO_PATH,
         "git_sha": git_sha,
         "source_tree_sha": tree_sha,
         "git_blob_sha": blob_sha,
         "sha256": hashlib.sha256(checked_in).hexdigest(),
+        "dependencies": [
+            {
+                "path": ACTIVE_TIMELINE_REPO_PATH,
+                "git_blob_sha": dependency_blob_sha,
+                "sha256": hashlib.sha256(dependency_checked_in).hexdigest(),
+            }
+        ],
         "dirty_status": {"is_dirty": False, "status_short": []},
     }
 
@@ -467,6 +510,13 @@ def internal_fixture_runner_identity() -> dict[str, Any]:
         "source_tree_sha": frozen_tree_sha(),
         "git_blob_sha": "0" * 40,
         "sha256": file_sha256(RUNNER_PATH),
+        "dependencies": [
+            {
+                "path": ACTIVE_TIMELINE_REPO_PATH,
+                "git_blob_sha": "0" * 40,
+                "sha256": file_sha256(ACTIVE_TIMELINE_PATH),
+            }
+        ],
         "dirty_status": {"is_dirty": False, "status_short": []},
         "internal_fixture": True,
     }
@@ -558,6 +608,33 @@ def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[
     expected_sha256 = hashlib.sha256(checked_in).hexdigest()
     require(runner.get("sha256") == expected_sha256, "scenario_report runner SHA256 mismatch")
     require(file_sha256(RUNNER_PATH) == expected_sha256, "scenario_report runner does not match the current gate contract")
+    dependencies = require_list(runner.get("dependencies"), "scenario_report.runner.dependencies")
+    require(len(dependencies) == 1, "scenario_report runner must bind exactly one dependency")
+    dependency = require_object(dependencies[0], "scenario_report.runner.dependencies[0]")
+    require(
+        dependency.get("path") == ACTIVE_TIMELINE_REPO_PATH,
+        "scenario_report runner active timeline dependency path mismatch",
+    )
+    dependency_blob = require_git_sha(
+        git_text(["rev-parse", f"{runner_git_sha}:{ACTIVE_TIMELINE_REPO_PATH}"]),
+        "scenario_report.runner.dependencies[0].git_blob_sha",
+    )
+    require(
+        dependency.get("git_blob_sha") == dependency_blob,
+        "scenario_report runner active timeline dependency git blob mismatch",
+    )
+    dependency_checked_in = git_bytes(
+        ["show", f"{runner_git_sha}:{ACTIVE_TIMELINE_REPO_PATH}"]
+    )
+    dependency_sha256 = hashlib.sha256(dependency_checked_in).hexdigest()
+    require(
+        dependency.get("sha256") == dependency_sha256,
+        "scenario_report runner active timeline dependency SHA256 mismatch",
+    )
+    require(
+        file_sha256(ACTIVE_TIMELINE_PATH) == dependency_sha256,
+        "scenario_report active timeline dependency does not match the current gate contract",
+    )
     return runner
 
 
@@ -801,13 +878,40 @@ def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, requi
         require(requested in expected and requested not in seen, f"C18 invalid or duplicate concurrency cell {requested}")
         seen.add(requested)
         count = require_count(cell.get("case_count"), f"C18.c{requested}.case_count", minimum=1)
+        rate = cell.get("completion_rate")
+        require(
+            isinstance(rate, (int, float))
+            and not isinstance(rate, bool)
+            and math.isfinite(rate)
+            and 0 <= rate <= 1,
+            f"C18.c{requested} completion_rate invalid",
+        )
         if require_pass:
             require(cell.get("passed_count") == count, f"C18.c{requested} must pass every case")
-            require(cell.get("completion_rate") == 1.0, f"C18.c{requested} completion_rate must be 1.0")
+            request_count = require_count(
+                cell.get("request_count"),
+                f"C18.c{requested}.request_count",
+                minimum=1,
+            )
+            completed_request_count = require_count(
+                cell.get("completed_request_count"),
+                f"C18.c{requested}.completed_request_count",
+            )
+            require(request_count == requested, f"C18.c{requested} request_count mismatch")
+            require(
+                completed_request_count <= request_count,
+                f"C18.c{requested} completed request count exceeds request count",
+            )
+            require(
+                abs(float(rate) - completed_request_count / request_count) <= 1e-12,
+                f"C18.c{requested} completion_rate is not derived from requests",
+            )
+            require(
+                completed_request_count == request_count and rate == 1.0,
+                f"C18.c{requested} must complete every request",
+            )
         else:
             require_count(cell.get("passed_count"), f"C18.c{requested}.passed_count")
-            rate = cell.get("completion_rate")
-            require(isinstance(rate, (int, float)) and not isinstance(rate, bool) and 0 <= rate <= 1, f"C18.c{requested} completion_rate invalid")
         cap = require_count(cell.get("typed_admission_cap"), f"C18.c{requested}.typed_admission_cap", minimum=1)
         active = require_count(
             cell.get("observed_max_active"),
@@ -815,6 +919,37 @@ def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, requi
             minimum=1 if require_pass else 0,
         )
         require(active <= min(requested, cap), f"C18.c{requested} observed max-active exceeds requested/cap")
+        if require_pass:
+            floor = require_count(
+                cell.get("active_floor"),
+                f"C18.c{requested}.active_floor",
+                minimum=1,
+            )
+            require(floor <= min(requested, cap), f"C18.c{requested} active floor exceeds requested/cap")
+            timeline = require_object(cell.get("active_timeline"), f"C18.c{requested}.active_timeline")
+            require(timeline.get("requested_concurrency") == requested, f"C18.c{requested} timeline request binding mismatch")
+            require(timeline.get("typed_active_cap") == cap, f"C18.c{requested} timeline cap binding mismatch")
+            require(timeline.get("active_floor") == floor, f"C18.c{requested} timeline floor binding mismatch")
+            require(timeline.get("observed_max_active") == active, f"C18.c{requested} timeline max-active mismatch")
+            eligible_ns = require_count(timeline.get("eligible_duration_ns"), f"C18.c{requested}.eligible_duration_ns", minimum=1)
+            active_ns = require_count(timeline.get("active_at_or_above_floor_duration_ns"), f"C18.c{requested}.active_duration_ns")
+            duty = timeline.get("active_duty_cycle")
+            require(isinstance(duty, (int, float)) and not isinstance(duty, bool) and math.isfinite(duty) and 0 <= duty <= 1, f"C18.c{requested} active duty-cycle invalid")
+            require(abs(float(duty) - active_ns / eligible_ns) <= 1e-12, f"C18.c{requested} active duty-cycle is not derived from durations")
+            coverage = require_object(timeline.get("request_transition_coverage"), f"C18.c{requested}.request_transition_coverage")
+            require(coverage == {"expected": requested, "open": requested, "close": requested, "active_count": requested * 2}, f"C18.c{requested} request transition coverage incomplete")
+            require_count(timeline.get("activity_observation_count"), f"C18.c{requested}.activity_observation_count", minimum=1)
+            if requested == max(expected):
+                require(active >= floor, f"C18.c{requested} max-active is below floor")
+                require(duty >= 0.80, f"C18.c{requested} active duty-cycle is below 0.80")
+                if cap == floor:
+                    require(active == cap, f"C18.c{requested} max-active must equal typed cap")
+        else:
+            floor = cell.get("active_floor")
+            if floor is not None:
+                require_count(floor, f"C18.c{requested}.active_floor")
+            timeline = cell.get("active_timeline")
+            require(timeline is None or isinstance(timeline, dict), f"C18.c{requested}.active_timeline invalid")
         for field in ("error_count", "bad_output_count", "crosstalk_count", "bad_checksum_count", "server_500_count", "panic_count", "oom_count"):
             value = require_count(cell.get(field), f"C18.c{requested}.{field}")
             if require_pass:
@@ -956,7 +1091,7 @@ def validate_case_output(
     require(transcript.get("case_id") == observed.get("case_id"), f"{label} transcript case id mismatch")
     exchanges = require_list(transcript.get("exchanges"), f"{label}.transcript.exchanges")
     require(exchanges, f"{label} HTTP transcript has no exchanges")
-    if input_document is not None:
+    if input_document is not None and scenario_id != "C18":
         bound_exchange = exchanges[-1] if (scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream")) else exchanges[0]
         require(require_object(bound_exchange, f"{label}.bound_exchange").get("request") == input_document, f"{label} HTTP transcript is not bound to the persisted input request")
     statuses: list[int] = []
@@ -1094,8 +1229,55 @@ def validate_case_output(
         requested = require_count(observed.get("requested_concurrency"), f"{label}.requested_concurrency", minimum=1)
         require(len(exchanges) == requested, f"{label} concurrency transcript count mismatch")
         cap = require_count(observed.get("typed_admission_cap"), f"{label}.typed_admission_cap", minimum=1)
+        floor = require_count(observed.get("active_floor"), f"{label}.active_floor", minimum=1)
         active = require_count(observed.get("observed_max_active"), f"{label}.observed_max_active", minimum=1)
         require(active <= min(requested, cap), f"{label} observed max-active exceeds requested/cap")
+        require(input_document is not None, f"{label} C18 input evidence is missing")
+        identities = c18_request_identities(observed["case_id"], requested)
+        require(
+            transcript.get("concurrency_request_identities") == identities,
+            f"{label} C18 transcript identities are not deterministic",
+        )
+        require(observed.get("request_identities") == identities, f"{label} C18 observed identities mismatch")
+        for index, (exchange, identity) in enumerate(zip(exchanges, identities, strict=True)):
+            require(
+                require_object(exchange, f"{label}.exchange[{index}]").get("request")
+                == c18_request_payload(input_document, identity),
+                f"{label} C18 request {index} is not bound to its unique marker/checksum",
+            )
+            require(exchange.get("status") == 200, f"{label} C18 request {index} did not return HTTP 200")
+            response = require_object(exchange.get("response"), f"{label}.exchange[{index}].response")
+            require_string(response.get("id"), f"{label}.exchange[{index}].id")
+            require(response.get("object") == "chat.completion", f"{label}.exchange[{index}] response object mismatch")
+            usage = require_object(response.get("usage"), f"{label}.exchange[{index}].usage")
+            prompt_tokens = require_count(usage.get("prompt_tokens"), f"{label}.exchange[{index}].prompt_tokens", minimum=1)
+            completion_tokens = require_count(usage.get("completion_tokens"), f"{label}.exchange[{index}].completion_tokens", minimum=1)
+            require(usage.get("total_tokens") == prompt_tokens + completion_tokens, f"{label}.exchange[{index}] usage mismatch")
+            _, content = response_message(response, f"{label}.exchange[{index}]")
+            require(content == identity["marker"], f"{label} C18 request {index} output marker/checksum mismatch")
+        isolation = c18_isolation_summary(exchanges, identities)
+        completion = c18_completion_summary(exchanges)
+        runtime_failures = c18_runtime_failure_summary(transcript.get("runtime_log_evidence"))
+        for field, value in completion.items():
+            require(observed.get(field) == value, f"{label} C18 {field} is not derived from requests")
+        require(completion["completion_rate"] == 1.0, f"{label} C18 request completion is below 100%")
+        for field, value in {**isolation, **runtime_failures}.items():
+            require(observed.get(field) == value, f"{label} C18 {field} is not derived from evidence")
+            require(value == 0, f"{label} C18 {field} must be zero")
+        require(observed.get("active_timeline_error") is None, f"{label} C18 active timeline is incomplete")
+        try:
+            timeline = derive_active_timeline(
+                require_list(transcript.get("scheduler_trace_rows"), f"{label}.scheduler_trace_rows"),
+                requested_concurrency=requested,
+                typed_active_cap=cap,
+                active_floor=floor,
+                expected_request_count=requested,
+            )
+        except ActiveTimelineError as exc:
+            raise ScenarioError(f"{label} C18 active timeline is invalid: {exc}") from exc
+        require(observed.get("active_timeline") == timeline, f"{label} C18 active timeline summary is not replayable")
+        require(active == timeline["observed_max_active"], f"{label} C18 max-active differs from timeline")
+        return
     if responses:
         final_response = responses[-1]
         require_string(final_response.get("id"), f"{label}.id")
@@ -1505,10 +1687,36 @@ def validate_case_evidence(
                 wall = observed.get("wall_sec_to_release")
                 require(isinstance(wall, (int, float)) and abs(float(wall) - derived_wall) <= 0.02, f"case {case_id} release wall time is not derived from trace")
             else:
-                derived_active = observed_max_active(trace_rows)
-                require(derived_active > 0 and observed.get("observed_max_active") == derived_active, f"case {case_id} observed max-active is not derived from trace")
+                requested = require_count(
+                    observed.get("requested_concurrency"),
+                    f"case {case_id}.requested_concurrency",
+                    minimum=1,
+                )
                 derived_cap = typed_admission_cap_value(actual_config)
                 require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
+                floor = required_active_floor(expected["model_key"], expected["backend"], requested)
+                require(observed.get("active_floor") == floor, f"case {case_id} active floor mismatch")
+                try:
+                    timeline = derive_active_timeline(
+                        trace_rows,
+                        requested_concurrency=requested,
+                        typed_active_cap=derived_cap,
+                        active_floor=floor,
+                        expected_request_count=requested,
+                    )
+                except ActiveTimelineError as exc:
+                    raise ScenarioError(f"case {case_id} active timeline is invalid: {exc}") from exc
+                require(observed.get("active_timeline_error") is None, f"case {case_id} active timeline records an error")
+                require(observed.get("active_timeline") == timeline, f"case {case_id} active timeline is not derived from trace")
+                require(observed.get("observed_max_active") == timeline["observed_max_active"], f"case {case_id} observed max-active is not derived from timeline")
+                required_client = 32 if expected["backend"] == "cuda" else 16
+                if requested == required_client:
+                    lane_floor = REQUIRED_ACTIVE_FLOORS[(expected["model_key"], expected["backend"])]
+                    require(derived_cap >= lane_floor, f"case {case_id} typed admission cap is below lane floor")
+                    require(timeline["observed_max_active"] >= lane_floor, f"case {case_id} observed max-active is below lane floor")
+                    require(timeline["active_duty_cycle"] >= 0.80, f"case {case_id} active duty-cycle is below 0.80")
+                    if derived_cap == lane_floor:
+                        require(timeline["observed_max_active"] == derived_cap, f"case {case_id} max-active must equal typed cap")
     output_error = capture_case_output_error(
         lambda: validate_case_output(
             scenario_id,
@@ -1701,6 +1909,39 @@ def validate_scenario(
     require(derived_variants == scenario["variants"], f"scenario {expected_id} variants are not derived from cases")
     require(derived_presets == scenario["presets"], f"scenario {expected_id} presets are not derived from cases")
     require(derived_unpreset == scenario["unpreset_count"], f"scenario {expected_id} unpreset count is not derived from cases")
+    if expected_id == "C18" and scenario["status"] == "pass":
+        derived_cells = [
+            {
+                "requested_concurrency": row["observed"]["requested_concurrency"],
+                "case_count": 1,
+                "passed_count": 1,
+                "request_count": row["observed"]["request_count"],
+                "completed_request_count": row["observed"]["completed_request_count"],
+                "completion_rate": row["observed"]["completion_rate"],
+                "typed_admission_cap": row["observed"]["typed_admission_cap"],
+                "active_floor": row["observed"]["active_floor"],
+                "observed_max_active": row["observed"]["observed_max_active"],
+                "active_timeline": row["observed"]["active_timeline"],
+                "active_timeline_error": row["observed"]["active_timeline_error"],
+                **{
+                    field: row["observed"][field]
+                    for field in (
+                        "error_count",
+                        "bad_output_count",
+                        "crosstalk_count",
+                        "bad_checksum_count",
+                        "server_500_count",
+                        "panic_count",
+                        "oom_count",
+                    )
+                },
+            }
+            for row in case_rows
+        ]
+        require(
+            scenario["concurrency_cells"] == derived_cells,
+            "scenario C18 concurrency cells are not derived from case evidence",
+        )
     if expected_id == "C01":
         require(set(derived_variants.values()) == {5} and len(derived_variants) == 4, "C01 must execute four exact five-case groups")
     elif expected_id == "C07":
@@ -2936,6 +3177,167 @@ def observed_max_active(rows: list[dict[str, Any]]) -> int:
     return max(values, default=0)
 
 
+def required_active_floor(model_key: str, backend: str, requested_concurrency: int) -> int:
+    floor = REQUIRED_ACTIVE_FLOORS.get((model_key, backend))
+    require(floor is not None, f"active floor is undefined for {model_key}/{backend}")
+    return min(requested_concurrency, floor)
+
+
+def c18_request_identities(case_id: str, requested_concurrency: int) -> list[dict[str, Any]]:
+    identities: list[dict[str, Any]] = []
+    for index in range(requested_concurrency):
+        checksum = hashlib.sha256(f"{case_id}:{index}".encode("utf-8")).hexdigest()[:16]
+        identities.append(
+            {
+                "request_index": index,
+                "checksum": checksum,
+                "marker": f"G00-{case_id}-R{index:03d}-{checksum}-OK",
+            }
+        )
+    return identities
+
+
+def c18_request_payload(base: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(base)
+    marker = require_string(identity.get("marker"), "C18 request marker")
+    messages = require_list(payload.get("messages"), "C18 request messages")
+    require(messages, "C18 request has no messages")
+    message = require_object(messages[-1], "C18 final request message")
+    require(message.get("role") == "user", "C18 final request message must be user-owned")
+    message["content"] = f"Return {marker} exactly."
+    payload["metadata"] = {
+        **require_object(payload.get("metadata", {}), "C18 request metadata"),
+        "g00_concurrency_request_index": identity["request_index"],
+        "g00_concurrency_checksum": identity["checksum"],
+    }
+    return payload
+
+
+def c18_isolation_summary(
+    exchanges: list[dict[str, Any]],
+    identities: list[dict[str, Any]],
+) -> dict[str, int]:
+    all_markers = {identity["marker"] for identity in identities}
+    all_checksums = {identity["checksum"] for identity in identities}
+    counts = {
+        "error_count": 0,
+        "bad_output_count": 0,
+        "crosstalk_count": 0,
+        "bad_checksum_count": 0,
+        "server_500_count": 0,
+    }
+    for exchange, identity in zip(exchanges, identities):
+        status = exchange.get("status")
+        if not isinstance(status, int) or status != 200:
+            counts["error_count"] += 1
+        if isinstance(status, int) and status >= 500:
+            counts["server_500_count"] += 1
+        content = ""
+        try:
+            _, content = response_message(
+                require_object(exchange.get("response"), "C18 exchange response"),
+                f"C18 request {identity['request_index']}",
+            )
+        except ScenarioError:
+            counts["bad_output_count"] += 1
+            counts["bad_checksum_count"] += 1
+            continue
+        expected_marker = identity["marker"]
+        expected_checksum = identity["checksum"]
+        if content != expected_marker:
+            counts["bad_output_count"] += 1
+        if any(marker in content for marker in all_markers - {expected_marker}):
+            counts["crosstalk_count"] += 1
+        observed_checksums = {checksum for checksum in all_checksums if checksum in content}
+        if observed_checksums != {expected_checksum}:
+            counts["bad_checksum_count"] += 1
+    return counts
+
+
+def c18_completion_summary(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
+    request_count = len(exchanges)
+    require(request_count > 0, "C18 completion summary requires at least one request")
+    completed_request_count = sum(exchange.get("status") == 200 for exchange in exchanges)
+    return {
+        "request_count": request_count,
+        "completed_request_count": completed_request_count,
+        "completion_rate": completed_request_count / request_count,
+    }
+
+
+def c18_runtime_failure_summary(evidence: Any) -> dict[str, int]:
+    item = require_object(evidence, "C18 runtime log evidence")
+    text = item.get("text")
+    require(isinstance(text, str), "C18 runtime log text must be a string")
+    encoded = text.encode("utf-8")
+    require(item.get("sha256") == hashlib.sha256(encoded).hexdigest(), "C18 runtime log SHA mismatch")
+    start = require_count(item.get("start_offset"), "C18 runtime log start offset")
+    end = require_count(item.get("end_offset"), "C18 runtime log end offset")
+    require(end >= start and end - start == len(encoded), "C18 runtime log byte range mismatch")
+    return {
+        "panic_count": len(C18_PANIC_RE.findall(text)),
+        "oom_count": len(C18_OOM_RE.findall(text)),
+    }
+
+
+def c18_transition_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    phases = [
+        raw.get("phase")
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance((raw := row.get("raw", row)), dict)
+    ]
+    return phases.count("engine_request_open"), phases.count("engine_request_close")
+
+
+def c18_fixture_trace_rows(
+    case_id: str,
+    requested_concurrency: int,
+    typed_active_cap: int,
+) -> list[dict[str, Any]]:
+    """Build deterministic paired transitions for validator-only fixtures."""
+
+    rows: list[dict[str, Any]] = []
+    timestamp = 1_000_000_000
+
+    def append_event(request_index: int, phase: str, active: int) -> None:
+        nonlocal timestamp
+        request_id = f"{case_id}-request-{request_index:03d}"
+        event = {
+            "event_id": f"fixture-{phase}-{request_id}",
+            "phase": phase,
+            "request_id": request_id,
+            "attributes": {
+                "monotonic_nanos": timestamp,
+                "active_sequence_count": active,
+                "scheduler_snapshot": {"active_len": active},
+            },
+        }
+        rows.append(
+            {
+                "raw": event,
+                "collector_observed_monotonic_ns": timestamp,
+                "raw_sha256": canonical_json_sha256(event),
+            }
+        )
+        timestamp += 1_000
+
+    for request_index in range(requested_concurrency):
+        append_event(
+            request_index,
+            "engine_request_open",
+            min(request_index + 1, typed_active_cap),
+        )
+    timestamp += 1_000_000
+    for request_index in range(requested_concurrency):
+        append_event(
+            request_index,
+            "engine_request_close",
+            min(requested_concurrency - request_index - 1, typed_active_cap),
+        )
+    return rows
+
+
 def trace_released(rows: list[dict[str, Any]]) -> tuple[bool, int, int | None]:
     active_seen = False
     ticks = 0
@@ -3522,12 +3924,14 @@ def serve_case_request(
     started_at = iso_now()
     started_ns = time.monotonic_ns()
     trace_offset = scheduler_trace_path.stat().st_size if scheduler_trace_path.is_file() else 0
+    runtime_log_start_offset = server.stderr_path.stat().st_size if server.stderr_path.is_file() else 0
     trace_rows: list[dict[str, Any]] = []
     release_ticks = 0
     released = False
     release_observed_ns: int | None = None
     release_wall = 0.0
     history_construction_errors: list[dict[str, Any]] = []
+    concurrency_identities: list[dict[str, Any]] = []
     if case["scenario_id"] == "C09":
         abort_started = time.monotonic()
         aborted = aborted_http_exchange(base_url, copy.deepcopy(payload), case["variant"])
@@ -3553,8 +3957,15 @@ def serve_case_request(
         recovery, _ = http_exchange(base_url, recovery_payload, timeout_sec)
         results = [(aborted, {}), (recovery, {})]
     elif case["scenario_id"] == "C18":
+        concurrency_identities = c18_request_identities(case_id, requested)
+        concurrent_payloads = [
+            c18_request_payload(payload, identity) for identity in concurrency_identities
+        ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=requested) as pool:
-            futures = [pool.submit(http_exchange, base_url, copy.deepcopy(payload), timeout_sec) for _ in range(requested)]
+            futures = [
+                pool.submit(http_exchange, base_url, concurrent_payload, timeout_sec)
+                for concurrent_payload in concurrent_payloads
+            ]
             results = [future.result() for future in futures]
     elif case["scenario_id"] == "C07":
         results = []
@@ -3604,13 +4015,45 @@ def serve_case_request(
     else:
         results = [http_exchange(base_url, copy.deepcopy(payload), timeout_sec)]
     exchanges = [item[0] for item in results]
-    if case["scenario_id"] != "C09":
+    if case["scenario_id"] == "C18":
+        deadline = time.monotonic() + min(5.0, timeout_sec)
+        while True:
+            fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
+            observed_ns = time.monotonic_ns()
+            trace_rows.extend(
+                {
+                    "raw": row,
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
+                for row in fresh
+            )
+            opened, closed = c18_transition_counts(trace_rows)
+            if opened >= requested and closed >= requested:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+    elif case["scenario_id"] != "C09":
         fresh, _ = read_jsonl_since(scheduler_trace_path, trace_offset)
         observed_ns = time.monotonic_ns()
         trace_rows.extend(
             {"raw": row, "collector_observed_monotonic_ns": observed_ns, "raw_sha256": canonical_json_sha256(row)}
             for row in fresh
         )
+    runtime_log_evidence: dict[str, Any] | None = None
+    if case["scenario_id"] == "C18":
+        with server.stderr_path.open("rb") as handle:
+            handle.seek(runtime_log_start_offset)
+            runtime_log_payload = handle.read()
+            runtime_log_end_offset = handle.tell()
+        runtime_log_text = runtime_log_payload.decode("utf-8")
+        runtime_log_evidence = {
+            "start_offset": runtime_log_start_offset,
+            "end_offset": runtime_log_end_offset,
+            "sha256": hashlib.sha256(runtime_log_payload).hexdigest(),
+            "text": runtime_log_text,
+        }
     sse: dict[str, Any] = {"done_count": 0, "usage_count": 0, "delta_count": 0}
     utf8_wire_evidence: dict[str, Any] | None = None
     if case["scenario_id"] in {"C06", "C12", "C17"} or (case["scenario_id"] == "C21" and case["variant"] == "serve-stream"):
@@ -3641,6 +4084,8 @@ def serve_case_request(
         "models_status": models_status if case["scenario_id"] == "C20" else None,
         "history_construction_errors": history_construction_errors,
         "utf8_wire_evidence": utf8_wire_evidence,
+        "concurrency_request_identities": concurrency_identities or None,
+        "runtime_log_evidence": runtime_log_evidence,
         **sse,
     }
     transcript_path = case_root / "http-transcript.json"
@@ -3698,11 +4143,37 @@ def serve_case_request(
             }
         )
     if case["scenario_id"] == "C18":
+        typed_cap = typed_admission_cap(effective_config_path)
+        active_floor = required_active_floor(case["model_key"], case["backend"], requested)
+        isolation = c18_isolation_summary(exchanges, concurrency_identities)
+        completion = c18_completion_summary(exchanges)
+        runtime_failures = c18_runtime_failure_summary(runtime_log_evidence)
+        active_timeline: dict[str, Any] | None = None
+        active_timeline_error: str | None = None
+        try:
+            active_timeline = derive_active_timeline(
+                trace_rows,
+                requested_concurrency=requested,
+                typed_active_cap=typed_cap,
+                active_floor=active_floor,
+                expected_request_count=requested,
+            )
+        except ActiveTimelineError as exc:
+            active_timeline_error = str(exc)
         observed.update(
             {
                 "requested_concurrency": requested,
-                "typed_admission_cap": typed_admission_cap(effective_config_path),
-                "observed_max_active": observed_max_active(trace_rows),
+                "typed_admission_cap": typed_cap,
+                "active_floor": active_floor,
+                "observed_max_active": (
+                    active_timeline["observed_max_active"] if active_timeline else 0
+                ),
+                "active_timeline": active_timeline,
+                "active_timeline_error": active_timeline_error,
+                "request_identities": concurrency_identities,
+                **completion,
+                **isolation,
+                **runtime_failures,
             }
         )
     if case["scenario_id"] == "C20":
@@ -4039,7 +4510,12 @@ def execute_manifest(
     try:
         execution_rows = sorted(rows, key=lambda row: 0 if row["entrypoint"] == "run" else 1)
         for row in execution_rows:
-            row = {**row, "model_key": manifest["model_key"], "model_files": manifest["model_files"]}
+            row = {
+                **row,
+                "model_key": manifest["model_key"],
+                "model_files": manifest["model_files"],
+                "backend": manifest["backend"],
+            }
             case_root = lane_root / "scenarios" / row["scenario_id"] / "cases" / row["case_id"]
             case_root.mkdir(parents=True, exist_ok=True)
             transcript_path: Path | None = None
@@ -4349,16 +4825,26 @@ def execute_manifest(
                     "requested_concurrency": case["observed"]["requested_concurrency"],
                     "case_count": 1,
                     "passed_count": 1 if case["status"] == "pass" else 0,
-                    "completion_rate": 1.0 if case["status"] == "pass" else 0.0,
+                    "request_count": case["observed"]["request_count"],
+                    "completed_request_count": case["observed"]["completed_request_count"],
+                    "completion_rate": case["observed"]["completion_rate"],
                     "typed_admission_cap": case["observed"]["typed_admission_cap"],
+                    "active_floor": case["observed"]["active_floor"],
                     "observed_max_active": case["observed"]["observed_max_active"],
-                    "error_count": 0 if case["status"] == "pass" else 1,
-                    "bad_output_count": 0,
-                    "crosstalk_count": 0,
-                    "bad_checksum_count": 0,
-                    "server_500_count": 0,
-                    "panic_count": 0,
-                    "oom_count": 0,
+                    "active_timeline": case["observed"]["active_timeline"],
+                    "active_timeline_error": case["observed"]["active_timeline_error"],
+                    **{
+                        field: case["observed"][field]
+                        for field in (
+                            "error_count",
+                            "bad_output_count",
+                            "crosstalk_count",
+                            "bad_checksum_count",
+                            "server_500_count",
+                            "panic_count",
+                            "oom_count",
+                        )
+                    },
                 }
                 for case in results
             ]
@@ -4487,15 +4973,33 @@ def selftest_scenario_shape(scenario_id: str, model_key: str, backend: str) -> d
     if scenario_id == "C18":
         concurrencies = [1, 4, 16, 32] if backend == "cuda" else [1, 4, 16]
         cells = []
-        for requested in concurrencies:
+        typed_cap = max(
+            16 if backend == "cuda" else 8,
+            REQUIRED_ACTIVE_FLOORS[(model_key, backend)],
+        )
+        for ordinal, requested in enumerate(concurrencies, start=1):
+            case_id = f"c18-{ordinal:03d}"
+            active_floor = required_active_floor(model_key, backend, requested)
+            active_timeline = derive_active_timeline(
+                c18_fixture_trace_rows(case_id, requested, typed_cap),
+                requested_concurrency=requested,
+                typed_active_cap=typed_cap,
+                active_floor=active_floor,
+                expected_request_count=requested,
+            )
             cells.append(
                 {
                     "requested_concurrency": requested,
                     "case_count": 1,
                     "passed_count": 1,
+                    "request_count": requested,
+                    "completed_request_count": requested,
                     "completion_rate": 1.0,
-                    "typed_admission_cap": 16 if backend == "cuda" else 8,
-                    "observed_max_active": min(requested, 16 if backend == "cuda" else 8),
+                    "typed_admission_cap": typed_cap,
+                    "active_floor": active_floor,
+                    "observed_max_active": active_timeline["observed_max_active"],
+                    "active_timeline": active_timeline,
+                    "active_timeline_error": None,
                     "error_count": 0,
                     "bad_output_count": 0,
                     "crosstalk_count": 0,
@@ -4853,7 +5357,32 @@ def make_case_fixture(
                 "usage": {"prompt_tokens": 8, "completion_tokens": completion_tokens, "total_tokens": 8 + completion_tokens},
             }
         requested = int(concurrency_cell["requested_concurrency"]) if concurrency_cell else 1
-        exchanges = [{"request": input_value, "status": status, "response": response} for _ in range(requested)]
+        concurrency_identities: list[dict[str, Any]] | None = None
+        scheduler_trace_rows: list[dict[str, Any]] = []
+        runtime_log_evidence: dict[str, Any] | None = None
+        if scenario_id == "C18":
+            require(concurrency_cell is not None, "C18 fixture requires a concurrency cell")
+            concurrency_identities = c18_request_identities(case_id, requested)
+            exchanges = []
+            for identity in concurrency_identities:
+                request = c18_request_payload(input_value, identity)
+                request_response = copy.deepcopy(response)
+                request_response["id"] = f"chatcmpl-{case_id}-{identity['request_index']:03d}"
+                request_response["choices"][0]["message"]["content"] = identity["marker"]
+                exchanges.append({"request": request, "status": status, "response": request_response})
+            scheduler_trace_rows = c18_fixture_trace_rows(
+                case_id,
+                requested,
+                concurrency_cell["typed_admission_cap"],
+            )
+            runtime_log_evidence = {
+                "start_offset": 0,
+                "end_offset": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+                "text": "",
+            }
+        else:
+            exchanges = [{"request": input_value, "status": status, "response": response} for _ in range(requested)]
         stream_reconstruction: dict[str, Any] | None = None
         utf8_wire_evidence: dict[str, Any] | None = None
         if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
@@ -4964,6 +5493,9 @@ def make_case_fixture(
         transcript = {
             "case_id": case_id,
             "exchanges": exchanges,
+            "scheduler_trace_rows": scheduler_trace_rows,
+            "concurrency_request_identities": concurrency_identities,
+            "runtime_log_evidence": runtime_log_evidence,
             "models_response": {"object": "list", "data": [{"id": base["model_key"], "modalities": ["text"]}]} if scenario_id == "C20" else None,
             "done_count": stream_reconstruction["done_count"] if stream_reconstruction else 0,
             "usage_count": stream_reconstruction["usage_count"] if stream_reconstruction else 0,
@@ -4995,11 +5527,27 @@ def make_case_fixture(
             observed.update({"scheduler_ticks_to_release": 2, "wall_sec_to_release": 0.25, "post_capacity_success": True})
         if scenario_id == "C18":
             require(concurrency_cell is not None, "C18 fixture requires a concurrency cell")
+            require(concurrency_identities is not None, "C18 fixture request identities are missing")
+            active_floor = required_active_floor(base["model_key"], base["backend"], requested)
+            active_timeline = derive_active_timeline(
+                scheduler_trace_rows,
+                requested_concurrency=requested,
+                typed_active_cap=concurrency_cell["typed_admission_cap"],
+                active_floor=active_floor,
+                expected_request_count=requested,
+            )
             observed.update(
                 {
                     "requested_concurrency": requested,
                     "typed_admission_cap": concurrency_cell["typed_admission_cap"],
-                    "observed_max_active": concurrency_cell["observed_max_active"],
+                    "active_floor": active_floor,
+                    "observed_max_active": active_timeline["observed_max_active"],
+                    "active_timeline": active_timeline,
+                    "active_timeline_error": None,
+                    "request_identities": concurrency_identities,
+                    **c18_completion_summary(exchanges),
+                    **c18_isolation_summary(exchanges, concurrency_identities),
+                    **c18_runtime_failure_summary(runtime_log_evidence),
                 }
             )
         if scenario_id == "C20":
@@ -5352,7 +5900,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         finally:
             if getattr(self, "g00_traced", False):
-                self.server.request_finished(self.g00_case_id)
+                self.server.request_finished(self.g00_trace_request_id)
 
     def send_json(self, status, value):
         body = json.dumps(value, ensure_ascii=False).encode()
@@ -5380,9 +5928,14 @@ class Handler(BaseHTTPRequestHandler):
         marker = {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "e\u0301"}.get(variant, f"G00-{case_id}-OK") if scenario == "C17" else f"G00-{case_id}-OK"
         if scenario == "C06":
             marker = f"G00-c05-{int(metadata.get('g00_ordinal', 1)):03d}-OK"
+        request_index = int(metadata.get("g00_concurrency_request_index", 0))
+        if scenario == "C18":
+            checksum = str(metadata.get("g00_concurrency_checksum", ""))
+            marker = f"G00-{case_id}-R{request_index:03d}-{checksum}-OK"
         self.g00_case_id = case_id
+        self.g00_trace_request_id = f"{case_id}-request-{request_index:03d}" if scenario == "C18" else case_id
         self.g00_traced = True
-        self.server.request_started(case_id)
+        self.server.request_started(self.g00_trace_request_id)
         if scenario in {"C09", "C18"}:
             time.sleep(0.05)
         if scenario == "C16" or (scenario == "C20" and variant != "text-array"):
@@ -5460,22 +6013,33 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         return
 
-    def trace(self, case_id, phase):
+    def trace(self, request_id, phase):
         if self.trace_path is None:
             return
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        monotonic_nanos = time.monotonic_ns()
+        event = {
+            "event_id": f"fixture-{phase}-{request_id}-{monotonic_nanos}",
+            "phase": phase,
+            "request_id": request_id,
+            "attributes": {
+                "monotonic_nanos": monotonic_nanos,
+                "active_sequence_count": self.active,
+                "scheduler_snapshot": {"active_len": self.active},
+            },
+        }
         with self.trace_path.open("a") as handle:
-            handle.write(json.dumps({"case_id": case_id, "phase": phase, "active": self.active}) + "\n")
+            handle.write(json.dumps(event) + "\n")
 
-    def request_started(self, case_id):
+    def request_started(self, request_id):
         with self.trace_lock:
             self.active += 1
-            self.trace(case_id, "scheduled")
+            self.trace(request_id, "engine_request_open")
 
-    def request_finished(self, case_id):
+    def request_finished(self, request_id):
         with self.trace_lock:
             self.active = max(0, self.active - 1)
-            self.trace(case_id, "released")
+            self.trace(request_id, "engine_request_close")
 
 
 def serve_mode(argv):
@@ -5831,7 +6395,15 @@ def self_test() -> int:
     validate_concurrency_cells("metal", known_fail_concurrency_cells, case_count=3, require_pass=False)
     passing_concurrency_cells = copy.deepcopy(known_fail_concurrency_cells)
     for cell in passing_concurrency_cells:
-        cell.update({"passed_count": 1, "completion_rate": 1.0, "error_count": 0})
+        cell.update(
+            {
+                "passed_count": 1,
+                "request_count": cell["requested_concurrency"],
+                "completed_request_count": cell["requested_concurrency"],
+                "completion_rate": 1.0,
+                "error_count": 0,
+            }
+        )
     try:
         validate_concurrency_cells("metal", passing_concurrency_cells, case_count=3, require_pass=True)
     except ScenarioError as exc:
@@ -6541,7 +7113,7 @@ def self_test() -> int:
             next(cell for cell in raw["concurrency_cells"] if cell["requested_concurrency"] == 32)["observed_max_active"] = 1
             next(cell for cell in scenario["concurrency_cells"] if cell["requested_concurrency"] == 32)["observed_max_active"] = 1
             persist_execution_case_mutation(mutation_root, scenario, raw_path, raw, case_path, case)
-            expect_execution_report_reject(mutation_root, candidate, "observed max-active is not derived from trace")
+            expect_execution_report_reject(mutation_root, candidate, "timeline max-active mismatch")
             rejected_mutations.add("c18-fabricated-max-active")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-invocation-time") as (mutation_root, candidate):
