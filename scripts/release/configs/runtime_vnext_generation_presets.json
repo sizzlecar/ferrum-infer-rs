@@ -51,12 +51,12 @@
           "presence_penalty": 1.5,
           "repetition_penalty": 1.0,
           "seed": 9271,
-          "max_tokens": 1024,
+          "max_tokens": 4096,
           "stop": [],
           "eos_token_ids": [248046, 248044],
           "enable_thinking": true,
           "template_kwargs": {"enable_thinking": true},
-          "source": "pinned model card general thinking recommendation"
+          "source": "pinned model card general thinking sampling with bounded correctness output budget"
         },
         "P_OFFICIAL_DEFAULT": {
           "temperature": 1.0,
@@ -66,12 +66,12 @@
           "presence_penalty": 1.5,
           "repetition_penalty": 1.0,
           "seed": 9271,
-          "max_tokens": 1024,
+          "max_tokens": 4096,
           "stop": [],
           "eos_token_ids": [248046, 248044],
           "enable_thinking": "model-default",
           "template_kwargs": {},
-          "source": "pinned model card default thinking recommendation"
+          "source": "pinned model card default thinking sampling with bounded correctness output budget"
         }
       }
     },
@@ -123,12 +123,12 @@
           "presence_penalty": 1.5,
           "repetition_penalty": 1.0,
           "seed": 9271,
-          "max_tokens": 1024,
+          "max_tokens": 4096,
           "stop": [],
           "eos_token_ids": [248046, 248044],
           "enable_thinking": true,
           "template_kwargs": {"enable_thinking": true},
-          "source": "pinned model card general thinking recommendation"
+          "source": "pinned model card general thinking sampling with bounded correctness output budget"
         },
         "P_OFFICIAL_DEFAULT": {
           "temperature": 1.0,
@@ -138,12 +138,12 @@
           "presence_penalty": 1.5,
           "repetition_penalty": 1.0,
           "seed": 9271,
-          "max_tokens": 1024,
+          "max_tokens": 4096,
           "stop": [],
           "eos_token_ids": [248046, 248044],
           "enable_thinking": "model-default",
           "template_kwargs": {},
-          "source": "pinned generation config plus model card default thinking recommendation"
+          "source": "pinned generation config plus model card default thinking sampling with bounded correctness output budget"
         }
       }
     },
@@ -195,12 +195,12 @@
           "presence_penalty": 0.0,
           "repetition_penalty": 1.0,
           "seed": 9271,
-          "max_tokens": 1024,
+          "max_tokens": 4096,
           "stop": [],
           "eos_token_ids": [151645, 151643],
           "enable_thinking": true,
           "template_kwargs": {"enable_thinking": true},
-          "source": "pinned generation config and model card thinking recommendation"
+          "source": "pinned generation config and model card thinking sampling with bounded correctness output budget"
         },
         "P_OFFICIAL_DEFAULT": {
           "temperature": 0.6,
@@ -210,12 +210,12 @@
           "presence_penalty": 0.0,
           "repetition_penalty": 1.0,
           "seed": 9271,
-          "max_tokens": 1024,
+          "max_tokens": 4096,
           "stop": [],
           "eos_token_ids": [151645, 151643],
           "enable_thinking": "model-default",
           "template_kwargs": {},
-          "source": "pinned generation config default thinking recommendation"
+          "source": "pinned generation config default thinking sampling with bounded correctness output budget"
         }
       }
     }
