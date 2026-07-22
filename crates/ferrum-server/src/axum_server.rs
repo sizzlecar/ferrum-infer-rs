@@ -7943,9 +7943,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_template_enable_thinking_default_is_template_controlled() {
+    async fn omitted_enable_thinking_preserves_model_template_default() {
         let template = ModelChatTemplate::new(
-            "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\n' ~ message.content ~ '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% endif %}{% endif %}",
+            "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\n' ~ message.content ~ '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% else %}{{ '<think>\n' }}{% endif %}{% endif %}",
             "test-template",
         );
         let (router, engine) = router_with_capturing_llm_and_template(template);
@@ -7961,21 +7961,16 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
-        assert!(request
-            .prompt
-            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
-        assert_eq!(
-            request
-                .metadata
-                .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
-            Some(&serde_json::json!([THINK_END_TAG, THINK_START_TAG]))
-        );
+        assert!(request.prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(!request
+            .metadata
+            .contains_key(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
     }
 
     #[tokio::test]
     async fn chat_template_enable_thinking_true_overrides_default() {
         let template = ModelChatTemplate::new(
-            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
             "test-template",
         );
         let (router, engine) = router_with_capturing_llm_and_template(template);
@@ -7992,7 +7987,39 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
-        assert_eq!(request.prompt, "<assistant>");
+        assert_eq!(request.prompt, "<assistant><think>\n");
+        assert!(!request
+            .metadata
+            .contains_key(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn chat_template_enable_thinking_false_is_a_hard_override() {
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
+            "test-template",
+        );
+        let (router, engine) = router_with_capturing_llm_and_template(template);
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": false}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(request.prompt, "<assistant><think>\n\n</think>\n\n");
+        assert_eq!(
+            request
+                .metadata
+                .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
+            Some(&serde_json::json!([THINK_END_TAG, THINK_START_TAG]))
+        );
     }
 
     #[tokio::test]

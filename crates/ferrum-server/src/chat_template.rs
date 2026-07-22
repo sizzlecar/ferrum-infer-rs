@@ -54,21 +54,11 @@ pub struct ChatTemplateOptions {
 }
 
 impl ChatTemplateOptions {
-    pub fn default_for_template(model_template: Option<&ModelChatTemplate>) -> Self {
-        if model_template_supports_enable_thinking(model_template) {
-            return Self {
-                enable_thinking: Some(false),
-                ..Self::default()
-            };
-        }
+    pub fn default_for_template(_model_template: Option<&ModelChatTemplate>) -> Self {
+        // Omission is a real third state: the model-owned template decides its
+        // default. Only explicit product controls may force true or false.
         Self::default()
     }
-}
-
-fn model_template_supports_enable_thinking(model_template: Option<&ModelChatTemplate>) -> bool {
-    model_template
-        .map(|template| template.template.contains("enable_thinking"))
-        .unwrap_or(false)
 }
 
 /// Common prompt-message shape used by both CLI `run` and OpenAI `serve`.
@@ -985,13 +975,13 @@ mod tests {
     }
 
     #[test]
-    fn enable_thinking_false_is_model_template_controlled() {
+    fn omitted_thinking_option_preserves_model_template_default() {
         let template = ModelChatTemplate::new(
-            "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- endif %}{%- endif %}",
+            "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- else %}{{- '<think>\n' }}{%- endif %}{%- endif %}",
             "thinking-template",
         );
         let options = ChatTemplateOptions::default_for_template(Some(&template));
-        assert_eq!(options.enable_thinking, Some(false));
+        assert_eq!(options.enable_thinking, None);
         let out = render_chat_prompt_with_model_template_options(
             &[msg(MessageRole::User, "Hi")],
             "served-model-alias",
@@ -999,16 +989,16 @@ mod tests {
             &options,
         )
         .unwrap();
-        assert!(out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(out.ends_with("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]
-    fn explicit_enable_thinking_overrides_template_default() {
+    fn explicit_thinking_options_override_model_template_default() {
         let template = ModelChatTemplate::new(
-            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
             "thinking-template",
         );
-        let out = render_chat_prompt_with_model_template_options(
+        let enabled = render_chat_prompt_with_model_template_options(
             &[msg(MessageRole::User, "Hi")],
             "Qwen/Qwen3-0.6B",
             Some(&template),
@@ -1018,7 +1008,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(out, "<assistant>");
+        assert_eq!(enabled, "<assistant><think>\n");
+
+        let disabled = render_chat_prompt_with_model_template_options(
+            &[msg(MessageRole::User, "Hi")],
+            "Qwen/Qwen3-0.6B",
+            Some(&template),
+            &ChatTemplateOptions {
+                enable_thinking: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(disabled, "<assistant><think>\n\n</think>\n\n");
     }
 
     #[test]
