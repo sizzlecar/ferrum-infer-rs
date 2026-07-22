@@ -44,7 +44,7 @@ use super::{
         VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointSelection,
     },
     vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
-    vnext_timing::AtomicDurationMetrics,
+    vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
 };
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
@@ -2497,6 +2497,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
+        let executor_startup = StartupPhaseTimer::start("executor_composition_total");
         let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let config =
             VNextExecutorConfig::from_engine_config(engine_config, &info, runtime.as_ref())?;
@@ -2536,6 +2537,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut compile_options);
         }
+        let compile_phase = StartupPhaseTimer::start("plan_compile");
         let compilation = ProgramPlanCompiler::compile(
             family,
             &catalog,
@@ -2544,6 +2546,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &compile_options,
         )
         .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
+        compile_phase.finish();
+        let resolve_bind_phase = StartupPhaseTimer::start("plan_resolve_and_bind");
         let resolved_plan = resolve_plan(prepared, &config.runtime_policy, &catalog, &compilation)?;
         if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
             return Err(FerrumError::internal(
@@ -2553,6 +2557,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let providers = registry
             .bind_plan(&resolved_plan)
             .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;
+        resolve_bind_phase.finish();
         let io = Self::resolve_io(&resolved_plan, &input_id, &output_id, info.vocab_size)?;
         let family_fingerprint = family
             .fingerprint()
@@ -2570,10 +2575,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|error| FerrumError::internal(error.to_string()))?;
         let provision_request = RequestIdentity::new(format!("request.vnext.provision.{run_id}"))
             .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let provision_phase = StartupPhaseTimer::start("static_provision");
         let provisioned = resolved_plan
             .execution_plan()
             .provision_static(Arc::clone(&runtime), provision_request)
             .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
+        provision_phase.finish();
         let plan_resources = match provisioned.into_provisioning() {
             StaticProvisioning::NoStatic(no_static) => no_static.into_plan_runtime(),
             StaticProvisioning::Required(permit) => {
@@ -2585,10 +2592,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 );
                 let driver = RuntimeResourceDriver::new(Arc::clone(&runtime))
                     .map_err(|error| FerrumError::device(error.to_string()))?;
+                let transaction_begin_phase =
+                    StartupPhaseTimer::start("resource_transaction_begin");
                 let transaction = ResourceTransaction::<VNextDriver<R>, TransactionNew>::begin(
                     driver, identity, permit,
                 )
                 .map_err(|error| FerrumError::device(error.to_string()))?;
+                transaction_begin_phase.finish();
+                let reserve_phase = StartupPhaseTimer::start("resource_reserve");
                 let reserved = match transaction.reserve() {
                     Ok(reserved) => reserved,
                     Err(error) => {
@@ -2599,6 +2610,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )));
                     }
                 };
+                reserve_phase.finish();
+                let commit_phase = StartupPhaseTimer::start("resource_commit");
                 let committed = match reserved.commit() {
                     Ok(committed) => committed,
                     Err(ResourceCommitTransitionError::Recoverable(error)) => {
@@ -2616,6 +2629,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )));
                     }
                 };
+                commit_phase.finish();
                 let initialized = match committed.initialize_static(
                     family,
                     resolved_plan.execution_plan(),
@@ -2631,8 +2645,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )));
                     }
                 };
+                log_static_initialization_receipt(initialized.receipt());
+                let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
                 match initialized.into_plan_runtime() {
-                    Ok(resources) => resources,
+                    Ok(resources) => {
+                        handoff_phase.finish();
+                        resources
+                    }
                     Err(error) => {
                         let message = error.error().to_string();
                         drop(error);
@@ -2643,6 +2662,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
+        executor_startup.finish();
         let lane = ExecutionLane::create(Arc::clone(&runtime)).map_err(|error| {
             FerrumError::device(format!("vNext execution lane creation failed: {error:?}"))
         })?;

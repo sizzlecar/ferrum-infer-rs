@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::super::{
     DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
@@ -93,6 +94,15 @@ pub struct StaticInitializationReceipt {
     imported_bytes: u64,
     upload_command_count: usize,
     submission_batch_count: usize,
+    total_duration_us: u64,
+    setup_duration_us: u64,
+    source_materialization_duration_us: u64,
+    device_encode_duration_us: u64,
+    device_import_duration_us: u64,
+    submission_wait_duration_us: u64,
+    import_seal_duration_us: u64,
+    slowest_component_id: Option<WeightId>,
+    slowest_component_materialization_duration_us: u64,
     source_files: BTreeSet<String>,
 }
 
@@ -123,6 +133,42 @@ impl StaticInitializationReceipt {
 
     pub const fn submission_batch_count(&self) -> usize {
         self.submission_batch_count
+    }
+
+    pub const fn total_duration_us(&self) -> u64 {
+        self.total_duration_us
+    }
+
+    pub const fn setup_duration_us(&self) -> u64 {
+        self.setup_duration_us
+    }
+
+    pub const fn source_materialization_duration_us(&self) -> u64 {
+        self.source_materialization_duration_us
+    }
+
+    pub const fn device_encode_duration_us(&self) -> u64 {
+        self.device_encode_duration_us
+    }
+
+    pub const fn device_import_duration_us(&self) -> u64 {
+        self.device_import_duration_us
+    }
+
+    pub const fn submission_wait_duration_us(&self) -> u64 {
+        self.submission_wait_duration_us
+    }
+
+    pub const fn import_seal_duration_us(&self) -> u64 {
+        self.import_seal_duration_us
+    }
+
+    pub fn slowest_component_id(&self) -> Option<&WeightId> {
+        self.slowest_component_id.as_ref()
+    }
+
+    pub const fn slowest_component_materialization_duration_us(&self) -> u64 {
+        self.slowest_component_materialization_duration_us
     }
 
     pub fn source_files(&self) -> &BTreeSet<String> {
@@ -416,6 +462,8 @@ fn initialize_static_inner<D>(
 where
     D: ResourceTransactionDriver,
 {
+    let initialization_started = Instant::now();
+    let setup_started = Instant::now();
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
     let placements = weight_placements(family, plan).map_err(contract_failure)?;
     let runtime = Arc::clone(transaction.lease().runtime());
@@ -442,6 +490,7 @@ where
         ))
     })?;
     let mut stream = Some(created_stream);
+    let setup_duration = setup_started.elapsed();
     let mut pending = Vec::<<D::Runtime as DeviceRuntime>::Command>::new();
     let mut pending_staging_bytes = 0_u64;
     let mut submission_batch_count = 0_usize;
@@ -450,19 +499,28 @@ where
     let mut uploaded_bytes = 0_u64;
     let mut imported_component_count = 0_usize;
     let mut imported_bytes = 0_u64;
+    let mut source_materialization_duration = Duration::ZERO;
+    let mut device_encode_duration = Duration::ZERO;
+    let mut device_import_duration = Duration::ZERO;
+    let mut submission_wait_duration = Duration::ZERO;
+    let mut import_seal_duration = Duration::ZERO;
+    let mut slowest_component_id = None;
+    let mut slowest_component_materialization_duration = Duration::ZERO;
     let mut source_files = BTreeSet::new();
 
     for allocation in plan.payload().memory().static_allocations() {
         if allocation.usage() == BufferUsage::Weights && weight_import.is_some() {
             continue;
         }
+        let encode_started = Instant::now();
         let command = with_static_buffer(transaction, allocation.resource_id(), |buffer| {
             runtime.encode_zero(buffer, 0, allocation.size_bytes())
         })
         .map_err(|error| runtime_or_contract_failure(&runtime, error, "static_zero_encode"))?;
+        device_encode_duration += encode_started.elapsed();
         pending.push(command);
         if pending.len() == policy.maximum_commands_per_batch() {
-            submit_pending(
+            submission_wait_duration += submit_pending(
                 &runtime,
                 &mut stream,
                 &mut pending,
@@ -480,15 +538,26 @@ where
         // converted payload as large as an embedding table; retaining every
         // converted component until the final submit would duplicate the
         // entire model in host memory.
+        let materialization_started = Instant::now();
         let upload = prepare_upload(source, component, placement).map_err(contract_failure)?;
+        let materialization_duration = materialization_started.elapsed();
+        source_materialization_duration += materialization_duration;
+        if slowest_component_id.is_none()
+            || materialization_duration > slowest_component_materialization_duration
+        {
+            slowest_component_materialization_duration = materialization_duration;
+            slowest_component_id = Some(component.id.clone());
+        }
         source_files.extend(upload.source_files().iter().cloned());
         if let Some(import) = weight_import.as_mut() {
+            let import_started = Instant::now();
             with_static_buffer(transaction, &placement.resource_id, |buffer| {
                 import.import_component(&upload, buffer, placement.offset_bytes)
             })
             .map_err(|error| {
                 runtime_or_contract_failure(&runtime, error, "static_weight_component_import")
             })?;
+            device_import_duration += import_started.elapsed();
             imported_component_count += 1;
             imported_bytes = imported_bytes
                 .checked_add(placement.length_bytes)
@@ -536,7 +605,7 @@ where
                         .checked_add(chunk_bytes_u64)
                         .is_none_or(|bytes| bytes > policy.maximum_staging_bytes()))
             {
-                submit_pending(
+                submission_wait_duration += submit_pending(
                     &runtime,
                     &mut stream,
                     &mut pending,
@@ -556,6 +625,7 @@ where
             let layout =
                 HostTransferLayout::new(upload.element_type(), chunk_bytes_u64 / element_bytes)
                     .map_err(contract_failure)?;
+            let encode_started = Instant::now();
             let command = with_static_buffer(transaction, &placement.resource_id, |buffer| {
                 runtime.encode_upload(
                     &bytes[source_offset..source_end],
@@ -567,6 +637,7 @@ where
             .map_err(|error| {
                 runtime_or_contract_failure(&runtime, error, "static_upload_encode")
             })?;
+            device_encode_duration += encode_started.elapsed();
             pending.push(command);
             pending_staging_bytes += chunk_bytes_u64;
             upload_command_count += 1;
@@ -583,7 +654,7 @@ where
     }
 
     if !pending.is_empty() {
-        submit_pending(
+        submission_wait_duration += submit_pending(
             &runtime,
             &mut stream,
             &mut pending,
@@ -592,6 +663,7 @@ where
         submission_batch_count += 1;
     }
     if let Some(import) = weight_import {
+        let seal_started = Instant::now();
         import.seal().map_err(|error| {
             InitializationStepFailure::Quiescent(device_failure(
                 &runtime,
@@ -599,6 +671,7 @@ where
                 "static_weight_import_seal",
             ))
         })?;
+        import_seal_duration += seal_started.elapsed();
     }
     Ok(StaticInitializationReceipt {
         initialized_resource_count: plan.payload().memory().static_allocations().len(),
@@ -608,6 +681,17 @@ where
         imported_bytes,
         upload_command_count,
         submission_batch_count,
+        total_duration_us: duration_us(initialization_started.elapsed()),
+        setup_duration_us: duration_us(setup_duration),
+        source_materialization_duration_us: duration_us(source_materialization_duration),
+        device_encode_duration_us: duration_us(device_encode_duration),
+        device_import_duration_us: duration_us(device_import_duration),
+        submission_wait_duration_us: duration_us(submission_wait_duration),
+        import_seal_duration_us: duration_us(import_seal_duration),
+        slowest_component_id,
+        slowest_component_materialization_duration_us: duration_us(
+            slowest_component_materialization_duration,
+        ),
         source_files,
     })
 }
@@ -617,10 +701,11 @@ fn submit_pending<R>(
     stream: &mut Option<R::Stream>,
     pending: &mut Vec<R::Command>,
     pending_staging_bytes: &mut u64,
-) -> Result<(), InitializationStepFailure<R>>
+) -> Result<Duration, InitializationStepFailure<R>>
 where
     R: DeviceRuntime,
 {
+    let started = Instant::now();
     debug_assert!(!pending.is_empty());
     let commands = std::mem::take(pending);
     *pending_staging_bytes = 0;
@@ -665,7 +750,7 @@ where
     let waited = catch_unwind(AssertUnwindSafe(|| runtime.wait_fence(&fence)));
     match waited {
         Ok(Ok(receipt)) => match receipt.into_parts().0 {
-            DeviceTerminal::Succeeded => Ok(()),
+            DeviceTerminal::Succeeded => Ok(started.elapsed()),
             DeviceTerminal::FailedButQuiescent(error) => Err(InitializationStepFailure::Quiescent(
                 device_failure(runtime, &error, "static_fence_failed"),
             )),
@@ -694,6 +779,10 @@ where
             },
         }),
     }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn preflight_transaction<D>(

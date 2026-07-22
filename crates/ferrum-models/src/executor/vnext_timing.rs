@@ -1,6 +1,60 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ferrum_interfaces::vnext::StaticInitializationReceipt;
+
+pub(super) struct StartupPhaseTimer {
+    phase: &'static str,
+    started: Instant,
+}
+
+impl StartupPhaseTimer {
+    pub(super) fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: Instant::now(),
+        }
+    }
+
+    pub(super) fn finish(self) -> u64 {
+        let duration_us = self.started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        tracing::info!(
+            target: "ferrum.startup",
+            phase = self.phase,
+            duration_us,
+            "vNext startup phase completed"
+        );
+        duration_us
+    }
+}
+
+pub(super) fn log_static_initialization_receipt(receipt: &StaticInitializationReceipt) {
+    tracing::info!(
+        target: "ferrum.startup",
+        initialized_resource_count = receipt.initialized_resource_count(),
+        uploaded_component_count = receipt.uploaded_component_count(),
+        uploaded_bytes = receipt.uploaded_bytes(),
+        imported_component_count = receipt.imported_component_count(),
+        imported_bytes = receipt.imported_bytes(),
+        upload_command_count = receipt.upload_command_count(),
+        submission_batch_count = receipt.submission_batch_count(),
+        total_duration_us = receipt.total_duration_us(),
+        setup_duration_us = receipt.setup_duration_us(),
+        source_materialization_duration_us = receipt.source_materialization_duration_us(),
+        device_encode_duration_us = receipt.device_encode_duration_us(),
+        device_import_duration_us = receipt.device_import_duration_us(),
+        submission_wait_duration_us = receipt.submission_wait_duration_us(),
+        import_seal_duration_us = receipt.import_seal_duration_us(),
+        slowest_component_id = receipt
+            .slowest_component_id()
+            .map(ToString::to_string)
+            .as_deref(),
+        slowest_component_materialization_duration_us = receipt
+            .slowest_component_materialization_duration_us(),
+        "vNext static initialization completed"
+    );
+}
+
 #[derive(Default)]
 pub(super) struct AtomicDurationMetrics {
     samples: AtomicU64,
