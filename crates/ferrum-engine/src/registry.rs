@@ -15,8 +15,6 @@ use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelSourceBundle};
-#[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
-use ferrum_types::DataType;
 use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -1127,6 +1125,36 @@ where
     }
 }
 
+fn validate_registered_vnext_backend(
+    kind: ferrum_models::vnext::ProductionExecutionKind,
+    device: &Device,
+    external_metadata_id: &ferrum_interfaces::vnext::ExternalModelMetadataId,
+) -> Result<()> {
+    use ferrum_models::vnext::ProductionExecutionKind;
+
+    match (kind, device) {
+        (ProductionExecutionKind::CausalLanguage, Device::CUDA(_)) => {
+            #[cfg(feature = "cuda")]
+            return Ok(());
+            #[cfg(not(feature = "cuda"))]
+            Err(FerrumError::device(
+                "registered vNext CUDA composition requires the 'cuda' feature",
+            ))
+        }
+        (ProductionExecutionKind::CausalLanguage, Device::Metal) => {
+            #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+            return Ok(());
+            #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+            Err(FerrumError::device(
+                "registered vNext Metal composition requires the 'metal' feature on an Apple platform",
+            ))
+        }
+        (kind, device) => Err(FerrumError::unsupported(format!(
+            "registered vNext model metadata {external_metadata_id} requires a {kind:?} backend composition, but {device} is not registered"
+        ))),
+    }
+}
+
 fn create_registered_vnext_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
@@ -1136,7 +1164,13 @@ fn create_registered_vnext_executor(
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
-    let prepared_model_reused = prepared_model.is_some();
+    validate_registered_vnext_backend(
+        registration.execution_kind(),
+        &config.device,
+        registration.external_metadata_id(),
+    )?;
+
+    let _prepared_model_reused = prepared_model.is_some();
     if let (Some(prepared), Some(sources)) = (prepared_model.as_ref(), sources.as_ref()) {
         if !Arc::ptr_eq(prepared.sources(), sources) {
             return Err(FerrumError::model(
@@ -1182,7 +1216,7 @@ fn create_registered_vnext_executor(
                     family_id = %family.family_id(),
                     family_fingerprint,
                     program_fingerprint,
-                    prepared_model_reused,
+                    prepared_model_reused = _prepared_model_reused,
                     backend = "cuda",
                     "Building registered model from a typed vNext execution plan"
                 );
@@ -1242,7 +1276,7 @@ fn create_registered_vnext_executor(
                 family_id = %family.family_id(),
                 family_fingerprint,
                 program_fingerprint,
-                prepared_model_reused,
+                prepared_model_reused = _prepared_model_reused,
                 backend = "metal",
                 "Building registered model from a typed vNext execution plan"
             );
@@ -1340,19 +1374,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // carry the same typed bundle. Migrated architectures without that
         // metadata fail closed during product source resolution; only explicit
         // legacy registry rows may continue through the generic GGUF loader.
-        let legacy_reference_requested = config
-            .get_option::<bool>("qwen35_reference")
-            .unwrap_or(false);
-        #[cfg(not(any(test, feature = "legacy-qwen35-reference-test")))]
-        if legacy_reference_requested {
-            return Err(FerrumError::unsupported(
-                "the legacy Qwen3.5 reference adapter is available only in explicit test builds",
-            ));
-        }
-        #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
-        let legacy_reference_enabled = legacy_reference_requested;
-        #[cfg(not(any(test, feature = "legacy-qwen35-reference-test")))]
-        let legacy_reference_enabled = false;
         let production_registration = match model_sources.as_ref() {
             Some(sources) => Some(ferrum_models::vnext::resolve_registered_model_from_sources(
                 sources,
@@ -1365,47 +1386,28 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             None => None,
         };
         if let Some(production_registration) = production_registration {
-            if legacy_reference_enabled && !production_registration.allows_legacy_reference() {
-                return Err(FerrumError::unsupported(format!(
-                    "--qwen35-reference is not permitted for model metadata {}",
-                    production_registration.external_metadata_id()
-                )));
-            }
-            if legacy_reference_enabled {
-                if checkpoint_capture_enabled {
-                    return Err(FerrumError::unsupported(
-                        "vNext checkpoint capture cannot run through the legacy reference executor",
-                    ));
+            match production_registration {
+                ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => {
+                    return create_registered_vnext_executor(
+                        config,
+                        std::path::Path::new(&model_path),
+                        model_sources,
+                        prepared_model,
+                        registration,
+                    );
                 }
-                info!(
-                    external_metadata_id = %production_registration.external_metadata_id(),
-                    "Entering the explicitly allowed Qwen3.5 CPU reference path"
-                );
-            } else {
-                match production_registration {
-                    ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => {
-                        return create_registered_vnext_executor(
-                            config,
-                            std::path::Path::new(&model_path),
-                            model_sources,
-                            prepared_model,
-                            registration,
-                        );
+                ferrum_models::vnext::ProductionModelRegistration::LegacyRegistered {
+                    external_metadata_id,
+                } => {
+                    if checkpoint_capture_enabled {
+                        return Err(FerrumError::unsupported(format!(
+                            "vNext checkpoint capture requires a migrated model; metadata {external_metadata_id} is still legacy"
+                        )));
                     }
-                    ferrum_models::vnext::ProductionModelRegistration::LegacyRegistered {
-                        external_metadata_id,
-                        ..
-                    } => {
-                        if checkpoint_capture_enabled {
-                            return Err(FerrumError::unsupported(format!(
-                                "vNext checkpoint capture requires a migrated model; metadata {external_metadata_id} is still legacy"
-                            )));
-                        }
-                        info!(
-                            %external_metadata_id,
-                            "Entering the explicitly registered legacy model path"
-                        );
-                    }
+                    info!(
+                        %external_metadata_id,
+                        "Entering the explicitly registered legacy model path"
+                    );
                 }
             }
         }
@@ -1704,52 +1706,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 )?;
                 Ok(Arc::new(executor))
             }
-            #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
-            ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
-                if !legacy_reference_enabled {
-                    return Err(FerrumError::unsupported(format!(
-                        "model metadata for {:?} is registered for legacy reference execution only; enable --qwen35-reference with CPU/FP32 or migrate the family to vNext",
-                        model_def.architecture
-                    )));
-                }
-                if config.device != Device::CPU || dtype != DType::F32 {
-                    return Err(FerrumError::unsupported(
-                        "Qwen3.5/Qwen3.6 reference execution requires --backend cpu and FP32; \
-                         CUDA/Metal release execution is not wired yet.",
-                    ));
-                }
-                info!("Using Qwen3.5/Qwen3.6 explicit CPU/FP32 reference executor");
-                let model_dir = std::path::Path::new(&model_path);
-                let model_id = config.engine_config.model.model_id.to_string();
-                let executor = match model_def.architecture {
-                    ferrum_models::Architecture::Qwen35 => {
-                        ferrum_models::Qwen35W3Executor::from_definition_with_dense_reference_cpu_safetensors(
-                            model_id,
-                            &model_def,
-                            model_dir,
-                            DataType::FP32,
-                            Device::CPU,
-                        )?
-                    }
-                    ferrum_models::Architecture::Qwen35Moe => {
-                        ferrum_models::Qwen35W3Executor::from_definition_with_sparse_moe_reference_cpu_safetensors(
-                            model_id,
-                            &model_def,
-                            model_dir,
-                            DataType::FP32,
-                            Device::CPU,
-                        )?
-                    }
-                    _ => unreachable!("matched Qwen35 architectures above"),
-                };
-                Ok(Arc::new(executor))
-            }
-            #[cfg(not(any(test, feature = "legacy-qwen35-reference-test")))]
-            ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
-                Err(FerrumError::unsupported(
-                    "Qwen3.5 legacy execution is absent from production builds; use a registered vNext model package",
-                ))
-            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
@@ -1901,8 +1857,6 @@ pub fn set_global_registry(registry: Arc<ComponentRegistry>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::model_executor::PrefillInput;
-    use ferrum_testkit::MockTensor;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use std::path::{Path, PathBuf};
 
@@ -1920,7 +1874,7 @@ mod tests {
         dir
     }
 
-    fn write_qwen35_reference_config(dir: &Path) {
+    fn write_qwen35_fixture_config(dir: &Path) {
         let config = serde_json::json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "model_type": "qwen3_5",
@@ -1944,6 +1898,8 @@ mod tests {
                 "head_dim": 2,
                 "num_attention_heads": 1,
                 "num_key_value_heads": 1,
+                "vocab_size": 3,
+                "max_position_embeddings": 16,
                 "tie_word_embeddings": false
             }
         });
@@ -1954,7 +1910,7 @@ mod tests {
         .unwrap();
     }
 
-    fn write_qwen35_reference_safetensors(dir: &Path) {
+    fn write_qwen35_fixture_safetensors(dir: &Path) {
         let tensors: Vec<(String, Vec<f32>)> = vec![
             (
                 "model.embed_tokens.weight".to_string(),
@@ -2083,26 +2039,20 @@ mod tests {
         .unwrap();
     }
 
-    fn write_qwen35_reference_model_dir() -> PathBuf {
-        let dir = unique_test_dir("qwen35-reference");
-        write_qwen35_reference_config(&dir);
-        write_qwen35_reference_safetensors(&dir);
+    fn write_qwen35_fixture_model_dir() -> PathBuf {
+        let dir = unique_test_dir("qwen35-vnext-route");
+        write_qwen35_fixture_config(&dir);
+        write_qwen35_fixture_safetensors(&dir);
         dir
     }
 
-    fn qwen35_reference_component_config(model_dir: &Path, enabled: bool) -> ComponentConfig {
+    fn qwen35_fixture_component_config(model_dir: &Path) -> ComponentConfig {
         let mut engine_config = EngineConfig::default();
         engine_config.backend.device = Device::CPU;
         engine_config.backend.backend_options.insert(
             "model_path".to_string(),
             serde_json::Value::String(model_dir.to_string_lossy().to_string()),
         );
-        if enabled {
-            engine_config
-                .backend
-                .backend_options
-                .insert("qwen35_reference".to_string(), serde_json::json!(true));
-        }
         ComponentConfig::from_engine_config(&engine_config)
     }
 
@@ -2131,24 +2081,10 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_capture_rejects_legacy_reference_executor() {
-        let dir = write_qwen35_reference_model_dir();
-        let mut config = qwen35_reference_component_config(&dir, true);
-        enable_checkpoint_capture(&mut config, dir.join("capture"));
-
-        let error = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("checkpoint capture unexpectedly entered the legacy reference"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("legacy reference executor"), "{error}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn qwen35_registry_routes_registered_package_before_legacy_loading() {
-        let dir = write_qwen35_reference_model_dir();
+        let dir = write_qwen35_fixture_model_dir();
         std::fs::remove_file(dir.join("model.safetensors")).unwrap();
-        let config = qwen35_reference_component_config(&dir, false);
+        let config = qwen35_fixture_component_config(&dir);
 
         let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
             Ok(_) => panic!("registered Qwen3.5 package unexpectedly accepted CPU execution"),
@@ -2166,7 +2102,7 @@ mod tests {
     #[test]
     fn qwen35_typed_gguf_routes_registered_package_before_legacy_gguf_loading() {
         let dir = unique_test_dir("qwen35-typed-gguf-route");
-        write_qwen35_reference_config(&dir);
+        write_qwen35_fixture_config(&dir);
         std::fs::write(dir.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
         std::fs::write(
             dir.join("tokenizer_config.json"),
@@ -2213,44 +2149,6 @@ mod tests {
         );
         assert!(err.contains("but cpu is not registered"), "{err}");
         assert!(!err.contains("GGUF"), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn qwen35_reference_option_is_rejected_for_other_model_metadata() {
-        let dir = write_qwen35_reference_model_dir();
-        std::fs::write(
-            dir.join("config.json"),
-            r#"{"architectures":["LlamaForCausalLM"]}"#,
-        )
-        .unwrap();
-        let config = qwen35_reference_component_config(&dir, true);
-
-        let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("Qwen3.5 reference option unexpectedly accepted Llama metadata"),
-            Err(err) => err.to_string(),
-        };
-
-        assert!(err.contains("--qwen35-reference is not permitted"), "{err}");
-        assert!(err.contains("hf.architecture.LlamaForCausalLM"), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn qwen35_registry_loads_explicit_cpu_reference_executor() {
-        let dir = write_qwen35_reference_model_dir();
-        let config = qwen35_reference_component_config(&dir, true);
-
-        let executor = tokio_test::block_on(LlmExecutorFactory.create(&config))
-            .expect("explicit Qwen3.5 reference path should load toy safetensors");
-        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
-        let output = tokio_test::block_on(executor.prefill(&input))
-            .expect("explicit Qwen3.5 reference path should prefill");
-
-        assert_eq!(output.logits.shape(), &[1, 1, 3]);
-        assert_eq!(output.kv_cache.block_table().sequence_length, 2);
-        let status = executor.status();
-        assert!(status.is_ready, "{status:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -132,12 +132,6 @@ const LEGACY_LONG_SIGNATURES: &[&str] = &[
     "crates/ferrum-kernels/src/backend/traits.rs::trait BackendPagedKv::trait_fn split_qkv_norm_rope_into_paged_cache_varlen_vllm (21)",
     "crates/ferrum-kernels/src/backend/traits.rs::trait BackendPagedKv::trait_fn split_qkv_norm_rope_into_paged_cache_vllm (22)",
     "crates/ferrum-models/src/models/llama_family_forward_batched.rs::impl LlamaFamilyModel::method unified_forward_layer (24)",
-    "crates/ferrum-models/src/models/qwen35.rs::<root>::fn qwen35_dense_linear_attention_layer_cpu (18)",
-    "crates/ferrum-models/src/models/qwen35.rs::<root>::fn qwen35_full_attention_prefill_batch_layer_backend (18)",
-    "crates/ferrum-models/src/models/qwen35.rs::<root>::fn qwen35_linear_attention_prefill_varlen_compact_core_backend (16)",
-    "crates/ferrum-models/src/models/qwen35.rs::<root>::fn qwen35_linear_attention_prefill_varlen_core_backend (16)",
-    "crates/ferrum-models/src/models/qwen35.rs::<root>::fn qwen35_sparse_moe_full_attention_layer_cpu (18)",
-    "crates/ferrum-models/src/models/qwen35.rs::<root>::fn qwen35_sparse_moe_linear_attention_layer_cpu (22)",
 ];
 
 fn repo_root() -> PathBuf {

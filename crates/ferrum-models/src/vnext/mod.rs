@@ -36,7 +36,6 @@ struct ModelLoaderRegistration {
     external_metadata_ids: &'static [&'static str],
     gguf_architectures: &'static [&'static str],
     execution_kind: ProductionExecutionKind,
-    allows_legacy_reference: bool,
     validate_semantic_config: ValidateSemanticConfig,
     prepare: PrepareModel,
     create_family_registration: CreateFamilyRegistration,
@@ -49,7 +48,6 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
     ],
     gguf_architectures: &["qwen35", "qwen35moe"],
     execution_kind: ProductionExecutionKind::CausalLanguage,
-    allows_legacy_reference: cfg!(any(test, feature = "test-support")),
     validate_semantic_config: qwen35::validate_semantic_config,
     prepare: qwen35::prepare_from_sources,
     create_family_registration: qwen35_family_registration,
@@ -99,7 +97,6 @@ impl ModelFamilyRegistry for ProductionModelFamilyRegistry {
 
 struct LegacyModelRegistration {
     external_metadata_id: &'static str,
-    allows_legacy_reference: bool,
 }
 
 /// Explicit migration ledger for safetensors families that still use the
@@ -109,71 +106,54 @@ struct LegacyModelRegistration {
 const LEGACY_MODELS: &[LegacyModelRegistration] = &[
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.LlamaForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen2ForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen3ForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen3MoeForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Gemma3ForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Gemma3ForConditionalGeneration",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.MistralForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.PhiForCausalLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.GPT2LMHeadModel",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.BertModel",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.BertForMaskedLM",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.BertForSequenceClassification",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.CLIPModel",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.ChineseCLIPModel",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.SiglipModel",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.WhisperForConditionalGeneration",
-        allows_legacy_reference: false,
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen3TTSForConditionalGeneration",
-        allows_legacy_reference: false,
     },
 ];
 
@@ -652,7 +632,6 @@ pub enum ProductionModelRegistration {
     Registered(RegisteredProductionModel),
     LegacyRegistered {
         external_metadata_id: ExternalModelMetadataId,
-        allows_legacy_reference: bool,
     },
 }
 
@@ -664,16 +643,6 @@ impl ProductionModelRegistration {
                 external_metadata_id,
                 ..
             } => external_metadata_id,
-        }
-    }
-
-    pub const fn allows_legacy_reference(&self) -> bool {
-        match self {
-            Self::Registered(registration) => registration.registration.allows_legacy_reference,
-            Self::LegacyRegistered {
-                allows_legacy_reference,
-                ..
-            } => *allows_legacy_reference,
         }
     }
 
@@ -807,9 +776,8 @@ fn resolve_registered_model(
                 external_metadata_id,
             },
         )),
-        (None, Some(registration)) => Ok(ProductionModelRegistration::LegacyRegistered {
+        (None, Some(_)) => Ok(ProductionModelRegistration::LegacyRegistered {
             external_metadata_id,
-            allows_legacy_reference: registration.allows_legacy_reference,
         }),
         (None, None) => Err(ferrum_types::FerrumError::unsupported(format!(
             "model metadata {external_metadata_id} is absent from both the vNext and explicit legacy registries; implicit architecture fallback is forbidden"
@@ -862,7 +830,6 @@ mod tests {
         let metadata = ExternalModelMetadataId::new("hf.architecture.LlamaForCausalLM").unwrap();
         let selection = ProductionModelRegistration::LegacyRegistered {
             external_metadata_id: metadata,
-            allows_legacy_reference: false,
         };
 
         let error = match selection.into_required() {

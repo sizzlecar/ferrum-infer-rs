@@ -1,6 +1,6 @@
 //! Model definition and configuration parsing
 
-use crate::{qwen35_config::Qwen35TextConfig, registry::Architecture, source::ResolvedModelSource};
+use crate::{registry::Architecture, source::ResolvedModelSource};
 use ferrum_types::{
     Activation, AttentionConfig, FerrumError, ModelInfo, ModelType, NormType, Result, RopeScaling,
 };
@@ -186,51 +186,26 @@ impl ConfigManager {
         // Detect architecture
         let architecture = self.detect_architecture(raw)?;
 
-        let qwen35_config =
-            if matches!(architecture, Architecture::Qwen35 | Architecture::Qwen35Moe) {
-                Some(Qwen35TextConfig::from_hf_config_value(raw).map_err(|err| {
-                    FerrumError::model(format!("invalid Qwen3.5/Qwen3.6 config: {err}"))
-                })?)
-            } else {
-                None
-            };
-
         // Gemma 3 multimodal checkpoints (Gemma3ForConditionalGeneration)
         // nest the language model under `text_config`. Flatten it over the
         // root so field extraction and `extra_params` lookups (head_dim /
         // sliding_window / rope_local_base_freq / query_pre_attn_scalar /
         // rope_scaling) see the text-model values; vision_config is
         // ignored — text-only support.
-        //
-        // Qwen3.5/Qwen3.6 use the same nested HF shape for the text model.
-        // Flatten them here too, then attach the typed W3 text config under
-        // `ferrum_qwen35_text_config` so the product loader can consume the
-        // exact layer/mixer/MoE shape without reparsing raw JSON or silently
-        // falling back to Llama-family defaults.
-        let text_merged: Option<serde_json::Map<String, serde_json::Value>> = if architecture
-            == Architecture::Gemma3
-            || matches!(architecture, Architecture::Qwen35 | Architecture::Qwen35Moe)
-        {
-            obj.get("text_config")
-                .and_then(|v| v.as_object())
-                .map(|tc| {
-                    let mut m = obj.clone();
-                    for (k, v) in tc {
-                        m.insert(k.clone(), v.clone());
-                    }
-                    if let Some(qwen35_config) = &qwen35_config {
-                        m.insert(
-                            "ferrum_qwen35_text_config".to_string(),
-                            serde_json::to_value(qwen35_config).unwrap_or_else(|_| {
-                                serde_json::Value::Object(serde_json::Map::new())
-                            }),
-                        );
-                    }
-                    m
-                })
-        } else {
-            None
-        };
+        let text_merged: Option<serde_json::Map<String, serde_json::Value>> =
+            if architecture == Architecture::Gemma3 {
+                obj.get("text_config")
+                    .and_then(|v| v.as_object())
+                    .map(|tc| {
+                        let mut m = obj.clone();
+                        for (k, v) in tc {
+                            m.insert(k.clone(), v.clone());
+                        }
+                        m
+                    })
+            } else {
+                None
+            };
         let obj = text_merged.as_ref().unwrap_or(obj);
 
         // Parse common fields (CLIP stores these in text_config/vision_config)
@@ -245,22 +220,11 @@ impl ConfigManager {
             })
             .unwrap_or(4096) as usize;
 
-        let mut intermediate_size = obj
+        let intermediate_size = obj
             .get("intermediate_size")
             .and_then(|v| v.as_u64())
             .or_else(|| obj.get("ffn_dim").and_then(|v| v.as_u64()))
             .unwrap_or(11008) as usize;
-        if let Some(qwen35_config) = &qwen35_config {
-            intermediate_size = qwen35_config
-                .dense_intermediate_size
-                .or_else(|| {
-                    qwen35_config
-                        .moe
-                        .as_ref()
-                        .map(|moe| moe.moe_intermediate_size)
-                })
-                .unwrap_or(intermediate_size);
-        }
 
         // CLIP models store vocab_size in text_config, not at top level
         let vocab_size = obj
@@ -428,382 +392,5 @@ mod tests {
             manager.detect_architecture(&config).unwrap(),
             Architecture::Llama
         );
-    }
-
-    const QWEN35_ARTIFACT_ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
-        "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
-    );
-
-    fn parse_artifact_config(name: &str) -> ModelDefinition {
-        let raw = std::fs::read_to_string(format!("{QWEN35_ARTIFACT_ROOT}/{name}")).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let mut manager = ConfigManager::new();
-        manager.parse_config_for_tests(&json).unwrap()
-    }
-
-    #[test]
-    fn qwen35_dense_config_flattens_text_config_without_llama_fallback() {
-        let def = parse_artifact_config("dense_min_reference.config.json");
-
-        assert_eq!(def.architecture, Architecture::Qwen35);
-        assert_eq!(def.hidden_size, 1024);
-        assert_eq!(def.intermediate_size, 3584);
-        assert_eq!(def.vocab_size, 248320);
-        assert_eq!(def.num_hidden_layers, 24);
-        assert_eq!(def.num_attention_heads, 8);
-        assert_eq!(def.num_key_value_heads, Some(2));
-        assert_eq!(def.max_position_embeddings, 262144);
-        assert_eq!(def.rope_theta, Some(10_000_000.0));
-        assert_eq!(def.norm_type, NormType::RMSNorm);
-        assert_eq!(def.activation, Activation::SiLU);
-
-        let extra = def.extra_params.as_object().unwrap();
-        assert_eq!(
-            extra.get("model_type").and_then(|value| value.as_str()),
-            Some("qwen3_5_text")
-        );
-        assert_eq!(
-            extra
-                .get("linear_num_key_heads")
-                .and_then(|value| value.as_u64()),
-            Some(16)
-        );
-        let typed = extra
-            .get("ferrum_qwen35_text_config")
-            .and_then(|value| value.as_object())
-            .unwrap();
-        let linear_attention = typed
-            .get("linear_attention")
-            .and_then(|value| value.as_object())
-            .unwrap();
-        assert_eq!(
-            linear_attention
-                .get("num_key_heads")
-                .and_then(|value| value.as_u64()),
-            Some(16)
-        );
-        assert_eq!(
-            typed
-                .get("text_model_type")
-                .and_then(|value| value.as_str()),
-            Some("qwen3_5_text")
-        );
-        assert_eq!(
-            typed
-                .get("layer_types")
-                .and_then(|value| value.as_array())
-                .map(Vec::len),
-            Some(24)
-        );
-    }
-
-    #[test]
-    fn qwen35_moe_config_preserves_shared_expert_shape() {
-        let def = parse_artifact_config("moe_shared_expert_reference.config.json");
-
-        assert_eq!(def.architecture, Architecture::Qwen35Moe);
-        assert_eq!(def.hidden_size, 2048);
-        assert_eq!(def.intermediate_size, 512);
-        assert_eq!(def.vocab_size, 248320);
-        assert_eq!(def.num_hidden_layers, 40);
-        assert_eq!(def.num_attention_heads, 16);
-        assert_eq!(def.num_key_value_heads, Some(2));
-        assert_eq!(def.rope_theta, Some(10_000_000.0));
-
-        let typed = def
-            .extra_params
-            .get("ferrum_qwen35_text_config")
-            .and_then(|value| value.as_object())
-            .unwrap();
-        assert_eq!(
-            typed
-                .get("text_model_type")
-                .and_then(|value| value.as_str()),
-            Some("qwen3_5_moe_text")
-        );
-        let moe = typed
-            .get("moe")
-            .and_then(|value| value.as_object())
-            .unwrap();
-        assert_eq!(
-            moe.get("num_experts").and_then(|value| value.as_u64()),
-            Some(256)
-        );
-        assert_eq!(
-            moe.get("num_experts_per_tok")
-                .and_then(|value| value.as_u64()),
-            Some(8)
-        );
-        assert_eq!(
-            moe.get("shared_expert_intermediate_size")
-                .and_then(|value| value.as_u64()),
-            Some(512)
-        );
-    }
-
-    #[test]
-    fn qwen35_model_definition_preserves_typed_gptq_quantization_config() {
-        let raw = serde_json::json!({
-            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
-            "model_type": "qwen3_5_moe",
-            "quantization_config": {
-                "bits": 4,
-                "group_size": 128,
-                "desc_act": false,
-                "sym": true,
-                "quant_method": "gptq"
-            },
-            "text_config": {
-                "model_type": "qwen3_5_moe_text",
-                "hidden_size": 2048,
-                "vocab_size": 248320,
-                "num_hidden_layers": 4,
-                "layer_types": [
-                    "linear_attention",
-                    "linear_attention",
-                    "linear_attention",
-                    "full_attention"
-                ],
-                "linear_num_key_heads": 16,
-                "linear_num_value_heads": 32,
-                "linear_key_head_dim": 128,
-                "linear_value_head_dim": 128,
-                "linear_conv_kernel_dim": 4,
-                "mamba_ssm_dtype": "float32",
-                "head_dim": 256,
-                "num_attention_heads": 16,
-                "num_key_value_heads": 2,
-                "attn_output_gate": true,
-                "rope_parameters": {
-                    "rope_theta": 10000000,
-                    "partial_rotary_factor": 0.25,
-                    "mrope_interleaved": true
-                },
-                "num_experts": 256,
-                "num_experts_per_tok": 8,
-                "moe_intermediate_size": 512,
-                "shared_expert_intermediate_size": 512,
-                "tie_word_embeddings": false
-            }
-        });
-        let mut manager = ConfigManager::new();
-        let def = manager.parse_config_for_tests(&raw).unwrap();
-
-        assert_eq!(def.architecture, Architecture::Qwen35Moe);
-        let typed = def
-            .extra_params
-            .get("ferrum_qwen35_text_config")
-            .and_then(|value| value.as_object())
-            .unwrap();
-        let quant = typed
-            .get("quantization")
-            .and_then(|value| value.as_object())
-            .expect("typed Qwen3.5 config should preserve GPTQ quantization");
-        assert_eq!(
-            quant.get("quant_method").and_then(|value| value.as_str()),
-            Some("gptq")
-        );
-        assert_eq!(quant.get("bits").and_then(|value| value.as_u64()), Some(4));
-        assert_eq!(
-            quant.get("group_size").and_then(|value| value.as_u64()),
-            Some(128)
-        );
-        assert_eq!(
-            quant.get("desc_act").and_then(|value| value.as_bool()),
-            Some(false)
-        );
-        assert_eq!(
-            quant.get("sym").and_then(|value| value.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn qwen35_model_definition_builds_recurrent_state_spec() {
-        let def = parse_artifact_config("moe_shared_expert_reference.config.json");
-        let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
-        let request_id = ferrum_types::RequestId::new();
-        let spec = cfg
-            .to_recurrent_state_spec(
-                request_id.clone(),
-                ferrum_types::DataType::FP16,
-                ferrum_types::Device::CPU,
-                1,
-            )
-            .unwrap();
-
-        assert_eq!(spec.request_id, request_id);
-        assert_eq!(spec.num_layers, 40);
-        assert_eq!(spec.tensors.len(), 60);
-        assert_eq!(spec.tensors[0].layer_index, 0);
-        assert_eq!(spec.tensors[1].layer_index, 0);
-        assert_eq!(spec.tensors[6].layer_index, 4);
-        assert_eq!(spec.tensors[0].name, "conv_state");
-        assert_eq!(spec.tensors[0].shape, vec![8192, 3]);
-        assert_eq!(spec.tensors[0].dtype, ferrum_types::DataType::FP16);
-        assert_eq!(spec.tensors[1].name, "delta_state");
-        assert_eq!(spec.tensors[1].shape, vec![32, 128, 128]);
-        assert_eq!(spec.tensors[1].dtype, ferrum_types::DataType::FP32);
-        assert_eq!(
-            spec.estimated_memory_bytes(),
-            30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4)
-        );
-    }
-
-    #[test]
-    fn qwen35_model_definition_rejects_non_w3_architecture() {
-        let def = ModelDefinition::default();
-        let err = Qwen35TextConfig::from_model_definition(&def)
-            .expect_err("Llama definition must not parse as Qwen3.5");
-        assert!(err.contains("not Qwen3.5/Qwen3.6"), "{err}");
-    }
-
-    #[test]
-    fn qwen35_w3_executor_skeleton_exposes_recurrent_state_spec_only() {
-        use ferrum_interfaces::ModelExecutor;
-
-        let def = parse_artifact_config("moe_shared_expert_reference.config.json");
-        let executor = crate::executor::Qwen35W3Executor::from_definition(
-            "qwen36-skeleton",
-            &def,
-            ferrum_types::DataType::FP16,
-            ferrum_types::Device::CPU,
-        )
-        .unwrap();
-        let request_id = ferrum_types::RequestId::new();
-        let input_tokens = [
-            ferrum_types::TokenId(1),
-            ferrum_types::TokenId(2),
-            ferrum_types::TokenId(3),
-        ];
-        let spec = executor
-            .recurrent_state_spec(&request_id, &input_tokens)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(executor.info().num_layers, 40);
-        assert_eq!(executor.qwen35_config().linear_attention_layers(), 30);
-        assert_eq!(spec.request_id, request_id);
-        assert_eq!(spec.tensors.len(), 60);
-        assert_eq!(spec.tensors[0].name, "conv_state");
-        assert_eq!(spec.tensors[0].shape, vec![8192, 3]);
-        assert_eq!(spec.tensors[0].dtype, ferrum_types::DataType::FP16);
-        assert_eq!(spec.tensors[1].name, "delta_state");
-        assert_eq!(spec.tensors[1].shape, vec![32, 128, 128]);
-        assert_eq!(spec.tensors[1].dtype, ferrum_types::DataType::FP32);
-        assert_eq!(spec.device, ferrum_types::Device::CPU);
-        assert_eq!(spec.max_batch_slots, 1);
-
-        let status = executor.status();
-        assert_eq!(
-            status.state,
-            ferrum_interfaces::model_executor::ExecutorState::Error
-        );
-        assert!(!status.is_ready);
-        let capabilities = executor.capabilities();
-        assert!(!capabilities.supports_continuous_batching);
-        assert_eq!(
-            capabilities.memory_requirements.overhead_memory,
-            30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4)
-        );
-    }
-
-    #[test]
-    fn qwen35_w3_executor_weight_preflight_accepts_complete_inventory() {
-        let def = parse_artifact_config("dense_min_reference.config.json");
-        let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
-        let manifest = cfg.weight_manifest("model").unwrap();
-        let names = manifest
-            .global_tensors
-            .iter()
-            .chain(
-                manifest
-                    .layers
-                    .iter()
-                    .flat_map(|layer| layer.tensors.iter()),
-            )
-            .filter(|tensor| tensor.required)
-            .map(|tensor| tensor.name.clone())
-            .collect::<Vec<_>>();
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_safetensors_inventory(tmp.path(), &names);
-
-        let executor = crate::executor::Qwen35W3Executor::from_definition_with_weight_preflight(
-            "qwen35-preflight",
-            &def,
-            tmp.path(),
-            ferrum_types::DataType::FP16,
-            ferrum_types::Device::CPU,
-        )
-        .unwrap();
-        let validation = executor.weight_validation().unwrap();
-        assert_eq!(validation.prefix, "model");
-        assert!(validation.is_pass());
-        let weight_plan = executor.weight_plan().unwrap();
-        assert_eq!(weight_plan.prefix, "model");
-        assert_eq!(
-            weight_plan
-                .layer_tensor(0, "linear_attn_qkv")
-                .map(|tensor| tensor.name.as_str()),
-            Some("model.layers.0.linear_attn.in_proj_qkv.weight")
-        );
-    }
-
-    #[test]
-    fn qwen35_w3_executor_weight_preflight_rejects_missing_required_tensor() {
-        let def = parse_artifact_config("dense_min_reference.config.json");
-        let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
-        let manifest = cfg.weight_manifest("model").unwrap();
-        let mut names = manifest
-            .global_tensors
-            .iter()
-            .chain(
-                manifest
-                    .layers
-                    .iter()
-                    .flat_map(|layer| layer.tensors.iter()),
-            )
-            .filter(|tensor| tensor.required)
-            .map(|tensor| tensor.name.clone())
-            .collect::<Vec<_>>();
-        names.retain(|name| name != "model.layers.3.self_attn.q_proj.weight");
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_safetensors_inventory(tmp.path(), &names);
-
-        let err = crate::executor::Qwen35W3Executor::from_definition_with_weight_preflight(
-            "qwen35-preflight",
-            &def,
-            tmp.path(),
-            ferrum_types::DataType::FP16,
-            ferrum_types::Device::CPU,
-        )
-        .expect_err("missing required W3 tensor should fail preflight");
-        assert!(err.to_string().contains("self_attn.q_proj.weight"), "{err}");
-    }
-
-    fn write_safetensors_inventory(dir: &std::path::Path, names: &[String]) {
-        use std::collections::HashMap;
-
-        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
-
-        let tensors = names
-            .iter()
-            .map(|name| {
-                let bytes: &'static [u8] =
-                    Box::leak(0.0f32.to_le_bytes().to_vec().into_boxed_slice());
-                (
-                    name.clone(),
-                    TensorView::new(Dtype::F32, vec![1], bytes).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        serialize_to_file(
-            tensors,
-            &None::<HashMap<String, String>>,
-            &dir.join("model.safetensors"),
-        )
-        .unwrap();
     }
 }

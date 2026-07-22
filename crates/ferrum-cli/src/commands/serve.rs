@@ -65,11 +65,6 @@ pub struct ServeCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
-    #[cfg(feature = "legacy-qwen35-reference-test")]
-    /// Test-only CPU/FP32 Qwen3.5/Qwen3.6 reference adapter; sunset=G08B.
-    #[arg(long)]
-    pub qwen35_reference: bool,
-
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
@@ -302,8 +297,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         port,
         tts_slots,
         backend,
-        #[cfg(feature = "legacy-qwen35-reference-test")]
-        qwen35_reference,
         gpu_devices,
         layer_split_pipeline_mode,
         spec_draft,
@@ -963,13 +956,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
             );
-            #[cfg(feature = "legacy-qwen35-reference-test")]
-            if qwen35_reference {
-                engine_config.backend.backend_options.insert(
-                    "qwen35_reference".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-            }
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
             }
@@ -2210,31 +2196,8 @@ fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
 mod tests {
     use super::*;
 
-    const QWEN35_ARTIFACT_ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
-        "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
-    );
-
-    #[cfg(feature = "legacy-qwen35-reference-test")]
     #[test]
-    fn serve_parses_explicit_qwen35_reference_flag() {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            serve: ServeCommand,
-        }
-
-        let parsed = TestCli::parse_from(["ferrum", "--model", "qwen3.5", "--qwen35-reference"]);
-
-        assert!(parsed.serve.qwen35_reference);
-    }
-
-    #[cfg(not(feature = "legacy-qwen35-reference-test"))]
-    #[test]
-    fn serve_rejects_legacy_qwen35_reference_flag_in_product_build() {
+    fn serve_rejects_removed_qwen35_flag() {
         use clap::Parser;
 
         #[derive(Parser)]
@@ -2852,108 +2815,10 @@ mod tests {
         definition
     }
 
-    fn qwen35_moe_reference_definition() -> ferrum_models::ModelDefinition {
-        let raw = std::fs::read_to_string(format!(
-            "{QWEN35_ARTIFACT_ROOT}/moe_shared_expert_reference.config.json"
-        ))
-        .expect("read Qwen3.5 MoE reference config");
-        let root: serde_json::Value =
-            serde_json::from_str(&raw).expect("parse Qwen3.5 MoE reference config");
-        let text = root
-            .get("text_config")
-            .and_then(|value| value.as_object())
-            .expect("Qwen3.5 reference config should include text_config");
-        let mut extra_params = root
-            .as_object()
-            .expect("Qwen3.5 reference config root should be an object")
-            .clone();
-        for (key, value) in text {
-            extra_params.insert(key.clone(), value.clone());
-        }
-
-        ferrum_models::ModelDefinition {
-            architecture: ferrum_models::Architecture::Qwen35Moe,
-            hidden_size: 2048,
-            intermediate_size: 512,
-            num_hidden_layers: 40,
-            num_attention_heads: 16,
-            num_key_value_heads: Some(2),
-            max_position_embeddings: 262144,
-            vocab_size: 248320,
-            extra_params: serde_json::Value::Object(extra_params),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn qwen35_moe_model_capabilities_preserve_moe_shape() {
-        let definition = qwen35_moe_reference_definition();
-
-        let capabilities = model_capabilities_from_definition_with_weight_bytes(&definition, None);
-
-        assert_eq!(capabilities.architecture, "qwen3_5_moe");
-        assert_eq!(capabilities.head_dim, Some(256));
-        assert_eq!(capabilities.num_hidden_layers, Some(40));
-        let moe = capabilities.moe.expect("Qwen3.5 MoE should be marked MoE");
-        assert_eq!(moe.num_experts, 256);
-        assert_eq!(moe.experts_per_token, 8);
-        assert_eq!(moe.moe_intermediate_size, Some(512));
-        assert!(
-            capabilities.estimated_weight_bytes.unwrap() > 14 * 1024 * 1024 * 1024,
-            "Qwen3.5 MoE weight estimate must account for all resident experts, not only active params"
-        );
-        assert_eq!(
-            capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
-        );
-    }
-
-    #[test]
-    fn qwen35_moe_cuda_model_capabilities_follow_legacy_homogeneous_state_pool() {
-        let definition = qwen35_moe_reference_definition();
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-
-        let capabilities = model_capabilities_from_definition_with_weight_bytes_for_hardware(
-            &definition,
-            None,
-            &hardware,
-        );
-
-        assert_eq!(
-            capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
-        );
-    }
-
-    #[test]
-    fn qwen35_dense_cuda_model_capabilities_follow_vnext_mixed_state_layout() {
-        let mut definition = qwen35_moe_reference_definition();
-        definition.architecture = ferrum_models::Architecture::Qwen35;
-        definition.extra_params["num_experts"] = serde_json::Value::Null;
-        definition.extra_params["num_experts_per_tok"] = serde_json::Value::Null;
-        definition.extra_params["moe_intermediate_size"] = serde_json::Value::Null;
-        definition.extra_params["shared_expert_intermediate_size"] = serde_json::Value::Null;
-        definition.extra_params["intermediate_size"] = serde_json::json!(11008);
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-
-        let capabilities = model_capabilities_from_definition_with_weight_bytes_for_hardware(
-            &definition,
-            None,
-            &hardware,
-        );
-
-        assert_eq!(
-            capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4))
-        );
-    }
-
     #[test]
     fn model_capabilities_prefer_measured_weight_bytes_from_model_source() {
         let mut definition = ferrum_models::ModelDefinition {
-            architecture: ferrum_models::Architecture::Qwen35Moe,
+            architecture: ferrum_models::Architecture::Qwen3Moe,
             hidden_size: 2048,
             intermediate_size: 512,
             num_hidden_layers: 40,

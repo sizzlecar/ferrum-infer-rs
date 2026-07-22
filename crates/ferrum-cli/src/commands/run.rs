@@ -498,11 +498,6 @@ pub struct RunCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
-    #[cfg(feature = "legacy-qwen35-reference-test")]
-    /// Test-only CPU/FP32 Qwen3.5/Qwen3.6 reference adapter; sunset=G08B.
-    #[arg(long)]
-    pub qwen35_reference: bool,
-
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
@@ -861,13 +856,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
-    #[cfg(feature = "legacy-qwen35-reference-test")]
-    if cmd.qwen35_reference {
-        engine_config.backend.backend_options.insert(
-            "qwen35_reference".to_string(),
-            serde_json::Value::Bool(true),
-        );
-    }
     let runtime_config = run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
@@ -2351,8 +2339,6 @@ mod tests {
             disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
-            #[cfg(feature = "legacy-qwen35-reference-test")]
-            qwen35_reference: false,
             gpu_devices: None,
             layer_split_pipeline_mode: None,
             prompt: None,
@@ -2913,25 +2899,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "legacy-qwen35-reference-test")]
     #[test]
-    fn run_parses_explicit_qwen35_reference_flag() {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            run: RunCommand,
-        }
-
-        let parsed = TestCli::parse_from(["ferrum", "qwen3.5", "--qwen35-reference"]);
-
-        assert!(parsed.run.qwen35_reference);
-    }
-
-    #[cfg(not(feature = "legacy-qwen35-reference-test"))]
-    #[test]
-    fn run_rejects_legacy_qwen35_reference_flag_in_product_build() {
+    fn run_rejects_removed_qwen35_flag() {
         use clap::Parser;
 
         #[derive(Parser)]

@@ -4,7 +4,7 @@
 //! Keeping this compatibility parser in the model crate prevents product
 //! entrypoints from owning architecture-specific resource formulas.
 
-use ferrum_types::{DataType, HardwareCapabilities, ModelCapabilities, MoeCapabilities};
+use ferrum_types::{HardwareCapabilities, ModelCapabilities, MoeCapabilities};
 
 use crate::{Architecture, ModelDefinition};
 
@@ -12,35 +12,24 @@ pub fn from_definition_with_weight_bytes(
     definition: &ModelDefinition,
     model_weight_bytes: Option<u64>,
 ) -> ModelCapabilities {
-    from_definition_with_weight_bytes_and_conv_state_dtype(
-        definition,
-        model_weight_bytes,
-        DataType::FP32,
-    )
+    from_definition_with_weight_bytes_inner(definition, model_weight_bytes)
 }
 
 pub fn from_definition_with_weight_bytes_for_hardware(
     definition: &ModelDefinition,
     model_weight_bytes: Option<u64>,
-    hardware: &HardwareCapabilities,
+    _hardware: &HardwareCapabilities,
 ) -> ModelCapabilities {
-    from_definition_with_weight_bytes_and_conv_state_dtype(
-        definition,
-        model_weight_bytes,
-        qwen35_conv_state_dtype_for_hardware(hardware),
-    )
+    from_definition_with_weight_bytes_inner(definition, model_weight_bytes)
 }
 
-fn from_definition_with_weight_bytes_and_conv_state_dtype(
+fn from_definition_with_weight_bytes_inner(
     definition: &ModelDefinition,
     model_weight_bytes: Option<u64>,
-    conv_state_dtype: DataType,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         Architecture::Qwen3Moe => "qwen3_moe",
-        Architecture::Qwen35Moe => "qwen3_5_moe",
         Architecture::Gemma3 => "gemma3",
-        Architecture::Qwen35 => "qwen3_5",
         Architecture::Qwen3 => "qwen3",
         Architecture::Qwen2 => "qwen2",
         Architecture::Llama => "llama",
@@ -63,10 +52,7 @@ fn from_definition_with_weight_bytes_and_conv_state_dtype(
             (definition.num_attention_heads > 0)
                 .then_some(definition.hidden_size / definition.num_attention_heads)
         });
-    let moe = if matches!(
-        definition.architecture,
-        Architecture::Qwen3Moe | Architecture::Qwen35Moe
-    ) {
+    let moe = if definition.architecture == Architecture::Qwen3Moe {
         Some(MoeCapabilities {
             num_experts: definition
                 .extra_params
@@ -99,47 +85,10 @@ fn from_definition_with_weight_bytes_and_conv_state_dtype(
         estimated_weight_bytes: model_weight_bytes
             .filter(|value| *value > 0)
             .or_else(|| estimated_weight_bytes_from_definition(definition)),
-        recurrent_state_bytes_per_sequence: recurrent_state_bytes_per_sequence_from_definition(
-            definition,
-            conv_state_dtype,
-        ),
+        recurrent_state_bytes_per_sequence: None,
         supported_dtypes: vec!["fp16".to_owned(), "fp32".to_owned()],
         graph_safe_moe: false,
     }
-}
-
-fn qwen35_conv_state_dtype_for_hardware(hardware: &HardwareCapabilities) -> DataType {
-    if hardware.backend.eq_ignore_ascii_case("cuda") && hardware.compiled_features.cuda {
-        DataType::FP16
-    } else {
-        DataType::FP32
-    }
-}
-
-fn recurrent_state_bytes_per_sequence_from_definition(
-    definition: &ModelDefinition,
-    conv_state_dtype: DataType,
-) -> Option<u64> {
-    if !matches!(
-        definition.architecture,
-        Architecture::Qwen35 | Architecture::Qwen35Moe
-    ) {
-        return None;
-    }
-    let config = crate::qwen35_config::Qwen35TextConfig::from_model_definition(definition).ok()?;
-    let dtypes = match definition.architecture {
-        Architecture::Qwen35 => crate::qwen35_config::Qwen35RecurrentStateDtypes::new(
-            conv_state_dtype,
-            config.mamba_ssm_dtype,
-        ),
-        Architecture::Qwen35Moe => {
-            crate::qwen35_config::Qwen35RecurrentStateDtypes::homogeneous(conv_state_dtype)
-        }
-        _ => return None,
-    };
-    config
-        .recurrent_state_bytes_per_slot_with_dtypes(dtypes)
-        .ok()
 }
 
 pub fn quantization_from_definition(definition: &ModelDefinition) -> Option<String> {
@@ -172,10 +121,7 @@ fn estimated_weight_bytes_from_definition(definition: &ModelDefinition) -> Optio
 
 fn estimated_total_parameters_from_definition(definition: &ModelDefinition) -> Option<u64> {
     let dense_params = definition.to_model_info("__auto_config").num_parameters;
-    if !matches!(
-        definition.architecture,
-        Architecture::Qwen3Moe | Architecture::Qwen35Moe
-    ) {
+    if definition.architecture != Architecture::Qwen3Moe {
         return Some(dense_params);
     }
 
