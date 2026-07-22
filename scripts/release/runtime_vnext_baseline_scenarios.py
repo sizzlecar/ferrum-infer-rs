@@ -1824,9 +1824,10 @@ def validate_case_output(
             require(content == c19_expected_final(expected_marker, 2), f"{label} second final answer mismatch")
             first_request = require_object(exchanges[0].get("request"), f"{label}.first.request")
             kwargs = first_request.get("chat_template_kwargs")
-            if variant == "hard-thinking":
+            hard_thinking = c19_hard_thinking_override(variant)
+            if hard_thinking is True:
                 require(kwargs == {"enable_thinking": True}, f"{label} hard thinking toggle was not sent")
-            elif variant == "hard-no-thinking":
+            elif hard_thinking is False:
                 require(kwargs == {"enable_thinking": False}, f"{label} hard no-thinking toggle was not sent")
             else:
                 require(kwargs is None, f"{label} soft/default mode incorrectly sent a hard toggle")
@@ -3800,11 +3801,19 @@ def strict_schema_case(case: dict[str, Any]) -> tuple[str, dict[str, Any], dict[
 
 
 def thinking_reasoning_expected(model_key: str, variant: str) -> bool:
-    if variant == "hard-no-thinking":
+    if variant in {"hard-no-thinking", "soft-think-misuse"}:
         return False
     if model_key == "m3-qwen3-30b-a3b" and variant == "soft-no-think":
         return False
     return True
+
+
+def c19_hard_thinking_override(variant: str) -> bool | str:
+    if variant in {"hard-thinking", "soft-no-think-misuse"}:
+        return True
+    if variant in {"hard-no-thinking", "soft-think-misuse"}:
+        return False
+    return "model-default"
 
 
 def c19_expected_final(marker: str, turn: int) -> str:
@@ -3979,9 +3988,10 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
             payload["max_tokens"] = 10**9
     elif scenario_id == "C19":
         payload["messages"] = [{"role": "user", "content": c19_turn_prompt(marker, 1, variant)}]
-        if variant == "hard-thinking":
+        hard_thinking = c19_hard_thinking_override(variant)
+        if hard_thinking is True:
             payload["chat_template_kwargs"] = {"enable_thinking": True}
-        elif variant == "hard-no-thinking":
+        elif hard_thinking is False:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
             payload.pop("chat_template_kwargs", None)
@@ -4827,12 +4837,7 @@ def run_case_option_args(case: dict[str, Any]) -> tuple[list[str], bool | str | 
             argv.extend([flag, str(values[key])])
     thinking: bool | str | None = values.get("enable_thinking")
     if case["scenario_id"] == "C19":
-        if case["variant"] == "hard-thinking":
-            thinking = True
-        elif case["variant"] == "hard-no-thinking":
-            thinking = False
-        else:
-            thinking = "model-default"
+        thinking = c19_hard_thinking_override(case["variant"])
     if thinking is True:
         argv.append("--enable-thinking")
     elif thinking is False:
@@ -7882,7 +7887,11 @@ def history_evidence(history):
 
 
 def reasoning_enabled(argv, prompt):
-    if "--disable-thinking" in argv or prompt.rstrip().endswith("/no_think"):
+    if "--disable-thinking" in argv:
+        return False
+    if "--enable-thinking" in argv:
+        return True
+    if prompt.rstrip().endswith("/no_think"):
         return False
     case_match = re.search(r"G00-c19-(\d{3})-OK", prompt)
     if case_match and int(case_match.group(1)) >= 17:
@@ -8136,7 +8145,8 @@ class Handler(BaseHTTPRequestHandler):
             message["content"] = f"G00-{case_id}-OK-H{history_turn}"
             kwargs = payload.get("chat_template_kwargs") or {}
             prompt = str(payload.get("messages", [{}])[0].get("content", ""))
-            reasoning_enabled = kwargs.get("enable_thinking") is not False and not prompt.endswith("/no_think")
+            hard_thinking = kwargs.get("enable_thinking")
+            reasoning_enabled = hard_thinking if isinstance(hard_thinking, bool) else not prompt.endswith("/no_think")
             if reasoning_enabled:
                 message["reasoning"] = f"fixture reasoning turn {history_turn}"
         elif scenario == "C21" and variant == "required-tool":
@@ -9312,6 +9322,50 @@ def self_test() -> int:
                 {"soft-think-misuse", "soft-no-think-misuse"} <= modes and not ({"soft-think", "soft-no-think"} & modes),
                 f"{model_key} C19 does not distinguish soft-command misuse from Qwen3 soft switches",
             )
+            expected_overrides: dict[str, bool | str] = {
+                "default-thinking": "model-default",
+                "hard-thinking": True,
+                "hard-no-thinking": False,
+                "soft-think-misuse": False,
+                "soft-no-think-misuse": True,
+            }
+            c19_rows = [
+                row
+                for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                if row["scenario_id"] == "C19"
+            ]
+            for variant, expected_override in expected_overrides.items():
+                case = {
+                    **next(row for row in c19_rows if row["variant"] == variant),
+                    "model_key": model_key,
+                }
+                _, run_override = run_case_option_args(case)
+                payload_override = case_http_payload(case, model_key).get("chat_template_kwargs")
+                expected_payload = (
+                    None
+                    if expected_override == "model-default"
+                    else {"enable_thinking": expected_override}
+                )
+                require(run_override == expected_override, f"{model_key} {variant} run hard-toggle precedence drift")
+                require(payload_override == expected_payload, f"{model_key} {variant} serve hard-toggle precedence drift")
+                require(
+                    thinking_reasoning_expected(model_key, variant) is (expected_override is not False),
+                    f"{model_key} {variant} reasoning oracle differs from hard-toggle precedence",
+                )
+
+        m3_c19_rows = [
+            row
+            for row in planned_case_rows("m3-qwen3-30b-a3b", "cuda", internal_expectations_catalog())
+            if row["scenario_id"] == "C19"
+        ]
+        for variant in ("default-thinking", "soft-think", "soft-no-think"):
+            case = {
+                **next(row for row in m3_c19_rows if row["variant"] == variant),
+                "model_key": "m3-qwen3-30b-a3b",
+            }
+            _, run_override = run_case_option_args(case)
+            require(run_override == "model-default", f"M3 {variant} unexpectedly sent a hard run toggle")
+            require(case_http_payload(case, "m3-qwen3-30b-a3b").get("chat_template_kwargs") is None, f"M3 {variant} unexpectedly sent a hard serve toggle")
 
         scoped_root = Path(tmp) / "scoped-discovery-artifacts"
         scoped_root.mkdir()
