@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     FileFingerprint, ModelArtifactSourceRole, ModelSourceKind, OriginalModelSource,
-    OriginalModelSources, ResolvedModelSource, ResolvedModelSources,
+    OriginalModelSources, ProductModelArtifactBinding, ProductModelSourceIdentity,
+    ResolvedModelSource, ResolvedModelSources,
 };
 use ferrum_types::{FerrumError, Result};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,12 @@ const TOKENIZER_OPTIONAL_FILES: &[&str] = &[
 pub enum ProductionWeightArtifact {
     SafetensorsDirectory(PathBuf),
     GgufFile(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HuggingFaceSnapshotIdentity {
+    pub repository_id: String,
+    pub revision: String,
 }
 
 impl ProductionWeightArtifact {
@@ -59,6 +66,7 @@ pub struct ProductionModelSourceBundle {
     original_sources: OriginalModelSources,
     resolved_sources: ResolvedModelSources,
     config_json: Arc<[u8]>,
+    weight_config_json: Option<Arc<[u8]>>,
     tokenizer_json: Arc<[u8]>,
     tokenizer_config_json: Option<Arc<[u8]>>,
     generation_config_json: Option<Arc<[u8]>>,
@@ -76,6 +84,10 @@ impl fmt::Debug for ProductionModelSourceBundle {
             .field("original_sources", &self.original_sources)
             .field("resolved_sources", &self.resolved_sources)
             .field("config_json_bytes", &self.config_json.len())
+            .field(
+                "weight_config_json_bytes",
+                &self.weight_config_json.as_ref().map(|bytes| bytes.len()),
+            )
             .field("tokenizer_json_bytes", &self.tokenizer_json.len())
             .field(
                 "tokenizer_config_json_bytes",
@@ -120,6 +132,12 @@ impl ProductionModelSourceBundle {
         let weight_files = fingerprint_weight_artifact(&weights)?;
 
         let config_json = read_required_file(&semantic_root.join("config.json"))?;
+        let weight_config_json = match &weights {
+            ProductionWeightArtifact::SafetensorsDirectory(root) => {
+                read_optional_file(&root.join("config.json"))?
+            }
+            ProductionWeightArtifact::GgufFile(_) => None,
+        };
         let tokenizer_json = read_required_file(&tokenizer_root.join("tokenizer.json"))?;
         let tokenizer_config_json =
             read_optional_file(&tokenizer_root.join("tokenizer_config.json"))?;
@@ -145,6 +163,7 @@ impl ProductionModelSourceBundle {
             original_sources,
             resolved_sources,
             config_json,
+            weight_config_json,
             tokenizer_json,
             tokenizer_config_json,
             generation_config_json,
@@ -207,6 +226,13 @@ impl ProductionModelSourceBundle {
         &self.tokenizer_json
     }
 
+    /// Physical checkpoint metadata retained independently from the semantic
+    /// model config. Quantized safetensors commonly repeat semantic fields in
+    /// this file, but only physical format metadata may be selected from it.
+    pub fn weight_config_json(&self) -> Option<&[u8]> {
+        self.weight_config_json.as_deref()
+    }
+
     pub fn tokenizer_config_json(&self) -> Option<&[u8]> {
         self.tokenizer_config_json.as_deref()
     }
@@ -233,6 +259,74 @@ impl ProductionModelSourceBundle {
             .files
             .iter()
             .find(|file| file.relative_path == relative_path)
+    }
+
+    pub fn weight_payload_bytes(&self) -> Result<u64> {
+        self.resolved_sources
+            .weights
+            .files
+            .iter()
+            .filter(|file| {
+                file.relative_path.ends_with(".safetensors")
+                    || self.weights.is_gguf()
+                        && self
+                            .weights
+                            .path()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            == Some(file.relative_path.as_str())
+            })
+            .try_fold(0_u64, |total, file| {
+                total.checked_add(file.size_bytes).ok_or_else(|| {
+                    FerrumError::model("resolved weight payload byte size overflows u64")
+                })
+            })
+    }
+
+    pub fn product_source_identity(
+        &self,
+        requested_model: impl Into<String>,
+        resolved_model: impl Into<String>,
+        template_source_file: &str,
+        template_content: &str,
+    ) -> Result<ProductModelSourceIdentity> {
+        let binding = |role, source_file: &str, content_sha256: Option<String>| {
+            let fingerprint = self.fingerprint(role, source_file).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "selected {role:?} source file is absent: {source_file}"
+                ))
+            })?;
+            ProductModelArtifactBinding::new(
+                role,
+                source_file,
+                fingerprint.sha256.clone(),
+                content_sha256,
+            )
+            .map_err(|error| FerrumError::model(error.to_string()))
+        };
+        let semantic_config = binding(ModelArtifactSourceRole::Semantic, "config.json", None)?;
+        let tokenizer = binding(ModelArtifactSourceRole::Tokenizer, "tokenizer.json", None)?;
+        let template = binding(
+            ModelArtifactSourceRole::Tokenizer,
+            template_source_file,
+            Some(format!("{:x}", Sha256::digest(template_content.as_bytes()))),
+        )?;
+        let weight_config = self
+            .weight_config_json
+            .as_ref()
+            .map(|_| binding(ModelArtifactSourceRole::Weights, "config.json", None))
+            .transpose()?;
+        ProductModelSourceIdentity::new(
+            requested_model,
+            resolved_model,
+            self.original_sources.clone(),
+            self.resolved_sources.clone(),
+            semantic_config,
+            tokenizer,
+            template,
+            weight_config,
+        )
+        .map_err(|error| FerrumError::model(error.to_string()))
     }
 }
 
@@ -322,7 +416,8 @@ fn fingerprint_weight_artifact(
                     let name = path.file_name()?.to_str()?.to_owned();
                     (path.is_file()
                         && (name.ends_with(".safetensors")
-                            || name == "model.safetensors.index.json"))
+                            || name == "model.safetensors.index.json"
+                            || name == "config.json"))
                         .then_some(name)
                 })
                 .collect::<Vec<_>>();
@@ -440,30 +535,72 @@ fn resolved_source(
     files: Vec<FileFingerprint>,
 ) -> Result<ResolvedModelSource> {
     let manifest_revision = manifest_revision(&files)?;
-    let (canonical_location, resolved_revision) = match original.kind {
-        ModelSourceKind::Repository => (
-            original.location.clone(),
-            huggingface_snapshot_revision(path).ok_or_else(|| {
-                FerrumError::model(format!(
-                    "repository source {} did not resolve below snapshots/<revision>: {}",
-                    original.location,
-                    path.display()
+    let snapshot_identity = huggingface_snapshot_identity(path);
+    let (canonical_location, resolved_revision) = if let Some(identity) = snapshot_identity {
+        (identity.repository_id, identity.revision)
+    } else {
+        match original.kind {
+            ModelSourceKind::Repository => (
+                original.location.clone(),
+                huggingface_snapshot_revision(path).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "repository source {} did not resolve below snapshots/<revision>: {}",
+                        original.location,
+                        path.display()
+                    ))
+                })?,
+            ),
+            ModelSourceKind::LocalDirectory | ModelSourceKind::LocalFile => {
+                (path.display().to_string(), manifest_revision)
+            }
+            ModelSourceKind::ReleaseArtifact => {
+                return Err(FerrumError::unsupported(
+                    "release artifact source bundles are not implemented",
                 ))
-            })?,
-        ),
-        ModelSourceKind::LocalDirectory | ModelSourceKind::LocalFile => {
-            (path.display().to_string(), manifest_revision)
-        }
-        ModelSourceKind::ReleaseArtifact => {
-            return Err(FerrumError::unsupported(
-                "release artifact source bundles are not implemented",
-            ))
+            }
         }
     };
     Ok(ResolvedModelSource {
         canonical_location,
         resolved_revision,
         files,
+    })
+}
+
+/// Recover a stable repository/revision identity only from an exact Hugging
+/// Face cache snapshot root or one direct artifact below it. The path is
+/// inspected structurally without canonicalizing an LFS symlink into `blobs/`.
+pub fn huggingface_snapshot_identity(path: &Path) -> Option<HuggingFaceSnapshotIdentity> {
+    huggingface_snapshot_root_identity(path)
+        .or_else(|| path.parent().and_then(huggingface_snapshot_root_identity))
+}
+
+fn huggingface_snapshot_root_identity(root: &Path) -> Option<HuggingFaceSnapshotIdentity> {
+    let revision = root.file_name()?.to_str()?;
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let snapshots = root.parent()?;
+    if snapshots.file_name()?.to_str()? != "snapshots" {
+        return None;
+    }
+    let repository_dir = snapshots.parent()?.file_name()?.to_str()?;
+    let encoded = repository_dir.strip_prefix("models--")?;
+    let components = encoded.split("--").collect::<Vec<_>>();
+    if components.len() != 2 || components.iter().any(|component| component.is_empty()) {
+        return None;
+    }
+    let repository_id = components.join("/");
+    if format!("models--{}", repository_id.replace('/', "--")) != repository_dir {
+        return None;
+    }
+    Some(HuggingFaceSnapshotIdentity {
+        repository_id,
+        revision: revision.to_owned(),
     })
 }
 
@@ -571,6 +708,104 @@ mod tests {
         assert!(bundle
             .fingerprint(ModelArtifactSourceRole::Weights, "model.safetensors")
             .is_some());
+        assert_eq!(bundle.weight_payload_bytes().unwrap(), 15);
+    }
+
+    #[test]
+    fn local_huggingface_snapshot_paths_recover_stable_role_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let semantic_revision = "a".repeat(40);
+        let weight_revision = "b".repeat(40);
+        let semantic = root
+            .path()
+            .join("models--Qwen--Qwen3.5-35B-A3B")
+            .join("snapshots")
+            .join(&semantic_revision);
+        let weights = root
+            .path()
+            .join("models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4")
+            .join("snapshots")
+            .join(&weight_revision);
+        std::fs::create_dir_all(&semantic).unwrap();
+        std::fs::create_dir_all(&weights).unwrap();
+        std::fs::write(
+            semantic.join("config.json"),
+            br#"{"architectures":["Fixture"]}"#,
+        )
+        .unwrap();
+        std::fs::write(semantic.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(
+            semantic.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            weights.join("config.json"),
+            br#"{"quantization_config":{"quant_method":"gptq"}}"#,
+        )
+        .unwrap();
+        std::fs::write(weights.join("model.safetensors"), b"fixture-weights").unwrap();
+        let local = |path: &Path| OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: path.display().to_string(),
+            requested_revision: None,
+        };
+        let bundle = ProductionModelSourceBundle::open(
+            &semantic,
+            &semantic,
+            ProductionWeightArtifact::safetensors_directory(&weights),
+            OriginalModelSources {
+                semantic: local(&semantic),
+                tokenizer: local(&semantic),
+                weights: local(&weights),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            bundle.resolved_sources().semantic.canonical_location,
+            "Qwen/Qwen3.5-35B-A3B"
+        );
+        assert_eq!(
+            bundle.resolved_sources().semantic.resolved_revision,
+            semantic_revision
+        );
+        assert_eq!(
+            bundle.resolved_sources().weights.canonical_location,
+            "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+        );
+        assert_eq!(
+            bundle.resolved_sources().weights.resolved_revision,
+            weight_revision
+        );
+        let identity = bundle
+            .product_source_identity(
+                weights.display().to_string(),
+                "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+                "tokenizer_config.json",
+                "fixture",
+            )
+            .unwrap();
+        let template_sha256 = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(identity.template.content_sha256, Some(template_sha256));
+        assert!(identity.weight_config.is_some());
+    }
+
+    #[test]
+    fn huggingface_snapshot_identity_rejects_ambiguous_cache_paths() {
+        let revision = "a".repeat(40);
+        assert!(huggingface_snapshot_identity(Path::new(&format!(
+            "/cache/models--Qwen--Model/snapshots/{revision}"
+        )))
+        .is_some());
+        assert!(huggingface_snapshot_identity(Path::new(
+            "/cache/models--Qwen--Model/snapshots/main"
+        ))
+        .is_none());
+        assert!(huggingface_snapshot_identity(Path::new(&format!(
+            "/cache/models--Qwen--Nested--Model/snapshots/{revision}"
+        )))
+        .is_none());
     }
 
     #[cfg(unix)]

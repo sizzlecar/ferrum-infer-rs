@@ -136,6 +136,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     )
     .await?;
     let product_input = resolved.into_product_engine_input();
+    let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
     let model_sources = product_input.model_sources;
@@ -144,7 +145,6 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         .map(crate::source_resolver::prepare_registered_product_model)
         .transpose()?
         .flatten();
-    let model_id = crate::source_resolver::public_model_id(&source);
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 

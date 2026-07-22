@@ -21,6 +21,129 @@ fn runtime_policy_roundtrip_preserves_sequence_fit_policy() {
     );
 }
 
+#[test]
+fn product_source_identity_rejects_cross_role_and_stale_bindings() {
+    let original = |location: &str| OriginalModelSource {
+        kind: ModelSourceKind::Repository,
+        location: location.to_owned(),
+        requested_revision: None,
+    };
+    let resolved = |location: &str, file: &str, digest: char| ResolvedModelSource {
+        canonical_location: location.to_owned(),
+        resolved_revision: digest.to_string().repeat(40),
+        files: vec![FileFingerprint {
+            relative_path: file.to_owned(),
+            size_bytes: 16,
+            sha256: sha(digest),
+        }],
+    };
+    let originals = OriginalModelSources {
+        semantic: original("repo/semantic"),
+        tokenizer: original("repo/tokenizer"),
+        weights: original("repo/weights"),
+    };
+    let sources = ResolvedModelSources {
+        semantic: resolved("repo/semantic", "config.json", '1'),
+        tokenizer: ResolvedModelSource {
+            canonical_location: "repo/tokenizer".to_owned(),
+            resolved_revision: "2".repeat(40),
+            files: vec![
+                FileFingerprint {
+                    relative_path: "tokenizer.json".to_owned(),
+                    size_bytes: 16,
+                    sha256: sha('2'),
+                },
+                FileFingerprint {
+                    relative_path: "tokenizer_config.json".to_owned(),
+                    size_bytes: 16,
+                    sha256: sha('3'),
+                },
+            ],
+        },
+        weights: resolved("repo/weights", "model.safetensors", '4'),
+    };
+    let semantic = ProductModelArtifactBinding::new(
+        ModelArtifactSourceRole::Semantic,
+        "config.json",
+        sha('1'),
+        None,
+    )
+    .unwrap();
+    let tokenizer = ProductModelArtifactBinding::new(
+        ModelArtifactSourceRole::Tokenizer,
+        "tokenizer.json",
+        sha('2'),
+        None,
+    )
+    .unwrap();
+    let template = ProductModelArtifactBinding::new(
+        ModelArtifactSourceRole::Tokenizer,
+        "tokenizer_config.json",
+        sha('3'),
+        Some(sha('5')),
+    )
+    .unwrap();
+    ProductModelSourceIdentity::new(
+        "requested/path",
+        "repo/weights",
+        originals.clone(),
+        sources.clone(),
+        semantic.clone(),
+        tokenizer.clone(),
+        template,
+        None,
+    )
+    .unwrap();
+
+    let stale_semantic = ProductModelArtifactBinding::new(
+        ModelArtifactSourceRole::Semantic,
+        "config.json",
+        sha('9'),
+        None,
+    )
+    .unwrap();
+    assert!(ProductModelSourceIdentity::new(
+        "requested/path",
+        "repo/weights",
+        originals.clone(),
+        sources.clone(),
+        stale_semantic,
+        tokenizer.clone(),
+        ProductModelArtifactBinding::new(
+            ModelArtifactSourceRole::Tokenizer,
+            "tokenizer_config.json",
+            sha('3'),
+            Some(sha('5')),
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("container_sha256"));
+
+    let cross_role_template = ProductModelArtifactBinding::new(
+        ModelArtifactSourceRole::Semantic,
+        "config.json",
+        sha('1'),
+        Some(sha('5')),
+    )
+    .unwrap();
+    assert!(ProductModelSourceIdentity::new(
+        "requested/path",
+        "repo/weights",
+        originals,
+        sources,
+        semantic,
+        tokenizer,
+        cross_role_template,
+        None,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("template.role"));
+}
+
 fn resolution_test_error(field: &str, reason: &str) -> VNextError {
     VNextError::InvalidResolvedModelPlan {
         field: field.to_owned(),

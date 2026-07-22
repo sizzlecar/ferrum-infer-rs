@@ -683,6 +683,289 @@ impl ResolvedModelSources {
     }
 }
 
+pub const PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION: u32 = 1;
+
+/// One selected artifact inside a role-specific model source.
+///
+/// `container_sha256` binds the complete source file. `content_sha256` is
+/// present when runtime selects content inside that file, for example the
+/// chat-template string inside `tokenizer_config.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductModelArtifactBinding {
+    pub role: ModelArtifactSourceRole,
+    pub source_file: String,
+    pub container_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+}
+
+impl ProductModelArtifactBinding {
+    pub fn new(
+        role: ModelArtifactSourceRole,
+        source_file: impl Into<String>,
+        container_sha256: impl Into<String>,
+        content_sha256: Option<String>,
+    ) -> Result<Self, VNextError> {
+        let binding = Self {
+            role,
+            source_file: source_file.into(),
+            container_sha256: container_sha256.into(),
+            content_sha256,
+        };
+        binding.validate("product_model_artifact_binding")?;
+        Ok(binding)
+    }
+
+    fn validate(&self, field: &str) -> Result<(), VNextError> {
+        if !validate_source_path(&self.source_file) {
+            return Err(invalid_plan(
+                format!("{field}.source_file"),
+                "must be a portable relative source path",
+            ));
+        }
+        if !is_canonical_sha256(&self.container_sha256) {
+            return Err(invalid_plan(
+                format!("{field}.container_sha256"),
+                "must be a canonical SHA-256",
+            ));
+        }
+        if self
+            .content_sha256
+            .as_deref()
+            .is_some_and(|sha256| !is_canonical_sha256(sha256))
+        {
+            return Err(invalid_plan(
+                format!("{field}.content_sha256"),
+                "must be a canonical SHA-256",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable product-facing identity for the exact model sources selected by
+/// resolution and family preparation.
+///
+/// Keeping the raw request separate from the stable resolved model id avoids
+/// exposing machine-local cache paths as public model names. The role-specific
+/// sources and selected artifacts are the same inputs consumed by the typed
+/// model family and `ResolvedModelPlan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductModelSourceIdentity {
+    pub schema_version: u32,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub original_sources: OriginalModelSources,
+    pub resolved_sources: ResolvedModelSources,
+    pub semantic_config: ProductModelArtifactBinding,
+    pub tokenizer: ProductModelArtifactBinding,
+    pub template: ProductModelArtifactBinding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_config: Option<ProductModelArtifactBinding>,
+}
+
+impl ProductModelSourceIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        requested_model: impl Into<String>,
+        resolved_model: impl Into<String>,
+        original_sources: OriginalModelSources,
+        resolved_sources: ResolvedModelSources,
+        semantic_config: ProductModelArtifactBinding,
+        tokenizer: ProductModelArtifactBinding,
+        template: ProductModelArtifactBinding,
+        weight_config: Option<ProductModelArtifactBinding>,
+    ) -> Result<Self, VNextError> {
+        let identity = Self {
+            schema_version: PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION,
+            requested_model: requested_model.into(),
+            resolved_model: resolved_model.into(),
+            original_sources,
+            resolved_sources,
+            semantic_config,
+            tokenizer,
+            template,
+            weight_config,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<(), VNextError> {
+        if self.schema_version != PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION {
+            return Err(invalid_plan(
+                "product_model_source_identity.schema_version",
+                format!("must be {}", PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION),
+            ));
+        }
+        for (field, value) in [
+            ("requested_model", self.requested_model.as_str()),
+            ("resolved_model", self.resolved_model.as_str()),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(invalid_plan(
+                    format!("product_model_source_identity.{field}"),
+                    "must be non-empty and have no surrounding whitespace",
+                ));
+            }
+        }
+        for role in ModelArtifactSourceRole::ALL {
+            self.validate_original_source(role)?;
+            self.validate_resolved_source(role)?;
+        }
+        self.validate_binding(
+            "semantic_config",
+            &self.semantic_config,
+            ModelArtifactSourceRole::Semantic,
+        )?;
+        self.validate_binding(
+            "tokenizer",
+            &self.tokenizer,
+            ModelArtifactSourceRole::Tokenizer,
+        )?;
+        self.validate_binding(
+            "template",
+            &self.template,
+            ModelArtifactSourceRole::Tokenizer,
+        )?;
+        if self.template.content_sha256.is_none() {
+            return Err(invalid_plan(
+                "product_model_source_identity.template.content_sha256",
+                "selected template content must be fingerprinted",
+            ));
+        }
+        if let Some(binding) = &self.weight_config {
+            self.validate_binding("weight_config", binding, ModelArtifactSourceRole::Weights)?;
+        }
+        Ok(())
+    }
+
+    fn validate_original_source(&self, role: ModelArtifactSourceRole) -> Result<(), VNextError> {
+        let source = self.original_sources.for_role(role);
+        if source.location.is_empty() || source.location.trim() != source.location {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.original_sources.{}.location",
+                    role.as_str()
+                ),
+                "must be non-empty and have no surrounding whitespace",
+            ));
+        }
+        if source
+            .requested_revision
+            .as_deref()
+            .is_some_and(|revision| revision.is_empty() || revision.trim() != revision)
+        {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.original_sources.{}.requested_revision",
+                    role.as_str()
+                ),
+                "must be non-empty and have no surrounding whitespace when present",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_resolved_source(&self, role: ModelArtifactSourceRole) -> Result<(), VNextError> {
+        let source = self.resolved_sources.for_role(role);
+        for (field, value) in [
+            ("canonical_location", source.canonical_location.as_str()),
+            ("resolved_revision", source.resolved_revision.as_str()),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(invalid_plan(
+                    format!(
+                        "product_model_source_identity.resolved_sources.{}.{field}",
+                        role.as_str()
+                    ),
+                    "must be non-empty and have no surrounding whitespace",
+                ));
+            }
+        }
+        if source.files.is_empty() {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.resolved_sources.{}.files",
+                    role.as_str()
+                ),
+                "must not be empty",
+            ));
+        }
+        for (index, file) in source.files.iter().enumerate() {
+            let field = format!(
+                "product_model_source_identity.resolved_sources.{}.files[{index}]",
+                role.as_str()
+            );
+            if !validate_source_path(&file.relative_path) {
+                return Err(invalid_plan(
+                    format!("{field}.relative_path"),
+                    "must be a portable relative source path",
+                ));
+            }
+            if file.size_bytes == 0 {
+                return Err(invalid_plan(
+                    format!("{field}.size_bytes"),
+                    "must be positive",
+                ));
+            }
+            if !is_canonical_sha256(&file.sha256) {
+                return Err(invalid_plan(
+                    format!("{field}.sha256"),
+                    "must be a canonical SHA-256",
+                ));
+            }
+        }
+        if source
+            .files
+            .windows(2)
+            .any(|pair| pair[0].relative_path >= pair[1].relative_path)
+        {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.resolved_sources.{}.files",
+                    role.as_str()
+                ),
+                "must be strictly sorted by relative_path without duplicates",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_binding(
+        &self,
+        field: &str,
+        binding: &ProductModelArtifactBinding,
+        expected_role: ModelArtifactSourceRole,
+    ) -> Result<(), VNextError> {
+        binding.validate(&format!("product_model_source_identity.{field}"))?;
+        if binding.role != expected_role {
+            return Err(invalid_plan(
+                format!("product_model_source_identity.{field}.role"),
+                format!("must be {expected_role:?}"),
+            ));
+        }
+        let source = self.resolved_sources.for_role(binding.role);
+        match source
+            .files
+            .iter()
+            .find(|file| file.relative_path == binding.source_file)
+        {
+            Some(file) if file.sha256 == binding.container_sha256 => Ok(()),
+            Some(file) => Err(invalid_plan(
+                format!("product_model_source_identity.{field}.container_sha256"),
+                format!("does not match resolved source file {}", file.relative_path),
+            )),
+            None => Err(invalid_plan(
+                format!("product_model_source_identity.{field}.source_file"),
+                format!("is absent from resolved {} source", binding.role.as_str()),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfigFingerprint {
     pub source_file: String,

@@ -27,17 +27,38 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
+use clap::Args;
+use ferrum_interfaces::vnext::{
+    ModelSourceKind, OriginalModelSource, OriginalModelSources, ProductModelSourceIdentity,
+};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_models::vnext::{ProductionModelSourceBundle, ProductionWeightArtifact};
+use ferrum_models::vnext::{
+    huggingface_snapshot_identity, ProductionModelSourceBundle, ProductionWeightArtifact,
+};
 use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
     EngineConfig, FerrumError, ModelId, ModelSource, Result, RuntimeConfigEntry,
     RuntimeConfigSnapshot, RuntimeConfigSource,
 };
+use sha2::{Digest, Sha256};
 
 use crate::config::CliConfig;
 use crate::gpu_mem_autosize::{apply_auto_size_with_profile, AutoSizeProfile};
+
+/// Explicit role-specific model metadata sources shared by `run` and `serve`.
+/// The physical weight source remains the positional MODEL argument.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ProductSourceArgs {
+    /// Directory containing the semantic `config.json` used to build the
+    /// typed model family. When set, it is also the tokenizer source unless
+    /// `--tokenizer-source` is supplied.
+    #[arg(long, value_name = "DIR")]
+    pub semantic_source: Option<PathBuf>,
+
+    /// Directory containing tokenizer files and the selected chat template.
+    #[arg(long, value_name = "DIR")]
+    pub tokenizer_source: Option<PathBuf>,
+}
 
 /// Resolve the single Hugging Face cache root used by product entrypoints.
 pub fn hf_cache_dir(config: &CliConfig) -> PathBuf {
@@ -83,6 +104,9 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// `run` and `serve` must use this helper rather than inventing entrypoint-
 /// specific ids for the same local source.
 pub fn public_model_id(source: &ResolvedModelSource) -> String {
+    if let Some(identity) = huggingface_snapshot_identity(&source.local_path) {
+        return identity.repository_id;
+    }
     match source.format {
         ModelFormat::GGUF => source
             .local_path
@@ -1056,6 +1080,8 @@ pub enum DownloadPolicy {
 /// caller can use to decide whether to apply GPU autosize.
 pub struct Resolved {
     source: ResolvedModelSource,
+    requested_model: String,
+    public_model_id: String,
     /// Typed source identity retained past local cache resolution. Product
     /// composition uses this instead of reverse-engineering a repository from
     /// an opaque snapshot path.
@@ -1074,6 +1100,8 @@ pub struct Resolved {
 /// architecture arms from retaining only the resolved cache path.
 pub struct ProductEngineInput {
     pub source: ResolvedModelSource,
+    pub requested_model: String,
+    pub public_model_id: String,
     pub engine_config: EngineConfig,
     pub model_sources: Option<Arc<ProductionModelSourceBundle>>,
     pub autosized: bool,
@@ -1094,6 +1122,37 @@ pub fn prepare_registered_product_model(
     }
 }
 
+pub fn prepared_product_source_identity(
+    prepared: &ferrum_models::vnext::PreparedProductionModel,
+    requested_model: &str,
+    resolved_model: &str,
+    selected_template: Option<&ModelChatTemplate>,
+) -> Result<ProductModelSourceIdentity> {
+    let identity = prepared.product_source_identity(requested_model, resolved_model)?;
+    let selected_template = selected_template.ok_or_else(|| {
+        FerrumError::model("typed product model has no selected runtime chat template")
+    })?;
+    let selected_sha256 = format!(
+        "{:x}",
+        Sha256::digest(selected_template.template.as_bytes())
+    );
+    if identity.template.content_sha256.as_deref() != Some(selected_sha256.as_str()) {
+        return Err(FerrumError::model(
+            "selected runtime chat template differs from the prepared typed family",
+        ));
+    }
+    let selected_file = Path::new(&selected_template.source)
+        .file_name()
+        .and_then(|value| value.to_str());
+    if selected_file != Some(identity.template.source_file.as_str()) {
+        return Err(FerrumError::model(format!(
+            "selected runtime chat template source differs from typed identity: {}",
+            selected_template.source
+        )));
+    }
+    Ok(identity)
+}
+
 impl Resolved {
     pub fn local_path(&self) -> &Path {
         &self.source.local_path
@@ -1101,10 +1160,12 @@ impl Resolved {
 
     pub fn into_product_engine_input(self) -> ProductEngineInput {
         let mut engine_config = EngineConfig::default();
-        engine_config.model.model_id = ModelId::new(public_model_id(&self.source));
+        engine_config.model.model_id = ModelId::new(self.public_model_id.clone());
         engine_config.model.source = Some(self.original_source);
         ProductEngineInput {
             source: self.source,
+            requested_model: self.requested_model,
+            public_model_id: self.public_model_id,
             engine_config,
             model_sources: self.model_sources,
             autosized: self.autosized,
@@ -1318,6 +1379,101 @@ pub async fn resolve_model_source(
     ))
 }
 
+/// Resolve one physical model and then replace only the explicitly selected
+/// semantic/tokenizer roles. This keeps the positional MODEL as the sole
+/// weight source while allowing quantized checkpoints to consume canonical
+/// base-model semantics without a model-name mapping or hidden environment.
+pub async fn resolve_model_source_with_product_sources(
+    model: &str,
+    cache_dir: &Path,
+    download: DownloadPolicy,
+    autosize: Option<(AutoSizeProfile, f32)>,
+    source_args: &ProductSourceArgs,
+) -> Result<Resolved> {
+    let mut resolved = resolve_model_source(model, cache_dir, download, autosize).await?;
+    resolved.requested_model = model.to_owned();
+    apply_explicit_product_sources(resolved, source_args)
+}
+
+fn apply_explicit_product_sources(
+    mut resolved: Resolved,
+    source_args: &ProductSourceArgs,
+) -> Result<Resolved> {
+    if source_args.semantic_source.is_none() && source_args.tokenizer_source.is_none() {
+        return Ok(resolved);
+    }
+    let existing = resolved.model_sources.as_deref();
+    let weight_root = match resolved.source.format {
+        ModelFormat::GGUF => resolved
+            .source
+            .local_path
+            .parent()
+            .unwrap_or_else(|| Path::new(".")),
+        _ => resolved.source.local_path.as_path(),
+    };
+    let semantic_root = source_args
+        .semantic_source
+        .as_deref()
+        .or_else(|| existing.map(ProductionModelSourceBundle::semantic_root))
+        .unwrap_or(weight_root);
+    let tokenizer_root = source_args
+        .tokenizer_source
+        .as_deref()
+        .or_else(|| source_args.semantic_source.as_ref().map(|_| semantic_root))
+        .or_else(|| existing.map(ProductionModelSourceBundle::tokenizer_root))
+        .unwrap_or(semantic_root);
+    let weights = existing
+        .map(|sources| sources.weights().clone())
+        .unwrap_or_else(|| match resolved.source.format {
+            ModelFormat::GGUF => ProductionWeightArtifact::gguf_file(&resolved.source.local_path),
+            _ => ProductionWeightArtifact::safetensors_directory(&resolved.source.local_path),
+        });
+    let explicit_original = |path: &Path| OriginalModelSource {
+        kind: if path.is_file() {
+            ModelSourceKind::LocalFile
+        } else {
+            ModelSourceKind::LocalDirectory
+        },
+        location: path.display().to_string(),
+        requested_revision: None,
+    };
+    let semantic_original = source_args
+        .semantic_source
+        .as_deref()
+        .map(explicit_original)
+        .or_else(|| existing.map(|sources| sources.original_sources().semantic.clone()))
+        .unwrap_or_else(|| explicit_original(semantic_root));
+    let tokenizer_original = source_args
+        .tokenizer_source
+        .as_deref()
+        .map(explicit_original)
+        .or_else(|| {
+            source_args
+                .semantic_source
+                .as_ref()
+                .map(|_| semantic_original.clone())
+        })
+        .or_else(|| existing.map(|sources| sources.original_sources().tokenizer.clone()))
+        .unwrap_or_else(|| explicit_original(tokenizer_root));
+    let weight_original = existing
+        .map(|sources| sources.original_sources().weights.clone())
+        .unwrap_or_else(|| {
+            original_product_source(&resolved.original_source, &resolved.source.local_path)
+                .unwrap_or_else(|_| explicit_original(weights.path()))
+        });
+    resolved.model_sources = Some(Arc::new(ProductionModelSourceBundle::open(
+        semantic_root,
+        tokenizer_root,
+        weights,
+        OriginalModelSources {
+            semantic: semantic_original,
+            tokenizer: tokenizer_original,
+            weights: weight_original,
+        },
+    )?));
+    Ok(resolved)
+}
+
 fn finalize_resolution(
     source: ResolvedModelSource,
     original_source: ModelSource,
@@ -1333,8 +1489,12 @@ fn finalize_resolution(
     } else {
         false
     };
+    let requested_model = source.original.clone();
+    let public_model_id = public_model_id(&source);
     Resolved {
         source,
+        requested_model,
+        public_model_id,
         original_source,
         model_sources,
         autosized,
@@ -1433,6 +1593,81 @@ mod tests {
             dir.file_name().unwrap().to_string_lossy()
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_semantic_source_replaces_metadata_roles_not_weights() {
+        let weights = temp_model_dir(
+            "explicit-role-weights",
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"quantization_config":{"quant_method":"gptq"}}"#,
+        );
+        std::fs::write(weights.join("model.safetensors"), b"fixture-weights").unwrap();
+        let semantic = temp_model_dir(
+            "explicit-role-semantic",
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"model_type":"qwen3_5_moe"}"#,
+        );
+        std::fs::write(
+            semantic.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture"}"#,
+        )
+        .unwrap();
+        let args = ProductSourceArgs {
+            semantic_source: Some(semantic.clone()),
+            tokenizer_source: None,
+        };
+
+        let resolved = resolve_model_source_with_product_sources(
+            weights.to_str().unwrap(),
+            &weights.join("unused-cache"),
+            DownloadPolicy::NoDownload,
+            None,
+            &args,
+        )
+        .await
+        .unwrap();
+        let product = resolved.into_product_engine_input();
+        let sources = product.model_sources.unwrap();
+        assert_eq!(product.requested_model, weights.display().to_string());
+        assert_eq!(sources.semantic_root(), semantic.canonicalize().unwrap());
+        assert_eq!(sources.tokenizer_root(), semantic.canonicalize().unwrap());
+        assert_eq!(sources.weights().path(), weights.canonicalize().unwrap());
+        assert!(sources
+            .fingerprint(
+                ferrum_interfaces::vnext::ModelArtifactSourceRole::Weights,
+                "config.json",
+            )
+            .is_some());
+        let _ = std::fs::remove_dir_all(weights);
+        let _ = std::fs::remove_dir_all(semantic);
+    }
+
+    #[test]
+    fn direct_huggingface_snapshot_uses_stable_repository_public_id() {
+        let revision = "a".repeat(40);
+        let source = ResolvedModelSource {
+            original: "/cache/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/local".to_owned(),
+            local_path: PathBuf::from(format!(
+                "/cache/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/{revision}"
+            )),
+            format: ModelFormat::SafeTensors,
+            from_cache: false,
+        };
+
+        assert_eq!(public_model_id(&source), "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4");
+
+        let gguf_source = ResolvedModelSource {
+            original: "/cache/models--unsloth--Qwen3.5-35B-A3B-GGUF/snapshots/local/model.gguf"
+                .to_owned(),
+            local_path: PathBuf::from(format!(
+                "/cache/models--unsloth--Qwen3.5-35B-A3B-GGUF/snapshots/{revision}/model.gguf"
+            )),
+            format: ModelFormat::GGUF,
+            from_cache: false,
+        };
+        assert_eq!(
+            public_model_id(&gguf_source),
+            "unsloth/Qwen3.5-35B-A3B-GGUF"
+        );
     }
 
     #[tokio::test]

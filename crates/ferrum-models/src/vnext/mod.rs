@@ -22,7 +22,10 @@ pub mod qwen35;
 pub mod source;
 mod weight_layout;
 
-pub use source::{ProductionModelSourceBundle, ProductionWeightArtifact};
+pub use source::{
+    huggingface_snapshot_identity, HuggingFaceSnapshotIdentity, ProductionModelSourceBundle,
+    ProductionWeightArtifact,
+};
 
 type PrepareModel =
     fn(Arc<ProductionModelSourceBundle>) -> ferrum_types::Result<PreparedProductionModel>;
@@ -374,6 +377,20 @@ impl PreparedProductionModel {
         &self.sources
     }
 
+    pub fn product_source_identity(
+        &self,
+        requested_model: impl Into<String>,
+        resolved_model: impl Into<String>,
+    ) -> ferrum_types::Result<ferrum_interfaces::vnext::ProductModelSourceIdentity> {
+        let template = &self.family.metadata().template;
+        self.sources.product_source_identity(
+            requested_model,
+            resolved_model,
+            &template.source_file,
+            &template.template,
+        )
+    }
+
     pub const fn execution_kind(&self) -> ProductionExecutionKind {
         ProductionExecutionKind::CausalLanguage
     }
@@ -383,16 +400,7 @@ impl PreparedProductionModel {
     /// scaled state (for example KV) remains under the plan/runtime capacity
     /// policy and is deliberately not double-counted here.
     pub fn model_capabilities(&self) -> ferrum_types::Result<ModelCapabilities> {
-        let estimated_weight_bytes = self
-            .sources
-            .resolved_sources()
-            .weights
-            .files
-            .iter()
-            .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes))
-            .ok_or_else(|| {
-                ferrum_types::FerrumError::model("resolved weight byte size overflows u64")
-            })?;
+        let estimated_weight_bytes = self.sources.weight_payload_bytes()?;
         let recurrent_state_bytes_per_sequence = self
             .family
             .program()

@@ -458,6 +458,9 @@ pub struct RunCommand {
     #[arg(default_value = "tinyllama")]
     pub model: String,
 
+    #[command(flatten)]
+    pub product_sources: crate::source_resolver::ProductSourceArgs,
+
     /// System prompt (interactive chat mode only).
     #[arg(long)]
     pub system: Option<String>,
@@ -770,14 +773,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // GGUF path (via gguf_engine_loader, routed by
     // `WeightFormat::detect()` inside `LlmExecutorFactory`).
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
-    let resolved = crate::source_resolver::resolve_model_source(
+    let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
         &cmd.model,
         &cache_dir,
         crate::source_resolver::DownloadPolicy::AutoDownload,
         autosize,
+        &cmd.product_sources,
     )
     .await?;
     let product_input = resolved.into_product_engine_input();
+    let requested_model = product_input.requested_model.clone();
+    let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
     let model_sources = product_input.model_sources;
@@ -786,7 +792,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .map(crate::source_resolver::prepare_registered_product_model)
         .transpose()?
         .flatten();
-    let model_id = crate::source_resolver::public_model_id(&source);
     let model_definition_for_config = if prepared_model.is_none() {
         load_run_model_definition(&source, model_sources.as_deref()).await?
     } else {
@@ -814,6 +819,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         Some(sources) => crate::source_resolver::load_product_chat_template(sources),
         None => crate::source_resolver::load_model_chat_template(&source.local_path),
     };
+    let product_source_identity = prepared_model
+        .as_deref()
+        .map(|prepared| {
+            crate::source_resolver::prepared_product_source_identity(
+                prepared,
+                &requested_model,
+                &model_id,
+                model_chat_template.as_ref(),
+            )
+        })
+        .transpose()?;
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
@@ -880,6 +896,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     crate::commands::serve::write_startup_config_artifacts(
         &startup_auto_config,
+        product_source_identity.as_ref(),
         cmd.effective_config_json.as_deref(),
         cmd.decision_trace_jsonl.as_deref(),
     )?;
@@ -985,7 +1002,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let request_id_text = request_id.to_string();
         let one_shot_history = Vec::new();
         if format == OutputFormat::Jsonl {
-            emit_jsonl_ready(&run_session_id, &cmd.model, &model_id, &device_label);
+            emit_jsonl_ready(&run_session_id, &requested_model, &model_id, &device_label);
             emit_jsonl_user(
                 &run_session_id,
                 0,
@@ -1209,7 +1226,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             eprintln!();
         }
         OutputFormat::Jsonl => {
-            emit_jsonl_ready(&run_session_id, &cmd.model, &model_id, &device_label);
+            emit_jsonl_ready(&run_session_id, &requested_model, &model_id, &device_label);
         }
     }
 
@@ -2325,6 +2342,7 @@ mod tests {
     fn test_run_cmd() -> RunCommand {
         RunCommand {
             model: "tinyllama".to_string(),
+            product_sources: crate::source_resolver::ProductSourceArgs::default(),
             system: None,
             max_tokens: 1024,
             stop: Vec::new(),

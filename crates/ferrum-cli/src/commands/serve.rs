@@ -36,6 +36,9 @@ pub struct ServeCommand {
     )]
     pub model_option: Option<String>,
 
+    #[command(flatten)]
+    pub product_sources: crate::source_resolver::ProductSourceArgs,
+
     /// Public OpenAI-compatible model names. The first name is primary and
     /// additional names are aliases for the same loaded model.
     #[arg(
@@ -293,6 +296,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let ServeCommand {
         model,
         model_option,
+        product_sources,
         served_model_name,
         host,
         port,
@@ -434,14 +438,17 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // aliases/files, local model directories, HF cache hits, and resumable HF
     // download without an entrypoint-specific fallback chain.
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
-    let resolved = crate::source_resolver::resolve_model_source(
+    let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
         &model_name,
         &cache_dir,
         crate::source_resolver::DownloadPolicy::AutoDownload,
         None,
+        &product_sources,
     )
     .await?;
     let product_input = resolved.into_product_engine_input();
+    let requested_model = product_input.requested_model.clone();
+    let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let product_engine_config = product_input.engine_config;
     let model_sources = product_input.model_sources;
@@ -451,11 +458,21 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .transpose()?
         .flatten();
     let vnext_plan_owns_context_capacity = prepared_model.is_some();
-    let model_id = crate::source_resolver::public_model_id(&source);
     let model_chat_template = match model_sources.as_deref() {
         Some(sources) => crate::source_resolver::load_product_chat_template(sources),
         None => crate::source_resolver::load_model_chat_template(&source.local_path),
     };
+    let product_source_identity = prepared_model
+        .as_deref()
+        .map(|prepared| {
+            crate::source_resolver::prepared_product_source_identity(
+                prepared,
+                &requested_model,
+                &model_id,
+                model_chat_template.as_ref(),
+            )
+        })
+        .transpose()?;
     let requested_public_model_name = matches!(
         product_engine_config.model.source.as_ref(),
         Some(ferrum_types::ModelSource::HuggingFace { .. })
@@ -802,6 +819,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     write_startup_config_artifacts(
         &startup_auto_config,
+        product_source_identity.as_ref(),
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
     )?;
@@ -1656,6 +1674,7 @@ fn effective_served_model_names(
 
 pub(crate) fn write_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
+    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -1664,7 +1683,20 @@ pub(crate) fn write_startup_config_artifacts(
             std::fs::create_dir_all(parent)
                 .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
         }
-        let bytes = serde_json::to_vec_pretty(&auto_config.effective_config_document())
+        let mut document = auto_config.effective_config_document();
+        if let Some(evidence) = resolution_evidence {
+            let object = document.as_object_mut().ok_or_else(|| {
+                ferrum_types::FerrumError::serialization(
+                    "effective startup config document must be an object",
+                )
+            })?;
+            object.insert(
+                "resolution_evidence".to_owned(),
+                serde_json::to_value(evidence)
+                    .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?,
+            );
+        }
+        let bytes = serde_json::to_vec_pretty(&document)
             .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?;
         std::fs::write(path, [bytes.as_slice(), b"\n"].concat())
             .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
