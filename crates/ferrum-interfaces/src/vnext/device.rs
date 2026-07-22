@@ -1143,6 +1143,7 @@ pub struct DeviceExecutionInterval {
     kind: DeviceExecutionIntervalKind,
     start_offset_ns: u64,
     end_offset_ns: u64,
+    subwork_id: Option<&'static str>,
 }
 
 impl DeviceExecutionInterval {
@@ -1155,6 +1156,21 @@ impl DeviceExecutionInterval {
             kind,
             start_offset_ns,
             end_offset_ns,
+            subwork_id: None,
+        })
+    }
+
+    pub fn new_labeled(
+        kind: DeviceExecutionIntervalKind,
+        start_offset_ns: u64,
+        end_offset_ns: u64,
+        subwork_id: &'static str,
+    ) -> Option<Self> {
+        (!subwork_id.is_empty() && end_offset_ns > start_offset_ns).then_some(Self {
+            kind,
+            start_offset_ns,
+            end_offset_ns,
+            subwork_id: Some(subwork_id),
         })
     }
 
@@ -1168,6 +1184,10 @@ impl DeviceExecutionInterval {
 
     pub const fn end_offset_ns(self) -> u64 {
         self.end_offset_ns
+    }
+
+    pub const fn subwork_id(self) -> Option<&'static str> {
+        self.subwork_id
     }
 
     pub const fn elapsed_ns(self) -> u64 {
@@ -2032,6 +2052,21 @@ mod execution_timing_tests {
             DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 19, 30).unwrap();
         assert!(DeviceCommandExecutionTiming::new(0, vec![first, adjacent]).is_some());
         assert!(DeviceCommandExecutionTiming::new(0, vec![first, overlapping]).is_none());
+        let labeled = DeviceExecutionInterval::new_labeled(
+            DeviceExecutionIntervalKind::Compute,
+            30,
+            40,
+            "projection.qkv",
+        )
+        .unwrap();
+        assert_eq!(labeled.subwork_id(), Some("projection.qkv"));
+        assert!(DeviceExecutionInterval::new_labeled(
+            DeviceExecutionIntervalKind::Compute,
+            30,
+            40,
+            "",
+        )
+        .is_none());
     }
 
     #[test]

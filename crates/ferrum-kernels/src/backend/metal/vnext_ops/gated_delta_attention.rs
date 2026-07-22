@@ -23,7 +23,7 @@ use metal::{
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
-    MetalDeviceRuntimeError,
+    MetalDeviceRuntimeError, MetalSubmissionEncoder,
 };
 use super::linear::{
     append_shared_matrix_weight, dispatch_linear, linear_launch, validate_launch_regions,
@@ -1161,7 +1161,7 @@ fn encode_attention(
                 &attention,
                 &linear,
                 &primitives,
-                encoder.compute_encoder(),
+                encoder,
                 regions,
                 shared,
                 layout,
@@ -1174,7 +1174,7 @@ fn encode_attention(
                     &attention,
                     &linear,
                     &primitives,
-                    encoder.compute_encoder(),
+                    encoder,
                     regions,
                     shared,
                     layout,
@@ -1211,7 +1211,7 @@ fn enqueue_attention(
     attention: &MetalGatedDeltaPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
-    encoder: &ComputeCommandEncoderRef,
+    encoder: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
     layout: ScratchLayout,
@@ -1220,7 +1220,7 @@ fn enqueue_attention(
     let scratch = &regions[shared.scratch];
     dispatch_rms_norm_at(
         primitives,
-        encoder,
+        compute_subwork(encoder, "gated_delta.input_norm"),
         &regions[launch.input],
         0,
         &regions[shared.input_norm],
@@ -1230,18 +1230,23 @@ fn enqueue_attention(
         launch.params.hidden_size,
         launch.params.epsilon,
     );
-    for projection in [
-        launch.qkv_projection,
-        launch.z_projection,
-        launch.b_projection,
-        launch.a_projection,
+    for (subwork_id, projection) in [
+        ("gated_delta.qkv_projection", launch.qkv_projection),
+        ("gated_delta.z_projection", launch.z_projection),
+        ("gated_delta.beta_projection", launch.b_projection),
+        ("gated_delta.decay_projection", launch.a_projection),
     ] {
-        dispatch_linear(linear, encoder, regions, projection);
+        dispatch_linear(
+            linear,
+            compute_subwork(encoder, subwork_id),
+            regions,
+            projection,
+        );
     }
     dispatch_prepare_conv_and_state(attention, encoder, regions, shared, layout, launch);
     dispatch_prepare_gates(
         attention,
-        encoder,
+        compute_subwork(encoder, "gated_delta.gate_prepare"),
         scratch,
         regions,
         shared,
@@ -1251,19 +1256,39 @@ fn enqueue_attention(
         launch.beta,
         &launch.params,
     );
-    dispatch_qk_norm(attention, encoder, scratch, launch);
+    dispatch_qk_norm(
+        attention,
+        compute_subwork(encoder, "gated_delta.qk_norm"),
+        scratch,
+        launch,
+    );
+    let delta_subwork_id = match launch.execution_form {
+        GatedDeltaExecutionForm::RecurrentScan => "gated_delta.recurrent_scan",
+        GatedDeltaExecutionForm::ChunkedScan(_) => "gated_delta.chunked_scan",
+    };
     dispatch_delta(
         attention,
-        encoder,
+        compute_subwork(encoder, delta_subwork_id),
         scratch,
         &regions[launch.delta_state],
         launch,
     );
-    dispatch_gated_norm(attention, encoder, scratch, &regions[shared.norm], launch);
-    dispatch_linear(linear, encoder, regions, launch.output_projection);
+    dispatch_gated_norm(
+        attention,
+        compute_subwork(encoder, "gated_delta.output_norm"),
+        scratch,
+        &regions[shared.norm],
+        launch,
+    );
+    dispatch_linear(
+        linear,
+        compute_subwork(encoder, "gated_delta.output_projection"),
+        regions,
+        launch.output_projection,
+    );
     dispatch_residual_add_at(
         primitives,
-        encoder,
+        compute_subwork(encoder, "gated_delta.residual_add"),
         &regions[launch.input],
         0,
         scratch,
@@ -1279,7 +1304,7 @@ fn enqueue_packed_attention(
     attention: &MetalGatedDeltaPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
-    encoder: &ComputeCommandEncoderRef,
+    encoder: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
     layout: ScratchLayout,
@@ -1289,7 +1314,7 @@ fn enqueue_packed_attention(
     let scratch = &regions[shared.scratch];
     dispatch_rms_norm_at(
         primitives,
-        encoder,
+        compute_subwork(encoder, "gated_delta.input_norm"),
         &regions[packed.input],
         0,
         &regions[shared.input_norm],
@@ -1299,17 +1324,22 @@ fn enqueue_packed_attention(
         packed.params.hidden_size,
         packed.params.epsilon,
     );
-    for projection in [
-        packed.qkv_projection,
-        packed.z_projection,
-        packed.b_projection,
-        packed.a_projection,
+    for (subwork_id, projection) in [
+        ("gated_delta.qkv_projection", packed.qkv_projection),
+        ("gated_delta.z_projection", packed.z_projection),
+        ("gated_delta.beta_projection", packed.b_projection),
+        ("gated_delta.decay_projection", packed.a_projection),
     ] {
-        dispatch_linear(linear, encoder, regions, projection);
+        dispatch_linear(
+            linear,
+            compute_subwork(encoder, subwork_id),
+            regions,
+            projection,
+        );
     }
     dispatch_prepare_gates(
         attention,
-        encoder,
+        compute_subwork(encoder, "gated_delta.gate_prepare"),
         scratch,
         regions,
         shared,
@@ -1324,16 +1354,20 @@ fn enqueue_packed_attention(
     }
     dispatch_qk_norm_at(
         attention,
-        encoder,
+        compute_subwork(encoder, "gated_delta.qk_norm"),
         scratch,
         layout.query,
         layout.key,
         &packed.params,
     );
     for participant in participants {
+        let delta_subwork_id = match participant.execution_form {
+            GatedDeltaExecutionForm::RecurrentScan => "gated_delta.recurrent_scan",
+            GatedDeltaExecutionForm::ChunkedScan(_) => "gated_delta.chunked_scan",
+        };
         dispatch_delta(
             attention,
-            encoder,
+            compute_subwork(encoder, delta_subwork_id),
             scratch,
             &regions[participant.delta_state],
             participant,
@@ -1341,7 +1375,7 @@ fn enqueue_packed_attention(
     }
     dispatch_gated_norm_at(
         attention,
-        encoder,
+        compute_subwork(encoder, "gated_delta.output_norm"),
         scratch,
         &regions[shared.norm],
         layout.core,
@@ -1349,10 +1383,15 @@ fn enqueue_packed_attention(
         layout.qkv,
         &packed.params,
     );
-    dispatch_linear(linear, encoder, regions, packed.output_projection);
+    dispatch_linear(
+        linear,
+        compute_subwork(encoder, "gated_delta.output_projection"),
+        regions,
+        packed.output_projection,
+    );
     dispatch_residual_add_at(
         primitives,
-        encoder,
+        compute_subwork(encoder, "gated_delta.residual_add"),
         &regions[packed.input],
         0,
         scratch,
@@ -1365,13 +1404,14 @@ fn enqueue_packed_attention(
 
 fn dispatch_prepare_conv_and_state(
     pipelines: &MetalGatedDeltaPipelines,
-    encoder: &ComputeCommandEncoderRef,
+    submission: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
     layout: ScratchLayout,
     launch: &ParticipantLaunch,
 ) {
     let scratch = &regions[shared.scratch];
+    let encoder = compute_subwork(submission, "gated_delta.conv_prepare");
     encoder.set_compute_pipeline_state(&pipelines.prepare_conv);
     set_region_offset(encoder, 0, scratch, launch.qkv);
     set_region_offset(encoder, 1, &regions[shared.conv], 0);
@@ -1385,6 +1425,7 @@ fn dispatch_prepare_conv_and_state(
         u64::from(launch.params.tokens) * u64::from(launch.params.qkv_features),
     );
 
+    let encoder = compute_subwork(submission, "gated_delta.conv_state_collect");
     encoder.set_compute_pipeline_state(&pipelines.collect_conv_state);
     set_region_offset(encoder, 0, scratch, launch.qkv);
     set_region_offset(encoder, 1, &regions[launch.conv_state], 0);
@@ -1393,6 +1434,7 @@ fn dispatch_prepare_conv_and_state(
     let state_elements = u64::from(launch.conv_state_elements);
     dispatch_elements(encoder, state_elements);
 
+    let encoder = compute_subwork(submission, "gated_delta.conv_state_commit");
     encoder.set_compute_pipeline_state(&pipelines.copy_f16);
     set_region_offset(encoder, 0, scratch, layout.conv_state);
     set_region_offset(encoder, 1, &regions[launch.conv_state], 0);
@@ -1402,6 +1444,14 @@ fn dispatch_prepare_conv_and_state(
         &launch.conv_state_elements as *const _ as *const c_void,
     );
     dispatch_elements(encoder, state_elements);
+}
+
+fn compute_subwork<'a>(
+    encoder: &'a mut MetalSubmissionEncoder,
+    subwork_id: &'static str,
+) -> &'a ComputeCommandEncoderRef {
+    encoder.begin_compute_subwork(subwork_id);
+    encoder.compute_encoder()
 }
 
 #[allow(clippy::too_many_arguments)]
