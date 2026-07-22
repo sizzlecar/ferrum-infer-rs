@@ -4343,6 +4343,24 @@ def parse_sse_evidence(body: str) -> dict[str, Any]:
     }
 
 
+def complete_jsonl_offset(path: Path) -> int:
+    """Return the byte immediately after the last complete JSONL record."""
+    if not path.is_file():
+        return 0
+    with path.open("rb") as handle:
+        end = handle.seek(0, os.SEEK_END)
+        cursor = end
+        while cursor > 0:
+            start = max(0, cursor - 64 * 1024)
+            handle.seek(start)
+            chunk = handle.read(cursor - start)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                return start + newline + 1
+            cursor = start
+    return 0
+
+
 def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
     if not path.is_file():
         return [], offset
@@ -6113,7 +6131,7 @@ def serve_case_request(
     requested = int(case["concurrency_cell"]["requested_concurrency"]) if case["concurrency_cell"] else 1
     started_at = iso_now()
     started_ns = time.monotonic_ns()
-    trace_offset = scheduler_trace_path.stat().st_size if scheduler_trace_path.is_file() else 0
+    trace_offset = complete_jsonl_offset(scheduler_trace_path)
     runtime_log_start_offset = server.stderr_path.stat().st_size if server.stderr_path.is_file() else 0
     trace_rows: list[dict[str, Any]] = []
     c09_outcome: dict[str, Any] | None = None
@@ -9650,10 +9668,18 @@ def self_test() -> int:
         first = json.dumps({"row": 1}).encode("utf-8") + b"\n"
         second = json.dumps({"row": 2}).encode("utf-8") + b"\n"
         trace_path.write_bytes(first + second[:5])
+        require(
+            complete_jsonl_offset(trace_path) == len(first),
+            "JSONL live cursor did not stop at the last complete record",
+        )
         rows, offset = read_jsonl_since(trace_path, 0)
         require(rows == [{"row": 1}] and offset == len(first), "JSONL reader consumed a partial row")
         with trace_path.open("ab") as handle:
             handle.write(second[5:])
+        require(
+            complete_jsonl_offset(trace_path) == len(first) + len(second),
+            "JSONL live cursor did not advance across a completed tail record",
+        )
         rows, offset = read_jsonl_since(trace_path, offset)
         require(rows == [{"row": 2}] and offset == len(first) + len(second), "JSONL reader lost a completed tail row")
         trace_path.write_bytes(b"{invalid}\n")
