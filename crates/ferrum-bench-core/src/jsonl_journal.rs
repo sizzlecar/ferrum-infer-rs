@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonlJournalOpenMode {
@@ -19,7 +19,7 @@ pub enum JsonlJournalOpenMode {
 pub struct JsonlJournalConfig {
     pub queue_capacity: usize,
     pub buffer_capacity_bytes: usize,
-    pub idle_flush_interval: Duration,
+    pub flush_interval: Duration,
 }
 
 impl Default for JsonlJournalConfig {
@@ -27,7 +27,7 @@ impl Default for JsonlJournalConfig {
         Self {
             queue_capacity: 256,
             buffer_capacity_bytes: 1024 * 1024,
-            idle_flush_interval: Duration::from_millis(50),
+            flush_interval: Duration::from_millis(50),
         }
     }
 }
@@ -216,10 +216,10 @@ where
                 "JSONL journal buffer capacity must be greater than zero",
             ));
         }
-        if config.idle_flush_interval.is_zero() {
+        if config.flush_interval.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "JSONL journal idle flush interval must be greater than zero",
+                "JSONL journal flush interval must be greater than zero",
             ));
         }
 
@@ -253,7 +253,7 @@ where
                     worker_failure,
                     &worker_path,
                     config.buffer_capacity_bytes,
-                    config.idle_flush_interval,
+                    config.flush_interval,
                 )
             })?;
 
@@ -324,19 +324,31 @@ fn run_writer<T>(
     failure: Arc<JournalFailure>,
     path: &Path,
     buffer_capacity_bytes: usize,
-    idle_flush_interval: Duration,
+    flush_interval: Duration,
 ) where
     T: Serialize + Send + 'static,
 {
     let mut writer = BufWriter::with_capacity(buffer_capacity_bytes, file);
     let mut encoded = Vec::with_capacity(4096);
     let mut writable = true;
-    let mut pending_flush = false;
+    let mut flush_deadline: Option<Instant> = None;
 
     loop {
-        match receiver.recv_timeout(idle_flush_interval) {
+        let command = match flush_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    flush_if_healthy(&mut writer, &failure, path, &mut writable);
+                    flush_deadline = None;
+                    continue;
+                }
+                receiver.recv_timeout(remaining)
+            }
+            None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match command {
             Ok(JournalCommand::Event(event)) => {
-                pending_flush = true;
+                flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
                 write_events_if_healthy(
                     &mut writer,
                     &mut encoded,
@@ -347,7 +359,7 @@ fn run_writer<T>(
                 );
             }
             Ok(JournalCommand::Batch(events)) => {
-                pending_flush = true;
+                flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
                 write_events_if_healthy(
                     &mut writer,
                     &mut encoded,
@@ -359,7 +371,7 @@ fn run_writer<T>(
             }
             Ok(JournalCommand::Flush(reply)) => {
                 flush_if_healthy(&mut writer, &failure, path, &mut writable);
-                pending_flush = false;
+                flush_deadline = None;
                 let _ = reply.send(failure.current().map_or(Ok(()), Err));
             }
             Ok(JournalCommand::Close(reply)) => {
@@ -367,11 +379,10 @@ fn run_writer<T>(
                 let _ = reply.send(failure.current().map_or(Ok(()), Err));
                 return;
             }
-            Err(RecvTimeoutError::Timeout) if pending_flush => {
+            Err(RecvTimeoutError::Timeout) => {
                 flush_if_healthy(&mut writer, &failure, path, &mut writable);
-                pending_flush = false;
+                flush_deadline = None;
             }
-            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -691,7 +702,7 @@ mod tests {
             JsonlJournalConfig {
                 queue_capacity: 1,
                 buffer_capacity_bytes: 4096,
-                idle_flush_interval: Duration::from_millis(10),
+                flush_interval: Duration::from_millis(10),
             },
         )
         .unwrap();
@@ -738,13 +749,13 @@ mod tests {
     }
 
     #[test]
-    fn idle_interval_makes_events_visible_without_explicit_flush() {
-        let path = temp_path("idle-flush");
+    fn flush_interval_makes_events_visible_without_explicit_flush() {
+        let path = temp_path("periodic-flush");
         let journal = JsonlJournal::open(
             path.clone(),
             JsonlJournalOpenMode::Truncate,
             JsonlJournalConfig {
-                idle_flush_interval: Duration::from_millis(10),
+                flush_interval: Duration::from_millis(10),
                 ..JsonlJournalConfig::default()
             },
         )
@@ -757,7 +768,7 @@ mod tests {
         while std::fs::read_to_string(&path).unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "idle journal event did not become visible"
+                "journal event did not become visible within the flush interval"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -767,6 +778,53 @@ mod tests {
             vec![serde_json::json!({"visible": true})]
         );
         drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct SlowEvent {
+        ordinal: u64,
+    }
+
+    impl Serialize for SlowEvent {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            std::thread::sleep(Duration::from_millis(2));
+            let mut state = serializer.serialize_struct("SlowEvent", 1)?;
+            state.serialize_field("ordinal", &self.ordinal)?;
+            state.end()
+        }
+    }
+
+    #[test]
+    fn continuous_event_stream_cannot_starve_periodic_flush() {
+        let path = temp_path("continuous-periodic-flush");
+        let journal = JsonlJournal::open(
+            path.clone(),
+            JsonlJournalOpenMode::Truncate,
+            JsonlJournalConfig {
+                queue_capacity: 128,
+                buffer_capacity_bytes: 1024 * 1024,
+                flush_interval: Duration::from_millis(25),
+            },
+        )
+        .unwrap();
+        for ordinal in 0..100 {
+            journal.enqueue(SlowEvent { ordinal }).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while std::fs::read_to_string(&path).unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "continuous event stream starved the periodic flush"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        journal.close().unwrap();
+        assert_eq!(read_values(&path).len(), 100);
         let _ = std::fs::remove_file(path);
     }
 }
