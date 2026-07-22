@@ -44,7 +44,7 @@ const DENSE_SWIGLU_ESTIMATOR_ID: &str = "resource-estimator.metal.dense_swiglu.f
 const LAST_TOKEN_PROVIDER_ID: &str = "provider.metal.last_token_dense_linear.f16.native";
 const LAST_TOKEN_ESTIMATOR_ID: &str = "resource-estimator.metal.last_token_dense_linear.f16.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
-const K_QUANT_TILED_GEMM_MIN_ROWS: u32 = 8;
+const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
 const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
 const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
@@ -111,7 +111,7 @@ impl MetalLinearPipelines {
         format: LinearPhysicalFormat,
         rows: u32,
     ) -> (&ComputePipelineState, LinearDispatchKind) {
-        let tiled = rows >= K_QUANT_TILED_GEMM_MIN_ROWS;
+        let tiled = rows >= QUANTIZED_TILED_GEMM_MIN_ROWS;
         match (format, tiled) {
             (LinearPhysicalFormat::Q4K, true) => {
                 (&self.k_quant_gemm.q4_k, LinearDispatchKind::TiledGemm)
@@ -121,6 +121,9 @@ impl MetalLinearPipelines {
             }
             (LinearPhysicalFormat::Q6K, true) => {
                 (&self.k_quant_gemm.q6_k, LinearDispatchKind::TiledGemm)
+            }
+            (LinearPhysicalFormat::Q8_0, true) => {
+                (&self.k_quant_gemm.q8_0, LinearDispatchKind::TiledGemm)
             }
             (LinearPhysicalFormat::Q4K, false) => {
                 (&self.q4_k_gemv, LinearDispatchKind::CooperativeGemv)
@@ -134,7 +137,9 @@ impl MetalLinearPipelines {
             (LinearPhysicalFormat::DenseF16, _) => {
                 (&self.dense, LinearDispatchKind::CooperativeGemv)
             }
-            (LinearPhysicalFormat::Q8_0, _) => (&self.q8_0, LinearDispatchKind::CooperativeGemv),
+            (LinearPhysicalFormat::Q8_0, false) => {
+                (&self.q8_0, LinearDispatchKind::CooperativeGemv)
+            }
         }
     }
 }
@@ -1894,6 +1899,7 @@ mod tests {
             (GgmlDType::Q4K, LinearPhysicalFormat::Q4K),
             (GgmlDType::Q5K, LinearPhysicalFormat::Q5K),
             (GgmlDType::Q6K, LinearPhysicalFormat::Q6K),
+            (GgmlDType::Q8_0, LinearPhysicalFormat::Q8_0),
         ] {
             let quantized = QTensor::quantize(&dense, dtype).unwrap();
             let reference = input_tensor
@@ -1959,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_k_quant_tiled_gemm_matches_prefill_shape_and_preserves_output_guards() {
+    fn shared_quantized_tiled_gemm_matches_prefill_shape_and_preserves_output_guards() {
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping shared K-quant GEMM ABI test");
             return;
@@ -2001,6 +2007,7 @@ mod tests {
             (GgmlDType::Q4K, LinearPhysicalFormat::Q4K),
             (GgmlDType::Q5K, LinearPhysicalFormat::Q5K),
             (GgmlDType::Q6K, LinearPhysicalFormat::Q6K),
+            (GgmlDType::Q8_0, LinearPhysicalFormat::Q8_0),
         ] {
             let (_, dispatch_kind) = pipelines.linear_pipeline(format, rows as u32);
             assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
@@ -2074,7 +2081,7 @@ mod tests {
         };
         let pipelines = MetalLinearPipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
-        let rows = K_QUANT_TILED_GEMM_MIN_ROWS as usize;
+        let rows = QUANTIZED_TILED_GEMM_MIN_ROWS as usize;
         let input_width = 256_usize;
         let output_width = i16::MAX as usize + 66;
         let input = (0..rows * input_width)
