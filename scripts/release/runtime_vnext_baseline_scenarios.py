@@ -1536,10 +1536,12 @@ def validate_case_output(
             require(len(users) == 2 and [row.get("turn") for row in users] == [0, 1], f"{label} thinking run history turns are incomplete")
             require([row.get("turn") for row in assistants] == [0, 1], f"{label} thinking assistant turn sequence is incomplete")
             reasoning_expected = bool(observed.get("reasoning_expected"))
+            expected_marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
             for index, assistant in enumerate(assistants):
                 reasoning = assistant.get("reasoning")
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} assistant[{index}] reasoning mode mismatch")
                 require("<think>" not in str(assistant.get("content")) and "</think>" not in str(assistant.get("content")), f"{label} reasoning leaked into final content")
+                require(assistant.get("content") == c19_expected_final(expected_marker, index + 1), f"{label} assistant[{index}] final answer mismatch")
             for record_label, record, expected_messages, expected_turns in (
                 ("first user", users[0], 0, 0),
                 ("first assistant", assistants[0], 0, 0),
@@ -1817,7 +1819,9 @@ def validate_case_output(
                 reasoning = response_message_value.get("reasoning")
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} {response_label} reasoning mode mismatch")
                 require("<think>" not in response_content and "</think>" not in response_content, f"{label} reasoning tags leaked into final content")
-            require(first_content != content, f"{label} second turn did not produce a distinct history-aware response")
+            expected_marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
+            require(first_content == c19_expected_final(expected_marker, 1), f"{label} first final answer mismatch")
+            require(content == c19_expected_final(expected_marker, 2), f"{label} second final answer mismatch")
             first_request = require_object(exchanges[0].get("request"), f"{label}.first.request")
             kwargs = first_request.get("chat_template_kwargs")
             if variant == "hard-thinking":
@@ -1827,10 +1831,11 @@ def validate_case_output(
             else:
                 require(kwargs is None, f"{label} soft/default mode incorrectly sent a hard toggle")
             prompt = str(require_object(require_list(first_request.get("messages"), f"{label}.first.messages")[0], f"{label}.first.user").get("content"))
+            second_prompt = str(require_object(second_messages[-1], f"{label}.second.user").get("content"))
             if variant in {"soft-think", "soft-think-misuse"}:
-                require(prompt.endswith("/think"), f"{label} soft think probe missing")
+                require(prompt.endswith("/think") and second_prompt.endswith("/think"), f"{label} soft think probe missing")
             if variant in {"soft-no-think", "soft-no-think-misuse"}:
-                require(prompt.endswith("/no_think"), f"{label} soft no-think probe missing")
+                require(prompt.endswith("/no_think") and second_prompt.endswith("/no_think"), f"{label} soft no-think probe missing")
         elif scenario_id == "C20":
             require(observed.get("declared_modalities") == ["text"], f"{label} model declared non-text modality")
         elif scenario_id == "C21":
@@ -3802,6 +3807,28 @@ def thinking_reasoning_expected(model_key: str, variant: str) -> bool:
     return True
 
 
+def c19_expected_final(marker: str, turn: int) -> str:
+    require(turn in {1, 2}, f"C19 turn must be 1 or 2, got {turn}")
+    return f"{marker}-H{turn}"
+
+
+def c19_turn_prompt(marker: str, turn: int, variant: str) -> str:
+    final = c19_expected_final(marker, turn)
+    if turn == 1:
+        task = "Solve (37 * 19) + 11 and verify whether it equals 714."
+    else:
+        task = "Using the arithmetic result from our prior exchange, subtract 29 and verify whether the result is 685."
+    prompt = (
+        f'{task} Do the calculation before answering, but keep it out of the final answer. '
+        f'Your final answer must be exactly "{final}" and contain nothing else.'
+    )
+    if variant in {"soft-think", "soft-think-misuse"}:
+        return f"{prompt} /think"
+    if variant in {"soft-no-think", "soft-no-think-misuse"}:
+        return f"{prompt} /no_think"
+    return prompt
+
+
 def validate_strict_schema_instance(instance: Any, schema: dict[str, Any], label: str) -> None:
     expected_type = schema.get("type")
     if expected_type == "object":
@@ -3951,16 +3978,13 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
         else:
             payload["max_tokens"] = 10**9
     elif scenario_id == "C19":
+        payload["messages"] = [{"role": "user", "content": c19_turn_prompt(marker, 1, variant)}]
         if variant == "hard-thinking":
             payload["chat_template_kwargs"] = {"enable_thinking": True}
         elif variant == "hard-no-thinking":
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
             payload.pop("chat_template_kwargs", None)
-            if variant in {"soft-think", "soft-think-misuse"}:
-                payload["messages"][0]["content"] += " /think"
-            elif variant in {"soft-no-think", "soft-no-think-misuse"}:
-                payload["messages"][0]["content"] += " /no_think"
     elif scenario_id == "C20":
         if variant == "text-array":
             payload["messages"] = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -4777,14 +4801,9 @@ def run_case_prompts(case: dict[str, Any]) -> list[str]:
     if case["scenario_id"] == "C03":
         return c03_user_turns(marker)
     if case["scenario_id"] == "C19":
-        soft_suffix = ""
-        if case["variant"] in {"soft-think", "soft-think-misuse"}:
-            soft_suffix = " /think"
-        elif case["variant"] in {"soft-no-think", "soft-no-think-misuse"}:
-            soft_suffix = " /no_think"
         return [
-            f"Return the exact marker {marker}-H1.{soft_suffix}",
-            f"Using our prior exchange, return the exact marker {marker}-H2.",
+            c19_turn_prompt(marker, 1, case["variant"]),
+            c19_turn_prompt(marker, 2, case["variant"]),
         ]
     return [
         "Write at least 512 numbered one-word items, then end naturally."
@@ -5669,7 +5688,7 @@ def serve_case_request(
         if first_message is not None:
             second_payload["messages"].append(copy.deepcopy(first_message))
         second_payload["messages"].append(
-            {"role": "user", "content": f"Using that reasoning history, return {case_marker(case_id)}-H2 exactly."}
+            {"role": "user", "content": c19_turn_prompt(case_marker(case_id), 2, case["variant"])}
         )
         second_payload["metadata"] = {**second_payload["metadata"], "g00_history_turn": 2}
         second = http_exchange(base_url, second_payload, timeout_sec)
@@ -7055,7 +7074,7 @@ def make_case_fixture(
             "scenario_id": scenario_id,
             "variant": variant,
             "preset": preset,
-            "prompt": f"Return the exact marker {marker}.",
+            "prompt": run_case_prompts(case_spec)[0] if scenario_id == "C19" else f"Return the exact marker {marker}.",
         }
         if scenario_id == "C01":
             fixture_config = {
@@ -7236,7 +7255,7 @@ def make_case_fixture(
                 user_content = c03_user_turns(marker)[turn]
             else:
                 content = f"{marker}-H{turn + 1}" if scenario_id == "C19" else marker
-                user_content = input_value["prompt"]
+                user_content = run_case_prompts(case_spec)[turn] if scenario_id == "C19" else input_value["prompt"]
             history_before = {
                 "message_count": len(history),
                 "turn_count": sum(role == "user" for role, _ in history),
@@ -7466,7 +7485,7 @@ def make_case_fixture(
             second_request["messages"] = [
                 copy.deepcopy(input_value["messages"][0]),
                 copy.deepcopy(first_message),
-                {"role": "user", "content": f"Using that reasoning history, return {marker}-H2 exactly."},
+                {"role": "user", "content": c19_turn_prompt(marker, 2, variant)},
             ]
             second_message = copy.deepcopy(first_message)
             second_message["content"] = f"{marker}-H2"
