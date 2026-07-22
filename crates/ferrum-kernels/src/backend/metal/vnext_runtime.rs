@@ -677,6 +677,7 @@ struct MetalCounterReservation {
 struct MetalCounterIntervalMapping {
     command_index: u32,
     kind: DeviceExecutionIntervalKind,
+    subwork_id: Option<&'static str>,
     page_index: usize,
     start_sample_index: u64,
     end_sample_index: u64,
@@ -734,6 +735,7 @@ impl MetalCounterCaptureBuilder {
         &mut self,
         command_index: u32,
         kind: DeviceExecutionIntervalKind,
+        subwork_id: Option<&'static str>,
     ) -> Option<MetalCounterReservation> {
         if self.unavailable {
             return None;
@@ -755,6 +757,7 @@ impl MetalCounterCaptureBuilder {
         self.mappings.push(MetalCounterIntervalMapping {
             command_index,
             kind,
+            subwork_id,
             page_index,
             start_sample_index,
             end_sample_index,
@@ -896,10 +899,14 @@ impl MetalCounterCapture {
                     DeviceTimingUnavailableReason::BackendMeasurementFailed,
                 );
             };
-            let Some(interval) = convert(start)
-                .zip(convert(end))
-                .and_then(|(start, end)| DeviceExecutionInterval::new(mapping.kind, start, end))
-            else {
+            let Some(interval) = convert(start).zip(convert(end)).and_then(|(start, end)| {
+                mapping.subwork_id.map_or_else(
+                    || DeviceExecutionInterval::new(mapping.kind, start, end),
+                    |subwork_id| {
+                        DeviceExecutionInterval::new_labeled(mapping.kind, start, end, subwork_id)
+                    },
+                )
+            }) else {
                 return DeviceTimingMeasurement::Unavailable(
                     DeviceTimingUnavailableReason::DurationOverflow,
                 );
@@ -966,6 +973,7 @@ pub(crate) struct MetalSubmissionEncoder {
     profile_enabled: bool,
     current_command_index: Option<u32>,
     command_label: Option<&'static str>,
+    compute_subwork_id: Option<&'static str>,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
     counter_capture: Option<MetalCounterCaptureBuilder>,
@@ -983,6 +991,7 @@ impl MetalSubmissionEncoder {
             profile_enabled,
             current_command_index: None,
             command_label: None,
+            compute_subwork_id: None,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
             counter_capture,
@@ -1003,6 +1012,7 @@ impl MetalSubmissionEncoder {
             self.end_compute();
             self.current_command_index = Some(command_index);
             self.command_label = Some(command_label);
+            self.compute_subwork_id = None;
         }
         self.compute_dispatch_count = 0;
         self.transfer_command_count = 0;
@@ -1012,11 +1022,23 @@ impl MetalSubmissionEncoder {
         (self.compute_dispatch_count, self.transfer_command_count)
     }
 
+    pub(crate) fn begin_compute_subwork(&mut self, subwork_id: &'static str) {
+        if self.profile_enabled && !subwork_id.is_empty() {
+            self.end_compute();
+            self.command_label = Some(subwork_id);
+            self.compute_subwork_id = Some(subwork_id);
+        }
+    }
+
     pub(crate) fn compute_encoder(&mut self) -> &ComputeCommandEncoderRef {
         if self.compute.is_none() {
             let reservation = self.counter_capture.as_mut().and_then(|capture| {
                 self.current_command_index.and_then(|command_index| {
-                    capture.reserve(command_index, DeviceExecutionIntervalKind::Compute)
+                    capture.reserve(
+                        command_index,
+                        DeviceExecutionIntervalKind::Compute,
+                        self.compute_subwork_id,
+                    )
                 })
             });
             let encoder = if let Some(reservation) = reservation {
@@ -1072,7 +1094,11 @@ impl MetalSubmissionEncoder {
         self.end_compute();
         let reservation = self.counter_capture.as_mut().and_then(|capture| {
             self.current_command_index.and_then(|command_index| {
-                capture.reserve(command_index, DeviceExecutionIntervalKind::Transfer)
+                capture.reserve(
+                    command_index,
+                    DeviceExecutionIntervalKind::Transfer,
+                    self.compute_subwork_id,
+                )
             })
         });
         let encoder = if let Some(reservation) = reservation {

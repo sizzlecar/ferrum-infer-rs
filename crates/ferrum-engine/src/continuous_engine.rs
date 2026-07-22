@@ -4006,6 +4006,7 @@ impl VNextProfileEventContext {
                             "kind": interval.kind().as_str(),
                             "start_offset_ns": interval.start_offset_ns(),
                             "end_offset_ns": interval.end_offset_ns(),
+                            "subwork_id": interval.subwork_id(),
                         })
                     })
                     .collect::<Vec<_>>()
