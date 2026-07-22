@@ -465,8 +465,9 @@ pub struct RunCommand {
     #[arg(long)]
     pub system: Option<String>,
 
-    /// Maximum tokens to generate
-    #[arg(long, default_value = "1024")]
+    /// Maximum output-token ceiling. Context planning shrinks it to the
+    /// remaining KV capacity before dropping any complete history turn.
+    #[arg(long, default_value = "4096")]
     pub max_tokens: u32,
 
     /// Stop generation when this text appears. Can be provided multiple times.
@@ -2340,7 +2341,7 @@ mod tests {
             model: "tinyllama".to_string(),
             product_sources: crate::source_resolver::ProductSourceArgs::default(),
             system: None,
-            max_tokens: 1024,
+            max_tokens: 4096,
             stop: Vec::new(),
             no_context_shift: false,
             enable_thinking: false,
@@ -2907,7 +2908,7 @@ mod tests {
     fn default_run_temperature_is_greedy() {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
-        assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+        assert_eq!(build_sampling_params(&cmd).max_tokens, 4096);
     }
 
     #[test]
@@ -3034,7 +3035,7 @@ mod tests {
 
         let prompt_tokens = plan.prompt_tokens.unwrap();
         assert!(prompt_tokens < 64);
-        assert_eq!(plan.max_tokens_clamped_from, Some(1024));
+        assert_eq!(plan.max_tokens_clamped_from, Some(4096));
         assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
     }
 

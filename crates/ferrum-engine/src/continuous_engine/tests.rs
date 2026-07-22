@@ -5871,6 +5871,45 @@ fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
 }
 
 #[test]
+fn automatic_output_budget_clamps_to_remaining_executor_capacity() {
+    let config = EngineConfig::default();
+    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+    let mut request = InferenceRequest::new("test", "test")
+        .with_sampling_params(SamplingParams {
+            max_tokens: 4096,
+            ..SamplingParams::default()
+        })
+        .with_metadata(
+            DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
+            serde_json::json!(true),
+        );
+
+    clamp_default_max_tokens_to_context(&mut request, 100, &config, &runtime, Some(4096));
+
+    assert_eq!(request.sampling_params.max_tokens, 3996);
+    validate_request_context_budget(&request, 100, &config, &runtime, Some(4096)).unwrap();
+}
+
+#[test]
+fn explicit_output_budget_is_not_silently_clamped() {
+    let config = EngineConfig::default();
+    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+    let mut request = InferenceRequest::new("test", "test").with_sampling_params(SamplingParams {
+        max_tokens: 4096,
+        ..SamplingParams::default()
+    });
+
+    clamp_default_max_tokens_to_context(&mut request, 100, &config, &runtime, Some(4096));
+
+    assert_eq!(request.sampling_params.max_tokens, 4096);
+    let error = validate_request_context_budget(&request, 100, &config, &runtime, Some(4096))
+        .expect_err("explicit output budget must remain a hard request contract");
+    assert!(error
+        .to_string()
+        .contains("100 input tokens + 4096 output tokens"));
+}
+
+#[test]
 fn test_sequence_state() {
     let request = InferenceRequest {
         id: RequestId::new(),

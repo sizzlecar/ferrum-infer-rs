@@ -473,6 +473,7 @@ PRESET_FIELDS = {
     "repetition_penalty",
     "seed",
     "max_tokens",
+    "output_budget_mode",
     "stop",
     "eos_token_ids",
     "enable_thinking",
@@ -2349,6 +2350,20 @@ def validate_models_lock(
                 require(isinstance(top_k, int) and not isinstance(top_k, bool) and top_k >= 0, f"models[{key}].generation_presets.{preset_name}.top_k must be a non-negative integer")
                 max_tokens = preset.get("max_tokens")
                 require(isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0, f"models[{key}].generation_presets.{preset_name}.max_tokens must be positive")
+                output_budget_mode = preset.get("output_budget_mode")
+                require(
+                    output_budget_mode in {"explicit", "auto-ceiling"},
+                    f"models[{key}].generation_presets.{preset_name}.output_budget_mode invalid",
+                )
+                expected_budget_mode = (
+                    "auto-ceiling"
+                    if preset_name in {"P_THINKING", "P_OFFICIAL_DEFAULT"}
+                    else "explicit"
+                )
+                require(
+                    output_budget_mode == expected_budget_mode,
+                    f"models[{key}].generation_presets.{preset_name}.output_budget_mode must be {expected_budget_mode}",
+                )
                 require(isinstance(preset.get("stop"), list), f"models[{key}].generation_presets.{preset_name}.stop must be a list")
                 eos_ids = preset.get("eos_token_ids")
                 require(isinstance(eos_ids, list) and eos_ids and all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in eos_ids), f"models[{key}].generation_presets.{preset_name}.eos_token_ids invalid")
