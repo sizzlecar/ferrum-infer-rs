@@ -1141,6 +1141,7 @@ fn validate_registered_vnext_backend(
                 "registered vNext CUDA composition requires the 'cuda' feature",
             ))
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         (ProductionExecutionKind::CausalLanguage, Device::Metal) => {
             #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
             return Ok(());
