@@ -29,9 +29,9 @@ use ferrum_interfaces::{
     vnext::{
         AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
         CapacityAvailabilityEpoch, DeferredAction, DeviceCapacityPressureScope,
-        EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy,
-        ExecutionEventDetail, ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink,
-        ExecutionEventSinkError,
+        DeviceTimingMeasurement, EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent,
+        ExecutionEventCapturePolicy, ExecutionEventDetail,
+        ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
@@ -3985,11 +3985,31 @@ impl VNextProfileEventContext {
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> std::result::Result<Vec<FerrumProfileEvent>, ExecutionEventSinkError> {
         let batch = attribution.batch_identity();
+        let measured_timings = match attribution.terminal_timing() {
+            DeviceTimingMeasurement::Measured(timing) => Some(timing.commands()),
+            DeviceTimingMeasurement::NotRequested | DeviceTimingMeasurement::Unavailable(_) => None,
+        };
         let mut events = Vec::with_capacity(attribution.device().commands().len());
-        for (command_index, command) in attribution.device().commands().iter().enumerate() {
+        for (attribution_index, command) in attribution.device().commands().iter().enumerate() {
             let Some(node_index) = command.node_index() else {
                 continue;
             };
+            let command_timing =
+                measured_timings.and_then(|timings| timings.get(attribution_index));
+            let device_elapsed_ns = command_timing.map(|timing| timing.elapsed_ns());
+            let device_intervals = command_timing.map(|timing| {
+                timing
+                    .intervals()
+                    .iter()
+                    .map(|interval| {
+                        serde_json::json!({
+                            "kind": interval.kind().as_str(),
+                            "start_offset_ns": interval.start_offset_ns(),
+                            "end_offset_ns": interval.end_offset_ns(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
             let node_index_usize = usize::try_from(node_index).map_err(|_| {
                 ExecutionEventSinkError::new(
                     "device attribution node index exceeds the host index range",
@@ -4027,8 +4047,16 @@ impl VNextProfileEventContext {
                     "physical_transfer_command_count".to_string(),
                     serde_json::json!(command.transfer_command_count()),
                 ),
+                (
+                    "device_interval_count".to_string(),
+                    serde_json::json!(command_timing.map_or(0, |timing| timing.intervals().len())),
+                ),
+                (
+                    "device_elapsed_ns".to_string(),
+                    serde_json::json!(device_elapsed_ns),
+                ),
             ]);
-            let attributes = BTreeMap::from([
+            let mut attributes = BTreeMap::from([
                 (
                     "actual_model_smoke".to_string(),
                     serde_json::json!(matches!(
@@ -4102,6 +4130,28 @@ impl VNextProfileEventContext {
                     serde_json::json!(batch.runtime_implementation_fingerprint()),
                 ),
             ]);
+            attributes.insert(
+                "device_timing_status".to_string(),
+                serde_json::json!(match attribution.terminal_timing() {
+                    DeviceTimingMeasurement::Measured(_) => "measured",
+                    DeviceTimingMeasurement::NotRequested => "not_requested",
+                    DeviceTimingMeasurement::Unavailable(_) => "unavailable",
+                }),
+            );
+            attributes.insert(
+                "device_timing_semantics".to_string(),
+                serde_json::json!("submission_relative_duration_only"),
+            );
+            attributes.insert(
+                "formal_device_busy_time_eligible".to_string(),
+                serde_json::json!(false),
+            );
+            if let DeviceTimingMeasurement::Unavailable(reason) = attribution.terminal_timing() {
+                attributes.insert(
+                    "device_timing_unavailable_reason".to_string(),
+                    serde_json::json!(format!("{reason:?}").to_ascii_lowercase()),
+                );
+            }
             let event = FerrumProfileEvent {
                 schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
                 ts_unix_nanos: timestamp
@@ -4111,7 +4161,7 @@ impl VNextProfileEventContext {
                     "evt-vnext-native-{}-{}-{}",
                     attribution.submission_fingerprint(),
                     node_index,
-                    command_index
+                    command.command_index()
                 ),
                 request_id: first_identity.request_id.to_string(),
                 correlation_id: Some(attribution.submission_fingerprint().to_owned()),
@@ -4137,6 +4187,10 @@ impl VNextProfileEventContext {
                     (
                         "backend_type".to_string(),
                         serde_json::json!(self.backend_type),
+                    ),
+                    (
+                        "device_intervals".to_string(),
+                        serde_json::json!(device_intervals),
                     ),
                 ])),
                 attributes,

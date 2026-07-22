@@ -600,10 +600,29 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
         assert_eq!(command.compute_dispatch_count(), 1);
         assert_eq!(command.transfer_command_count(), 0);
     }
-    assert!(matches!(
-        handle.wait().unwrap(),
-        CompletionObservation::Terminal(_)
-    ));
+    let completion = match handle.wait().unwrap() {
+        CompletionObservation::Terminal(completion) => completion,
+        other => panic!("kernel-profiled wave did not terminate: {other:?}"),
+    };
+    let attribution = attribution
+        .bind_terminal_timing(completion.submission_timing().clone())
+        .unwrap();
+    let DeviceTimingMeasurement::Measured(timing) = attribution.terminal_timing() else {
+        panic!("kernel-profiled wave must bind terminal command timing")
+    };
+    assert_eq!(
+        timing.commands().len(),
+        attribution.device().commands().len()
+    );
+    for (timing, command) in timing
+        .commands()
+        .iter()
+        .zip(attribution.device().commands())
+    {
+        assert_eq!(timing.command_index(), command.command_index());
+        assert_eq!(timing.intervals().len(), 1);
+        assert_eq!(timing.elapsed_ns(), 10);
+    }
 
     drop(handle);
     drop(providers);

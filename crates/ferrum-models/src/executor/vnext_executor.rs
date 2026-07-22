@@ -4253,26 +4253,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let _phase_timing = phase_timing.host_encode_submit.start();
             self.dispatch_participant_wave(participants, wave, kind)
         };
-        let mut attribution_event_error = None;
-        let completion = match dispatch {
+        let mut execution_event_error = None;
+        let (completion, attribution) = match dispatch {
             DispatchOutcome::Submitted {
                 completion,
                 attribution,
-            } => {
-                if kind == VNextExecutionWaveKind::Prefill {
-                    if let Some(attribution) = attribution.as_ref() {
-                        let sink = self.event_sink.read().clone();
-                        if let Some(sink) = sink {
-                            if let Err(error) =
-                                sink.record_device_submission_attribution(attribution)
-                            {
-                                attribution_event_error = Some(error.to_string());
-                            }
-                        }
-                    }
-                }
-                completion
-            }
+            } => (completion, attribution),
             DispatchOutcome::QuiescentFailure(message) => {
                 return Err(self.abort_step(step, message).await)
             }
@@ -4334,7 +4320,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
-        let mut execution_event_error = attribution_event_error;
         for participant in participants {
             if let Some(events) = &participant.sequence.events {
                 if let Err(error) = events.lock().submitted(completion.receipt()) {
@@ -4380,6 +4365,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         self.metrics.device_timing.record(&receipt);
         self.metrics.device_timing_for(kind).record(&receipt);
+        if let Some(attribution) = attribution {
+            match attribution.bind_terminal_timing(receipt.completion().submission_timing().clone())
+            {
+                Ok(attribution) => {
+                    let sink = self.event_sink.read().clone();
+                    if let Some(sink) = sink {
+                        if let Err(error) = sink.record_device_submission_attribution(&attribution)
+                        {
+                            execution_event_error.get_or_insert_with(|| error.to_string());
+                        }
+                    }
+                }
+                Err(error) => {
+                    execution_event_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
         for participant in participants {
             if let Some(events) = &participant.sequence.events {
                 if let Err(error) = events.lock().completed(receipt.completion()) {

@@ -14,14 +14,14 @@ use super::{
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
     DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-    DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape, EncodedDeviceOperation,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
-    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
-    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
-    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand,
+    DynamicResourceShape, EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
+    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedWeightBinding, ResourceId,
     SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
     SpanId, StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
@@ -4730,6 +4730,7 @@ pub struct BoundDeviceSubmissionAttribution {
     batch_identity: BatchOperationIdentity,
     submission_fingerprint: String,
     device: DeviceSubmissionAttribution,
+    terminal_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
 }
 
 impl BoundDeviceSubmissionAttribution {
@@ -4759,7 +4760,29 @@ impl BoundDeviceSubmissionAttribution {
             batch_identity,
             submission_fingerprint,
             device,
+            terminal_timing: DeviceTimingMeasurement::NotRequested,
         })
+    }
+
+    pub fn bind_terminal_timing(
+        mut self,
+        terminal_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    ) -> Result<Self, VNextError> {
+        if let DeviceTimingMeasurement::Measured(timing) = &terminal_timing {
+            if timing.commands().len() != self.device.commands().len()
+                || timing
+                    .commands()
+                    .iter()
+                    .zip(self.device.commands())
+                    .any(|(timing, command)| timing.command_index() != command.command_index())
+            {
+                return Err(invalid_operation(
+                    "terminal device timing differs from submission command attribution",
+                ));
+            }
+        }
+        self.terminal_timing = terminal_timing;
+        Ok(self)
     }
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {
@@ -4772,6 +4795,12 @@ impl BoundDeviceSubmissionAttribution {
 
     pub fn device(&self) -> &DeviceSubmissionAttribution {
         &self.device
+    }
+
+    pub const fn terminal_timing(
+        &self,
+    ) -> &DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        &self.terminal_timing
     }
 }
 

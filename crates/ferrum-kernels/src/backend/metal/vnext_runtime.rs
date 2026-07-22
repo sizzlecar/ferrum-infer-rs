@@ -17,20 +17,25 @@ use std::time::Instant;
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
-    DeviceCommandPhase, DeviceDescriptor, DeviceErrorReport, DeviceExecutionPath,
+    DeviceCommandExecutionTiming, DeviceCommandPhase, DeviceDescriptor, DeviceErrorReport,
+    DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, RetainedHostMemoryRegion,
-    StaticWeightImportSession, StreamState, VNextError, WeightComponentPayload,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    RetainedHostMemoryRegion, StaticWeightImportSession, StreamState, VNextError,
+    WeightComponentPayload,
 };
+use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, BOOL, YES};
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
-    BlitCommandEncoder, Buffer, BufferRef, CommandBuffer, CommandBufferRef, CommandQueue,
-    ComputeCommandEncoder, ComputeCommandEncoderRef, MTLCommandBufferStatus, MTLResourceOptions,
-    NSRange,
+    BlitCommandEncoder, BlitPassDescriptor, Buffer, BufferRef, CommandBuffer, CommandBufferRef,
+    CommandQueue, ComputeCommandEncoder, ComputeCommandEncoderRef, ComputePassDescriptor,
+    CounterSampleBuffer, CounterSampleBufferDescriptor, CounterSet, MTLBuffer,
+    MTLCommandBufferStatus, MTLCounterSampleBuffer, MTLCounterSamplingPoint, MTLResourceOptions,
+    MTLStorageMode, NSRange,
 };
 
 use super::st;
@@ -593,26 +598,394 @@ impl MetalBufferRegion {
     }
 }
 
+const METAL_COUNTER_SAMPLES_PER_PAGE: u64 = 256;
+const METAL_COUNTER_MAX_PAGES: usize = 16;
+const METAL_COUNTER_ERROR_VALUE: u64 = u64::MAX;
+
+#[derive(Clone)]
+enum MetalTimestampCounterSupport {
+    Supported(CounterSet),
+    Unsupported,
+}
+
+fn timestamp_counter_support(device: &metal::DeviceRef) -> MetalTimestampCounterSupport {
+    let supports_selector = sel!(supportsCounterSampling:);
+    let counter_sets_selector = sel!(counterSets);
+    let timestamps_selector = sel!(sampleTimestamps:gpuTimestamp:);
+    let selectors_available = unsafe {
+        let supports: BOOL = msg_send![device, respondsToSelector: supports_selector];
+        let counter_sets: BOOL = msg_send![device, respondsToSelector: counter_sets_selector];
+        let timestamps: BOOL = msg_send![device, respondsToSelector: timestamps_selector];
+        supports == YES && counter_sets == YES && timestamps == YES
+    };
+    if !selectors_available
+        || !device.supports_counter_sampling(MTLCounterSamplingPoint::AtStageBoundary)
+    {
+        return MetalTimestampCounterSupport::Unsupported;
+    }
+    device
+        .counter_sets()
+        .into_iter()
+        .find(|counter_set| counter_set.name() == "timestamp")
+        .map_or(
+            MetalTimestampCounterSupport::Unsupported,
+            MetalTimestampCounterSupport::Supported,
+        )
+}
+
+fn new_counter_sample_buffer_checked(
+    device: &metal::DeviceRef,
+    descriptor: &metal::CounterSampleBufferDescriptorRef,
+) -> Result<CounterSampleBuffer, ()> {
+    let mut error: *mut Object = std::ptr::null_mut();
+    let buffer: *mut MTLCounterSampleBuffer = unsafe {
+        msg_send![device, newCounterSampleBufferWithDescriptor: descriptor error: &mut error]
+    };
+    if buffer.is_null() {
+        Err(())
+    } else {
+        Ok(unsafe { CounterSampleBuffer::from_ptr(buffer) })
+    }
+}
+
+fn new_shared_buffer_checked(device: &metal::DeviceRef, length: u64) -> Result<Buffer, ()> {
+    let buffer: *mut MTLBuffer = unsafe {
+        msg_send![device,
+            newBufferWithLength: length
+            options: MTLResourceOptions::StorageModeShared
+        ]
+    };
+    if buffer.is_null() {
+        Err(())
+    } else {
+        Ok(unsafe { Buffer::from_ptr(buffer) })
+    }
+}
+
+struct MetalCounterPageBuilder {
+    sample_buffer: CounterSampleBuffer,
+    resolved: Buffer,
+    used_samples: u64,
+}
+
+struct MetalCounterReservation {
+    sample_buffer: CounterSampleBuffer,
+    start_sample_index: u64,
+    end_sample_index: u64,
+}
+
+struct MetalCounterIntervalMapping {
+    command_index: u32,
+    kind: DeviceExecutionIntervalKind,
+    page_index: usize,
+    start_sample_index: u64,
+    end_sample_index: u64,
+}
+
+struct MetalCounterCaptureBuilder {
+    device: metal::Device,
+    counter_set: CounterSet,
+    pages: Vec<MetalCounterPageBuilder>,
+    mappings: Vec<MetalCounterIntervalMapping>,
+    cpu_anchor_start: u64,
+    gpu_anchor_start: u64,
+    unavailable: bool,
+}
+
+impl MetalCounterCaptureBuilder {
+    fn new(device: metal::Device, counter_set: CounterSet) -> Self {
+        let mut cpu_anchor_start = 0;
+        let mut gpu_anchor_start = 0;
+        device.sample_timestamps(&mut cpu_anchor_start, &mut gpu_anchor_start);
+        Self {
+            device,
+            counter_set,
+            pages: Vec::new(),
+            mappings: Vec::new(),
+            cpu_anchor_start,
+            gpu_anchor_start,
+            unavailable: cpu_anchor_start == 0 || gpu_anchor_start == 0,
+        }
+    }
+
+    fn add_page(&mut self) -> Result<(), ()> {
+        if self.pages.len() >= METAL_COUNTER_MAX_PAGES {
+            return Err(());
+        }
+        let descriptor = CounterSampleBufferDescriptor::new();
+        descriptor.set_counter_set(&self.counter_set);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_sample_count(METAL_COUNTER_SAMPLES_PER_PAGE);
+        descriptor.set_label("ferrum.vnext.command_timestamps");
+        let sample_buffer = new_counter_sample_buffer_checked(&self.device, &descriptor)?;
+        let byte_len = METAL_COUNTER_SAMPLES_PER_PAGE
+            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .ok_or(())?;
+        let resolved = new_shared_buffer_checked(&self.device, byte_len)?;
+        self.pages.push(MetalCounterPageBuilder {
+            sample_buffer,
+            resolved,
+            used_samples: 0,
+        });
+        Ok(())
+    }
+
+    fn reserve(
+        &mut self,
+        command_index: u32,
+        kind: DeviceExecutionIntervalKind,
+    ) -> Option<MetalCounterReservation> {
+        if self.unavailable {
+            return None;
+        }
+        if self
+            .pages
+            .last()
+            .is_none_or(|page| page.used_samples + 2 > METAL_COUNTER_SAMPLES_PER_PAGE)
+            && self.add_page().is_err()
+        {
+            self.unavailable = true;
+            return None;
+        }
+        let page_index = self.pages.len() - 1;
+        let page = &mut self.pages[page_index];
+        let start_sample_index = page.used_samples;
+        let end_sample_index = start_sample_index + 1;
+        page.used_samples += 2;
+        self.mappings.push(MetalCounterIntervalMapping {
+            command_index,
+            kind,
+            page_index,
+            start_sample_index,
+            end_sample_index,
+        });
+        Some(MetalCounterReservation {
+            sample_buffer: page.sample_buffer.clone(),
+            start_sample_index,
+            end_sample_index,
+        })
+    }
+
+    fn mark_unavailable(&mut self) {
+        self.unavailable = true;
+    }
+
+    fn finish(mut self, command_buffer: &CommandBufferRef) -> MetalCounterCapture {
+        if !self.unavailable && !self.pages.is_empty() {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.set_label("ferrum.vnext.resolve_command_timestamps");
+            for page in &self.pages {
+                blit.resolve_counters(
+                    &page.sample_buffer,
+                    NSRange::new(0, page.used_samples),
+                    &page.resolved,
+                    0,
+                );
+            }
+            blit.end_encoding();
+        }
+        let resolved_pages = self
+            .pages
+            .drain(..)
+            .map(|page| MetalCounterPage {
+                _sample_buffer: page.sample_buffer,
+                resolved: page.resolved,
+                used_samples: page.used_samples,
+            })
+            .collect();
+        MetalCounterCapture {
+            device: self.device,
+            pages: resolved_pages,
+            mappings: self.mappings.into_boxed_slice(),
+            cpu_anchor_start: self.cpu_anchor_start,
+            gpu_anchor_start: self.gpu_anchor_start,
+            unavailable: self.unavailable,
+        }
+    }
+}
+
+struct MetalCounterPage {
+    _sample_buffer: CounterSampleBuffer,
+    resolved: Buffer,
+    used_samples: u64,
+}
+
+struct MetalCounterCapture {
+    device: metal::Device,
+    pages: Vec<MetalCounterPage>,
+    mappings: Box<[MetalCounterIntervalMapping]>,
+    cpu_anchor_start: u64,
+    gpu_anchor_start: u64,
+    unavailable: bool,
+}
+
+impl MetalCounterCapture {
+    fn resolve(&self) -> DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        if self.unavailable || self.mappings.is_empty() {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            );
+        }
+        let mut cpu_anchor_end = 0;
+        let mut gpu_anchor_end = 0;
+        self.device
+            .sample_timestamps(&mut cpu_anchor_end, &mut gpu_anchor_end);
+        let Some(cpu_span) = cpu_anchor_end.checked_sub(self.cpu_anchor_start) else {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            );
+        };
+        let Some(gpu_span) = gpu_anchor_end.checked_sub(self.gpu_anchor_start) else {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            );
+        };
+        if cpu_span == 0 || gpu_span == 0 {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            );
+        }
+        let mut page_samples = Vec::with_capacity(self.pages.len());
+        for page in &self.pages {
+            let Some(sample_count) = usize::try_from(page.used_samples).ok() else {
+                return DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::DurationOverflow,
+                );
+            };
+            if page.resolved.contents().is_null() {
+                return DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                );
+            }
+            let samples = unsafe {
+                std::slice::from_raw_parts(page.resolved.contents().cast::<u64>(), sample_count)
+            };
+            page_samples.push(samples);
+        }
+        let raw_interval = |mapping: &MetalCounterIntervalMapping| -> Option<(u64, u64)> {
+            let samples = *page_samples.get(mapping.page_index)?;
+            let start = *samples.get(usize::try_from(mapping.start_sample_index).ok()?)?;
+            let end = *samples.get(usize::try_from(mapping.end_sample_index).ok()?)?;
+            (start != METAL_COUNTER_ERROR_VALUE
+                && end != METAL_COUNTER_ERROR_VALUE
+                && start >= self.gpu_anchor_start
+                && end > start
+                && end <= gpu_anchor_end)
+                .then_some((start, end))
+        };
+        let Some(origin) = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| raw_interval(mapping).map(|(start, _)| start))
+            .min()
+        else {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            );
+        };
+        let convert = |timestamp: u64| -> Option<u64> {
+            let delta = u128::from(timestamp.checked_sub(origin)?);
+            let numerator = delta.checked_mul(u128::from(cpu_span))?;
+            let rounded = numerator.checked_add(u128::from(gpu_span) / 2)?;
+            u64::try_from(rounded / u128::from(gpu_span)).ok()
+        };
+        let mut commands = BTreeMap::<u32, Vec<DeviceExecutionInterval>>::new();
+        for mapping in self.mappings.iter() {
+            let Some((start, end)) = raw_interval(mapping) else {
+                return DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                );
+            };
+            let Some(interval) = convert(start)
+                .zip(convert(end))
+                .and_then(|(start, end)| DeviceExecutionInterval::new(mapping.kind, start, end))
+            else {
+                return DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::DurationOverflow,
+                );
+            };
+            commands
+                .entry(mapping.command_index)
+                .or_default()
+                .push(interval);
+        }
+        let Some(commands) = commands
+            .into_iter()
+            .map(|(command_index, intervals)| {
+                DeviceCommandExecutionTiming::new(command_index, intervals)
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(DeviceSubmissionExecutionTiming::new)
+        else {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            );
+        };
+        DeviceTimingMeasurement::Measured(commands)
+    }
+}
+
+enum MetalFenceCommandTiming {
+    NotRequested,
+    Unavailable(DeviceTimingUnavailableReason),
+    Captured {
+        capture: MetalCounterCapture,
+        resolved: OnceLock<DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>>,
+    },
+}
+
+impl MetalFenceCommandTiming {
+    fn measurement(
+        &self,
+        command_buffer: &CommandBufferRef,
+    ) -> DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return match self {
+                Self::NotRequested => DeviceTimingMeasurement::NotRequested,
+                Self::Unavailable(reason) => DeviceTimingMeasurement::Unavailable(*reason),
+                Self::Captured { .. } => DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                ),
+            };
+        }
+        match self {
+            Self::NotRequested => DeviceTimingMeasurement::NotRequested,
+            Self::Unavailable(reason) => DeviceTimingMeasurement::Unavailable(*reason),
+            Self::Captured { capture, resolved } => {
+                resolved.get_or_init(|| capture.resolve()).clone()
+            }
+        }
+    }
+}
+
 /// Safe, submission-local encoder. It owns the encoder references retained
 /// from the command buffer and closes compute before switching to blit work.
 pub(crate) struct MetalSubmissionEncoder {
     command_buffer: CommandBuffer,
     compute: Option<ComputeCommandEncoder>,
     profile_enabled: bool,
+    current_command_index: Option<u32>,
     command_label: Option<&'static str>,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
+    counter_capture: Option<MetalCounterCaptureBuilder>,
 }
 
 impl MetalSubmissionEncoder {
-    fn new(command_buffer: &CommandBufferRef, profile_enabled: bool) -> Self {
+    fn new(
+        command_buffer: &CommandBufferRef,
+        profile_enabled: bool,
+        counter_capture: Option<MetalCounterCaptureBuilder>,
+    ) -> Self {
         Self {
             command_buffer: command_buffer.to_owned(),
             compute: None,
             profile_enabled,
+            current_command_index: None,
             command_label: None,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
+            counter_capture,
         }
     }
 
@@ -622,12 +995,13 @@ impl MetalSubmissionEncoder {
         }
     }
 
-    fn begin_command(&mut self, command_label: &'static str) {
+    fn begin_command(&mut self, command_index: u32, command_label: &'static str) {
         if self.profile_enabled {
             // A full-profile run deliberately gives every native command an
             // encoder boundary so Metal System Trace can attribute GPU time
             // to the same native_op_id emitted by Ferrum's typed profile.
             self.end_compute();
+            self.current_command_index = Some(command_index);
             self.command_label = Some(command_label);
         }
         self.compute_dispatch_count = 0;
@@ -640,7 +1014,29 @@ impl MetalSubmissionEncoder {
 
     pub(crate) fn compute_encoder(&mut self) -> &ComputeCommandEncoderRef {
         if self.compute.is_none() {
-            let encoder = self.command_buffer.new_compute_command_encoder().to_owned();
+            let reservation = self.counter_capture.as_mut().and_then(|capture| {
+                self.current_command_index.and_then(|command_index| {
+                    capture.reserve(command_index, DeviceExecutionIntervalKind::Compute)
+                })
+            });
+            let encoder = if let Some(reservation) = reservation {
+                let descriptor = ComputePassDescriptor::new();
+                if let Some(attachment) = descriptor.sample_buffer_attachments().object_at(0) {
+                    attachment.set_sample_buffer(&reservation.sample_buffer);
+                    attachment.set_start_of_encoder_sample_index(reservation.start_sample_index);
+                    attachment.set_end_of_encoder_sample_index(reservation.end_sample_index);
+                    self.command_buffer
+                        .compute_command_encoder_with_descriptor(descriptor)
+                        .to_owned()
+                } else {
+                    if let Some(capture) = self.counter_capture.as_mut() {
+                        capture.mark_unavailable();
+                    }
+                    self.command_buffer.new_compute_command_encoder().to_owned()
+                }
+            } else {
+                self.command_buffer.new_compute_command_encoder().to_owned()
+            };
             if let Some(label) = self.command_label {
                 encoder.set_label(label);
             }
@@ -674,7 +1070,29 @@ impl MetalSubmissionEncoder {
             self.transfer_command_count = self.transfer_command_count.saturating_add(command_count);
         }
         self.end_compute();
-        let encoder = self.command_buffer.new_blit_command_encoder().to_owned();
+        let reservation = self.counter_capture.as_mut().and_then(|capture| {
+            self.current_command_index.and_then(|command_index| {
+                capture.reserve(command_index, DeviceExecutionIntervalKind::Transfer)
+            })
+        });
+        let encoder = if let Some(reservation) = reservation {
+            let descriptor = BlitPassDescriptor::new();
+            if let Some(attachment) = descriptor.sample_buffer_attachments().object_at(0) {
+                attachment.set_sample_buffer(&reservation.sample_buffer);
+                attachment.set_start_of_encoder_sample_index(reservation.start_sample_index);
+                attachment.set_end_of_encoder_sample_index(reservation.end_sample_index);
+                self.command_buffer
+                    .blit_command_encoder_with_descriptor(descriptor)
+                    .to_owned()
+            } else {
+                if let Some(capture) = self.counter_capture.as_mut() {
+                    capture.mark_unavailable();
+                }
+                self.command_buffer.new_blit_command_encoder().to_owned()
+            }
+        } else {
+            self.command_buffer.new_blit_command_encoder().to_owned()
+        };
         if let Some(label) = self.command_label {
             encoder.set_label(label);
         }
@@ -682,8 +1100,11 @@ impl MetalSubmissionEncoder {
         encode(&encoder.0)
     }
 
-    fn finish(mut self) {
+    fn finish(mut self) -> Option<MetalCounterCapture> {
         self.end_compute();
+        self.counter_capture
+            .take()
+            .map(|capture| capture.finish(&self.command_buffer))
     }
 }
 
@@ -973,6 +1394,7 @@ pub struct MetalDeviceFence {
     submission_id: u64,
     command_buffer: CommandBuffer,
     timing: MetalFenceTiming,
+    command_timing: MetalFenceCommandTiming,
     stream_state: Arc<MetalStreamState>,
     pending: Arc<MetalPendingSubmissions>,
     terminal_accounted: AtomicBool,
@@ -1011,7 +1433,11 @@ impl MetalDeviceFence {
         match self.timing {
             MetalFenceTiming::NotRequested => DeviceTerminalReceipt::unprofiled(terminal),
             MetalFenceTiming::CommandBuffer => {
-                DeviceTerminalReceipt::profiled(terminal, self.execution_timing())
+                DeviceTerminalReceipt::profiled_with_submission_timing(
+                    terminal,
+                    self.execution_timing(),
+                    self.command_timing.measurement(&self.command_buffer),
+                )
             }
         }
     }
@@ -1102,6 +1528,7 @@ pub struct MetalDeviceRuntime {
     descriptor: DeviceDescriptor,
     runtime_instance: u64,
     device: metal::Device,
+    timestamp_counter_support: OnceLock<MetalTimestampCounterSupport>,
     static_weight_import_gate: Mutex<()>,
 }
 
@@ -1139,12 +1566,19 @@ impl MetalDeviceRuntime {
             descriptor,
             runtime_instance,
             device,
+            timestamp_counter_support: OnceLock::new(),
             static_weight_import_gate: Mutex::new(()),
         })
     }
 
     pub(crate) fn device(&self) -> &metal::Device {
         &self.device
+    }
+
+    fn timestamp_counter_support(&self) -> MetalTimestampCounterSupport {
+        self.timestamp_counter_support
+            .get_or_init(|| timestamp_counter_support(&self.device))
+            .clone()
     }
 
     fn allocate_request(
@@ -1252,6 +1686,11 @@ impl MetalDeviceRuntime {
                 MetalDeviceRuntimeError::contract("Metal command batch is empty"),
             ));
         }
+        if u32::try_from(entries.len()).is_err() {
+            return Err(DefinitelyNotSubmitted::new(
+                MetalDeviceRuntimeError::contract("Metal command batch exceeds u32 indexing"),
+            ));
+        }
         if entries
             .iter()
             .any(|(_, _, command)| command.runtime_instance != self.runtime_instance)
@@ -1282,12 +1721,24 @@ impl MetalDeviceRuntime {
         if kernel_attribution {
             command_buffer.set_label("ferrum.vnext.full_profile");
         }
-        let mut encoder = MetalSubmissionEncoder::new(&command_buffer, kernel_attribution);
+        let counter_capture = if kernel_attribution {
+            match self.timestamp_counter_support() {
+                MetalTimestampCounterSupport::Supported(counter_set) => Some(
+                    MetalCounterCaptureBuilder::new(self.device.clone(), counter_set),
+                ),
+                MetalTimestampCounterSupport::Unsupported => None,
+            }
+        } else {
+            None
+        };
+        let mut encoder =
+            MetalSubmissionEncoder::new(&command_buffer, kernel_attribution, counter_capture);
         let mut attribution = kernel_attribution.then(|| Vec::with_capacity(entries.len()));
         let enqueue_stage =
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
-        for (phase, node_index, command) in &entries {
-            encoder.begin_command(command.operation);
+        for (command_index, (phase, node_index, command)) in entries.iter().enumerate() {
+            let command_index = command_index as u32;
+            encoder.begin_command(command_index, command.operation);
             if let Err(error) = command.encode(&mut encoder) {
                 stream.state.cancel_recording();
                 return Err(DefinitelyNotSubmitted::new(error));
@@ -1295,6 +1746,7 @@ impl MetalDeviceRuntime {
             if let Some(attribution) = attribution.as_mut() {
                 let (compute_dispatch_count, transfer_command_count) = encoder.command_counts();
                 if let Some(observation) = DeviceNativeWorkAttribution::new(
+                    command_index,
                     *node_index,
                     *phase,
                     command.operation,
@@ -1309,7 +1761,17 @@ impl MetalDeviceRuntime {
                 }
             }
         }
-        encoder.finish();
+        let counter_capture = encoder.finish();
+        let command_timing = match (kernel_attribution, counter_capture) {
+            (false, _) => MetalFenceCommandTiming::NotRequested,
+            (true, Some(capture)) => MetalFenceCommandTiming::Captured {
+                capture,
+                resolved: OnceLock::new(),
+            },
+            (true, None) => MetalFenceCommandTiming::Unavailable(
+                DeviceTimingUnavailableReason::BackendUnsupported,
+            ),
+        };
         drop(enqueue_stage);
         let attribution = attribution.and_then(DeviceSubmissionAttribution::new);
         let commands = entries.into_iter().map(|(_, _, command)| command).collect();
@@ -1341,6 +1803,7 @@ impl MetalDeviceRuntime {
             submission_id,
             command_buffer,
             timing,
+            command_timing,
             stream_state: Arc::clone(&stream.state),
             pending: Arc::clone(&stream.pending),
             terminal_accounted: AtomicBool::new(false),
@@ -2148,6 +2611,7 @@ mod tests {
         let [command] = attribution.commands() else {
             panic!("expected exactly one native command attribution")
         };
+        assert_eq!(command.command_index(), 0);
         assert_eq!(command.node_index(), Some(0));
         assert_eq!(command.command_phase(), DeviceCommandPhase::Compute);
         assert_eq!(command.native_op_id(), "device zero");
@@ -2164,6 +2628,19 @@ mod tests {
             terminal.execution_timing(),
             DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
         ));
+        let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
+            panic!("Metal kernel profile must report command counter timing")
+        };
+        let [timing] = timing.commands() else {
+            panic!("expected exactly one command timing row")
+        };
+        assert_eq!(timing.command_index(), command.command_index());
+        assert_eq!(timing.intervals().len(), 1);
+        assert_eq!(
+            timing.intervals()[0].kind(),
+            DeviceExecutionIntervalKind::Transfer
+        );
+        assert!(timing.elapsed_ns() > 0);
     }
 
     #[test]
@@ -2213,6 +2690,23 @@ mod tests {
 
         let terminal = runtime.wait_fence(&fence).expect("terminal fence");
         assert!(terminal.terminal().is_succeeded());
+        let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
+            panic!("Metal kernel profile must report command counter timing")
+        };
+        let [timing] = timing.commands() else {
+            panic!("expected exactly one command timing row")
+        };
+        assert_eq!(timing.command_index(), command.command_index());
+        assert_eq!(
+            timing.intervals().len(),
+            1,
+            "three transfer operations in one blit encoder are one physical interval"
+        );
+        assert_eq!(
+            timing.intervals()[0].kind(),
+            DeviceExecutionIntervalKind::Transfer
+        );
+        assert!(timing.elapsed_ns() > 0);
     }
 
     #[test]

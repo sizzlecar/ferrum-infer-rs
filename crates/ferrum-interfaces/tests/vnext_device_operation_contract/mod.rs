@@ -691,12 +691,48 @@ impl TestFence {
     ) -> DeviceTerminalReceipt<TestRuntimeError> {
         match self.1 {
             DeviceTimingMode::Off => DeviceTerminalReceipt::unprofiled(terminal),
-            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
-                DeviceTerminalReceipt::profiled(
+            DeviceTimingMode::Completion => DeviceTerminalReceipt::profiled(
+                terminal,
+                DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
+                    1_000_000,
+                )),
+            ),
+            DeviceTimingMode::Kernel => {
+                let submission_timing = self
+                    .2
+                    .as_ref()
+                    .map(|attribution| {
+                        attribution
+                            .commands()
+                            .iter()
+                            .map(|command| {
+                                let start = u64::from(command.command_index()) * 100;
+                                DeviceCommandExecutionTiming::new(
+                                    command.command_index(),
+                                    vec![DeviceExecutionInterval::new(
+                                        DeviceExecutionIntervalKind::Compute,
+                                        start,
+                                        start + 10,
+                                    )
+                                    .unwrap()],
+                                )
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .and_then(DeviceSubmissionExecutionTiming::new)
+                    .map_or(
+                        DeviceTimingMeasurement::Unavailable(
+                            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                        ),
+                        DeviceTimingMeasurement::Measured,
+                    );
+                DeviceTerminalReceipt::profiled_with_submission_timing(
                     terminal,
                     DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
                         1_000_000,
                     )),
+                    submission_timing,
                 )
             }
         }
@@ -927,7 +963,8 @@ impl DeviceRuntime for TestRuntime {
         let attribution = timing_mode.kernel_attribution_enabled().then(|| {
             entries
                 .iter()
-                .filter_map(|entry| {
+                .enumerate()
+                .filter_map(|(command_index, entry)| {
                     let (native_op_id, compute_dispatch_count, transfer_command_count) =
                         match entry.command() {
                             TestCommand::Provider => ("test_provider", 1, 0),
@@ -938,6 +975,7 @@ impl DeviceRuntime for TestRuntime {
                             TestCommand::Zero => ("test_zero", 0, 1),
                         };
                     DeviceNativeWorkAttribution::new(
+                        u32::try_from(command_index).ok()?,
                         entry.node_index(),
                         entry.phase(),
                         native_op_id,
