@@ -3905,7 +3905,18 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
         },
     }
     values = preset_values(model_key, case["preset"])
-    for key in ("temperature", "top_p", "top_k", "seed", "max_tokens", "stop"):
+    for key in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "seed",
+        "max_tokens",
+        "stop",
+    ):
         if key in values:
             payload[key] = values[key]
     if isinstance(values.get("template_kwargs"), dict) and values["template_kwargs"]:
@@ -4829,6 +4840,8 @@ def run_case_option_args(case: dict[str, Any]) -> tuple[list[str], bool | str | 
         ("--temperature", "temperature"),
         ("--top-p", "top_p"),
         ("--top-k", "top_k"),
+        ("--min-p", "min_p"),
+        ("--presence-penalty", "presence_penalty"),
         ("--seed", "seed"),
         ("--max-tokens", "max_tokens"),
         ("--repeat-penalty", "repetition_penalty"),
@@ -9334,6 +9347,29 @@ def self_test() -> int:
                 for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
                 if row["scenario_id"] == "C19"
             ]
+            preset_case = {
+                **next(row for row in c19_rows if row["variant"] == "default-thinking"),
+                "model_key": model_key,
+            }
+            preset_argv, _ = run_case_option_args(preset_case)
+            preset_payload = case_http_payload(preset_case, model_key)
+            for flag, key in (
+                ("--temperature", "temperature"),
+                ("--top-p", "top_p"),
+                ("--top-k", "top_k"),
+                ("--min-p", "min_p"),
+                ("--presence-penalty", "presence_penalty"),
+                ("--repeat-penalty", "repetition_penalty"),
+                ("--seed", "seed"),
+                ("--max-tokens", "max_tokens"),
+            ):
+                expected_value = preset_values(model_key, "P_THINKING")[key]
+                require(flag in preset_argv, f"{model_key} P_THINKING run omitted {key}")
+                require(
+                    preset_argv[preset_argv.index(flag) + 1] == str(expected_value),
+                    f"{model_key} P_THINKING run changed {key}",
+                )
+                require(preset_payload.get(key) == expected_value, f"{model_key} P_THINKING serve omitted or changed {key}")
             for variant, expected_override in expected_overrides.items():
                 case = {
                     **next(row for row in c19_rows if row["variant"] == variant),
