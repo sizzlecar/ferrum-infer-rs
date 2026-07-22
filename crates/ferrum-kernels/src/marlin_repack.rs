@@ -54,6 +54,119 @@ pub fn permute_gptq_qweight_rows(
 /// Repack `[K/8, N]` GPTQ INT4 words into the shared IST-DASLab/vLLM Marlin
 /// 16-by-64 tile ABI.
 pub fn repack_gptq_to_marlin(qweight_gptq: &[i32], k: usize, n: usize) -> Vec<i32> {
+    if k.is_multiple_of(16) && n.is_multiple_of(64) {
+        return repack_gptq_to_marlin_tiles(qweight_gptq, k, n);
+    }
+
+    // Preserve the legacy transform for unsupported diagnostic shapes. The
+    // CUDA Marlin execution contract requires 16-by-64 alignment, but keeping
+    // this fallback avoids changing the behavior of format-validation callers.
+    repack_gptq_to_marlin_staged(qweight_gptq, k, n)
+}
+
+/// Write final 16-by-64 Marlin tiles directly from GPTQ words.
+///
+/// The staged implementation below expands every INT4 value into three full
+/// byte buffers before packing the final output. Direct tile emission performs
+/// the same permutation in one parallel pass and bounds temporary storage to
+/// eight nibbles per output word.
+fn repack_gptq_to_marlin_tiles(qweight_gptq: &[i32], k: usize, n: usize) -> Vec<i32> {
+    debug_assert_eq!(qweight_gptq.len(), (k / 8) * n);
+    let n_tiles = n / 64;
+    let mut output = vec![0_i32; qweight_gptq.len()];
+    output
+        .par_chunks_mut(16 * 64 / 8)
+        .enumerate()
+        .for_each(|(tile_index, tile)| {
+            let k_tile = tile_index / n_tiles;
+            let n_tile = tile_index % n_tiles;
+            for thread in 0..32 {
+                for warp in 0..4 {
+                    tile[thread * 4 + warp] =
+                        marlin_tile_word(qweight_gptq, k_tile, n_tile, thread, warp, n);
+                }
+            }
+        });
+    output
+}
+
+/// Repack directly into a byte-oriented format-adapter destination.
+///
+/// This avoids materializing an intermediate `Vec<i32>` and a second encoded
+/// `Vec<u8>` before a component source appends the final physical bytes.
+pub fn repack_gptq_to_marlin_bytes_into(
+    qweight_gptq: &[i32],
+    k: usize,
+    n: usize,
+    output: &mut [u8],
+) {
+    assert_eq!(qweight_gptq.len(), (k / 8) * n);
+    assert_eq!(
+        output.len(),
+        qweight_gptq.len() * std::mem::size_of::<i32>()
+    );
+    if !k.is_multiple_of(16) || !n.is_multiple_of(64) {
+        for (destination, value) in
+            output
+                .chunks_exact_mut(4)
+                .zip(repack_gptq_to_marlin_staged(qweight_gptq, k, n))
+        {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+        return;
+    }
+
+    let n_tiles = n / 64;
+    output
+        .par_chunks_mut(16 * 64 / 2)
+        .enumerate()
+        .for_each(|(tile_index, tile)| {
+            let k_tile = tile_index / n_tiles;
+            let n_tile = tile_index % n_tiles;
+            for thread in 0..32 {
+                for warp in 0..4 {
+                    let offset = (thread * 4 + warp) * 4;
+                    tile[offset..offset + 4].copy_from_slice(
+                        &marlin_tile_word(qweight_gptq, k_tile, n_tile, thread, warp, n)
+                            .to_le_bytes(),
+                    );
+                }
+            }
+        });
+}
+
+#[inline]
+fn marlin_tile_word(
+    qweight_gptq: &[i32],
+    k_tile: usize,
+    n_tile: usize,
+    thread: usize,
+    warp: usize,
+    n: usize,
+) -> i32 {
+    let tensor_core_column = thread / 4;
+    let tensor_core_row = (thread % 4) * 2;
+    let column = n_tile * 64 + warp * 16 + tensor_core_column;
+    let mut values = [0_u32; 8];
+    for (slot, row_offset) in [0_usize, 1, 8, 9].into_iter().enumerate() {
+        let row = k_tile * 16 + tensor_core_row + row_offset;
+        let word = qweight_gptq[(row / 8) * n + column] as u32;
+        values[slot] = (word >> ((row % 8) * 4)) & 0x0f;
+    }
+    for (slot, row_offset) in [0_usize, 1, 8, 9].into_iter().enumerate() {
+        let row = k_tile * 16 + tensor_core_row + row_offset;
+        let word = qweight_gptq[(row / 8) * n + column + 8] as u32;
+        values[slot + 4] = (word >> ((row % 8) * 4)) & 0x0f;
+    }
+    [0_usize, 2, 4, 6, 1, 3, 5, 7]
+        .into_iter()
+        .enumerate()
+        .fold(0_u32, |word, (lane, source)| {
+            word | (values[source] << (lane * 4))
+        }) as i32
+}
+
+fn repack_gptq_to_marlin_staged(qweight_gptq: &[i32], k: usize, n: usize) -> Vec<i32> {
     let mut unpacked = vec![0_u8; k * n];
     unpacked
         .par_chunks_mut(8 * n)
@@ -133,13 +246,15 @@ pub fn repack_scales_to_marlin(
     let total = group_count * n;
     let permutation_length = permutation.len();
     let mut result = vec![half::f16::ZERO; total];
-    for block in 0..(total / permutation_length) {
-        let base = block * permutation_length;
-        for (destination, &source) in permutation.iter().enumerate() {
-            result[base + destination] = scales_gptq[base + source];
-        }
-    }
     let remainder = (total / permutation_length) * permutation_length;
+    result[..remainder]
+        .par_chunks_mut(permutation_length)
+        .zip(scales_gptq[..remainder].par_chunks(permutation_length))
+        .for_each(|(output, input)| {
+            for (destination, &source) in permutation.iter().enumerate() {
+                output[destination] = input[source];
+            }
+        });
     result[remainder..total].copy_from_slice(&scales_gptq[remainder..total]);
     result
 }
@@ -248,6 +363,16 @@ mod tests {
         assert_eq!(
             repack_gptq_to_marlin(&qweight, k, n),
             vllm_int4_repack_reference(&qweight, k, n)
+        );
+
+        let mut bytes = vec![0_u8; qweight.len() * std::mem::size_of::<i32>()];
+        repack_gptq_to_marlin_bytes_into(&qweight, k, n, &mut bytes);
+        assert_eq!(
+            bytes,
+            vllm_int4_repack_reference(&qweight, k, n)
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>()
         );
     }
 }
