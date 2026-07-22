@@ -56,6 +56,43 @@ misuse prevented、hot-path overhead 和 compile invalidation domain。只有被
 没有上述理由且没有目标 consumer 的 public API 必须删除。不得用单纯 LOC、type 数或 test 数作为
 架构质量指标。
 
+## 架构冻结与升级规则（2026-07-22 澄清）
+
+“收敛当前纵切”不等于冻结现有架构。冻结的对象只有没有证据支撑的横向扩散、同时叠加多个
+性能 lever，以及为了让 gate 变绿而增加的 case/model/backend 特判；核心 contract、trait、资源
+所有权、执行计划、调度、provider、产品组合和测试/profile 根抽象不受这种冻结保护。
+
+每个真实模型失败先保存 artifact，并在继续实现前分类：
+
+1. `test-infrastructure`：产品行为正确，runner、validator、fixture、receipt 或 artifact 拓扑错误；
+2. `local-implementation`：抽象边界仍成立，单个 provider/kernel/映射实现违反已有 contract；
+3. `systemic-architecture`：contract 或 ownership 本身无法同时满足正确性、性能、扩展性和产品能力。
+
+命中以下任一条件，必须分类为 `systemic-architecture`，立即停止继续堆叠局部补丁和完整 gate，先
+重写根抽象：
+
+- 同一失败类别在两个实现尝试后仍复现，或跨两个模型、两个 backend、`run`/`serve` 两入口出现；
+- 修复需要模型名、GPU 名、显存档位、backend 隐藏环境变量、固定并发或静默 fallback；
+- 资源不足只能 reject/OOM，而不能以 typed waiting/defer/resume 保持已有 eligible work 推进；
+- 正确性只能通过过滤输出、弱化 validator、跳过正式 case 或改变用户不可见配置维持；
+- 热路径需要重复 capability 查询、请求级计划重建、请求级 device allocation、逐 token host allocation、
+  不可批处理的 per-token/per-expert dispatch，且局部实现无法消除；
+- 新模型、MoE、Metal、CUDA 或未来 ROCm 接入必须复制 scheduler、KV/recurrent/scratch、资源回收、
+  product composition、测试或 profile 生命周期；
+- profile/trace 无法把一次请求稳定关联到 plan/node/op/resource/backend/kernel，导致瓶颈仍只能靠
+  反复排除试验定位；
+- 用户可见能力（streaming、tool calling、structured output、cancel、continuous batching）只能在
+  某一入口或某一 backend 单独实现。
+
+架构升级必须先写出失败 artifact、被推翻的 invariant/边界、替代 ownership/依赖图、性能成本模型、
+迁移与 legacy 删除范围，以及能证伪新设计的最小真实模型实验。允许 breaking rewrite 和删除既有
+contract/test；不得为了兼容尚未形成稳定公共承诺的 vNext 内部 API 保留双重真相。
+
+重构完成后的验收不是“编译通过”：先跑受影响的 L0/L1 和真实 `ferrum run`/`ferrum serve`
+correctness，再在同硬件运行对应性能 smoke；涉及共享路径时必须回归 CUDA 和 Metal。只有 artifact
+证明原失败类别消失、没有模型/backend 特判、性能不回退且扩展边界可由第二个 consumer 复用，才可
+恢复当前 S milestone 的完整 gate。
+
 ## S0：优先拆分现有 vNext contract
 
 S0 是文档修订后的第一个实现任务。它分两步，不能合并成一次大改。
