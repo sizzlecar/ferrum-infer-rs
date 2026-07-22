@@ -150,6 +150,7 @@ impl ProgramPlanCompiler {
         )?;
         let probe_resolutions = resolve_nodes(
             family,
+            &family_fingerprint,
             catalog,
             policy,
             planning,
@@ -177,6 +178,7 @@ impl ProgramPlanCompiler {
             )?;
             let node_resolutions = resolve_nodes(
                 family,
+                &family_fingerprint,
                 catalog,
                 policy,
                 planning,
@@ -860,6 +862,7 @@ fn activation_storage(
 #[allow(clippy::too_many_arguments)]
 fn resolve_nodes<P: RuntimePolicy>(
     family: &PreparedModelFamily,
+    prepared_family_fingerprint: &str,
     catalog: &CapabilityCatalog,
     policy: &P,
     planning: &OperationPlanningHandle<'_>,
@@ -904,8 +907,9 @@ fn resolve_nodes<P: RuntimePolicy>(
                     },
                 ))
                 .collect::<Result<Vec<_>, VNextError>>()?;
-            PlanNodeResolution::resolve(
+            PlanNodeResolution::resolve_with_family_fingerprint(
                 family,
+                prepared_family_fingerprint,
                 catalog,
                 policy,
                 planning,

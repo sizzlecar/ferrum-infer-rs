@@ -160,6 +160,7 @@ impl ExecutionPlan {
             let storage_rejection = storage_rejections.remove(&program_node.id);
             let node = Self::build_node(
                 family,
+                &prepared_family_fingerprint,
                 program_node,
                 resolution,
                 provider_resources,
@@ -247,6 +248,7 @@ impl ExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_node(
         family: &PreparedModelFamily,
+        prepared_family_fingerprint: &str,
         program_node: &ProgramNode,
         resolution: PlanNodeResolution,
         provider_resources: ProviderResourcePlan,
@@ -358,6 +360,7 @@ impl ExecutionPlan {
         }
         let expected_estimator_input = provider_resource_estimator_input_fingerprint(
             family,
+            prepared_family_fingerprint,
             operation,
             program_node,
             &selection.selected_provider,
