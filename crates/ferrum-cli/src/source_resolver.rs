@@ -33,7 +33,8 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_models::vnext::{
-    huggingface_snapshot_identity, ProductionModelSourceBundle, ProductionWeightArtifact,
+    huggingface_snapshot_identity, open_registered_product_sources, ProductionModelSourceBundle,
+    ProductionWeightArtifact,
 };
 use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
@@ -1051,7 +1052,7 @@ fn open_colocated_product_sources(
         }
         _ => return Ok(None),
     };
-    ProductionModelSourceBundle::open(metadata_root, metadata_root, weights, original_sources)
+    open_registered_product_sources(metadata_root, metadata_root, weights, original_sources)
         .map(Arc::new)
         .map(Some)
 }
@@ -1074,6 +1075,12 @@ pub enum DownloadPolicy {
     AutoDownload,
     /// Error out if not cached.
     NoDownload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductSourceComposition {
+    ResolveColocated,
+    DeferUntilExplicitSemantic,
 }
 
 /// Resolution outcome — a fully-resolved local source plus a flag the
@@ -1194,14 +1201,28 @@ pub async fn resolve_model_source(
     download: DownloadPolicy,
     autosize: Option<(AutoSizeProfile, f32)>,
 ) -> Result<Resolved> {
+    resolve_model_source_internal(
+        model,
+        cache_dir,
+        download,
+        autosize,
+        ProductSourceComposition::ResolveColocated,
+    )
+    .await
+}
+
+async fn resolve_model_source_internal(
+    model: &str,
+    cache_dir: &Path,
+    download: DownloadPolicy,
+    autosize: Option<(AutoSizeProfile, f32)>,
+    source_composition: ProductSourceComposition,
+) -> Result<Resolved> {
+    let defer_colocated_product_sources =
+        source_composition == ProductSourceComposition::DeferUntilExplicitSemantic;
     // 1. Curated GGUF alias. Resolve this before the general HF alias table:
     // a GGUF alias names one exact file, not a safetensors repository.
     if let Some((repo, filename)) = resolve_gguf_alias(model) {
-        let metadata_repo = tokenizer_sibling_repo(&repo).ok_or_else(|| {
-            FerrumError::model(format!(
-                "GGUF repository '{repo}' has no semantic/tokenizer source"
-            ))
-        })?;
         let token = (download == DownloadPolicy::AutoDownload)
             .then(|| {
                 std::env::var("HF_TOKEN")
@@ -1225,39 +1246,49 @@ pub async fn resolve_model_source(
                 )))
             }
         };
-        let (metadata_root, metadata_from_cache) =
-            match find_cached_product_metadata(cache_dir, &metadata_repo) {
-                Some(path) => (path, true),
-                None if download == DownloadPolicy::AutoDownload => {
-                    let downloader =
-                        ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
-                    let path = downloader
-                        .download_sidecar_files(&metadata_repo, None, &PRODUCT_SOURCE_FILES)
-                        .await?;
-                    if !is_complete_product_metadata_snapshot(&path) {
-                        return Err(FerrumError::model(format!(
-                            "semantic/tokenizer source '{metadata_repo}' did not provide config.json and tokenizer.json"
-                        )));
+        let (model_sources, metadata_from_cache) = if defer_colocated_product_sources {
+            (None, true)
+        } else {
+            let metadata_repo = tokenizer_sibling_repo(&repo).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "GGUF repository '{repo}' has no semantic/tokenizer source"
+                ))
+            })?;
+            let (metadata_root, metadata_from_cache) =
+                match find_cached_product_metadata(cache_dir, &metadata_repo) {
+                    Some(path) => (path, true),
+                    None if download == DownloadPolicy::AutoDownload => {
+                        let downloader =
+                            ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
+                        let path = downloader
+                            .download_sidecar_files(&metadata_repo, None, &PRODUCT_SOURCE_FILES)
+                            .await?;
+                        if !is_complete_product_metadata_snapshot(&path) {
+                            return Err(FerrumError::model(format!(
+                                "semantic/tokenizer source '{metadata_repo}' did not provide config.json and tokenizer.json"
+                            )));
+                        }
+                        (path, false)
                     }
-                    (path, false)
-                }
-                None => {
-                    return Err(FerrumError::model(format!(
-                        "semantic/tokenizer source '{metadata_repo}' for GGUF alias '{model}' is not cached and DownloadPolicy::NoDownload is set"
-                    )))
-                }
-            };
-        let metadata_original = repository_source(metadata_repo);
-        let model_sources = Arc::new(ProductionModelSourceBundle::open(
-            &metadata_root,
-            &metadata_root,
-            ProductionWeightArtifact::gguf_file(&local_path),
-            OriginalModelSources {
-                semantic: metadata_original.clone(),
-                tokenizer: metadata_original,
-                weights: repository_source(&repo),
-            },
-        )?);
+                    None => {
+                        return Err(FerrumError::model(format!(
+                            "semantic/tokenizer source '{metadata_repo}' for GGUF alias '{model}' is not cached and DownloadPolicy::NoDownload is set"
+                        )))
+                    }
+                };
+            let metadata_original = repository_source(metadata_repo);
+            let sources = Arc::new(open_registered_product_sources(
+                &metadata_root,
+                &metadata_root,
+                ProductionWeightArtifact::gguf_file(&local_path),
+                OriginalModelSources {
+                    semantic: metadata_original.clone(),
+                    tokenizer: metadata_original,
+                    weights: repository_source(&repo),
+                },
+            )?);
+            (Some(sources), metadata_from_cache)
+        };
         return Ok(finalize_resolution(
             ResolvedModelSource {
                 original: model.to_string(),
@@ -1270,7 +1301,7 @@ pub async fn resolve_model_source(
                 revision: None,
                 cache_dir: Some(cache_dir.display().to_string()),
             },
-            Some(model_sources),
+            model_sources,
             autosize,
         ));
     }
@@ -1285,8 +1316,14 @@ pub async fn resolve_model_source(
             from_cache: false,
         };
         let original_source = ModelSource::Local(model.to_owned());
-        let model_sources = open_colocated_product_sources(&source, &original_source)?;
-        if model_sources.is_none() && direct_gguf_requires_typed_product_sources(&source.local_path)
+        let model_sources = if defer_colocated_product_sources {
+            None
+        } else {
+            open_colocated_product_sources(&source, &original_source)?
+        };
+        if !defer_colocated_product_sources
+            && model_sources.is_none()
+            && direct_gguf_requires_typed_product_sources(&source.local_path)
         {
             return Err(FerrumError::unsupported(format!(
                 "GGUF architecture in '{}' has migrated to the typed vNext product runtime; use a curated GGUF alias or place config.json and tokenizer.json beside the file",
@@ -1313,7 +1350,11 @@ pub async fn resolve_model_source(
                 from_cache: false,
             };
             let original_source = ModelSource::Local(model.to_owned());
-            let model_sources = open_colocated_product_sources(&source, &original_source)?;
+            let model_sources = if defer_colocated_product_sources {
+                None
+            } else {
+                open_colocated_product_sources(&source, &original_source)?
+            };
             return Ok(finalize_resolution(
                 source,
                 original_source,
@@ -1331,7 +1372,11 @@ pub async fn resolve_model_source(
             revision: None,
             cache_dir: Some(cache_dir.display().to_string()),
         };
-        let model_sources = open_colocated_product_sources(&source, &original_source)?;
+        let model_sources = if defer_colocated_product_sources {
+            None
+        } else {
+            open_colocated_product_sources(&source, &original_source)?
+        };
         return Ok(finalize_resolution(
             source,
             original_source,
@@ -1370,7 +1415,11 @@ pub async fn resolve_model_source(
         revision: None,
         cache_dir: Some(cache_dir.display().to_string()),
     };
-    let model_sources = open_colocated_product_sources(&source, &original_source)?;
+    let model_sources = if defer_colocated_product_sources {
+        None
+    } else {
+        open_colocated_product_sources(&source, &original_source)?
+    };
     Ok(finalize_resolution(
         source,
         original_source,
@@ -1390,7 +1439,18 @@ pub async fn resolve_model_source_with_product_sources(
     autosize: Option<(AutoSizeProfile, f32)>,
     source_args: &ProductSourceArgs,
 ) -> Result<Resolved> {
-    let mut resolved = resolve_model_source(model, cache_dir, download, autosize).await?;
+    let mut resolved = resolve_model_source_internal(
+        model,
+        cache_dir,
+        download,
+        autosize,
+        if source_args.semantic_source.is_some() {
+            ProductSourceComposition::DeferUntilExplicitSemantic
+        } else {
+            ProductSourceComposition::ResolveColocated
+        },
+    )
+    .await?;
     resolved.requested_model = model.to_owned();
     apply_explicit_product_sources(resolved, source_args)
 }
@@ -1461,7 +1521,7 @@ fn apply_explicit_product_sources(
             original_product_source(&resolved.original_source, &resolved.source.local_path)
                 .unwrap_or_else(|_| explicit_original(weights.path()))
         });
-    resolved.model_sources = Some(Arc::new(ProductionModelSourceBundle::open(
+    resolved.model_sources = Some(Arc::new(open_registered_product_sources(
         semantic_root,
         tokenizer_root,
         weights,
@@ -1521,11 +1581,104 @@ mod tests {
         dir
     }
 
+    fn qwen35_semantic_config(moe: bool) -> String {
+        let mut text = serde_json::json!({
+            "model_type": if moe { "qwen3_5_moe_text" } else { "qwen3_5_text" },
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 2,
+            "mamba_ssm_dtype": "float32",
+            "head_dim": 4,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 128,
+            "vocab_size": 32,
+            "rms_norm_eps": 0.000001,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 1.0,
+                "mrope_interleaved": false
+            }
+        });
+        let text = text.as_object_mut().unwrap();
+        if moe {
+            text.insert("num_experts".to_owned(), serde_json::json!(4));
+            text.insert("num_experts_per_tok".to_owned(), serde_json::json!(2));
+            text.insert("moe_intermediate_size".to_owned(), serde_json::json!(8));
+            text.insert(
+                "shared_expert_intermediate_size".to_owned(),
+                serde_json::json!(8),
+            );
+        } else {
+            text.insert("intermediate_size".to_owned(), serde_json::json!(32));
+        }
+        serde_json::json!({
+            "architectures": [if moe {
+                "Qwen3_5MoeForConditionalGeneration"
+            } else {
+                "Qwen3_5ForConditionalGeneration"
+            }],
+            "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5" },
+            "text_config": text,
+            "tie_word_embeddings": false
+        })
+        .to_string()
+    }
+
     fn value(entries: &[RuntimeConfigEntry], key: &str) -> Option<String> {
         entries
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.effective_value.clone())
+    }
+
+    #[tokio::test]
+    async fn explicit_semantic_preflight_rejects_before_weight_binding() {
+        let weights = temp_model_dir(
+            "preflight-weights",
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"]}"#,
+        );
+        std::fs::write(weights.join("model.safetensors"), []).unwrap();
+        let semantic = temp_model_dir(
+            "preflight-semantic",
+            r#"{
+                "architectures":["Qwen3_5MoeForConditionalGeneration"],
+                "model_type":"qwen3_5_moe",
+                "text_config":{"model_type":"unsupported_nested_layout"}
+            }"#,
+        );
+        let args = ProductSourceArgs {
+            semantic_source: Some(semantic.clone()),
+            tokenizer_source: None,
+        };
+
+        let error = resolve_model_source_with_product_sources(
+            weights.to_str().unwrap(),
+            &weights.join("unused-cache"),
+            DownloadPolicy::NoDownload,
+            None,
+            &args,
+        )
+        .await
+        .err()
+        .expect("invalid semantic layout must fail before weight binding")
+        .to_string();
+
+        assert!(
+            error.contains("unsupported Qwen3.5 text model_type"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("source manifest file is missing or empty"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(weights);
+        let _ = std::fs::remove_dir_all(semantic);
     }
 
     #[test]
@@ -1561,10 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_local_model_directory_with_stable_product_id() {
-        let dir = temp_model_dir(
-            "local-product-id",
-            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
-        );
+        let config = qwen35_semantic_config(false);
+        let dir = temp_model_dir("local-product-id", &config);
         std::fs::write(dir.join("model.safetensors"), b"fixture-weights").unwrap();
 
         let resolved = resolve_model_source(
@@ -1602,10 +1753,8 @@ mod tests {
             r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"quantization_config":{"quant_method":"gptq"}}"#,
         );
         std::fs::write(weights.join("model.safetensors"), b"fixture-weights").unwrap();
-        let semantic = temp_model_dir(
-            "explicit-role-semantic",
-            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"model_type":"qwen3_5_moe"}"#,
-        );
+        let semantic_config = qwen35_semantic_config(true);
+        let semantic = temp_model_dir("explicit-role-semantic", &semantic_config);
         std::fs::write(
             semantic.join("tokenizer_config.json"),
             br#"{"chat_template":"fixture"}"#,
@@ -1672,10 +1821,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_direct_gguf_package_with_file_stem_product_id() {
-        let dir = temp_model_dir(
-            "direct-gguf-package",
-            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
-        );
+        let config = qwen35_semantic_config(false);
+        let dir = temp_model_dir("direct-gguf-package", &config);
         let gguf = dir.join("Qwen3.5-4B-Instruct-Q4_K_M.gguf");
         std::fs::write(&gguf, b"fixture-gguf").unwrap();
 

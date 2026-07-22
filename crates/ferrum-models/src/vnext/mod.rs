@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     AttributeId, ElementType, ExternalModelMetadataId, ModelFamilyRegistration,
-    ModelFamilyRegistry, PreparedModelFamily, ProgramNode, SemanticValue, StateCapacityDemand,
-    StateLifetime, TypedFamilyRegistration, WeightComponentSource,
-    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    ModelFamilyRegistry, ModelSourceKind, OriginalModelSource, OriginalModelSources,
+    PreparedModelFamily, ProgramNode, SemanticValue, StateCapacityDemand, StateLifetime,
+    TypedFamilyRegistration, WeightComponentSource, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 use ferrum_types::{
     DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelType, MoeCapabilities,
@@ -29,6 +29,7 @@ pub use source::{
 
 type PrepareModel =
     fn(Arc<ProductionModelSourceBundle>) -> ferrum_types::Result<PreparedProductionModel>;
+type ValidateSemanticConfig = fn(&ExternalModelMetadataId, &[u8]) -> ferrum_types::Result<()>;
 type CreateFamilyRegistration = fn() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>>;
 
 struct ModelLoaderRegistration {
@@ -36,6 +37,7 @@ struct ModelLoaderRegistration {
     gguf_architectures: &'static [&'static str],
     execution_kind: ProductionExecutionKind,
     allows_legacy_reference: bool,
+    validate_semantic_config: ValidateSemanticConfig,
     prepare: PrepareModel,
     create_family_registration: CreateFamilyRegistration,
 }
@@ -48,6 +50,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
     gguf_architectures: &["qwen35", "qwen35moe"],
     execution_kind: ProductionExecutionKind::CausalLanguage,
     allows_legacy_reference: cfg!(any(test, feature = "test-support")),
+    validate_semantic_config: qwen35::validate_semantic_config,
     prepare: qwen35::prepare_from_sources,
     create_family_registration: qwen35_family_registration,
 }];
@@ -584,16 +587,33 @@ impl RegisteredProductionModel {
         self.registration.execution_kind
     }
 
-    pub fn prepare(&self, model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
-        let current = external_metadata_id_from_model_dir(model_dir)?;
+    pub fn validate_semantic_config(&self, raw: &[u8]) -> ferrum_types::Result<()> {
+        let current = external_metadata_id_from_bytes(raw, "config.json")?;
         if current != self.external_metadata_id {
             return Err(ferrum_types::FerrumError::model(format!(
-                "model metadata identity changed between registration and preparation: expected {} got {}",
+                "model metadata identity changed between registration and semantic preflight: expected {} got {}",
                 self.external_metadata_id, current
             )));
         }
-        let sources = Arc::new(ProductionModelSourceBundle::open_colocated_safetensors(
+        (self.registration.validate_semantic_config)(&self.external_metadata_id, raw)
+    }
+
+    pub fn prepare(&self, model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
+        let original = OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: model_dir.display().to_string(),
+            requested_revision: None,
+        };
+        let sources = Arc::new(ProductionModelSourceBundle::open_with_semantic_preflight(
             model_dir,
+            model_dir,
+            ProductionWeightArtifact::safetensors_directory(model_dir),
+            OriginalModelSources {
+                semantic: original.clone(),
+                tokenizer: original.clone(),
+                weights: original,
+            },
+            |raw| self.validate_semantic_config(raw),
         )?);
         self.prepare_from_sources(sources)
     }
@@ -602,13 +622,7 @@ impl RegisteredProductionModel {
         &self,
         sources: Arc<ProductionModelSourceBundle>,
     ) -> ferrum_types::Result<PreparedProductionModel> {
-        let current = external_metadata_id_from_bytes(sources.config_json(), "config.json")?;
-        if current != self.external_metadata_id {
-            return Err(ferrum_types::FerrumError::model(format!(
-                "model metadata identity changed between registration and preparation: expected {} got {}",
-                self.external_metadata_id, current
-            )));
-        }
+        self.validate_semantic_config(sources.config_json())?;
         let prepared = (self.registration.prepare)(sources)?;
         if prepared.family().external_metadata_id() != &self.external_metadata_id {
             return Err(ferrum_types::FerrumError::model(format!(
@@ -663,6 +677,24 @@ impl ProductionModelRegistration {
         }
     }
 
+    fn validate_semantic_config(&self, raw: &[u8]) -> ferrum_types::Result<()> {
+        match self {
+            Self::Registered(registration) => registration.validate_semantic_config(raw),
+            Self::LegacyRegistered {
+                external_metadata_id,
+                ..
+            } => {
+                let current = external_metadata_id_from_bytes(raw, "config.json")?;
+                if &current != external_metadata_id {
+                    return Err(ferrum_types::FerrumError::model(format!(
+                        "model metadata identity changed during semantic preflight: expected {external_metadata_id} got {current}"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Requires a registered vNext production package and fails closed instead
     /// of allowing a product caller to fall back to a legacy executor.
     pub fn into_required(self) -> ferrum_types::Result<RegisteredProductionModel> {
@@ -676,6 +708,54 @@ impl ProductionModelRegistration {
             ))),
         }
     }
+}
+
+/// Resolves and validates one semantic config without accessing its physical
+/// weight source. Family-specific validation is supplied by the same registry
+/// row that owns preparation, so product composition has no model-name switch.
+pub fn validate_registered_model_semantics(raw: &[u8]) -> ferrum_types::Result<()> {
+    let external_metadata_id = external_metadata_id_from_bytes(raw, "config.json")?;
+    let registration = resolve_registered_model(external_metadata_id)?;
+    registration.validate_semantic_config(raw)
+}
+
+/// Product source constructor with a hard semantic-before-weights ordering.
+/// The exact config bytes validated by the registry are retained in the
+/// returned immutable bundle.
+pub fn open_registered_product_sources(
+    semantic_root: impl AsRef<Path>,
+    tokenizer_root: impl AsRef<Path>,
+    weights: ProductionWeightArtifact,
+    original_sources: OriginalModelSources,
+) -> ferrum_types::Result<ProductionModelSourceBundle> {
+    ProductionModelSourceBundle::open_with_semantic_preflight(
+        semantic_root,
+        tokenizer_root,
+        weights,
+        original_sources,
+        validate_registered_model_semantics,
+    )
+}
+
+pub fn open_registered_colocated_safetensors(
+    model_dir: impl AsRef<Path>,
+) -> ferrum_types::Result<ProductionModelSourceBundle> {
+    let model_dir = model_dir.as_ref();
+    let original = OriginalModelSource {
+        kind: ModelSourceKind::LocalDirectory,
+        location: model_dir.display().to_string(),
+        requested_revision: None,
+    };
+    open_registered_product_sources(
+        model_dir,
+        model_dir,
+        ProductionWeightArtifact::safetensors_directory(model_dir),
+        OriginalModelSources {
+            semantic: original.clone(),
+            tokenizer: original.clone(),
+            weights: original,
+        },
+    )
 }
 
 pub fn resolve_registered_model_from_dir(
@@ -892,6 +972,71 @@ mod tests {
             error.contains("implicit architecture fallback is forbidden"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn registered_source_open_rejects_nested_layout_before_weight_resolution() {
+        let semantic = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        fs::write(
+            semantic.path().join("config.json"),
+            r#"{
+                "architectures":["Qwen3_5MoeForConditionalGeneration"],
+                "model_type":"qwen3_5_moe",
+                "text_config":{"model_type":"unsupported_nested_layout"}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            tokenizer.path().join("tokenizer.json"),
+            br#"{"version":"1.0"}"#,
+        )
+        .unwrap();
+        let original = OriginalModelSource {
+            kind: ModelSourceKind::LocalDirectory,
+            location: "fixture".to_owned(),
+            requested_revision: None,
+        };
+
+        let error = open_registered_product_sources(
+            semantic.path(),
+            tokenizer.path(),
+            ProductionWeightArtifact::safetensors_directory(
+                semantic.path().join("missing-weight-root"),
+            ),
+            OriginalModelSources {
+                semantic: original.clone(),
+                tokenizer: original.clone(),
+                weights: original,
+            },
+        )
+        .expect_err("invalid nested semantics must fail before resolving weights")
+        .to_string();
+
+        assert!(
+            error.contains("unsupported Qwen3.5 text model_type"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("weight source is not a directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn registered_semantic_preflight_accepts_reference_dense_and_moe_configs() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../docs/goals/model-coverage-2026-06-12/artifacts/\
+             w3_hf_config_probe_20260617T131209Z_f97c1d6f",
+        );
+        for name in [
+            "dense_min_reference.config.json",
+            "moe_shared_expert_reference.config.json",
+        ] {
+            let raw = fs::read(root.join(name)).unwrap();
+            validate_registered_model_semantics(&raw)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
     }
 
     #[test]

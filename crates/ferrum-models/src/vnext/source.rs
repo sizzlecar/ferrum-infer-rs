@@ -12,7 +12,6 @@ use ferrum_interfaces::vnext::{
 use ferrum_types::{FerrumError, Result};
 use sha2::{Digest, Sha256};
 
-const SEMANTIC_FILES: &[&str] = &["config.json"];
 const TOKENIZER_REQUIRED_FILES: &[&str] = &["tokenizer.json"];
 const TOKENIZER_OPTIONAL_FILES: &[&str] = &[
     "tokenizer_config.json",
@@ -119,11 +118,33 @@ impl ProductionModelSourceBundle {
         weights: ProductionWeightArtifact,
         original_sources: OriginalModelSources,
     ) -> Result<Self> {
+        Self::open_with_semantic_preflight(
+            semantic_root,
+            tokenizer_root,
+            weights,
+            original_sources,
+            |_| Ok(()),
+        )
+    }
+
+    /// Opens one immutable role-specific bundle after validating the exact
+    /// semantic bytes retained by the bundle. The preflight runs before the
+    /// weight path is normalized, listed, fingerprinted, or opened.
+    pub(super) fn open_with_semantic_preflight(
+        semantic_root: impl AsRef<Path>,
+        tokenizer_root: impl AsRef<Path>,
+        weights: ProductionWeightArtifact,
+        original_sources: OriginalModelSources,
+        semantic_preflight: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<Self> {
         let semantic_root = canonical_directory(semantic_root.as_ref(), "semantic source")?;
+        let config_json = read_required_file(&semantic_root.join("config.json"))?;
+        semantic_preflight(&config_json)?;
+
         let tokenizer_root = canonical_directory(tokenizer_root.as_ref(), "tokenizer source")?;
         let weights = normalize_weight_artifact(weights)?;
 
-        let semantic_files = fingerprint_named_files(&semantic_root, SEMANTIC_FILES, &[])?;
+        let semantic_files = vec![fingerprint_loaded_file("config.json", &config_json)?];
         let tokenizer_files = fingerprint_named_files(
             &tokenizer_root,
             TOKENIZER_REQUIRED_FILES,
@@ -131,7 +152,6 @@ impl ProductionModelSourceBundle {
         )?;
         let weight_files = fingerprint_weight_artifact(&weights)?;
 
-        let config_json = read_required_file(&semantic_root.join("config.json"))?;
         let weight_config_json = match &weights {
             ProductionWeightArtifact::SafetensorsDirectory(root) => {
                 read_optional_file(&root.join("config.json"))?
@@ -465,6 +485,26 @@ fn fingerprint_file(root: &Path, relative_path: &str) -> Result<FileFingerprint>
     })
 }
 
+fn fingerprint_loaded_file(relative_path: &str, bytes: &[u8]) -> Result<FileFingerprint> {
+    if !portable_relative_path(relative_path) {
+        return Err(FerrumError::model(format!(
+            "source manifest path is not portable: {relative_path:?}"
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(FerrumError::model(format!(
+            "source manifest file is empty: {relative_path}"
+        )));
+    }
+    let size_bytes = u64::try_from(bytes.len())
+        .map_err(|_| FerrumError::internal("source file size exceeds u64"))?;
+    Ok(FileFingerprint {
+        relative_path: relative_path.to_owned(),
+        size_bytes,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
 fn trusted_hf_blob_sha256(path: &Path) -> Option<String> {
     let mut entry = path.to_path_buf();
     for _ in 0..8 {
@@ -709,6 +749,51 @@ mod tests {
             .fingerprint(ModelArtifactSourceRole::Weights, "model.safetensors")
             .is_some());
         assert_eq!(bundle.weight_payload_bytes().unwrap(), 15);
+    }
+
+    #[test]
+    fn semantic_preflight_fingerprint_and_retained_bytes_are_atomic() {
+        let root = tempfile::tempdir().unwrap();
+        let semantic = root.path().join("semantic");
+        let tokenizer = root.path().join("tokenizer");
+        let weights = root.path().join("weights");
+        std::fs::create_dir_all(&semantic).unwrap();
+        std::fs::create_dir_all(&tokenizer).unwrap();
+        std::fs::create_dir_all(&weights).unwrap();
+        let original_config = br#"{"architectures":["Original"]}"#;
+        std::fs::write(semantic.join("config.json"), original_config).unwrap();
+        std::fs::write(tokenizer.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(weights.join("model.safetensors"), b"fixture-weights").unwrap();
+
+        let bundle = ProductionModelSourceBundle::open_with_semantic_preflight(
+            &semantic,
+            &tokenizer,
+            ProductionWeightArtifact::safetensors_directory(&weights),
+            OriginalModelSources {
+                semantic: original(ModelSourceKind::LocalDirectory, "semantic-input"),
+                tokenizer: original(ModelSourceKind::LocalDirectory, "tokenizer-input"),
+                weights: original(ModelSourceKind::LocalDirectory, "weights-input"),
+            },
+            |raw| {
+                assert_eq!(raw, original_config);
+                std::fs::write(
+                    semantic.join("config.json"),
+                    br#"{"architectures":["Mutated"]}"#,
+                )
+                .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.config_json(), original_config);
+        assert_eq!(
+            bundle
+                .fingerprint(ModelArtifactSourceRole::Semantic, "config.json")
+                .unwrap()
+                .sha256,
+            format!("{:x}", Sha256::digest(original_config))
+        );
     }
 
     #[test]
