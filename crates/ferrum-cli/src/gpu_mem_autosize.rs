@@ -411,7 +411,6 @@ const CHAT_PRESETS: &[(usize, usize)] = &[
 
 const TIGHT_RECURRENT_STATE_SERVER_PRESETS: &[(usize, usize)] =
     &[(16, 512), (8, 512), (4, 512), (1, 512)];
-const TIGHT_RECURRENT_STATE_CHAT_PRESETS: &[(usize, usize)] = &[(2, 512), (1, 512)];
 
 fn model_auto_size_defaults(
     model_class: ModelAutoSizeClass,
@@ -427,7 +426,11 @@ fn model_auto_size_defaults(
         }
         (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
             max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
-            presets: TIGHT_RECURRENT_STATE_CHAT_PRESETS,
+            // Recurrent scratch pressure constrains aggregate prefill, not the
+            // logical per-sequence block table. Chat can use the dynamic KV
+            // pool's full context ladder without reserving that capacity for
+            // every sequence up front.
+            presets: CHAT_PRESETS,
             kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
         },
         (ModelAutoSizeClass::Generic, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
@@ -774,8 +777,13 @@ mod tests {
 
         let chat = model_auto_size_defaults(class, AutoSizeProfile::Chat);
         assert_eq!(
+            chat.max_batched_tokens,
+            TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(chat.kv_block_floor, TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR);
+        assert_eq!(
             select_paged_pool_preset(chat.presets, chat.kv_block_floor),
-            (2, 512)
+            (2, 4096)
         );
     }
 
