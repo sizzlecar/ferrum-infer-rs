@@ -9326,6 +9326,10 @@ def self_test() -> int:
         for receipt_path in execution_root.rglob("*process-receipt.json"):
             require(hostile_key not in receipt_path.read_text(encoding="utf-8"), f"hostile environment leaked into {receipt_path}")
         for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
+            require(
+                preset_values(model_key, "P_THINKING")["max_tokens"] == 4096,
+                f"{model_key} C19 thinking correctness budget must be 4096",
+            )
             modes = {
                 row["variant"]
                 for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
@@ -9388,6 +9392,19 @@ def self_test() -> int:
                     thinking_reasoning_expected(model_key, variant) is (expected_override is not False),
                     f"{model_key} {variant} reasoning oracle differs from hard-toggle precedence",
                 )
+
+            c08_case = {
+                **next(
+                    row
+                    for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                    if row["scenario_id"] == "C08" and row["variant"] == "max-tokens"
+                ),
+                "model_key": model_key,
+            }
+            require(
+                case_http_payload(c08_case, model_key).get("max_tokens") == 8,
+                f"{model_key} C08 serve explicit max-token budget lost precedence",
+            )
 
         m3_c19_rows = [
             row
