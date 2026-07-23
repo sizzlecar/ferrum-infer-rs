@@ -451,9 +451,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .transpose()?
         .flatten();
     let vnext_plan_owns_context_capacity = prepared_model.is_some();
-    let model_chat_template = match model_sources.as_deref() {
-        Some(sources) => crate::source_resolver::load_product_chat_template(sources),
-        None => crate::source_resolver::load_model_chat_template(&source.local_path),
+    let model_chat_template = match prepared_model.as_deref() {
+        Some(prepared) => Some(crate::source_resolver::load_prepared_product_chat_template(
+            prepared,
+        )?),
+        None => match model_sources.as_deref() {
+            Some(sources) => crate::source_resolver::load_product_chat_template(sources),
+            None => crate::source_resolver::load_model_chat_template(&source.local_path),
+        },
     };
     let product_source_identity = prepared_model
         .as_deref()

@@ -796,6 +796,46 @@ pub fn load_product_chat_template(
     })
 }
 
+fn load_product_chat_template_source(
+    sources: &ProductionModelSourceBundle,
+    source_file: &str,
+) -> Option<ModelChatTemplate> {
+    let origin = sources.tokenizer_root().join(source_file);
+    match source_file {
+        "tokenizer_config.json" => sources
+            .tokenizer_config_json()
+            .and_then(|bytes| tokenizer_config_template_bytes(bytes, origin.display().to_string())),
+        "chat_template.json" => sources
+            .chat_template_json()
+            .and_then(|bytes| template_json_bytes(bytes, origin.display().to_string())),
+        "chat_template.jinja" => sources.chat_template_jinja().and_then(|bytes| {
+            let template = std::str::from_utf8(bytes).ok()?;
+            (!template.trim().is_empty())
+                .then(|| ModelChatTemplate::new(template.to_owned(), origin.display().to_string()))
+        }),
+        _ => None,
+    }
+}
+
+pub fn load_prepared_product_chat_template(
+    prepared: &ferrum_models::vnext::PreparedProductionModel,
+) -> Result<ModelChatTemplate> {
+    let metadata = &prepared.family().metadata().template;
+    let selected = load_product_chat_template_source(prepared.sources(), &metadata.source_file)
+        .ok_or_else(|| {
+            FerrumError::model(format!(
+                "typed product chat template source is unavailable: {}",
+                metadata.source_file
+            ))
+        })?;
+    if selected.template != metadata.template {
+        return Err(FerrumError::model(
+            "typed product chat template bytes differ from the prepared family",
+        ));
+    }
+    Ok(selected)
+}
+
 fn read_template_json(path: &Path) -> Option<ModelChatTemplate> {
     let bytes = std::fs::read(path).ok()?;
     template_json_bytes(&bytes, path.display().to_string())
@@ -2342,6 +2382,28 @@ mod tests {
         let template = load_product_chat_template(&bundle).unwrap();
         assert_eq!(template.template, "original-template");
         assert_eq!(template.eos_token.as_deref(), Some("</s>"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typed_template_source_ignores_unselected_duplicate() {
+        let dir = temp_model_dir(
+            "typed-template-source",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        );
+        std::fs::write(dir.join("model.safetensors"), b"fixture-weights").unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"typed-template","eos_token":"</s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "unselected-template").unwrap();
+        let bundle = ProductionModelSourceBundle::open_colocated_safetensors(&dir).unwrap();
+
+        let template = load_product_chat_template_source(&bundle, "tokenizer_config.json").unwrap();
+        assert_eq!(template.template, "typed-template");
+        assert_eq!(template.eos_token.as_deref(), Some("</s>"));
+        assert!(template.source.ends_with("tokenizer_config.json"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
