@@ -5,7 +5,15 @@
       "id": "engine_shared_runtime",
       "changed_files": ["crates/ferrum-engine/src/continuous_engine/inner/batch.rs"],
       "expect_domains": ["shared_runtime"],
-      "expect_required_gates": ["unit", "resource_invariant", "metal_sentinel", "cuda_sentinel"]
+      "expect_required_gates": ["unit", "resource_invariant", "metal_sentinel", "cuda_sentinel"],
+      "expect_required_scenarios": [
+        "run_multiturn_recall",
+        "serve_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_tool_call",
+        "serve_structured_output",
+        "serve_concurrency_quality"
+      ]
     },
     {
       "id": "scheduler_shared_runtime",
@@ -18,6 +26,24 @@
       "changed_files": ["crates/ferrum-types/src/auto_config.rs"],
       "expect_domains": ["shared_runtime", "runtime_preset"],
       "expect_required_gates": ["preset_snapshot", "metal_sentinel", "cuda_sentinel"]
+    },
+    {
+      "id": "api_request_contract",
+      "changed_files": ["crates/ferrum-types/src/requests.rs"],
+      "expect_domains": ["api_contract", "tool_protocol", "structured_output"],
+      "expect_required_gates": [
+        "run_scenarios_selftest",
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "product_sentinel"
+      ],
+      "expect_required_scenarios": [
+        "run_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_tool_call",
+        "serve_structured_output"
+      ]
     },
     {
       "id": "kv_manager",

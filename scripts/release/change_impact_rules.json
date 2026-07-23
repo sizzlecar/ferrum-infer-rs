@@ -13,6 +13,14 @@
         "metal_sentinel",
         "cuda_sentinel"
       ],
+      "required_scenarios": [
+        "run_multiturn_recall",
+        "serve_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_tool_call",
+        "serve_structured_output",
+        "serve_concurrency_quality"
+      ],
       "release_invalidation": [
         "unit",
         "resource_invariant",
@@ -98,6 +106,37 @@
       "exceptions": [],
       "owner": "runtime",
       "reason": "runtime preset and config changes select backend behavior"
+    },
+    {
+      "id": "types-api-request-contract",
+      "path_globs": ["crates/ferrum-types/src/requests.rs"],
+      "domains": ["api_contract", "tool_protocol", "structured_output"],
+      "required_gates": [
+        "unit",
+        "run_scenarios_selftest",
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "product_sentinel"
+      ],
+      "required_scenarios": [
+        "run_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_tool_call",
+        "serve_structured_output"
+      ],
+      "release_invalidation": [
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "product_sentinel",
+        "metal_full",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "api-contract",
+      "reason": "typed request, tool protocol, and structured-output changes affect both product entrypoints and every shipped backend"
     },
     {
       "id": "evidence-schema",
