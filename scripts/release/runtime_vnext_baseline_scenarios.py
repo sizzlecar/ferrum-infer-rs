@@ -71,6 +71,8 @@ CANDIDATE_PASS_PREFIX = "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS"
 C09_DIAGNOSTIC_KEEP_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC KEEP"
 C09_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC REJECT"
+FOCUSED_DIAGNOSTIC_KEEP_PREFIX = "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP"
+FOCUSED_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC REJECT"
 SCHEMA_VERSION = 1
 LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
@@ -3398,6 +3400,41 @@ def select_c09_diagnostic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
     return selected
 
 
+def select_focused_rows(
+    rows: list[dict[str, Any]],
+    *,
+    case_ids: list[str],
+    scenario_ids: list[str],
+) -> list[dict[str, Any]]:
+    requested_cases = set(case_ids)
+    requested_scenarios = set(scenario_ids)
+    require(
+        len(requested_cases) == len(case_ids),
+        "--focus-case contains duplicate case ids",
+    )
+    require(
+        len(requested_scenarios) == len(scenario_ids),
+        "--focus-scenario contains duplicate scenario ids",
+    )
+    available_cases = {str(row["case_id"]) for row in rows}
+    available_scenarios = {str(row["scenario_id"]) for row in rows}
+    missing_cases = sorted(requested_cases - available_cases)
+    missing_scenarios = sorted(requested_scenarios - available_scenarios)
+    require(not missing_cases, f"--focus-case did not match canonical cases: {missing_cases}")
+    require(
+        not missing_scenarios,
+        f"--focus-scenario did not match canonical scenarios: {missing_scenarios}",
+    )
+    selected = [
+        row
+        for row in rows
+        if row["case_id"] in requested_cases
+        or row["scenario_id"] in requested_scenarios
+    ]
+    require(selected, "focused execution selected zero cases")
+    return selected
+
+
 def preset_values(model_key: str, preset: str | None) -> dict[str, Any]:
     if preset is None:
         return {}
@@ -6712,11 +6749,20 @@ def execute_manifest(
     discover: bool,
     discovery_scenario: str | None = None,
     diagnose_c09: bool = False,
+    focus_case_ids: list[str] | None = None,
+    focus_scenario_ids: list[str] | None = None,
     allow_internal_fixture: bool = False,
 ) -> dict[str, Any]:
+    focus_case_ids = list(focus_case_ids or [])
+    focus_scenario_ids = list(focus_scenario_ids or [])
+    focused = bool(focus_case_ids or focus_scenario_ids)
     require(discovery_scenario is None or discover, "scenario-scoped execution is allowed only in discovery mode")
     require(discovery_scenario in {None, "C03"}, "only the versioned C03 contract supports scoped discovery")
     require(not (diagnose_c09 and discover), "C09 diagnostic and discovery modes are mutually exclusive")
+    require(
+        not (focused and (diagnose_c09 or discover)),
+        "focused execution, C09 diagnostic, and discovery modes are mutually exclusive",
+    )
     root = root.resolve()
     out = out.resolve()
     validated = validate_execution_manifest(
@@ -6760,6 +6806,12 @@ def execute_manifest(
         require(len(rows) == 10, "scoped C03 discovery must execute the complete 10-case contract")
     elif diagnose_c09:
         rows = select_c09_diagnostic_rows(rows)
+    elif focused:
+        rows = select_focused_rows(
+            rows,
+            case_ids=focus_case_ids,
+            scenario_ids=focus_scenario_ids,
+        )
     unresolved = [row for row in rows if row["expectation"]["expected_status"] == "discovery-required"]
     if unresolved and not discover:
         raise ScenarioError(f"canonical collection refused: {len(unresolved)} cases remain discovery-required; run --discover first")
@@ -6793,6 +6845,16 @@ def execute_manifest(
             *(["--discover"] if discover else []),
             *(["--discover-scenario", discovery_scenario] if discovery_scenario is not None else []),
             *(["--diagnose-c09"] if diagnose_c09 else []),
+            *[
+                item
+                for case_id in focus_case_ids
+                for item in ("--focus-case", case_id)
+            ],
+            *[
+                item
+                for scenario_id in focus_scenario_ids
+                for item in ("--focus-scenario", scenario_id)
+            ],
         ]
         if allow_internal_fixture
         else [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
@@ -6803,6 +6865,8 @@ def execute_manifest(
         require(("--discover" in invocation_argv) is discover, "canonical executor mode differs from actual invocation argv")
         require(("--discover-scenario" in invocation_argv) is (discovery_scenario is not None), "canonical executor discovery scope differs from actual invocation argv")
         require(("--diagnose-c09" in invocation_argv) is diagnose_c09, "canonical executor C09 diagnostic scope differs from actual invocation argv")
+        require(("--focus-case" in invocation_argv) is bool(focus_case_ids), "canonical executor case focus differs from actual invocation argv")
+        require(("--focus-scenario" in invocation_argv) is bool(focus_scenario_ids), "canonical executor scenario focus differs from actual invocation argv")
     invocation_process_receipt = capture_process_receipt(
         root,
         executor_root / "scenario-executor-process-receipt.json",
@@ -6826,6 +6890,8 @@ def execute_manifest(
         "mode": (
             "c09-diagnostic"
             if diagnose_c09
+            else "focused-diagnostic"
+            if focused
             else "discover"
             if discover
             else "canonical"
@@ -6968,7 +7034,7 @@ def execute_manifest(
             }
             for row in rows
         ]
-        if contract == G08_EXECUTION_CONTRACT and not diagnose_c09:
+        if contract == G08_EXECUTION_CONTRACT and not diagnose_c09 and not focused:
             grouped_run_rows: dict[tuple[str, ...], list[dict[str, Any]]] = {}
             serve_rows: list[dict[str, Any]] = []
             for row in bound_rows:
@@ -7416,6 +7482,97 @@ def execute_manifest(
             ),
         }
         return discovery
+    if focused:
+        selected_cases = [
+            case
+            for scenario_id in SCENARIO_IDS
+            for case in case_results[scenario_id]
+        ]
+        require(
+            len(selected_cases) == len(rows),
+            "focused execution did not persist exactly one result per selected case",
+        )
+        status_counts: dict[str, int] = {}
+        for case in selected_cases:
+            status = require_string(
+                require_object(
+                    case.get("observed_outcome"),
+                    f"{case['case_id']}.observed_outcome",
+                ).get("status"),
+                f"{case['case_id']}.observed_outcome.status",
+            )
+            status_counts[status] = status_counts.get(status, 0) + 1
+        diagnostic = {
+            **{
+                key: manifest[key]
+                for key in (
+                    "source_git_sha",
+                    "source_tree_sha",
+                    "dirty_status",
+                    "models_lock_sha256",
+                    "binary_sha256",
+                    "model_key",
+                    "backend",
+                    "model_revision",
+                    "model_files",
+                    "hardware_id",
+                    "binary_artifact",
+                    "models_lock",
+                    "effective_config",
+                )
+            },
+            "schema_version": SCHEMA_VERSION,
+            "artifact_kind": "runtime-vnext-focused-diagnostic",
+            "execution_contract": contract,
+            "status": "pass",
+            "decision": "KEEP",
+            "formal_pass_allowed": False,
+            "model_path": execution["model_arg"],
+            "runner": (
+                internal_fixture_runner_identity()
+                if allow_internal_fixture
+                else canonical_runner_identity()
+            ),
+            "expectations_catalog_sha256": expectations_sha,
+            "expectations_catalog": existing_artifact_ref(
+                root,
+                expectations_path,
+                "raw-json",
+            ),
+            "executor_invocation": existing_artifact_ref(
+                root,
+                invocation_path,
+                "raw-json",
+            ),
+            "scope": {
+                "kind": "focused-diagnostic",
+                "requested_case_ids": focus_case_ids,
+                "requested_scenario_ids": focus_scenario_ids,
+                "selected_case_ids": [case["case_id"] for case in selected_cases],
+                "selected_scenario_ids": sorted(
+                    {case["scenario_id"] for case in selected_cases}
+                ),
+                "case_count": len(selected_cases),
+                "canonical_case_count": len(
+                    planned_case_rows(
+                        manifest["model_key"],
+                        manifest["backend"],
+                        catalog,
+                    )
+                ),
+            },
+            "observed_status_counts": dict(sorted(status_counts.items())),
+            "cases": [
+                ref
+                for scenario_id in SCENARIO_IDS
+                for ref in case_refs_by_scenario[scenario_id]
+            ],
+            "artifact_path": str(out),
+            "pass_line": f"{FOCUSED_DIAGNOSTIC_KEEP_PREFIX}: {out}",
+        }
+        if contract == G08_EXECUTION_CONTRACT:
+            diagnostic["binary_build_receipt"] = manifest["binary_build_receipt"]
+        return diagnostic
     require(serve_sessions, f"canonical serve session unavailable: {server_error}")
     require(len(serve_sessions) == 2, "canonical serve collection must isolate post-C09 scenarios in a second server session")
     if contract == G08_EXECUTION_CONTRACT:
@@ -9562,6 +9719,42 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
 
 def self_test() -> int:
     validate_c17_markers()
+    focus_fixture_rows = [
+        {"case_id": "c01-001", "scenario_id": "C01"},
+        {"case_id": "c01-002", "scenario_id": "C01"},
+        {"case_id": "c11-001", "scenario_id": "C11"},
+    ]
+    focused_rows = select_focused_rows(
+        focus_fixture_rows,
+        case_ids=["c11-001"],
+        scenario_ids=["C01"],
+    )
+    require(
+        [row["case_id"] for row in focused_rows]
+        == ["c01-001", "c01-002", "c11-001"],
+        "focused selector must preserve canonical row order and union case/scenario scope",
+    )
+    for invalid_cases, invalid_scenarios, marker in (
+        (["c11-001", "c11-001"], [], "duplicate case"),
+        ([], ["C01", "C01"], "duplicate scenario"),
+        (["c21-999"], [], "did not match canonical cases"),
+        ([], ["C21"], "did not match canonical scenarios"),
+    ):
+        try:
+            select_focused_rows(
+                focus_fixture_rows,
+                case_ids=invalid_cases,
+                scenario_ids=invalid_scenarios,
+            )
+        except ScenarioError as exc:
+            require(
+                marker in str(exc),
+                f"focused selector rejected invalid scope for unexpected reason: {exc}",
+            )
+        else:
+            raise AssertionError(
+                f"focused selector accepted invalid scope: {invalid_cases}/{invalid_scenarios}"
+            )
 
     def c09_fixture_request_rows(
         request_id: str,
@@ -10242,6 +10435,51 @@ def self_test() -> int:
         else:
             raise AssertionError("execution manifest accepted mutated model bytes")
         fixture_weight.write_bytes(fixture_weight_bytes)
+
+        focused_root = Path(tmp) / "focused-execution-artifacts"
+        focused_root.mkdir()
+        focused_manifest = make_execution_fixture_manifest(focused_root)
+        focused_out = focused_root / "focused-report.json"
+        focused_report = execute_manifest(
+            focused_manifest,
+            focused_root,
+            focused_out,
+            discover=False,
+            focus_case_ids=["c11-001"],
+            allow_internal_fixture=True,
+        )
+        write_json(focused_out, focused_report)
+        require(
+            focused_report["artifact_kind"] == "runtime-vnext-focused-diagnostic"
+            and focused_report["decision"] == "KEEP"
+            and focused_report["formal_pass_allowed"] is False
+            and focused_report["scope"]["selected_case_ids"] == ["c11-001"]
+            and focused_report["scope"]["case_count"] == 1
+            and focused_report["scope"]["canonical_case_count"] == 783
+            and focused_report["pass_line"]
+            == f"{FOCUSED_DIAGNOSTIC_KEEP_PREFIX}: {focused_out.resolve()}",
+            "focused execution fixture lost its non-formal exact-case contract",
+        )
+        require(
+            len(focused_report["cases"]) == 1
+            and (focused_root / focused_report["cases"][0]["path"]).is_file(),
+            "focused execution fixture did not preserve exact case evidence",
+        )
+        try:
+            validate_report_document(
+                focused_report,
+                focused_root,
+                report_path=focused_out,
+                allow_internal_fixture=True,
+                require_current_output_path=True,
+            )
+        except ScenarioError as exc:
+            require(
+                "not produced by canonical executor mode" in str(exc),
+                f"full validator rejected focused evidence for unexpected reason: {exc}",
+            )
+        else:
+            raise AssertionError("full validator accepted focused diagnostic evidence")
 
         failure_root = Path(tmp) / "unexpected-status-artifacts"
         failure_root.mkdir()
@@ -11249,14 +11487,27 @@ def main() -> int:
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--discover-scenario", choices=("C03",))
     parser.add_argument("--diagnose-c09", action="store_true")
+    parser.add_argument("--focus-case", action="append", default=[])
+    parser.add_argument("--focus-scenario", action="append", choices=SCENARIO_IDS, default=[])
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if args.discover_scenario is not None and not args.discover:
         parser.error("--discover-scenario requires --discover")
+    if (args.focus_case or args.focus_scenario) and not args.execute:
+        parser.error("--focus-case/--focus-scenario require --execute")
+    invalid_case_ids = [
+        case_id for case_id in args.focus_case if not CASE_ID_RE.fullmatch(case_id)
+    ]
+    if invalid_case_ids:
+        parser.error(f"--focus-case values must be canonical case ids: {invalid_case_ids}")
     if sum((args.execute, args.discover, args.diagnose_c09)) > 1:
         parser.error("--execute, --discover, and --diagnose-c09 are mutually exclusive")
+    if (args.focus_case or args.focus_scenario) and (
+        args.discover or args.diagnose_c09
+    ):
+        parser.error("focused execution, discovery, and C09 diagnostic are mutually exclusive")
     if args.manifest is None or args.artifact_root is None or args.out is None:
         parser.error("--manifest, --artifact-root, and --out are required")
     root = args.artifact_root.resolve()
@@ -11272,6 +11523,8 @@ def main() -> int:
                 discover=args.discover,
                 discovery_scenario=args.discover_scenario,
                 diagnose_c09=args.diagnose_c09,
+                focus_case_ids=args.focus_case,
+                focus_scenario_ids=args.focus_scenario,
             )
             if args.execute or args.discover or args.diagnose_c09
             else collect_manifest(manifest, root, out)
@@ -11284,27 +11537,70 @@ def main() -> int:
             if isinstance(manifest_value, dict)
             else LEGACY_EXECUTION_CONTRACT
         )
-        fail_prefix = C09_DIAGNOSTIC_REJECT_PREFIX if args.diagnose_c09 else (
-            "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS FAIL"
+        fail_prefix = (
+            C09_DIAGNOSTIC_REJECT_PREFIX
+            if args.diagnose_c09
+            else FOCUSED_DIAGNOSTIC_REJECT_PREFIX
+            if args.focus_case or args.focus_scenario
+            else "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS FAIL"
             if contract == G08_EXECUTION_CONTRACT
             else "FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL"
         )
-        if args.diagnose_c09 and args.out is not None:
+        diagnostic_requested = bool(
+            args.diagnose_c09 or args.focus_case or args.focus_scenario
+        )
+        if diagnostic_requested and args.out is not None:
             reject_out = args.out.resolve()
             try:
                 reject_out.relative_to(root)
             except ValueError:
                 pass
             else:
+                focused = bool(args.focus_case or args.focus_scenario)
                 write_json(
                     reject_out,
                     {
                         "schema_version": SCHEMA_VERSION,
-                        "artifact_kind": "runtime-vnext-c09-three-variant-diagnostic",
+                        "artifact_kind": (
+                            "runtime-vnext-focused-diagnostic"
+                            if focused
+                            else "runtime-vnext-c09-three-variant-diagnostic"
+                        ),
                         "status": "fail",
                         "decision": "REJECT",
                         "formal_pass_allowed": False,
                         "error": str(exc),
+                        **(
+                            {
+                                "scope": {
+                                    "kind": "focused-diagnostic",
+                                    "requested_case_ids": args.focus_case,
+                                    "requested_scenario_ids": args.focus_scenario,
+                                }
+                            }
+                            if focused
+                            else {}
+                        ),
+                        **(
+                            {
+                                key: manifest_value[key]
+                                for key in (
+                                    "source_git_sha",
+                                    "source_tree_sha",
+                                    "dirty_status",
+                                    "models_lock_sha256",
+                                    "binary_sha256",
+                                    "model_key",
+                                    "backend",
+                                    "model_revision",
+                                    "model_files",
+                                    "hardware_id",
+                                )
+                                if key in manifest_value
+                            }
+                            if isinstance(manifest_value, dict)
+                            else {}
+                        ),
                         "artifact_path": str(reject_out),
                         "pass_line": None,
                     },
