@@ -35,6 +35,24 @@ consumer 或 backend conformance，而不是已有测试数量。任何 product-
 3. `full matrix`：代码冻结后在 S6/S7、正式性能前和发布候选阶段执行完整 C01-C21；同一冻结候选
    只因正式 artifact 自身失败或代码再次变化而重跑。
 
+703 基线执行器的快速入口与完整入口共用同一套 case 生成、真实 `run`/`serve` 执行和 oracle：
+
+```bash
+# 单个失败 case；--focus-case 可重复
+python3 scripts/release/runtime_vnext_baseline_scenarios.py \
+  --manifest <execution-manifest.json> --artifact-root <focused-root> \
+  --out <focused-root>/focused-report.json --execute --focus-case c11-017
+
+# 完整受影响 contract；--focus-scenario 可重复，也可与 --focus-case 取并集
+python3 scripts/release/runtime_vnext_baseline_scenarios.py \
+  --manifest <execution-manifest.json> --artifact-root <focused-root> \
+  --out <focused-root>/focused-report.json --execute --focus-scenario C11
+```
+
+focused 成功只打印 `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`，artifact 必须携带
+`formal_pass_allowed=false`、选中 case、完整 evidence identity 和原始 case evidence。它不能生成
+或冒充 C01-C21 PASS；不带 focus 参数的 canonical 模式仍由完整分母 validator 验收。
+
 断点或分片证据只有在 source git SHA、dirty status、binary SHA256、model revision/files、
 effective config、runner/dependency SHA 和输入 SHA 全部相同时才允许聚合。代码变化后，旧分片只能
 作为诊断输入；最终 full-matrix PASS 禁止混合不同 evidence identity。基础设施中断可在相同 identity
