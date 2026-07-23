@@ -4,11 +4,11 @@ use super::{
     BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
     CapacityDomainId, CapacityEntry, CapacityUnits, CapacityVector, DeviceRuntime, Digest,
     DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId, ExecutionLane,
-    LaneStableArenaSlotLease, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
-    LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
-    PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash,
-    RequestAuthorityId, SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession,
-    SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
+    LaneStableArenaSlotLease, LogicalBackingSliceAuthority, LogicalBatchCapacityLease, Mutex,
+    NodeId, ParticipantFlightPhase, ParticipantNodeKey, PhysicalBackingClaimIdentity,
+    PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash, RequestAuthorityId,
+    SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch,
+    SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
     SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
     TrustedPlanRuntimeEvidence, VNextError,
 };
@@ -1562,7 +1562,7 @@ pub struct ClaimedBackingTransaction {
     // Physical extents release before the logical capacity claim.
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     logical_capacity: Option<LogicalBatchCapacityLease>,
-    work_shape: BatchWorkShape,
+    work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
     // Occupancy releases after every physical/logical claim field above.
@@ -1691,7 +1691,7 @@ fn logical_capacity_matches(
 
 impl ClaimedBackingTransaction {
     pub(super) fn new(
-        work_shape: BatchWorkShape,
+        work_shape: Arc<BatchWorkShape>,
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
@@ -1709,20 +1709,30 @@ impl ClaimedBackingTransaction {
             ));
         }
         #[derive(Serialize)]
+        struct BackingFingerprint<'a> {
+            allocation_fingerprint: &'a str,
+            logical_size_bytes: u64,
+        }
+
+        #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
             work_fingerprint: &'a str,
             demand: &'a AdmissionDemand,
-            backing: Vec<&'a LogicalBackingSliceEvidence>,
+            backing: Vec<BackingFingerprint<'a>>,
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-backing.v3",
+            domain: "ferrum.runtime-vnext.claimed-backing.v4",
             work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
             backing: backing_slices
                 .iter()
                 .map(LogicalBackingSliceAuthority::evidence)
+                .map(|evidence| BackingFingerprint {
+                    allocation_fingerprint: evidence.allocation_fingerprint(),
+                    logical_size_bytes: evidence.size_bytes(),
+                })
                 .collect(),
             capacity_parents: logical_capacity
                 .as_ref()
@@ -1751,6 +1761,10 @@ impl ClaimedBackingTransaction {
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
+        self.work_shape.as_ref()
+    }
+
+    pub(super) fn work_shape_arc(&self) -> &Arc<BatchWorkShape> {
         &self.work_shape
     }
 
@@ -1831,17 +1845,23 @@ impl ClaimedSubmissionWaveBacking {
         }
 
         #[derive(Serialize)]
+        struct BackingFingerprint<'a> {
+            allocation_fingerprint: &'a str,
+            logical_size_bytes: u64,
+        }
+
+        #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
             plan_hash: &'a PlanHash,
             node_count: usize,
             work_fingerprint: &'a str,
             demand: &'a AdmissionDemand,
-            backing: Vec<&'a LogicalBackingSliceEvidence>,
+            backing: Vec<BackingFingerprint<'a>>,
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v3",
+            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v4",
             plan_hash: &plan_hash,
             node_count,
             work_fingerprint: work_shape.fingerprint(),
@@ -1849,6 +1869,10 @@ impl ClaimedSubmissionWaveBacking {
             backing: backing_slices
                 .iter()
                 .map(LogicalBackingSliceAuthority::evidence)
+                .map(|evidence| BackingFingerprint {
+                    allocation_fingerprint: evidence.allocation_fingerprint(),
+                    logical_size_bytes: evidence.size_bytes(),
+                })
                 .collect(),
             capacity_parents: logical_capacity
                 .as_ref()

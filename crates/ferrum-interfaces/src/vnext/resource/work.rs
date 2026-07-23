@@ -8,7 +8,7 @@ use std::{ops::Range, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepResourceAdmissionRequest {
-    pub(super) work_shape: BatchWorkShape,
+    pub(super) work_shape: Arc<BatchWorkShape>,
     pub(super) fit_policy: AdmissionFitPolicy,
     pub(super) pressure_action: AdmissionPressureAction,
     pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
@@ -16,12 +16,12 @@ pub struct StepResourceAdmissionRequest {
 
 impl StepResourceAdmissionRequest {
     pub fn new(
-        work_shape: BatchWorkShape,
+        work_shape: impl Into<Arc<BatchWorkShape>>,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<Self, VNextError> {
         Ok(Self {
-            work_shape,
+            work_shape: work_shape.into(),
             fit_policy,
             pressure_action,
             reusable_execution_bucket_id: None,
@@ -37,11 +37,11 @@ impl StepResourceAdmissionRequest {
         &self.work_shape
     }
 
-    pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    pub(crate) fn immediate_shape(&self) -> DynamicResourceShape {
         self.work_shape.immediate_shape()
     }
 
-    pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    pub(crate) fn fit_shape(&self) -> DynamicResourceShape {
         match self.fit_policy {
             AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
             AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),

@@ -1334,7 +1334,7 @@ where
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
-        let capacity_shape = match reusable_execution_bucket {
+        match reusable_execution_bucket {
             Some(bucket)
                 if bucket.capacity().covers(
                     immediate_shape.sequences(),
@@ -1346,19 +1346,16 @@ where
                     fit_shape.pages(),
                 ) =>
             {
-                DynamicResourceShape::from_validated(
-                    bucket.capacity().maximum_sequences(),
-                    bucket.capacity().maximum_tokens(),
-                    bucket.capacity().maximum_pages(),
-                )
+                // Physical reusable capacity is compiled once with the immutable
+                // plan. Per-wave logical and fit demand remain dynamic below.
             }
             Some(_) => {
                 return Err(invalid_resource(
                     "reusable execution bucket does not cover the submission-wave work shape",
                 ));
             }
-            None => immediate_shape,
-        };
+            None => {}
+        }
 
         let mut immediate_entries = Vec::new();
         let mut fit_entries = Vec::new();
@@ -1369,10 +1366,59 @@ where
                 "submission wave layout count differs from immutable plan domains",
             ));
         }
-        for (domain, layout) in pools.domains.iter().zip(&pools.submission_wave_layouts) {
+        let reusable_capacity_layouts = reusable_execution_bucket
+            .map(|bucket| {
+                pools
+                    .submission_wave_reusable_capacity_layouts
+                    .get(bucket.bucket_id())
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "reusable execution bucket has no compiled submission-wave capacity layout",
+                        )
+                    })
+            })
+            .transpose()?;
+        if reusable_capacity_layouts.is_some_and(|layouts| layouts.len() != pools.domains.len()) {
+            return Err(invalid_resource(
+                "compiled reusable submission-wave capacity layout count differs from immutable plan domains",
+            ));
+        }
+        for (domain_index, (domain, layout)) in pools
+            .domains
+            .iter()
+            .zip(&pools.submission_wave_layouts)
+            .enumerate()
+        {
+            let reusable_capacity_layout = reusable_capacity_layouts
+                .map(|layouts| {
+                    layouts.get(domain_index).ok_or_else(|| {
+                        invalid_resource(
+                            "compiled reusable submission-wave capacity layout is incomplete",
+                        )
+                    })
+                })
+                .transpose()?
+                .and_then(Option::as_ref);
             let Some(layout) = layout else {
+                if reusable_capacity_layout.is_some() {
+                    return Err(invalid_resource(
+                        "compiled reusable submission-wave capacity exists without a domain layout",
+                    ));
+                }
                 continue;
             };
+            if reusable_execution_bucket.is_some() && reusable_capacity_layout.is_none() {
+                return Err(invalid_resource(
+                    "compiled reusable submission-wave capacity is missing for a domain layout",
+                ));
+            }
+            if reusable_capacity_layout
+                .is_some_and(|capacity| capacity.projections.len() != layout.projection_count)
+            {
+                return Err(invalid_resource(
+                    "compiled reusable submission-wave projection count differs from its domain layout",
+                ));
+            }
             let mode = domain.pool.invocation_liveness_mode();
 
             let mut projections = vec![None; layout.projection_count];
@@ -1409,17 +1455,32 @@ where
                     } else {
                         descriptor.evaluate_request_bytes_for_shape(fit_shape)?
                     };
-                    let capacity_size_bytes = if capacity_shape == immediate_shape {
-                        logical_size_bytes
-                    } else if capacity_shape == fit_shape {
-                        fit_bytes
-                    } else {
-                        descriptor.evaluate_request_bytes_for_shape(capacity_shape)?
-                    };
-                    let physical_offset_bytes =
-                        row_base.checked_add(capacity_row_bytes).ok_or_else(|| {
-                            invalid_resource("invocation wave projection offset overflows u64")
-                        })?;
+                    let (physical_offset_bytes, capacity_size_bytes) =
+                        match reusable_capacity_layout {
+                            Some(capacity_layout) => {
+                                let capacity_projection = capacity_layout
+                                    .projections
+                                    .get(projection_layout.projection_index)
+                                    .ok_or_else(|| {
+                                        invalid_resource(
+                                            "compiled reusable submission-wave projection is missing",
+                                        )
+                                    })?;
+                                (
+                                    capacity_projection.physical_offset_bytes,
+                                    capacity_projection.capacity_size_bytes,
+                                )
+                            }
+                            None => {
+                                let physical_offset_bytes =
+                                    row_base.checked_add(capacity_row_bytes).ok_or_else(|| {
+                                        invalid_resource(
+                                            "invocation wave projection offset overflows u64",
+                                        )
+                                    })?;
+                                (physical_offset_bytes, logical_size_bytes)
+                            }
+                        };
                     immediate_row_bytes = immediate_row_bytes
                         .checked_add(logical_size_bytes)
                         .ok_or_else(|| {
@@ -1428,11 +1489,13 @@ where
                     fit_row_bytes = fit_row_bytes.checked_add(fit_bytes).ok_or_else(|| {
                         invalid_resource("invocation wave fit row demand overflows u64")
                     })?;
-                    capacity_row_bytes = capacity_row_bytes
-                        .checked_add(capacity_size_bytes)
-                        .ok_or_else(|| {
-                            invalid_resource("invocation wave capacity row overflows u64")
-                        })?;
+                    if reusable_capacity_layout.is_none() {
+                        capacity_row_bytes = capacity_row_bytes
+                            .checked_add(capacity_size_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("invocation wave capacity row overflows u64")
+                            })?;
+                    }
                     if projections[projection_layout.projection_index]
                         .replace(EvaluatedBackingProjection {
                             descriptor,
@@ -1451,7 +1514,9 @@ where
                     InvocationLivenessMode::TotalOrderReuse => {
                         immediate_pool_bytes = immediate_pool_bytes.max(immediate_row_bytes);
                         fit_pool_bytes = fit_pool_bytes.max(fit_row_bytes);
-                        capacity_pool_bytes = capacity_pool_bytes.max(capacity_row_bytes);
+                        if reusable_capacity_layout.is_none() {
+                            capacity_pool_bytes = capacity_pool_bytes.max(capacity_row_bytes);
+                        }
                     }
                     InvocationLivenessMode::ConservativeConcurrent => {
                         immediate_pool_bytes = immediate_pool_bytes
@@ -1463,14 +1528,21 @@ where
                             fit_pool_bytes.checked_add(fit_row_bytes).ok_or_else(|| {
                                 invalid_resource("invocation wave pool fit demand overflows u64")
                             })?;
-                        capacity_pool_bytes = capacity_pool_bytes
-                            .checked_add(capacity_row_bytes)
-                            .ok_or_else(|| {
-                            invalid_resource("invocation wave capacity pool demand overflows u64")
-                        })?;
+                        if reusable_capacity_layout.is_none() {
+                            capacity_pool_bytes = capacity_pool_bytes
+                                .checked_add(capacity_row_bytes)
+                                .ok_or_else(|| {
+                                    invalid_resource(
+                                        "invocation wave capacity pool demand overflows u64",
+                                    )
+                                })?;
+                        }
                     }
                     InvocationLivenessMode::NoInvocationResources => unreachable!(),
                 }
+            }
+            if let Some(capacity_layout) = reusable_capacity_layout {
+                capacity_pool_bytes = capacity_layout.physical_size_bytes;
             }
             let projections = projections
                 .into_iter()
