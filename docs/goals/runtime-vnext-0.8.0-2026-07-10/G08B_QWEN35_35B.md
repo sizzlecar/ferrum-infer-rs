@@ -161,12 +161,20 @@ status=REJECT
 failure_class=resource-prepare-target-miss-despite-throughput-keep
 ```
 
-The immutable singleton `ExecutionBatchParticipants` is still reconstructed for
-every decode token, including a new `Vec`, participant canonicalization, plan-evidence
-clone, lifecycle read, and a second `spans.to_vec`. Before another paid run, cache
-that immutable singleton membership on `VNextSequence` and bind work shape from
-borrowed spans. The falsifiable target is decode `resource_prepare_attempt <=3.45 ms`
-without weakening dynamic multi-sequence admission or correctness.
+Post-run source audit invalidated the first follow-up hypothesis recorded in the
+diagnostic artifact: `bench-serve` c1 constructs `ExecutionBatchParticipants` before
+`execute_batch_step` starts `resource_prepare_attempt`, so caching the outer singleton
+batch cannot directly explain or close that measured `0.103 ms` gap. The immutable
+artifact remains unchanged; this paragraph is the durable correction. A borrowed-span
+binding can still remove the inner `spans.to_vec`, and singleton caching can still
+reduce unmeasured host work for single-sequence `run`, but neither is accepted as the
+next paid-run hypothesis without phase evidence.
+
+Before another paid run, extend the existing typed `wave_timing` metrics to split
+`resource_prepare_attempt` into work-shape/request preparation, step admission, and
+submission-wave preparation. The next source change must name the dominant measured
+phase and predict its metric delta; another GPU sweep must not be used to rediscover
+that boundary.
 
 The complete artifact is stored in the temporary
 [GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-host-dispatch-d0d2e4f5-20260723T170239Z.tar.zst)
