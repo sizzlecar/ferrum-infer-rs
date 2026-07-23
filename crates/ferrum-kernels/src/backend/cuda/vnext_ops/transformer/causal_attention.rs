@@ -874,6 +874,7 @@ fn encode_attention(
     };
 
     let mut binding_regions = vec![compute_regions[shared.binding].clone()];
+    let mut compute_fence_dependencies = Vec::new();
     let mut host_storage = Vec::with_capacity(invocation.participants().len());
     let mut launches = Vec::with_capacity(invocation.participants().len());
     let mut bindings = Vec::with_capacity(invocation.participants().len());
@@ -951,7 +952,7 @@ fn encode_attention(
             &pages,
         )?);
         let page_count = pages.len();
-        compute_regions.extend(pages.iter().cloned());
+        compute_fence_dependencies.extend(pages.iter().cloned());
         binding_regions.extend(pages);
         let binding_offset = binding_layout.binding_offset(participant_index)?;
         bindings.push(CausalAttentionBinding {
@@ -1047,9 +1048,10 @@ fn encode_attention(
     }
 
     let functions = functions.clone();
-    let compute_command = CudaDeviceCommand::replayable_operation_with_blas(
+    let compute_command = CudaDeviceCommand::replayable_operation_with_blas_and_fence_dependencies(
         compute_operation,
         compute_regions,
+        compute_fence_dependencies,
         replay_key.finish(),
         move |stream, blas, regions| {
             for launch in &launches {

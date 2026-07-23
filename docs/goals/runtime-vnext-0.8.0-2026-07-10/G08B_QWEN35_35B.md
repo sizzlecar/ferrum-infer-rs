@@ -393,6 +393,61 @@ No further paid run is allowed until source analysis classifies the 53 eager com
 per decode wave by typed command owner and a source change predicts which owner will
 move into prepared replay and reduce enqueue below `2.0 ms`.
 
+The saved full scheduler trace and immutable 163-node Qwen3.5 program now close that
+classification. Each decode wave contains one token upload plus 173 provider commands:
+
+| owner | commands/wave | current path |
+|---|---:|---|
+| RMSNorm (`40` layer + `1` final) | `41` | replayed |
+| routed/shared MoE | `40` | replayed |
+| residual add | `40` | replayed |
+| gated-delta recurrent attention | `30` | eager compute |
+| causal paged attention compute | `10` | eager compute |
+| causal paged attention address binding | `10` | eager dynamic binding |
+| token embedding | `1` | eager compute |
+| last-token logits projection | `1` | eager compute |
+| token upload | `1` | eager input boundary |
+
+Thus `121 + 53 = 174` is fully owned; there is no unidentified CUDA work. Source
+inspection also shows why adding more cache keys would be the wrong fix. The causal
+compute command currently carries paged-state regions only to retain their lifetime,
+even though the kernel reads their addresses from the typed binding workspace. That
+mixes fence retention with captured kernel arguments and strips its reusable-address
+contract. Recurrent attention, embedding, and logits still bind request/sequence
+addresses directly. They require a plan-owned static command program whose stable
+buffers are updated through typed per-wave bindings; dynamic bindings and input
+uploads remain explicit ordered boundaries. Capturing those boundaries or marking
+request-owned addresses stable is forbidden.
+
+Historical evidence was also re-audited. `beb3e63c` is a real Qwen3.5-4B product
+path, but its derived `1.819 ms/wave` mixes prefill and decode and still includes six
+request-time captures. `b38e9645` is also a real Qwen3.5-4B serve path, but
+`2432/2432` means candidate-segment hits, not command-complete replay: it recorded
+`7980` replayed and `2660` eager commands (`75%`) with
+`3.27695 ms/wave` enqueue. Neither value is a directly comparable target for the
+current Qwen3.5-35B-A3B MoE/GPTQ decode lane. In addition, the current owner trace
+used full kernel attribution, which records CUDA events around eager commands; its
+command ownership is valid, but its enqueue duration is not directly comparable to
+the historical basic-profile runs. The failed `>=150` replay,
+`<=24` eager, and `<=2.0 ms` enqueue thresholds remain the immutable predeclared
+result for `a0038a0e`; they must not be recycled as evidence for another paid run.
+
+The source work is staged by exact owner movement. First, separate captured launch
+regions from fence-only dependencies and restore the ten causal compute commands,
+predicting `131 replay / 43 eager`. Second, introduce lane-stable recurrent-state
+bindings, predicting `161 / 13`. Third, move embedding/logits through lane-stable
+I/O staging, predicting `163 / 11`; the ten causal address bindings and one upload
+remain explicit eager boundaries. These are structural predictions, not PASS claims.
+
+The resulting checkpoint is a backend-neutral static-program/binding contract plus
+its CUDA implementation, not another replay-key sweep. Before paid
+validation it must locally prove that provider node encoding is not rebuilt on a
+cache hit, that every dynamic state/IO address is supplied through a typed binding
+or explicit eager boundary, that cached programs retain no request-owned resource,
+and that fence ownership still covers every binding target until completion. The
+next paid prediction must name the exact owner counts and host stages expected to
+move; the formal `76.1583 tok/s` floor remains unchanged.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

@@ -25,7 +25,7 @@ use crate::backend::reusable_execution::{
     ReusableExecutionPreparationTracker,
 };
 
-use super::vnext_runtime::{CudaCommandPayload, CudaDeviceCommand, CudaDeviceRuntimeError};
+use super::vnext_runtime::{CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError};
 
 const COMMAND_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.command-replay.v1\0";
 const SEGMENT_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.executable-segment.v1\0";
@@ -252,7 +252,7 @@ struct CudaExecutableSegment {
     context: Arc<CudaContext>,
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
-    _payloads: Vec<Arc<CudaCommandPayload>>,
+    _executables: Vec<Arc<CudaCommandExecutable>>,
     uploaded: bool,
     last_used: u64,
 }
@@ -346,7 +346,7 @@ impl CudaExecutableSegment {
             context: Arc::clone(context),
             _stream: Arc::clone(stream),
             _blas: Arc::clone(blas),
-            _payloads: commands.iter().map(CudaDeviceCommand::payload).collect(),
+            _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             uploaded: false,
             last_used,
         })
