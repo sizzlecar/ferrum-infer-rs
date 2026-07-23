@@ -281,6 +281,39 @@
       "reason": "FA2 build/runtime selection must be tied to native operator artifacts and CUDA smoke"
     },
     {
+      "id": "cli-model-source-composition",
+      "path_globs": ["crates/ferrum-cli/src/source_resolver.rs"],
+      "domains": ["cli_run", "server_api", "model_contract"],
+      "required_gates": [
+        "unit",
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "model_contract",
+        "product_sentinel"
+      ],
+      "required_scenarios": [
+        "run_multiturn_recall",
+        "serve_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_tool_call",
+        "serve_structured_output"
+      ],
+      "release_invalidation": [
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "model_contract",
+        "product_sentinel",
+        "metal_full",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "cli",
+      "reason": "shared model source, metadata, tokenizer, and template resolution feeds both product entrypoints and every shipped backend"
+    },
+    {
       "id": "cli-run",
       "path_globs": ["crates/ferrum-cli/src/commands/run.rs"],
       "domains": ["cli_run"],
