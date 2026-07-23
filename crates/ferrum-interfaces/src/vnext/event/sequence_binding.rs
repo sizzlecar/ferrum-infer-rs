@@ -35,6 +35,8 @@ pub struct TrustedActiveSequenceBinding {
     #[serde(rename = "backing_slices")]
     legacy_backing_slices: Option<Vec<LogicalBackingSliceEvidence>>,
     #[serde(skip)]
+    static_pool_identity_fingerprint: Option<String>,
+    #[serde(skip)]
     fingerprint: String,
 }
 
@@ -68,6 +70,8 @@ impl TrustedActiveSequenceBinding {
             permit.runtime_implementation_fingerprint(),
             "runtime implementation fingerprint",
         )?;
+        let static_pool_identity_fingerprint =
+            plan.static_pool_identity().map(canonical_fingerprint);
         let mut binding = Self {
             plan,
             coordinator_id: permit.coordinator_id(),
@@ -87,6 +91,7 @@ impl TrustedActiveSequenceBinding {
                     .map(|slice| slice.evidence().clone())
                     .collect(),
             ),
+            static_pool_identity_fingerprint,
             fingerprint: String::new(),
         };
         binding.fingerprint = canonical_fingerprint(&binding);
@@ -102,6 +107,8 @@ impl TrustedActiveSequenceBinding {
         let plan = resources.plan_evidence();
         let runtime_fingerprint = plan.runtime_implementation_fingerprint().to_owned();
         validate_sha256(&runtime_fingerprint, "runtime implementation fingerprint")?;
+        let static_pool_identity_fingerprint =
+            plan.static_pool_identity().map(canonical_fingerprint);
         let mut static_entries = resources
             .static_provisioning()
             .map(|lease| lease.plan_static_entries().cloned().collect::<Vec<_>>())
@@ -134,6 +141,7 @@ impl TrustedActiveSequenceBinding {
             // A session identity is stable across dynamic backing generations.
             // The exact physical authority belongs to each captured Step.
             legacy_backing_slices: None,
+            static_pool_identity_fingerprint,
             fingerprint: String::new(),
         };
         binding.fingerprint = canonical_fingerprint(&binding);
@@ -157,7 +165,11 @@ impl TrustedActiveSequenceBinding {
     }
 
     pub fn static_pool_identity_fingerprint(&self) -> Option<String> {
-        self.plan.static_pool_identity().map(canonical_fingerprint)
+        self.static_pool_identity_fingerprint.clone()
+    }
+
+    pub(crate) fn static_pool_identity_fingerprint_ref(&self) -> Option<&str> {
+        self.static_pool_identity_fingerprint.as_deref()
     }
 
     pub fn static_provisioning_identity(&self) -> Option<&ResourceTransactionIdentity> {

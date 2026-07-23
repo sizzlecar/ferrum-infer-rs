@@ -3741,13 +3741,6 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
-    fn participant_node_keys(self) -> Result<Vec<ParticipantNodeKey>, VNextError> {
-        match self {
-            Self::Invocation(invocation) => Ok(invocation.participant_node_keys()),
-            Self::Wave { .. } => Ok(self.wave_node()?.participant_node_keys()),
-        }
-    }
-
     fn batch_step_id(self) -> BatchStepId {
         match self {
             Self::Invocation(invocation) => invocation.batch_step_id(),
@@ -3787,10 +3780,35 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
-    fn plan_evidence(self) -> Result<TrustedPlanRuntimeEvidence, VNextError> {
+    fn plan_identity_matches(
+        self,
+        plan_id: &PlanId,
+        plan_hash: &PlanHash,
+        device_id: &DeviceId,
+    ) -> Result<bool, VNextError> {
         match self {
-            Self::Invocation(invocation) => Ok(invocation.plan_evidence()),
-            Self::Wave { .. } => Ok(self.wave_node()?.plan_evidence()),
+            Self::Invocation(invocation) => {
+                let evidence = invocation.plan_evidence();
+                Ok(evidence.plan_id() == plan_id
+                    && evidence.plan_hash() == plan_hash
+                    && evidence.device_id() == device_id)
+            }
+            Self::Wave { .. } => {
+                let evidence = self.wave_node()?.plan_evidence_ref();
+                Ok(evidence.plan_id() == plan_id
+                    && evidence.plan_hash() == plan_hash
+                    && evidence.device_id() == device_id)
+            }
+        }
+    }
+
+    fn plan_evidence_matches(
+        self,
+        expected: &TrustedPlanRuntimeEvidence,
+    ) -> Result<bool, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.plan_evidence() == *expected),
+            Self::Wave { .. } => Ok(self.wave_node()?.plan_evidence_ref() == expected),
         }
     }
 
@@ -4066,13 +4084,13 @@ impl<'a, B> OperationInvocation<'a, B> {
         let static_lease = participant.static_provisioning();
         let lease_identity = static_lease.map(|lease| lease.identity());
         let admission = active_binding.plan().static_provisioning_binding();
-        let pool_fingerprint = active_binding.static_pool_identity_fingerprint();
+        let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
         let memory = plan.payload().memory();
         if resources.participant_count()? != resources.prepared_participant_count()?
             || resources.node_id()? != node_id
             || participant_frame.sequence_authority() != participant.sequence_authority()
             || participant_frame.request_authority() != participant.request_authority()
-            || resources.plan_evidence()? != *active_binding.plan()
+            || !resources.plan_evidence_matches(active_binding.plan())?
             || resources.coordinator_id()? != active_binding.coordinator_id()
             || participant.sequence_authority() != active_binding.sequence_authority()
             || participant.run_id() != active_binding.run_id()
@@ -4096,7 +4114,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             || parts.transaction_id.as_ref()
                 != lease_identity.map(|identity| identity.transaction_id())
             || parts.resource_pool_id != active_binding.static_pool_id()
-            || parts.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint.as_deref()
+            || parts.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint
             || parts.provisioning_run_id.as_ref()
                 != lease_identity.map(|identity| identity.run_id())
             || parts.provisioning_request_id.as_ref()
@@ -4540,11 +4558,11 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         let participant_count = resources.participant_count()?;
-        let resource_keys = resources.participant_node_keys()?;
+        let participant_frames = resources.participant_frames()?;
         if participant_count == 0
             || participant_count != active_bindings.len()
             || participant_count != node_identity.participants().len()
-            || participant_count != resource_keys.len()
+            || participant_count != participant_frames.len()
             || batch_identity.batch_step_id() != resources.batch_step_id()
             || batch_identity.batch_invocation_id() != resources.batch_invocation_id()
             || node_identity.node_id() != resources.node_id()?
@@ -4553,8 +4571,14 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             || node_identity
                 .participants()
                 .iter()
-                .zip(&resource_keys)
-                .any(|(participant, key)| participant.node_key() != key)
+                .zip(participant_frames)
+                .any(|(participant, frame)| {
+                    let key = participant.node_key();
+                    key.sequence_authority() != frame.sequence_authority()
+                        || key.request_authority() != frame.request_authority()
+                        || key.frame_id() != frame.frame_id()
+                        || key.node_id() != node_identity.node_id()
+                })
         {
             return Err(invalid_operation(
                 "batched operation identity differs from its exact invocation resources",
@@ -5151,7 +5175,9 @@ impl OperationDispatch {
             provider_id: Some(node.selection().selected_provider().clone()),
             device_id: Some(plan.payload().device_id().clone()),
             resource_pool_id: active.static_pool_id(),
-            resource_pool_identity_fingerprint: active.static_pool_identity_fingerprint(),
+            resource_pool_identity_fingerprint: active
+                .static_pool_identity_fingerprint_ref()
+                .map(str::to_owned),
             provisioning_run_id: provisioning.map(|identity| identity.run_id().clone()),
             provisioning_request_id: provisioning.map(|identity| identity.request_id().clone()),
             transaction_id: provisioning.map(|identity| identity.transaction_id().clone()),
@@ -5189,38 +5215,55 @@ impl OperationDispatch {
     {
         let plan = resolved.execution_plan();
         let node_id = resources.node_id()?;
-        let node = plan
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == node_id)
-            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        let node = match resources {
+            OperationInvocationResources::Wave {
+                node_index: resource_node_index,
+                ..
+            } => plan
+                .payload()
+                .nodes()
+                .get(resource_node_index)
+                .filter(|node| node.id() == node_id),
+            OperationInvocationResources::Invocation(_) => plan
+                .payload()
+                .nodes()
+                .iter()
+                .find(|node| node.id() == node_id),
+        }
+        .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        // Wave construction proves every node shares this authority by Arc identity.
+        let validate_common_authority = match resources {
+            OperationInvocationResources::Invocation(_) => true,
+            OperationInvocationResources::Wave {
+                node_index: resource_node_index,
+                ..
+            } => resource_node_index == 0,
+        };
         let participant_count = resources.participant_count()?;
-        let participants = (0..participant_count)
-            .map(|index| resources.participant(index))
-            .collect::<Result<Vec<_>, _>>()?;
         let frames = resources.participant_frames()?;
-        let sessions = (0..participant_count)
-            .map(|index| resources.participant_session_identity(index))
-            .collect::<Result<Vec<_>, _>>()?;
-        let node_keys = resources.participant_node_keys()?;
-        let plan_evidence = resources.plan_evidence()?;
+        let plan_identity_matches = validate_common_authority
+            .then(|| {
+                resources.plan_identity_matches(
+                    plan.payload().plan_id(),
+                    plan.plan_hash(),
+                    plan.payload().device_id(),
+                )
+            })
+            .transpose()?;
         if participant_identities.is_empty()
-            || participant_identities.len() != participants.len()
+            || participant_identities.len() != participant_count
             || participant_identities.len() != frames.len()
-            || participant_identities.len() != sessions.len()
-            || participant_identities.len() != node_keys.len()
             || participant_identities.len() != active_bindings.len()
             || resources.prepared_participant_count()? != participant_count
-            || plan_evidence.plan_id() != plan.payload().plan_id()
-            || plan_evidence.plan_hash() != plan.plan_hash()
-            || plan_evidence.device_id() != plan.payload().device_id()
-            || !Arc::ptr_eq(resources.runtime(), lane.runtime_arc())
-            || resources.step_resources().execution_lane().id() != lane.id()
-            || lane.descriptor() != resolved.device()
-            || lane.descriptor() != resolved.capabilities().device()
-            || lane.descriptor().runtime_implementation_fingerprint
-                != plan.payload().device_runtime_implementation_fingerprint()
+            || validate_common_authority && {
+                !plan_identity_matches.expect("common wave authority requested plan evidence")
+                    || !Arc::ptr_eq(resources.runtime(), lane.runtime_arc())
+                    || resources.step_resources().execution_lane().id() != lane.id()
+                    || lane.descriptor() != resolved.device()
+                    || lane.descriptor() != resolved.capabilities().device()
+                    || lane.descriptor().runtime_implementation_fingerprint
+                        != plan.payload().device_runtime_implementation_fingerprint()
+            }
         {
             return Err(invalid_operation(
                 "batch node identity inputs differ from submission resources, plan, or lane",
@@ -5232,24 +5275,34 @@ impl OperationDispatch {
             .zip(active_bindings)
             .enumerate()
         {
-            let participant = participants[local_index];
-            let frame = frames[local_index];
-            let session = sessions[local_index];
-            let key = &node_keys[local_index];
+            let participant = resources.participant(local_index)?;
+            let frame = *frames
+                .get(local_index)
+                .ok_or_else(|| invalid_operation("operation participant frame is missing"))?;
+            let session = validate_common_authority
+                .then(|| resources.participant_session_identity(local_index))
+                .transpose()?;
+            let key =
+                ParticipantNodeKey::new(frame.participant(), frame.frame_id(), node.id().clone());
             let parts = identity.parts();
             if key.sequence_authority() != participant.sequence_authority()
                 || key.request_authority() != participant.request_authority()
                 || key.frame_id() != frame.frame_id()
-                || active.sequence_authority() != participant.sequence_authority()
-                || active.coordinator_id() != resources.coordinator_id()?
-                || active.run_id() != participant.run_id()
-                || active.request_id() != participant.request_id()
-                || !active.matches_sequence_session(session.0, session.1)
-                || active.plan().plan_id() != plan.payload().plan_id()
-                || active.plan().plan_hash() != plan.plan_hash()
-                || active.plan().device_id() != plan.payload().device_id()
-                || active.runtime_implementation_fingerprint()
-                    != plan.payload().device_runtime_implementation_fingerprint()
+                || validate_common_authority && {
+                    let session = session
+                        .as_ref()
+                        .expect("common wave authority requested session evidence");
+                    active.sequence_authority() != participant.sequence_authority()
+                        || active.coordinator_id() != resources.coordinator_id()?
+                        || active.run_id() != participant.run_id()
+                        || active.request_id() != participant.request_id()
+                        || !active.matches_sequence_session(session.0, session.1)
+                        || active.plan().plan_id() != plan.payload().plan_id()
+                        || active.plan().plan_hash() != plan.plan_hash()
+                        || active.plan().device_id() != plan.payload().device_id()
+                        || active.runtime_implementation_fingerprint()
+                            != plan.payload().device_runtime_implementation_fingerprint()
+                }
                 || parts.run_id != *active.run_id()
                 || parts.request_id != *active.request_id()
                 || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
@@ -5282,7 +5335,7 @@ impl OperationDispatch {
                 participant_start.checked_add(local_index).ok_or_else(|| {
                     invalid_operation("physical batch participant index overflows u32")
                 })?,
-                key.clone(),
+                key,
                 identity,
             ));
         }

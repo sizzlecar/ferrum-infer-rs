@@ -108,7 +108,7 @@ pub struct ParticipantNodeKey {
 }
 
 impl ParticipantNodeKey {
-    pub(super) fn new(
+    pub(in crate::vnext) fn new(
         participant: BatchParticipantAuthority,
         frame_id: ExecutionFrameId,
         node_id: NodeId,

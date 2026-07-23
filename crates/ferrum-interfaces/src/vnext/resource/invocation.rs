@@ -1150,6 +1150,7 @@ where
             pressure_action,
         } = request;
         let PreparedParticipantAuthority {
+            plan_evidence: _,
             participants,
             participant_frames,
             participant_session_identities,
@@ -1259,6 +1260,7 @@ where
             .map(|candidate| (candidate.epoch, candidate.fingerprint.clone()))
             .collect();
         Ok(PreparedParticipantAuthority {
+            plan_evidence: self.plan_evidence(),
             participants,
             participant_frames,
             participant_session_identities,
@@ -1395,6 +1397,7 @@ struct PreparedParticipantAuthority<R>
 where
     R: DeviceRuntime,
 {
+    plan_evidence: TrustedPlanRuntimeEvidence,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
     participant_frames: Vec<StepParticipantFrameAssignment>,
     participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
@@ -1573,7 +1576,11 @@ where
     }
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
-        self.participant_authority.participants[0].plan_evidence()
+        self.participant_authority.plan_evidence.clone()
+    }
+
+    pub(crate) fn plan_evidence_ref(&self) -> &TrustedPlanRuntimeEvidence {
+        &self.participant_authority.plan_evidence
     }
 
     pub(crate) fn runtime(&self) -> &Arc<R> {
@@ -1590,20 +1597,6 @@ where
             .participant_session_identities
             .iter()
             .map(|(epoch, fingerprint)| (*epoch, fingerprint))
-    }
-
-    pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
-        self.participant_authority
-            .participant_frames
-            .iter()
-            .map(|assignment| {
-                ParticipantNodeKey::new(
-                    assignment.participant(),
-                    assignment.frame_id(),
-                    self.node_id().clone(),
-                )
-            })
-            .collect()
     }
 }
 
@@ -1992,19 +1985,6 @@ where
         self.prepared_participant_flights
             .iter()
             .map(|hold| (hold.epoch, &hold.fingerprint))
-    }
-
-    pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
-        self.participant_frames
-            .iter()
-            .map(|assignment| {
-                ParticipantNodeKey::new(
-                    assignment.participant(),
-                    assignment.frame_id(),
-                    self.node_id.clone(),
-                )
-            })
-            .collect()
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {
