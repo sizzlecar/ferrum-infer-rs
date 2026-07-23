@@ -32,6 +32,40 @@ use super::{
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
 use crate::vnext::ReusableExecutionBucketSpec;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepResourceAdmissionProfilePhase {
+    AuthorityAndPolicyValidate,
+    DemandEvaluate,
+    BackingClaim,
+    LogicalCapacityClaim,
+    TransactionValidateAndFingerprint,
+    FrameCaptureAndLease,
+}
+
+#[inline(always)]
+fn step_admission_profile_start<const PROFILE: bool>() -> Option<Instant> {
+    PROFILE.then(Instant::now)
+}
+
+#[inline(always)]
+fn record_step_admission_profile<const PROFILE: bool, F>(
+    observer: &mut F,
+    phase: StepResourceAdmissionProfilePhase,
+    started: Option<Instant>,
+) where
+    F: FnMut(StepResourceAdmissionProfilePhase, Duration),
+{
+    if PROFILE {
+        observer(
+            phase,
+            started
+                .expect("profiled step admission phase owns a start instant")
+                .elapsed(),
+        );
+    }
+}
 
 #[derive(Debug)]
 pub enum ExecutionStreamCreationError<E> {
@@ -2287,6 +2321,31 @@ where
         request: StepResourceAdmissionRequest,
         lane: &Arc<ExecutionLane<R>>,
     ) -> Result<StepResourceAdmissionDecision<R>, VNextError> {
+        self.try_begin_step_inner::<false, _>(request, lane, |_, _| {})
+    }
+
+    pub fn try_begin_step_profiled<F>(
+        &self,
+        request: StepResourceAdmissionRequest,
+        lane: &Arc<ExecutionLane<R>>,
+        observer: F,
+    ) -> Result<StepResourceAdmissionDecision<R>, VNextError>
+    where
+        F: FnMut(StepResourceAdmissionProfilePhase, Duration),
+    {
+        self.try_begin_step_inner::<true, _>(request, lane, observer)
+    }
+
+    fn try_begin_step_inner<const PROFILE: bool, F>(
+        &self,
+        request: StepResourceAdmissionRequest,
+        lane: &Arc<ExecutionLane<R>>,
+        mut observer: F,
+    ) -> Result<StepResourceAdmissionDecision<R>, VNextError>
+    where
+        F: FnMut(StepResourceAdmissionProfilePhase, Duration),
+    {
+        let phase_started = step_admission_profile_start::<PROFILE>();
         let _lifecycle = self.sessions[0]
             .resources()
             .request
@@ -2349,6 +2408,13 @@ where
                 "step work shape exceeds its selected reusable execution bucket",
             ));
         }
+        record_step_admission_profile::<PROFILE, _>(
+            &mut observer,
+            StepResourceAdmissionProfilePhase::AuthorityAndPolicyValidate,
+            phase_started,
+        );
+
+        let phase_started = step_admission_profile_start::<PROFILE>();
         let (demand, requested_slices) = plan.scoped_demand(
             AllocationLifetime::Step,
             None,
@@ -2358,9 +2424,21 @@ where
             fit_policy,
             pressure_action,
         )?;
+        record_step_admission_profile::<PROFILE, _>(
+            &mut observer,
+            StepResourceAdmissionProfilePhase::DemandEvaluate,
+            phase_started,
+        );
+
+        let phase_started = step_admission_profile_start::<PROFILE>();
         let prepared = match plan.prepare_lane_stable_backing_slices(lane, requested_slices)? {
             LaneBackingPrepareDecision::Prepared(prepared) => prepared,
             LaneBackingPrepareDecision::Deferred(deferred) => {
+                record_step_admission_profile::<PROFILE, _>(
+                    &mut observer,
+                    StepResourceAdmissionProfilePhase::BackingClaim,
+                    phase_started,
+                );
                 return Ok(StepResourceAdmissionDecision::BackingDeferred(
                     StepAdmissionBackingDeferral::new(
                         deferred,
@@ -2370,6 +2448,13 @@ where
                 ));
             }
         };
+        record_step_admission_profile::<PROFILE, _>(
+            &mut observer,
+            StepResourceAdmissionProfilePhase::BackingClaim,
+            phase_started,
+        );
+
+        let phase_started = step_admission_profile_start::<PROFILE>();
         let logical_capacity = if demand.immediate_claim().is_empty() {
             None
         } else {
@@ -2402,13 +2487,30 @@ where
                     Some(capacity)
                 }
                 BatchCapacityClaimDecision::Deferred(deferred) => {
+                    record_step_admission_profile::<PROFILE, _>(
+                        &mut observer,
+                        StepResourceAdmissionProfilePhase::LogicalCapacityClaim,
+                        phase_started,
+                    );
                     return Ok(StepResourceAdmissionDecision::Deferred(deferred));
                 }
                 BatchCapacityClaimDecision::PermanentRejected(rejected) => {
+                    record_step_admission_profile::<PROFILE, _>(
+                        &mut observer,
+                        StepResourceAdmissionProfilePhase::LogicalCapacityClaim,
+                        phase_started,
+                    );
                     return Ok(StepResourceAdmissionDecision::PermanentRejected(rejected));
                 }
             }
         };
+        record_step_admission_profile::<PROFILE, _>(
+            &mut observer,
+            StepResourceAdmissionProfilePhase::LogicalCapacityClaim,
+            phase_started,
+        );
+
+        let phase_started = step_admission_profile_start::<PROFILE>();
         let (backing_slices, lane_slot_lease) = prepared.commit().into_parts();
         let claimed_backing = ClaimedBackingTransaction::new(
             work_shape,
@@ -2417,6 +2519,13 @@ where
             backing_slices,
             lane_slot_lease,
         )?;
+        record_step_admission_profile::<PROFILE, _>(
+            &mut observer,
+            StepResourceAdmissionProfilePhase::TransactionValidateAndFingerprint,
+            phase_started,
+        );
+
+        let phase_started = step_admission_profile_start::<PROFILE>();
         let batch_step_id = issue_batch_step_id()?;
         let candidates = session_frame_capture_candidates(&self.sessions);
         let captured_frames = acquire_session_frames_with_backing(&candidates, batch_step_id)?;
@@ -2431,15 +2540,19 @@ where
                 session,
             })
             .collect();
-        Ok(StepResourceAdmissionDecision::Admitted(Arc::new(
-            StepResourceLease::new(
-                participants,
-                Arc::clone(lane),
-                reusable_execution_bucket,
-                batch_step_id,
-                claimed_backing,
-            )?,
-        )))
+        let decision = StepResourceAdmissionDecision::Admitted(Arc::new(StepResourceLease::new(
+            participants,
+            Arc::clone(lane),
+            reusable_execution_bucket,
+            batch_step_id,
+            claimed_backing,
+        )?));
+        record_step_admission_profile::<PROFILE, _>(
+            &mut observer,
+            StepResourceAdmissionProfilePhase::FrameCaptureAndLease,
+            phase_started,
+        );
+        Ok(decision)
     }
 }
 

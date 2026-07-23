@@ -149,7 +149,7 @@ pub struct VNextExecutorConfig {
     pub maximum_model_tokens: usize,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
-    pub reusable_execution_enabled: bool,
+    pub device_reusable_execution_capture_enabled: bool,
     pub reusable_execution_prefill_token_counts: Vec<usize>,
 }
 
@@ -216,21 +216,14 @@ impl VNextExecutorConfig {
         .collect::<Vec<_>>();
         reusable_execution_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
         reusable_execution_prefill_token_counts.dedup();
-        let reusable_execution_supported = descriptor
-            .capabilities
-            .iter()
-            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
-        let reusable_execution_policy =
-            if engine.backend.enable_cuda_graphs && reusable_execution_supported {
-                Some(resolve_reusable_execution_policy(
-                    maximum_active_sequences,
-                    maximum_scheduled_tokens,
-                    maximum_model_tokens,
-                    &reusable_execution_prefill_token_counts,
-                )?)
-            } else {
-                None
-            };
+        // Stable workspace buckets are backend-independent memory policy.
+        // Device executable capture remains capability/config gated at startup.
+        let reusable_execution_policy = Some(resolve_reusable_execution_policy(
+            maximum_active_sequences,
+            maximum_scheduled_tokens,
+            maximum_model_tokens,
+            &reusable_execution_prefill_token_counts,
+        )?);
 
         let runtime_policy = ResolvedRuntimePolicy::new(
             POLICY_ID,
@@ -264,7 +257,7 @@ impl VNextExecutorConfig {
             maximum_model_tokens,
             static_initialization,
             runtime_policy,
-            reusable_execution_enabled: engine.backend.enable_cuda_graphs,
+            device_reusable_execution_capture_enabled: engine.backend.enable_cuda_graphs,
             reusable_execution_prefill_token_counts,
         })
     }
@@ -536,10 +529,66 @@ impl VNextExecutionWaveKind {
 }
 
 #[derive(Default)]
+struct VNextStepAdmissionTimingMetrics {
+    authority_and_policy_validate: AtomicDurationMetrics,
+    demand_evaluate: AtomicDurationMetrics,
+    backing_claim: AtomicDurationMetrics,
+    logical_capacity_claim: AtomicDurationMetrics,
+    transaction_validate_and_fingerprint: AtomicDurationMetrics,
+    frame_capture_and_lease: AtomicDurationMetrics,
+}
+
+impl VNextStepAdmissionTimingMetrics {
+    fn record(&self, phase: StepResourceAdmissionProfilePhase, duration: Duration) {
+        match phase {
+            StepResourceAdmissionProfilePhase::AuthorityAndPolicyValidate => {
+                &self.authority_and_policy_validate
+            }
+            StepResourceAdmissionProfilePhase::DemandEvaluate => &self.demand_evaluate,
+            StepResourceAdmissionProfilePhase::BackingClaim => &self.backing_claim,
+            StepResourceAdmissionProfilePhase::LogicalCapacityClaim => &self.logical_capacity_claim,
+            StepResourceAdmissionProfilePhase::TransactionValidateAndFingerprint => {
+                &self.transaction_validate_and_fingerprint
+            }
+            StepResourceAdmissionProfilePhase::FrameCaptureAndLease => {
+                &self.frame_capture_and_lease
+            }
+        }
+        .record(duration);
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "collection": "profile_attached_only",
+            "authority_and_policy_validate": self.authority_and_policy_validate.snapshot(),
+            "demand_evaluate": self.demand_evaluate.snapshot(),
+            "backing_claim": self.backing_claim.snapshot(),
+            "logical_capacity_claim": self.logical_capacity_claim.snapshot(),
+            "transaction_validate_and_fingerprint": self.transaction_validate_and_fingerprint.snapshot(),
+            "frame_capture_and_lease": self.frame_capture_and_lease.snapshot(),
+        })
+    }
+
+    fn reset(&self) {
+        for metrics in [
+            &self.authority_and_policy_validate,
+            &self.demand_evaluate,
+            &self.backing_claim,
+            &self.logical_capacity_claim,
+            &self.transaction_validate_and_fingerprint,
+            &self.frame_capture_and_lease,
+        ] {
+            metrics.reset();
+        }
+    }
+}
+
+#[derive(Default)]
 struct VNextWaveTimingMetrics {
     resource_prepare_attempt: AtomicDurationMetrics,
     resource_step_request_prepare: AtomicDurationMetrics,
     resource_step_admission: AtomicDurationMetrics,
+    resource_step_admission_breakdown: VNextStepAdmissionTimingMetrics,
     resource_submission_wave_prepare: AtomicDurationMetrics,
     host_encode_submit: AtomicDurationMetrics,
     token_upload_prepare: AtomicDurationMetrics,
@@ -640,6 +689,7 @@ impl VNextWaveTimingMetrics {
                 "collection": "profile_attached_only",
                 "step_request_prepare": self.resource_step_request_prepare.snapshot(),
                 "step_admission": self.resource_step_admission.snapshot(),
+                "step_admission_breakdown": self.resource_step_admission_breakdown.snapshot(),
                 "submission_wave_prepare": self.resource_submission_wave_prepare.snapshot(),
             },
             "host_encode_submit": self.host_encode_submit.snapshot(),
@@ -674,6 +724,7 @@ impl VNextWaveTimingMetrics {
                 "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
                 "resource_prepare breakdown is collected only while a typed profile sink is attached",
                 "resource_prepare breakdown samples low-level admission attempts; retries may produce more breakdown samples than outer resource_prepare_attempt samples",
+                "step_admission breakdown records completed admission phases; an error returned inside a phase remains in the outer step_admission interval",
                 "resource_prepare residual includes caller-side participant construction and orchestration not attributed to the three child intervals",
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
@@ -712,6 +763,7 @@ impl VNextWaveTimingMetrics {
         ] {
             metrics.reset();
         }
+        self.resource_step_admission_breakdown.reset();
         self.reusable_execution.reset();
     }
 }
@@ -2405,7 +2457,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     program_fingerprint: String,
     checkpoint_capture: Option<VNextCheckpointCapture>,
     static_bytes: u64,
-    reusable_execution_enabled: bool,
+    device_reusable_execution_capture_enabled: bool,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
     startup_preparation: Mutex<VNextStartupPreparationState>,
@@ -2691,7 +2743,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
         let reusable_execution_startup_plan =
-            if config.reusable_execution_enabled && reusable_execution_supported {
+            if config.device_reusable_execution_capture_enabled && reusable_execution_supported {
                 Some(VNextReusableExecutionStartupPlan::resolve(
                     config.runtime_policy.memory().maximum_active_sequences,
                     config.runtime_policy.admission().maximum_scheduled_tokens,
@@ -2732,7 +2784,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             program_fingerprint,
             checkpoint_capture,
             static_bytes,
-            reusable_execution_enabled: config.reusable_execution_enabled,
+            device_reusable_execution_capture_enabled: config
+                .device_reusable_execution_capture_enabled,
             reusable_execution_supported,
             reusable_execution_startup_plan,
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
@@ -2915,7 +2968,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let started = Instant::now();
         let Some(plan) = self.reusable_execution_startup_plan.clone() else {
             return Ok(VNextReusableExecutionStartupReport {
-                enabled: self.reusable_execution_enabled,
+                enabled: self.device_reusable_execution_capture_enabled,
                 supported: self.reusable_execution_supported,
                 requested_descriptors: Vec::new(),
                 prepared_descriptors: Vec::new(),
@@ -3724,9 +3777,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let _phase_timing = phase_timing
                 .resource_step_admission
                 .start_if(timing_enabled);
-            batch
-                .try_begin_step(request, &self.lane)
-                .map_err(|error| FerrumError::backend(error.to_string()))
+            let decision = if timing_enabled {
+                batch.try_begin_step_profiled(request, &self.lane, |phase, duration| {
+                    self.metrics
+                        .wave_timing
+                        .resource_step_admission_breakdown
+                        .record(phase, duration);
+                    phase_timing
+                        .resource_step_admission_breakdown
+                        .record(phase, duration);
+                })
+            } else {
+                batch.try_begin_step(request, &self.lane)
+            };
+            decision.map_err(|error| FerrumError::backend(error.to_string()))
         }
     }
 
@@ -6162,14 +6226,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
-        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextExecutionWaveKind, VNextPreparedWaveTopologyMetrics, VNextReusableExecutionDescriptor,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
-        VNextWaveTimingSink,
+        reported_allocated_bytes, resolve_reusable_execution_policy, resolved_sequence_fit_policy,
+        AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
+        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPreparedWaveTopologyMetrics,
+        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::vnext::{
         DeviceReusableExecutionObservation, DeviceSubmissionTimingSink,
+        StepResourceAdmissionProfilePhase,
     };
 
     #[test]
@@ -6283,6 +6348,27 @@ mod tests {
     }
 
     #[test]
+    fn reusable_workspace_policy_is_backend_neutral_and_bucketed() {
+        let policy = resolve_reusable_execution_policy(16, 2_048, 4_096, &[128, 64]).unwrap();
+        let decode_widths = policy
+            .buckets()
+            .iter()
+            .filter(|bucket| bucket.class_id().as_str() == super::UNIFORM_QUERY_REUSABLE_CLASS)
+            .map(|bucket| bucket.capacity().maximum_sequences())
+            .collect::<Vec<_>>();
+        let prefill_tokens = policy
+            .buckets()
+            .iter()
+            .filter(|bucket| bucket.class_id().as_str() == super::PACKED_TOKEN_REUSABLE_CLASS)
+            .map(|bucket| bucket.capacity().maximum_tokens())
+            .collect::<Vec<_>>();
+
+        assert_eq!(policy.maximum_reusable_lanes(), 1);
+        assert_eq!(decode_widths, [1, 2, 4, 8, 16]);
+        assert_eq!(prefill_tokens, [64, 128]);
+    }
+
+    #[test]
     fn wave_timing_snapshot_exposes_honest_host_boundaries() {
         let snapshot = VNextWaveTimingMetrics::default().snapshot();
 
@@ -6298,6 +6384,11 @@ mod tests {
         );
         assert_eq!(
             snapshot["resource_prepare_breakdown"]["step_admission"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_admission_breakdown"]["demand_evaluate"]
+                ["samples"],
             0
         );
         assert_eq!(
@@ -6351,6 +6442,10 @@ mod tests {
         metrics
             .resource_step_admission
             .record(Duration::from_micros(13));
+        metrics.resource_step_admission_breakdown.record(
+            StepResourceAdmissionProfilePhase::DemandEvaluate,
+            Duration::from_micros(7),
+        );
         metrics
             .resource_submission_wave_prepare
             .record(Duration::from_micros(17));
@@ -6365,6 +6460,11 @@ mod tests {
             13.0
         );
         assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_admission_breakdown"]["demand_evaluate"]
+                ["average_us"],
+            7.0
+        );
+        assert_eq!(
             snapshot["resource_prepare_breakdown"]["submission_wave_prepare"]["average_us"],
             17.0
         );
@@ -6377,6 +6477,11 @@ mod tests {
         );
         assert_eq!(
             snapshot["resource_prepare_breakdown"]["step_admission"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_admission_breakdown"]["demand_evaluate"]
+                ["samples"],
             0
         );
         assert_eq!(

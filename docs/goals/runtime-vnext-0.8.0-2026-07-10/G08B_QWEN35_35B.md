@@ -184,6 +184,52 @@ The GitHub-downloaded local copy was verified at
 Vast instance `45319871` is `stopped/exited`, and the reconciled unexpected
 billable-or-transitional instance count is `0`.
 
+## Backend-Neutral Workspace Reuse Diagnostic - 2026-07-24
+
+The CUDA correctness checkpoint and host-dispatch diagnostic both ran with
+`FERRUM_BATCHED_GRAPH=0`. Their startup preparation reported `enabled=false`, and
+the CUDA dynamic pools reported `live_segments=0` after the request. This means the
+703-case checkpoint proved the typed vNext product path, but did not prove that
+lane-stable reusable workspace backing was active.
+
+Source inspection found that `ReusableExecutionPolicy` creation was incorrectly
+conditional on CUDA graph configuration and device executable-capture capability.
+The policy owns backend-neutral decode/prefill workspace buckets as well as the
+inputs used by device capture. Consequently, Metal and graph-disabled CUDA repeatedly
+claimed and released step/submission backing even though executable capture was not
+requested.
+
+A dirty local candidate based on `89d3f66d5a709d866ae0accb083f4b528ad62e41`
+decouples those responsibilities: the immutable runtime policy always contains
+lane-stable workspace buckets, while executable warmup/capture/replay remains gated by
+the typed backend capability and `enable_cuda_graphs`. The same real
+Qwen3.5-35B-A3B Q4_K_S Metal request produced:
+
+| decode host interval | before | candidate | change |
+|---|---:|---:|---:|
+| backing claim | 4173.926 us | 261.633 us | -93.73% |
+| step admission | 4590.789 us | 692.091 us | -84.92% |
+| submission-wave prepare | 2928.569 us | 445.300 us | -84.79% |
+| resource-prepare attempt | 7527.991 us | 1170.058 us | -84.46% |
+
+Device capture remained disabled and unsupported with zero captured/replayed
+executables. Resource domains 1/4/5 retained `2/2/6` live lane-stable segments,
+respectively. The request completed `32/32` waves with zero failed wave and zero
+request/sequence/step/wave deferral. Six bounded backing-growth maintenance attempts
+were observed during cold allocation, versus four in the baseline; they converged
+internally and are not hidden from the artifact.
+
+The diagnostic is deliberately not a correctness or performance PASS: the 32-token
+response ended during Qwen reasoning and the source was dirty. The durable artifact is
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/workspace-reuse-metal-dirty-89d3f66d/`;
+`diagnostic-summary.json` is `KEEP_DIAGNOSTIC`, and the bound Metal binary SHA256 is
+`53b5787c97957556c5dcf27e5c600374377a85b1ed1cb898e5c8bd0445be517c`.
+
+The next CUDA work is one clean-SHA correctness-first bounded smoke, not a 703-case or
+full performance sweep. It must keep graph capture disabled, prove the focused
+`run`/`serve`/stream paths, show no product-visible deferral or request error, and
+measure decode resource preparation before any broader G08B/G09 run.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
