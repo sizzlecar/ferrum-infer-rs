@@ -448,6 +448,85 @@ and that fence ownership still covers every binding target until completion. The
 next paid prediction must name the exact owner counts and host stages expected to
 move; the formal `76.1583 tok/s` floor remains unchanged.
 
+### 2026-07-24 Causal Replay Ownership Result
+
+Clean source `4578e612f5f5c1546be06440a767e8999fbc4cec` first split cached CUDA
+executables from fence-only page dependencies. Its CUDA release build and manifest
+were READY, but the first real `c03-001 run` stopped the lane before `c05`, `c06`,
+or performance: startup replay validation changed the executable inventory from
+`80` to `100`. The exact failure class was
+`causal-replay-exact-sequence-shape-outside-startup-preparation`; the causal decode
+key still contained the current sequence length and block-table length. The
+immutable result is:
+
+```text
+CUDA CAUSAL REPLAY PREPARATION REJECT: /workspace/ferrum-artifacts/runtime-vnext-causal-replay-4578e612-20260724T0525/diagnostic-summary.json
+```
+
+That artifact was transferred through GitHub and verified locally at
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/causal-replay-cuda-4578e612/`.
+Its archive is `27,702,492` bytes with SHA256
+`995b92995772553eecc8a4b1454778d2973ca3bdf68b61a5e031f6d795d43943`.
+
+Clean follow-up `3ac6b65a9dcbbd9e5751424dfbd65d85583d76d2` introduced a typed causal
+decode launch envelope: V1 uses one `<=512` token topology and V2 uses native
+512-token partition buckets, while the actual sequence length remains in the
+per-wave device binding. The CUDA unit test for those boundaries passed `1/1`;
+the candidate release build and model manifest printed their exact READY lines.
+The same binary then passed the bounded product correctness gate:
+
+- `c03-001`: resident `ferrum run`, multi-turn memory;
+- `c05-001`: OpenAI-compatible non-streaming `ferrum serve`;
+- `c06-001`: streaming `ferrum serve`;
+- result: `3/3 pass`, request/quality/stream/panic errors `0`.
+
+The predeclared decode owner prediction was exact. Across 75 decode waves, each
+wave changed from `121 replay / 53 eager` to `131 replay / 43 eager`: ten causal
+compute commands entered replay, ten address-binding commands and one token upload
+remained explicit eager boundaries.
+
+The complete performance candidate was nevertheless rejected. The same full-profile
+workload exposed cross-topology segment poisoning:
+
+| prefill replay owner | `a0038a0e` | `3ac6b65a` | delta |
+|---|---:|---:|---:|
+| RMSNorm | `1230` | `955` | `-275` |
+| routed/shared MoE | `1200` | `950` | `-250` |
+| residual add | `1200` | `950` | `-250` |
+| causal attention | `0` | `50` | `+50` |
+
+Making exact-shape varlen prefill commands reusable removed `775` adjacent stable
+replays to gain only `50` causal replays, a net prefill loss of `725`. Across the
+whole scoped workload, replay therefore increased by only `25`
+(`12705 -> 12730`) instead of the decode-only `+750`. This is a static-program
+segmentation defect, not a reason to raise cache capacity or add another kernel.
+
+Profile-off `random 64/32`, c1, `100 x 3`, seed `9271` completed `300/300`
+requests with usage token counts and zero errors, but throughput fell to
+`51.5331 +/- 4.3387 tok/s`. It was `3.9567 tok/s` (`7.13%`) below
+`a0038a0e` and missed the unchanged `76.1583 tok/s` floor by
+`24.6252 tok/s` (`32.33%`). The immutable result is:
+
+```text
+CUDA CAUSAL REPLAY ENVELOPE REJECT: /workspace/ferrum-artifacts/runtime-vnext-causal-envelope-3ac6b65a-20260724T0548/diagnostic-summary.json
+```
+
+The complete archive remains on the retained stopped instance because both
+`api.github.com` and `uploads.github.com` timed out from the host after packaging.
+It is `35,154,675` bytes with SHA256
+`1e0b9774ff7822ffe3336b39c7afb96b78171a40e5c0a17ba9f4f9863108b8d7`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no sibling instance.
+This transfer blocker does not permit another benchmark run.
+
+The next source hypothesis is topology-typed replay eligibility. Causal decode
+V1/V2 remains reusable; exact-shape varlen/fallback prefill remains an explicit
+eager boundary until it has a stable prefill envelope. A dynamic-key miss must not
+force adjacent stable commands to eager. Before another paid run, local contracts
+must prove those boundaries and predict the following scoped full-profile result:
+decode `131/43`, prefill stable-owner replay restored to `1230/1200/1200`, total
+`13455 replay / 5985 eager`. Model names, GPU names, VRAM sizes, and hidden env
+switches are forbidden from that contract.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
