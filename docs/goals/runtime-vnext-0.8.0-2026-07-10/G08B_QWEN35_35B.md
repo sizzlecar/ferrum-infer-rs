@@ -334,6 +334,65 @@ The verified local artifact is
 The paid window was approximately 12 minutes (`$0.0939`). Vast instance `45319871`
 was then polled to `stopped/exited`; no billable or transitional sibling remains.
 
+Clean candidate `a0038a0eb0ec0b83af8f3d34b72d2ec0715f1e55` implemented that
+product-policy split without adding a kernel or command cache. Its bound CUDA binary
+SHA256 was
+`e4a55cddc7883ec65e7fb13dd726ac14692ee3f7b9d0a1f100ff7e42442721eb`.
+Local affected-crate gates passed before paid work:
+
+- `ferrum-types` lib `95/95` and config integration `17/17`;
+- `ferrum-models` lib `233 pass`, two designed real-model tests ignored, zero fail;
+- `ferrum-cli` lib `169/169`;
+- formatting and diff checks passed.
+
+On the retained RTX 4090, `c03-001 run`, `c05-001 serve`, and `c06-001 streaming
+serve` again passed `3/3`. Default product configuration reported legacy
+`FERRUM_BATCHED_GRAPH=0` and typed `FERRUM_REUSABLE_EXECUTION=1`. Startup preparation
+reached `ready` in `1.389 s`: all 240 executables were captured, uploaded, and
+resident, with rejected/deferred `0` and `eager_fallback_required=false`.
+
+The bounded result nevertheless failed the predeclared performance signal:
+
+| metric | required | observed |
+|---|---:|---:|
+| request-time capture/upload | `0` | `0/0` |
+| candidate/cache-hit/outside-preparation segments per wave | `40/40/0` | `40/40/0` |
+| replayed commands per wave | `>=150` | `121` |
+| eager commands per wave | `<=24` | `53` |
+| enqueue commands | `<=2.0 ms/wave` | `2.509 ms/wave` |
+| profile-off throughput | `>55.5897 tok/s` | `55.4898 +/- 2.1109 tok/s` |
+
+Thus typed startup preparation and all 40 segment replays are working, and enqueue
+fell from `5.614 ms` to `2.509 ms`, but only `69.54%` of the 174-command wave moved
+into replay. The remaining 53 eager commands prevent a performance KEEP and leave
+the formal `76.1583 tok/s` floor open by `20.6685 tok/s`. Full-profile diagnostic
+throughput was `8.1976 tok/s`; it is not product performance evidence.
+
+The immutable result is:
+
+```text
+CUDA REUSABLE PROGRAM INTEGRATION REJECT: /workspace/ferrum-artifacts/runtime-vnext-reusable-program-a0038a0e-20260724T0423/diagnostic-summary.json
+```
+
+The first benchmark warmup attempt is preserved as auxiliary failure
+`bench-client-served-model-name-mismatch`: the client sent the model directory while
+the server exposed `m2-qwen35-35b-a3b`, so it returned HTTP 400 before inference.
+The corrected bounded retry reused the same warmed server and completed `300/300`
+requests with zero request, quality, panic, HTTP 500, or stream error.
+
+The complete GitHub asset is
+[runtime-vnext-reusable-program-a0038a0e-20260724T0423.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-reusable-program-a0038a0e-20260724T0423.tar.zst),
+asset id `487626043`, SHA256
+`f7ab54160372956f39b868df20cc6ffedca6c06ce953cad43110953d13dbb80d`.
+The GitHub-downloaded local copy was verified at
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/reusable-program-cuda-a0038a0e/`.
+The paid window was approximately 29 minutes (`$0.2269`). Vast `45319871` is
+`stopped/exited`, with no billable/transitional sibling.
+
+No further paid run is allowed until source analysis classifies the 53 eager commands
+per decode wave by typed command owner and a source change predicts which owner will
+move into prepared replay and reduce enqueue below `2.0 ms`.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
