@@ -131,6 +131,51 @@ vLLM attention kernel and improves that operation. It does not refresh the curre
 703-case CUDA matrix, satisfy the G08B performance smoke, prove Metal, or complete
 G08B/G09.
 
+## CUDA Host-Dispatch Diagnostic - 2026-07-23
+
+Clean source `d0d2e4f5f080b1deb7359569313c27fe15e02454` retained the addressed
+vLLM paged-attention path and removed repeated resource-layout compilation, O(N^2)
+wave-node lookup, per-node temporary identity vectors, and repeated common-authority
+validation. The bound CUDA binary SHA256 was
+`3b09cb93f04c2ad9fc255f1f965ee574afc7b1b57d73bce135c16fcd2bf22fc1`.
+
+Correctness passed before performance:
+
+- addressed causal-attention provider tests `8/8` and vLLM dispatcher tests `3/3`;
+- actual-model `c03-001 run`, `c05-001 serve`, and `c06-001 streaming serve`
+  passed `3/3`;
+- the profile-off performance run completed `300/300` measured requests with
+  usage-derived output-token counts and zero request, output-quality, malformed-SSE,
+  HTTP 500, or panic errors.
+
+The same-hardware profile-off result was `46.0342 +/- 0.7937 tok/s`. This is
+`16.34%` above the preceding `39.5687 tok/s` candidate and exceeds the diagnostic
+KEEP floor by `5.0993 tok/s`. Decode `submitted_wave_total` fell from `14.964 ms`
+to `12.888 ms`, satisfying the `<=13.5 ms` source prediction. Decode
+`resource_prepare_attempt` fell from `4.192 ms` to `3.603 ms`, but missed the
+predeclared `<=3.5 ms` target by `0.103 ms`. The formal `76.158 tok/s` legacy
+90% floor remains open by `30.124 tok/s`, so the scoped diagnostic remains REJECT:
+
+```text
+status=REJECT
+failure_class=resource-prepare-target-miss-despite-throughput-keep
+```
+
+The immutable singleton `ExecutionBatchParticipants` is still reconstructed for
+every decode token, including a new `Vec`, participant canonicalization, plan-evidence
+clone, lifecycle read, and a second `spans.to_vec`. Before another paid run, cache
+that immutable singleton membership on `VNextSequence` and bind work shape from
+borrowed spans. The falsifiable target is decode `resource_prepare_attempt <=3.45 ms`
+without weakening dynamic multi-sequence admission or correctness.
+
+The complete artifact is stored in the temporary
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-host-dispatch-d0d2e4f5-20260723T170239Z.tar.zst)
+with SHA256 `72932611450603a67b7ded73be5767079d8f8a616dc690b424e3a6ccba0b724e`.
+The GitHub-downloaded local copy was verified at
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260723/github-assets/`.
+Vast instance `45319871` is `stopped/exited`, and the reconciled unexpected
+billable-or-transitional instance count is `0`.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
