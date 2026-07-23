@@ -1,6 +1,8 @@
-// Generic vNext causal attention over independently allocated fixed-size pages.
-// Logical KV layout is [token, K_or_V, kv_head, head_dim]. The provider owns
-// the page-pointer table and the core owns allocation, admission, and lifetime.
+// vNext causal attention over independently allocated fixed-size pages. The
+// provider owns the address table and the core owns allocation, admission, and
+// lifetime. The token-major kernels remain the generic fallback. The addressed
+// kernels use vLLM's 16-token K/V block layout so decode can dispatch the
+// existing tiled vLLM attention without changing core resource ownership.
 
 #include "common.cuh"
 
@@ -11,6 +13,8 @@
 
 #define VNEXT_WARP_SIZE 32
 #define VNEXT_MAX_HEAD_CHUNKS 8
+#define VNEXT_VLLM_BLOCK_TOKENS 16
+#define VNEXT_VLLM_K_PACK 8
 
 __device__ __forceinline__ __half* vnext_paged_element(
     const unsigned long long* __restrict__ page_pointers,
@@ -68,11 +72,86 @@ __device__ __forceinline__ float vnext_load_kv(
   return source == nullptr ? 0.0f : __half2float(*source);
 }
 
+__device__ __forceinline__ __half* vnext_vllm_block_pointer(
+    const unsigned long long* __restrict__ block_pointers,
+    const int block_count,
+    const int token) {
+  const int block = token / VNEXT_VLLM_BLOCK_TOKENS;
+  if (block < 0 || block >= block_count) return nullptr;
+  return reinterpret_cast<__half*>(
+      static_cast<uintptr_t>(block_pointers[block]));
+}
+
+__device__ __forceinline__ long long vnext_vllm_k_offset(
+    const int token_offset,
+    const int head,
+    const int dim,
+    const int head_dim) {
+  return (long long)head * head_dim * VNEXT_VLLM_BLOCK_TOKENS +
+         (dim / VNEXT_VLLM_K_PACK) * VNEXT_VLLM_BLOCK_TOKENS *
+             VNEXT_VLLM_K_PACK +
+         token_offset * VNEXT_VLLM_K_PACK + dim % VNEXT_VLLM_K_PACK;
+}
+
+__device__ __forceinline__ long long vnext_vllm_v_offset(
+    const int token_offset,
+    const int head,
+    const int dim,
+    const int kv_heads,
+    const int head_dim) {
+  const long long key_block_elements =
+      (long long)kv_heads * head_dim * VNEXT_VLLM_BLOCK_TOKENS;
+  return key_block_elements +
+         (long long)head * head_dim * VNEXT_VLLM_BLOCK_TOKENS +
+         (long long)dim * VNEXT_VLLM_BLOCK_TOKENS + token_offset;
+}
+
+__device__ __forceinline__ void vnext_store_vllm_kv(
+    const unsigned long long* __restrict__ block_pointers,
+    const int block_count,
+    const int token,
+    const int kind,
+    const int head,
+    const int dim,
+    const int kv_heads,
+    const int head_dim,
+    const __half value) {
+  __half* block = vnext_vllm_block_pointer(block_pointers, block_count, token);
+  if (block == nullptr) return;
+  const int token_offset = token % VNEXT_VLLM_BLOCK_TOKENS;
+  const long long offset =
+      kind == 0
+          ? vnext_vllm_k_offset(token_offset, head, dim, head_dim)
+          : vnext_vllm_v_offset(token_offset, head, dim, kv_heads, head_dim);
+  block[offset] = value;
+}
+
+__device__ __forceinline__ float vnext_load_vllm_kv(
+    const unsigned long long* __restrict__ block_pointers,
+    const int block_count,
+    const int token,
+    const int kind,
+    const int head,
+    const int dim,
+    const int kv_heads,
+    const int head_dim) {
+  const __half* block =
+      vnext_vllm_block_pointer(block_pointers, block_count, token);
+  if (block == nullptr) return 0.0f;
+  const int token_offset = token % VNEXT_VLLM_BLOCK_TOKENS;
+  const long long offset =
+      kind == 0
+          ? vnext_vllm_k_offset(token_offset, head, dim, head_dim)
+          : vnext_vllm_v_offset(token_offset, head, dim, kv_heads, head_dim);
+  return __half2float(block[offset]);
+}
+
 __device__ __forceinline__ void vnext_store_prepared_value(
     __half* __restrict__ query,
     const unsigned long long* __restrict__ page_pointers,
     const int page_count,
     const int page_elements,
+    const int kv_layout,
     const bool is_query,
     const int token,
     const int absolute_position,
@@ -85,6 +164,9 @@ __device__ __forceinline__ void vnext_store_prepared_value(
   const __half converted = __float2half(value);
   if (is_query) {
     query[((long long)token * query_heads + head) * head_dim + dim] = converted;
+  } else if (kv_layout != 0) {
+    vnext_store_vllm_kv(page_pointers, page_count, absolute_position, 0, head,
+                        dim, kv_heads, head_dim, converted);
   } else {
     vnext_store_kv(page_pointers, page_count, page_elements, absolute_position,
                    0, head, dim, kv_heads, head_dim, converted);
@@ -101,6 +183,7 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const int* __restrict__ control,
     const unsigned long long* __restrict__ page_pointers,
     const int page_elements,
+    const int kv_layout,
     const int query_heads,
     const int kv_heads,
     const int head_dim,
@@ -133,8 +216,14 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const __half* source =
         value_raw + (long long)token * kv_projection_stride + head * head_dim;
     for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
-      vnext_store_kv(page_pointers, page_count, page_elements, absolute_position,
-                     1, head, dim, kv_heads, head_dim, source[dim]);
+      if (kv_layout != 0) {
+        vnext_store_vllm_kv(page_pointers, page_count, absolute_position, 1,
+                            head, dim, kv_heads, head_dim, source[dim]);
+      } else {
+        vnext_store_kv(page_pointers, page_count, page_elements,
+                       absolute_position, 1, head, dim, kv_heads, head_dim,
+                       source[dim]);
+      }
     }
     return;
   }
@@ -171,12 +260,12 @@ extern "C" __global__ void vnext_causal_prepare_f16(
       float cosine = 0.0f;
       sincosf(angle, &sine, &cosine);
       vnext_store_prepared_value(
-          query, page_pointers, page_count, page_elements, is_query, token,
-          absolute_position, head, low, query_heads, kv_heads, head_dim,
+          query, page_pointers, page_count, page_elements, kv_layout, is_query,
+          token, absolute_position, head, low, query_heads, kv_heads, head_dim,
           x0 * cosine - x1 * sine);
       vnext_store_prepared_value(
-          query, page_pointers, page_count, page_elements, is_query, token,
-          absolute_position, head, high, query_heads, kv_heads, head_dim,
+          query, page_pointers, page_count, page_elements, kv_layout, is_query,
+          token, absolute_position, head, high, query_heads, kv_heads, head_dim,
           x1 * cosine + x0 * sine);
     }
   } else {
@@ -194,12 +283,12 @@ extern "C" __global__ void vnext_causal_prepare_f16(
       float cosine = 0.0f;
       sincosf(angle, &sine, &cosine);
       vnext_store_prepared_value(
-          query, page_pointers, page_count, page_elements, is_query, token,
-          absolute_position, head, low, query_heads, kv_heads, head_dim,
+          query, page_pointers, page_count, page_elements, kv_layout, is_query,
+          token, absolute_position, head, low, query_heads, kv_heads, head_dim,
           x0 * cosine - x1 * sine);
       vnext_store_prepared_value(
-          query, page_pointers, page_count, page_elements, is_query, token,
-          absolute_position, head, high, query_heads, kv_heads, head_dim,
+          query, page_pointers, page_count, page_elements, kv_layout, is_query,
+          token, absolute_position, head, high, query_heads, kv_heads, head_dim,
           x1 * cosine + x0 * sine);
     }
   }
@@ -208,8 +297,9 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const float value = __half2float(source[dim]) * norm_scale *
                         __half2float(weight[dim]);
     vnext_store_prepared_value(
-        query, page_pointers, page_count, page_elements, is_query, token,
-        absolute_position, head, dim, query_heads, kv_heads, head_dim, value);
+        query, page_pointers, page_count, page_elements, kv_layout, is_query,
+        token, absolute_position, head, dim, query_heads, kv_heads, head_dim,
+        value);
   }
 }
 
@@ -220,6 +310,7 @@ extern "C" __global__ void vnext_causal_attention_f16(
     const unsigned long long* __restrict__ page_pointers,
     __half* __restrict__ output,
     const int page_elements,
+    const int kv_layout,
     const int query_heads,
     const int kv_heads,
     const int head_dim,
@@ -260,10 +351,14 @@ extern "C" __global__ void vnext_causal_attention_f16(
     for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
       const int dim = lane + chunk * VNEXT_WARP_SIZE;
       if (dim < head_dim) {
-        partial_dot += query_values[chunk] *
-                       vnext_load_kv(page_pointers, page_count, page_elements,
-                                     key_position, 0, kv_head, dim, kv_heads,
-                                     head_dim);
+        const float key =
+            kv_layout != 0
+                ? vnext_load_vllm_kv(page_pointers, page_count, key_position,
+                                     0, kv_head, dim, kv_heads, head_dim)
+                : vnext_load_kv(page_pointers, page_count, page_elements,
+                                key_position, 0, kv_head, dim, kv_heads,
+                                head_dim);
+        partial_dot += query_values[chunk] * key;
       }
     }
     const float score = warp_reduce_sum(partial_dot) * attention_scale;
@@ -277,8 +372,12 @@ extern "C" __global__ void vnext_causal_attention_f16(
       const int dim = lane + chunk * VNEXT_WARP_SIZE;
       if (dim < head_dim) {
         const float value =
-            vnext_load_kv(page_pointers, page_count, page_elements,
-                          key_position, 1, kv_head, dim, kv_heads, head_dim);
+            kv_layout != 0
+                ? vnext_load_vllm_kv(page_pointers, page_count, key_position,
+                                     1, kv_head, dim, kv_heads, head_dim)
+                : vnext_load_kv(page_pointers, page_count, page_elements,
+                                key_position, 1, kv_head, dim, kv_heads,
+                                head_dim);
         accumulated[chunk] = accumulated[chunk] * previous_scale +
                              value * value_scale;
       }
