@@ -213,6 +213,17 @@ def _parse_linux_stat(raw: str) -> tuple[int, int, int]:
     return pid, pgid, threads
 
 
+def _read_linux_stat(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        # A process may exit after /proc was enumerated but before its stat
+        # record is opened. This is normal process churn, not lost sampling.
+        return None
+    except OSError as error:
+        raise SamplingError(f"cannot read {path}: {error}") from error
+
+
 def _sample_linux_process_group(pgid: int) -> ProcessGroupSnapshot:
     process_threads: dict[int, int] = {}
     try:
@@ -223,12 +234,9 @@ def _sample_linux_process_group(pgid: int) -> ProcessGroupSnapshot:
         for entry in entries:
             if not entry.name.isdigit():
                 continue
-            try:
-                raw = Path(entry.path, "stat").read_text(encoding="utf-8")
-            except FileNotFoundError:
+            raw = _read_linux_stat(Path(entry.path, "stat"))
+            if raw is None:
                 continue
-            except OSError as error:
-                raise SamplingError(f"cannot read {entry.path}/stat: {error}") from error
             pid, row_pgid, threads = _parse_linux_stat(raw)
             if row_pgid == pgid:
                 process_threads[pid] = threads
@@ -656,6 +664,8 @@ def _self_test_case(
 
 
 def self_test() -> int:
+    from unittest import mock
+
     with tempfile.TemporaryDirectory(prefix="bounded-command-selftest-") as temporary:
         root = Path(temporary).resolve()
         fast = {
@@ -781,6 +791,25 @@ def self_test() -> int:
         assert receipt["sampling_error_count"] == 0
         assert receipt["sampling_errors"] == []
         assert exit_race_calls >= 2
+
+        linux_stat_path = Path("/proc/123/stat")
+        with mock.patch.object(
+            Path,
+            "read_text",
+            side_effect=ProcessLookupError(3, "No such process"),
+        ):
+            assert _read_linux_stat(linux_stat_path) is None
+        with mock.patch.object(
+            Path,
+            "read_text",
+            side_effect=PermissionError(13, "Permission denied"),
+        ):
+            try:
+                _read_linux_stat(linux_stat_path)
+            except SamplingError as error:
+                assert "cannot read /proc/123/stat" in str(error)
+            else:
+                raise AssertionError("non-transient /proc read error was ignored")
 
     print("BOUNDED COMMAND SELFTEST PASS")
     return 0
