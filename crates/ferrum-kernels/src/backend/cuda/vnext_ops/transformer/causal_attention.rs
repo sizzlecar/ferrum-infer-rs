@@ -479,6 +479,44 @@ impl CausalAttentionReplayEnvelope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CausalAttentionReplayTopology {
+    PartitionStableDecode(CausalAttentionReplayEnvelope),
+    ExactShapeEager(CausalAttentionReplayEnvelope),
+}
+
+impl CausalAttentionReplayTopology {
+    fn new(
+        shape: CausalAttentionShape,
+        path: CausalAttentionKernelPath,
+        sequence_tokens: u64,
+    ) -> Result<Self, String> {
+        let envelope = CausalAttentionReplayEnvelope::new(shape, path, sequence_tokens)?;
+        Ok(match path {
+            CausalAttentionKernelPath::VllmAddressedDecodeV1
+            | CausalAttentionKernelPath::VllmAddressedDecodeV2 => {
+                Self::PartitionStableDecode(envelope)
+            }
+            CausalAttentionKernelPath::TokenMajorFallback
+            | CausalAttentionKernelPath::VllmAddressedFallback
+            | CausalAttentionKernelPath::VllmAddressedVarlen
+            | CausalAttentionKernelPath::VllmAddressedVarlenTiled => {
+                Self::ExactShapeEager(envelope)
+            }
+        })
+    }
+
+    const fn envelope(self) -> CausalAttentionReplayEnvelope {
+        match self {
+            Self::PartitionStableDecode(envelope) | Self::ExactShapeEager(envelope) => envelope,
+        }
+    }
+
+    const fn is_partition_stable(self) -> bool {
+        matches!(self, Self::PartitionStableDecode(_))
+    }
+}
+
 impl CausalAttentionShape {
     fn from_attributes(attributes: &BTreeMap<AttributeId, SemanticValue>) -> Result<Self, String> {
         let shape = Self {
@@ -840,7 +878,7 @@ struct CausalAttentionLaunch {
     sequence_tokens: u64,
     sequence_tokens_i32: i32,
     table_entries_i32: i32,
-    replay_envelope: CausalAttentionReplayEnvelope,
+    replay_topology: CausalAttentionReplayTopology,
     path: CausalAttentionKernelPath,
 }
 
@@ -985,7 +1023,7 @@ fn encode_attention(
         let table_entries_i32 =
             checked_i32(table_entries, "causal attention address-table entry count")?;
         let path = CausalAttentionKernelPath::select(shape, tokens, source.end)?;
-        let replay_envelope = CausalAttentionReplayEnvelope::new(shape, path, source.end)?;
+        let replay_topology = CausalAttentionReplayTopology::new(shape, path, source.end)?;
         let host_binding = host_storage.len();
         host_storage.push(binding_payload(
             shape.kv_layout()?,
@@ -1014,7 +1052,7 @@ fn encode_attention(
             sequence_tokens: source.end,
             sequence_tokens_i32,
             table_entries_i32,
-            replay_envelope,
+            replay_topology,
             path,
         });
     }
@@ -1050,62 +1088,82 @@ fn encode_attention(
         .iter()
         .map(|launch| 7 + launch.path.attention_dispatch_count() + u64::from(shape.output_gate))
         .sum();
-    let mut replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, compute_operation)
-        .u64(shape.hidden_size)
-        .u64(shape.query_heads)
-        .u64(shape.key_value_heads)
-        .u64(shape.head_dim)
-        .u64(shape.query_features)
-        .u64(shape.query_projection_features)
-        .u64(shape.kv_features)
-        .u64(shape.rope_dim)
-        .u64(shape.maximum_context_tokens)
-        .f32(shape.epsilon)
-        .f32(shape.rope_theta)
-        .boolean(shape.rope_interleaved)
-        .boolean(shape.output_gate)
-        .u64(total_tokens)
-        .u64(layout.required_bytes)
-        .u64(layout.normalized)
-        .u64(layout.query_raw)
-        .u64(layout.key_raw)
-        .u64(layout.value_raw)
-        .u64(layout.query)
-        .u64(layout.context)
-        .u64(layout.projected)
-        .u64(layout.vllm.map_or(0, |vllm| vllm.exp_sums))
-        .u64(layout.vllm.map_or(0, |vllm| vllm.max_logits))
-        .u64(layout.vllm.map_or(0, |vllm| vllm.temporary_output))
-        .u64(binding_layout.required_bytes)
-        .u64(binding_layout.slot_bytes)
-        .u64(launches.len() as u64);
-    for launch in &launches {
-        replay_key = replay_key
-            .u64(launch.input_region as u64)
-            .u64(launch.output_region as u64)
-            .u64(launch.binding_offset)
-            .u64(launch.tokens)
-            .i32(launch.tokens_i32)
-            .u64(launch.replay_envelope.sequence_capacity_tokens)
-            .i32(launch.replay_envelope.table_capacity_entries)
-            .u64(launch.path.replay_id());
-    }
+    let replay_key = launches
+        .iter()
+        .all(|launch| launch.replay_topology.is_partition_stable())
+        .then(|| {
+            let mut replay_key =
+                CudaCommandReplayKeyBuilder::new(provider_fingerprint, compute_operation)
+                    .u64(shape.hidden_size)
+                    .u64(shape.query_heads)
+                    .u64(shape.key_value_heads)
+                    .u64(shape.head_dim)
+                    .u64(shape.query_features)
+                    .u64(shape.query_projection_features)
+                    .u64(shape.kv_features)
+                    .u64(shape.rope_dim)
+                    .u64(shape.maximum_context_tokens)
+                    .f32(shape.epsilon)
+                    .f32(shape.rope_theta)
+                    .boolean(shape.rope_interleaved)
+                    .boolean(shape.output_gate)
+                    .u64(total_tokens)
+                    .u64(layout.required_bytes)
+                    .u64(layout.normalized)
+                    .u64(layout.query_raw)
+                    .u64(layout.key_raw)
+                    .u64(layout.value_raw)
+                    .u64(layout.query)
+                    .u64(layout.context)
+                    .u64(layout.projected)
+                    .u64(layout.vllm.map_or(0, |vllm| vllm.exp_sums))
+                    .u64(layout.vllm.map_or(0, |vllm| vllm.max_logits))
+                    .u64(layout.vllm.map_or(0, |vllm| vllm.temporary_output))
+                    .u64(binding_layout.required_bytes)
+                    .u64(binding_layout.slot_bytes)
+                    .u64(launches.len() as u64);
+            for launch in &launches {
+                let replay_envelope = launch.replay_topology.envelope();
+                replay_key = replay_key
+                    .u64(launch.input_region as u64)
+                    .u64(launch.output_region as u64)
+                    .u64(launch.binding_offset)
+                    .u64(launch.tokens)
+                    .i32(launch.tokens_i32)
+                    .u64(replay_envelope.sequence_capacity_tokens)
+                    .i32(replay_envelope.table_capacity_entries)
+                    .u64(launch.path.replay_id());
+            }
+            replay_key.finish()
+        });
 
     let functions = functions.clone();
-    let compute_command = CudaDeviceCommand::replayable_operation_with_blas_and_fence_dependencies(
-        compute_operation,
-        compute_regions,
-        compute_fence_dependencies,
-        replay_key.finish(),
-        move |stream, blas, regions| {
+    let enqueue_compute =
+        move |stream: &CudaStream, blas: &CudaBlas, regions: &[CudaBufferRegion]| {
             for launch in &launches {
                 enqueue_attention(
                     stream, blas, &functions, shape, cuda, layout, shared, *launch, regions,
                 )?;
             }
             Ok(())
-        },
-    )
+        };
+    let compute_command = match replay_key {
+        Some(replay_key) => {
+            CudaDeviceCommand::replayable_operation_with_blas_and_fence_dependencies(
+                compute_operation,
+                compute_regions,
+                compute_fence_dependencies,
+                replay_key,
+                enqueue_compute,
+            )
+        }
+        None => CudaDeviceCommand::operation_with_blas_and_fence_dependencies(
+            compute_operation,
+            compute_regions,
+            compute_fence_dependencies,
+            enqueue_compute,
+        ),
+    }
     .and_then(|command| {
         command.with_work_attribution(
             DeviceBatchingForm::ParticipantLoop,
@@ -1478,14 +1536,14 @@ fn launch_selected_attention(
                         query,
                         page_table,
                         sequence_length_device,
-                        launch.replay_envelope.sequence_capacity_tokens,
+                        launch.replay_topology.envelope().sequence_capacity_tokens,
                         Some(scratch_pointer(scratch_base, scratch.exp_sums)?),
                         Some(scratch_pointer(scratch_base, scratch.max_logits)?),
                         Some(scratch_pointer(scratch_base, scratch.temporary_output)?),
                         shape.query_heads,
                         shape.key_value_heads,
                         shape.head_dim,
-                        launch.replay_envelope.table_capacity_entries,
+                        launch.replay_topology.envelope().table_capacity_entries,
                     )
                 }
                 .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
@@ -2318,6 +2376,37 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn only_partition_stable_decode_topologies_are_replayable() {
+        let shape = goal_shape(32, 4, 128, 32_768);
+        for path in [
+            CausalAttentionKernelPath::VllmAddressedDecodeV1,
+            CausalAttentionKernelPath::VllmAddressedDecodeV2,
+        ] {
+            let sequence_tokens = if path == CausalAttentionKernelPath::VllmAddressedDecodeV1 {
+                512
+            } else {
+                513
+            };
+            assert!(
+                CausalAttentionReplayTopology::new(shape, path, sequence_tokens)
+                    .unwrap()
+                    .is_partition_stable()
+            );
+        }
+
+        for path in [
+            CausalAttentionKernelPath::TokenMajorFallback,
+            CausalAttentionKernelPath::VllmAddressedFallback,
+            CausalAttentionKernelPath::VllmAddressedVarlen,
+            CausalAttentionKernelPath::VllmAddressedVarlenTiled,
+        ] {
+            assert!(!CausalAttentionReplayTopology::new(shape, path, 64)
+                .unwrap()
+                .is_partition_stable());
+        }
     }
 
     #[test]
