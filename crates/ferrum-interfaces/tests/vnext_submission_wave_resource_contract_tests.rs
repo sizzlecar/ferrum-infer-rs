@@ -112,6 +112,55 @@ fn reusable_sequential_scratch_plan() -> (
     (plan, registry, bucket)
 }
 
+fn reusable_token_scaled_plan() -> (
+    ExecutionPlan,
+    core::TestRegistry,
+    core::TestPlanningRegistry,
+    ReusableExecutionBucketSpec,
+) {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("execution.test-token-scaled").unwrap(),
+        ReusableExecutionCapacity::new(1, 4, 1).unwrap(),
+    )
+    .unwrap();
+    let policy = ResolvedRuntimePolicy::new(
+        "runtime-policy.test-token-scaled",
+        ContractVersion::new(1, 0),
+        SchedulingDiscipline::FirstReady,
+        RuntimeMemoryPolicy {
+            capacity_bytes: 4096,
+            reserve_bytes: 128,
+            maximum_active_sequences: 3,
+            dynamic_storage_profile_order: vec![core::contiguous_storage_profile()],
+        },
+        serde_json::from_value(serde_json::json!({
+            "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 4,
+            "sequence_fit_policy": "immediate_only",
+            "allow_defer": true,
+            "cancellation_check_interval_steps": 1
+        }))
+        .unwrap(),
+        Some(ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap()),
+    )
+    .unwrap();
+    let model_registry = core::TestRegistry::new();
+    let family = model_registry.prepare();
+    let catalog = core::catalog();
+    let planning = core::TestPlanningRegistry::new(
+        &catalog,
+        32,
+        32,
+        core::EstimateBehavior::TokenScaledScratch,
+    );
+    let resolution = core::node_resolution(&family, &catalog, &policy, 0, &planning);
+    let plan = ExecutionPlan::build(
+        PlanBuildRequest::new(&family, &catalog, &policy, vec![resolution]).unwrap(),
+    )
+    .unwrap();
+    (plan, model_registry, planning, bucket)
+}
+
 fn begin_step(
     batch: &ExecutionBatchParticipants<resource_support::TestRuntime>,
     lane: &Arc<ExecutionLane<resource_support::TestRuntime>>,
@@ -124,10 +173,17 @@ fn begin_step_with_bucket(
     lane: &Arc<ExecutionLane<resource_support::TestRuntime>>,
     bucket: Option<&ReusableExecutionBucketSpec>,
 ) -> Arc<StepResourceLease<resource_support::TestRuntime>> {
+    begin_step_for_span(batch, lane, bucket, resource_support::one_token_span())
+}
+
+fn begin_step_for_span(
+    batch: &ExecutionBatchParticipants<resource_support::TestRuntime>,
+    lane: &Arc<ExecutionLane<resource_support::TestRuntime>>,
+    bucket: Option<&ReusableExecutionBucketSpec>,
+    token_span: TokenSpanWork,
+) -> Arc<StepResourceLease<resource_support::TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
-        batch
-            .bind_work_shape(vec![resource_support::one_token_span()])
-            .unwrap(),
+        batch.bind_work_shape(vec![token_span]).unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -152,10 +208,9 @@ fn submission_requests(
     plan: &ExecutionPlan,
     step: &Arc<StepResourceLease<resource_support::TestRuntime>>,
 ) -> Vec<InvocationResourceAdmissionRequest> {
-    let work_shape = Arc::new(
-        step.bind_all_invocation_work_shape(vec![resource_support::one_token_span()])
-            .unwrap(),
-    );
+    let work_shape = step
+        .shared_all_invocation_work_shape(&[resource_support::one_token_span()])
+        .unwrap();
     plan.payload()
         .nodes()
         .iter()
@@ -175,10 +230,16 @@ fn prepare_wave(
     _plan: &ExecutionPlan,
     step: &Arc<StepResourceLease<resource_support::TestRuntime>>,
 ) -> PreparedStepSubmissionWave<resource_support::TestRuntime> {
-    let work_shape = Arc::new(
-        step.bind_all_invocation_work_shape(vec![resource_support::one_token_span()])
-            .unwrap(),
-    );
+    prepare_wave_for_span(step, resource_support::one_token_span())
+}
+
+fn prepare_wave_for_span(
+    step: &Arc<StepResourceLease<resource_support::TestRuntime>>,
+    token_span: TokenSpanWork,
+) -> PreparedStepSubmissionWave<resource_support::TestRuntime> {
+    let work_shape = step
+        .shared_all_invocation_work_shape(&[token_span])
+        .unwrap();
     for attempt in 0..=3 {
         match step
             .try_prepare_full_plan_submission_wave(
@@ -205,6 +266,7 @@ struct PhysicalSliceIdentity {
     segment_generation: u64,
     segments: Vec<BackingSegment>,
     physical_offset_bytes: u64,
+    capacity_size_bytes: u64,
     physical_size_bytes: u64,
 }
 
@@ -221,9 +283,17 @@ fn physical_slice_identities(
                 segment_generation: evidence.segment_generation(),
                 segments: evidence.segments().to_vec(),
                 physical_offset_bytes: evidence.physical_offset_bytes(),
+                capacity_size_bytes: evidence.capacity_size_bytes(),
                 physical_size_bytes: evidence.physical_size_bytes(),
             }
         })
+        .collect()
+}
+
+fn logical_slice_sizes(slices: &[LogicalBackingSliceAuthority]) -> Vec<(ResourceId, u64)> {
+    slices
+        .iter()
+        .map(|slice| (slice.resource_id().clone(), slice.size_bytes()))
         .collect()
 }
 
@@ -285,6 +355,13 @@ fn eager_submission_wave_releases_invocation_backing_while_step_and_lane_remain_
     let before_wave = live_segments_by_pool(&root);
 
     let wave = prepare_wave(&plan, &step);
+    assert!(std::ptr::eq(
+        step.work_shape(),
+        wave.nodes()[0].work_shape()
+    ));
+    assert!(step
+        .shared_all_invocation_work_shape(&[TokenSpanWork::from_token_ids(&[1, 2], 0..2).unwrap()])
+        .is_err());
     let during_wave = live_segments_by_pool(&root);
     assert!(during_wave.iter().any(|(pool_id, live_segments)| {
         *live_segments > before_wave.get(pool_id).copied().unwrap_or_default()
@@ -348,6 +425,84 @@ fn reusable_lane_same_shape_reuses_step_and_invocation_physical_generations() {
     drop(sequence);
     drop(lane);
     drop(registry);
+    resource_support::close_plan_runtime(root);
+}
+
+#[test]
+fn reusable_wave_keeps_compiled_physical_layout_while_logical_demand_changes() {
+    let (plan, model_registry, planning, bucket) = reusable_token_scaled_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let root = resource_support::plan_runtime(&plan, driver, "lane-arena-token-scaled");
+    let sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-token-scaled",
+        "request.lane-arena-token-scaled",
+    );
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+
+    let first_span = TokenSpanWork::from_token_ids(&[1], 0..1).unwrap();
+    let first_step = begin_step_for_span(&batch, &lane, Some(&bucket), first_span.clone());
+    let first_wave = prepare_wave_for_span(&first_step, first_span);
+    let first_slices = first_wave.claimed_backing().backing_slices();
+    let first_physical = physical_slice_identities(first_slices);
+    let first_logical = logical_slice_sizes(first_slices);
+    let wire = serde_json::to_value(first_slices[0].evidence()).unwrap();
+    assert_eq!(
+        wire.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "alignment_bytes",
+            "capacity_size_bytes",
+            "domain_id",
+            "element_type",
+            "initialization",
+            "physical_claim_identity",
+            "physical_offset_bytes",
+            "physical_size_bytes",
+            "pool_id",
+            "pool_instance_id",
+            "resource_id",
+            "reusable_execution_bucket_id",
+            "segment_generation",
+            "segments",
+            "size_bytes",
+            "storage_profile",
+            "usage",
+        ]),
+        "allocation caching must preserve the public evidence wire shape"
+    );
+    drop(first_wave);
+    first_step.try_retire_normal().unwrap();
+
+    let second_span = TokenSpanWork::from_token_ids(&[1, 2], 0..2).unwrap();
+    let second_step = begin_step_for_span(&batch, &lane, Some(&bucket), second_span.clone());
+    let second_wave = prepare_wave_for_span(&second_step, second_span);
+    let second_slices = second_wave.claimed_backing().backing_slices();
+    assert_eq!(
+        physical_slice_identities(second_slices),
+        first_physical,
+        "one reusable bucket must retain its precompiled physical capacity layout"
+    );
+    assert_ne!(
+        logical_slice_sizes(second_slices),
+        first_logical,
+        "logical per-wave demand must remain dynamic inside a reusable capacity bucket"
+    );
+
+    drop(second_wave);
+    second_step.try_retire_normal().unwrap();
+    drop(batch);
+    session.try_complete().unwrap();
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    drop(planning);
+    drop(model_registry);
     resource_support::close_plan_runtime(root);
 }
 

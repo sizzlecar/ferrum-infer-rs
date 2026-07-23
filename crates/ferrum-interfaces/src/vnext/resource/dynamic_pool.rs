@@ -148,6 +148,18 @@ pub(super) struct SubmissionWaveDomainLayout {
     pub(super) projection_count: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct SubmissionWaveProjectionCapacity {
+    pub(super) physical_offset_bytes: u64,
+    pub(super) capacity_size_bytes: u64,
+}
+
+#[derive(Debug)]
+pub(super) struct SubmissionWaveDomainCapacityLayout {
+    pub(super) physical_size_bytes: u64,
+    pub(super) projections: Vec<SubmissionWaveProjectionCapacity>,
+}
+
 fn compile_submission_wave_domain_layout(
     domain: &DynamicPoolDomainSpec,
     nodes: &[PlanNode],
@@ -234,6 +246,132 @@ fn compile_submission_wave_domain_layout(
         )?,
         projection_count: canonical_projections.len(),
     }))
+}
+
+fn compile_submission_wave_reusable_capacity_layouts(
+    domains: &[DynamicPoolDomainSpec],
+    layouts: &[Option<SubmissionWaveDomainLayout>],
+    reusable_execution: Option<&ReusableExecutionMemoryPlan>,
+) -> Result<
+    BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
+    VNextError,
+> {
+    let Some(reusable_execution) = reusable_execution else {
+        return Ok(BTreeMap::new());
+    };
+    if domains.len() != layouts.len() {
+        return Err(invalid_resource(
+            "submission wave reusable capacity layout count differs from dynamic pool domains",
+        ));
+    }
+
+    reusable_execution
+        .buckets()
+        .iter()
+        .map(|resolved| {
+            let bucket = resolved.bucket();
+            let capacity = bucket.capacity();
+            let capacity_shape = DynamicResourceShape::from_validated(
+                capacity.maximum_sequences(),
+                capacity.maximum_tokens(),
+                capacity.maximum_pages(),
+            );
+            let compiled = domains
+                .iter()
+                .zip(layouts)
+                .map(|(domain, layout)| {
+                    let Some(layout) = layout else {
+                        return Ok(None);
+                    };
+                    let mode = domain.pool.invocation_liveness_mode();
+                    let mut projections = (0..layout.projection_count)
+                        .map(|_| None)
+                        .collect::<Vec<_>>();
+                    let mut physical_size_bytes = 0_u64;
+                    for row in &layout.rows {
+                        let row_base = match mode {
+                            InvocationLivenessMode::TotalOrderReuse => 0,
+                            InvocationLivenessMode::ConservativeConcurrent => physical_size_bytes,
+                            InvocationLivenessMode::NoInvocationResources => unreachable!(),
+                        };
+                        let mut row_bytes = 0_u64;
+                        for projection_layout in &row.projections {
+                            let descriptor = domain
+                                .descriptors
+                                .get(projection_layout.descriptor_index)
+                                .ok_or_else(|| {
+                                    invalid_resource(
+                                        "reusable submission layout references a descriptor outside its pool",
+                                    )
+                                })?;
+                            if descriptor.lifetime() != AllocationLifetime::Invocation {
+                                return Err(invalid_resource(
+                                    "reusable submission layout references a non-Invocation descriptor",
+                                ));
+                            }
+                            let capacity_size_bytes =
+                                descriptor.evaluate_request_bytes_for_shape(capacity_shape)?;
+                            let physical_offset_bytes =
+                                row_base.checked_add(row_bytes).ok_or_else(|| {
+                                    invalid_resource(
+                                        "reusable submission projection offset overflows u64",
+                                    )
+                                })?;
+                            row_bytes =
+                                row_bytes.checked_add(capacity_size_bytes).ok_or_else(|| {
+                                    invalid_resource(
+                                        "reusable submission row capacity overflows u64",
+                                    )
+                                })?;
+                            if projections[projection_layout.projection_index]
+                                .replace(SubmissionWaveProjectionCapacity {
+                                    physical_offset_bytes,
+                                    capacity_size_bytes,
+                                })
+                                .is_some()
+                            {
+                                return Err(invalid_resource(
+                                    "reusable submission layout repeats one canonical projection",
+                                ));
+                            }
+                        }
+                        physical_size_bytes = match mode {
+                            InvocationLivenessMode::TotalOrderReuse => {
+                                physical_size_bytes.max(row_bytes)
+                            }
+                            InvocationLivenessMode::ConservativeConcurrent => physical_size_bytes
+                                .checked_add(row_bytes)
+                                .ok_or_else(|| {
+                                    invalid_resource(
+                                        "reusable submission pool capacity overflows u64",
+                                    )
+                                })?,
+                            InvocationLivenessMode::NoInvocationResources => unreachable!(),
+                        };
+                    }
+                    let projections =
+                        projections
+                            .into_iter()
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| {
+                                invalid_resource(
+                                    "reusable submission layout left a projection uncompiled",
+                                )
+                            })?;
+                    if projections.is_empty() || physical_size_bytes == 0 {
+                        return Err(invalid_resource(
+                            "reusable submission layout compiled empty capacity",
+                        ));
+                    }
+                    Ok(Some(SubmissionWaveDomainCapacityLayout {
+                        physical_size_bytes,
+                        projections,
+                    }))
+                })
+                .collect::<Result<Vec<_>, VNextError>>()?;
+            Ok((bucket.bucket_id().clone(), compiled))
+        })
+        .collect()
 }
 
 pub(super) struct ResidentChunkBacking<B> {
@@ -1598,6 +1736,8 @@ where
     pub(super) domains: Vec<DynamicPoolDomainSpec>,
     pub(super) nodes: Arc<[PlanNode]>,
     pub(super) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
+    pub(super) submission_wave_reusable_capacity_layouts:
+        BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
     pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) budget: Arc<DeviceCapacityBudget>,
@@ -1607,8 +1747,9 @@ where
     runtime: Arc<R>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LogicalBackingSliceEvidence {
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct LogicalBackingSliceAllocationEvidence {
     pub(super) domain_id: CapacityDomainId,
     pub(super) pool_id: DynamicBackingPoolId,
     pub(super) resource_id: ResourceId,
@@ -1619,8 +1760,6 @@ pub struct LogicalBackingSliceEvidence {
     pub(super) segment_generation: u64,
     pub(super) segments: Vec<BackingSegment>,
     pub(super) physical_offset_bytes: u64,
-    #[serde(rename = "size_bytes")]
-    pub(super) logical_size_bytes: u64,
     pub(super) capacity_size_bytes: u64,
     pub(super) physical_size_bytes: u64,
     pub(super) alignment_bytes: u64,
@@ -1628,10 +1767,77 @@ pub struct LogicalBackingSliceEvidence {
     pub(super) element_type: ElementType,
     pub(super) storage_profile: DynamicStorageProfile,
     pub(super) initialization: StateInitialization,
+    #[serde(skip)]
+    pub(super) fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalBackingSliceEvidence {
+    allocation: Arc<LogicalBackingSliceAllocationEvidence>,
+    pub(super) logical_size_bytes: u64,
+}
+
+impl std::ops::Deref for LogicalBackingSliceEvidence {
+    type Target = LogicalBackingSliceAllocationEvidence;
+
+    fn deref(&self) -> &Self::Target {
+        self.allocation.as_ref()
+    }
+}
+
+impl Serialize for LogicalBackingSliceEvidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            domain_id: CapacityDomainId,
+            pool_id: &'a DynamicBackingPoolId,
+            resource_id: &'a ResourceId,
+            pool_instance_id: u64,
+            physical_claim_identity: &'a PhysicalBackingClaimIdentity,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reusable_execution_bucket_id: Option<&'a ReusableExecutionBucketId>,
+            segment_generation: u64,
+            segments: &'a [BackingSegment],
+            physical_offset_bytes: u64,
+            #[serde(rename = "size_bytes")]
+            logical_size_bytes: u64,
+            capacity_size_bytes: u64,
+            physical_size_bytes: u64,
+            alignment_bytes: u64,
+            usage: BufferUsage,
+            element_type: ElementType,
+            storage_profile: DynamicStorageProfile,
+            initialization: StateInitialization,
+        }
+
+        Wire {
+            domain_id: self.domain_id,
+            pool_id: &self.pool_id,
+            resource_id: &self.resource_id,
+            pool_instance_id: self.pool_instance_id,
+            physical_claim_identity: &self.physical_claim_identity,
+            reusable_execution_bucket_id: self.reusable_execution_bucket_id.as_ref(),
+            segment_generation: self.segment_generation,
+            segments: &self.segments,
+            physical_offset_bytes: self.physical_offset_bytes,
+            logical_size_bytes: self.logical_size_bytes,
+            capacity_size_bytes: self.capacity_size_bytes,
+            physical_size_bytes: self.physical_size_bytes,
+            alignment_bytes: self.alignment_bytes,
+            usage: self.usage,
+            element_type: self.element_type,
+            storage_profile: self.storage_profile,
+            initialization: self.initialization,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl LogicalBackingSliceEvidence {
-    pub const fn domain_id(&self) -> CapacityDomainId {
+    pub fn domain_id(&self) -> CapacityDomainId {
         self.domain_id
     }
 
@@ -1643,11 +1849,11 @@ impl LogicalBackingSliceEvidence {
         &self.pool_id
     }
 
-    pub const fn pool_instance_id(&self) -> u64 {
+    pub fn pool_instance_id(&self) -> u64 {
         self.pool_instance_id
     }
 
-    pub const fn segment_generation(&self) -> u64 {
+    pub fn segment_generation(&self) -> u64 {
         self.segment_generation
     }
 
@@ -1663,7 +1869,7 @@ impl LogicalBackingSliceEvidence {
         &self.segments
     }
 
-    pub const fn physical_offset_bytes(&self) -> u64 {
+    pub fn physical_offset_bytes(&self) -> u64 {
         self.physical_offset_bytes
     }
 
@@ -1671,32 +1877,36 @@ impl LogicalBackingSliceEvidence {
         self.logical_size_bytes
     }
 
-    pub const fn capacity_size_bytes(&self) -> u64 {
+    pub fn capacity_size_bytes(&self) -> u64 {
         self.capacity_size_bytes
     }
 
-    pub const fn physical_size_bytes(&self) -> u64 {
+    pub fn physical_size_bytes(&self) -> u64 {
         self.physical_size_bytes
     }
 
-    pub const fn alignment_bytes(&self) -> u64 {
+    pub fn alignment_bytes(&self) -> u64 {
         self.alignment_bytes
     }
 
-    pub const fn usage(&self) -> BufferUsage {
+    pub fn usage(&self) -> BufferUsage {
         self.usage
     }
 
-    pub const fn element_type(&self) -> ElementType {
+    pub fn element_type(&self) -> ElementType {
         self.element_type
     }
 
-    pub const fn storage_profile(&self) -> DynamicStorageProfile {
+    pub fn storage_profile(&self) -> DynamicStorageProfile {
         self.storage_profile
     }
 
-    pub const fn initialization(&self) -> StateInitialization {
+    pub fn initialization(&self) -> StateInitialization {
         self.initialization
+    }
+
+    pub(super) fn allocation_fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 }
 
@@ -1728,7 +1938,7 @@ impl LogicalBackingSliceAuthority {
         }
     }
 
-    pub const fn domain_id(&self) -> CapacityDomainId {
+    pub fn domain_id(&self) -> CapacityDomainId {
         self.evidence.domain_id
     }
 
@@ -1740,7 +1950,7 @@ impl LogicalBackingSliceAuthority {
         self.evidence.logical_size_bytes
     }
 
-    pub const fn capacity_size_bytes(&self) -> u64 {
+    pub fn capacity_size_bytes(&self) -> u64 {
         self.evidence.capacity_size_bytes
     }
 
@@ -1859,6 +2069,12 @@ where
             .iter()
             .map(|domain| compile_submission_wave_domain_layout(domain, &nodes))
             .collect::<Result<Vec<_>, _>>()?;
+        let submission_wave_reusable_capacity_layouts =
+            compile_submission_wave_reusable_capacity_layouts(
+                &domains,
+                &submission_wave_layouts,
+                reusable_execution.as_ref(),
+            )?;
         let mut pools = BTreeMap::new();
         for domain in &domains {
             let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
@@ -1898,6 +2114,7 @@ where
             pools,
             nodes,
             submission_wave_layouts,
+            submission_wave_reusable_capacity_layouts,
             reusable_execution,
             lane_stable_arenas: Arc::new(Mutex::new(LaneStableArenaState::default())),
         })
@@ -3411,7 +3628,7 @@ where
                         .projections
                         .iter()
                         .map(|projection| {
-                            Ok(LogicalBackingSliceEvidence {
+                            let mut allocation = LogicalBackingSliceAllocationEvidence {
                                 domain_id: pool.domain.domain_id,
                                 pool_id: pool.domain.pool_id().clone(),
                                 resource_id: projection.descriptor.base_resource_id().clone(),
@@ -3427,7 +3644,6 @@ where
                                     projection.capacity_size_bytes,
                                 )?,
                                 physical_offset_bytes: projection.physical_offset_bytes,
-                                logical_size_bytes: projection.logical_size_bytes,
                                 capacity_size_bytes: projection.capacity_size_bytes,
                                 physical_size_bytes: request.capacity_size_bytes,
                                 alignment_bytes: projection.descriptor.alignment_bytes(),
@@ -3435,6 +3651,17 @@ where
                                 element_type: projection.descriptor.element_type(),
                                 storage_profile: pool.domain.pool.compatibility().profile(),
                                 initialization: projection.descriptor.initialization(),
+                                fingerprint: String::new(),
+                            };
+                            let bytes = serde_json::to_vec(&allocation).map_err(|error| {
+                                invalid_resource(format!(
+                                    "logical backing allocation evidence encode failed: {error}"
+                                ))
+                            })?;
+                            allocation.fingerprint = format!("sha256/{:x}", Sha256::digest(bytes));
+                            Ok(LogicalBackingSliceEvidence {
+                                allocation: Arc::new(allocation),
+                                logical_size_bytes: projection.logical_size_bytes,
                             })
                         })
                         .collect::<Result<Vec<_>, VNextError>>()?;

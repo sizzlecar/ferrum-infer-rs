@@ -687,6 +687,27 @@ where
         )
     }
 
+    /// Reuses the exact immutable work authority admitted for this step when a
+    /// full-plan wave binds the same participants and token spans.
+    pub fn shared_all_invocation_work_shape(
+        &self,
+        token_spans: &[TokenSpanWork],
+    ) -> Result<Arc<BatchWorkShape>, VNextError> {
+        let work_shape = self.claimed_backing.work_shape();
+        if token_spans.len() != self.participants.len()
+            || work_shape
+                .participant_work()
+                .iter()
+                .zip(token_spans)
+                .any(|(bound, requested)| bound.token_span() != requested)
+        {
+            return Err(invalid_resource(
+                "submission wave token work differs from its admitted step work authority",
+            ));
+        }
+        Ok(Arc::clone(self.claimed_backing.work_shape_arc()))
+    }
+
     pub fn claimed_backing(&self) -> &ClaimedBackingTransaction {
         &self.claimed_backing
     }
@@ -1101,7 +1122,7 @@ where
         };
         let backing_slices = prepared.commit();
         let claimed_backing = ClaimedBackingTransaction::new(
-            Arc::unwrap_or_clone(work_shape),
+            work_shape,
             demand,
             logical_capacity,
             backing_slices,

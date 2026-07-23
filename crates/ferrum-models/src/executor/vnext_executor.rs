@@ -3655,9 +3655,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<StepResourceAdmissionDecision<R>> {
-        let work_shape = batch
-            .bind_work_shape(spans.to_vec())
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let work_shape = Arc::new(
+            batch
+                .bind_work_shape(spans.to_vec())
+                .map_err(|error| FerrumError::backend(error.to_string()))?,
+        );
         let reusable_bucket_id = self
             .resolved_plan
             .execution_plan()
@@ -3800,10 +3802,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
         spans: &[TokenSpanWork],
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>> {
-        let work_shape = Arc::new(
-            step.bind_all_invocation_work_shape(spans.to_vec())
-                .map_err(|error| FerrumError::backend(error.to_string()))?,
-        );
+        let work_shape = step
+            .shared_all_invocation_work_shape(spans)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         step.try_prepare_full_plan_submission_wave(
             work_shape,
             AdmissionFitPolicy::ImmediateOnly,
