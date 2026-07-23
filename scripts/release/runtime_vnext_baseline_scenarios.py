@@ -5397,27 +5397,110 @@ def typed_admission_cap(config_path: Path) -> int:
 
 
 def typed_admission_cap_value(data: Any) -> int:
-    candidates: list[int] = []
+    config = require_object(data, "typed admission config")
 
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                lowered = str(key).lower()
-                if isinstance(child, int) and not isinstance(child, bool) and child > 0 and lowered in {
-                    "max_sequences",
-                    "max_num_seqs",
-                    "max_active",
-                    "admission_cap",
-                    "target_concurrency",
-                }:
-                    candidates.append(child)
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
+    def positive(value: Any, label: str) -> int | None:
+        if value is None:
+            return None
+        return require_count(value, label, minimum=1)
 
-    visit(data)
-    return min(candidates) if candidates else 0
+    admission = config.get("admission")
+    admission_document = (
+        require_object(admission, "typed admission config.admission")
+        if admission is not None
+        else {}
+    )
+    selected_max_sequences = positive(
+        config.get("selected_max_sequences"),
+        "typed admission config.selected_max_sequences",
+    )
+    selected_recurrent_slots = positive(
+        config.get("selected_recurrent_state_max_slots"),
+        "typed admission config.selected_recurrent_state_max_slots",
+    )
+    admission_max_sequences = positive(
+        admission_document.get("max_sequences"),
+        "typed admission config.admission.max_sequences",
+    )
+    admission_recurrent_slots = positive(
+        admission_document.get("recurrent_state_max_slots"),
+        "typed admission config.admission.recurrent_state_max_slots",
+    )
+
+    authoritative: list[tuple[str, int]] = []
+
+    def add_authoritative(label: str, value: int | None) -> None:
+        if value is not None:
+            authoritative.append((label, value))
+
+    def effective_limit(
+        max_sequences: int | None,
+        recurrent_slots: int | None,
+    ) -> int | None:
+        candidates = [
+            value for value in (max_sequences, recurrent_slots) if value is not None
+        ]
+        return min(candidates) if candidates else None
+
+    add_authoritative(
+        "selected_admission_limit",
+        positive(
+            config.get("selected_admission_limit"),
+            "typed admission config.selected_admission_limit",
+        ),
+    )
+    add_authoritative(
+        "admission.effective_max_concurrent",
+        positive(
+            admission_document.get("effective_max_concurrent"),
+            "typed admission config.admission.effective_max_concurrent",
+        ),
+    )
+    add_authoritative(
+        "selected capacity",
+        effective_limit(selected_max_sequences, selected_recurrent_slots),
+    )
+    add_authoritative(
+        "admission capacity",
+        effective_limit(admission_max_sequences, admission_recurrent_slots),
+    )
+    if authoritative:
+        distinct = {value for _, value in authoritative}
+        require(
+            len(distinct) == 1,
+            "typed admission config has conflicting authoritative caps: "
+            + ", ".join(f"{label}={value}" for label, value in authoritative),
+        )
+        return authoritative[0][1]
+
+    legacy_effective: list[int] = []
+    legacy_capacity: list[int] = []
+
+    def collect_legacy(container: Any, label: str) -> None:
+        if not isinstance(container, dict):
+            return
+        for key in ("admission_cap", "max_active", "effective_max_concurrent"):
+            value = positive(container.get(key), f"{label}.{key}")
+            if value is not None:
+                legacy_effective.append(value)
+        for key in ("max_sequences", "max_num_seqs", "recurrent_state_max_slots"):
+            value = positive(container.get(key), f"{label}.{key}")
+            if value is not None:
+                legacy_capacity.append(value)
+
+    collect_legacy(config, "typed admission config")
+    collect_legacy(config.get("scheduler"), "typed admission config.scheduler")
+    runtime = config.get("runtime")
+    if isinstance(runtime, dict):
+        collect_legacy(runtime.get("scheduler"), "typed admission config.runtime.scheduler")
+        collect_legacy(runtime.get("admission"), "typed admission config.runtime.admission")
+    if legacy_effective:
+        require(
+            len(set(legacy_effective)) == 1,
+            "typed admission config has conflicting legacy effective caps",
+        )
+        return legacy_effective[0]
+    return min(legacy_capacity) if legacy_capacity else 0
 
 
 def validate_actual_effective_config(
@@ -9924,6 +10007,52 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
 
 def self_test_c18_trace_scope() -> int:
     boundary = 1_800_000_000_000_000_000
+    typed_config = {
+        "selected_max_sequences": 16,
+        "selected_recurrent_state_max_slots": None,
+        "selected_admission_limit": 16,
+        "workload_profile": {"target_concurrency": 4},
+        "admission": {
+            "effective_max_concurrent": 16,
+            "max_sequences": 16,
+            "recurrent_state_max_slots": None,
+        },
+    }
+    require(
+        typed_admission_cap_value(typed_config) == 16,
+        "C18 typed cap used workload target instead of authoritative admission fields",
+    )
+    require(
+        typed_admission_cap_value(
+            {
+                **typed_config,
+                "selected_recurrent_state_max_slots": 8,
+                "selected_admission_limit": 8,
+                "admission": {
+                    **typed_config["admission"],
+                    "effective_max_concurrent": 8,
+                    "recurrent_state_max_slots": 8,
+                },
+            }
+        )
+        == 8,
+        "C18 typed cap did not apply the recurrent-state capacity limit",
+    )
+    require(
+        typed_admission_cap_value({"max_sequences": 32}) == 32,
+        "C18 typed cap lost legacy fixture compatibility",
+    )
+    conflicting_config = copy.deepcopy(typed_config)
+    conflicting_config["admission"]["effective_max_concurrent"] = 8
+    try:
+        typed_admission_cap_value(conflicting_config)
+    except ScenarioError as exc:
+        require(
+            "conflicting authoritative caps" in str(exc),
+            f"C18 typed cap conflict used unexpected rejection: {exc}",
+        )
+    else:
+        raise AssertionError("C18 typed cap accepted conflicting authoritative fields")
 
     def row(
         phase: str,
