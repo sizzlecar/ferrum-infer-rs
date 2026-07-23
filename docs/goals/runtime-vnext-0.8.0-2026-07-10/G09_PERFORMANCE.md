@@ -123,8 +123,11 @@ SHA256 `3b09cb93...` 消除部分 resource/identity 重建：profile-off c1 从
 因此 scoped diagnostic 仍为 REJECT，且正式 `76.158 tok/s` legacy 90% 线仍差
 `30.124 tok/s`。完整证据记录在
 [`G08B_QWEN35_35B.md`](G08B_QWEN35_35B.md)；下一次 paid M2 performance
-diagnostic 阻塞于缓存 immutable singleton batch membership、借用 spans 的本地验证，
-源码预测为 `resource_prepare_attempt <=3.45 ms`，不得用另一轮 GPU sweep 代替该验证。
+diagnostic 暂停。事后源码审计确认 `bench-serve` c1 的 outer batch 构造发生在
+`resource_prepare_attempt` 计时区间之外，因此 artifact 中“缓存 singleton batch 可把
+该指标降到 `<=3.45 ms`”的初始假设无效。先在现有 typed `wave_timing` 中把该指标拆为
+work-shape/request preparation、step admission 和 submission-wave preparation，
+再基于占比最高的实测阶段提出下一项源码预测；不得用另一轮 GPU sweep 代替该定位。
 
 ### M3 Qwen3-30B historical floors
 

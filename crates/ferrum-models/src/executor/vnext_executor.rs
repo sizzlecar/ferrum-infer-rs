@@ -538,6 +538,9 @@ impl VNextExecutionWaveKind {
 #[derive(Default)]
 struct VNextWaveTimingMetrics {
     resource_prepare_attempt: AtomicDurationMetrics,
+    resource_step_request_prepare: AtomicDurationMetrics,
+    resource_step_admission: AtomicDurationMetrics,
+    resource_submission_wave_prepare: AtomicDurationMetrics,
     host_encode_submit: AtomicDurationMetrics,
     token_upload_prepare: AtomicDurationMetrics,
     wave_identity_bind: AtomicDurationMetrics,
@@ -633,6 +636,12 @@ impl VNextWaveTimingMetrics {
             "clock": "host_monotonic",
             "scope": "executor_host_wall_boundaries",
             "resource_prepare_attempt": self.resource_prepare_attempt.snapshot(),
+            "resource_prepare_breakdown": {
+                "collection": "profile_attached_only",
+                "step_request_prepare": self.resource_step_request_prepare.snapshot(),
+                "step_admission": self.resource_step_admission.snapshot(),
+                "submission_wave_prepare": self.resource_submission_wave_prepare.snapshot(),
+            },
             "host_encode_submit": self.host_encode_submit.snapshot(),
             "host_encode_submit_breakdown": {
                 "collection": "profile_attached_only",
@@ -663,6 +672,9 @@ impl VNextWaveTimingMetrics {
             "submitted_wave_total": self.submitted_wave_total.snapshot(),
             "limitations": [
                 "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
+                "resource_prepare breakdown is collected only while a typed profile sink is attached",
+                "resource_prepare breakdown samples low-level admission attempts; retries may produce more breakdown samples than outer resource_prepare_attempt samples",
+                "resource_prepare residual includes caller-side participant construction and orchestration not attributed to the three child intervals",
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
@@ -676,6 +688,9 @@ impl VNextWaveTimingMetrics {
     fn reset(&self) {
         for metrics in [
             &self.resource_prepare_attempt,
+            &self.resource_step_request_prepare,
+            &self.resource_step_admission,
+            &self.resource_submission_wave_prepare,
             &self.host_encode_submit,
             &self.token_upload_prepare,
             &self.wave_identity_bind,
@@ -3655,42 +3670,64 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<StepResourceAdmissionDecision<R>> {
-        let work_shape = Arc::new(
-            batch
-                .bind_work_shape(spans.to_vec())
-                .map_err(|error| FerrumError::backend(error.to_string()))?,
-        );
-        let reusable_bucket_id = self
-            .resolved_plan
-            .execution_plan()
-            .payload()
-            .memory()
-            .reusable_execution()
-            .and_then(|plan| {
-                plan.buckets().iter().find(|resolved| {
-                    let bucket = resolved.bucket();
-                    bucket.class_id().as_str() == kind.reusable_execution_class()
-                        && bucket.capacity().covers(
-                            work_shape.immediate_sequences(),
-                            work_shape.immediate_tokens(),
-                            work_shape.immediate_pages(),
-                        )
+        let timing_enabled = self.host_dispatch_timing_enabled();
+        let phase_timing = self.metrics.wave_timing_for(kind);
+        let request = {
+            let _timing = self
+                .metrics
+                .wave_timing
+                .resource_step_request_prepare
+                .start_if(timing_enabled);
+            let _phase_timing = phase_timing
+                .resource_step_request_prepare
+                .start_if(timing_enabled);
+            let work_shape = Arc::new(
+                batch
+                    .bind_work_shape(spans.to_vec())
+                    .map_err(|error| FerrumError::backend(error.to_string()))?,
+            );
+            let reusable_bucket_id = self
+                .resolved_plan
+                .execution_plan()
+                .payload()
+                .memory()
+                .reusable_execution()
+                .and_then(|plan| {
+                    plan.buckets().iter().find(|resolved| {
+                        let bucket = resolved.bucket();
+                        bucket.class_id().as_str() == kind.reusable_execution_class()
+                            && bucket.capacity().covers(
+                                work_shape.immediate_sequences(),
+                                work_shape.immediate_tokens(),
+                                work_shape.immediate_pages(),
+                            )
+                    })
                 })
-            })
-            .map(|resolved| resolved.bucket().bucket_id().clone());
-        let request = StepResourceAdmissionRequest::new(
-            work_shape,
-            AdmissionFitPolicy::ImmediateOnly,
-            AdmissionPressureAction::WaitForRelease,
-        )
-        .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let request = match reusable_bucket_id {
-            Some(bucket_id) => request.with_reusable_execution_bucket(bucket_id),
-            None => request,
+                .map(|resolved| resolved.bucket().bucket_id().clone());
+            let request = StepResourceAdmissionRequest::new(
+                work_shape,
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+            match reusable_bucket_id {
+                Some(bucket_id) => request.with_reusable_execution_bucket(bucket_id),
+                None => request,
+            }
         };
-        batch
-            .try_begin_step(request, &self.lane)
-            .map_err(|error| FerrumError::backend(error.to_string()))
+        {
+            let _timing = self
+                .metrics
+                .wave_timing
+                .resource_step_admission
+                .start_if(timing_enabled);
+            let _phase_timing = phase_timing
+                .resource_step_admission
+                .start_if(timing_enabled);
+            batch
+                .try_begin_step(request, &self.lane)
+                .map_err(|error| FerrumError::backend(error.to_string()))
+        }
     }
 
     fn begin_step(
@@ -3826,7 +3863,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
         spans: &[TokenSpanWork],
     ) -> Result<PreparedStepSubmissionWave<R>> {
-        match self.prepare_wave_for_spans_with_capacity(step, spans)? {
+        match self.prepare_wave_for_spans_with_capacity(
+            step,
+            spans,
+            VNextExecutionWaveKind::Decode,
+        )? {
             VNextExecutionCapacityDecision::Ready(wave) => Ok(wave),
             VNextExecutionCapacityDecision::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
@@ -3838,7 +3879,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         step: &Arc<StepResourceLease<R>>,
         spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<PreparedStepSubmissionWave<R>>> {
+        let timing_enabled = self.host_dispatch_timing_enabled();
+        let phase_timing = self.metrics.wave_timing_for(kind);
+        let _timing = self
+            .metrics
+            .wave_timing
+            .resource_submission_wave_prepare
+            .start_if(timing_enabled);
+        let _phase_timing = phase_timing
+            .resource_submission_wave_prepare
+            .start_if(timing_enabled);
         let mut backing_attempts = 0;
         loop {
             match self.try_prepare_wave_for_spans(step, spans)? {
@@ -4201,7 +4253,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
                 }
             };
-            let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans)? {
+            let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans, kind)? {
                 VNextExecutionCapacityDecision::Ready(wave) => wave,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
                     step.try_rollback_unsubmitted().map_err(|failure| {
@@ -6107,6 +6159,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
         DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
@@ -6234,6 +6288,22 @@ mod tests {
 
         assert_eq!(snapshot["clock"], "host_monotonic");
         assert_eq!(snapshot["resource_prepare_attempt"]["samples"], 0);
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["collection"],
+            "profile_attached_only"
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_request_prepare"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_admission"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["submission_wave_prepare"]["samples"],
+            0
+        );
         assert_eq!(snapshot["submitted_wave_total"]["samples"], 0);
         assert_eq!(
             snapshot["host_encode_submit_breakdown"]["collection"],
@@ -6270,6 +6340,49 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.as_str().unwrap().contains("not kernel")));
+    }
+
+    #[test]
+    fn wave_timing_reset_clears_resource_prepare_breakdown() {
+        let metrics = VNextWaveTimingMetrics::default();
+        metrics
+            .resource_step_request_prepare
+            .record(Duration::from_micros(11));
+        metrics
+            .resource_step_admission
+            .record(Duration::from_micros(13));
+        metrics
+            .resource_submission_wave_prepare
+            .record(Duration::from_micros(17));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_request_prepare"]["samples"],
+            1
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_admission"]["average_us"],
+            13.0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["submission_wave_prepare"]["average_us"],
+            17.0
+        );
+
+        metrics.reset();
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_request_prepare"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["step_admission"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["resource_prepare_breakdown"]["submission_wave_prepare"]["samples"],
+            0
+        );
     }
 
     #[test]
