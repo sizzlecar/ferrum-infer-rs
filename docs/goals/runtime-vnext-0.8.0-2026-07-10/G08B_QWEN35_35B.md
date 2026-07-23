@@ -74,6 +74,63 @@ freshness or complete G08B. Metal Q4_K_S correctness, CUDA/Metal performance smo
 legacy/reference parity, historical mutation plus legacy-deletion acceptance, and the
 final G08B aggregate remain open.
 
+## CUDA Addressed Paged-Attention Diagnostic - 2026-07-23
+
+Clean source `6a59655836a0a5dc98fc7b361ef85bb374dcfc5e` integrated the existing
+vLLM paged-attention v1/v2 implementation with vNext's non-contiguous 64 KiB resource
+pages through a typed device-address table. It did not add a second attention
+algorithm. The bound CUDA binary SHA256 was
+`e8d12cc22b4c1cc88a6473b7cdc17e77ab7a631de6bea0078aec0692f9dd5f72`.
+
+Correctness passed before the performance diagnostic:
+
+- addressed causal-attention provider tests `8/8` and vLLM dispatcher tests `3/3`;
+- focused actual-model `c03-001 run`, `c05-001 serve`, and `c06-001 streaming
+  serve` all passed;
+- the profile-off performance run completed `300/300` measured requests with zero
+  request or output-quality errors and usage-derived output-token counts.
+
+The focused runner printed:
+
+```text
+FERRUM RUNTIME VNEXT G08B CUDA BUILD READY: /workspace/ferrum-artifacts/runtime-vnext-addressed-pa-6a596558-20260723T152052Z/build/candidate/candidate-build-receipt.json
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-addressed-pa-6a596558-20260723T152052Z/focused-report.json
+```
+
+Full operation trace confirmed the exact native path
+`vnext.causal_attention.vllm_paged_attention_v1_addressed`. Decode attention fell from
+historical `582.551 us/command` and `5.826 ms/wave` to `88.731 us/command` and
+`0.887 ms/wave`. Full-profile throughput moved from `6.854` to `7.301 tok/s`, but that
+mode remains dominated by about `101 ms/wave` of trace host postprocessing and is not
+the product throughput comparison.
+
+The same-hardware profile-off result was `39.5687 +/- 2.0459 tok/s`, `11.16%` above
+the historical vNext `35.5956 tok/s`. It missed the predeclared diagnostic KEEP floor
+`40.935 tok/s` by `1.366 tok/s` and the `0.90x` historical legacy floor
+`76.158 tok/s` by `36.590 tok/s`, so the performance candidate is REJECT:
+
+```text
+CUDA ADDRESSED PAGED ATTENTION DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-addressed-pa-6a596558-20260723T152052Z/diagnostic-summary.json
+```
+
+The next paid run is blocked on a source-level change predicted to reduce profile-off
+decode `resource_prepare_attempt` from `4.192 ms` to `<=3.5 ms` and
+`submitted_wave_total` from `14.964 ms` to `<=13.5 ms`, while retaining at least
+`40.935 tok/s` and all correctness results.
+
+The complete artifact is stored in the temporary
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-addressed-pa-6a596558-20260723T152052Z.tar.zst)
+with SHA256 `41543e1e1b4e7acf0decb5fdb31f0bd38b868cdf5d20ebb4a9813384b798769c`.
+The GitHub-downloaded local copy was verified at
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260723/github-assets/`.
+Vast instance `45319871` is `stopped/exited`, and the reconciled unexpected
+billable-or-transitional instance count is `0`.
+
+This diagnostic proves that the typed vNext CUDA path invokes the intended existing
+vLLM attention kernel and improves that operation. It does not refresh the current-HEAD
+703-case CUDA matrix, satisfy the G08B performance smoke, prove Metal, or complete
+G08B/G09.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
