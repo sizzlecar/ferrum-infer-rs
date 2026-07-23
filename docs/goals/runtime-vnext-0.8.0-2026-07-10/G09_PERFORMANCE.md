@@ -286,8 +286,44 @@ command。下一付费 artifact 的可证伪预测为：
 
 本轮压缩包 SHA256 为
 `1e0b9774ff7822ffe3336b39c7afb96b78171a40e5c0a17ba9f4f9863108b8d7`。
-GitHub 从 Vast 出站连接超时，archive 暂留 retained instance；实例已确认
-`stopped/exited`，同账户 sibling 为 `0`。恢复传输不允许顺带启动 benchmark。
+后续已通过临时 GitHub branch 传回并在本机校验，路径为
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/causal-envelope-cuda-3ac6b65a/`。
+
+clean source `4df3d63a` 随后把 eligibility 固化为 typed launch-topology contract：
+decode V1/V2 继续 replay，exact-shape varlen/fallback prefill 成为带独立 fence
+dependency 的 eager barrier。CUDA candidate build 与 manifest READY，`c03 run`、
+`c05 serve`、`c06 streaming` 再次 `3/3 pass`。full-profile 精确命中全部预言：
+
+- scoped native replay `12730 -> 13455`，目标 `13455`；
+- prefill RMSNorm/MoE/residual replay 为 `1230/1200/1200`；
+- prefill causal replay 为 `0`；
+- 75 个 decode wave 均为 `131 replay + 42 eager provider + 1 upload`。
+
+因此 topology isolation 作为结构改造 KEEP；它没有改变 decode 主瓶颈。正式
+profile-off c1 `random 64/32`、`100 x 3`、seed `9271` 完成 `300/300`，
+usage token count、请求错误和质量问题均合格，但只有
+`48.3721 +/- 4.9645 tok/s`。相对 `3ac6b65a` 为 `-6.13%`，相对
+`a0038a0e` 稳定 checkpoint 为 `-12.83%`；两个近期候选的 CI 重叠，因此不把这段小差异
+另行归因。绝对 floor 仍差 `27.7862 tok/s`（`36.48%`），本轮按
+`formal-throughput-floor-miss-after-topology-isolation-hit` REJECT：
+
+```text
+CUDA TOPOLOGY REPLAY BARRIER REJECT: /workspace/ferrum-artifacts/runtime-vnext-topology-barrier-4df3d63a-20260723T231634Z/diagnostic-summary.json
+```
+
+archive 为 `35,174,029` bytes，SHA256
+`c433fffb9e77bfea543a66a6e5df5f4420f6cb58d80743e61f4dd2516084657d`。
+首次 GitHub upload 在远端连接超时，archive 暂留 retained instance `45319871`；
+实例已确认 `stopped/exited`。禁止为重复 benchmark 单独恢复实例。
+
+下一 source lever 不再调整 replay key 或 prefill segmentation，而是建立
+plan-owned immutable CUDA command program 与 typed per-wave binding patch。
+当前 decode 仍有 `43` 条 eager command，其中 `30` 条属于 recurrent attention；
+必须先用 lane-stable state indirection 证明 recurrent state 地址、RAII 和 fence
+生命周期，再降低 eager owner 数。下一 paid run 前必须有本地 command-program
+ownership、binding lifetime、recurrent address-scope 和无硬编码合同，并预言
+`decode eager <43`、`recurrent eager <30` 或可测的 host enqueue 下降；否则停止在
+source analysis。
 
 ### M3 Qwen3-30B historical floors
 
