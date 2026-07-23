@@ -511,12 +511,11 @@ requests with usage token counts and zero errors, but throughput fell to
 CUDA CAUSAL REPLAY ENVELOPE REJECT: /workspace/ferrum-artifacts/runtime-vnext-causal-envelope-3ac6b65a-20260724T0548/diagnostic-summary.json
 ```
 
-The complete archive remains on the retained stopped instance because both
-`api.github.com` and `uploads.github.com` timed out from the host after packaging.
+The complete archive was subsequently transferred through a temporary GitHub
+branch and verified locally at
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/causal-envelope-cuda-3ac6b65a/`.
 It is `35,154,675` bytes with SHA256
 `1e0b9774ff7822ffe3336b39c7afb96b78171a40e5c0a17ba9f4f9863108b8d7`.
-Vast instance `45319871` is confirmed `stopped/exited`, with no sibling instance.
-This transfer blocker does not permit another benchmark run.
 
 The next source hypothesis is topology-typed replay eligibility. Causal decode
 V1/V2 remains reusable; exact-shape varlen/fallback prefill remains an explicit
@@ -526,6 +525,61 @@ must prove those boundaries and predict the following scoped full-profile result
 decode `131/43`, prefill stable-owner replay restored to `1230/1200/1200`, total
 `13455 replay / 5985 eager`. Model names, GPU names, VRAM sizes, and hidden env
 switches are forbidden from that contract.
+
+### 2026-07-24 Topology Barrier Result
+
+Clean source `4df3d63a85bcd69479e827b2c545148ed4c9a91e` made replay eligibility a
+typed launch-topology decision. Partition-stable decode V1/V2 commands retain their
+bucketed replay key; exact-shape varlen/fallback prefill commands use an explicit
+eager command constructor with independent fence dependencies. No model, GPU, VRAM,
+or hidden-environment branch selects this behavior.
+
+The candidate release build and execution manifest printed their exact READY lines.
+The same binary passed all three bounded product paths:
+
+- `c03-001`: `ferrum run` multi-turn correctness;
+- `c05-001`: non-streaming OpenAI-compatible `ferrum serve`;
+- `c06-001`: streaming `ferrum serve`;
+- result: `3/3 pass`; all execution-envelope, expectation, model-binding, and
+  scenario-oracle checks were true.
+
+The full-profile structural prediction was exact:
+
+| signal | predicted | observed |
+|---|---:|---:|
+| total native replay commands | `13455` | `13455` |
+| prefill RMSNorm replay | `1230` | `1230` |
+| prefill MoE replay | `1200` | `1200` |
+| prefill residual replay | `1200` | `1200` |
+| prefill causal replay | `0` | `0` |
+| decode owner split | `131/43` | `131/43` across 75 waves |
+
+This accepts the topology isolation source change: exact-shape prefill no longer
+poisons adjacent stable replay segments. It does not satisfy G08B or G09. The
+profile-off c1 `random 64/32`, `100 x 3`, seed `9271` command completed `300/300`
+requests with usage token counts, zero errors, and zero quality issues, but achieved
+only `48.3721 +/- 4.9645 tok/s`. It is `12.83%` below the `55.4898 tok/s` stable
+Ferrum checkpoint and misses the unchanged `76.1583 tok/s` floor by
+`27.7862 tok/s` (`36.48%`). The immutable result is:
+
+```text
+CUDA TOPOLOGY REPLAY BARRIER REJECT: /workspace/ferrum-artifacts/runtime-vnext-topology-barrier-4df3d63a-20260723T231634Z/diagnostic-summary.json
+```
+
+The archive is `35,174,029` bytes with SHA256
+`c433fffb9e77bfea543a66a6e5df5f4420f6cb58d80743e61f4dd2516084657d`.
+Its first GitHub upload attempt timed out after packaging, so it remains on retained
+instance `45319871`; that instance is confirmed `stopped/exited` and is not billing.
+Restoring transfer later does not authorize another benchmark.
+
+The next CUDA source checkpoint moves from command-key work to command-program
+ownership: a plan-owned immutable CUDA command program plus typed per-wave binding
+patches. Recurrent state must first use lane-stable indirection with RAII/fence
+coverage; request-owned state must never be falsely marked stable. Before another
+paid run, local contracts must prove program ownership, binding lifetime, state
+address scope, and zero model/hardware hard-codes. The next paid artifact must predict
+a decode eager count below `43` and recurrent eager count below `30`; otherwise it
+cannot justify GPU time.
 
 ## Metal Matrix Workflow
 
