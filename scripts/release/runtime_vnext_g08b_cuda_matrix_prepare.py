@@ -404,6 +404,12 @@ def materialize_exact(path: Path, payload: bytes, label: str) -> None:
     path.write_bytes(payload)
 
 
+def normalized_model_arg(path: Path) -> Path:
+    # Preserve the locked filename for Hugging Face snapshot symlinks. The
+    # downstream validator follows the file only when hashing its contents.
+    return path.expanduser().absolute()
+
+
 def prepare_manifest(
     root: Path,
     *,
@@ -432,7 +438,7 @@ def prepare_manifest(
         build_receipt.get("backend") == spec.backend,
         f"candidate build backend is not {spec.backend.upper()}",
     )
-    model_dir = model_dir.expanduser().resolve()
+    model_dir = normalized_model_arg(model_dir)
     semantic_source_root = semantic_source_root.expanduser().resolve()
     sources = checked_lock["sources"]
     effective_path = (
@@ -525,6 +531,18 @@ def self_test(spec: BackendSpec) -> None:
         prefix=f"ferrum-g08b-{spec.backend}-prepare-"
     ) as tmp:
         root = Path(tmp)
+        blob = root / "blobs" / ("a" * 64)
+        blob.parent.mkdir(parents=True)
+        blob.write_bytes(b"locked GGUF bytes\n")
+        snapshot_file = root / "snapshots/revision/Model-Q4_K_S.gguf"
+        snapshot_file.parent.mkdir(parents=True)
+        snapshot_file.symlink_to(blob)
+        normalized_snapshot = normalized_model_arg(snapshot_file)
+        require(
+            normalized_snapshot.name == snapshot_file.name
+            and normalized_snapshot.is_symlink(),
+            "model argument normalization resolved away the HF snapshot filename",
+        )
         manifest = matrix.make_execution_fixture_manifest(root)
         lock_path = root / manifest["models_lock"]["path"]
         lock = matrix.read_json(lock_path)
