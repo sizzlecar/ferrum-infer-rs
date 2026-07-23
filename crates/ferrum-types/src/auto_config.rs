@@ -710,6 +710,13 @@ impl FerrumConfigBuilder {
         let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
         let batched_graph =
             self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
+        let reusable_execution = self.bool_value(
+            "FERRUM_REUSABLE_EXECUTION",
+            cuda_backend
+                && self.hardware.graph_support
+                && self.hardware.compiled_features.cuda_graph,
+            AutoConfigSource::HardwareCapability,
+        )?;
         let unified_graph =
             self.bool_value("FERRUM_UNIFIED_GRAPH", false, AutoConfigSource::Default)?;
         let unified_graph_layers_only = self.bool_value(
@@ -847,6 +854,7 @@ impl FerrumConfigBuilder {
             ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
             ("FERRUM_BATCHED_GRAPH", &batched_graph),
+            ("FERRUM_REUSABLE_EXECUTION", &reusable_execution),
             ("FERRUM_UNIFIED_GRAPH", &unified_graph),
             (
                 "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
@@ -858,7 +866,7 @@ impl FerrumConfigBuilder {
             ),
             ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
-            if resolved.source != AutoConfigSource::Env {
+            if self.entry(key).is_none() {
                 runtime_config.upsert(
                     key,
                     if resolved.value { "1" } else { "0" },
@@ -901,6 +909,7 @@ impl FerrumConfigBuilder {
         }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
+        decisions.push(self.reusable_execution_decision(reusable_execution));
         decisions.push(self.decode_graph_decision(
             batched_graph,
             unified_graph,
@@ -1997,6 +2006,38 @@ impl FerrumConfigBuilder {
                         "legacy batched decode graph not selected",
                     ),
                     ("graph_disabled", "decode graph selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Correctness,
+            ],
+        )
+    }
+
+    fn reusable_execution_decision(
+        &self,
+        reusable_execution: ResolvedValue<bool>,
+    ) -> AutoConfigDecision {
+        let selected = if reusable_execution.value {
+            "enabled_when_runtime_capable"
+        } else {
+            "disabled"
+        };
+        self.decision(
+            "reusable_execution_policy",
+            selected,
+            reusable_execution.source,
+            reusable_execution.source_key,
+            ["enabled_when_runtime_capable", "disabled"],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "enabled_when_runtime_capable",
+                        "reusable device programs are disabled",
+                    ),
+                    ("disabled", "reusable device programs are enabled"),
                 ],
             ),
             vec![
@@ -3904,6 +3945,72 @@ mod tests {
             resolved.effective_config_document()["selected_graph_mode"],
             "legacy_batched_decode_graph"
         );
+    }
+
+    #[test]
+    fn reusable_execution_defaults_on_without_enabling_legacy_graphs() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::default())
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let entry = |key: &str| {
+            resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key} entry"))
+        };
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+
+        assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "0");
+        assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "1");
+        assert_eq!(decisions["decode_graph_policy"], "graph_disabled");
+        assert_eq!(
+            decisions["reusable_execution_policy"],
+            "enabled_when_runtime_capable"
+        );
+    }
+
+    #[test]
+    fn reusable_execution_explicit_disable_is_preserved() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_REUSABLE_EXECUTION",
+            "0",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_REUSABLE_EXECUTION")
+            .expect("reusable execution entry");
+        let decision = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "reusable_execution_policy")
+            .expect("reusable execution decision");
+
+        assert_eq!(entry.effective_value, "0");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+        assert_eq!(decision.selected, "disabled");
     }
 
     #[test]

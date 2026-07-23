@@ -149,7 +149,7 @@ pub struct VNextExecutorConfig {
     pub maximum_model_tokens: usize,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
-    pub device_reusable_execution_capture_enabled: bool,
+    pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_token_counts: Vec<usize>,
 }
 
@@ -257,7 +257,7 @@ impl VNextExecutorConfig {
             maximum_model_tokens,
             static_initialization,
             runtime_policy,
-            device_reusable_execution_capture_enabled: engine.backend.enable_cuda_graphs,
+            device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_token_counts,
         })
     }
@@ -427,6 +427,7 @@ impl VNextReusableExecutionStartupPlan {
 struct VNextReusableExecutionStartupReport {
     enabled: bool,
     supported: bool,
+    eager_fallback_required: bool,
     requested_descriptors: Vec<VNextReusableExecutionDescriptor>,
     prepared_descriptors: Vec<VNextReusableExecutionDescriptor>,
     requested_decode_widths: Vec<usize>,
@@ -439,6 +440,25 @@ struct VNextReusableExecutionStartupReport {
     replay_validation_waves: usize,
     device_preparation: DeviceReusableExecutionPreparation,
     elapsed_ms: u64,
+}
+
+fn reusable_executable_inventory_matches(
+    before: DeviceReusableExecutionPreparation,
+    after: DeviceReusableExecutionPreparation,
+) -> bool {
+    before.maximum_executables() == after.maximum_executables()
+        && before.resident_executables() == after.resident_executables()
+        && before.rejected_executables() == after.rejected_executables()
+        && before.captured_executables() == after.captured_executables()
+        && before.uploaded_executables() == after.uploaded_executables()
+}
+
+fn reusable_execution_requires_eager_fallback(
+    preparation: DeviceReusableExecutionPreparation,
+) -> bool {
+    preparation.resident_executables() == 0
+        || preparation.rejected_executables() != 0
+        || preparation.capacity_deferred_executables() != 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2457,7 +2477,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     program_fingerprint: String,
     checkpoint_capture: Option<VNextCheckpointCapture>,
     static_bytes: u64,
-    device_reusable_execution_capture_enabled: bool,
+    device_reusable_execution_enabled: bool,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
     startup_preparation: Mutex<VNextStartupPreparationState>,
@@ -2743,7 +2763,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
         let reusable_execution_startup_plan =
-            if config.device_reusable_execution_capture_enabled && reusable_execution_supported {
+            if config.device_reusable_execution_enabled && reusable_execution_supported {
                 Some(VNextReusableExecutionStartupPlan::resolve(
                     config.runtime_policy.memory().maximum_active_sequences,
                     config.runtime_policy.admission().maximum_scheduled_tokens,
@@ -2784,8 +2804,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             program_fingerprint,
             checkpoint_capture,
             static_bytes,
-            device_reusable_execution_capture_enabled: config
-                .device_reusable_execution_capture_enabled,
+            device_reusable_execution_enabled: config.device_reusable_execution_enabled,
             reusable_execution_supported,
             reusable_execution_startup_plan,
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
@@ -2968,8 +2987,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let started = Instant::now();
         let Some(plan) = self.reusable_execution_startup_plan.clone() else {
             return Ok(VNextReusableExecutionStartupReport {
-                enabled: self.device_reusable_execution_capture_enabled,
+                enabled: self.device_reusable_execution_enabled,
                 supported: self.reusable_execution_supported,
+                eager_fallback_required: self.device_reusable_execution_enabled
+                    && !self.reusable_execution_supported,
                 requested_descriptors: Vec::new(),
                 prepared_descriptors: Vec::new(),
                 requested_decode_widths: Vec::new(),
@@ -3063,9 +3084,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ))
             })?;
         if captured.state() != DeviceReusableExecutionPreparationState::Preparing
-            || captured.resident_executables() == 0
-            || captured.rejected_executables() != 0
-            || captured.capacity_deferred_executables() != 0
             || captured.captured_executables() != captured.uploaded_executables()
             || captured.uploaded_executables() != captured.resident_executables()
         {
@@ -3092,7 +3110,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "vNext reusable execution replay inspection failed: {error}"
                 ))
             })?;
-        if replayed != captured {
+        if replayed.state() != DeviceReusableExecutionPreparationState::Preparing
+            || !reusable_executable_inventory_matches(captured, replayed)
+        {
             return Err(FerrumError::device(format!(
                 "vNext replay validation compiled or changed executable state: before={captured:?}, after={replayed:?}"
             )));
@@ -3114,9 +3134,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ))
                     })?;
             if prefill_captured.state() != DeviceReusableExecutionPreparationState::Preparing
-                || prefill_captured.resident_executables() == 0
-                || prefill_captured.rejected_executables() != 0
-                || prefill_captured.capacity_deferred_executables() != 0
                 || prefill_captured.captured_executables()
                     != prefill_captured.uploaded_executables()
                 || prefill_captured.uploaded_executables()
@@ -3138,7 +3155,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         "vNext {token_count}-token fresh-request prefill replay inspection failed: {error}"
                     ))
                 })?;
-            if prefill_replayed != prefill_captured {
+            if prefill_replayed.state() != DeviceReusableExecutionPreparationState::Preparing
+                || !reusable_executable_inventory_matches(prefill_captured, prefill_replayed)
+            {
                 return Err(FerrumError::device(format!(
                     "vNext {token_count}-token fresh-request prefill replay changed executable state: before={prefill_captured:?}, after={prefill_replayed:?}"
                 )));
@@ -3150,10 +3169,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             FerrumError::device(format!("vNext reusable execution sealing failed: {error}"))
         })?;
         if device_preparation.state() != DeviceReusableExecutionPreparationState::Ready
-            || device_preparation.resident_executables() == 0
             || device_preparation.uploaded_executables() < device_preparation.resident_executables()
-            || device_preparation.captured_executables() != captured.captured_executables()
-            || device_preparation.uploaded_executables() != captured.uploaded_executables()
+            || !reusable_executable_inventory_matches(captured, device_preparation)
         {
             return Err(FerrumError::device(format!(
                 "vNext reusable execution sealing produced an unusable receipt: {device_preparation:?}"
@@ -3175,6 +3192,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Ok(VNextReusableExecutionStartupReport {
             enabled: true,
             supported: true,
+            eager_fallback_required: reusable_execution_requires_eager_fallback(device_preparation),
             requested_descriptors,
             prepared_descriptors,
             requested_decode_widths,
@@ -6227,13 +6245,15 @@ mod tests {
 
     use super::{
         reported_allocated_bytes, resolve_reusable_execution_policy, resolved_sequence_fit_policy,
+        reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
         AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
         VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPreparedWaveTopologyMetrics,
         VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
         VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::vnext::{
-        DeviceReusableExecutionObservation, DeviceSubmissionTimingSink,
+        DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+        DeviceReusableExecutionPreparation, DeviceSubmissionTimingSink,
         StepResourceAdmissionProfilePhase,
     };
 
@@ -6345,6 +6365,32 @@ mod tests {
         assert_eq!(non_power_of_two.prefill_token_counts(), [7, 4]);
         assert_eq!(non_power_of_two.device_plan.maximum_executables(), 12);
         assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[64], 23).is_err());
+    }
+
+    #[test]
+    fn reusable_execution_safe_misses_use_eager_fallback_without_inventory_drift() {
+        let plan = DeviceReusableExecutionPlan::new(4).unwrap();
+        let captured =
+            DeviceReusableExecutionPreparation::preparing_with_progress(plan, 2, 1, 2, 2, 0)
+                .unwrap();
+        let replayed =
+            DeviceReusableExecutionPreparation::preparing_with_progress(plan, 2, 1, 2, 2, 3)
+                .unwrap();
+        let sealed = DeviceReusableExecutionPreparation::ready(plan, 2, 1, 2, 2, 3).unwrap();
+
+        assert!(reusable_executable_inventory_matches(captured, replayed));
+        assert!(reusable_executable_inventory_matches(replayed, sealed));
+        assert!(reusable_execution_requires_eager_fallback(sealed));
+    }
+
+    #[test]
+    fn reusable_execution_complete_preparation_needs_no_eager_fallback() {
+        let plan = DeviceReusableExecutionPlan::new(4).unwrap();
+        let prepared = DeviceReusableExecutionPreparation::ready(plan, 2, 0, 2, 2, 0).unwrap();
+        let drifted = DeviceReusableExecutionPreparation::ready(plan, 1, 0, 2, 2, 0).unwrap();
+
+        assert!(!reusable_execution_requires_eager_fallback(prepared));
+        assert!(!reusable_executable_inventory_matches(prepared, drifted));
     }
 
     #[test]

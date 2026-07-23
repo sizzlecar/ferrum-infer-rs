@@ -223,6 +223,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub batched_graph: Option<bool>,
 
+    /// vNext reusable device-program policy override, equivalent to
+    /// `FERRUM_REUSABLE_EXECUTION`.
+    #[serde(default)]
+    pub reusable_execution: Option<bool>,
+
     /// Unified Llama/Gemma decode CUDA graph policy override,
     /// equivalent to `FERRUM_UNIFIED_GRAPH`.
     #[serde(default)]
@@ -400,6 +405,11 @@ impl RuntimeCliConfig {
         );
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_REUSABLE_EXECUTION",
+            self.reusable_execution,
+        );
         push_bool_entry(&mut entries, "FERRUM_UNIFIED_GRAPH", self.unified_graph);
         push_bool_entry(
             &mut entries,
@@ -748,6 +758,7 @@ mod tests {
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
             batched_graph: Some(true),
+            reusable_execution: Some(false),
             unified_graph: Some(true),
             unified_graph_layers_only: Some(true),
             unified_graph_lm_head_eager: Some(true),
@@ -784,7 +795,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 41);
+        assert_eq!(entries.len(), 42);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -825,6 +836,7 @@ mod tests {
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,

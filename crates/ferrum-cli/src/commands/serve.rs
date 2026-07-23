@@ -190,6 +190,14 @@ pub struct ServeCommand {
     #[arg(long, conflicts_with = "batched_graph")]
     pub disable_batched_graph: bool,
 
+    /// Enable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "disable_reusable_execution")]
+    pub reusable_execution: bool,
+
+    /// Disable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "reusable_execution")]
+    pub disable_reusable_execution: bool,
+
     /// Enable Llama/Gemma unified decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_unified_graph")]
     pub unified_graph: bool,
@@ -324,6 +332,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         disable_greedy_argmax,
         batched_graph,
         disable_batched_graph,
+        reusable_execution,
+        disable_reusable_execution,
         unified_graph,
         disable_unified_graph,
         unified_graph_layers_only,
@@ -736,6 +746,15 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) =
+        batched_graph_cli_override(reusable_execution, disable_reusable_execution)
+    {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));

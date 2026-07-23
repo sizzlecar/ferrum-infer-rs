@@ -267,6 +267,73 @@ The GitHub-downloaded local copy is verified at
 Vast instance `45319871` is `stopped/exited`, the cache is retained, and the
 reconciled potentially billable/transitional sibling count is `0`.
 
+## CUDA Stable Program Preparation Diagnostic - 2026-07-24
+
+The exact clean `e66ade7f0c0cd88ffc55c9a3c5a9ac902c68f58d` production source and
+binary SHA256 `f35878204dbc0cfbfdf62e8b0ec1304d01b610385244465924c60a31d7ff624f`
+were reused after the focused correctness and profile-off artifact above. This
+bounded full-profile run completed `4/4` requests with zero errors and collected
+75 decode waves. Full-profile throughput was `7.4649 tok/s`; it is diagnostic-only
+and is not comparable to the profile-off performance result.
+
+The trace localized the remaining host submission cost:
+
+| decode metric | per wave |
+|---|---:|
+| host encode + submit | `8.5245 ms` |
+| provider encode | `1.8789 ms` |
+| device runtime submit | `5.6823 ms` |
+| enqueue commands | `5.6145 ms` |
+| device execution | `9.4945 ms` |
+| fence wait | `3.0152 ms` |
+| completion-worker queued wait | `0.0458 ms` |
+| readback | `0.3570 ms`, `496,640 bytes` |
+
+Every decode wave submitted `174` eager commands: 163 compute commands, ten
+dynamic causal-attention bindings, and one token upload. The reusable-execution
+metrics reported 40 candidate segments per wave, all 40 outside preparation, and
+zero replayed commands. This accepted the predeclared source hypothesis and assigned
+failure class `stable-decode-command-program-outside-reusable-preparation`:
+
+```text
+CUDA CURRENT HOST DISPATCH PROFILE KEEP: /workspace/ferrum-artifacts/runtime-vnext-current-full-profile-e66ade7f-20260724T0340/diagnostic-summary.json
+```
+
+Historical artifacts already prove the existing CUDA reusable-executable path can
+replay the stable program: `beb3e63c` reduced enqueue from `6.625 ms` to
+`1.819 ms`, and `b38e9645` replayed `2432/2432` candidates with zero request-time
+capture. The current miss is therefore a product-policy integration defect, not a
+missing paged-attention implementation or a reason to add another command cache.
+vNext reusable execution was incorrectly controlled by the legacy, default-off
+`FERRUM_BATCHED_GRAPH` policy.
+
+The next candidate must separate legacy whole-model graph policy from typed,
+backend-owned reusable program preparation. `ferrum run`, `ferrum serve`, and
+configuration must expose the same product-visible policy. Safe capture rejection or
+capacity deferral may use visible eager fallback, while indeterminate CUDA, fence,
+ownership, or inventory state remains fail-closed.
+
+The next paid CUDA run is bounded by these predeclared checks:
+
+- run `c03-001`, serve `c05-001`, and streaming serve `c06-001` pass before
+  performance, with zero panic/OOM/output/stream error;
+- startup reports captured, uploaded, and resident executable inventory, with
+  `eager_fallback_required=false`;
+- request-time capture/upload remains `0`;
+- decode replay is `>=150 commands/wave`, eager submission is `<=24 commands/wave`,
+  and enqueue is `<=2.0 ms/wave`;
+- profile-off throughput exceeds `55.5897 tok/s`; the formal `76.1583 tok/s` floor
+  remains unchanged and must still pass before any G08B/G09 performance claim.
+
+The complete GitHub-transfer diagnostic asset is
+`runtime-vnext-current-full-profile-e66ade7f-20260724T0340.tar.zst`, asset id
+`487573242`, SHA256
+`ebb2e401276fc5767ef96bfa66373967f6d242d9bbacd7ccf938dac27fbb59b6`.
+The verified local artifact is
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/current-sha-full-profile-e66ade7f/`.
+The paid window was approximately 12 minutes (`$0.0939`). Vast instance `45319871`
+was then polled to `stopped/exited`; no billable or transitional sibling remains.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
