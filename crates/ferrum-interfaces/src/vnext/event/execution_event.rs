@@ -698,11 +698,11 @@ fn validate_active_identity(
     active: &TrustedActiveSequenceBinding,
 ) -> Result<(), VNextError> {
     let provisioning = active.static_provisioning_identity();
-    let pool_fingerprint = active.static_pool_identity_fingerprint();
+    let pool_fingerprint = active.static_pool_identity_fingerprint_ref();
     if &ids.run_id != active.run_id()
         || &ids.request_id != active.request_id()
         || ids.resource_pool_id != active.static_pool_id()
-        || ids.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint.as_deref()
+        || ids.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint
         || ids.provisioning_run_id.as_ref() != provisioning.map(ResourceTransactionIdentity::run_id)
         || ids.provisioning_request_id.as_ref()
             != provisioning.map(ResourceTransactionIdentity::request_id)
