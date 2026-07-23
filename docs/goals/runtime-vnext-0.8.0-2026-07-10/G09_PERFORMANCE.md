@@ -173,15 +173,20 @@ graph capture 保持关闭且 lane-stable live segments 非零，命中预期 si
 或 scheduler/resource admission 重新设计问题。full-profile 的 `7.4649 tok/s` 仅用于
 归因，不可与 profile-off 性能比较。
 
-现有历史实现已经提供反证和目标：`beb3e63c` 的 replay 把 enqueue 降到
-`1.819 ms/wave`，`b38e9645` 达到 `2432/2432` candidate replay 且 request-time
-capture 为 0。当前 vNext 默认路径只是错误复用了 legacy、默认关闭的
-`FERRUM_BATCHED_GRAPH` 策略。因此下一候选只修复 typed product-policy integration，
-不新增 paged-attention 内核或第二套 command cache。下一次 paid run 必须先通过
-`c03/c05/c06`，随后满足 startup `eager_fallback_required=false`、request-time
-capture/upload `0`、decode replay `>=150/wave`、eager `<=24/wave`、
-enqueue `<=2.0 ms/wave`。profile-off 吞吐必须高于 `55.5897 tok/s`；正式
-`76.1583 tok/s` floor 不变。
+历史实现只证明 reusable executable 的产品路径真实存在，不能直接提供本轮性能目标。
+`beb3e63c` 的 `1.819 ms/wave` 来自真实 Qwen3.5-4B `serve`，但差分中的 36 个
+wave 混合 prefill/decode，且 measured 区间仍发生 6 次 capture。`b38e9645` 的
+`2432/2432` 也是 Qwen3.5-4B 真实请求，但它表示 76 个 decode wave 的 candidate
+segment 全命中，不是全部 command replay；同一 artifact 实际为 `7980` replay、
+`2660` eager（75% command replay），enqueue `3.27695 ms/wave`。模型、workload 和
+统计口径均与当前 M2 不同；此外 `a0038a0e` 使用 full kernel attribution，会在 eager
+command 前后记录 CUDA event，因此 owner 数可用而 enqueue 时长不能与历史 basic-profile
+直接比较。二者不得作为 `a0038a0e` 或下一候选的直接验收线。
+
+`a0038a0e` 的 `>=150` replay、`<=24` eager、`<=2.0 ms` enqueue 是该次 paid
+diagnostic 预先声明且已失败的假设，保留为 immutable REJECT 证据，不循环复用。
+该候选已证明 typed product policy integration 生效；后续问题不是再接一次开关，也不是
+新增 paged-attention 内核或第二套 command cache。
 
 诊断产物 SHA256 为
 `ebb2e401276fc5767ef96bfa66373967f6d242d9bbacd7ccf938dac27fbb59b6`，本机验证路径为
@@ -213,6 +218,43 @@ CUDA REUSABLE PROGRAM INTEGRATION REJECT: /workspace/ferrum-artifacts/runtime-vn
 该轮约 29 分钟、`$0.2269`，实例已 `stopped/exited`。下一轮 paid work 被 source
 analysis 阻塞：必须先按 typed command owner 分类 53 条 eager command，并预测哪一类进入
 prepared replay 后可把 enqueue 降到 `<=2.0 ms`；不得继续试跑发现 owner。
+
+保存的 scheduler trace 已完成该分类。每 wave 的 174 条命令由 `1` 条 token upload 和
+173 条 provider command 构成：
+
+| owner | commands/wave | 当前路径 |
+|---|---:|---|
+| RMSNorm（40 层 + final） | 41 | replay |
+| routed/shared MoE | 40 | replay |
+| residual add | 40 | replay |
+| gated-delta recurrent attention | 30 | eager compute |
+| causal paged attention compute | 10 | eager compute |
+| causal address binding | 10 | eager dynamic binding |
+| token embedding | 1 | eager compute |
+| last-token logits projection | 1 | eager compute |
+| token upload | 1 | eager input boundary |
+
+因此 `121 replay + 53 eager = 174` 已无未知 owner。源码同时证明当前抽象把两类责任混在
+同一个 `CudaDeviceCommand`：一类是 CUDA graph 真正读取的稳定 kernel/BLAS 参数，另一类是
+只为 fence 生命周期保留的动态 KV/state region。causal compute 虽然从 binding workspace
+读取 page address，仍把动态 page region 放入 compute payload，导致 reusable-address
+合同被剥离；recurrent attention、embedding 和 logits 则仍直接绑定 sequence/request 地址。
+把这些地址强行标记稳定或把 dynamic binding 捕获进 graph 都会破坏正确性。
+
+源码改造按 owner 精确分三步：先拆 captured launch region 与 fence-only dependency，
+使十个 causal compute 恢复 replay，预测 `131 replay / 43 eager`；再引入 lane-stable
+recurrent-state binding，预测 `161 / 13`；最后将 embedding/logits 移入 lane-stable
+I/O staging，预测 `163 / 11`。十个 causal address binding 与一个 upload 保持显式 eager
+边界；这些数字是下一 artifact 的可证伪预测，不是提前宣告 PASS。
+
+最终 source checkpoint 是 backend-neutral 的“plan-owned static command program +
+typed per-wave binding patch”合同及 CUDA 实现：cache hit 不再逐 node 重新
+`encode_selected`；动态 state/IO 只能通过 typed binding 或显式 eager boundary 更新；
+cached program 不得持有 request-owned resource；completion fence 必须继续覆盖所有 binding
+target。Metal 可以复用 program/binding 生命周期合同，但保留自己的 command-buffer/pipeline
+实现。完成本地 contract、生命周期和故障测试前禁止再开 paid GPU；下一轮必须重新声明将减少
+的具体 owner 数、`provider_node_encode`/`enqueue_commands` 预测和停止线。正式
+`76.1583 tok/s` floor 不变。
 
 ### M3 Qwen3-30B historical floors
 

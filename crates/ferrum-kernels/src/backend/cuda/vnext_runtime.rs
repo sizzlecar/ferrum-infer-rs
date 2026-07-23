@@ -252,7 +252,10 @@ type EnqueueAction = Box<
         + 'static,
 >;
 
-pub(crate) struct CudaCommandPayload {
+/// CUDA work captured by a reusable executable. Submission-scoped resource
+/// dependencies must stay on `CudaDeviceCommand` so a cached executable never
+/// retains request- or sequence-owned allocations.
+pub(crate) struct CudaCommandExecutable {
     regions: Vec<CudaBufferRegion>,
     host_storage: Vec<Box<[u8]>>,
     enqueue: Mutex<EnqueueAction>,
@@ -268,7 +271,8 @@ pub struct CudaDeviceCommand {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
-    payload: Arc<CudaCommandPayload>,
+    executable: Arc<CudaCommandExecutable>,
+    fence_dependencies: Vec<CudaBufferRegion>,
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
 }
@@ -284,8 +288,12 @@ impl fmt::Debug for CudaDeviceCommand {
             .field("token_count", &self.token_count)
             .field("compute_dispatch_count", &self.compute_dispatch_count)
             .field("transfer_command_count", &self.transfer_command_count)
-            .field("region_count", &self.payload.regions.len())
-            .field("host_storage_count", &self.payload.host_storage.len())
+            .field("captured_region_count", &self.executable.regions.len())
+            .field(
+                "captured_host_storage_count",
+                &self.executable.host_storage.len(),
+            )
+            .field("fence_dependency_count", &self.fence_dependencies.len())
             .field("replayable", &self.replay_key.is_some())
             .finish_non_exhaustive()
     }
@@ -304,6 +312,7 @@ impl CudaDeviceCommand {
         Self::operation_inner(
             operation,
             regions,
+            Vec::new(),
             None,
             move |stream, _blas, regions, _host_storage| enqueue(stream, regions),
         )
@@ -320,6 +329,7 @@ impl CudaDeviceCommand {
         Self::operation_inner(
             operation,
             regions,
+            Vec::new(),
             Some(replay_key),
             move |stream, _blas, regions, _host_storage| enqueue(stream, regions),
         )
@@ -335,6 +345,7 @@ impl CudaDeviceCommand {
         Self::operation_inner(
             operation,
             regions,
+            Vec::new(),
             None,
             move |stream, blas, regions, _host_storage| enqueue(stream, blas, regions),
         )
@@ -351,6 +362,28 @@ impl CudaDeviceCommand {
         Self::operation_inner(
             operation,
             regions,
+            Vec::new(),
+            Some(replay_key),
+            move |stream, blas, regions, _host_storage| enqueue(stream, blas, regions),
+        )
+    }
+
+    /// Encodes replayable work whose launch addresses are stable while keeping
+    /// additional submission-scoped allocations alive through the completion
+    /// fence. Fence dependencies do not participate in graph identity or scope.
+    pub(crate) fn replayable_operation_with_blas_and_fence_dependencies(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        fence_dependencies: Vec<CudaBufferRegion>,
+        replay_key: CudaCommandReplayKey,
+        enqueue: impl Fn(&CudaStream, &CudaBlas, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_inner(
+            operation,
+            regions,
+            fence_dependencies,
             Some(replay_key),
             move |stream, blas, regions, _host_storage| enqueue(stream, blas, regions),
         )
@@ -373,6 +406,7 @@ impl CudaDeviceCommand {
             operation,
             regions,
             host_storage,
+            Vec::new(),
             None,
             enqueue,
         )
@@ -396,6 +430,7 @@ impl CudaDeviceCommand {
             operation,
             regions,
             host_storage,
+            Vec::new(),
             Some(replay_key),
             enqueue,
         )
@@ -405,6 +440,7 @@ impl CudaDeviceCommand {
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
         host_storage: Vec<Box<[u8]>>,
+        fence_dependencies: Vec<CudaBufferRegion>,
         replay_key: Option<CudaCommandReplayKey>,
         enqueue: impl Fn(
                 &CudaStream,
@@ -416,6 +452,7 @@ impl CudaDeviceCommand {
             + 'static,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let runtime_instance = common_runtime_instance(&regions)?;
+        validate_fence_dependencies(runtime_instance, &fence_dependencies)?;
         if host_storage.iter().any(|storage| storage.is_empty()) {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA operation host storage contains an empty region",
@@ -431,11 +468,12 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            payload: Arc::new(CudaCommandPayload {
+            executable: Arc::new(CudaCommandExecutable {
                 regions,
                 host_storage,
                 enqueue: Mutex::new(Box::new(enqueue)),
             }),
+            fence_dependencies,
             replay_key,
             reusable_address_scope,
         })
@@ -444,6 +482,7 @@ impl CudaDeviceCommand {
     fn operation_inner(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
+        fence_dependencies: Vec<CudaBufferRegion>,
         replay_key: Option<CudaCommandReplayKey>,
         enqueue: impl Fn(
                 &CudaStream,
@@ -455,6 +494,7 @@ impl CudaDeviceCommand {
             + 'static,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let runtime_instance = common_runtime_instance(&regions)?;
+        validate_fence_dependencies(runtime_instance, &fence_dependencies)?;
         let host_storage = Vec::new();
         let (replay_key, reusable_address_scope) =
             bind_replay_contract(replay_key, operation, &regions, &host_storage);
@@ -466,11 +506,12 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            payload: Arc::new(CudaCommandPayload {
+            executable: Arc::new(CudaCommandExecutable {
                 regions,
                 host_storage,
                 enqueue: Mutex::new(Box::new(enqueue)),
             }),
+            fence_dependencies,
             replay_key,
             reusable_address_scope,
         })
@@ -483,7 +524,7 @@ impl CudaDeviceCommand {
         host_storage: Vec<Box<[u8]>>,
         enqueue: EnqueueAction,
     ) -> Self {
-        let payload = Arc::new(CudaCommandPayload {
+        let executable = Arc::new(CudaCommandExecutable {
             regions,
             host_storage,
             enqueue: Mutex::new(enqueue),
@@ -496,7 +537,8 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 1,
-            payload,
+            executable,
+            fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
         }
@@ -529,15 +571,15 @@ impl CudaDeviceCommand {
         blas: &CudaBlas,
     ) -> Result<(), CudaDeviceRuntimeError> {
         let enqueue = self
-            .payload
+            .executable
             .enqueue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         enqueue(
             stream,
             blas,
-            &self.payload.regions,
-            &self.payload.host_storage,
+            &self.executable.regions,
+            &self.executable.host_storage,
         )
     }
 
@@ -549,8 +591,8 @@ impl CudaDeviceCommand {
         self.reusable_address_scope
     }
 
-    pub(crate) fn payload(&self) -> Arc<CudaCommandPayload> {
-        Arc::clone(&self.payload)
+    pub(crate) fn executable(&self) -> Arc<CudaCommandExecutable> {
+        Arc::clone(&self.executable)
     }
 }
 
@@ -610,6 +652,21 @@ fn common_runtime_instance(regions: &[CudaBufferRegion]) -> Result<u64, CudaDevi
         ));
     }
     Ok(runtime_instance)
+}
+
+fn validate_fence_dependencies(
+    runtime_instance: u64,
+    dependencies: &[CudaBufferRegion],
+) -> Result<(), CudaDeviceRuntimeError> {
+    if dependencies
+        .iter()
+        .any(|region| region.runtime_instance != runtime_instance)
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA operation retains fence dependencies from another runtime instance",
+        ));
+    }
+    Ok(())
 }
 
 fn cuda_submission_attribution(
@@ -1820,11 +1877,12 @@ mod tests {
             token_count: 1,
             compute_dispatch_count: 1,
             transfer_command_count: 0,
-            payload: Arc::new(CudaCommandPayload {
+            executable: Arc::new(CudaCommandExecutable {
                 regions: Vec::new(),
                 host_storage: Vec::new(),
                 enqueue: Mutex::new(Box::new(|_, _, _, _| Ok(()))),
             }),
+            fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
         }
