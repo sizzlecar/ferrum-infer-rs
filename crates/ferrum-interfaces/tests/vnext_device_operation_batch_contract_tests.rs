@@ -43,6 +43,61 @@ fn admit_batch_step(
     unreachable!("bounded batch step admission returns or panics")
 }
 
+#[test]
+fn profiled_step_admission_reports_completed_phases_without_changing_decision() {
+    let Fixture { plan_resources, .. } = fixture();
+    let resources = logical_resources(
+        &plan_resources,
+        "run.device-operation.profiled-step",
+        "request.device-operation.profiled-step",
+    );
+    let session = resources.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![session]).unwrap();
+    let lane = plan_resources.create_execution_lane().unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![chunked_token_span()]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+
+    for attempt in 0..=3 {
+        let mut phases = Vec::new();
+        let decision = batch
+            .try_begin_step_profiled(request.clone(), &lane, |phase, _| phases.push(phase))
+            .unwrap();
+        match decision {
+            StepResourceAdmissionDecision::Admitted(_) => {
+                assert_eq!(
+                    phases,
+                    [
+                        StepResourceAdmissionProfilePhase::AuthorityAndPolicyValidate,
+                        StepResourceAdmissionProfilePhase::DemandEvaluate,
+                        StepResourceAdmissionProfilePhase::BackingClaim,
+                        StepResourceAdmissionProfilePhase::LogicalCapacityClaim,
+                        StepResourceAdmissionProfilePhase::TransactionValidateAndFingerprint,
+                        StepResourceAdmissionProfilePhase::FrameCaptureAndLease,
+                    ]
+                );
+                return;
+            }
+            StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                assert_eq!(
+                    phases,
+                    [
+                        StepResourceAdmissionProfilePhase::AuthorityAndPolicyValidate,
+                        StepResourceAdmissionProfilePhase::DemandEvaluate,
+                        StepResourceAdmissionProfilePhase::BackingClaim,
+                    ]
+                );
+                deferred.maintain().unwrap();
+            }
+            _ => panic!("profiled step admission did not converge"),
+        }
+    }
+    unreachable!("bounded profiled step admission returns or panics")
+}
+
 fn admit_batch_invocation(
     _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     step: &Arc<StepResourceLease<TestRuntime>>,
