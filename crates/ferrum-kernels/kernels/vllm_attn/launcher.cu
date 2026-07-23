@@ -275,3 +275,231 @@ extern "C" void ferrum_vllm_paged_attention_v2_f16_h256_b16(
             reinterpret_cast<const uint16_t*>(tmp_out), seq_lens,
             max_num_partitions);
 }
+
+namespace {
+
+// Each address-table entry is the device address of a combined block's K base.
+// The corresponding V block starts kv_block_stride FP16 elements later.
+template <int HEAD_SIZE>
+void launch_vnext_vllm_paged_attention_v1_f16_b16_addressed(
+    __half* __restrict__ out,
+    const __half* __restrict__ query,
+    const int num_kv_heads,
+    const float scale,
+    const uint64_t* __restrict__ block_addresses,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 16;
+    constexpr int NUM_THREADS = 128;
+    constexpr bool IS_BLOCK_SPARSE = false;
+    constexpr vllm::Fp8KVCacheDataType KV_DTYPE =
+        vllm::Fp8KVCacheDataType::kAuto;
+    const float* k_scale_ptr = nullptr;
+    const float* v_scale_ptr = nullptr;
+    const int tp_rank = 0;
+    const int blocksparse_local_blocks = 0;
+    const int blocksparse_vert_stride = 0;
+    const int blocksparse_block_size = 0;
+    const int blocksparse_head_sliding_step = 0;
+    const float* alibi_slopes_ptr = nullptr;
+
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    const int padded_max_seq_len =
+        ((max_seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    const int logits_size = padded_max_seq_len * sizeof(float);
+    const int outputs_size = (NUM_WARPS / 2) * HEAD_SIZE * sizeof(float);
+    const int shared_mem_size =
+        logits_size > outputs_size ? logits_size : outputs_size;
+
+    dim3 grid(num_heads, num_seqs, 1);
+    dim3 block(NUM_THREADS);
+    vllm::paged_attention_v1_kernel<
+        uint16_t, uint16_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, KV_DTYPE,
+        IS_BLOCK_SPARSE, uint64_t>
+        <<<grid, block, shared_mem_size, stream>>>(
+            reinterpret_cast<uint16_t*>(out),
+            reinterpret_cast<const uint16_t*>(query),
+            /* key_cache */ nullptr,
+            /* value_cache */ nullptr,
+            num_kv_heads, scale, block_addresses, seq_lens,
+            max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,
+            kv_block_stride, kv_head_stride, k_scale_ptr, v_scale_ptr, tp_rank,
+            blocksparse_local_blocks, blocksparse_vert_stride,
+            blocksparse_block_size, blocksparse_head_sliding_step);
+}
+
+template <int HEAD_SIZE>
+void launch_vnext_vllm_paged_attention_v2_f16_b16_addressed(
+    __half* __restrict__ out,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    __half* __restrict__ tmp_out,
+    const __half* __restrict__ query,
+    const int num_kv_heads,
+    const float scale,
+    const uint64_t* __restrict__ block_addresses,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 16;
+    constexpr int NUM_THREADS = 128;
+    constexpr int PARTITION_SIZE = 512;
+    constexpr bool IS_BLOCK_SPARSE = false;
+    constexpr vllm::Fp8KVCacheDataType KV_DTYPE =
+        vllm::Fp8KVCacheDataType::kAuto;
+    const float* k_scale_ptr = nullptr;
+    const float* v_scale_ptr = nullptr;
+    const int tp_rank = 0;
+    const int blocksparse_local_blocks = 0;
+    const int blocksparse_vert_stride = 0;
+    const int blocksparse_block_size = 0;
+    const int blocksparse_head_sliding_step = 0;
+    const float* alibi_slopes_ptr = nullptr;
+
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    const int max_num_partitions =
+        (max_seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+    const int logits_size = PARTITION_SIZE * sizeof(float);
+    const int outputs_size = (NUM_WARPS / 2) * HEAD_SIZE * sizeof(float);
+    const int shared_mem_size =
+        logits_size > outputs_size ? logits_size : outputs_size;
+
+    dim3 grid(num_heads, num_seqs, max_num_partitions);
+    dim3 block(NUM_THREADS);
+    vllm::paged_attention_v2_kernel<
+        uint16_t, uint16_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, KV_DTYPE,
+        IS_BLOCK_SPARSE, PARTITION_SIZE, uint64_t>
+        <<<grid, block, shared_mem_size, stream>>>(
+            exp_sums, max_logits, reinterpret_cast<uint16_t*>(tmp_out),
+            reinterpret_cast<const uint16_t*>(query),
+            /* key_cache */ nullptr,
+            /* value_cache */ nullptr,
+            num_kv_heads, scale, block_addresses, seq_lens,
+            max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,
+            kv_block_stride, kv_head_stride, k_scale_ptr, v_scale_ptr, tp_rank,
+            blocksparse_local_blocks, blocksparse_vert_stride,
+            blocksparse_block_size, blocksparse_head_sliding_step);
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    const int reduce_shared_mem_size =
+        2 * max_num_partitions * sizeof(float);
+    vllm::paged_attention_v2_reduce_kernel<
+        uint16_t, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE>
+        <<<reduce_grid, block, reduce_shared_mem_size, stream>>>(
+            reinterpret_cast<uint16_t*>(out), exp_sums, max_logits,
+            reinterpret_cast<const uint16_t*>(tmp_out), seq_lens,
+            max_num_partitions);
+}
+
+}  // namespace
+
+extern "C" void ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed(
+    __half* __restrict__ out,
+    const __half* __restrict__ query,
+    const int num_kv_heads,
+    const float scale,
+    const uint64_t* __restrict__ block_addresses,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    launch_vnext_vllm_paged_attention_v1_f16_b16_addressed<128>(
+        out, query, num_kv_heads, scale, block_addresses, seq_lens, num_seqs,
+        num_heads, max_num_blocks_per_seq, q_stride, kv_block_stride,
+        kv_head_stride, max_seq_len, stream);
+}
+
+extern "C" void ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed(
+    __half* __restrict__ out,
+    const __half* __restrict__ query,
+    const int num_kv_heads,
+    const float scale,
+    const uint64_t* __restrict__ block_addresses,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    launch_vnext_vllm_paged_attention_v1_f16_b16_addressed<256>(
+        out, query, num_kv_heads, scale, block_addresses, seq_lens, num_seqs,
+        num_heads, max_num_blocks_per_seq, q_stride, kv_block_stride,
+        kv_head_stride, max_seq_len, stream);
+}
+
+extern "C" void ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed(
+    __half* __restrict__ out,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    __half* __restrict__ tmp_out,
+    const __half* __restrict__ query,
+    const int num_kv_heads,
+    const float scale,
+    const uint64_t* __restrict__ block_addresses,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    launch_vnext_vllm_paged_attention_v2_f16_b16_addressed<128>(
+        out, exp_sums, max_logits, tmp_out, query, num_kv_heads, scale,
+        block_addresses, seq_lens, num_seqs, num_heads,
+        max_num_blocks_per_seq, q_stride, kv_block_stride, kv_head_stride,
+        max_seq_len, stream);
+}
+
+extern "C" void ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed(
+    __half* __restrict__ out,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    __half* __restrict__ tmp_out,
+    const __half* __restrict__ query,
+    const int num_kv_heads,
+    const float scale,
+    const uint64_t* __restrict__ block_addresses,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    launch_vnext_vllm_paged_attention_v2_f16_b16_addressed<256>(
+        out, exp_sums, max_logits, tmp_out, query, num_kv_heads, scale,
+        block_addresses, seq_lens, num_seqs, num_heads,
+        max_num_blocks_per_seq, q_stride, kv_block_stride, kv_head_stride,
+        max_seq_len, stream);
+}
