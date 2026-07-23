@@ -12,16 +12,16 @@ use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
-    AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceRuntime,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID,
-    RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
+    AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm,
+    DeviceRuntime, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
+    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -474,6 +474,10 @@ fn encode_rms_norm(
         .i32(hidden_size)
         .f32(epsilon)
         .finish();
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "RMSNorm participant count",
+    )?;
     CudaDeviceCommand::replayable_operation(
         "vnext_rms_norm",
         regions,
@@ -499,6 +503,15 @@ fn encode_rms_norm(
             .map_err(|error| CudaDeviceRuntimeError::driver("vNext RMSNorm launch", error))
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::Packed,
+            participant_count,
+            u64::from(rows),
+            1,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -618,6 +631,17 @@ fn encode_dense_linear(
             });
         }
     }
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "dense linear participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let batching_form = if input_shared && output_shared {
+        DeviceBatchingForm::Packed
+    } else {
+        DeviceBatchingForm::ParticipantLoop
+    };
+    let compute_dispatch_count = launches.len() as u64;
     let mut replay_key =
         CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_linear")
             .u64(launches.len() as u64);
@@ -649,6 +673,15 @@ fn encode_dense_linear(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            batching_form,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -721,6 +754,11 @@ fn encode_dense_swiglu(
         )?,
         scratch,
     ];
+    let token_count = tokens;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "dense SwiGLU participant count",
+    )?;
     let tokens = checked_i32(tokens, "dense SwiGLU token count")?;
     let hidden_size = checked_i32(hidden_size, "dense SwiGLU hidden size")?;
     let intermediate_size = checked_i32(intermediate_size, "dense SwiGLU intermediate size")?;
@@ -786,6 +824,15 @@ fn encode_dense_swiglu(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::Packed,
+            participant_count,
+            token_count,
+            3,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -837,6 +884,11 @@ fn encode_residual_add(
             tokens,
         )?,
     ];
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "residual add participant count",
+    )?;
+    let token_count = tokens;
     let elements = checked_i32(elements, "residual add element count")?;
     let grid_x = checked_u32(
         u64::try_from(elements)
@@ -873,6 +925,15 @@ fn encode_residual_add(
             .map_err(|error| CudaDeviceRuntimeError::driver("vNext residual add launch", error))
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::Packed,
+            participant_count,
+            token_count,
+            1,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 

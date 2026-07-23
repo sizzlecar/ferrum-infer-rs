@@ -8,15 +8,16 @@ use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    CapabilityId, ContractVersion, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities,
-    GatedDeltaExecutionForm, GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderWorkspaceRequirement,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement,
+    ElementType, EncodedDeviceOperation, GatedDeltaDecayParameterization,
+    GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm, GatedDeltaExecutionPreference,
+    GatedDeltaValueHeadMapping, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
+    WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 
@@ -724,6 +725,8 @@ fn encode_attention(
             .u64(launch.tokens)
             .i32(launch.tokens_i32);
     }
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
     CudaDeviceCommand::replayable_operation_with_host_storage_and_blas(
         "vnext_gated_delta_recurrent_attention",
         regions,
@@ -747,6 +750,15 @@ fn encode_attention(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            total_tokens,
+            u64::from(participant_count) * 12,
+            u64::from(participant_count) * 3,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 

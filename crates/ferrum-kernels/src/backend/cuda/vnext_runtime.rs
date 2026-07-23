@@ -16,11 +16,13 @@ use std::time::Instant;
 use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
-    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBufferRetention,
-    DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceDescriptor, DeviceErrorReport,
-    DeviceExecutionTiming, DeviceId, DeviceReusableAddressScope,
-    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim, DeviceRuntime,
+    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
+    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
+    DeviceCommandExecutionTiming, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
+    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionTiming, DeviceId,
+    DeviceNativeWorkAttribution, DeviceReusableAddressScope, DeviceReusableExecutionObservation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim,
+    DeviceRuntime, DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming,
     DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
     DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
@@ -261,6 +263,11 @@ pub(crate) struct CudaCommandPayload {
 pub struct CudaDeviceCommand {
     runtime_instance: u64,
     operation: &'static str,
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
     payload: Arc<CudaCommandPayload>,
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
@@ -272,6 +279,11 @@ impl fmt::Debug for CudaDeviceCommand {
             .debug_struct("CudaDeviceCommand")
             .field("runtime_instance", &self.runtime_instance)
             .field("operation", &self.operation)
+            .field("batching_form", &self.batching_form)
+            .field("participant_count", &self.participant_count)
+            .field("token_count", &self.token_count)
+            .field("compute_dispatch_count", &self.compute_dispatch_count)
+            .field("transfer_command_count", &self.transfer_command_count)
             .field("region_count", &self.payload.regions.len())
             .field("host_storage_count", &self.payload.host_storage.len())
             .field("replayable", &self.replay_key.is_some())
@@ -414,6 +426,11 @@ impl CudaDeviceCommand {
         Ok(Self {
             runtime_instance,
             operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 0,
+            token_count: 0,
+            compute_dispatch_count: 0,
+            transfer_command_count: 0,
             payload: Arc::new(CudaCommandPayload {
                 regions,
                 host_storage,
@@ -444,6 +461,11 @@ impl CudaDeviceCommand {
         Ok(Self {
             runtime_instance,
             operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 0,
+            token_count: 0,
+            compute_dispatch_count: 0,
+            transfer_command_count: 0,
             payload: Arc::new(CudaCommandPayload {
                 regions,
                 host_storage,
@@ -469,10 +491,36 @@ impl CudaDeviceCommand {
         Self {
             runtime_instance,
             operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 0,
+            token_count: 0,
+            compute_dispatch_count: 0,
+            transfer_command_count: 1,
             payload,
             replay_key: None,
             reusable_address_scope: None,
         }
+    }
+
+    pub(crate) fn with_work_attribution(
+        mut self,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if participant_count == 0 || (compute_dispatch_count == 0 && transfer_command_count == 0) {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA operation attribution has no participants or native work",
+            ));
+        }
+        self.batching_form = batching_form;
+        self.participant_count = participant_count;
+        self.token_count = token_count;
+        self.compute_dispatch_count = compute_dispatch_count;
+        self.transfer_command_count = transfer_command_count;
+        Ok(self)
     }
 
     pub(crate) fn enqueue(
@@ -562,6 +610,50 @@ fn common_runtime_instance(regions: &[CudaBufferRegion]) -> Result<u64, CudaDevi
         ));
     }
     Ok(runtime_instance)
+}
+
+fn cuda_submission_attribution(
+    command_phases: &[ferrum_interfaces::vnext::DeviceCommandPhase],
+    command_node_indices: &[Option<u32>],
+    commands: &[CudaDeviceCommand],
+    execution_paths: &[DeviceExecutionPath],
+) -> Result<DeviceSubmissionAttribution, CudaDeviceRuntimeError> {
+    if command_phases.len() != commands.len()
+        || command_node_indices.len() != commands.len()
+        || execution_paths.len() != commands.len()
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA command attribution differs from its submitted batch",
+        ));
+    }
+    let rows = commands
+        .iter()
+        .enumerate()
+        .map(|(command_index, command)| {
+            let command_index = u32::try_from(command_index)
+                .map_err(|_| CudaDeviceRuntimeError::contract("CUDA command index exceeds u32"))?;
+            DeviceNativeWorkAttribution::new(
+                command_index,
+                command_node_indices[command_index as usize],
+                command_phases[command_index as usize],
+                command.operation,
+                execution_paths[command_index as usize],
+                command.batching_form,
+                command.participant_count,
+                command.token_count,
+                command.compute_dispatch_count,
+                command.transfer_command_count,
+            )
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA command attribution has invalid native work metadata",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    DeviceSubmissionAttribution::new(rows).ok_or_else(|| {
+        CudaDeviceRuntimeError::contract("CUDA submission attribution is empty or unordered")
+    })
 }
 
 pub struct CudaDeviceStream {
@@ -678,6 +770,8 @@ impl CudaStreamState {
 pub struct CudaDeviceFence {
     event: CudaEvent,
     timing: CudaFenceTiming,
+    command_timing: CudaFenceCommandTiming,
+    attribution: Option<DeviceSubmissionAttribution>,
     stream_state: Arc<CudaStreamState>,
     terminal_accounted: AtomicBool,
     _stream: Arc<CudaStream>,
@@ -689,6 +783,59 @@ enum CudaFenceTiming {
     NotRequested,
     Events { start: CudaEvent },
     Unavailable,
+}
+
+struct CudaCommandEventTiming {
+    command_index: u32,
+    kind: DeviceExecutionIntervalKind,
+    operation: &'static str,
+    start: CudaEvent,
+    end: CudaEvent,
+}
+
+enum CudaFenceCommandTiming {
+    NotRequested,
+    Unavailable(DeviceTimingUnavailableReason),
+    Events(Vec<CudaCommandEventTiming>),
+}
+
+impl CudaFenceCommandTiming {
+    fn measurement(&self) -> DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        match self {
+            Self::NotRequested => DeviceTimingMeasurement::NotRequested,
+            Self::Unavailable(reason) => DeviceTimingMeasurement::Unavailable(*reason),
+            Self::Events(events) => {
+                let Some(origin) = events.first().map(|event| &event.start) else {
+                    return DeviceTimingMeasurement::Unavailable(
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    );
+                };
+                let commands = events
+                    .iter()
+                    .map(|event| {
+                        let start_offset_ns = cuda_event_elapsed_ns(origin, &event.start)?;
+                        let end_offset_ns = cuda_event_elapsed_ns(origin, &event.end)?;
+                        let interval = DeviceExecutionInterval::new_labeled(
+                            event.kind,
+                            start_offset_ns,
+                            end_offset_ns,
+                            event.operation,
+                        )?;
+                        DeviceCommandExecutionTiming::new(event.command_index, vec![interval])
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(DeviceSubmissionExecutionTiming::new);
+                commands.map_or_else(
+                    || {
+                        DeviceTimingMeasurement::Unavailable(
+                            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                        )
+                    },
+                    DeviceTimingMeasurement::Measured,
+                )
+            }
+        }
+    }
 }
 
 impl fmt::Debug for CudaDeviceFence {
@@ -720,35 +867,49 @@ impl CudaDeviceFence {
                 };
             }
         };
-        let elapsed_ms = match unsafe {
-            cudarc::driver::result::event::elapsed(start.cu_event(), self.event.cu_event())
-        } {
-            Ok(elapsed_ms) if elapsed_ms.is_finite() && elapsed_ms >= 0.0 => elapsed_ms,
-            Ok(_) | Err(_) => {
-                return DeviceTimingMeasurement::Unavailable(
+        cuda_event_elapsed_ns(start, &self.event).map_or_else(
+            || {
+                DeviceTimingMeasurement::Unavailable(
                     DeviceTimingUnavailableReason::BackendMeasurementFailed,
-                );
-            }
-        };
-        let elapsed_ns = f64::from(elapsed_ms) * 1_000_000.0;
-        if elapsed_ns > u64::MAX as f64 {
-            return DeviceTimingMeasurement::Unavailable(
-                DeviceTimingUnavailableReason::DurationOverflow,
-            );
-        }
-        DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
-            elapsed_ns.round() as u64,
-        ))
+                )
+            },
+            |elapsed_ns| {
+                DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
+                    elapsed_ns,
+                ))
+            },
+        )
     }
 
     fn terminal_receipt<E>(&self, terminal: DeviceTerminal<E>) -> DeviceTerminalReceipt<E> {
         match &self.timing {
             CudaFenceTiming::NotRequested => DeviceTerminalReceipt::unprofiled(terminal),
             CudaFenceTiming::Events { .. } | CudaFenceTiming::Unavailable => {
-                DeviceTerminalReceipt::profiled(terminal, self.execution_timing())
+                match &self.command_timing {
+                    CudaFenceCommandTiming::NotRequested => {
+                        DeviceTerminalReceipt::profiled(terminal, self.execution_timing())
+                    }
+                    CudaFenceCommandTiming::Unavailable(_) | CudaFenceCommandTiming::Events(_) => {
+                        DeviceTerminalReceipt::profiled_with_submission_timing(
+                            terminal,
+                            self.execution_timing(),
+                            self.command_timing.measurement(),
+                        )
+                    }
+                }
             }
         }
     }
+}
+
+fn cuda_event_elapsed_ns(start: &CudaEvent, end: &CudaEvent) -> Option<u64> {
+    let elapsed_ms =
+        unsafe { cudarc::driver::result::event::elapsed(start.cu_event(), end.cu_event()) }.ok()?;
+    if !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+        return None;
+    }
+    let elapsed_ns = f64::from(elapsed_ms) * 1_000_000.0;
+    (elapsed_ns <= u64::MAX as f64).then(|| elapsed_ns.round() as u64)
 }
 
 struct QuarantinedSubmission {
@@ -1195,12 +1356,33 @@ impl DeviceRuntime for CudaDeviceRuntime {
             ));
         }
         let timing_mode = commands.timing_mode();
-        let (command_phases, commands): (Vec<_>, Vec<_>) = commands
+        let entries = commands
             .into_entries()
             .into_iter()
             .map(DeviceCommandEntry::into_parts)
-            .map(|(phase, _node_index, command)| (phase, command))
-            .unzip();
+            .collect::<Vec<_>>();
+        if u32::try_from(entries.len()).is_err() {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract("CUDA command count exceeds u32"),
+            ));
+        }
+        let command_phases = entries
+            .iter()
+            .map(|(phase, _, _)| *phase)
+            .collect::<Vec<_>>();
+        let command_node_indices = timing_mode.kernel_attribution_enabled().then(|| {
+            entries
+                .iter()
+                .map(|(_, node_index, _)| *node_index)
+                .collect::<Vec<_>>()
+        });
+        let commands = entries
+            .into_iter()
+            .map(|(_, _, command)| command)
+            .collect::<Vec<_>>();
+        let kernel_attribution = timing_mode.kernel_attribution_enabled();
+        let mut execution_paths =
+            kernel_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
         if commands
             .iter()
             .any(|command| command.runtime_instance != self.runtime_instance)
@@ -1210,6 +1392,18 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     "CUDA command batch contains work from another runtime instance",
                 ),
             ));
+        }
+        if let (Some(command_node_indices), Some(execution_paths)) =
+            (&command_node_indices, &execution_paths)
+        {
+            if let Err(error) = cuda_submission_attribution(
+                &command_phases,
+                command_node_indices,
+                &commands,
+                execution_paths,
+            ) {
+                return Err(DefinitelyNotSubmitted::new(error));
+            }
         }
         if let Err(error) = self.context.bind_to_thread() {
             return Err(DefinitelyNotSubmitted::new(CudaDeviceRuntimeError::driver(
@@ -1298,6 +1492,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
+        let mut command_events = kernel_attribution.then(|| Vec::with_capacity(commands.len()));
+        let mut command_timing_unavailable = None;
         let mut index = 0;
         let mut executable_candidate_index = 0;
         while index < commands.len() {
@@ -1319,6 +1515,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 });
             match replayed_end {
                 Some(Ok(segment_end)) => {
+                    if let Some(execution_paths) = execution_paths.as_mut() {
+                        execution_paths[index..segment_end].fill(DeviceExecutionPath::Replayed);
+                    }
+                    if kernel_attribution {
+                        command_events = None;
+                        command_timing_unavailable =
+                            Some(DeviceTimingUnavailableReason::BackendUnsupported);
+                    }
                     if S::ENABLED {
                         replay_observation.observe_replayed_segment(segment_end - index);
                     }
@@ -1334,10 +1538,47 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 None => {}
             }
+            let command_start = command_events.as_ref().and_then(|_| {
+                stream
+                    .stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .ok()
+            });
             if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
                 stream.state.fail();
                 self.quarantine(stream, commands);
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
+            }
+            if command_events.is_some() {
+                let command_end = stream
+                    .stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .ok();
+                match command_start.zip(command_end) {
+                    Some((start, end)) => {
+                        let command = &commands[index];
+                        let kind = if command.compute_dispatch_count > 0 {
+                            DeviceExecutionIntervalKind::Compute
+                        } else {
+                            DeviceExecutionIntervalKind::Transfer
+                        };
+                        command_events
+                            .as_mut()
+                            .expect("CUDA command event collection was checked")
+                            .push(CudaCommandEventTiming {
+                                command_index: index as u32,
+                                kind,
+                                operation: command.operation,
+                                start,
+                                end,
+                            });
+                    }
+                    None => {
+                        command_events = None;
+                        command_timing_unavailable =
+                            Some(DeviceTimingUnavailableReason::BackendMeasurementFailed);
+                    }
+                }
             }
             if S::ENABLED {
                 replay_observation.observe_eager_command();
@@ -1348,6 +1589,32 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if S::ENABLED {
             timing_sink.record_reusable_execution(replay_observation);
         }
+        let attribution = command_node_indices
+            .as_ref()
+            .zip(execution_paths.as_ref())
+            .map(|(command_node_indices, execution_paths)| {
+                cuda_submission_attribution(
+                    &command_phases,
+                    command_node_indices,
+                    &commands,
+                    execution_paths,
+                )
+                .expect("pre-submit CUDA attribution validation must remain stable")
+            });
+        let command_timing = match timing_mode {
+            DeviceTimingMode::Off | DeviceTimingMode::Completion => {
+                CudaFenceCommandTiming::NotRequested
+            }
+            DeviceTimingMode::Kernel => match command_timing_unavailable {
+                Some(reason) => CudaFenceCommandTiming::Unavailable(reason),
+                None => command_events.map_or(
+                    CudaFenceCommandTiming::Unavailable(
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    ),
+                    CudaFenceCommandTiming::Events,
+                ),
+            },
+        };
 
         let fence_stage = CudaSubmissionStageTimer::start(
             timing_sink,
@@ -1375,6 +1642,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let fence = CudaDeviceFence {
             event,
             timing,
+            command_timing,
+            attribution,
             stream_state: Arc::clone(&stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&stream.stream),
@@ -1383,6 +1652,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
         };
         drop(fence_stage);
         Ok(fence)
+    }
+
+    fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
+        fence.attribution.clone()
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
@@ -1521,5 +1794,78 @@ impl DeviceRuntime for CudaDeviceRuntime {
             },
         };
         DeviceErrorReport::new(code, error.to_string(), retryable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_interfaces::vnext::DeviceCommandPhase;
+
+    fn command(operation: &'static str) -> CudaDeviceCommand {
+        CudaDeviceCommand {
+            runtime_instance: 1,
+            operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 1,
+            token_count: 1,
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            payload: Arc::new(CudaCommandPayload {
+                regions: Vec::new(),
+                host_storage: Vec::new(),
+                enqueue: Mutex::new(Box::new(|_, _, _, _| Ok(()))),
+            }),
+            replay_key: None,
+            reusable_address_scope: None,
+        }
+    }
+
+    #[test]
+    fn kernel_attribution_retains_core_identity_and_cuda_work_shape() {
+        let compute = command("test_compute")
+            .with_work_attribution(DeviceBatchingForm::Packed, 2, 8, 3, 0)
+            .unwrap();
+        let binding = command("test_binding")
+            .with_work_attribution(DeviceBatchingForm::ParticipantLoop, 2, 8, 0, 2)
+            .unwrap();
+        let attribution = cuda_submission_attribution(
+            &[
+                DeviceCommandPhase::Compute,
+                DeviceCommandPhase::DynamicBinding,
+            ],
+            &[Some(0), Some(0)],
+            &[compute, binding],
+            &[DeviceExecutionPath::Eager, DeviceExecutionPath::Replayed],
+        )
+        .unwrap();
+
+        let [compute, binding] = attribution.commands() else {
+            panic!("expected two CUDA attribution rows")
+        };
+        assert_eq!(compute.command_index(), 0);
+        assert_eq!(compute.node_index(), Some(0));
+        assert_eq!(compute.command_phase(), DeviceCommandPhase::Compute);
+        assert_eq!(compute.native_op_id(), "test_compute");
+        assert_eq!(compute.execution_path(), DeviceExecutionPath::Eager);
+        assert_eq!(compute.batching_form(), DeviceBatchingForm::Packed);
+        assert_eq!(compute.participant_count(), 2);
+        assert_eq!(compute.token_count(), 8);
+        assert_eq!(compute.compute_dispatch_count(), 3);
+        assert_eq!(compute.transfer_command_count(), 0);
+
+        assert_eq!(binding.command_index(), 1);
+        assert_eq!(binding.command_phase(), DeviceCommandPhase::DynamicBinding);
+        assert_eq!(binding.execution_path(), DeviceExecutionPath::Replayed);
+        assert_eq!(binding.compute_dispatch_count(), 0);
+        assert_eq!(binding.transfer_command_count(), 2);
+    }
+
+    #[test]
+    fn cuda_work_attribution_rejects_empty_native_work() {
+        let error = command("test_invalid")
+            .with_work_attribution(DeviceBatchingForm::Scalar, 1, 1, 0, 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("no participants or native work"));
     }
 }
