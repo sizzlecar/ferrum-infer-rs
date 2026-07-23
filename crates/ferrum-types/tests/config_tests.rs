@@ -82,6 +82,7 @@ fn engine_config_applies_runtime_snapshot() {
             RuntimeConfigSource::Env,
         ),
         RuntimeConfigEntry::new("FERRUM_BATCHED_GRAPH", "1", RuntimeConfigSource::Cli),
+        RuntimeConfigEntry::new("FERRUM_REUSABLE_EXECUTION", "0", RuntimeConfigSource::Cli),
         RuntimeConfigEntry::new(
             "FERRUM_SCHEDULER_TRACE_JSONL",
             "/tmp/sched.jsonl",
@@ -98,6 +99,7 @@ fn engine_config_applies_runtime_snapshot() {
     assert_eq!(cfg.memory.usable_capacity_bytes, Some(12_345));
     assert!(cfg.scheduler.prompt_token_estimate);
     assert!(cfg.backend.enable_cuda_graphs);
+    assert!(!cfg.backend.enable_reusable_execution);
     assert_eq!(
         cfg.runtime.scheduler_trace_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/sched.jsonl"))
@@ -252,6 +254,7 @@ fn backend_config_default_sane() {
     let cfg = BackendConfig::default();
     assert!(matches!(cfg.backend_type, BackendType::Candle));
     assert!(cfg.enable_optimizations);
+    assert!(cfg.enable_reusable_execution);
 }
 
 #[test]

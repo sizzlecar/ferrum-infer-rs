@@ -131,6 +131,9 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_BATCHED_GRAPH") {
             self.backend.enable_cuda_graphs = parse_presence_bool(value)?;
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION") {
+            self.backend.enable_reusable_execution = parse_presence_bool(value)?;
+        }
         // Engine runtime knobs (previously read by the engine from env). The
         // CLI/autosizer resolves these into the snapshot; the engine reads the
         // typed `runtime` field instead of `std::env::vars()`.
@@ -619,6 +622,9 @@ pub struct BackendConfig {
     pub optimization_level: u8,
     /// Enable CUDA graphs
     pub enable_cuda_graphs: bool,
+    /// Prepare backend-owned reusable device programs when supported.
+    #[serde(default = "default_enable_reusable_execution")]
+    pub enable_reusable_execution: bool,
     /// Enable kernel fusion
     pub enable_kernel_fusion: bool,
     /// Custom backend-specific options
@@ -634,10 +640,15 @@ impl Default for BackendConfig {
             enable_optimizations: true,
             optimization_level: 2,
             enable_cuda_graphs: false,
+            enable_reusable_execution: default_enable_reusable_execution(),
             enable_kernel_fusion: true,
             backend_options: HashMap::new(),
         }
     }
+}
+
+const fn default_enable_reusable_execution() -> bool {
+    true
 }
 
 /// Supported backend types

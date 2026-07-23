@@ -164,6 +164,30 @@ graph capture 保持关闭且 lane-stable live segments 非零，命中预期 si
 `host_encode_submit=6.224 ms`、`completion_round_trip=5.629 ms` 和 device timing 中提出
 单一 source-level hypothesis；不得因本轮 KEEP 直接启动 full sweep。
 
+同一 clean source/binary 的后续 bounded full-profile 已完成该定位：4/4 请求正确，
+75 个 decode wave 中每 wave 均有 174 条 eager command、40/40 个 reusable candidate
+落在 startup preparation 之外，replay 为 0。`device_runtime_submit=5.682 ms/wave` 中
+`enqueue_commands=5.614 ms/wave`，而 completion-worker queued wait 仅
+`0.046 ms/wave`。因此失败类收敛为
+`stable-decode-command-program-outside-reusable-preparation`，不是 paged-attention
+或 scheduler/resource admission 重新设计问题。full-profile 的 `7.4649 tok/s` 仅用于
+归因，不可与 profile-off 性能比较。
+
+现有历史实现已经提供反证和目标：`beb3e63c` 的 replay 把 enqueue 降到
+`1.819 ms/wave`，`b38e9645` 达到 `2432/2432` candidate replay 且 request-time
+capture 为 0。当前 vNext 默认路径只是错误复用了 legacy、默认关闭的
+`FERRUM_BATCHED_GRAPH` 策略。因此下一候选只修复 typed product-policy integration，
+不新增 paged-attention 内核或第二套 command cache。下一次 paid run 必须先通过
+`c03/c05/c06`，随后满足 startup `eager_fallback_required=false`、request-time
+capture/upload `0`、decode replay `>=150/wave`、eager `<=24/wave`、
+enqueue `<=2.0 ms/wave`。profile-off 吞吐必须高于 `55.5897 tok/s`；正式
+`76.1583 tok/s` floor 不变。
+
+诊断产物 SHA256 为
+`ebb2e401276fc5767ef96bfa66373967f6d242d9bbacd7ccf938dac27fbb59b6`，本机验证路径为
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/current-sha-full-profile-e66ade7f/`。
+该轮约 12 分钟、`$0.0939`；Vast `45319871` 已 `stopped/exited`，计费或过渡 sibling 为 0。
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

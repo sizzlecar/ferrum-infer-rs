@@ -604,6 +604,14 @@ pub struct RunCommand {
     #[arg(long, conflicts_with = "batched_graph")]
     pub disable_batched_graph: bool,
 
+    /// Enable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "disable_reusable_execution")]
+    pub reusable_execution: bool,
+
+    /// Disable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "reusable_execution")]
+    pub disable_reusable_execution: bool,
+
     /// Enable Llama/Gemma unified decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_unified_graph")]
     pub unified_graph: bool,
@@ -2185,6 +2193,14 @@ fn run_startup_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
+    if let Some(enabled) = bool_cli_override(cmd.reusable_execution, cmd.disable_reusable_execution)
+    {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(enabled) = bool_cli_override(cmd.unified_graph, cmd.disable_unified_graph) {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_UNIFIED_GRAPH",
@@ -2373,6 +2389,8 @@ mod tests {
             sequence_fit_policy: None,
             batched_graph: false,
             disable_batched_graph: false,
+            reusable_execution: false,
+            disable_reusable_execution: false,
             unified_graph: false,
             disable_unified_graph: false,
             unified_graph_layers_only: false,
@@ -2531,6 +2549,7 @@ mod tests {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();
         cmd.batched_graph = true;
+        cmd.disable_reusable_execution = true;
         cmd.unified_graph = true;
         cmd.unified_graph_layers_only = true;
         cmd.unified_graph_lm_head_eager = true;
@@ -2546,6 +2565,11 @@ mod tests {
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_BATCHED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION").source,
             RuntimeConfigSource::Cli
         );
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
