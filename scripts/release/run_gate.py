@@ -54,6 +54,7 @@ LANES = (
     "vnext-s1-cuda-capacity",
     "vnext-s1-cuda-decode-capacity",
     "vnext-g08b-cuda",
+    "vnext-g08b-metal",
     "unit",
     "metal",
     "cuda-smoke",
@@ -966,6 +967,28 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-g08b-cuda",
+        )
+    if lane == "vnext-g08b-metal":
+        if args.g08b_artifact_root is None:
+            raise GateError("vnext-g08b-metal requires --g08b-artifact-root")
+        if args.g08b_scenario_report is None:
+            raise GateError("vnext-g08b-metal requires --g08b-scenario-report")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g08b_metal_matrix_checkpoint.py",
+                "--artifact-root",
+                str(args.g08b_artifact_root.resolve()),
+                "--scenario-report",
+                str(args.g08b_scenario_report.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g08b-metal",
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
@@ -6782,6 +6805,54 @@ def self_test() -> int:
                 str(g08b_out.resolve()),
             ],
             g08b_manifest,
+        )
+        g08b_metal_report = (
+            g08b_root
+            / "correctness/m2-qwen35-35b-a3b/metal/scenario-report.json"
+        )
+        g08b_metal_out = root / "g08b-metal-dry-run"
+        g08b_metal_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g08b-metal",
+                "--g08b-artifact-root",
+                str(g08b_root),
+                "--g08b-scenario-report",
+                str(g08b_metal_report),
+                "--out",
+                str(g08b_metal_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g08b_metal_dry.returncode == 0,
+            g08b_metal_dry.stderr or g08b_metal_dry.stdout,
+        )
+        g08b_metal_manifest = json.loads(
+            (g08b_metal_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g08b_metal_manifest["status"] == "dry-run",
+            g08b_metal_manifest,
+        )
+        require_selftest(
+            g08b_metal_manifest["lane"] == "vnext-g08b-metal",
+            g08b_metal_manifest,
+        )
+        require_selftest(
+            g08b_metal_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g08b_metal_matrix_checkpoint.py",
+                "--artifact-root",
+                str(g08b_root.resolve()),
+                "--scenario-report",
+                str(g08b_metal_report.resolve()),
+                "--out",
+                str(g08b_metal_out.resolve()),
+            ],
+            g08b_metal_manifest,
         )
         unit_root = root / "unit-bounded-provenance"
         bounded_root = unit_root / "unit-bounded"

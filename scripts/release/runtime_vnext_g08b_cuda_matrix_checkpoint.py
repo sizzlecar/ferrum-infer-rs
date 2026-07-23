@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the canonical G08B Qwen3.5-35B CUDA C01-C21 candidate report."""
+"""Validate G08B model matrices; the path remains CUDA-named for compatibility."""
 
 from __future__ import annotations
 
@@ -10,36 +10,90 @@ import json
 import math
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import runtime_vnext_baseline_scenarios as matrix
+from runtime_vnext_g08b_cuda_matrix_prepare import BACKEND_SPECS as PREPARATION_SPECS
 
 
 SCHEMA_VERSION = 1
-CHECKPOINT_ID = "runtime-vnext-g08b-cuda-model-matrix"
 MODEL_KEY = "m2-qwen35-35b-a3b"
-BACKEND = "cuda"
-EXPECTED_CASE_COUNT = 703
-REQUIRED_CLIENT_CONCURRENCY = 32
-REQUIRED_ACTIVE_FLOOR = 16
-REQUIRED_ACTIVE_DUTY_CYCLE = 0.80
-MODEL_LOCK_PATH = (
-    Path(__file__).resolve().parent
-    / "configs/runtime_vnext_g08b_m2_cuda.models.lock.json"
+
+
+@dataclass(frozen=True)
+class CheckpointSpec:
+    backend: str
+    checkpoint_id: str
+    checkpoint_label: str
+    expected_case_count: int
+    required_client_concurrency: int
+    required_active_floor: int
+    required_active_duty_cycle: float
+    concurrency_cells: tuple[int, ...]
+    pass_prefix: str
+    selftest_pass_line: str
+    does_not_prove: tuple[str, ...]
+
+    @property
+    def model_lock_path(self) -> Path:
+        return PREPARATION_SPECS[self.backend].model_lock_path
+
+    @property
+    def artifact_type_prefix(self) -> str:
+        return f"runtime_vnext_g08b_{self.backend}_model_matrix"
+
+
+CUDA_SPEC = CheckpointSpec(
+    backend="cuda",
+    checkpoint_id="runtime-vnext-g08b-cuda-model-matrix",
+    checkpoint_label="G08B-CUDA-MATRIX",
+    expected_case_count=703,
+    required_client_concurrency=32,
+    required_active_floor=16,
+    required_active_duty_cycle=0.80,
+    concurrency_cells=(1, 4, 16, 32),
+    pass_prefix="FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS",
+    selftest_pass_line="FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX SELFTEST PASS",
+    does_not_prove=(
+        "G08B Metal Q4_K_S product path",
+        "G08B legacy/reference parity",
+        "G08B mutation and legacy-deletion acceptance",
+        "G08B CUDA/Metal performance smoke",
+        "G08B final PASS",
+        "G09 formal performance",
+        "G10 release readiness",
+    ),
 )
-PASS_PREFIX = "FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS"
-SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX SELFTEST PASS"
-DOES_NOT_PROVE = [
-    "G08B Metal Q4_K_S product path",
-    "G08B legacy/reference parity",
-    "G08B mutation and legacy-deletion acceptance",
-    "G08B CUDA/Metal performance smoke",
-    "G08B final PASS",
-    "G09 formal performance",
-    "G10 release readiness",
-]
+
+METAL_SPEC = CheckpointSpec(
+    backend="metal",
+    checkpoint_id="runtime-vnext-g08b-metal-model-matrix",
+    checkpoint_label="G08B-METAL-MATRIX",
+    expected_case_count=702,
+    required_client_concurrency=16,
+    required_active_floor=4,
+    required_active_duty_cycle=0.80,
+    concurrency_cells=(1, 4, 16),
+    pass_prefix="FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX PASS",
+    selftest_pass_line="FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX SELFTEST PASS",
+    does_not_prove=(
+        "current-HEAD G08B CUDA GPTQ-Int4 product path",
+        "G08B legacy/reference parity",
+        "G08B mutation and legacy-deletion acceptance",
+        "G08B CUDA/Metal performance smoke",
+        "G08B final PASS",
+        "G09 formal performance",
+        "G10 release readiness",
+    ),
+)
+
+CHECKPOINT_SPECS = {
+    CUDA_SPEC.backend: CUDA_SPEC,
+    METAL_SPEC.backend: METAL_SPEC,
+}
 
 
 class ValidationError(RuntimeError):
@@ -89,32 +143,44 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
-def expected_case_count(source_git_sha: str) -> int:
+def expected_case_count(source_git_sha: str, spec: CheckpointSpec) -> int:
     catalog = matrix.candidate_expectations_catalog(source_git_sha)
-    return len(matrix.planned_case_rows(MODEL_KEY, BACKEND, catalog))
+    return len(matrix.planned_case_rows(MODEL_KEY, spec.backend, catalog))
 
 
-def summarize_matrix(report: dict[str, Any]) -> dict[str, Any]:
+def summarize_matrix(
+    report: dict[str, Any],
+    spec: CheckpointSpec = CUDA_SPEC,
+) -> dict[str, Any]:
     require(
         report.get("execution_contract") == matrix.G08_EXECUTION_CONTRACT,
         "scenario report is not a G08 candidate execution",
     )
     require(report.get("status") == "pass", "scenario report status is not pass")
     require(report.get("model_key") == MODEL_KEY, f"scenario report model must be {MODEL_KEY}")
-    require(report.get("backend") == BACKEND, "scenario report backend must be cuda")
     require(
-        report.get("models_lock_sha256") == file_sha256(MODEL_LOCK_PATH),
-        "scenario report is not bound to the checked-in M2 CUDA model lock",
+        report.get("backend") == spec.backend,
+        f"scenario report backend must be {spec.backend}",
+    )
+    require(
+        report.get("models_lock_sha256") == file_sha256(spec.model_lock_path),
+        (
+            "scenario report is not bound to the checked-in "
+            f"M2 {spec.backend.upper()} model lock"
+        ),
     )
     source_git_sha = report.get("source_git_sha")
     require(
         isinstance(source_git_sha, str) and matrix.GIT_SHA_RE.fullmatch(source_git_sha),
         "scenario report source_git_sha is invalid",
     )
-    planned_count = expected_case_count(source_git_sha)
+    planned_count = expected_case_count(source_git_sha, spec)
     require(
-        planned_count == EXPECTED_CASE_COUNT,
-        f"canonical M2 CUDA planner drifted from {EXPECTED_CASE_COUNT} to {planned_count}",
+        planned_count == spec.expected_case_count,
+        (
+            f"canonical M2 {spec.backend.upper()} planner drifted from "
+            f"{spec.expected_case_count} to {planned_count}"
+        ),
     )
 
     scenarios = require_list(report.get("scenarios"), "scenario report scenarios")
@@ -140,8 +206,11 @@ def summarize_matrix(report: dict[str, Any]) -> dict[str, Any]:
             require(scenario.get(field) == 0, f"{scenario_id}.{field} must be 0")
         total_cases += count
     require(
-        total_cases == EXPECTED_CASE_COUNT,
-        f"scenario report must pass exactly {EXPECTED_CASE_COUNT} cases, got {total_cases}",
+        total_cases == spec.expected_case_count,
+        (
+            f"scenario report must pass exactly {spec.expected_case_count} "
+            f"cases, got {total_cases}"
+        ),
     )
 
     commands = require_list(report.get("commands"), "scenario report commands")
@@ -156,8 +225,11 @@ def summarize_matrix(report: dict[str, Any]) -> dict[str, Any]:
     cells = require_list(c18.get("concurrency_cells"), "C18 concurrency cells")
     require(
         [cell.get("requested_concurrency") for cell in cells if isinstance(cell, dict)]
-        == [1, 4, 16, 32],
-        "C18 CUDA cells must be ordered c1/c4/c16/c32",
+        == list(spec.concurrency_cells),
+        (
+            f"C18 {spec.backend.upper()} cells must be ordered "
+            + "/".join(f"c{value}" for value in spec.concurrency_cells)
+        ),
     )
     for raw_cell in cells:
         cell = require_object(raw_cell, "C18 concurrency cell")
@@ -167,30 +239,62 @@ def summarize_matrix(report: dict[str, Any]) -> dict[str, Any]:
             expected_request_count=requested,
             label=f"C18.c{requested}.resource_balance",
         )
-    c32 = require_object(cells[-1], "C18.c32")
-    cap = require_count(c32.get("typed_admission_cap"), "C18.c32.typed_admission_cap", minimum=1)
-    floor = require_count(c32.get("active_floor"), "C18.c32.active_floor", minimum=1)
-    observed = require_count(c32.get("observed_max_active"), "C18.c32.observed_max_active", minimum=1)
-    timeline = require_object(c32.get("active_timeline"), "C18.c32.active_timeline")
+    top_label = f"C18.c{spec.required_client_concurrency}"
+    top_cell = require_object(cells[-1], top_label)
+    cap = require_count(
+        top_cell.get("typed_admission_cap"),
+        f"{top_label}.typed_admission_cap",
+        minimum=1,
+    )
+    floor = require_count(
+        top_cell.get("active_floor"),
+        f"{top_label}.active_floor",
+        minimum=1,
+    )
+    observed = require_count(
+        top_cell.get("observed_max_active"),
+        f"{top_label}.observed_max_active",
+        minimum=1,
+    )
+    timeline = require_object(
+        top_cell.get("active_timeline"),
+        f"{top_label}.active_timeline",
+    )
     duty = timeline.get("active_duty_cycle")
-    require(cap >= REQUIRED_ACTIVE_FLOOR, "C18.c32 typed admission cap is below 16")
-    require(floor == REQUIRED_ACTIVE_FLOOR, "C18.c32 active floor must equal 16")
     require(
-        REQUIRED_ACTIVE_FLOOR <= observed <= cap,
-        "C18.c32 observed max-active does not reach the typed active floor",
+        cap >= spec.required_active_floor,
+        (
+            f"{top_label} typed admission cap is below "
+            f"{spec.required_active_floor}"
+        ),
+    )
+    require(
+        floor == spec.required_active_floor,
+        f"{top_label} active floor must equal {spec.required_active_floor}",
+    )
+    require(
+        spec.required_active_floor <= observed <= cap,
+        f"{top_label} observed max-active does not reach the typed active floor",
     )
     require(
         isinstance(duty, (int, float))
         and not isinstance(duty, bool)
         and math.isfinite(float(duty))
-        and float(duty) >= REQUIRED_ACTIVE_DUTY_CYCLE,
-        "C18.c32 active duty-cycle is below 0.80",
+        and float(duty) >= spec.required_active_duty_cycle,
+        (
+            f"{top_label} active duty-cycle is below "
+            f"{spec.required_active_duty_cycle:.2f}"
+        ),
     )
     require(
-        c32.get("request_count") == REQUIRED_CLIENT_CONCURRENCY
-        and c32.get("completed_request_count") == REQUIRED_CLIENT_CONCURRENCY
-        and c32.get("completion_rate") == 1.0,
-        "C18.c32 request completion is not 32/32",
+        top_cell.get("request_count") == spec.required_client_concurrency
+        and top_cell.get("completed_request_count")
+        == spec.required_client_concurrency
+        and top_cell.get("completion_rate") == 1.0,
+        (
+            f"{top_label} request completion is not "
+            f"{spec.required_client_concurrency}/{spec.required_client_concurrency}"
+        ),
     )
     for field in (
         "error_count",
@@ -201,7 +305,7 @@ def summarize_matrix(report: dict[str, Any]) -> dict[str, Any]:
         "panic_count",
         "oom_count",
     ):
-        require(c32.get(field) == 0, f"C18.c32.{field} must be 0")
+        require(top_cell.get(field) == 0, f"{top_label}.{field} must be 0")
 
     return {
         "scenario_count": len(scenarios),
@@ -213,17 +317,21 @@ def summarize_matrix(report: dict[str, Any]) -> dict[str, Any]:
         "unexpected_count": 0,
         "entrypoints": sorted(entrypoints),
         "c18": {
-            "requested_concurrency": REQUIRED_CLIENT_CONCURRENCY,
+            "requested_concurrency": spec.required_client_concurrency,
             "typed_admission_cap": cap,
             "active_floor": floor,
             "observed_max_active": observed,
             "active_duty_cycle": float(duty),
-            "resource_balance": copy.deepcopy(c32["resource_balance"]),
+            "resource_balance": copy.deepcopy(top_cell["resource_balance"]),
         },
     }
 
 
-def validate_report(artifact_root: Path, report_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def validate_report(
+    artifact_root: Path,
+    report_path: Path,
+    spec: CheckpointSpec = CUDA_SPEC,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     artifact_root = artifact_root.resolve()
     report_path = report_path.resolve()
     require(artifact_root.is_dir(), f"artifact root does not exist: {artifact_root}")
@@ -242,30 +350,31 @@ def validate_report(artifact_root: Path, report_path: Path) -> tuple[dict[str, A
         )
     except matrix.ScenarioError as error:
         raise ValidationError(f"canonical scenario report validation failed: {error}") from error
-    return report, summarize_matrix(report)
+    return report, summarize_matrix(report, spec)
 
 
 def write_checkpoint(
     artifact_root: Path,
     report_path: Path,
     out: Path,
+    spec: CheckpointSpec = CUDA_SPEC,
 ) -> dict[str, Any]:
-    report, summary = validate_report(artifact_root, report_path)
+    report, summary = validate_report(artifact_root, report_path, spec)
     out = out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     require(not (out / "manifest.json").exists(), "checkpoint output already contains manifest.json")
-    pass_line = f"{PASS_PREFIX}: {out}"
+    pass_line = f"{spec.pass_prefix}: {out}"
     validation = {
         "schema_version": SCHEMA_VERSION,
-        "artifact_type": "runtime_vnext_g08b_cuda_model_matrix_validation",
-        "checkpoint_id": CHECKPOINT_ID,
+        "artifact_type": f"{spec.artifact_type_prefix}_validation",
+        "checkpoint_id": spec.checkpoint_id,
         "status": "pass",
         "validated_at": iso_now(),
         "execution_contract": matrix.G08_EXECUTION_CONTRACT,
         "source_git_sha": report["source_git_sha"],
         "source_tree_sha": report["source_tree_sha"],
         "model_key": MODEL_KEY,
-        "backend": BACKEND,
+        "backend": spec.backend,
         "model_revision": report["model_revision"],
         "model_files": report["model_files"],
         "binary_sha256": report["binary_sha256"],
@@ -275,16 +384,16 @@ def write_checkpoint(
             "sha256": file_sha256(report_path.resolve()),
         },
         "summary": summary,
-        "does_not_prove": DOES_NOT_PROVE,
+        "does_not_prove": list(spec.does_not_prove),
         "pass_line": pass_line,
     }
     validation_path = out / "validation.json"
     write_json(validation_path, validation)
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "artifact_type": "runtime_vnext_g08b_cuda_model_matrix_manifest",
-        "lane": CHECKPOINT_ID,
-        "checkpoint_id": "G08B-CUDA-MATRIX",
+        "artifact_type": f"{spec.artifact_type_prefix}_manifest",
+        "lane": spec.checkpoint_id,
+        "checkpoint_id": spec.checkpoint_label,
         "status": "pass",
         "canonical": True,
         "source_git_sha": report["source_git_sha"],
@@ -297,18 +406,18 @@ def write_checkpoint(
             "sha256": file_sha256(validation_path),
         },
         "summary": summary,
-        "does_not_prove": DOES_NOT_PROVE,
+        "does_not_prove": list(spec.does_not_prove),
         "pass_line": pass_line,
     }
     write_json(out / "manifest.json", manifest)
     return manifest
 
 
-def fixture_report() -> dict[str, Any]:
+def fixture_report(spec: CheckpointSpec = CUDA_SPEC) -> dict[str, Any]:
     source_git_sha = "1" * 40
     rows = matrix.planned_case_rows(
         MODEL_KEY,
-        BACKEND,
+        spec.backend,
         matrix.candidate_expectations_catalog(source_git_sha),
     )
     counts = Counter(row["scenario_id"] for row in rows)
@@ -328,10 +437,14 @@ def fixture_report() -> dict[str, Any]:
         }
         if scenario_id == "C18":
             cells = []
-            typed_cap = REQUIRED_ACTIVE_FLOOR
-            for ordinal, requested in enumerate((1, 4, 16, 32), start=1):
+            typed_cap = spec.required_active_floor
+            for ordinal, requested in enumerate(spec.concurrency_cells, start=1):
                 case_id = f"c18-{ordinal:03d}"
-                floor = matrix.required_active_floor(MODEL_KEY, BACKEND, requested)
+                floor = matrix.required_active_floor(
+                    MODEL_KEY,
+                    spec.backend,
+                    requested,
+                )
                 trace = matrix.c18_fixture_trace_rows(case_id, requested, typed_cap)
                 timeline = matrix.derive_active_timeline(
                     trace,
@@ -373,9 +486,9 @@ def fixture_report() -> dict[str, Any]:
         "execution_contract": matrix.G08_EXECUTION_CONTRACT,
         "status": "pass",
         "source_git_sha": source_git_sha,
-        "models_lock_sha256": file_sha256(MODEL_LOCK_PATH),
+        "models_lock_sha256": file_sha256(spec.model_lock_path),
         "model_key": MODEL_KEY,
-        "backend": BACKEND,
+        "backend": spec.backend,
         "commands": [
             {"id": "actual-run", "entrypoint": "run"},
             {"id": "actual-serve", "entrypoint": "serve"},
@@ -389,39 +502,56 @@ def expect_reject(
     name: str,
     mutate: Callable[[dict[str, Any]], None],
     marker: str,
+    spec: CheckpointSpec = CUDA_SPEC,
 ) -> None:
     candidate = copy.deepcopy(report)
     mutate(candidate)
     try:
-        summarize_matrix(candidate)
+        summarize_matrix(candidate, spec)
     except (ValidationError, matrix.ScenarioError) as error:
         require(marker.lower() in str(error).lower(), f"{name} rejected unexpectedly: {error}")
         return
     raise AssertionError(f"{name} unexpectedly passed")
 
 
-def self_test() -> int:
+def self_test(spec: CheckpointSpec = CUDA_SPEC) -> int:
+    preparation_spec = PREPARATION_SPECS[spec.backend]
     locked_sources = matrix.locked_execution_sources(
-        matrix.read_json(MODEL_LOCK_PATH),
+        matrix.read_json(spec.model_lock_path),
         MODEL_KEY,
-        BACKEND,
+        spec.backend,
     )
-    require(len(locked_sources["weight_files"]) == 19, "checked-in M2 CUDA weight lock is incomplete")
-    require(len(locked_sources["semantic_source"]["files"]) == 5, "checked-in M2 semantic lock is incomplete")
     require(
-        locked_sources["weight_revision"] == "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
-        "checked-in M2 CUDA revision drift",
+        len(locked_sources["weight_files"]) == preparation_spec.weight_file_count,
+        f"checked-in M2 {spec.backend.upper()} weight lock is incomplete",
     )
-    report = fixture_report()
-    summary = summarize_matrix(report)
+    require(
+        len(locked_sources["semantic_source"]["files"])
+        == preparation_spec.semantic_file_count,
+        "checked-in M2 semantic lock is incomplete",
+    )
+    require(
+        locked_sources["weight_revision"] == preparation_spec.weight_revision,
+        f"checked-in M2 {spec.backend.upper()} revision drift",
+    )
+    report = fixture_report(spec)
+    summary = summarize_matrix(report, spec)
     require(summary["scenario_count"] == 21, "fixture scenario count mismatch")
-    require(summary["case_count"] == EXPECTED_CASE_COUNT, "fixture case count mismatch")
-    require(summary["c18"]["active_duty_cycle"] >= 0.80, "fixture c32 duty-cycle mismatch")
+    require(
+        summary["case_count"] == spec.expected_case_count,
+        "fixture case count mismatch",
+    )
+    require(
+        summary["c18"]["active_duty_cycle"]
+        >= spec.required_active_duty_cycle,
+        "fixture top concurrency duty-cycle mismatch",
+    )
     expect_reject(
         report,
         "wrong model lock",
         lambda value: value.update({"models_lock_sha256": "0" * 64}),
-        "checked-in M2 CUDA model lock",
+        f"checked-in M2 {spec.backend.upper()} model lock",
+        spec,
     )
     expect_reject(
         report,
@@ -430,12 +560,14 @@ def self_test() -> int:
             {"status": "known-fail", "known_failed_count": 1}
         ),
         "status is not pass",
+        spec,
     )
     expect_reject(
         report,
         "missing scenario",
         lambda value: value["scenarios"].pop(),
         "ordered C01-C21",
+        spec,
     )
     expect_reject(
         report,
@@ -446,29 +578,33 @@ def self_test() -> int:
                 "passed_count": value["scenarios"][0]["passed_count"] - 1,
             }
         ),
-        "exactly 703 cases",
+        f"exactly {spec.expected_case_count} cases",
+        spec,
     )
     expect_reject(
         report,
         "missing serve",
         lambda value: value.update({"commands": [{"id": "actual-run", "entrypoint": "run"}]}),
         "run and serve",
+        spec,
     )
     expect_reject(
         report,
-        "low c32 duty",
+        "low top-cell duty",
         lambda value: value["scenarios"][17]["concurrency_cells"][-1]["active_timeline"].update(
-            {"active_duty_cycle": 0.79}
+            {"active_duty_cycle": spec.required_active_duty_cycle - 0.01}
         ),
-        "below 0.80",
+        f"below {spec.required_active_duty_cycle:.2f}",
+        spec,
     )
     expect_reject(
         report,
-        "low c32 cap",
+        "low top-cell cap",
         lambda value: value["scenarios"][17]["concurrency_cells"][-1].update(
-            {"typed_admission_cap": 15}
+            {"typed_admission_cap": spec.required_active_floor - 1}
         ),
-        "below 16",
+        f"below {spec.required_active_floor}",
+        spec,
     )
     expect_reject(
         report,
@@ -477,26 +613,51 @@ def self_test() -> int:
             {"leaked_resource_count": 1}
         ),
         "leaked_resource_count",
+        spec,
     )
-    print(SELFTEST_PASS_LINE)
+    print(spec.selftest_pass_line)
     return 0
 
 
-def main() -> int:
+def main(
+    *,
+    default_backend: str = "cuda",
+    fixed_backend: bool = False,
+) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--scenario-report", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--self-test", action="store_true")
+    if fixed_backend:
+        parser.set_defaults(backend=default_backend)
+    else:
+        parser.add_argument(
+            "--backend",
+            choices=tuple(CHECKPOINT_SPECS),
+            default=default_backend,
+        )
     args = parser.parse_args()
+    spec = CHECKPOINT_SPECS[args.backend]
     if args.self_test:
-        return self_test()
+        return self_test(spec)
     if args.artifact_root is None or args.scenario_report is None or args.out is None:
         parser.error("--artifact-root, --scenario-report, and --out are required")
     try:
-        manifest = write_checkpoint(args.artifact_root, args.scenario_report, args.out)
+        manifest = write_checkpoint(
+            args.artifact_root,
+            args.scenario_report,
+            args.out,
+            spec,
+        )
     except (ValidationError, matrix.ScenarioError, OSError, ValueError) as error:
-        print(f"FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX FAIL: {args.out}: {error}", file=sys.stderr)
+        print(
+            (
+                "FERRUM RUNTIME VNEXT G08B "
+                f"{spec.backend.upper()} MODEL MATRIX FAIL: {args.out}: {error}"
+            ),
+            file=sys.stderr,
+        )
         return 1
     print(manifest["pass_line"])
     return 0
