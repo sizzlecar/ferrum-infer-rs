@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "lock_id": "runtime-vnext-g08b-m2-metal-v1",
+  "provenance": {
+    "source_git_sha": "bb01afc4550fdc3a818c008d8a76ed63089a8697",
+    "source_catalog_sha256": "4c923c6177d8fd638684e63e1a3638e8fd1f50a82743f9afbf64a34aff4b1d5b",
+    "extraction": "exact M2-METAL lane projection; path and sha256 fields preserved"
+  },
+  "models": [
+    {
+      "key": "m2-qwen35-35b-a3b",
+      "lanes": {
+        "metal": {
+          "catalog_lane_id": "M2-METAL",
+          "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
+          "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+          "format": "gguf_q4_k_s",
+          "files": [
+            {
+              "path": "Qwen3.5-35B-A3B-Q4_K_S.gguf",
+              "sha256": "ee93ceffed5ce4df8b09bcbaf59a286d531025a1ebde9cf204c74e800c47d57e"
+            }
+          ],
+          "semantic_source": {
+            "repo": "Qwen/Qwen3.5-35B-A3B",
+            "revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+            "files": [
+              {
+                "path": "README.md",
+                "sha256": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492"
+              },
+              {
+                "path": "config.json",
+                "sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944"
+              },
+              {
+                "path": "generation_config.json",
+                "sha256": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0"
+              },
+              {
+                "path": "tokenizer.json",
+                "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+              },
+              {
+                "path": "tokenizer_config.json",
+                "sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+              }
+            ]
+          },
+          "chat_template": {
+            "source": "semantic_source",
+            "repo": "Qwen/Qwen3.5-35B-A3B",
+            "revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+            "path": "tokenizer_config.json",
+            "json_pointer": "/chat_template",
+            "container_sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+            "content_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+          }
+        }
+      }
+    }
+  ]
+}

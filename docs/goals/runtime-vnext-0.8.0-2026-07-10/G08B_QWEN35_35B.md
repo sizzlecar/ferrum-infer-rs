@@ -73,3 +73,26 @@ It proves M2 CUDA product correctness at `6fa8e215`; it does not prove current-H
 freshness or complete G08B. Metal Q4_K_S correctness, CUDA/Metal performance smoke,
 legacy/reference parity, historical mutation plus legacy-deletion acceptance, and the
 final G08B aggregate remain open.
+
+## Metal Matrix Workflow
+
+The Metal lane reuses the same backend-parameterized preparation and checkpoint
+contracts as CUDA. The thin Metal entrypoints must not fork the matrix or artifact
+schema. The pinned M2 Metal lock is
+`scripts/release/configs/runtime_vnext_g08b_m2_metal.models.lock.json`.
+
+Use the staged regression policy from `G02_TEST_EVIDENCE.md`:
+
+1. Build and bind one clean candidate binary.
+2. Replay the exact failed case with `--focus-case`; this produces diagnostic
+   `KEEP` or `REJECT`, never a formal PASS.
+3. Run the affected contract scenario with `--focus-scenario`, plus the
+   cross-entrypoint sentinels when shared behavior changed.
+4. After source freeze, execute the complete 702-case Metal matrix once.
+5. Validate it through `run_gate.py vnext-g08b-metal`.
+
+The formal Metal checkpoint requires ordered C01-C21, `702/702 pass`, both `run`
+and `serve`, C18 cells `c1/c4/c16`, typed active floor `4`, active duty-cycle
+`>=0.80`, and zero error/OOM/leak counters. Focused artifacts and reports from a
+different source SHA, binary SHA256, model lock, model revision, hardware id, or
+effective config cannot satisfy this checkpoint.
