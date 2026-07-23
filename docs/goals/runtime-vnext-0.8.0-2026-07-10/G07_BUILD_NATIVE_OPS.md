@@ -86,6 +86,21 @@ Metal-only 文件修改不得使 CUDA provider/native artifact dirty，反向同
   monotonic/wall time、return code、binary SHA256 和 smoke receipt。五次必须使用相同 host/power
   policy/compiler/toolchain；混合 cold/warm 样本后只报一个 p95 禁止通过。
 
+### 2026-07-24 失效域诊断
+
+clean source `3ac6b65a` 只修改了 CUDA provider 的 Rust replay shape 和一项 Rust test，
+没有修改 CUDA/C++ TU、header、build script 或 feature set。retained RTX 4090 build host
+上的 release test target 仍重新执行整套 Marlin/MoE native 编译，耗时 `16m57s`；随后同一
+缓存上的正式 candidate release build 仍耗时 `4m54s`。这些是单次 diagnostic 数字，不是本文件
+要求的五样本 p95，也不能形成 G07A PASS。
+
+该样本已经证明当前 graph 未达到“Rust model/runtime leaf edit 不重编 native ops”的目标。
+test target 与 product target 使用不同的 `ferrum-kernels` Cargo build-output identity，使
+OUT_DIR 内的 native static-lib stamp 不能跨目标复用；在 native artifact 从 Cargo package
+fingerprint 中解耦前，继续微调 `nvcc --threads` 不能解决该失效域。G07A 必须保存本次
+`cuda-unit.log`、candidate `cargo.log`、两个 build output identity 和实际 nvcc invocation
+作为 invalidation fixture，并用目标 graph 证明相同 Rust leaf edit 的 nvcc TU 数量为 `0`。
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。

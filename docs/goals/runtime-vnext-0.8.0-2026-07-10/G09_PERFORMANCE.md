@@ -256,6 +256,39 @@ target。Metal 可以复用 program/binding 生命周期合同，但保留自己
 的具体 owner 数、`provider_node_encode`/`enqueue_commands` 预测和停止线。正式
 `76.1583 tok/s` floor 不变。
 
+clean source `3ac6b65a` 随后验证了第一阶段 owner 移动，但也暴露了 program segmentation
+的根缺陷。`c03 run`、`c05 serve`、`c06 streaming` 真实 CUDA 正确性 `3/3 pass`；
+75 个 decode wave 精确达到预言的 `131 replay / 43 eager`。但是同一 full-profile
+workload 中，exact-shape causal varlen prefill 进入 reusable segment 后，使相邻稳定
+RMSNorm/MoE/residual 的 prefill replay 分别丢失 `275/250/250` 条，只换回 `50` 条 causal
+prefill replay。整个 workload 的 replay 最终只增加 `25` 条，而不是 decode 局部看到的
+`750` 条。
+
+profile-off c1 `random 64/32`、`100 x 3` 完成 `300/300`，错误和质量问题均为 `0`，
+但吞吐为 `51.5331 +/- 4.3387 tok/s`，比 `a0038a0e` 的 `55.4898` 低 `7.13%`，
+距正式 floor 仍差 `24.6252 tok/s`（`32.33%`）。因此本轮按
+`mixed-topology-replay-segment-poisoning` REJECT：
+
+```text
+CUDA CAUSAL REPLAY ENVELOPE REJECT: /workspace/ferrum-artifacts/runtime-vnext-causal-envelope-3ac6b65a-20260724T0548/diagnostic-summary.json
+```
+
+下一步不是提高 executable cache 容量，也不是继续搬 recurrent owner。必须先让 replay
+eligibility 成为 typed launch-topology contract：decode V1/V2 可复用，尚无稳定 envelope
+的 varlen/fallback prefill 是显式 eager barrier，单个 dynamic-key miss 不能污染相邻 stable
+command。下一付费 artifact 的可证伪预测为：
+
+- decode 保持 `131 replay / 43 eager`；
+- prefill RMSNorm/MoE/residual replay 恢复为 `1230/1200/1200`；
+- causal prefill replay 为 `0`；
+- scoped workload 总计 `13455 replay / 5985 eager`；
+- 在这些结构数字命中前，不运行另一轮 `100 x 3` 性能。
+
+本轮压缩包 SHA256 为
+`1e0b9774ff7822ffe3336b39c7afb96b78171a40e5c0a17ba9f4f9863108b8d7`。
+GitHub 从 Vast 出站连接超时，archive 暂留 retained instance；实例已确认
+`stopped/exited`，同账户 sibling 为 `0`。恢复传输不允许顺带启动 benchmark。
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
