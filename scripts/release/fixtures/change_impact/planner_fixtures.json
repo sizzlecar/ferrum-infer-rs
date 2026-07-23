@@ -149,6 +149,18 @@
       "forbid_required_gates": ["cuda_full"]
     },
     {
+      "id": "cli_model_source_composition",
+      "changed_files": ["crates/ferrum-cli/src/source_resolver.rs"],
+      "expect_domains": ["cli_run", "server_api", "model_contract"],
+      "expect_required_gates": [
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "model_contract",
+        "product_sentinel"
+      ]
+    },
+    {
       "id": "cli_run",
       "changed_files": ["crates/ferrum-cli/src/commands/run.rs"],
       "expect_domains": ["cli_run"],
