@@ -6323,13 +6323,9 @@ def serve_case_request(
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.02)
-    elif case["scenario_id"] != "C09":
-        fresh, _ = read_jsonl_since(scheduler_trace_path, trace_offset)
-        observed_ns = time.monotonic_ns()
-        trace_rows.extend(
-            {"raw": row, "collector_observed_monotonic_ns": observed_ns, "raw_sha256": canonical_json_sha256(row)}
-            for row in fresh
-        )
+    # C09 and C18 consume request-scoped scheduler transitions as correctness
+    # evidence. Other scenarios retain the command-level trace without copying
+    # thousands of unrelated rows into every HTTP transcript.
     runtime_log_evidence: dict[str, Any] | None = None
     if case["scenario_id"] == "C18":
         with server.stderr_path.open("rb") as handle:
