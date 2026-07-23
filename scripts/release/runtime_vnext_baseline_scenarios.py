@@ -159,6 +159,11 @@ C18_OOM_RE = re.compile(
     r"memory allocation (?:failed|failure)|allocator exhaustion)",
     re.IGNORECASE,
 )
+C18_TRACE_SCOPE_SELFTEST_PASS_LINE = (
+    "FERRUM RUNTIME VNEXT C18 TRACE SCOPE SELFTEST PASS"
+)
+C18_PRODUCT_REQUEST_PREFIX = "request.product."
+C18_FIXTURE_TRACE_START_UNIX_NS = 1_700_000_000_000_000_000
 CHILD_ENV_ALLOWLIST = frozenset(
     {
         "CUDA_HOME",
@@ -1840,9 +1845,19 @@ def validate_case_output(
             require(observed.get(field) == value, f"{label} C18 {field} is not derived from evidence")
             require(value == 0, f"{label} C18 {field} must be zero")
         require(observed.get("active_timeline_error") is None, f"{label} C18 active timeline is incomplete")
+        trace_rows = require_list(
+            transcript.get("scheduler_trace_rows"),
+            f"{label}.scheduler_trace_rows",
+        )
+        trace_rows = c18_scoped_trace_rows(
+            trace_rows,
+            transcript.get("scheduler_trace_scope"),
+            expected_request_count=requested,
+            label=label,
+        )
         try:
             timeline = derive_active_timeline(
-                require_list(transcript.get("scheduler_trace_rows"), f"{label}.scheduler_trace_rows"),
+                trace_rows,
                 requested_concurrency=requested,
                 typed_active_cap=cap,
                 active_floor=floor,
@@ -1854,7 +1869,7 @@ def validate_case_output(
         require(active == timeline["observed_max_active"], f"{label} C18 max-active differs from timeline")
         if require_c18_resource_balance:
             resource_balance = c18_resource_balance(
-                require_list(transcript.get("scheduler_trace_rows"), f"{label}.scheduler_trace_rows"),
+                trace_rows,
                 expected_request_count=requested,
             )
             require(
@@ -2464,6 +2479,29 @@ def validate_case_evidence(
                     f"case {case_id}.requested_concurrency",
                     minimum=1,
                 )
+                trace_rows = c18_scoped_trace_rows(
+                    trace_rows,
+                    transcript_object.get("scheduler_trace_scope"),
+                    expected_request_count=requested,
+                    label=f"case {case_id}",
+                )
+                if not expected["allow_internal_fixture"]:
+                    scope_started_unix_ns = require_count(
+                        require_object(
+                            transcript_object.get("scheduler_trace_scope"),
+                            f"case {case_id}.scheduler_trace_scope",
+                        ).get("started_unix_ns"),
+                        f"case {case_id}.scheduler_trace_scope.started_unix_ns",
+                        minimum=1,
+                    )
+                    execution_started_unix_ns = int(started.timestamp() * 1_000_000_000)
+                    execution_finished_unix_ns = int(finished.timestamp() * 1_000_000_000)
+                    require(
+                        execution_started_unix_ns
+                        <= scope_started_unix_ns
+                        <= execution_finished_unix_ns,
+                        f"case {case_id} C18 scheduler trace scope is outside the case window",
+                    )
                 derived_cap = typed_admission_cap_value(actual_config)
                 require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
                 floor = required_active_floor(expected["model_key"], expected["backend"], requested)
@@ -4814,14 +4852,154 @@ def c18_runtime_failure_summary(evidence: Any) -> dict[str, int]:
     }
 
 
-def c18_transition_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
-    phases = [
-        raw.get("phase")
+def c18_trace_scope_summary(
+    rows: list[dict[str, Any]],
+    *,
+    started_unix_ns: int,
+    expected_request_count: int,
+) -> dict[str, Any]:
+    """Bind a C18 trace window to the request identities opened by this case."""
+
+    started_unix_ns = require_count(
+        started_unix_ns,
+        "C18 trace scope started_unix_ns",
+        minimum=1,
+    )
+    expected_request_count = require_count(
+        expected_request_count,
+        "C18 trace scope expected_request_count",
+        minimum=1,
+    )
+    open_counts: dict[str, int] = {}
+    close_counts: dict[str, int] = {}
+    open_positions: dict[str, int] = {}
+    close_positions: dict[str, list[int]] = {}
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("raw", row)
+        if not isinstance(raw, dict):
+            continue
+        phase = raw.get("phase")
+        if phase not in {"engine_request_open", "engine_request_close"}:
+            continue
+        request_id = require_string(
+            raw.get("request_id"),
+            f"C18 trace scope row[{index}].request_id",
+        )
+        if phase == "engine_request_open":
+            event_unix_ns = require_count(
+                raw.get("ts_unix_nanos"),
+                f"C18 trace scope row[{index}].ts_unix_nanos",
+                minimum=1,
+            )
+            if event_unix_ns < started_unix_ns:
+                continue
+            open_counts[request_id] = open_counts.get(request_id, 0) + 1
+            open_positions.setdefault(request_id, index)
+        else:
+            close_counts[request_id] = close_counts.get(request_id, 0) + 1
+            close_positions.setdefault(request_id, []).append(index)
+
+    request_ids = list(open_counts)
+    selected_close_counts = {
+        request_id: close_counts.get(request_id, 0) for request_id in request_ids
+    }
+    duplicate_open_count = sum(max(0, count - 1) for count in open_counts.values())
+    duplicate_close_count = sum(
+        max(0, count - 1) for count in selected_close_counts.values()
+    )
+    out_of_order_close_count = sum(
+        1
+        for request_id in request_ids
+        for close_position in close_positions.get(request_id, [])
+        if close_position < open_positions[request_id]
+    )
+    closed_request_ids = [
+        request_id
+        for request_id in request_ids
+        if selected_close_counts[request_id] == 1
+        and close_positions[request_id][0] > open_positions[request_id]
+    ]
+    complete = (
+        len(request_ids) == expected_request_count
+        and duplicate_open_count == 0
+        and duplicate_close_count == 0
+        and out_of_order_close_count == 0
+        and len(closed_request_ids) == expected_request_count
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "started_unix_ns": started_unix_ns,
+        "expected_request_count": expected_request_count,
+        "request_ids": request_ids,
+        "closed_request_ids": closed_request_ids,
+        "open_event_count": sum(open_counts.values()),
+        "close_event_count": sum(selected_close_counts.values()),
+        "duplicate_open_count": duplicate_open_count,
+        "duplicate_close_count": duplicate_close_count,
+        "out_of_order_close_count": out_of_order_close_count,
+        "complete": complete,
+    }
+
+
+def c18_scoped_trace_rows(
+    rows: list[dict[str, Any]],
+    scope: Any,
+    *,
+    expected_request_count: int,
+    label: str,
+) -> list[dict[str, Any]]:
+    scope_document = require_object(scope, f"{label}.scheduler_trace_scope")
+    started_unix_ns = require_count(
+        scope_document.get("started_unix_ns"),
+        f"{label}.scheduler_trace_scope.started_unix_ns",
+        minimum=1,
+    )
+    derived = c18_trace_scope_summary(
+        rows,
+        started_unix_ns=started_unix_ns,
+        expected_request_count=expected_request_count,
+    )
+    require(
+        scope_document == derived,
+        f"{label} C18 scheduler trace scope is not replayable",
+    )
+    require(
+        derived["complete"] is True,
+        f"{label} C18 scheduler trace scope did not close the same request identities",
+    )
+    scoped = c18_trace_rows_for_request_ids(
+        rows,
+        derived["request_ids"],
+        label=label,
+    )
+    require(scoped, f"{label} C18 scheduler trace scope is empty")
+    return scoped
+
+
+def c18_trace_rows_for_request_ids(
+    rows: list[dict[str, Any]],
+    request_id_values: list[str],
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    request_ids = {
+        require_string(request_id, f"{label}.request_id")
+        for request_id in request_id_values
+    }
+    product_request_ids = {
+        f"{C18_PRODUCT_REQUEST_PREFIX}{request_id}" for request_id in request_ids
+    }
+    scoped = [
+        row
         for row in rows
         if isinstance(row, dict)
         and isinstance((raw := row.get("raw", row)), dict)
-    ]
-    return phases.count("engine_request_open"), phases.count("engine_request_close")
+        and raw.get("request_id") in request_ids | product_request_ids
+        ]
+    return scoped
 
 
 def c18_fixture_trace_rows(
@@ -4843,6 +5021,7 @@ def c18_fixture_trace_rows(
         nonlocal timestamp
         request_id = f"{case_id}-request-{request_index:03d}"
         event = {
+            "ts_unix_nanos": C18_FIXTURE_TRACE_START_UNIX_NS + timestamp,
             "event_id": f"fixture-{phase}-{request_id}",
             "phase": phase,
             "request_id": request_id,
@@ -6193,8 +6372,10 @@ def serve_case_request(
     started_at = iso_now()
     started_ns = time.monotonic_ns()
     trace_offset = complete_jsonl_offset(scheduler_trace_path)
+    trace_started_unix_ns = time.time_ns()
     runtime_log_start_offset = server.stderr_path.stat().st_size if server.stderr_path.is_file() else 0
     trace_rows: list[dict[str, Any]] = []
+    c18_trace_scope: dict[str, Any] | None = None
     c09_outcome: dict[str, Any] | None = None
     c09_trace_contract_error: str | None = None
     history_construction_errors: list[dict[str, Any]] = []
@@ -6354,12 +6535,28 @@ def serve_case_request(
                 }
                 for row in fresh
             )
-            opened, closed = c18_transition_counts(trace_rows)
-            if opened >= requested and closed >= requested:
+            c18_trace_scope = c18_trace_scope_summary(
+                trace_rows,
+                started_unix_ns=trace_started_unix_ns,
+                expected_request_count=requested,
+            )
+            if (
+                c18_trace_scope["complete"]
+                or len(c18_trace_scope["request_ids"]) > requested
+                or c18_trace_scope["duplicate_open_count"] > 0
+                or c18_trace_scope["duplicate_close_count"] > 0
+                or c18_trace_scope["out_of_order_close_count"] > 0
+            ):
                 break
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.02)
+        require(c18_trace_scope is not None, "C18 scheduler trace scope was not collected")
+        trace_rows = c18_trace_rows_for_request_ids(
+            trace_rows,
+            c18_trace_scope["request_ids"],
+            label=f"case {case_id}",
+        )
     # C09 and C18 consume request-scoped scheduler transitions as correctness
     # evidence. Other scenarios retain the command-level trace without copying
     # thousands of unrelated rows into every HTTP transcript.
@@ -6402,6 +6599,7 @@ def serve_case_request(
         "case_id": case_id,
         "exchanges": exchanges,
         "scheduler_trace_rows": trace_rows,
+        "scheduler_trace_scope": c18_trace_scope,
         "models_response": models_response,
         "models_status": models_status if case["scenario_id"] == "C20" else None,
         "history_construction_errors": history_construction_errors,
@@ -8282,6 +8480,7 @@ def make_case_fixture(
         requested = int(concurrency_cell["requested_concurrency"]) if concurrency_cell else 1
         concurrency_identities: list[dict[str, Any]] | None = None
         scheduler_trace_rows: list[dict[str, Any]] = []
+        scheduler_trace_scope: dict[str, Any] | None = None
         runtime_log_evidence: dict[str, Any] | None = None
         if scenario_id == "C18":
             require(concurrency_cell is not None, "C18 fixture requires a concurrency cell")
@@ -8297,6 +8496,11 @@ def make_case_fixture(
                 case_id,
                 requested,
                 concurrency_cell["typed_admission_cap"],
+            )
+            scheduler_trace_scope = c18_trace_scope_summary(
+                scheduler_trace_rows,
+                started_unix_ns=C18_FIXTURE_TRACE_START_UNIX_NS,
+                expected_request_count=requested,
             )
             runtime_log_evidence = {
                 "start_offset": 0,
@@ -8446,6 +8650,7 @@ def make_case_fixture(
             "case_id": case_id,
             "exchanges": exchanges,
             "scheduler_trace_rows": scheduler_trace_rows,
+            "scheduler_trace_scope": scheduler_trace_scope,
             "concurrency_request_identities": concurrency_identities,
             "runtime_log_evidence": runtime_log_evidence,
             "models_response": {"object": "list", "data": [{"id": base["model_key"], "modalities": ["text"]}]} if scenario_id == "C20" else None,
@@ -9717,7 +9922,104 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
     raise AssertionError(f"execution report mutation unexpectedly passed; expected {marker}")
 
 
+def self_test_c18_trace_scope() -> int:
+    boundary = 1_800_000_000_000_000_000
+
+    def row(
+        phase: str,
+        request_id: str,
+        event_unix_ns: int,
+    ) -> dict[str, Any]:
+        raw = {
+            "ts_unix_nanos": event_unix_ns,
+            "event_id": f"{phase}-{request_id}-{event_unix_ns}",
+            "phase": phase,
+            "request_id": request_id,
+            "status": "ok",
+            "error": None,
+        }
+        return {"raw": raw, "raw_sha256": canonical_json_sha256(raw)}
+
+    stale_request_id = "stale-before-c18"
+    current_request_ids = ["c18-request-a", "c18-request-b"]
+    contaminated = [
+        row("engine_request_close", stale_request_id, boundary - 10),
+        row("engine_request_open", current_request_ids[0], boundary + 10),
+        row("engine_request_open", current_request_ids[1], boundary + 20),
+        row("engine_request_close", current_request_ids[0], boundary + 30),
+    ]
+    legacy_open_count = sum(
+        item["raw"]["phase"] == "engine_request_open" for item in contaminated
+    )
+    legacy_close_count = sum(
+        item["raw"]["phase"] == "engine_request_close" for item in contaminated
+    )
+    require(
+        legacy_open_count == 2 and legacy_close_count == 2,
+        "C18 trace-scope self-test did not reproduce aggregate-count false completion",
+    )
+    incomplete = c18_trace_scope_summary(
+        contaminated,
+        started_unix_ns=boundary,
+        expected_request_count=2,
+    )
+    require(
+        incomplete["request_ids"] == current_request_ids
+        and incomplete["closed_request_ids"] == [current_request_ids[0]]
+        and incomplete["complete"] is False,
+        "C18 trace scope accepted a stale close as the current request close",
+    )
+
+    complete_rows = [
+        *contaminated,
+        row(
+            "vnext.request_completed",
+            f"{C18_PRODUCT_REQUEST_PREFIX}{stale_request_id}",
+            boundary - 5,
+        ),
+        row(
+            "vnext.request_completed",
+            f"{C18_PRODUCT_REQUEST_PREFIX}{current_request_ids[0]}",
+            boundary + 35,
+        ),
+        row("engine_request_close", current_request_ids[1], boundary + 40),
+    ]
+    complete = c18_trace_scope_summary(
+        complete_rows,
+        started_unix_ns=boundary,
+        expected_request_count=2,
+    )
+    require(
+        complete["complete"] is True
+        and complete["closed_request_ids"] == current_request_ids,
+        "C18 trace scope did not complete after the matching request close arrived",
+    )
+    scoped_rows = c18_scoped_trace_rows(
+        complete_rows,
+        complete,
+        expected_request_count=2,
+        label="C18 trace-scope self-test",
+    )
+    scoped_request_ids = {
+        item["raw"]["request_id"] for item in scoped_rows
+    }
+    require(
+        stale_request_id not in scoped_request_ids
+        and f"{C18_PRODUCT_REQUEST_PREFIX}{stale_request_id}"
+        not in scoped_request_ids
+        and scoped_request_ids
+        == {
+            *current_request_ids,
+            f"{C18_PRODUCT_REQUEST_PREFIX}{current_request_ids[0]}",
+        },
+        "C18 trace scope retained a foreign request",
+    )
+    print(C18_TRACE_SCOPE_SELFTEST_PASS_LINE)
+    return 0
+
+
 def self_test() -> int:
+    self_test_c18_trace_scope()
     validate_c17_markers()
     focus_fixture_rows = [
         {"case_id": "c01-001", "scenario_id": "C01"},
@@ -11490,7 +11792,10 @@ def main() -> int:
     parser.add_argument("--focus-case", action="append", default=[])
     parser.add_argument("--focus-scenario", action="append", choices=SCENARIO_IDS, default=[])
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--self-test-c18-trace-scope", action="store_true")
     args = parser.parse_args()
+    if args.self_test_c18_trace_scope:
+        return self_test_c18_trace_scope()
     if args.self_test:
         return self_test()
     if args.discover_scenario is not None and not args.discover:
