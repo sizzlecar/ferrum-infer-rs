@@ -336,6 +336,7 @@ fn resolve_stop_conditions(
 fn resolve_sampling_token_constraints(
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     stop_token_ids: &HashSet<u32>,
+    request_generated_control_token_texts: &[&str],
 ) -> (HashSet<u32>, Option<usize>, HashSet<u32>) {
     let mut allowed_extended = stop_token_ids.clone();
     let Some(tok) = tokenizer else {
@@ -349,6 +350,11 @@ fn resolve_sampling_token_constraints(
         allowed_extended.insert(extra.get());
     }
     for text in GENERATED_CONTROL_TOKEN_TEXTS {
+        if let Some(token) = tok.token_id(text) {
+            allowed_extended.insert(token.get());
+        }
+    }
+    for text in request_generated_control_token_texts {
         if let Some(token) = tok.token_id(text) {
             allowed_extended.insert(token.get());
         }
@@ -1161,8 +1167,17 @@ impl SequenceState {
             })
             .transpose()?
             .flatten();
+        let request_generated_control_token_texts = request
+            .api_request
+            .as_ref()
+            .map(ferrum_types::ApiRequest::generated_control_token_texts)
+            .unwrap_or_default();
         let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
-            resolve_sampling_token_constraints(tokenizer.as_deref(), &stop_token_ids);
+            resolve_sampling_token_constraints(
+                tokenizer.as_deref(),
+                &stop_token_ids,
+                request_generated_control_token_texts,
+            );
         let mut initial_forbidden_token_ids = HashSet::new();
         let initial_forbidden_token_texts = request
             .metadata

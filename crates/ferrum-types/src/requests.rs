@@ -160,6 +160,40 @@ pub enum ApiToolCallProtocol {
     FunctionParameterXml,
 }
 
+impl ApiToolCallProtocol {
+    /// Atomic tokenizer entries that this wire protocol may need to emit.
+    ///
+    /// The sampling layer resolves these texts against the loaded tokenizer
+    /// and allows only exact matches. Other added-vocabulary tokens remain
+    /// masked.
+    pub const fn generated_control_token_texts(self) -> &'static [&'static str] {
+        match self {
+            Self::Json => &[],
+            Self::FunctionParameterXml => &["<tool_call>", "</tool_call>"],
+        }
+    }
+}
+
+impl ApiChatRequest {
+    /// Protocol controls are generatable only when this request can emit a
+    /// modern tool call. `tool_choice: none` must not widen token sampling.
+    pub fn generated_control_token_texts(&self) -> &'static [&'static str] {
+        if self.tools.is_empty() || api_tool_choice_is_none(self) {
+            return &[];
+        }
+        self.tool_call_protocol.generated_control_token_texts()
+    }
+}
+
+impl ApiRequest {
+    pub fn generated_control_token_texts(&self) -> &'static [&'static str] {
+        match self {
+            Self::Chat(request) => request.generated_control_token_texts(),
+            Self::Completion(_) => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ApiFunctionCallChoice {

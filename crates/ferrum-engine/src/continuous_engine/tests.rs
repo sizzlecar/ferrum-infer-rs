@@ -1370,6 +1370,34 @@ fn policy_request() -> InferenceRequest {
     }
 }
 
+fn policy_tool_request(
+    protocol: ferrum_types::ApiToolCallProtocol,
+    tool_choice: ferrum_types::ApiToolChoice,
+) -> InferenceRequest {
+    let mut request = policy_request();
+    request.api_request = Some(ferrum_types::ApiRequest::Chat(
+        ferrum_types::ApiChatRequest {
+            messages: Vec::new(),
+            tools: vec![ferrum_types::ApiTool {
+                tool_type: "function".to_string(),
+                function: ferrum_types::ApiFunction {
+                    name: "lookup_weather".to_string(),
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                },
+            }],
+            tool_choice: Some(tool_choice),
+            tool_call_protocol: protocol,
+            legacy_functions: Vec::new(),
+            legacy_function_call: None,
+            response_format: None,
+            stream_options: None,
+        },
+    ));
+    request
+}
+
 #[derive(Debug, Clone, Default)]
 struct TestResourceTraceState {
     reserved: i64,
@@ -9357,6 +9385,112 @@ fn sample_allows_generated_control_tokens_above_base_vocab() {
     assert_eq!(token.get(), 5);
     assert_eq!(logits[5], 90.0);
     assert_eq!(logits[6], f32::NEG_INFINITY);
+}
+
+#[test]
+fn tool_protocol_allows_only_its_added_tokens_for_auto_calls() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("ok", 4),
+            ("x", 5),
+            ("<tool_call>", 7),
+            ("</tool_call>", 8),
+            ("<|fim_prefix|>", 9),
+        ],
+    ));
+    let request = policy_tool_request(
+        ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+        ferrum_types::ApiToolChoice::Mode("auto".to_string()),
+    );
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(10),
+    );
+
+    assert!(state.allowed_extended_token_ids.contains(&7));
+    assert!(state.allowed_extended_token_ids.contains(&8));
+    assert!(
+        !state.allowed_extended_token_ids.contains(&9),
+        "unrelated added-vocabulary controls must remain masked"
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 10];
+    logits[5] = 1.0;
+    logits[7] = 90.0;
+    logits[9] = 100.0;
+
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token.get(), 7);
+    assert_eq!(logits[7], 90.0);
+    assert_eq!(logits[9], f32::NEG_INFINITY);
+}
+
+#[test]
+fn tool_protocol_does_not_widen_sampling_when_tool_choice_is_none() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("ok", 4),
+            ("x", 5),
+            ("<tool_call>", 7),
+            ("</tool_call>", 8),
+        ],
+    ));
+    let request = policy_tool_request(
+        ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+        ferrum_types::ApiToolChoice::Mode("none".to_string()),
+    );
+    let state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(9),
+    );
+
+    assert!(!state.allowed_extended_token_ids.contains(&7));
+    assert!(!state.allowed_extended_token_ids.contains(&8));
+}
+
+#[test]
+fn json_tool_protocol_does_not_allow_xml_added_tokens() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("ok", 4),
+            ("x", 5),
+            ("<tool_call>", 7),
+            ("</tool_call>", 8),
+        ],
+    ));
+    let request = policy_tool_request(
+        ferrum_types::ApiToolCallProtocol::Json,
+        ferrum_types::ApiToolChoice::Mode("auto".to_string()),
+    );
+    let state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(9),
+    );
+
+    assert!(!state.allowed_extended_token_ids.contains(&7));
+    assert!(!state.allowed_extended_token_ids.contains(&8));
 }
 
 #[test]
