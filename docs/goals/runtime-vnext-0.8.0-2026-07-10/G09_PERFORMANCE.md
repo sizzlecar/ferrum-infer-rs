@@ -146,11 +146,23 @@ dirty candidate `89d3f66d + source.diff` 将 workspace bucket policy 与 device 
 `KEEP_DIAGNOSTIC`，不是正式性能或正确性 PASS；artifact 位于
 `/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/workspace-reuse-metal-dirty-89d3f66d/`。
 
-下一次 paid CUDA 只允许 clean-SHA bounded smoke：先跑 focused `run`、`serve`、stream
-正确性，再跑一次 c1 diagnostic。预期信号是 graph capture 仍关闭、lane-stable backing
-存在、product-visible deferral/error 为 `0`，且 decode
-`resource_prepare_attempt <= 3.5 ms`。未满足即保存 REJECT 并停止，不触发 703-case 或
-full sweep。
+clean source `e66ade7f0c0cd88ffc55c9a3c5a9ac902c68f58d` 已按上述合同完成一次
+1x RTX 4090 bounded smoke。`c03-001 run`、`c05-001 serve`、`c06-001 stream`
+正确性 `3/3 pass` 后，profile-off c1 `random 64/32`、`100 x 3` 完成
+`300/300` measured requests，error/quality issue 均为 `0`，token source 为 usage。
+`resource_prepare_attempt` 从 `3.6031 ms` 降至 `1.1426 ms`（`-68.29%`），
+graph capture 保持关闭且 lane-stable live segments 非零，命中预期 signal。
+吞吐从 `46.0342` 提升至 `55.5897 +/- 0.2898 tok/s`（`+20.76%`），但仍比
+`76.1583 tok/s` 正式 floor 低 `20.5685 tok/s`（`27.01%`），所以结论仅为
+`KEEP_DIAGNOSTIC`，不是 G09 PASS。三次 client event/usage mismatch 使 ITL comparison
+不具资格，不得从该 artifact 得出 ITL no-regression 结论。
+
+完整 artifact 通过 GitHub transfer 回传，SHA256 为
+`e25500b9da8ef546f5cb70b0785cd81a15f8b26b0d4a94fa1d2618a439363445`；详情见
+[`G08B_QWEN35_35B.md`](G08B_QWEN35_35B.md)。Vast `45319871` 已
+`stopped/exited`。在下一次 paid run 前，必须从现有 artifact 的
+`host_encode_submit=6.224 ms`、`completion_round_trip=5.629 ms` 和 device timing 中提出
+单一 source-level hypothesis；不得因本轮 KEEP 直接启动 full sweep。
 
 ### M3 Qwen3-30B historical floors
 

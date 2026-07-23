@@ -225,10 +225,47 @@ response ended during Qwen reasoning and the source was dirty. The durable artif
 `diagnostic-summary.json` is `KEEP_DIAGNOSTIC`, and the bound Metal binary SHA256 is
 `53b5787c97957556c5dcf27e5c600374377a85b1ed1cb898e5c8bd0445be517c`.
 
-The next CUDA work is one clean-SHA correctness-first bounded smoke, not a 703-case or
-full performance sweep. It must keep graph capture disabled, prove the focused
-`run`/`serve`/stream paths, show no product-visible deferral or request error, and
-measure decode resource preparation before any broader G08B/G09 run.
+Clean source `e66ade7f0c0cd88ffc55c9a3c5a9ac902c68f58d` then completed the
+predeclared one-RTX-4090 bounded CUDA diagnostic. The bound release binary SHA256 was
+`f35878204dbc0cfbfdf62e8b0ec1304d01b610385244465924c60a31d7ff624f`.
+Correctness ran before performance: `c03-001 run`, `c05-001 serve`, and `c06-001
+streaming serve` passed `3/3`; the stream emitted one `[DONE]`, one usage event, zero
+malformed event, and the exact expected marker.
+
+The profile-off c1 run used the same historical workload (`random 64/32`, `100 x 3`
+measured requests, ten warmups per repeat, `--fail-on-error --require-ci`). It
+completed `300/300` with zero request or quality error and usage-derived token counts:
+
+- throughput `55.5897 +/- 0.2898 tok/s`, `20.76%` above `d0d2e4f5` at
+  `46.0342 tok/s`;
+- decode resource preparation `3.6031 ms -> 1.1426 ms` (`-68.29%`), satisfying
+  the predeclared `<=3.5 ms` signal;
+- decode submitted-wave total `12.8876 ms -> 12.3382 ms` (`-4.26%`);
+- graph capture stayed disabled, captured executables stayed `0`, while resource
+  domains 3/4/5 retained `2/6/2` lane-stable segments;
+- request/sequence/step/wave/extension deferrals and failed waves were all `0`.
+  Nine internal cold backing-growth maintenance attempts converged and are preserved
+  in the artifact.
+
+The runner printed:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-workspace-reuse-e66ade7f-20260724/focused-report.json
+CUDA WORKSPACE REUSE DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-workspace-reuse-e66ade7f-20260724/diagnostic-summary.json
+```
+
+This is a scoped `KEEP_DIAGNOSTIC`, not G08B or G09 PASS. It still misses the
+`76.1583 tok/s` formal floor by `20.5685 tok/s` (`27.01%`). Client ITL also remains
+ineligible for comparison because three of 300 requests had event/usage mismatch,
+although request correctness and TPOT evidence were unaffected.
+
+The complete GitHub-transfer artifact is
+[runtime-vnext-workspace-reuse-e66ade7f-20260724.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-workspace-reuse-e66ade7f-20260724.tar.zst)
+with SHA256 `e25500b9da8ef546f5cb70b0785cd81a15f8b26b0d4a94fa1d2618a439363445`.
+The GitHub-downloaded local copy is verified at
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/workspace-reuse-cuda-e66ade7f/`.
+Vast instance `45319871` is `stopped/exited`, the cache is retained, and the
+reconciled potentially billable/transitional sibling count is `0`.
 
 ## Metal Matrix Workflow
 
