@@ -26,3 +26,12 @@ fn executable_cache_has_no_fence_dependency_owner() {
     assert!(REPLAY_SOURCE.contains("_executables: Vec<Arc<CudaCommandExecutable>>"));
     assert!(!REPLAY_SOURCE.contains("fence_dependencies"));
 }
+
+#[test]
+fn causal_replay_identity_uses_a_partition_capacity_envelope() {
+    assert!(
+        CAUSAL_ATTENTION_SOURCE.contains(".u64(launch.replay_envelope.sequence_capacity_tokens)")
+    );
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(".i32(launch.replay_envelope.table_capacity_entries)"));
+    assert!(!CAUSAL_ATTENTION_SOURCE.contains(".u64(launch.sequence_tokens)"));
+}

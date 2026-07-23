@@ -437,6 +437,48 @@ impl CausalAttentionKernelPath {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CausalAttentionReplayEnvelope {
+    sequence_capacity_tokens: u64,
+    table_capacity_entries: i32,
+}
+
+impl CausalAttentionReplayEnvelope {
+    fn new(
+        shape: CausalAttentionShape,
+        path: CausalAttentionKernelPath,
+        sequence_tokens: u64,
+    ) -> Result<Self, String> {
+        let sequence_capacity_tokens = match path {
+            CausalAttentionKernelPath::VllmAddressedDecodeV1 => {
+                VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens)
+            }
+            CausalAttentionKernelPath::VllmAddressedDecodeV2 => sequence_tokens
+                .div_ceil(VLLM_PARTITION_TOKENS)
+                .checked_mul(VLLM_PARTITION_TOKENS)
+                .map(|capacity| capacity.min(shape.maximum_context_tokens))
+                .ok_or_else(|| "causal attention replay sequence capacity overflows".to_owned())?,
+            CausalAttentionKernelPath::TokenMajorFallback
+            | CausalAttentionKernelPath::VllmAddressedFallback
+            | CausalAttentionKernelPath::VllmAddressedVarlen
+            | CausalAttentionKernelPath::VllmAddressedVarlenTiled => sequence_tokens,
+        };
+        if sequence_tokens == 0
+            || sequence_tokens > sequence_capacity_tokens
+            || sequence_capacity_tokens > shape.maximum_context_tokens
+        {
+            return Err("causal attention replay sequence capacity is invalid".to_owned());
+        }
+        Ok(Self {
+            sequence_capacity_tokens,
+            table_capacity_entries: checked_i32(
+                shape.table_entries(sequence_capacity_tokens)?,
+                "causal attention replay table capacity",
+            )?,
+        })
+    }
+}
+
 impl CausalAttentionShape {
     fn from_attributes(attributes: &BTreeMap<AttributeId, SemanticValue>) -> Result<Self, String> {
         let shape = Self {
@@ -798,6 +840,7 @@ struct CausalAttentionLaunch {
     sequence_tokens: u64,
     sequence_tokens_i32: i32,
     table_entries_i32: i32,
+    replay_envelope: CausalAttentionReplayEnvelope,
     path: CausalAttentionKernelPath,
 }
 
@@ -942,6 +985,7 @@ fn encode_attention(
         let table_entries_i32 =
             checked_i32(table_entries, "causal attention address-table entry count")?;
         let path = CausalAttentionKernelPath::select(shape, tokens, source.end)?;
+        let replay_envelope = CausalAttentionReplayEnvelope::new(shape, path, source.end)?;
         let host_binding = host_storage.len();
         host_storage.push(binding_payload(
             shape.kv_layout()?,
@@ -970,6 +1014,7 @@ fn encode_attention(
             sequence_tokens: source.end,
             sequence_tokens_i32,
             table_entries_i32,
+            replay_envelope,
             path,
         });
     }
@@ -1041,9 +1086,8 @@ fn encode_attention(
             .u64(launch.binding_offset)
             .u64(launch.tokens)
             .i32(launch.tokens_i32)
-            .u64(launch.sequence_tokens)
-            .i32(launch.sequence_tokens_i32)
-            .i32(launch.table_entries_i32)
+            .u64(launch.replay_envelope.sequence_capacity_tokens)
+            .i32(launch.replay_envelope.table_capacity_entries)
             .u64(launch.path.replay_id());
     }
 
@@ -1434,14 +1478,14 @@ fn launch_selected_attention(
                         query,
                         page_table,
                         sequence_length_device,
-                        launch.sequence_tokens,
+                        launch.replay_envelope.sequence_capacity_tokens,
                         Some(scratch_pointer(scratch_base, scratch.exp_sums)?),
                         Some(scratch_pointer(scratch_base, scratch.max_logits)?),
                         Some(scratch_pointer(scratch_base, scratch.temporary_output)?),
                         shape.query_heads,
                         shape.key_value_heads,
                         shape.head_dim,
-                        launch.table_entries_i32,
+                        launch.replay_envelope.table_capacity_entries,
                     )
                 }
                 .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
@@ -2223,6 +2267,57 @@ mod tests {
         let addresses = binding_addresses(layout, 3, &[0x10_0000, 0x20_0000]).unwrap();
         assert_eq!(addresses, vec![0x10_0000, 0x10_0000 + 32 * 1024, 0x20_0000]);
         assert!(binding_addresses(layout, 5, &[0x10_0000, 0x20_0000]).is_err());
+    }
+
+    #[test]
+    fn decode_replay_envelope_is_stable_within_native_partition_topology() {
+        let shape = goal_shape(32, 4, 128, 32_768);
+        let v1_first = CausalAttentionReplayEnvelope::new(
+            shape,
+            CausalAttentionKernelPath::VllmAddressedDecodeV1,
+            1,
+        )
+        .unwrap();
+        let v1_last = CausalAttentionReplayEnvelope::new(
+            shape,
+            CausalAttentionKernelPath::VllmAddressedDecodeV1,
+            512,
+        )
+        .unwrap();
+        assert_eq!(v1_first, v1_last);
+        assert_eq!(v1_first.sequence_capacity_tokens, 512);
+        assert_eq!(v1_first.table_capacity_entries, 32);
+        assert!(CausalAttentionReplayEnvelope::new(
+            shape,
+            CausalAttentionKernelPath::VllmAddressedDecodeV1,
+            513,
+        )
+        .is_err());
+
+        let v2_first = CausalAttentionReplayEnvelope::new(
+            shape,
+            CausalAttentionKernelPath::VllmAddressedDecodeV2,
+            513,
+        )
+        .unwrap();
+        let v2_last = CausalAttentionReplayEnvelope::new(
+            shape,
+            CausalAttentionKernelPath::VllmAddressedDecodeV2,
+            1_024,
+        )
+        .unwrap();
+        assert_eq!(v2_first, v2_last);
+        assert_eq!(v2_first.sequence_capacity_tokens, 1_024);
+        assert_eq!(v2_first.table_capacity_entries, 64);
+        assert_ne!(
+            v2_last,
+            CausalAttentionReplayEnvelope::new(
+                shape,
+                CausalAttentionKernelPath::VllmAddressedDecodeV2,
+                1_025,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
