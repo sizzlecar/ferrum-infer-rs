@@ -2,9 +2,9 @@
   "schema_version": 1,
   "lock_id": "runtime-vnext-g08b-m2-cuda-v1",
   "provenance": {
-    "source_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+    "source_git_sha": "a0952953f14b27c16fac02abab7768a4a9c9d1c6",
     "source_models_lock_sha256": "41b162618ed277d9a0278a3ede646cdd58e812bd345d3240407f8fe82a4295d3",
-    "source_catalog_sha256": "4c923c6177d8fd638684e63e1a3638e8fd1f50a82743f9afbf64a34aff4b1d5b",
+    "source_catalog_sha256": "73018b13c4fb70c3897ef86865ef99b32eedf2baa18c042c4e018c782535becf",
     "extraction": "exact M2-CUDA lane projection; path and sha256 fields preserved"
   },
   "models": [
@@ -101,6 +101,10 @@
               {
                 "path": "README.md",
                 "sha256": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492"
+              },
+              {
+                "path": "chat_template.jinja",
+                "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
               },
               {
                 "path": "config.json",
