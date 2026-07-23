@@ -5,13 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceRuntime, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
-    OperationContract, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProfilePhase, ProviderId, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedValueBinding, ResolvedValueRole,
-    SemanticValue, VNextError, WeightFormatId, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
-    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, OperationContract, OperationFailure, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderWorkspaceRequirement,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
+    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 
 use super::super::super::marlin::{launch_marlin_moe_vllm_raw, MarlinMoeRawLaunchArgs};
@@ -377,6 +377,8 @@ fn encode_moe(
         .u64(layout.total_bytes)
         .u64(MOE_BLOCK_SIZE)
         .finish();
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "CUDA MoE participant count exceeds u32".to_owned())?;
 
     CudaDeviceCommand::replayable_operation_with_blas(
         COMMAND_NAME,
@@ -542,6 +544,9 @@ fn encode_moe(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 12, 2)
+    })
     .map_err(|error| error.to_string())
 }
 

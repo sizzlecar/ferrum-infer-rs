@@ -8,10 +8,10 @@ use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
-    OperationBufferStorageKind, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
+    EncodedDeviceOperation, OperationBufferStorageKind, OperationContract, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
@@ -673,6 +673,8 @@ fn encode_attention(
         });
     }
 
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "CUDA causal attention participant count exceeds u32".to_owned())?;
     let binding_command = CudaDeviceCommand::operation_with_host_storage_and_blas(
         "vnext_causal_paged_attention_bindings",
         binding_regions,
@@ -681,6 +683,15 @@ fn encode_attention(
             enqueue_bindings(stream, binding_layout, &bindings, regions, host_storage)
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            total_tokens,
+            0,
+            u64::from(participant_count),
+        )
+    })
     .map_err(|error| error.to_string())?;
 
     let mut replay_key = CudaCommandReplayKeyBuilder::new(
@@ -735,6 +746,15 @@ fn encode_attention(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            total_tokens,
+            u64::from(participant_count) * 8,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())?;
 
     Ok(EncodedDeviceOperation::compute(compute_command).with_dynamic_binding(binding_command))

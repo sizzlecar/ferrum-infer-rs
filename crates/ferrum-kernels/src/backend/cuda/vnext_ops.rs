@@ -9,14 +9,14 @@ use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
     gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
     residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
-    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
-    DynamicStorageView, ElementType, EncodedDeviceOperation, EngineProviderDescriptor,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, OperationRuntimeRegistry, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion,
+    DeviceBatchingForm, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
+    EngineProviderDescriptor, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
+    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
@@ -479,6 +479,10 @@ fn encode_last_token_dense_linear(
         });
     }
 
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "last-token dense-linear participant count exceeds u32".to_owned())?;
+    let token_count = u64::from(participant_count);
+    let compute_dispatch_count = launches.len() as u64;
     let rows = 1_i32;
     let hidden_size = i32::try_from(hidden_size)
         .map_err(|_| "last-token dense-linear hidden size exceeds i32".to_owned())?;
@@ -516,6 +520,15 @@ fn encode_last_token_dense_linear(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -620,6 +633,13 @@ fn encode_token_embedding(
         });
     }
 
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "embedding participant count exceeds u32".to_owned())?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let compute_dispatch_count = launches
+        .iter()
+        .map(|launch| launch.token_count.div_ceil(MAXIMUM_TOKENS_PER_LAUNCH))
+        .sum();
     let mut replay_key =
         CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_token_embedding")
             .u64(launches.len() as u64);
@@ -688,6 +708,15 @@ fn encode_token_embedding(
             Ok(())
         },
     )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            0,
+        )
+    })
     .map_err(|error| error.to_string())
 }
 
