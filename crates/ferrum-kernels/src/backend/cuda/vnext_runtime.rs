@@ -1589,7 +1589,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if S::ENABLED {
             timing_sink.record_reusable_execution(replay_observation);
         }
-        let attribution = command_node_indices
+        let attribution = match command_node_indices
             .as_ref()
             .zip(execution_paths.as_ref())
             .map(|(command_node_indices, execution_paths)| {
@@ -1599,8 +1599,17 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     &commands,
                     execution_paths,
                 )
-                .expect("pre-submit CUDA attribution validation must remain stable")
-            });
+            }) {
+            None => None,
+            Some(Ok(attribution)) => Some(attribution),
+            Some(Err(error)) => {
+                stream.state.fail();
+                self.quarantine(stream, commands);
+                panic!(
+                    "CUDA submission became indeterminate while binding native attribution: {error}"
+                );
+            }
+        };
         let command_timing = match timing_mode {
             DeviceTimingMode::Off | DeviceTimingMode::Completion => {
                 CudaFenceCommandTiming::NotRequested
