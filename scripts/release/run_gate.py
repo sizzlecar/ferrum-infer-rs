@@ -55,6 +55,7 @@ LANES = (
     "vnext-s1-cuda-decode-capacity",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
+    "vnext-g08-performance-smoke",
     "unit",
     "metal",
     "cuda-smoke",
@@ -989,6 +990,27 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-g08b-metal",
+        )
+    if lane == "vnext-g08-performance-smoke":
+        if args.g08_performance_artifact_root is None:
+            raise GateError(
+                "vnext-g08-performance-smoke requires "
+                "--g08-performance-artifact-root"
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g08_performance_smoke.py",
+                "--artifact-root",
+                str(args.g08_performance_artifact_root.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08 PERFORMANCE SMOKE PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g08-performance-smoke",
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
@@ -6854,6 +6876,43 @@ def self_test() -> int:
             ],
             g08b_metal_manifest,
         )
+        g08_performance_root = root / "g08-performance-artifact-root"
+        g08_performance_out = root / "g08-performance-dry-run"
+        g08_performance_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g08-performance-smoke",
+                "--g08-performance-artifact-root",
+                str(g08_performance_root),
+                "--out",
+                str(g08_performance_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g08_performance_dry.returncode == 0,
+            g08_performance_dry.stderr or g08_performance_dry.stdout,
+        )
+        g08_performance_manifest = json.loads(
+            (g08_performance_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g08_performance_manifest["lane"] == "vnext-g08-performance-smoke",
+            g08_performance_manifest,
+        )
+        require_selftest(
+            g08_performance_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g08_performance_smoke.py",
+                "--artifact-root",
+                str(g08_performance_root.resolve()),
+                "--out",
+                str(g08_performance_out.resolve()),
+            ],
+            g08_performance_manifest,
+        )
         unit_root = root / "unit-bounded-provenance"
         bounded_root = unit_root / "unit-bounded"
         bounded_root.mkdir(parents=True)
@@ -7755,6 +7814,7 @@ def main() -> int:
     parser.add_argument("--s1-artifact", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
+    parser.add_argument("--g08-performance-artifact-root", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

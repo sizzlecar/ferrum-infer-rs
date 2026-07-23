@@ -79,6 +79,9 @@ RUNTIME_VNEXT_G08B_METAL_MATRIX_CHECKPOINT = (
 RUNTIME_VNEXT_G08B_METAL_MATRIX_PREPARE = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08b_metal_matrix_prepare.py"
 )
+RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08_performance_smoke.py"
+)
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 OPENAI_TOOL_CALL_REGRESSION = REPO_ROOT / "scripts/release/openai_tool_call_regression.py"
@@ -678,6 +681,21 @@ def test_runtime_vnext_g08b_metal_matrix_prepare_selftest() -> None:
     )
 
 
+def test_runtime_vnext_g08_performance_smoke_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08 PERFORMANCE SMOKE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_bounded_command_selftest() -> None:
     ok = run([sys.executable, str(BOUNDED_COMMAND), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -971,6 +989,7 @@ def main() -> int:
     test_runtime_vnext_g08b_cuda_matrix_prepare_selftest()
     test_runtime_vnext_g08b_metal_matrix_checkpoint_selftest()
     test_runtime_vnext_g08b_metal_matrix_prepare_selftest()
+    test_runtime_vnext_g08_performance_smoke_selftest()
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
