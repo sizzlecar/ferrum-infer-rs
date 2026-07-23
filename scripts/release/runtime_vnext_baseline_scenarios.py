@@ -69,6 +69,8 @@ C20_REMOTE_MEDIA_URL = (
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G00 SCENARIOS PASS"
 CANDIDATE_PASS_PREFIX = "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS"
+C09_DIAGNOSTIC_KEEP_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC KEEP"
+C09_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC REJECT"
 SCHEMA_VERSION = 1
 LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
@@ -124,6 +126,7 @@ C09_TERMINAL_OUTCOMES = frozenset(
 C09_ADMISSION_TIMEOUT_SEC = 5.0
 C09_NOT_ADMITTED_OBSERVATION_SEC = 0.25
 C09_TRACE_TIMEOUT_SEC = 5.0
+C09_DIAGNOSTIC_VARIANTS = ("cancel", "timeout", "disconnect")
 C17_MARKERS = {
     "chinese": "中文正确",
     "emoji": "🙂🚀",
@@ -3372,6 +3375,27 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
                 }
             )
     return rows
+
+
+def select_c09_diagnostic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for variant in C09_DIAGNOSTIC_VARIANTS:
+        matches = [
+            row
+            for row in rows
+            if row["scenario_id"] == "C09" and row["variant"] == variant
+        ]
+        require(len(matches) == 20, f"C09 {variant} partition must contain exactly 20 cases")
+        selected.append(matches[0])
+    require(
+        [row["case_id"] for row in selected] == ["c09-001", "c09-021", "c09-041"],
+        "C09 diagnostic sentinel case ids drifted",
+    )
+    require(
+        all(row["entrypoint"] == "serve" for row in selected),
+        "C09 diagnostic must use the serve product entrypoint",
+    )
+    return selected
 
 
 def preset_values(model_key: str, preset: str | None) -> dict[str, Any]:
@@ -6691,10 +6715,12 @@ def execute_manifest(
     *,
     discover: bool,
     discovery_scenario: str | None = None,
+    diagnose_c09: bool = False,
     allow_internal_fixture: bool = False,
 ) -> dict[str, Any]:
     require(discovery_scenario is None or discover, "scenario-scoped execution is allowed only in discovery mode")
     require(discovery_scenario in {None, "C03"}, "only the versioned C03 contract supports scoped discovery")
+    require(not (diagnose_c09 and discover), "C09 diagnostic and discovery modes are mutually exclusive")
     root = root.resolve()
     out = out.resolve()
     validated = validate_execution_manifest(
@@ -6736,6 +6762,8 @@ def execute_manifest(
     if discovery_scenario is not None:
         rows = [row for row in rows if row["scenario_id"] == discovery_scenario]
         require(len(rows) == 10, "scoped C03 discovery must execute the complete 10-case contract")
+    elif diagnose_c09:
+        rows = select_c09_diagnostic_rows(rows)
     unresolved = [row for row in rows if row["expectation"]["expected_status"] == "discovery-required"]
     if unresolved and not discover:
         raise ScenarioError(f"canonical collection refused: {len(unresolved)} cases remain discovery-required; run --discover first")
@@ -6768,6 +6796,7 @@ def execute_manifest(
             str(out),
             *(["--discover"] if discover else []),
             *(["--discover-scenario", discovery_scenario] if discovery_scenario is not None else []),
+            *(["--diagnose-c09"] if diagnose_c09 else []),
         ]
         if allow_internal_fixture
         else [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
@@ -6777,6 +6806,7 @@ def execute_manifest(
         require("--manifest" in invocation_argv and "--artifact-root" in invocation_argv and "--out" in invocation_argv, "canonical executor invocation argv incomplete")
         require(("--discover" in invocation_argv) is discover, "canonical executor mode differs from actual invocation argv")
         require(("--discover-scenario" in invocation_argv) is (discovery_scenario is not None), "canonical executor discovery scope differs from actual invocation argv")
+        require(("--diagnose-c09" in invocation_argv) is diagnose_c09, "canonical executor C09 diagnostic scope differs from actual invocation argv")
     invocation_process_receipt = capture_process_receipt(
         root,
         executor_root / "scenario-executor-process-receipt.json",
@@ -6797,7 +6827,13 @@ def execute_manifest(
         "pid": os.getpid(),
         "pgid": os.getpgid(0),
         "process_receipt": invocation_process_receipt,
-        "mode": "discover" if discover else "canonical",
+        "mode": (
+            "c09-diagnostic"
+            if diagnose_c09
+            else "discover"
+            if discover
+            else "canonical"
+        ),
     }
     execution = validated["execution"]
     binary_path = validated["binary_path"]
@@ -6936,7 +6972,7 @@ def execute_manifest(
             }
             for row in rows
         ]
-        if contract == G08_EXECUTION_CONTRACT:
+        if contract == G08_EXECUTION_CONTRACT and not diagnose_c09:
             grouped_run_rows: dict[tuple[str, ...], list[dict[str, Any]]] = {}
             serve_rows: list[dict[str, Any]] = []
             for row in bound_rows:
@@ -7257,6 +7293,106 @@ def execute_manifest(
     invocation["duration_sec"] = (invocation["finished_monotonic_ns"] - invocation_start_ns) / 1e9
     invocation_path = executor_root / "scenario-executor-invocation.json"
     write_json(invocation_path, invocation)
+    if diagnose_c09:
+        cases = case_results["C09"]
+        require(len(cases) == len(C09_DIAGNOSTIC_VARIANTS), "C09 diagnostic did not execute exactly three cases")
+        require(
+            [case["variant"] for case in cases] == list(C09_DIAGNOSTIC_VARIANTS),
+            "C09 diagnostic variant order drifted",
+        )
+        require(all(case["status"] == "pass" for case in cases), "C09 diagnostic contains a non-passing case")
+        require(len(serve_sessions) == 1, "C09 diagnostic must use exactly one serve session")
+        serve_session = serve_sessions[0]
+        serve_process = serve_session["server"]
+        observed_rows = [require_object(case.get("observed"), f"{case['case_id']}.observed") for case in cases]
+        diagnostic = {
+            **{
+                key: manifest[key]
+                for key in (
+                    "source_git_sha",
+                    "source_tree_sha",
+                    "dirty_status",
+                    "models_lock_sha256",
+                    "binary_sha256",
+                    "model_key",
+                    "backend",
+                    "model_revision",
+                    "model_files",
+                    "hardware_id",
+                    "binary_artifact",
+                    "models_lock",
+                    "effective_config",
+                )
+            },
+            "schema_version": SCHEMA_VERSION,
+            "artifact_kind": "runtime-vnext-c09-three-variant-diagnostic",
+            "execution_contract": contract,
+            "status": "pass",
+            "decision": "KEEP",
+            "formal_pass_allowed": False,
+            "model_path": execution["model_arg"],
+            "runner": internal_fixture_runner_identity() if allow_internal_fixture else canonical_runner_identity(),
+            "executor_invocation": existing_artifact_ref(root, invocation_path, "raw-json"),
+            "scope": {
+                "scenario_id": "C09",
+                "variants": list(C09_DIAGNOSTIC_VARIANTS),
+                "case_ids": [case["case_id"] for case in cases],
+                "case_count": len(cases),
+                "canonical_case_count": minimum_case_count("C09", manifest["model_key"]),
+            },
+            "metrics": {
+                "admitted_released_count": sum(
+                    observed["cancel_resource_outcome"] == C09_ADMITTED_RELEASED
+                    for observed in observed_rows
+                ),
+                "post_capacity_success_count": sum(
+                    observed["post_capacity_success"] is True for observed in observed_rows
+                ),
+                "max_scheduler_ticks_to_terminal": max(
+                    require_count(observed["scheduler_ticks_to_terminal"], "C09 diagnostic scheduler ticks")
+                    for observed in observed_rows
+                ),
+                "max_wall_sec_to_terminal": max(float(observed["wall_sec_to_terminal"]) for observed in observed_rows),
+                "leaked_resource_count": sum(
+                    require_count(
+                        require_object(observed[balance], f"C09 diagnostic {balance}")["leaked_resource_count"],
+                        f"C09 diagnostic {balance}.leaked_resource_count",
+                    )
+                    for observed in observed_rows
+                    for balance in ("cancel_resource_balance", "recovery_resource_balance")
+                ),
+                "underflow_count": sum(
+                    require_count(
+                        require_object(observed[balance], f"C09 diagnostic {balance}")["underflow_count"],
+                        f"C09 diagnostic {balance}.underflow_count",
+                    )
+                    for observed in observed_rows
+                    for balance in ("cancel_resource_balance", "recovery_resource_balance")
+                ),
+            },
+            "serve": {
+                "command_id": serve_session["command_id"],
+                "envelope": serve_process.envelope(),
+                "process_receipt": serve_process.process_receipt,
+                "stdout": existing_artifact_ref(root, serve_session["stdout"], "stdout-log"),
+                "stderr": existing_artifact_ref(root, serve_session["stderr"], "stderr-log"),
+                "scheduler_trace": existing_artifact_ref(root, serve_session["scheduler_trace"], "runtime-log"),
+                "actual_effective_config": existing_artifact_ref(root, serve_session["config"], "raw-json"),
+            },
+            "cases": case_refs_by_scenario["C09"],
+            "artifact_path": str(out),
+            "pass_line": f"{C09_DIAGNOSTIC_KEEP_PREFIX}: {out}",
+        }
+        if contract == G08_EXECUTION_CONTRACT:
+            diagnostic["binary_build_receipt"] = manifest["binary_build_receipt"]
+        metrics = diagnostic["metrics"]
+        require(metrics["admitted_released_count"] == 3, "C09 diagnostic admission release coverage is incomplete")
+        require(metrics["post_capacity_success_count"] == 3, "C09 diagnostic capacity recovery coverage is incomplete")
+        require(metrics["leaked_resource_count"] == 0, "C09 diagnostic contains leaked resources")
+        require(metrics["underflow_count"] == 0, "C09 diagnostic contains resource underflow")
+        require(diagnostic["metrics"]["max_scheduler_ticks_to_terminal"] <= 2, "C09 diagnostic release exceeded two scheduler ticks")
+        require(diagnostic["metrics"]["max_wall_sec_to_terminal"] <= 5, "C09 diagnostic release exceeded five seconds")
+        return diagnostic
     if discover:
         discovery = {
             "schema_version": SCHEMA_VERSION,
@@ -10154,6 +10290,16 @@ def self_test() -> int:
             and {row["expectation"]["expected_status"] for row in candidate_rows} == {"pass"},
             "G08 candidate catalog does not require all 703 M2 CUDA cases to pass",
         )
+        diagnostic_rows = select_c09_diagnostic_rows(candidate_rows)
+        require(
+            [(row["case_id"], row["variant"]) for row in diagnostic_rows]
+            == [
+                ("c09-001", "cancel"),
+                ("c09-021", "timeout"),
+                ("c09-041", "disconnect"),
+            ],
+            "C09 diagnostic selector drifted",
+        )
         hostile_candidate_catalog = copy.deepcopy(candidate_catalog)
         hostile_candidate_catalog["lanes"]["m2-qwen35-35b-a3b/cuda"]["rules"][0].update(
             {
@@ -11106,14 +11252,15 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--discover-scenario", choices=("C03",))
+    parser.add_argument("--diagnose-c09", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if args.discover_scenario is not None and not args.discover:
         parser.error("--discover-scenario requires --discover")
-    if args.execute and args.discover:
-        parser.error("--execute and --discover are mutually exclusive")
+    if sum((args.execute, args.discover, args.diagnose_c09)) > 1:
+        parser.error("--execute, --discover, and --diagnose-c09 are mutually exclusive")
     if args.manifest is None or args.artifact_root is None or args.out is None:
         parser.error("--manifest, --artifact-root, and --out are required")
     root = args.artifact_root.resolve()
@@ -11128,8 +11275,9 @@ def main() -> int:
                 out,
                 discover=args.discover,
                 discovery_scenario=args.discover_scenario,
+                diagnose_c09=args.diagnose_c09,
             )
-            if args.execute or args.discover
+            if args.execute or args.discover or args.diagnose_c09
             else collect_manifest(manifest, root, out)
         )
         write_json(out, report)
@@ -11140,11 +11288,31 @@ def main() -> int:
             if isinstance(manifest_value, dict)
             else LEGACY_EXECUTION_CONTRACT
         )
-        fail_prefix = (
+        fail_prefix = C09_DIAGNOSTIC_REJECT_PREFIX if args.diagnose_c09 else (
             "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS FAIL"
             if contract == G08_EXECUTION_CONTRACT
             else "FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL"
         )
+        if args.diagnose_c09 and args.out is not None:
+            reject_out = args.out.resolve()
+            try:
+                reject_out.relative_to(root)
+            except ValueError:
+                pass
+            else:
+                write_json(
+                    reject_out,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "artifact_kind": "runtime-vnext-c09-three-variant-diagnostic",
+                        "status": "fail",
+                        "decision": "REJECT",
+                        "formal_pass_allowed": False,
+                        "error": str(exc),
+                        "artifact_path": str(reject_out),
+                        "pass_line": None,
+                    },
+                )
         print(f"{fail_prefix}: {args.out}: {exc}", file=sys.stderr)
         return 1
     if args.discover:
