@@ -351,6 +351,26 @@ impl CudaDeviceCommand {
         )
     }
 
+    /// Encodes eager work while retaining additional submission-scoped
+    /// allocations through the completion fence. Fence dependencies are not
+    /// executable inputs and never make the command replayable.
+    pub(crate) fn operation_with_blas_and_fence_dependencies(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        fence_dependencies: Vec<CudaBufferRegion>,
+        enqueue: impl Fn(&CudaStream, &CudaBlas, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_inner(
+            operation,
+            regions,
+            fence_dependencies,
+            None,
+            move |stream, blas, regions, _host_storage| enqueue(stream, blas, regions),
+        )
+    }
+
     pub(crate) fn replayable_operation_with_blas(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,

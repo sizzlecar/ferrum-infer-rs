@@ -17,6 +17,8 @@ fn causal_pages_are_fence_dependencies_not_captured_regions() {
     assert!(
         CAUSAL_ATTENTION_SOURCE.contains("replayable_operation_with_blas_and_fence_dependencies")
     );
+    assert!(CAUSAL_ATTENTION_SOURCE
+        .contains("None => CudaDeviceCommand::operation_with_blas_and_fence_dependencies"));
 }
 
 #[test]
@@ -29,9 +31,11 @@ fn executable_cache_has_no_fence_dependency_owner() {
 
 #[test]
 fn causal_replay_identity_uses_a_partition_capacity_envelope() {
-    assert!(
-        CAUSAL_ATTENTION_SOURCE.contains(".u64(launch.replay_envelope.sequence_capacity_tokens)")
-    );
-    assert!(CAUSAL_ATTENTION_SOURCE.contains(".i32(launch.replay_envelope.table_capacity_entries)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("CausalAttentionReplayTopology"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStableDecode"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("ExactShapeEager"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("is_partition_stable"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(".u64(replay_envelope.sequence_capacity_tokens)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(".i32(replay_envelope.table_capacity_entries)"));
     assert!(!CAUSAL_ATTENTION_SOURCE.contains(".u64(launch.sequence_tokens)"));
 }
