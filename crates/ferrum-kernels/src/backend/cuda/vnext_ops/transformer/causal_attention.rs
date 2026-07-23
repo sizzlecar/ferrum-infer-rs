@@ -1493,11 +1493,13 @@ fn launch_addressed_varlen_attention(
         launch.tokens
     };
     let mut builder = stream.launch_builder(function);
-    for pointer in [query, control, page_table, output] {
-        builder.arg(&pointer);
+    let pointers = [query, control, page_table, output];
+    for pointer in &pointers {
+        builder.arg(pointer);
     }
-    for dimension in [shape.query_heads, shape.key_value_heads, shape.head_dim] {
-        builder.arg(&dimension);
+    let dimensions = [shape.query_heads, shape.key_value_heads, shape.head_dim];
+    for dimension in &dimensions {
+        builder.arg(dimension);
     }
     if tiled {
         builder.arg(&launch.sequence_tokens_i32);
@@ -1539,16 +1541,18 @@ fn launch_attention_gate(
         "attention gate grid",
     )?;
     let mut builder = stream.launch_builder(function);
-    for pointer in [context, query_raw] {
-        builder.arg(&pointer);
+    let pointers = [context, query_raw];
+    for pointer in &pointers {
+        builder.arg(pointer);
     }
-    for dimension in [
+    let dimensions = [
         launch.tokens_i32,
         shape.query_features,
         shape.query_projection_features,
         shape.head_dim,
-    ] {
-        builder.arg(&dimension);
+    ];
+    for dimension in &dimensions {
+        builder.arg(dimension);
     }
     unsafe {
         builder.launch(LaunchConfig {
