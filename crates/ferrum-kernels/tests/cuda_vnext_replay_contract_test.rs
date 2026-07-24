@@ -68,6 +68,30 @@ fn typed_program_binding_patches_form_one_layout_owned_upload() {
 }
 
 #[test]
+fn direct_attention_bindings_do_not_rebuild_compute_commands() {
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
+
+    for source in [RECURRENT_ATTENTION_SOURCE, CAUSAL_ATTENTION_SOURCE] {
+        let binding_only = source
+            .split("fn encode_reusable_attention_bindings(")
+            .nth(1)
+            .expect("CUDA attention provider must define a binding-only encoder")
+            .split("\nfn ")
+            .next()
+            .expect("binding-only encoder must have a bounded body");
+        assert!(binding_only.contains(
+            "EncodedReusableExecutionBindings::empty().with_program_binding(binding_command)"
+        ));
+        assert!(!binding_only.contains("CudaCommandReplayKeyBuilder"));
+        assert!(!binding_only.contains("replayable_operation"));
+        assert!(!binding_only.contains("encode_attention("));
+    }
+}
+
+#[test]
 fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("compute_fence_dependencies.push(conv_state"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("compute_fence_dependencies.push(delta_state"));

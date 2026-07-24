@@ -10,13 +10,13 @@ use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    EncodedDeviceOperation, OperationBufferStorageKind, OperationContract, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    SemanticValue, VNextError, WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-    CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    EncodedDeviceOperation, EncodedReusableExecutionBindings, OperationBufferStorageKind,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
+    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 
 use super::{ensure_estimator_request, estimate, launch_gemm_f16};
@@ -314,6 +314,23 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 identity,
                 ProfilePhase::Forward,
                 "cuda.causal_paged_attention.encode",
+                message.chars().take(2048).collect::<String>(),
+                false,
+            )
+            .expect("core-issued CUDA causal attention identity must be valid")
+        })
+    }
+
+    fn encode_reusable_execution_bindings(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_reusable_attention_bindings(invocation).map_err(|message| {
+            OperationFailure::new(
+                identity,
+                ProfilePhase::Forward,
+                "cuda.causal_paged_attention.encode_reusable_bindings",
                 message.chars().take(2048).collect::<String>(),
                 false,
             )
@@ -1202,6 +1219,105 @@ fn encode_attention(
     .map_err(|error| error.to_string())?;
 
     Ok(EncodedDeviceOperation::compute(compute_command).with_program_binding(binding_command))
+}
+
+fn encode_reusable_attention_bindings(
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, String> {
+    if invocation.participants().is_empty()
+        || invocation.operation().id.as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID
+    {
+        return Err("CUDA causal attention received another or empty operation".to_owned());
+    }
+    let program_binding = invocation.program_binding().cloned().ok_or_else(|| {
+        "CUDA causal direct execution requires a compiled program binding".to_owned()
+    })?;
+    let shape = CausalAttentionShape::from_attributes(invocation.participants()[0].attributes())?;
+    let total_tokens = invocation.work_shape().immediate_tokens();
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "CUDA causal attention participant count exceeds u32".to_owned())?;
+    let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
+    let token_ranges = invocation.participant_token_ranges();
+    if token_ranges.len() != invocation.participants().len() {
+        return Err("CUDA causal attention participant ranges are incomplete".to_owned());
+    }
+    let destination = super::shared_binding_region(&invocation, binding_layout.required_bytes)?;
+    let kv_layout = shape.kv_layout()?;
+    let maximum_pages = shape.maximum_pages()?;
+    let maximum_table_entries = shape.table_entries(shape.maximum_context_tokens)?;
+    let mut writes = Vec::with_capacity(invocation.participants().len());
+    let mut fence_dependencies = Vec::new();
+
+    // Static weights, scratch, kernel selection, and replay topology are
+    // sealed into the exact program identity. Only the current KV page table
+    // and sequence frontier belong on this hot path.
+    for (participant_index, (participant, token_range)) in invocation
+        .participants()
+        .iter()
+        .zip(token_ranges)
+        .enumerate()
+    {
+        let tokens = token_range.immediate_tokens();
+        let source = token_range.source_token_range();
+        if source.end > token_range.full_input_tokens()
+            || token_range.full_input_tokens() > shape.maximum_context_tokens
+        {
+            return Err("causal attention token range exceeds its admitted context".to_owned());
+        }
+        let state = binding(participant.bindings(), ResolvedValueRole::Input, 8)?;
+        let pages = paged_state_regions(
+            participant,
+            state,
+            shape.physical_state_bytes_for_source_frontier(
+                source.end,
+                token_range.full_input_tokens(),
+            )?,
+        )?;
+        let page_count = u64::try_from(pages.len())
+            .map_err(|_| "causal attention page count exceeds u64".to_owned())?;
+        if page_count > maximum_pages {
+            return Err("causal attention page table exceeds its admitted maximum".to_owned());
+        }
+        let table_entries = shape.table_entries(source.end)?;
+        if table_entries > maximum_table_entries {
+            return Err("causal attention address table exceeds its admitted maximum".to_owned());
+        }
+        let payload = binding_payload(
+            kv_layout,
+            checked_i32(table_entries, "causal attention address-table entry count")?,
+            checked_i32(source.start, "causal attention source position")?,
+            checked_i32(tokens, "causal attention participant token count")?,
+            checked_i32(source.end, "causal attention sequence token count")?,
+            &pages,
+        )?;
+        writes.push(
+            super::CudaProgramBindingWrite::new(
+                binding_layout.binding_offset(participant_index)?,
+                payload,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        fence_dependencies.extend(pages);
+    }
+
+    let binding_command = CudaDeviceCommand::program_binding_patch(
+        "vnext_causal_paged_attention_bindings",
+        program_binding,
+        destination,
+        writes,
+        fence_dependencies,
+    )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            total_tokens,
+            0,
+            u64::from(participant_count),
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(EncodedReusableExecutionBindings::empty().with_program_binding(binding_command))
 }
 
 fn enqueue_bindings(
