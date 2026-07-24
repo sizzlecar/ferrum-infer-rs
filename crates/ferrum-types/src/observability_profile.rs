@@ -69,6 +69,7 @@ pub enum ObservabilityProfileDetail {
     Off,
     Basic,
     Debug,
+    Replay,
     Full,
 }
 
@@ -78,6 +79,7 @@ impl ObservabilityProfileDetail {
             "off" => Some(Self::Off),
             "basic" => Some(Self::Basic),
             "debug" => Some(Self::Debug),
+            "replay" => Some(Self::Replay),
             "full" => Some(Self::Full),
             _ => None,
         }
@@ -88,12 +90,13 @@ impl ObservabilityProfileDetail {
             Self::Off => "off",
             Self::Basic => "basic",
             Self::Debug => "debug",
+            Self::Replay => "replay",
             Self::Full => "full",
         }
     }
 
     pub fn diagnostic_only(self) -> bool {
-        matches!(self, Self::Debug | Self::Full)
+        matches!(self, Self::Debug | Self::Replay | Self::Full)
     }
 }
 
@@ -397,6 +400,17 @@ mod tests {
         let mut missing_shape = base_event();
         missing_shape.shape.clear();
         assert!(missing_shape.validate().is_err());
+    }
+
+    #[test]
+    fn replay_profile_detail_is_typed_and_diagnostic_only() {
+        assert_eq!(
+            ObservabilityProfileDetail::parse(" replay "),
+            Some(ObservabilityProfileDetail::Replay)
+        );
+        assert_eq!(ObservabilityProfileDetail::Replay.as_str(), "replay");
+        assert!(ObservabilityProfileDetail::Replay.diagnostic_only());
+        assert!(!ObservabilityProfileDetail::Basic.diagnostic_only());
     }
 
     #[test]

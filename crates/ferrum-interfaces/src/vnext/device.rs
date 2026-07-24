@@ -654,21 +654,29 @@ pub enum StreamState {
 /// Backend timing is enabled monotonically before product requests start.
 /// `Off` must not allocate backend events or add host clock reads to the hot
 /// path; `Completion` measures only the existing submission terminal and
-/// readback boundaries; `Kernel` additionally attributes backend-observed
-/// physical work to the core-issued immutable-plan node index.
+/// readback boundaries; `Replay` preserves normal reusable-versus-eager path
+/// selection while measuring physical executable/eager spans; `Kernel`
+/// additionally attributes backend-observed physical work to immutable-plan
+/// node indices. Replay timing is diagnostic instrumentation and may add
+/// backend measurement events or encoder boundaries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceTimingMode {
     #[default]
-    Off,
-    Completion,
-    Kernel,
+    Off = 0,
+    Completion = 1,
+    Replay = 2,
+    Kernel = 3,
 }
 
 impl DeviceTimingMode {
     pub const fn completion_enabled(self) -> bool {
         !matches!(self, Self::Off)
+    }
+
+    pub const fn physical_span_attribution_enabled(self) -> bool {
+        matches!(self, Self::Replay | Self::Kernel)
     }
 
     pub const fn kernel_attribution_enabled(self) -> bool {
@@ -2719,6 +2727,17 @@ pub fn classify_device_error<R: DeviceRuntime + ?Sized>(
 #[cfg(test)]
 mod execution_timing_tests {
     use super::*;
+
+    #[test]
+    fn replay_timing_preserves_physical_spans_without_kernel_attribution() {
+        assert!(DeviceTimingMode::Replay.completion_enabled());
+        assert!(DeviceTimingMode::Replay.physical_span_attribution_enabled());
+        assert!(!DeviceTimingMode::Replay.kernel_attribution_enabled());
+        assert!(DeviceTimingMode::Kernel.physical_span_attribution_enabled());
+        assert!(DeviceTimingMode::Kernel.kernel_attribution_enabled());
+        assert!(!DeviceTimingMode::Completion.physical_span_attribution_enabled());
+        assert!(!DeviceTimingMode::Off.completion_enabled());
+    }
 
     #[test]
     fn command_timing_requires_positive_ordered_nonoverlapping_intervals() {

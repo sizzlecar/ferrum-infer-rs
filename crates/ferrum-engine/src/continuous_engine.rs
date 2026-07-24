@@ -33,7 +33,7 @@ use ferrum_interfaces::{
         DeviceSubmissionExecutionTiming, DeviceTimingMeasurement, DeviceTimingUnavailableReason,
         EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy,
         ExecutionEventDetail, ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink,
-        ExecutionEventSinkError,
+        ExecutionEventSinkError, OperationCompletionReceipt,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
@@ -3878,8 +3878,10 @@ impl VNextProfileExecutionEventSink {
                 backend_device: format!("{:?}", config.backend.device),
                 backend_type: format!("{:?}", config.backend.backend_type),
                 profile_detail: config.runtime.profile_detail,
-                capture_policy: if config.runtime.profile_detail == ObservabilityProfileDetail::Full
-                {
+                capture_policy: if matches!(
+                    config.runtime.profile_detail,
+                    ObservabilityProfileDetail::Replay | ObservabilityProfileDetail::Full
+                ) {
                     ExecutionEventCapturePolicy::AllFrames
                 } else {
                     ExecutionEventCapturePolicy::FirstFramePerRequest
@@ -4067,6 +4069,201 @@ impl VNextProfileEventContext {
             ExecutionEventSinkError::new(format!("invalid vNext profile event: {error}"))
         })?;
         Ok(profile)
+    }
+
+    fn physical_device_submission_timing_event(
+        &self,
+        completion: &OperationCompletionReceipt,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<Option<FerrumProfileEvent>, ExecutionEventSinkError> {
+        let submission = completion.submission();
+        let batch = submission.batch_identity();
+        let first = batch
+            .nodes()
+            .first()
+            .and_then(|node| node.participants().first())
+            .ok_or_else(|| {
+                ExecutionEventSinkError::new(
+                    "physical device submission timing has no batch participant",
+                )
+            })?;
+        let first_identity = first.identity().parts();
+        let mut participant_request_ids = batch
+            .nodes()
+            .iter()
+            .flat_map(|node| node.participants())
+            .map(|participant| participant.identity().parts().request_id.to_string())
+            .collect::<Vec<_>>();
+        participant_request_ids.sort();
+        participant_request_ids.dedup();
+
+        let (command_count, spans, timing_status, unavailable_reason) =
+            match completion.submission_timing() {
+                DeviceTimingMeasurement::NotRequested => return Ok(None),
+                DeviceTimingMeasurement::Unavailable(reason) => (
+                    0_u32,
+                    None,
+                    "unavailable",
+                    Some(format!("{reason:?}").to_ascii_lowercase()),
+                ),
+                DeviceTimingMeasurement::Measured(timing) => (
+                    timing.command_count(),
+                    Some(timing.spans()),
+                    "measured",
+                    None,
+                ),
+            };
+        let eager_span_count = spans.map_or(0, |spans| {
+            spans
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::EagerCommand)
+                .count()
+        });
+        let reusable_span_count = spans.map_or(0, |spans| {
+            spans
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::ReusableExecutable)
+                .count()
+        });
+        let shape = BTreeMap::from([
+            (
+                "command_count".to_string(),
+                serde_json::json!(command_count),
+            ),
+            (
+                "eager_span_count".to_string(),
+                serde_json::json!(eager_span_count),
+            ),
+            (
+                "participant_count".to_string(),
+                serde_json::json!(participant_request_ids.len()),
+            ),
+            (
+                "reusable_span_count".to_string(),
+                serde_json::json!(reusable_span_count),
+            ),
+            (
+                "span_count".to_string(),
+                serde_json::json!(spans.map_or(0, |spans| spans.len())),
+            ),
+        ]);
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    self.entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "attribution_scope".to_string(),
+                serde_json::json!("physical_submission"),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(self.backend_device),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(self.backend_type),
+            ),
+            (
+                "device_id".to_string(),
+                serde_json::json!(batch.device_id().to_string()),
+            ),
+            ("diagnostic_only".to_string(), serde_json::json!(true)),
+            (
+                "device_timing_semantics".to_string(),
+                serde_json::json!("submission_relative_duration_only"),
+            ),
+            (
+                "device_timing_status".to_string(),
+                serde_json::json!(timing_status),
+            ),
+            (
+                "formal_device_busy_time_eligible".to_string(),
+                serde_json::json!(false),
+            ),
+            (
+                "participant_request_ids".to_string(),
+                serde_json::json!(participant_request_ids),
+            ),
+            (
+                "physical_submission_fingerprint".to_string(),
+                serde_json::json!(submission.fingerprint()),
+            ),
+            (
+                "plan_hash".to_string(),
+                serde_json::json!(batch.plan_hash().to_string()),
+            ),
+            (
+                "plan_id".to_string(),
+                serde_json::json!(batch.plan_id().to_string()),
+            ),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.profile_detail.as_str()),
+            ),
+            (
+                "runtime_implementation_fingerprint".to_string(),
+                serde_json::json!(batch.runtime_implementation_fingerprint()),
+            ),
+            (
+                "production_reusable_execution_selection_preserved".to_string(),
+                serde_json::json!(self.profile_detail == ObservabilityProfileDetail::Replay),
+            ),
+            (
+                "measurement_instrumentation_present".to_string(),
+                serde_json::json!(true),
+            ),
+        ]);
+        if let Some(reason) = unavailable_reason {
+            attributes.insert(
+                "device_timing_unavailable_reason".to_string(),
+                serde_json::json!(reason),
+            );
+        }
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+            event_id: format!("evt-vnext-physical-{}", submission.fingerprint()),
+            request_id: first_identity.request_id.to_string(),
+            correlation_id: Some(submission.fingerprint().to_owned()),
+            entrypoint: self.entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: "vnext.device_physical_submission".to_string(),
+            event_kind: ProfileEventKind::Instant,
+            timestamp,
+            status: ProfileStatus::DiagnosticOnly,
+            model: Some(self.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: None,
+            replay: None,
+            shape,
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+                ("physical_spans".to_string(), serde_json::json!(spans)),
+            ])),
+            attributes,
+        };
+        event.validate().map_err(|error| {
+            ExecutionEventSinkError::new(format!(
+                "invalid vNext physical submission timing event: {error}"
+            ))
+        })?;
+        Ok(Some(event))
     }
 
     fn device_submission_attribution_events(
@@ -4609,6 +4806,9 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
             ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Completion
             }
+            ObservabilityProfileDetail::Replay => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Replay
+            }
             ObservabilityProfileDetail::Full => ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
         }
     }
@@ -4630,6 +4830,23 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         self.journal.enqueue_batch(events).map_err(|error| {
             ExecutionEventSinkError::new(format!(
                 "enqueue vNext device attribution profile batch: {error}"
+            ))
+        })
+    }
+
+    fn record_physical_device_submission_timing(
+        &self,
+        completion: &OperationCompletionReceipt,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let Some(event) = self
+            .context
+            .physical_device_submission_timing_event(completion, chrono::Utc::now())?
+        else {
+            return Ok(());
+        };
+        self.journal.enqueue_batch(vec![event]).map_err(|error| {
+            ExecutionEventSinkError::new(format!(
+                "enqueue vNext physical submission timing event: {error}"
             ))
         })
     }
