@@ -198,6 +198,81 @@ fn immutable_plan_nodes_prepare_one_owned_submission_wave() {
 }
 
 #[test]
+fn compiled_wave_identity_defers_full_node_and_participant_materialization() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let topology =
+        OperationDispatch::compile_submission_wave_identity(&fixture.resolved, &lane).unwrap();
+    let batch_identity = OperationDispatch::bind_compiled_submission_wave_identity(
+        &topology,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    assert_eq!(topology.node_count(), fixture.plan.payload().nodes().len());
+    assert_eq!(batch_identity.node_count(), topology.node_count());
+    assert_eq!(
+        batch_identity.materialization_snapshot().logical_nodes(),
+        u32::try_from(topology.node_count()).unwrap()
+    );
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        0
+    );
+    assert!(!batch_identity
+        .materialization_snapshot()
+        .full_participant_projection());
+    assert_eq!(
+        batch_identity.node_id_at(0),
+        Some(fixture.plan.payload().nodes()[0].id())
+    );
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        0
+    );
+
+    let eager_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    assert_eq!(batch_identity.nodes().len(), topology.node_count());
+    assert_eq!(batch_identity.nodes(), eager_identity.nodes());
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        u32::try_from(topology.node_count()).unwrap()
+    );
+    assert_eq!(
+        batch_identity.participants().len(),
+        topology.node_count() * active_bindings.len()
+    );
+    assert_eq!(batch_identity.participants(), eager_identity.participants());
+    assert!(batch_identity
+        .materialization_snapshot()
+        .full_participant_projection());
+
+    drop(eager_identity);
+    drop(batch_identity);
+    drop(topology);
+    drop(lane);
+    drop(active_bindings);
+    drop(wave);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
     let (fixture, sequence, session, batch, first_step) = setup();
     let first_step_id = first_step.batch_step_id();
@@ -221,13 +296,24 @@ fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &retry);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(retry.execution_lane());
-    let batch_identity = OperationDispatch::bind_submission_wave_identity(
-        &fixture.resolved,
+    let topology =
+        OperationDispatch::compile_submission_wave_identity(&fixture.resolved, &lane).unwrap();
+    let batch_identity = OperationDispatch::bind_compiled_submission_wave_identity(
+        &topology,
         active_bindings.iter(),
         &wave,
         &lane,
     )
     .unwrap();
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        0
+    );
+    assert!(!batch_identity
+        .materialization_snapshot()
+        .full_participant_projection());
     let first_operation = batch_identity.nodes()[0].participants()[0]
         .identity()
         .parts();
@@ -236,6 +322,7 @@ fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
     assert_eq!(first_operation.node_invocation_id.unwrap().get(), 1);
 
     drop(batch_identity);
+    drop(topology);
     drop(lane);
     drop(active_bindings);
     drop(wave);
@@ -1051,13 +1138,24 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         .iter()
         .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
         .collect::<Vec<_>>();
-    let batch_identity = OperationDispatch::bind_submission_wave_identity(
-        &fixture.resolved,
+    let topology =
+        OperationDispatch::compile_submission_wave_identity(&fixture.resolved, &lane).unwrap();
+    let batch_identity = OperationDispatch::bind_compiled_submission_wave_identity(
+        &topology,
         active_bindings.iter(),
         &wave,
         &lane,
     )
     .unwrap();
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        0
+    );
+    assert!(!batch_identity
+        .materialization_snapshot()
+        .full_participant_projection());
     let program_id = wave
         .claimed_backing()
         .reusable_execution_program_id(
@@ -1088,6 +1186,7 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         &reaper,
     )
     .unwrap();
+    assert!(!handle.receipt().has_materialized_participant_receipts());
 
     {
         let trace = fixture.runtime_trace.lock().unwrap();
@@ -1120,8 +1219,12 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         handle.wait().unwrap(),
         CompletionObservation::Terminal(_)
     ));
+    assert!(!batch_identity
+        .materialization_snapshot()
+        .full_participant_projection());
 
     drop(handle);
+    drop(topology);
     drop(providers);
     drop(active_bindings);
     drop(reaper);

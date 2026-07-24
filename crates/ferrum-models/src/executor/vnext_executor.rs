@@ -515,6 +515,10 @@ struct VNextExecutorMetrics {
     direct_reusable_fallbacks: AtomicU64,
     reusable_catalog_misses: AtomicU64,
     reusable_catalog_epoch_misses: AtomicU64,
+    identity_waves: AtomicU64,
+    identity_logical_nodes: AtomicU64,
+    identity_nodes_materialized_before_submit: AtomicU64,
+    identity_full_participant_materializations_before_submit: AtomicU64,
     definitely_not_submitted_retries: AtomicU64,
     request_deferrals: AtomicU64,
     sequence_deferrals: AtomicU64,
@@ -1250,6 +1254,10 @@ impl VNextExecutorMetrics {
             &self.direct_reusable_fallbacks,
             &self.reusable_catalog_misses,
             &self.reusable_catalog_epoch_misses,
+            &self.identity_waves,
+            &self.identity_logical_nodes,
+            &self.identity_nodes_materialized_before_submit,
+            &self.identity_full_participant_materializations_before_submit,
             &self.definitely_not_submitted_retries,
             &self.request_deferrals,
             &self.sequence_deferrals,
@@ -2619,6 +2627,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     policy: ResolvedRuntimePolicy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
+    submission_wave_identity: CompiledSubmissionWaveIdentity,
     completion_worker: VNextCompletionWorker,
     reaper: Arc<CompletionReaper<R>>,
     io: VNextIoBinding,
@@ -2906,6 +2915,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let lane = ExecutionLane::create(Arc::clone(&runtime)).map_err(|error| {
             FerrumError::device(format!("vNext execution lane creation failed: {error:?}"))
         })?;
+        let submission_wave_identity =
+            OperationDispatch::compile_submission_wave_identity(&resolved_plan, &lane).map_err(
+                |error| {
+                    FerrumError::model(format!(
+                        "vNext submission-wave identity compilation failed: {error}"
+                    ))
+                },
+            )?;
         let completion_worker = VNextCompletionWorker::new().map_err(|error| {
             FerrumError::device(format!("vNext completion worker creation failed: {error}"))
         })?;
@@ -2947,6 +2964,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             policy: config.runtime_policy,
             plan_resources,
             lane,
+            submission_wave_identity,
             completion_worker,
             reaper,
             io,
@@ -4341,8 +4359,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .wave_identity_bind
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.wave_identity_bind.start_if(timing_enabled);
-                OperationDispatch::bind_submission_wave_identity(
-                    &self.resolved_plan,
+                OperationDispatch::bind_compiled_submission_wave_identity(
+                    &self.submission_wave_identity,
                     active_bindings(),
                     &wave,
                     &self.lane,
@@ -4470,7 +4488,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             match submission {
                 Ok((completion, attribution)) => {
+                    let identity_materialization = identity.materialization_snapshot();
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.identity_waves.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.identity_logical_nodes.fetch_add(
+                        u64::from(identity_materialization.logical_nodes()),
+                        Ordering::Relaxed,
+                    );
+                    self.metrics
+                        .identity_nodes_materialized_before_submit
+                        .fetch_add(
+                            u64::from(identity_materialization.materialized_nodes()),
+                            Ordering::Relaxed,
+                        );
+                    self.metrics
+                        .identity_full_participant_materializations_before_submit
+                        .fetch_add(
+                            u64::from(identity_materialization.full_participant_projection()),
+                            Ordering::Relaxed,
+                        );
                     if let Some((segments, logical_nodes, binding_nodes)) = reusable_program_stats {
                         self.metrics
                             .direct_reusable_waves
@@ -5945,6 +5981,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "direct_fallbacks": self.metrics.direct_reusable_fallbacks.load(Ordering::Relaxed),
                     "catalog_misses": self.metrics.reusable_catalog_misses.load(Ordering::Relaxed),
                     "catalog_epoch_misses": self.metrics.reusable_catalog_epoch_misses.load(Ordering::Relaxed),
+                },
+                "identity_materialization": {
+                    "waves": self.metrics.identity_waves.load(Ordering::Relaxed),
+                    "logical_nodes": self.metrics.identity_logical_nodes.load(Ordering::Relaxed),
+                    "nodes_materialized_before_submit": self.metrics.identity_nodes_materialized_before_submit.load(Ordering::Relaxed),
+                    "full_participant_materializations_before_submit": self.metrics.identity_full_participant_materializations_before_submit.load(Ordering::Relaxed),
                 },
                 "definitely_not_submitted_retries": self.metrics.definitely_not_submitted_retries.load(Ordering::Relaxed),
                 "request_deferrals": self.metrics.request_deferrals.load(Ordering::Relaxed),
