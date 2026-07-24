@@ -2657,16 +2657,15 @@ mod tests {
         let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
             panic!("Metal kernel profile must report command counter timing")
         };
-        let [timing] = timing.commands() else {
+        let [timing] = timing.spans() else {
             panic!("expected exactly one command timing row")
         };
-        assert_eq!(timing.command_index(), command.command_index());
-        assert_eq!(timing.intervals().len(), 1);
-        assert_eq!(
-            timing.intervals()[0].kind(),
-            DeviceExecutionIntervalKind::Transfer
-        );
-        assert!(timing.elapsed_ns() > 0);
+        assert_eq!(timing.start_command_index(), command.command_index());
+        assert_eq!(timing.end_command_index(), command.command_index() + 1);
+        let intervals = timing.measurement().intervals().unwrap();
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
+        assert!(timing.measurement().elapsed_ns().unwrap() > 0);
     }
 
     #[test]
@@ -2719,20 +2718,19 @@ mod tests {
         let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
             panic!("Metal kernel profile must report command counter timing")
         };
-        let [timing] = timing.commands() else {
+        let [timing] = timing.spans() else {
             panic!("expected exactly one command timing row")
         };
-        assert_eq!(timing.command_index(), command.command_index());
+        assert_eq!(timing.start_command_index(), command.command_index());
+        assert_eq!(timing.end_command_index(), command.command_index() + 1);
+        let intervals = timing.measurement().intervals().unwrap();
         assert_eq!(
-            timing.intervals().len(),
+            intervals.len(),
             1,
             "three transfer operations in one blit encoder are one physical interval"
         );
-        assert_eq!(
-            timing.intervals()[0].kind(),
-            DeviceExecutionIntervalKind::Transfer
-        );
-        assert!(timing.elapsed_ns() > 0);
+        assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
+        assert!(timing.measurement().elapsed_ns().unwrap() > 0);
     }
 
     #[test]

@@ -4810,15 +4810,18 @@ impl BoundDeviceSubmissionAttribution {
         terminal_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
     ) -> Result<Self, VNextError> {
         if let DeviceTimingMeasurement::Measured(timing) = &terminal_timing {
-            if timing.commands().len() != self.device.commands().len()
-                || timing
+            if usize::try_from(timing.command_count()).ok() != Some(self.device.commands().len())
+                || self
+                    .device
                     .commands()
                     .iter()
-                    .zip(self.device.commands())
-                    .any(|(timing, command)| timing.command_index() != command.command_index())
+                    .enumerate()
+                    .any(|(index, command)| {
+                        u32::try_from(index).ok() != Some(command.command_index())
+                    })
             {
                 return Err(invalid_operation(
-                    "terminal device timing differs from submission command attribution",
+                    "terminal device timing coverage differs from submission command attribution",
                 ));
             }
         }

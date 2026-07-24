@@ -657,6 +657,10 @@ impl CudaExecutableCache {
         Ok(true)
     }
 
+    pub(crate) fn contains(&self, candidate: &CudaExecutableCandidate) -> bool {
+        self.entries.contains_key(&candidate.key)
+    }
+
     pub(crate) fn trim_quiescent(&mut self) -> (usize, usize) {
         let released_executables = self.entries.len();
         let released_rejections = self.rejected.len();

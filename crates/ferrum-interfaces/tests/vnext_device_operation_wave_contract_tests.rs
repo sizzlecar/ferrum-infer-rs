@@ -616,17 +616,18 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
         panic!("kernel-profiled wave must bind terminal command timing")
     };
     assert_eq!(
-        timing.commands().len(),
+        timing.command_count() as usize,
         attribution.device().commands().len()
     );
-    for (timing, command) in timing
-        .commands()
-        .iter()
-        .zip(attribution.device().commands())
-    {
-        assert_eq!(timing.command_index(), command.command_index());
-        assert_eq!(timing.intervals().len(), 1);
-        assert_eq!(timing.elapsed_ns(), 10);
+    for (timing, command) in timing.spans().iter().zip(attribution.device().commands()) {
+        assert_eq!(timing.start_command_index(), command.command_index());
+        assert_eq!(timing.end_command_index(), command.command_index() + 1);
+        assert_eq!(
+            timing.kind(),
+            ferrum_interfaces::vnext::DeviceExecutionSpanKind::EagerCommand
+        );
+        assert_eq!(timing.measurement().intervals().unwrap().len(), 1);
+        assert_eq!(timing.measurement().elapsed_ns(), Some(10));
     }
 
     drop(handle);
