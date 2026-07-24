@@ -306,6 +306,39 @@ CUDA DIRECT BINDING AB ATTRIBUTION KEEP: /Users/chejinxuan/ferrum-artifacts/runt
 级 device attribution；在此之前使用上述双路径合同，不得再以反复 profile-off sweep
 代替归因。
 
+### Direct-path Replay profiler source checkpoint（2026-07-25）
+
+source commit `6a2c49a65077161f988ac04e372ff5a6fcc1adc3` 新增 typed
+`profile-detail=replay`，用于关闭上述 full/profile-off 执行路径歧义。该模式已经接入
+`ferrum run` 与 `ferrum serve` 的公开 CLI/config 路径，并具备以下合同：
+
+- `off/basic/debug/full` 语义保持不变；`replay` 单独映射到
+  `DeviceTimingMode::Replay`，不会借用 hidden env；
+- CUDA 仍选择正常 typed direct reusable program；只有 `full/Kernel` 继续切换到 logical
+  provider encoding。`replay` 会增加 CUDA event 等诊断插桩，但不改变
+  reusable-versus-eager 路径选择；
+- direct program、普通 reusable graph segment 与 eager command 都生成物理 span；
+  reusable span 保存 executable fingerprint，JSONL 每个 physical submission 保存精确
+  span/range/participant/plan/runtime identity；
+- health metrics 分开累计 eager 与 reusable device duration，并按 executable fingerprint
+  聚合；fingerprint cardinality 上限为 `256`，溢出显式计数；
+- `replay` 不生成逐 immutable-plan node 的 native attribution，也不加载 full-profile
+  tool correlation；`full` 的既有逐 node attribution 合同仍独立保留；
+- artifact 显式记录 `measurement_instrumentation_present=true` 与
+  `production_reusable_execution_selection_preserved=true`，禁止把 replay throughput
+  当成无插桩产品性能。
+
+本地已通过公共 crate check、真实 Metal command-buffer Replay timing、CUDA replay source
+contract `9/9`、既有 full native-attribution contract `1/1`、typed config/CLI mapping、
+`ferrum run --help` 和 `ferrum serve --help`。这些结果只证明 source contract，不是 CUDA
+产品证据，也不产生 G06/G09 PASS。
+
+下一次 paid CUDA 只允许复用 retained 1x RTX 4090 实例 `45319871` 做 bounded profiler
+validation：clean SHA CUDA feature build/type-check 后先通过一个 `run` 和一个 `serve`
+正确性 smoke，再要求 Replay JSONL 出现 direct reusable physical span/fingerprint，
+direct fallback 与 catalog-epoch miss 均为 `0`。任一条件失败即 copy back REJECT artifact
+并停止实例；本轮不得运行 throughput sweep。当前实例已确认 `stopped/exited`。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
