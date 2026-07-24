@@ -1668,6 +1668,35 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
       value_dim, conv_kernel);
 }
 
+static __device__ __forceinline__ float
+linear_attention_decode_conv_update_f16_state_f16(
+    const __half* __restrict__ mixed_qkvz_raw,
+    const __half* __restrict__ conv_weight,
+    __half* __restrict__ conv_state,
+    const int channel,
+    const int conv_kernel) {
+  const int state_len = conv_kernel - 1;
+  const int state_base = channel * state_len;
+  const float current = ferrum_load_value(mixed_qkvz_raw, channel);
+  float acc = 0.0f;
+  for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
+    const float x =
+        kernel_idx < state_len
+            ? ferrum_load_value(conv_state, state_base + kernel_idx)
+            : current;
+    acc += x * ferrum_load_value(
+                   conv_weight, channel * conv_kernel + kernel_idx);
+  }
+  for (int pos = 0; pos < state_len; ++pos) {
+    ferrum_store_value(
+        conv_state, state_base + pos,
+        pos + 1 < state_len
+            ? ferrum_load_value(conv_state, state_base + pos + 1)
+            : current);
+  }
+  return ferrum_silu(acc);
+}
+
 extern "C" __global__ void
 linear_attention_decode_fused_conv_qk_norm_pack_f16_to_f32_state_f16_z_f16_indirect(
     const __half* __restrict__ mixed_qkvz_raw,
@@ -1680,73 +1709,55 @@ linear_attention_decode_fused_conv_qk_norm_pack_f16_to_f32_state_f16_z_f16_indir
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  const int key_head = static_cast<int>(blockIdx.x);
-  if (key_head >= key_heads || key_heads <= 0 ||
-      value_heads % key_heads != 0) {
+  const int worker = static_cast<int>(blockIdx.x);
+  if (key_heads <= 0 || value_heads <= 0 ||
+      worker >= key_heads + value_heads) {
     return;
   }
 
   const int qk_total = key_heads * key_dim;
   const int value_total = value_heads * value_dim;
   const int conv_channels = 2 * qk_total + value_total;
-  const int state_len = conv_kernel - 1;
-  const int repeat_factor = value_heads / key_heads;
-  const int first_value_feature = key_head * repeat_factor * value_dim;
-  const int owned_value_features = repeat_factor * value_dim;
-  const int owned_conv_channels = 2 * key_dim + owned_value_features;
   __half* conv_state =
       reinterpret_cast<__half*>(state_bindings[0]);
 
-  float q_sum = 0.0f;
-  float k_sum = 0.0f;
-  for (int local = threadIdx.x; local < owned_conv_channels;
-       local += blockDim.x) {
-    int channel;
-    if (local < key_dim) {
-      channel = key_head * key_dim + local;
-    } else if (local < 2 * key_dim) {
-      channel = qk_total + key_head * key_dim + local - key_dim;
-    } else {
-      channel =
-          2 * qk_total + first_value_feature + local - 2 * key_dim;
+  if (worker >= key_heads) {
+    const int value_head = worker - key_heads;
+    const int first_value_feature = value_head * value_dim;
+    for (int d = threadIdx.x; d < value_dim; d += blockDim.x) {
+      const int value_feature = first_value_feature + d;
+      const int channel = 2 * qk_total + value_feature;
+      mixed_qkv[channel] =
+          linear_attention_decode_conv_update_f16_state_f16(
+              mixed_qkvz_raw, conv_weight, conv_state, channel,
+              conv_kernel);
+      ferrum_store_value(
+          z, value_feature,
+          ferrum_load_value(mixed_qkvz_raw,
+                            conv_channels + value_feature));
     }
-
-    const int state_base = channel * state_len;
-    float acc = 0.0f;
-    for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
-      const float x =
-          kernel_idx < state_len
-              ? ferrum_load_value(conv_state, state_base + kernel_idx)
-              : ferrum_load_value(mixed_qkvz_raw, channel);
-      acc += x * ferrum_load_value(
-                     conv_weight, channel * conv_kernel + kernel_idx);
-    }
-    if (state_len > 0) {
-      for (int pos = 0; pos < state_len; ++pos) {
-        ferrum_store_value(
-            conv_state, state_base + pos,
-            pos + 1 < state_len
-                ? ferrum_load_value(conv_state, state_base + pos + 1)
-                : ferrum_load_value(mixed_qkvz_raw, channel));
-      }
-    }
-
-    const float conv = ferrum_silu(acc);
-    mixed_qkv[channel] = conv;
-    if (local < key_dim) {
-      q_sum += conv * conv;
-    } else if (local < 2 * key_dim) {
-      k_sum += conv * conv;
-    }
+    return;
   }
 
-  for (int local = threadIdx.x; local < owned_value_features;
+  const int key_head = worker;
+  float q_sum = 0.0f;
+  float k_sum = 0.0f;
+  for (int local = threadIdx.x; local < 2 * key_dim;
        local += blockDim.x) {
-    const int value_feature = first_value_feature + local;
-    ferrum_store_value(
-        z, value_feature,
-        ferrum_load_value(mixed_qkvz_raw,
-                          conv_channels + value_feature));
+    const bool is_query = local < key_dim;
+    const int d = is_query ? local : local - key_dim;
+    const int channel =
+        (is_query ? 0 : qk_total) + key_head * key_dim + d;
+    const float conv =
+        linear_attention_decode_conv_update_f16_state_f16(
+            mixed_qkvz_raw, conv_weight, conv_state, channel,
+            conv_kernel);
+    mixed_qkv[channel] = conv;
+    if (is_query) {
+      q_sum += conv * conv;
+    } else {
+      k_sum += conv * conv;
+    }
   }
 
   __shared__ float q_reduce[1024];
