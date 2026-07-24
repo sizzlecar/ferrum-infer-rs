@@ -20,13 +20,15 @@ use ferrum_interfaces::vnext::{
     DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
-    DeviceReusableAddressScope, DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
-    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, StreamState, VNextError,
+    DeviceReusableAddressScope, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ProgramBindingNodeBinding, StreamState, VNextError,
 };
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
@@ -306,6 +308,7 @@ pub struct CudaDeviceCommand {
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
     program_binding_patch: Option<CudaProgramBindingPatch>,
+    reusable_execution: Option<DeviceReusableExecutionInvocation>,
 }
 
 impl fmt::Debug for CudaDeviceCommand {
@@ -329,6 +332,10 @@ impl fmt::Debug for CudaDeviceCommand {
             .field(
                 "typed_program_binding_patch",
                 &self.program_binding_patch.is_some(),
+            )
+            .field(
+                "direct_reusable_execution",
+                &self.reusable_execution.is_some(),
             )
             .finish_non_exhaustive()
     }
@@ -557,6 +564,7 @@ impl CudaDeviceCommand {
             replay_key,
             reusable_address_scope,
             program_binding_patch: None,
+            reusable_execution: None,
         })
     }
 
@@ -596,6 +604,7 @@ impl CudaDeviceCommand {
             replay_key,
             reusable_address_scope,
             program_binding_patch: None,
+            reusable_execution: None,
         })
     }
 
@@ -624,6 +633,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             program_binding_patch: None,
+            reusable_execution: None,
         }
     }
 
@@ -694,6 +704,7 @@ impl CudaDeviceCommand {
                 writes,
                 fence_dependencies,
             }),
+            reusable_execution: None,
         })
     }
 
@@ -716,6 +727,38 @@ impl CudaDeviceCommand {
         self.compute_dispatch_count = compute_dispatch_count;
         self.transfer_command_count = transfer_command_count;
         Ok(self)
+    }
+
+    fn reusable_execution(
+        runtime_instance: u64,
+        invocation: DeviceReusableExecutionInvocation,
+    ) -> Self {
+        let participant_count = invocation.participant_count();
+        let token_count = invocation.token_count();
+        let executable = Arc::new(CudaCommandExecutable {
+            regions: Vec::new(),
+            host_storage: Vec::new(),
+            enqueue: Mutex::new(Box::new(|_, _, _, _| {
+                Err(CudaDeviceRuntimeError::contract(
+                    "direct reusable execution must be resolved by the owning stream cache",
+                ))
+            })),
+        });
+        Self {
+            runtime_instance,
+            operation: "vnext_reusable_execution",
+            batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            token_count,
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            executable,
+            fence_dependencies: Vec::new(),
+            replay_key: None,
+            reusable_address_scope: None,
+            program_binding_patch: None,
+            reusable_execution: Some(invocation),
+        }
     }
 
     fn coalesced_program_bindings(
@@ -914,6 +957,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             program_binding_patch: None,
+            reusable_execution: None,
         }])
     }
 
@@ -969,6 +1013,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             program_binding_patch: None,
+            reusable_execution: None,
         }])
     }
 
@@ -992,6 +1037,12 @@ impl CudaDeviceCommand {
 
     pub(crate) const fn replay_key(&self) -> Option<CudaCommandReplayKey> {
         self.replay_key
+    }
+
+    pub(crate) fn reusable_execution_invocation(
+        &self,
+    ) -> Option<&DeviceReusableExecutionInvocation> {
+        self.reusable_execution.as_ref()
     }
 
     pub(crate) const fn reusable_address_scope(&self) -> Option<DeviceReusableAddressScope> {
@@ -1752,6 +1803,39 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .map_err(CudaDeviceRuntimeError::contract)
     }
 
+    fn reusable_execution_catalog(
+        &self,
+        stream: &Self::Stream,
+    ) -> Result<Vec<DeviceReusableExecutionProgram>, Self::Error> {
+        self.validate_stream(stream)?;
+        if !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable execution catalog requires its quiescent owning stream",
+            ));
+        }
+        stream
+            .executable_cache
+            .catalog()
+            .map_err(CudaDeviceRuntimeError::contract)
+    }
+
+    fn encode_reusable_execution(
+        &self,
+        invocation: DeviceReusableExecutionInvocation,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        if invocation.program_id().runtime_implementation_fingerprint()
+            != self.descriptor.runtime_implementation_fingerprint
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable execution reference targets another runtime implementation",
+            ));
+        }
+        Ok(Some(CudaDeviceCommand::reusable_execution(
+            self.runtime_instance,
+            invocation,
+        )))
+    }
+
     fn trim_reusable_executables(
         &self,
         stream: &mut Self::Stream,
@@ -1925,6 +2009,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             ));
         }
         let timing_mode = commands.timing_mode();
+        let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands
             .into_entries()
             .into_iter()
@@ -1939,7 +2024,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .iter()
             .map(|(phase, _, _)| *phase)
             .collect::<Vec<_>>();
-        let command_node_indices = timing_mode.kernel_attribution_enabled().then(|| {
+        let command_node_indices = (timing_mode.kernel_attribution_enabled()
+            || reusable_execution_capture.is_some())
+        .then(|| {
             entries
                 .iter()
                 .map(|(_, node_index, _)| *node_index)
@@ -1966,6 +2053,23 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 ),
             ));
         }
+        let contains_direct_execution = commands
+            .iter()
+            .any(|command| command.reusable_execution_invocation().is_some());
+        if reusable_execution_capture.is_some() && contains_direct_execution {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA reusable execution capture cannot contain direct program references",
+                ),
+            ));
+        }
+        if kernel_attribution && contains_direct_execution {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA kernel attribution requires full logical command encoding",
+                ),
+            ));
+        }
         if let (Some(command_node_indices), Some(execution_paths)) =
             (&command_node_indices, &execution_paths)
         {
@@ -1984,6 +2088,26 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 "submission context binding",
                 error,
             )));
+        }
+        for invocation in commands
+            .iter()
+            .filter_map(CudaDeviceCommand::reusable_execution_invocation)
+        {
+            match stream.executable_cache.contains_program_segment(invocation) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(DefinitelyNotSubmitted::new(
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA direct reusable execution is not resident in the sealed catalog",
+                        ),
+                    ))
+                }
+                Err(error) => {
+                    return Err(DefinitelyNotSubmitted::new(
+                        CudaDeviceRuntimeError::contract(error.to_string()),
+                    ))
+                }
+            }
         }
         let executable_candidates = match cuda_executable_candidates(&command_phases, &commands) {
             Ok(candidates) => candidates,
@@ -2046,6 +2170,22 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 );
             }
         }
+        if let Some(capture) = reusable_execution_capture.as_ref() {
+            let command_node_indices = command_node_indices
+                .as_deref()
+                .expect("reusable execution capture retained node attribution");
+            if let Err(error) = stream.executable_cache.register_program(
+                capture,
+                &executable_candidates,
+                command_node_indices,
+            ) {
+                stream.state.fail();
+                self.quarantine(stream, commands);
+                panic!(
+                    "CUDA submission became indeterminate while registering a reusable program: {error}"
+                );
+            }
+        }
         drop(validate_stage);
 
         let begin_timing_stage =
@@ -2070,6 +2210,35 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let mut index = 0;
         let mut executable_candidate_index = 0;
         while index < commands.len() {
+            if let Some(invocation) = commands[index].reusable_execution_invocation() {
+                match stream.executable_cache.launch_program_segment(
+                    &stream.stream,
+                    invocation,
+                    false,
+                ) {
+                    Ok(Some(_)) => {
+                        if S::ENABLED {
+                            replay_observation.observe_replayed_segment(
+                                invocation.segment().logical_command_count() as usize,
+                            );
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    Ok(None) => {
+                        stream.state.fail();
+                        self.quarantine(stream, commands);
+                        panic!("CUDA reusable execution disappeared after pre-submit validation");
+                    }
+                    Err(error) => {
+                        stream.state.fail();
+                        self.quarantine(stream, commands);
+                        panic!(
+                            "CUDA submission became indeterminate while launching a reusable program: {error}"
+                        );
+                    }
+                }
+            }
             while executable_candidates
                 .get(executable_candidate_index)
                 .is_some_and(|candidate| candidate.start() < index)
@@ -2460,6 +2629,7 @@ mod tests {
             replay_key: None,
             reusable_address_scope: None,
             program_binding_patch: None,
+            reusable_execution: None,
         }
     }
 

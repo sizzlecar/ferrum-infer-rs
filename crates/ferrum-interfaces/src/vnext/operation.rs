@@ -13,15 +13,17 @@ use super::{
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceRuntime,
+    DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram, DeviceRuntime,
     DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
     DeviceSubmissionTimingSink, DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand,
-    DynamicResourceShape, EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope,
-    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
-    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
+    DynamicResourceShape, EncodedDeviceOperation, EncodedReusableExecutionBindings,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
+    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
+    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
+    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
     ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
     ResolvedWeightBinding, ResourceId, SemanticValue, SequenceBackingSnapshot,
     SequenceSessionEpoch, SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment,
@@ -5131,6 +5133,47 @@ where
 }
 
 /// The only public path from a resolved plan to an operation kernel.
+fn validate_program_binding_patch(
+    resolved: &dyn ExecutablePlanView,
+    node_index: usize,
+    node_identity: &BatchOperationNodeIdentity,
+    program_binding: Option<&ProgramBindingNodeBinding>,
+    encoded_program_binding_count: usize,
+    program_binding_resources: &mut BTreeSet<ResourceId>,
+) -> Result<(), VNextError> {
+    if program_binding.is_some() != (encoded_program_binding_count == 1) {
+        return Err(invalid_operation(
+            "compiled program binding slot and provider patch cardinality differ",
+        ));
+    }
+    let Some(program_binding) = program_binding else {
+        return Ok(());
+    };
+    let binding_resource = resolved
+        .execution_plan()
+        .payload()
+        .nodes()
+        .get(node_index)
+        .and_then(PlanNode::binding_resource)
+        .ok_or_else(|| {
+            invalid_operation("program binding requires a provider-owned binding workspace")
+        })?;
+    if program_binding.node_index() != node_index
+        || program_binding.slot().node_id() != node_identity.node_id()
+        || program_binding.slot().resource_id() != binding_resource
+    {
+        return Err(invalid_operation(
+            "provider program binding differs from its compiled node slot",
+        ));
+    }
+    if !program_binding_resources.insert(binding_resource.clone()) {
+        return Err(invalid_operation(
+            "program bindings from different nodes alias one binding workspace",
+        ));
+    }
+    Ok(())
+}
+
 pub struct OperationDispatch;
 
 impl OperationDispatch {
@@ -5712,6 +5755,7 @@ impl OperationDispatch {
             active_bindings,
             timing_mode,
             input_uploads,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -5748,6 +5792,74 @@ impl OperationDispatch {
             active_bindings,
             timing_mode,
             input_uploads,
+            None,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_reusable_wave_with_inputs<'binding, R, I>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: &DeviceReusableExecutionProgram,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            Some(reusable_program),
+            &DisabledSubmissionWaveDispatchTimingSink,
+            wave,
+            lane,
+            reaper,
+        )
+        .map(|profiled| profiled.into_parts().0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_reusable_wave_with_inputs_and_timing<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: &DeviceReusableExecutionProgram,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            Some(reusable_program),
             timing_sink,
             wave,
             lane,
@@ -5763,6 +5875,7 @@ impl OperationDispatch {
         active_bindings: I,
         timing_mode: DeviceTimingMode,
         input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
         timing_sink: &S,
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -5868,95 +5981,322 @@ impl OperationDispatch {
         let mut encoded_provider_command_count = 0_usize;
         let mut program_bindings = Vec::new();
         let mut program_binding_resources = BTreeSet::new();
+        let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
-        for (node_index, (provider, node_identity)) in
-            providers.iter().zip(batch_identity.nodes()).enumerate()
-        {
-            let invocation = BatchedOperationInvocation::from_wave_node(
-                runtime,
-                resolved,
-                provider.dispatch(),
-                batch_identity,
-                node_identity,
-                completion.wave(),
-                node_index,
-                active_bindings.clone(),
-            )
-            .map_err(SubmissionWaveDispatchError::Contract)?;
-            let expected_phase = invocation.operation().profile_phase;
-            let program_binding = invocation.program_binding().cloned();
-            let operation = match provider.provider().encode_selected(invocation) {
-                Ok(operation) => operation,
-                Err(failure)
-                    if node_identity.contains_identity(failure.identity())
-                        && failure.phase() == expected_phase =>
-                {
-                    return Err(SubmissionWaveDispatchError::Provider(failure));
-                }
-                Err(_) => {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "wave provider returned a failure for another node identity or profile phase",
-                    )));
-                }
-            };
-            let program_binding_count = operation.program_binding_count();
-            if program_binding.is_some() && program_binding_count != 1 {
+        if let Some(reusable_program) = reusable_program {
+            if timing_mode == DeviceTimingMode::Kernel {
                 return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "compiled program binding slot requires exactly one provider patch",
+                    "kernel attribution requires full logical provider encoding",
                 )));
             }
-            if program_binding_count > 0 {
-                let binding_resource = resolved
-                    .execution_plan()
-                    .payload()
-                    .nodes()
-                    .get(node_index)
-                    .and_then(PlanNode::binding_resource)
+            let actual_program_id = completion
+                .wave()
+                .claimed_backing()
+                .reusable_execution_program_id(
+                    &lane.descriptor().runtime_implementation_fingerprint,
+                    lane.id(),
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "reusable execution program has no live program binding authority",
+                    ))
+                })?;
+            if &actual_program_id != reusable_program.program_id()
+                || reusable_program.segments().iter().any(|segment| {
+                    segment.end_node_index() as usize > providers.len()
+                        || segment.logical_command_count()
+                            != segment.end_node_index() - segment.start_node_index()
+                })
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "reusable execution program differs from the exact wave topology",
+                )));
+            }
+
+            let mut node_index = 0_usize;
+            let mut segment_index = 0_usize;
+            while node_index < providers.len() {
+                let segment = reusable_program
+                    .segments()
+                    .get(segment_index)
+                    .filter(|segment| segment.start_node_index() as usize == node_index);
+                if let Some(segment) = segment {
+                    let mut segment_dynamic_bindings = Vec::new();
+                    let mut segment_result_bindings = Vec::new();
+                    for binding_node_index in reusable_program
+                        .per_wave_binding_node_indices()
+                        .iter()
+                        .copied()
+                        .filter(|binding_node_index| segment.contains_node(*binding_node_index))
+                    {
+                        let binding_node_index =
+                            usize::try_from(binding_node_index).map_err(|_| {
+                                SubmissionWaveDispatchError::Contract(invalid_operation(
+                                    "reusable execution binding node exceeds usize",
+                                ))
+                            })?;
+                        let provider = &providers[binding_node_index];
+                        let node_identity = &batch_identity.nodes()[binding_node_index];
+                        let invocation = BatchedOperationInvocation::from_wave_node(
+                            runtime,
+                            resolved,
+                            provider.dispatch(),
+                            batch_identity,
+                            node_identity,
+                            completion.wave(),
+                            binding_node_index,
+                            active_bindings.clone(),
+                        )
+                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        let expected_phase = invocation.operation().profile_phase;
+                        let program_binding = invocation.program_binding().cloned();
+                        let bindings = match provider
+                            .provider()
+                            .encode_reusable_execution_bindings(invocation)
+                        {
+                            Ok(bindings) => bindings,
+                            Err(failure)
+                                if node_identity.contains_identity(failure.identity())
+                                    && failure.phase() == expected_phase =>
+                            {
+                                return Err(SubmissionWaveDispatchError::Provider(failure));
+                            }
+                            Err(_) => {
+                                return Err(SubmissionWaveDispatchError::Contract(
+                                    invalid_operation(
+                                        "reusable provider returned a failure for another node identity or profile phase",
+                                    ),
+                                ));
+                            }
+                        };
+                        let program_binding_count = bindings.program_binding_count();
+                        validate_program_binding_patch(
+                            resolved,
+                            binding_node_index,
+                            node_identity,
+                            program_binding.as_ref(),
+                            program_binding_count,
+                            &mut program_binding_resources,
+                        )
+                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        let (mut node_program_bindings, mut dynamic_bindings, mut result_bindings) =
+                            bindings.into_parts();
+                        program_bindings.append(&mut node_program_bindings);
+                        segment_dynamic_bindings.append(&mut dynamic_bindings);
+                        segment_result_bindings.append(&mut result_bindings);
+                    }
+                    let invocation = DeviceReusableExecutionInvocation::new(
+                        actual_program_id.clone(),
+                        segment.clone(),
+                        u32::try_from(active_participant_count).map_err(|_| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "reusable execution participant count exceeds u32",
+                            ))
+                        })?,
+                        completion
+                            .wave()
+                            .claimed_backing()
+                            .work_shape()
+                            .immediate_tokens(),
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                    let compute = runtime
+                        .encode_reusable_execution(invocation)
+                        .map_err(|error| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(format!(
+                                "device runtime rejected a sealed reusable program: {error}"
+                            )))
+                        })?
+                        .ok_or_else(|| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "device runtime published a reusable program it cannot encode",
+                            ))
+                        })?;
+                    let operation_command_count = segment_dynamic_bindings
+                        .len()
+                        .checked_add(1)
+                        .and_then(|count| count.checked_add(segment_result_bindings.len()))
+                        .ok_or_else(|| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "reusable execution command count overflows usize",
+                            ))
+                        })?;
+                    encoded_provider_command_count = encoded_provider_command_count
+                        .checked_add(operation_command_count)
+                        .ok_or_else(|| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "submission wave command count overflows usize",
+                            ))
+                        })?;
+                    encoded_operations.push((
+                        segment.start_node_index(),
+                        segment_dynamic_bindings,
+                        compute,
+                        segment_result_bindings,
+                    ));
+                    node_index = segment.end_node_index() as usize;
+                    segment_index += 1;
+                    continue;
+                }
+                if reusable_program
+                    .segments()
+                    .get(segment_index)
+                    .is_some_and(|segment| (segment.start_node_index() as usize) < node_index)
+                {
+                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "reusable execution segment traversal is not canonical",
+                    )));
+                }
+                let provider = &providers[node_index];
+                let node_identity = &batch_identity.nodes()[node_index];
+                let invocation = BatchedOperationInvocation::from_wave_node(
+                    runtime,
+                    resolved,
+                    provider.dispatch(),
+                    batch_identity,
+                    node_identity,
+                    completion.wave(),
+                    node_index,
+                    active_bindings.clone(),
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+                let expected_phase = invocation.operation().profile_phase;
+                let program_binding = invocation.program_binding().cloned();
+                let operation = match provider.provider().encode_selected(invocation) {
+                    Ok(operation) => operation,
+                    Err(failure)
+                        if node_identity.contains_identity(failure.identity())
+                            && failure.phase() == expected_phase =>
+                    {
+                        return Err(SubmissionWaveDispatchError::Provider(failure));
+                    }
+                    Err(_) => {
+                        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "wave provider returned a failure for another node identity or profile phase",
+                        )));
+                    }
+                };
+                let program_binding_count = operation.program_binding_count();
+                validate_program_binding_patch(
+                    resolved,
+                    node_index,
+                    node_identity,
+                    program_binding.as_ref(),
+                    program_binding_count,
+                    &mut program_binding_resources,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+                let operation_command_count = operation
+                    .dynamic_binding_count()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_add(operation.result_binding_count()))
                     .ok_or_else(|| {
                         SubmissionWaveDispatchError::Contract(invalid_operation(
-                            "program binding requires a provider-owned binding workspace",
+                            "provider operation command count overflows usize",
                         ))
                     })?;
-                if program_binding.as_ref().is_some_and(|binding| {
-                    binding.node_index() != node_index
-                        || binding.slot().node_id() != node_identity.node_id()
-                        || binding.slot().resource_id() != binding_resource
-                }) {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "provider program binding differs from its compiled node slot",
-                    )));
-                }
-                if !program_binding_resources.insert(binding_resource.clone()) {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "program bindings from different nodes alias one binding workspace",
-                    )));
-                }
+                encoded_provider_command_count = encoded_provider_command_count
+                    .checked_add(operation_command_count)
+                    .ok_or_else(|| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "submission wave command count overflows usize",
+                        ))
+                    })?;
+                let encoded_node_index = u32::try_from(node_index).map_err(|_| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission wave node index exceeds u32",
+                    ))
+                })?;
+                let (mut node_program_bindings, dynamic_bindings, compute, result_bindings) =
+                    operation.into_parts();
+                program_bindings.append(&mut node_program_bindings);
+                encoded_operations.push((
+                    encoded_node_index,
+                    dynamic_bindings,
+                    compute,
+                    result_bindings,
+                ));
+                node_index += 1;
             }
-            let operation_command_count = operation
-                .dynamic_binding_count()
-                .checked_add(1)
-                .and_then(|count| count.checked_add(operation.result_binding_count()))
-                .ok_or_else(|| {
+            if segment_index != reusable_program.segments().len() {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "reusable execution program contains an unreachable segment",
+                )));
+            }
+        } else {
+            for (node_index, (provider, node_identity)) in
+                providers.iter().zip(batch_identity.nodes()).enumerate()
+            {
+                let invocation = BatchedOperationInvocation::from_wave_node(
+                    runtime,
+                    resolved,
+                    provider.dispatch(),
+                    batch_identity,
+                    node_identity,
+                    completion.wave(),
+                    node_index,
+                    active_bindings.clone(),
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+                let expected_phase = invocation.operation().profile_phase;
+                let program_binding = invocation.program_binding().cloned();
+                let operation = match provider.provider().encode_selected(invocation) {
+                    Ok(operation) => operation,
+                    Err(failure)
+                        if node_identity.contains_identity(failure.identity())
+                            && failure.phase() == expected_phase =>
+                    {
+                        return Err(SubmissionWaveDispatchError::Provider(failure));
+                    }
+                    Err(_) => {
+                        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "wave provider returned a failure for another node identity or profile phase",
+                    )));
+                    }
+                };
+                let program_binding_count = operation.program_binding_count();
+                validate_program_binding_patch(
+                    resolved,
+                    node_index,
+                    node_identity,
+                    program_binding.as_ref(),
+                    program_binding_count,
+                    &mut program_binding_resources,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+                let operation_command_count = operation
+                    .dynamic_binding_count()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_add(operation.result_binding_count()))
+                    .ok_or_else(|| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "provider operation command count overflows usize",
+                        ))
+                    })?;
+                let has_per_wave_bindings = program_binding_count > 0
+                    || operation.dynamic_binding_count() > 0
+                    || operation.result_binding_count() > 0;
+                encoded_provider_command_count = encoded_provider_command_count
+                    .checked_add(operation_command_count)
+                    .ok_or_else(|| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "submission wave command count overflows usize",
+                        ))
+                    })?;
+                let node_index = u32::try_from(node_index).map_err(|_| {
                     SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "provider operation command count overflows usize",
+                        "submission wave node index exceeds u32",
                     ))
                 })?;
-            encoded_provider_command_count = encoded_provider_command_count
-                .checked_add(operation_command_count)
-                .ok_or_else(|| {
-                    SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission wave command count overflows usize",
-                    ))
-                })?;
-            let node_index = u32::try_from(node_index).map_err(|_| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission wave node index exceeds u32",
-                ))
-            })?;
-            let (mut node_program_bindings, dynamic_bindings, compute, result_bindings) =
-                operation.into_parts();
-            program_bindings.append(&mut node_program_bindings);
-            encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
+                if has_per_wave_bindings {
+                    reusable_execution_binding_nodes.push(node_index);
+                }
+                let (mut node_program_bindings, dynamic_bindings, compute, result_bindings) =
+                    operation.into_parts();
+                program_bindings.append(&mut node_program_bindings);
+                encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
+            }
         }
         if completion
             .wave()
@@ -6001,6 +6341,24 @@ impl OperationDispatch {
         }
         for (node_index, dynamic_bindings, compute, result_bindings) in encoded_operations {
             commands.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
+        }
+        if reusable_program.is_none() {
+            if let Some(program_id) = completion
+                .wave()
+                .claimed_backing()
+                .reusable_execution_program_id(
+                    &lane.descriptor().runtime_implementation_fingerprint,
+                    lane.id(),
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+            {
+                commands
+                    .set_reusable_execution_capture(DeviceReusableExecutionCapture::new(
+                        program_id,
+                        reusable_execution_binding_nodes,
+                    ))
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+            }
         }
         if commands.len()
             != pre_provider_command_count.saturating_add(encoded_provider_command_count)
@@ -6553,6 +6911,20 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
         &self,
         invocation: BatchedOperationInvocation<'_, R::Buffer>,
     ) -> Result<EncodedDeviceOperation<R::Command>, OperationFailure>;
+
+    /// Encodes only the request-varying boundaries around a compute segment
+    /// that was already prepared as a reusable backend executable.
+    ///
+    /// The default deliberately reuses the exact provider implementation and
+    /// discards its compute command. Providers may override this cold-selected
+    /// boundary to avoid rebuilding static launch metadata.
+    fn encode_reusable_execution_bindings(
+        &self,
+        invocation: BatchedOperationInvocation<'_, R::Buffer>,
+    ) -> Result<EncodedReusableExecutionBindings<R::Command>, OperationFailure> {
+        self.encode_selected(invocation)
+            .map(EncodedReusableExecutionBindings::from_operation)
+    }
 }
 
 /// Composition-root registry that owns the exact provider objects used for

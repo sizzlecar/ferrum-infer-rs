@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
-    ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, VNextError,
-    WeightComponentPayload,
+    ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
+    ReusableExecutionBucketId, VNextError, WeightComponentPayload,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable
@@ -880,6 +880,301 @@ impl DeviceReusableExecutionPlan {
 
     pub const fn maximum_executables(self) -> usize {
         self.maximum_executables
+    }
+}
+
+/// Runtime-local identity for one immutable reusable program.
+///
+/// The bucket binds execution topology and capacity, while the plan and lane
+/// bind provider semantics and every lane-stable physical address. Request and
+/// sequence identities are deliberately excluded because their live state is
+/// supplied through explicit per-wave bindings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct DeviceReusableExecutionProgramId {
+    plan_hash: PlanHash,
+    runtime_implementation_fingerprint: String,
+    lane_id: ExecutionLaneId,
+    bucket_id: ReusableExecutionBucketId,
+    program_binding_layout_fingerprint: String,
+    lane_stable_layout_fingerprint: String,
+    lane_slot_id: u64,
+    immediate_sequences: u32,
+    immediate_tokens: u64,
+    immediate_pages: u64,
+}
+
+impl DeviceReusableExecutionProgramId {
+    pub fn new(
+        plan_hash: PlanHash,
+        runtime_implementation_fingerprint: String,
+        lane_id: ExecutionLaneId,
+        bucket_id: ReusableExecutionBucketId,
+        program_binding_layout_fingerprint: String,
+        lane_stable_layout_fingerprint: String,
+        lane_slot_id: u64,
+        immediate_sequences: u32,
+        immediate_tokens: u64,
+        immediate_pages: u64,
+    ) -> Result<Self, VNextError> {
+        let is_sha256 = |value: &str| {
+            let digest = value.strip_prefix("sha256/").unwrap_or(value);
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !is_sha256(&runtime_implementation_fingerprint)
+            || !is_sha256(&program_binding_layout_fingerprint)
+            || !is_sha256(&lane_stable_layout_fingerprint)
+            || immediate_sequences == 0
+            || immediate_tokens == 0
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution program identity is incomplete or non-canonical"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            plan_hash,
+            runtime_implementation_fingerprint,
+            lane_id,
+            bucket_id,
+            program_binding_layout_fingerprint,
+            lane_stable_layout_fingerprint,
+            lane_slot_id,
+            immediate_sequences,
+            immediate_tokens,
+            immediate_pages,
+        })
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.plan_hash
+    }
+
+    pub fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.runtime_implementation_fingerprint
+    }
+
+    pub const fn lane_id(&self) -> ExecutionLaneId {
+        self.lane_id
+    }
+
+    pub fn bucket_id(&self) -> &ReusableExecutionBucketId {
+        &self.bucket_id
+    }
+
+    pub fn program_binding_layout_fingerprint(&self) -> &str {
+        &self.program_binding_layout_fingerprint
+    }
+
+    pub fn lane_stable_layout_fingerprint(&self) -> &str {
+        &self.lane_stable_layout_fingerprint
+    }
+
+    pub const fn lane_slot_id(&self) -> u64 {
+        self.lane_slot_id
+    }
+
+    pub const fn immediate_sequences(&self) -> u32 {
+        self.immediate_sequences
+    }
+
+    pub const fn immediate_tokens(&self) -> u64 {
+        self.immediate_tokens
+    }
+
+    pub const fn immediate_pages(&self) -> u64 {
+        self.immediate_pages
+    }
+}
+
+/// Core metadata attached to a full eager encoding while a backend prepares
+/// reusable programs. The backend may publish a catalog entry only when every
+/// referenced segment is resident and the observed node topology is stable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionCapture {
+    program_id: DeviceReusableExecutionProgramId,
+    per_wave_binding_node_indices: Box<[u32]>,
+}
+
+impl DeviceReusableExecutionCapture {
+    pub fn new(
+        program_id: DeviceReusableExecutionProgramId,
+        mut per_wave_binding_node_indices: Vec<u32>,
+    ) -> Self {
+        per_wave_binding_node_indices.sort_unstable();
+        per_wave_binding_node_indices.dedup();
+        Self {
+            program_id,
+            per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+        }
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub fn per_wave_binding_node_indices(&self) -> &[u32] {
+        &self.per_wave_binding_node_indices
+    }
+}
+
+/// One contiguous node range owned by a resident backend executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionSegment {
+    ordinal: u32,
+    start_node_index: u32,
+    end_node_index: u32,
+    logical_command_count: u32,
+}
+
+impl DeviceReusableExecutionSegment {
+    pub fn new(
+        ordinal: u32,
+        start_node_index: u32,
+        end_node_index: u32,
+        logical_command_count: u32,
+    ) -> Result<Self, VNextError> {
+        if end_node_index <= start_node_index || logical_command_count == 0 {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution segment is empty".to_owned(),
+            });
+        }
+        Ok(Self {
+            ordinal,
+            start_node_index,
+            end_node_index,
+            logical_command_count,
+        })
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn start_node_index(&self) -> u32 {
+        self.start_node_index
+    }
+
+    pub const fn end_node_index(&self) -> u32 {
+        self.end_node_index
+    }
+
+    pub const fn logical_command_count(&self) -> u32 {
+        self.logical_command_count
+    }
+
+    pub const fn contains_node(&self, node_index: u32) -> bool {
+        node_index >= self.start_node_index && node_index < self.end_node_index
+    }
+}
+
+/// Immutable catalog row published only after the backend preparation window
+/// is sealed. Product requests may reference these segments directly instead
+/// of rebuilding their provider commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionProgram {
+    program_id: DeviceReusableExecutionProgramId,
+    segments: Box<[DeviceReusableExecutionSegment]>,
+    per_wave_binding_node_indices: Box<[u32]>,
+}
+
+impl DeviceReusableExecutionProgram {
+    pub fn new(
+        program_id: DeviceReusableExecutionProgramId,
+        segments: Vec<DeviceReusableExecutionSegment>,
+        mut per_wave_binding_node_indices: Vec<u32>,
+    ) -> Result<Self, VNextError> {
+        if segments.is_empty()
+            || segments
+                .iter()
+                .enumerate()
+                .any(|(ordinal, segment)| segment.ordinal() as usize != ordinal)
+            || segments
+                .windows(2)
+                .any(|pair| pair[0].end_node_index() > pair[1].start_node_index())
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution program segments are empty, unordered, or overlap"
+                    .to_owned(),
+            });
+        }
+        per_wave_binding_node_indices.sort_unstable();
+        per_wave_binding_node_indices.dedup();
+        if per_wave_binding_node_indices.iter().any(|node_index| {
+            !segments
+                .iter()
+                .any(|segment| segment.contains_node(*node_index))
+        }) {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution binding node is outside every resident segment"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            program_id,
+            segments: segments.into_boxed_slice(),
+            per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+        })
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub fn segments(&self) -> &[DeviceReusableExecutionSegment] {
+        &self.segments
+    }
+
+    pub fn per_wave_binding_node_indices(&self) -> &[u32] {
+        &self.per_wave_binding_node_indices
+    }
+}
+
+/// One exact invocation of a segment from the sealed reusable program catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionInvocation {
+    program_id: DeviceReusableExecutionProgramId,
+    segment: DeviceReusableExecutionSegment,
+    participant_count: u32,
+    token_count: u64,
+}
+
+impl DeviceReusableExecutionInvocation {
+    pub fn new(
+        program_id: DeviceReusableExecutionProgramId,
+        segment: DeviceReusableExecutionSegment,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, VNextError> {
+        if participant_count == 0 || token_count == 0 {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution invocation has no participants or tokens".to_owned(),
+            });
+        }
+        Ok(Self {
+            program_id,
+            segment,
+            participant_count,
+            token_count,
+        })
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub const fn segment(&self) -> &DeviceReusableExecutionSegment {
+        &self.segment
+    }
+
+    pub const fn participant_count(&self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
     }
 }
 
@@ -1928,6 +2223,71 @@ impl<C> EncodedDeviceOperation<C> {
     }
 }
 
+/// Per-wave commands that remain outside one resident reusable compute
+/// segment. Program bindings may be coalesced into the wave prelude; dynamic
+/// and result bindings preserve their position around the segment launch.
+#[must_use = "reusable execution bindings must accompany their segment launch"]
+pub struct EncodedReusableExecutionBindings<C> {
+    program_bindings: Vec<C>,
+    dynamic_bindings: Vec<C>,
+    result_bindings: Vec<C>,
+}
+
+impl<C> EncodedReusableExecutionBindings<C> {
+    pub fn empty() -> Self {
+        Self {
+            program_bindings: Vec::new(),
+            dynamic_bindings: Vec::new(),
+            result_bindings: Vec::new(),
+        }
+    }
+
+    pub fn with_program_binding(mut self, command: C) -> Self {
+        self.program_bindings.push(command);
+        self
+    }
+
+    pub fn with_dynamic_binding(mut self, command: C) -> Self {
+        self.dynamic_bindings.push(command);
+        self
+    }
+
+    pub fn with_result_binding(mut self, command: C) -> Self {
+        self.result_bindings.push(command);
+        self
+    }
+
+    pub fn from_operation(operation: EncodedDeviceOperation<C>) -> Self {
+        let (program_bindings, dynamic_bindings, _compute, result_bindings) =
+            operation.into_parts();
+        Self {
+            program_bindings,
+            dynamic_bindings,
+            result_bindings,
+        }
+    }
+
+    pub fn program_binding_count(&self) -> usize {
+        self.program_bindings.len()
+    }
+
+    pub fn dynamic_binding_count(&self) -> usize {
+        self.dynamic_bindings.len()
+    }
+
+    pub fn result_binding_count(&self) -> usize {
+        self.result_bindings.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, Vec<C>) {
+        (
+            self.program_bindings,
+            self.dynamic_bindings,
+            self.result_bindings,
+        )
+    }
+}
+
 /// One command plus the core-issued semantic phase that constrains backend
 /// execution optimizations.
 pub struct DeviceCommandEntry<C> {
@@ -1964,6 +2324,7 @@ impl<C> DeviceCommandEntry<C> {
 pub struct DeviceCommandBatch<C> {
     commands: Vec<DeviceCommandEntry<C>>,
     timing_mode: DeviceTimingMode,
+    reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
 }
 
 impl<C> DeviceCommandBatch<C> {
@@ -1975,6 +2336,7 @@ impl<C> DeviceCommandBatch<C> {
                 command,
             }],
             timing_mode: DeviceTimingMode::Off,
+            reusable_execution_capture: None,
         }
     }
 
@@ -1982,6 +2344,7 @@ impl<C> DeviceCommandBatch<C> {
         Self {
             commands: Vec::with_capacity(capacity),
             timing_mode: DeviceTimingMode::Off,
+            reusable_execution_capture: None,
         }
     }
 
@@ -1989,7 +2352,26 @@ impl<C> DeviceCommandBatch<C> {
         Self {
             commands: Vec::with_capacity(capacity),
             timing_mode,
+            reusable_execution_capture: None,
         }
+    }
+
+    pub(crate) fn set_reusable_execution_capture(
+        &mut self,
+        capture: DeviceReusableExecutionCapture,
+    ) -> Result<(), VNextError> {
+        if self.reusable_execution_capture.is_some() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "device command batch already owns reusable execution capture metadata"
+                    .to_owned(),
+            });
+        }
+        self.reusable_execution_capture = Some(capture);
+        Ok(())
+    }
+
+    pub fn reusable_execution_capture(&self) -> Option<&DeviceReusableExecutionCapture> {
+        self.reusable_execution_capture.as_ref()
     }
 
     pub(crate) fn push_initialization(&mut self, command: C) {
@@ -2175,6 +2557,28 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         _stream: &Self::Stream,
     ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
         Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
+    /// Returns the immutable direct-submit catalog after preparation is sealed.
+    ///
+    /// Backends without direct reusable execution return an empty catalog.
+    fn reusable_execution_catalog(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Result<Vec<DeviceReusableExecutionProgram>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Encodes one lightweight reference to a resident reusable segment.
+    ///
+    /// Returning `None` selects the normal provider encoding path. The
+    /// reference itself owns no request resources; every dynamic target must be
+    /// retained by explicit per-wave binding commands and the completion fence.
+    fn encode_reusable_execution(
+        &self,
+        _invocation: DeviceReusableExecutionInvocation,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        Ok(None)
     }
 
     /// Releases reusable executable cache entries on a proven-quiescent

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
@@ -14,12 +14,12 @@ use super::{
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
     DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceRuntime, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId,
-    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
-    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave, ResourceId, StreamState,
-    VNextError,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram, DeviceRuntime,
+    DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
+    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
+    NodeId, PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
 };
 
 mod readback_collection;
@@ -63,6 +63,26 @@ struct ExecutionLaneState<S> {
     fail_closed: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutionLaneReusableExecutionCatalog {
+    epoch: u64,
+    programs: Vec<DeviceReusableExecutionProgram>,
+}
+
+impl ExecutionLaneReusableExecutionCatalog {
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn programs(&self) -> &[DeviceReusableExecutionProgram] {
+        &self.programs
+    }
+
+    pub fn into_parts(self) -> (u64, Vec<DeviceReusableExecutionProgram>) {
+        (self.epoch, self.programs)
+    }
+}
+
 enum LaneReadbackError<E> {
     Contract(VNextError),
     Device(E),
@@ -81,6 +101,7 @@ pub struct ExecutionLane<R: DeviceRuntime> {
     runtime: Arc<R>,
     descriptor: DeviceDescriptor,
     fail_closed: AtomicBool,
+    reusable_execution_epoch: AtomicU64,
     state: Mutex<ExecutionLaneState<R::Stream>>,
 }
 
@@ -120,6 +141,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             runtime,
             descriptor,
             fail_closed: AtomicBool::new(false),
+            reusable_execution_epoch: AtomicU64::new(1),
             state: Mutex::new(ExecutionLaneState {
                 stream,
                 in_flight: 0,
@@ -155,6 +177,10 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             .lock()
             .map(|state| state.in_flight)
             .unwrap_or(u64::MAX)
+    }
+
+    pub fn reusable_execution_epoch(&self) -> u64 {
+        self.reusable_execution_epoch.load(Ordering::Acquire)
     }
 
     fn with_quiescent_stream<T>(
@@ -242,6 +268,19 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         )
     }
 
+    pub fn reusable_execution_catalog(
+        &self,
+    ) -> Result<ExecutionLaneReusableExecutionCatalog, VNextError> {
+        self.with_quiescent_stream("inspect reusable execution catalog", |runtime, stream| {
+            runtime.reusable_execution_catalog(stream).map(|programs| {
+                ExecutionLaneReusableExecutionCatalog {
+                    epoch: self.reusable_execution_epoch(),
+                    programs,
+                }
+            })
+        })
+    }
+
     pub(crate) fn trim_reusable_executables_if_quiescent(&self) -> Result<bool, VNextError> {
         if self.fail_closed.load(Ordering::Acquire) {
             return Err(invalid_completion(
@@ -273,10 +312,22 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             self.runtime.trim_reusable_executables(&mut state.stream)
         }));
         match trimmed {
-            Ok(Ok(_))
+            Ok(Ok(trim))
                 if self.current_descriptor_matches_snapshot()
                     && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
             {
+                if trim.released_executables() != 0 {
+                    let epoch = self.reusable_execution_epoch.load(Ordering::Relaxed);
+                    let Some(next_epoch) = epoch.checked_add(1) else {
+                        state.fail_closed = true;
+                        self.fail_closed.store(true, Ordering::Release);
+                        return Err(invalid_completion(
+                            "reusable execution catalog epoch is exhausted",
+                        ));
+                    };
+                    self.reusable_execution_epoch
+                        .store(next_epoch, Ordering::Release);
+                }
                 Ok(true)
             }
             Ok(Ok(_)) => {
