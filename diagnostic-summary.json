@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "artifact_type": "cuda_replay_execution_span_diagnostic_summary",
+  "generated_at": "2026-07-24T04:51:33Z",
+  "decision": "KEEP_OBSERVABILITY_CHECKPOINT",
+  "formal_performance_goal_progress": false,
+  "formal_performance_claim_allowed": false,
+  "observability_checkpoint_keep": true,
+  "lane": {
+    "schema_version": 1,
+    "lane": "cuda-replay-span-narrow-diagnostic",
+    "instance_id": 45319871,
+    "hardware": "1x RTX 4090",
+    "hourly_usd": 0.46944444444444444,
+    "git_sha": "33fc6e46a64b56cc5f3f7d53020bc16b3db3c630",
+    "expected_runtime_minutes": [
+      18,
+      35
+    ],
+    "expected_cost_usd": [
+      0.1408333333,
+      0.2738425926
+    ],
+    "correctness_gate": "G08B focused c03 run, c05 serve, c06 streaming",
+    "build_command": "cargo build --release --locked --jobs 4 -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2",
+    "diagnostic_command": "ferrum serve --profile-detail full plus bench-serve c=1 random 64/16, 4 prompts, 1 repeat, seed 9271",
+    "formal_performance_claim": false,
+    "expected_signal": {
+      "reusable_span_count_min": 1,
+      "replay_span_measured_coverage": 1,
+      "replay_command_status": "covered_by_physical_span",
+      "replay_command_elapsed_must_be_null": true,
+      "replay_backend_unsupported_count": 0,
+      "command_range_membership_exact": true
+    },
+    "stop_condition": "build/correctness failure; no replay spans; measured coverage <100%; duplicate or invalid command ownership; or diagnostic PASS"
+  },
+  "source": {
+    "git_sha": "33fc6e46a64b56cc5f3f7d53020bc16b3db3c630",
+    "tree_sha": "96ae5a4f5a3e536925a0d3af660dd6c82897a19a",
+    "dirty": false,
+    "dirty_status": []
+  },
+  "binary": {
+    "sha256": "7e2b279eb8899c3dd3c7a0da938b00cbc11580dca679986347844ebb78101eb6",
+    "canonical_build_status": "pass",
+    "canonical_receipt_duration_seconds": 0.405077,
+    "actual_incremental_compile_duration_seconds": 293.913041,
+    "actual_incremental_compile_peak_group_threads": 34
+  },
+  "hardware": {
+    "id": "vast-45319871-rtx4090",
+    "gpu": "1x RTX 4090",
+    "instance_id": 45319871,
+    "hourly_usd": 0.46944444444444444
+  },
+  "correctness": {
+    "c03_status": "pass",
+    "c03_decision": "KEEP",
+    "c03_pass_line": "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/focused-c03-report.json",
+    "c05_c06_status": "pass",
+    "c05_c06_decision": "KEEP",
+    "c05_c06_pass_line": "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/focused-c05-c06-report.json"
+  },
+  "diagnostic_execution": {
+    "status": "pass",
+    "duration_seconds": 235.417023,
+    "peak_group_threads": 101,
+    "process_group_gone": true
+  },
+  "diagnostic_benchmark": {
+    "purpose": "profile-shape-only; not release performance evidence",
+    "concurrency": 1,
+    "requested_input_tokens": 64,
+    "requested_output_tokens": 16,
+    "repeats": 1,
+    "requests_per_repeat": 4,
+    "completed_per_run": [
+      4
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_throughput_tps_mean": 7.885163861189165,
+    "tpot_p50_ms_mean": 112.86395249999998
+  },
+  "replay_span_contract": {
+    "schema_version": 1,
+    "trace": "/workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/scheduler-trace.jsonl",
+    "native_event_count": 18450,
+    "replay_command_count": 16605,
+    "replay_physical_span_count": 405,
+    "replay_measured_span_count": 405,
+    "replay_measured_span_coverage": 1,
+    "replay_backend_unsupported_count": 0,
+    "replay_command_elapsed_non_null_count": 0,
+    "replay_command_status_mismatch_count": 0,
+    "eager_measured_command_count": 1845,
+    "eager_unavailable_command_count": 0,
+    "replay_span_elapsed_ns_total": 898469888,
+    "ownership_error_count": 0,
+    "ownership_errors": [],
+    "pass": true
+  },
+  "execution_breakdown": {
+    "schema_version": 1,
+    "trace": "/workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/scheduler-trace.jsonl",
+    "unclassified_profile_event_count": 0,
+    "pending_stage_count": 0,
+    "stage_breakdown": {
+      "decode": {
+        "frame_count": 75,
+        "submission_count": 75,
+        "replay_command_count": 12075,
+        "replay_span_count": 75,
+        "eager_command_count": 300,
+        "replay_elapsed_total_ns": 524689408,
+        "eager_elapsed_total_ns": 89788128,
+        "measured_work_average_us_per_submission": 8193.033813333333,
+        "replay_average_us_per_submission": 6995.858773333333,
+        "eager_average_us_per_submission": 1197.17504,
+        "first_interval_start_average_us": 4.06272,
+        "last_interval_end_average_us": 8203.624106666666,
+        "inter_interval_gap_average_us": 6.527573333333334,
+        "replay_fraction_of_measured_work": 0.8538789089272745,
+        "replay_span_count_distribution": [
+          1
+        ]
+      },
+      "prefill": {
+        "frame_count": 35,
+        "submission_count": 35,
+        "replay_command_count": 4530,
+        "replay_span_count": 330,
+        "eager_command_count": 1545,
+        "replay_elapsed_total_ns": 373780480,
+        "eager_elapsed_total_ns": 139089023,
+        "measured_work_average_us_per_submission": 14653.414371428571,
+        "replay_average_us_per_submission": 10679.442285714285,
+        "eager_average_us_per_submission": 3973.9720857142856,
+        "first_interval_start_average_us": 2.9997714285714285,
+        "last_interval_end_average_us": 14736.874028571428,
+        "inter_interval_gap_average_us": 80.45988571428572,
+        "replay_fraction_of_measured_work": 0.7288023128955671,
+        "replay_span_count_distribution": [
+          0,
+          11
+        ]
+      }
+    },
+    "pass": true
+  },
+  "eager_operation_breakdown": {
+    "schema_version": 1,
+    "frame_counts": {
+      "prefill": 35,
+      "decode": 75
+    },
+    "rows": [
+      {
+        "stage": "decode",
+        "native_op_id": "vnext_last_token_dense_linear",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 75,
+        "elapsed_ns": 80229376,
+        "average_us_per_command": 1069.7250133333334,
+        "average_us_per_frame": 1069.7250133333334
+      },
+      {
+        "stage": "decode",
+        "native_op_id": "vnext_program_binding_prelude",
+        "command_phase": "dynamicbinding",
+        "attribution_scope": "wave",
+        "count": 75,
+        "elapsed_ns": 7658528,
+        "average_us_per_command": 102.11370666666666,
+        "average_us_per_frame": 102.11370666666666
+      },
+      {
+        "stage": "decode",
+        "native_op_id": "host upload",
+        "command_phase": "dynamicbinding",
+        "attribution_scope": "wave",
+        "count": 75,
+        "elapsed_ns": 1508800,
+        "average_us_per_command": 20.11733333333333,
+        "average_us_per_frame": 20.11733333333333
+      },
+      {
+        "stage": "decode",
+        "native_op_id": "vnext_token_embedding",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 75,
+        "elapsed_ns": 391424,
+        "average_us_per_command": 5.218986666666667,
+        "average_us_per_frame": 5.218986666666667
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext.causal_attention.vllm_varlen_q4_addressed",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 350,
+        "elapsed_ns": 46201056,
+        "average_us_per_command": 132.00301714285715,
+        "average_us_per_frame": 1320.0301714285715
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_last_token_dense_linear",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 35,
+        "elapsed_ns": 37255295,
+        "average_us_per_command": 1064.437,
+        "average_us_per_frame": 1064.437
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_gated_delta_recurrent_attention",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 150,
+        "elapsed_ns": 26102240,
+        "average_us_per_command": 174.01493333333332,
+        "average_us_per_frame": 745.7782857142856
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_routed_shared_swiglu_moe",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 200,
+        "elapsed_ns": 21686912,
+        "average_us_per_command": 108.43456,
+        "average_us_per_frame": 619.6260571428571
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_program_binding_prelude",
+        "command_phase": "dynamicbinding",
+        "attribution_scope": "wave",
+        "count": 35,
+        "elapsed_ns": 4224096,
+        "average_us_per_command": 120.68845714285713,
+        "average_us_per_frame": 120.68845714285713
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "device zero",
+        "command_phase": "initialization",
+        "attribution_scope": "wave",
+        "count": 300,
+        "elapsed_ns": 1425984,
+        "average_us_per_command": 4.75328,
+        "average_us_per_frame": 40.7424
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_rms_norm",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 205,
+        "elapsed_ns": 827200,
+        "average_us_per_command": 4.035121951219512,
+        "average_us_per_frame": 23.634285714285713
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_residual_add",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 200,
+        "elapsed_ns": 619328,
+        "average_us_per_command": 3.09664,
+        "average_us_per_frame": 17.695085714285714
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "host upload",
+        "command_phase": "dynamicbinding",
+        "attribution_scope": "wave",
+        "count": 35,
+        "elapsed_ns": 531552,
+        "average_us_per_command": 15.1872,
+        "average_us_per_frame": 15.1872
+      },
+      {
+        "stage": "prefill",
+        "native_op_id": "vnext_token_embedding",
+        "command_phase": "compute",
+        "attribution_scope": "node",
+        "count": 35,
+        "elapsed_ns": 215360,
+        "average_us_per_command": 6.153142857142857,
+        "average_us_per_frame": 6.153142857142857
+      }
+    ]
+  },
+  "pass_lines": [
+    "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/focused-c03-report.json",
+    "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/focused-c05-c06-report.json",
+    "CUDA REPLAY EXECUTION SPAN TRACE PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-span-summary.json",
+    "CUDA REPLAY EXECUTION BREAKDOWN PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-breakdown-summary.json"
+  ],
+  "rejected_attempts": [
+    {
+      "failure_class": "artifact_shape_missing_canonical_build_receipt",
+      "path": "rejected-attempts/manifest-missing-build-receipt",
+      "source_or_runtime_failure": false
+    }
+  ],
+  "conclusion": {
+    "decode_submission_average_us": 8203.624106666666,
+    "decode_replay_average_us": 6995.858773333333,
+    "decode_replay_fraction": 0.8538789089272745,
+    "decode_eager_average_us": 1197.17504,
+    "decode_inter_interval_gap_average_us": 6.527573333333334,
+    "primary_bottleneck": "CUDA graph replay body",
+    "secondary_bottleneck": "eager vnext_last_token_dense_linear",
+    "next_hypothesis": "Kernel-activity profiling inside the decode CUDA graph will identify one or more replayed kernels accounting for the 6.996 ms replay body; no broad throughput sweep is justified before that evidence.",
+    "next_stop_condition": "Produce a kernel-level replay breakdown with >=95% classified replay duration or reject the profiler path without another throughput sweep."
+  }
+}
