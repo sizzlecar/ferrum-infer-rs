@@ -816,6 +816,58 @@ Vast `45319871` is again `stopped/exited`; active or transitional siblings are
 bounded same-process attribution must separate provider-node encode cost from
 host-wide variance and name the next measurable source signal.
 
+### 2026-07-24 Single-Token Packed-Decode Rejection
+
+Clean source `67921b1c55a093c43e5e6a4ea5f60c7916a962df` and CUDA binary
+SHA256
+`1a6c582c6af39bf22bfd9f9d6d9a138334ba1b397a6280d955bb376531b1d8d3`
+passed the bounded actual-model product paths:
+
+- `c03-001`: resident multi-turn `ferrum run`;
+- `c05-001`: non-streaming OpenAI-compatible `ferrum serve`;
+- `c06-001`: streaming `ferrum serve`;
+- result: `3/3 pass`, zero request error, zero quality issue, and usage-derived
+  token counts.
+
+The typed single-token topology removed two transfers and two compute
+dispatches per recurrent layer. Full-profile evidence observed 75 decode
+correlations and 2,250 recurrent-layer events, all at
+`9 compute / 0 transfer`, versus `11 / 2` before the candidate. The recurrent
+decode contribution moved from `330` to `270` compute dispatches per
+correlation; physical replay span improved from `6.888088 ms` to
+`6.195692 ms` (`10.05%`).
+
+The bounded profile-off random `64/32`, c1, `25 x 3`, five-warmup, seed `9271`
+check completed `75/75` without error. Its
+`54.612796 +/- 10.026469 tok/s` mean missed the predeclared
+`59.887970 tok/s` acceptance line and remained `28.29%` below the formal
+floor. The structural result is retained as evidence, but the source candidate
+is rejected:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: focused-c03-c05-c06-report.json
+CUDA PACKED DECODE STRUCTURAL KEEP: dispatch-diagnostic/dispatch-summary.json
+CUDA PACKED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commit `b0286270` reverted the packed-decode candidate after local replay
+contracts passed `9/9`, the ferrum-kernels all-target check passed, and
+formatting passed. The active branch therefore does not ship this
+performance-rejected path.
+
+The sanitized GitHub asset is
+[runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z-sanitized.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z-sanitized.tar.zst),
+asset id `488525573`, size `28,247,157` bytes, SHA256
+`152c6cb4257c7656ab7f3fd3722713da97f0e109b7216b9f2c7970969838cc07`.
+The locally verified evidence root is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z/`.
+Vast `45319871` is `stopped/exited`; there is no paid sibling.
+
+No repeat benchmark is authorized. A successor must compute Q/K normalization
+once per key head instead of once per value-tile block, retain the indirect
+state and fence contracts, and prove numeric/ABI behavior locally before a
+new paid lane.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

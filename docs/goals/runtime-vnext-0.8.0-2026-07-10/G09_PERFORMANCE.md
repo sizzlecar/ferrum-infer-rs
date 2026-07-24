@@ -662,6 +662,68 @@ requires existing full-profile or bounded same-process attribution to isolate
 `provider_node_encode` from host-wide variance, followed by one source-level
 hypothesis with a named stage delta.
 
+### 2026-07-24 Rejected Single-Token Packed-Decode Candidate
+
+Clean candidate `67921b1c55a093c43e5e6a4ea5f60c7916a962df`, binary SHA256
+`1a6c582c6af39bf22bfd9f9d6d9a138334ba1b397a6280d955bb376531b1d8d3`,
+implemented a typed single-token recurrent topology. The CUDA build completed
+in `295.411386 s`. Correctness ran before profiling or throughput:
+
+- actual-model `c03-001 ferrum run`, `c05-001 ferrum serve`, and `c06-001`
+  streaming serve passed `3/3`;
+- all three cases passed execution-envelope, expectation, model-binding, and
+  scenario-oracle checks;
+- the runner printed `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`.
+
+The full-profile structural prediction was exact. Across 75 decode
+correlations and 2,250 recurrent-layer observations, each recurrent layer
+moved from `11 compute + 2 transfer` commands to `9 compute + 0 transfer`.
+The recurrent contribution therefore moved from `330` to `270` compute
+dispatches per decode correlation. Mean physical replay span moved from
+`6.888088 ms` to `6.195692 ms`, an improvement of `0.692397 ms` or `10.05%`.
+The full-profile diagnostic throughput also moved from `7.454970` to
+`7.918762 tok/s`; profile-on throughput is not a product performance claim.
+
+The bounded profile-off check used random `64/32`, concurrency one, 25 measured
+requests plus five warmups per repeat, three repeats, seed `9271`,
+`--fail-on-error --require-ci`, and usage token counts. It completed `75/75`
+with zero request or quality error. Repeat throughput was
+`54.6932 / 58.6079 / 50.5373 tok/s`, mean
+`54.6128 +/- 10.0265 tok/s`. This missed the predeclared current-path
+`59.887970 tok/s` line by `5.275174 tok/s` and the unchanged
+`76.1583 tok/s` formal floor by `21.545504 tok/s` (`28.29%`). The smaller
+diagnostic request count does not prove a formal regression, but it cannot
+accept the candidate or authorize a full sweep.
+
+The result is therefore structural KEEP and candidate REJECT:
+
+```text
+CUDA PACKED DECODE STRUCTURAL KEEP: dispatch-diagnostic/dispatch-summary.json
+CUDA PACKED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commit `b0286270` explicitly reverted the two candidate commits after targeted
+verification: the CUDA replay source contracts passed `9/9`,
+`cargo check -p ferrum-kernels --all-targets` passed, and formatting passed.
+The rejected implementation remains in Git history for diagnosis but is not
+present in the active source tree.
+
+The sanitized GitHub evidence asset is
+[runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z-sanitized.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z-sanitized.tar.zst),
+asset id `488525573`, size `28,247,157` bytes, SHA256
+`152c6cb4257c7656ab7f3fd3722713da97f0e109b7216b9f2c7970969838cc07`.
+It was verified locally under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
+
+This exact candidate must not be rerun. Source review found that its packed
+delta kernel normalizes Q/K inside each value-tile block. A successor must
+first move normalization to a once-per-key-head stage, preserve the typed
+topology and indirect-state lifetime contract, and pass local numeric/ABI
+coverage. Before another paid run it must predict both a physical replay span
+below `6.195692 ms` and profile-off throughput at or above
+`59.887970 tok/s`; otherwise work remains offline.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
