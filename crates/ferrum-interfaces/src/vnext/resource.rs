@@ -51,6 +51,8 @@ pub use recovery::*;
 mod backing_extent;
 use backing_extent::{backing_segment_range, FreeExtentIndex};
 pub use backing_extent::{BackingChunkIdentity, BackingSegment};
+mod program_binding;
+pub use program_binding::*;
 mod dynamic_pool;
 pub use dynamic_pool::*;
 mod dynamic_pool_maintenance;

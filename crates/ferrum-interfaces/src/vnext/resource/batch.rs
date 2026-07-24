@@ -4,11 +4,11 @@ use super::{
     BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
     CapacityDomainId, CapacityEntry, CapacityUnits, CapacityVector, DeviceRuntime, Digest,
     DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId, ExecutionLane,
-    LaneStableArenaSlotLease, LogicalBackingSliceAuthority, LogicalBatchCapacityLease, Mutex,
-    NodeId, ParticipantFlightPhase, ParticipantNodeKey, PhysicalBackingClaimIdentity,
-    PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash, RequestAuthorityId,
-    SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch,
-    SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
+    LaneStableArenaSlotIdentity, LaneStableArenaSlotLease, LogicalBackingSliceAuthority,
+    LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
+    PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash,
+    RequestAuthorityId, SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession,
+    SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
     SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
     TrustedPlanRuntimeEvidence, VNextError,
 };
@@ -1796,6 +1796,12 @@ impl ClaimedBackingTransaction {
         self.backing_slices
             .iter()
             .any(|slice| slice.evidence().physical_claim_identity().is_shared())
+    }
+
+    pub fn lane_stable_slot_identity(&self) -> Option<LaneStableArenaSlotIdentity> {
+        self._lane_slot_lease
+            .as_ref()
+            .map(LaneStableArenaSlotLease::identity)
     }
 }
 

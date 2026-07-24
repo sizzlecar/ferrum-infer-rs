@@ -1,17 +1,18 @@
 use super::{
-    backing_segment_range, invalid_resource, validate_runtime_descriptor_for_admission,
-    AllocationLifetime, AllocationSeal, Arc, AtomicU64, AtomicU8, BTreeMap, BackingChunkIdentity,
-    BackingSegment, BufferDescriptor, BufferRequest, BufferUsage, CapacityAvailabilityEpoch,
-    CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
-    CapacityWaitCondition, DeviceAllocationPermit, DeviceBufferRetention,
-    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
-    DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
-    DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageView, ElementType, ExecutionLane, ExecutionLaneId,
-    FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering,
-    PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
-    ResourceTransactionIdentity, RunId, Serialize, StateInitialization, StaticProvisioningBinding,
-    StepResourceSlotKind, TransactionId, VNextError, Weak,
+    backing_segment_range, compile_program_binding_layouts, invalid_resource,
+    lane_stable_layout_fingerprint, validate_runtime_descriptor_for_admission, AllocationLifetime,
+    AllocationSeal, Arc, AtomicU64, AtomicU8, BTreeMap, BackingChunkIdentity, BackingSegment,
+    BufferDescriptor, BufferRequest, BufferUsage, CapacityAvailabilityEpoch, CapacityDomainId,
+    CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitCondition,
+    DeviceAllocationPermit, DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot,
+    DeviceCapacityBudget, DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime,
+    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, ElementType, ExecutionLane,
+    ExecutionLaneId, FreeExtentIndex, InvocationLivenessMode, LaneStableArenaSlotIdentity,
+    LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode, ProgramBindingLayout, ResourceId,
+    ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
+    StateInitialization, StaticProvisioningBinding, StepResourceSlotKind, TransactionId,
+    VNextError, Weak,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
@@ -160,7 +161,7 @@ pub(super) struct SubmissionWaveDomainCapacityLayout {
     pub(super) projections: Vec<SubmissionWaveProjectionCapacity>,
 }
 
-fn compile_submission_wave_domain_layout(
+pub(super) fn compile_submission_wave_domain_layout(
     domain: &DynamicPoolDomainSpec,
     nodes: &[PlanNode],
 ) -> Result<Option<SubmissionWaveDomainLayout>, VNextError> {
@@ -248,7 +249,7 @@ fn compile_submission_wave_domain_layout(
     }))
 }
 
-fn compile_submission_wave_reusable_capacity_layouts(
+pub(super) fn compile_submission_wave_reusable_capacity_layouts(
     domains: &[DynamicPoolDomainSpec],
     layouts: &[Option<SubmissionWaveDomainLayout>],
     reusable_execution: Option<&ReusableExecutionMemoryPlan>,
@@ -1384,6 +1385,7 @@ struct LaneStableArenaKey {
     lane_id: ExecutionLaneId,
     lifetime: AllocationLifetime,
     reusable_execution_bucket_id: ReusableExecutionBucketId,
+    layout_fingerprint: String,
 }
 
 struct LaneStableProjectionBinding {
@@ -1636,6 +1638,18 @@ pub(super) struct LaneStableArenaSlotLease {
     slot_id: u64,
 }
 
+impl LaneStableArenaSlotLease {
+    pub(super) fn identity(&self) -> LaneStableArenaSlotIdentity {
+        LaneStableArenaSlotIdentity::new(
+            self.key.lane_id,
+            self.key.lifetime,
+            self.key.reusable_execution_bucket_id.clone(),
+            self.key.layout_fingerprint.clone(),
+            self.slot_id,
+        )
+    }
+}
+
 impl Drop for LaneStableArenaSlotLease {
     fn drop(&mut self) {
         let mut arenas = match self.arenas.lock() {
@@ -1725,6 +1739,7 @@ fn lane_stable_layout_key(
         lane_id,
         lifetime,
         reusable_execution_bucket_id: bucket_id.clone(),
+        layout_fingerprint: lane_stable_layout_fingerprint(lifetime, bucket_id, requests)?,
     })
 }
 
@@ -1738,6 +1753,7 @@ where
     pub(super) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(super) submission_wave_reusable_capacity_layouts:
         BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
+    pub(super) program_binding_layouts: BTreeMap<ReusableExecutionBucketId, ProgramBindingLayout>,
     pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) budget: Arc<DeviceCapacityBudget>,
@@ -2075,6 +2091,12 @@ where
                 &submission_wave_layouts,
                 reusable_execution.as_ref(),
             )?;
+        let program_binding_layouts = compile_program_binding_layouts(
+            &domains,
+            &nodes,
+            &submission_wave_layouts,
+            &submission_wave_reusable_capacity_layouts,
+        )?;
         let mut pools = BTreeMap::new();
         for domain in &domains {
             let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
@@ -2115,9 +2137,17 @@ where
             nodes,
             submission_wave_layouts,
             submission_wave_reusable_capacity_layouts,
+            program_binding_layouts,
             reusable_execution,
             lane_stable_arenas: Arc::new(Mutex::new(LaneStableArenaState::default())),
         })
+    }
+
+    pub(super) fn program_binding_layout(
+        &self,
+        bucket_id: &ReusableExecutionBucketId,
+    ) -> Option<&ProgramBindingLayout> {
+        self.program_binding_layouts.get(bucket_id)
     }
 
     pub(super) fn write_capacity_availability(
