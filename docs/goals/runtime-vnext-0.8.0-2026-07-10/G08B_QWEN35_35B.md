@@ -991,6 +991,32 @@ resource/host/provider increase and predict which direct-path boundary will
 move. A new source delta must be derived from that attribution, not stacked on
 either rejected kernel.
 
+### 2026-07-25 Lane-Stable Backing Certificate Keep
+
+G09's source-level resource audit produced an accepted shared-runtime change,
+not a Qwen3.5/CUDA special case. Clean source `24a2c651` compiles immutable
+physical backing authority once per lane-stable slot while preserving
+per-wave logical demand, admission, defer/wait/retry, and fence ownership.
+Qwen3.5-35B-A3B-GPTQ actual-model `run`, non-streaming `serve`, and streaming
+`serve` passed `3/3` with zero request or quality error.
+
+The bounded Basic artifact reduced transaction validation/fingerprinting from
+`1064.203` to `4.101 us/wave` and submission-wave preparation from `1139.794`
+to `169.975 us/wave`. A single profile-off diagnostic completed `25/25` at
+`60.1407 tok/s`; this is a KEEP signal, not a formal G08B performance pass.
+The unchanged `76.1583 tok/s` floor remains open.
+
+```text
+CUDA BACKING CERTIFICATE BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-backing-certificate-cuda-24a2c651-20260724T222019Z
+```
+
+The verified local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-backing-certificate-cuda-24a2c651-20260724T222019Z/`;
+the GitHub artifact branch is
+`artifact/runtime-vnext-backing-certificate-24a2c651-20260725` at
+`5c4ef937`. Detailed phase evidence and the next paid-run restriction are
+owned by `G09_PERFORMANCE.md`.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
