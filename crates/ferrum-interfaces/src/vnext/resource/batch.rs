@@ -1,17 +1,16 @@
 use super::{
     fmt, invalid_resource, ActiveSequenceFrame, AdmissionDeferred, AdmissionDemand,
-    AdmissionRejected, AdmittedSequenceResources, Arc, BTreeMap, BatchInvocationId,
-    BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
-    CapacityDomainId, CapacityEntry, CapacityUnits, CapacityVector, DeviceRuntime, Digest,
-    DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId, ExecutionLane,
+    AdmissionRejected, AdmittedSequenceResources, Arc, BTreeMap, BackingClaimCertificate,
+    BatchInvocationId, BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId,
+    BatchWorkShape, CommittedLaneBackingClaim, DeviceRuntime, Digest, DynamicBackingDeferred,
+    DynamicDeferredMaintenanceOutcome, ExecutionFrameId, ExecutionLane,
     LaneStableArenaSlotIdentity, LaneStableArenaSlotLease, LogicalBackingSliceAuthority,
     LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
-    PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash,
-    ProgramBindingExecutionBinding, ProgramBindingLayout, ProgramBindingNodeBinding,
-    RequestAuthorityId, SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession,
-    SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
-    SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
-    TrustedPlanRuntimeEvidence, VNextError,
+    PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash, ProgramBindingExecutionBinding,
+    ProgramBindingLayout, ProgramBindingNodeBinding, RequestAuthorityId, SequenceAuthorityId,
+    SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
+    SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
+    StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 use crate::vnext::DeviceReusableExecutionProgramId;
 use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
@@ -1567,105 +1566,10 @@ pub struct ClaimedBackingTransaction {
     work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
+    physical_claim_count: usize,
+    has_shared_physical_claims: bool,
     // Occupancy releases after every physical/logical claim field above.
     _lane_slot_lease: Option<LaneStableArenaSlotLease>,
-}
-
-fn validate_backing_claim(
-    backing_slices: &[LogicalBackingSliceAuthority],
-    demand: &AdmissionDemand,
-) -> Result<(), VNextError> {
-    let reusable_execution_bucket_id = backing_slices
-        .first()
-        .and_then(|slice| slice.evidence().reusable_execution_bucket_id());
-    if backing_slices.iter().any(|slice| {
-        slice.evidence().reusable_execution_bucket_id() != reusable_execution_bucket_id
-    }) {
-        return Err(invalid_resource(
-            "one backing transaction cannot mix reusable execution buckets",
-        ));
-    }
-    let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
-    let mut physical_claims = BTreeMap::<
-        PhysicalBackingClaimIdentity,
-        (Arc<super::BackingSegmentLease>, CapacityDomainId, u64),
-    >::new();
-    for slice in backing_slices {
-        let evidence = slice.evidence();
-        let claim_identity = evidence.physical_claim_identity();
-        if claim_identity.pool_id() != evidence.pool_id()
-            || claim_identity
-                .resource_ids()
-                .binary_search(evidence.resource_id())
-                .is_err()
-            || slice.segment_lease.claim_identity != *claim_identity
-            || slice.segment_lease.segment_generation != evidence.segment_generation()
-            || slice.segment_lease.size_bytes != evidence.physical_size_bytes()
-            || evidence.size_bytes() == 0
-            || evidence.size_bytes() > evidence.capacity_size_bytes()
-            || evidence
-                .physical_offset_bytes()
-                .checked_add(evidence.capacity_size_bytes())
-                .is_none_or(|end| end > evidence.physical_size_bytes())
-        {
-            return Err(invalid_resource(
-                "logical backing projection differs from its physical claim authority",
-            ));
-        }
-        match physical_claims.entry(claim_identity.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let total = backing_by_domain.entry(slice.domain_id()).or_default();
-                *total = total
-                    .checked_add(evidence.physical_size_bytes())
-                    .ok_or_else(|| invalid_resource("claimed backing domain bytes overflow u64"))?;
-                entry.insert((
-                    Arc::clone(&slice.segment_lease),
-                    slice.domain_id(),
-                    evidence.physical_size_bytes(),
-                ));
-            }
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                let (lease, domain_id, size_bytes) = entry.get();
-                if !Arc::ptr_eq(lease, &slice.segment_lease)
-                    || *domain_id != slice.domain_id()
-                    || *size_bytes != evidence.physical_size_bytes()
-                {
-                    return Err(invalid_resource(
-                        "shared logical projections do not retain one physical claim",
-                    ));
-                }
-            }
-        }
-    }
-    let backing_claim = if backing_by_domain.is_empty() {
-        CapacityVector::empty()
-    } else {
-        CapacityVector::new(
-            backing_by_domain
-                .into_iter()
-                .map(|(domain, bytes)| CapacityEntry::new(domain, CapacityUnits::new(bytes)))
-                .collect::<Result<Vec<_>, _>>()?,
-        )?
-    };
-    let physical_covers_logical = backing_claim.entries().len()
-        == demand.immediate_claim().entries().len()
-        && backing_claim.entries().iter().all(|physical| {
-            demand
-                .immediate_claim()
-                .units_for(physical.domain())
-                .is_some_and(|logical| physical.units().get() >= logical.get())
-        });
-    let claim_matches = if reusable_execution_bucket_id.is_some() {
-        physical_covers_logical
-    } else {
-        backing_claim == *demand.immediate_claim()
-    };
-    if !claim_matches {
-        return Err(invalid_resource(
-            "physical backing does not cover the exact evaluated logical demand",
-        ));
-    }
-    Ok(())
 }
 
 fn logical_capacity_matches(
@@ -1699,7 +1603,44 @@ impl ClaimedBackingTransaction {
         backing_slices: Vec<LogicalBackingSliceAuthority>,
         lane_slot_lease: Option<LaneStableArenaSlotLease>,
     ) -> Result<Self, VNextError> {
-        validate_backing_claim(&backing_slices, &demand)?;
+        let certificate = Arc::new(BackingClaimCertificate::from_slices(&backing_slices)?);
+        Self::new_certified(
+            work_shape,
+            demand,
+            logical_capacity,
+            backing_slices,
+            certificate,
+            lane_slot_lease,
+        )
+    }
+
+    pub(super) fn new_lane_stable(
+        work_shape: Arc<BatchWorkShape>,
+        demand: AdmissionDemand,
+        logical_capacity: Option<LogicalBatchCapacityLease>,
+        committed_backing: CommittedLaneBackingClaim,
+    ) -> Result<Self, VNextError> {
+        let (backing_slices, certificate, lane_slot_lease) =
+            committed_backing.into_certified_parts();
+        Self::new_certified(
+            work_shape,
+            demand,
+            logical_capacity,
+            backing_slices,
+            certificate,
+            lane_slot_lease,
+        )
+    }
+
+    fn new_certified(
+        work_shape: Arc<BatchWorkShape>,
+        demand: AdmissionDemand,
+        logical_capacity: Option<LogicalBatchCapacityLease>,
+        backing_slices: Vec<LogicalBackingSliceAuthority>,
+        certificate: Arc<BackingClaimCertificate>,
+        lane_slot_lease: Option<LaneStableArenaSlotLease>,
+    ) -> Result<Self, VNextError> {
+        let bound_certificate = certificate.bind(&backing_slices, &demand)?;
         if !logical_capacity_matches(
             &logical_capacity,
             &demand,
@@ -1711,31 +1652,18 @@ impl ClaimedBackingTransaction {
             ));
         }
         #[derive(Serialize)]
-        struct BackingFingerprint<'a> {
-            allocation_fingerprint: &'a str,
-            logical_size_bytes: u64,
-        }
-
-        #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
             work_fingerprint: &'a str,
             demand: &'a AdmissionDemand,
-            backing: Vec<BackingFingerprint<'a>>,
+            backing_certificate_fingerprint: &'a str,
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-backing.v4",
+            domain: "ferrum.runtime-vnext.claimed-backing.v5",
             work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
-            backing: backing_slices
-                .iter()
-                .map(LogicalBackingSliceAuthority::evidence)
-                .map(|evidence| BackingFingerprint {
-                    allocation_fingerprint: evidence.allocation_fingerprint(),
-                    logical_size_bytes: evidence.size_bytes(),
-                })
-                .collect(),
+            backing_certificate_fingerprint: bound_certificate.fingerprint(),
             capacity_parents: logical_capacity
                 .as_ref()
                 .map(|capacity| {
@@ -1758,6 +1686,8 @@ impl ClaimedBackingTransaction {
             work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            physical_claim_count: bound_certificate.physical_claim_count(),
+            has_shared_physical_claims: bound_certificate.has_shared_physical_claims(),
             _lane_slot_lease: lane_slot_lease,
         })
     }
@@ -1787,17 +1717,11 @@ impl ClaimedBackingTransaction {
     }
 
     pub fn physical_claim_count(&self) -> usize {
-        self.backing_slices
-            .iter()
-            .map(|slice| slice.evidence().physical_claim_identity())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
+        self.physical_claim_count
     }
 
     pub fn has_shared_physical_claims(&self) -> bool {
-        self.backing_slices
-            .iter()
-            .any(|slice| slice.evidence().physical_claim_identity().is_shared())
+        self.has_shared_physical_claims
     }
 
     pub fn lane_stable_slot_identity(&self) -> Option<LaneStableArenaSlotIdentity> {
@@ -1820,6 +1744,7 @@ pub struct ClaimedSubmissionWaveBacking {
     work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
+    physical_claim_count: usize,
     program_binding: Option<Arc<ProgramBindingExecutionBinding>>,
     // Occupancy releases only after terminal completion readback drops this claim.
     _lane_slot_lease: Option<LaneStableArenaSlotLease>,
@@ -1832,10 +1757,11 @@ impl ClaimedSubmissionWaveBacking {
         work_shape: Arc<BatchWorkShape>,
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
-        backing_slices: Vec<LogicalBackingSliceAuthority>,
+        committed_backing: CommittedLaneBackingClaim,
         program_binding_layout: Option<Arc<ProgramBindingLayout>>,
-        lane_slot_lease: Option<LaneStableArenaSlotLease>,
     ) -> Result<Self, VNextError> {
+        let (backing_slices, certificate, lane_slot_lease) =
+            committed_backing.into_certified_parts();
         let participants = work_shape.participants();
         if node_count == 0
             || participants.is_empty()
@@ -1847,7 +1773,7 @@ impl ClaimedSubmissionWaveBacking {
                 "submission wave backing requires ordered unique nodes and participants",
             ));
         }
-        validate_backing_claim(&backing_slices, &demand)?;
+        let bound_certificate = certificate.bind(&backing_slices, &demand)?;
         if !logical_capacity_matches(&logical_capacity, &demand, participants, &backing_slices) {
             return Err(invalid_resource(
                 "submission wave capacity differs from its participants or evaluated demand",
@@ -1874,35 +1800,22 @@ impl ClaimedSubmissionWaveBacking {
             .transpose()?;
 
         #[derive(Serialize)]
-        struct BackingFingerprint<'a> {
-            allocation_fingerprint: &'a str,
-            logical_size_bytes: u64,
-        }
-
-        #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
             plan_hash: &'a PlanHash,
             node_count: usize,
             work_fingerprint: &'a str,
             demand: &'a AdmissionDemand,
-            backing: Vec<BackingFingerprint<'a>>,
+            backing_certificate_fingerprint: &'a str,
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v4",
+            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v5",
             plan_hash: &plan_hash,
             node_count,
             work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
-            backing: backing_slices
-                .iter()
-                .map(LogicalBackingSliceAuthority::evidence)
-                .map(|evidence| BackingFingerprint {
-                    allocation_fingerprint: evidence.allocation_fingerprint(),
-                    logical_size_bytes: evidence.size_bytes(),
-                })
-                .collect(),
+            backing_certificate_fingerprint: bound_certificate.fingerprint(),
             capacity_parents: logical_capacity
                 .as_ref()
                 .map(|capacity| {
@@ -1927,6 +1840,7 @@ impl ClaimedSubmissionWaveBacking {
             work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            physical_claim_count: bound_certificate.physical_claim_count(),
             program_binding,
             _lane_slot_lease: lane_slot_lease,
         })
@@ -2031,11 +1945,7 @@ impl ClaimedSubmissionWaveBacking {
     }
 
     pub fn physical_claim_count(&self) -> usize {
-        self.backing_slices
-            .iter()
-            .map(|slice| slice.evidence().physical_claim_identity())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
+        self.physical_claim_count
     }
 }
 

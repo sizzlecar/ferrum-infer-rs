@@ -448,6 +448,7 @@ fn reusable_wave_keeps_compiled_physical_layout_while_logical_demand_changes() {
     let first_slices = first_wave.claimed_backing().backing_slices();
     let first_physical = physical_slice_identities(first_slices);
     let first_logical = logical_slice_sizes(first_slices);
+    let first_claimed_fingerprint = first_wave.claimed_backing().fingerprint().to_owned();
     let wire = serde_json::to_value(first_slices[0].evidence()).unwrap();
     assert_eq!(
         wire.as_object()
@@ -492,6 +493,11 @@ fn reusable_wave_keeps_compiled_physical_layout_while_logical_demand_changes() {
         logical_slice_sizes(second_slices),
         first_logical,
         "logical per-wave demand must remain dynamic inside a reusable capacity bucket"
+    );
+    assert_ne!(
+        second_wave.claimed_backing().fingerprint(),
+        first_claimed_fingerprint,
+        "dynamic logical projection changes must remain visible above the reused physical certificate"
     );
 
     drop(second_wave);

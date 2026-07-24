@@ -1345,12 +1345,226 @@ where
     Deferred(DynamicBackingDeferred),
 }
 
+/// Cold physical-layout proof for one committed backing claim.
+///
+/// Lane-stable arenas build this once when a slot is published. Reusing the
+/// slot only binds the current logical projection sizes, so hot admission does
+/// not need to reconstruct physical-claim maps or re-encode allocation
+/// evidence on every wave.
+#[derive(Debug)]
+pub(super) struct BackingClaimCertificate {
+    allocations: Box<[Arc<LogicalBackingSliceAllocationEvidence>]>,
+    physical_capacity: CapacityVector,
+    reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
+    physical_claim_count: usize,
+    has_shared_physical_claims: bool,
+    fingerprint: String,
+}
+
+#[derive(Debug)]
+pub(super) struct BoundBackingClaimCertificate {
+    fingerprint: String,
+    physical_claim_count: usize,
+    has_shared_physical_claims: bool,
+}
+
+impl BoundBackingClaimCertificate {
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(super) const fn physical_claim_count(&self) -> usize {
+        self.physical_claim_count
+    }
+
+    pub(super) const fn has_shared_physical_claims(&self) -> bool {
+        self.has_shared_physical_claims
+    }
+}
+
+impl BackingClaimCertificate {
+    pub(super) fn from_slices(
+        backing_slices: &[LogicalBackingSliceAuthority],
+    ) -> Result<Self, VNextError> {
+        if backing_slices
+            .windows(2)
+            .any(|pair| pair[0].resource_id() >= pair[1].resource_id())
+        {
+            return Err(invalid_resource(
+                "backing claim certificate requires canonical unique logical projections",
+            ));
+        }
+        let reusable_execution_bucket_id = backing_slices
+            .first()
+            .and_then(|slice| slice.evidence().reusable_execution_bucket_id())
+            .cloned();
+        if backing_slices.iter().any(|slice| {
+            slice.evidence().reusable_execution_bucket_id() != reusable_execution_bucket_id.as_ref()
+        }) {
+            return Err(invalid_resource(
+                "one backing certificate cannot mix reusable execution buckets",
+            ));
+        }
+
+        let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
+        let mut physical_claims = BTreeMap::<
+            PhysicalBackingClaimIdentity,
+            (Arc<BackingSegmentLease>, CapacityDomainId, u64),
+        >::new();
+        let mut has_shared_physical_claims = false;
+        for slice in backing_slices {
+            let evidence = slice.evidence();
+            let claim_identity = evidence.physical_claim_identity();
+            if claim_identity.pool_id() != evidence.pool_id()
+                || claim_identity
+                    .resource_ids()
+                    .binary_search(evidence.resource_id())
+                    .is_err()
+                || slice.segment_lease.claim_identity != *claim_identity
+                || slice.segment_lease.segment_generation != evidence.segment_generation()
+                || slice.segment_lease.size_bytes != evidence.physical_size_bytes()
+                || evidence.size_bytes() == 0
+                || evidence.size_bytes() > evidence.capacity_size_bytes()
+                || evidence
+                    .physical_offset_bytes()
+                    .checked_add(evidence.capacity_size_bytes())
+                    .is_none_or(|end| end > evidence.physical_size_bytes())
+            {
+                return Err(invalid_resource(
+                    "logical backing projection differs from its physical claim authority",
+                ));
+            }
+            has_shared_physical_claims |= claim_identity.is_shared();
+            match physical_claims.entry(claim_identity.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let total = backing_by_domain.entry(slice.domain_id()).or_default();
+                    *total = total
+                        .checked_add(evidence.physical_size_bytes())
+                        .ok_or_else(|| {
+                            invalid_resource("certified backing domain bytes overflow u64")
+                        })?;
+                    entry.insert((
+                        Arc::clone(&slice.segment_lease),
+                        slice.domain_id(),
+                        evidence.physical_size_bytes(),
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    let (lease, domain_id, size_bytes) = entry.get();
+                    if !Arc::ptr_eq(lease, &slice.segment_lease)
+                        || *domain_id != slice.domain_id()
+                        || *size_bytes != evidence.physical_size_bytes()
+                    {
+                        return Err(invalid_resource(
+                            "shared logical projections do not retain one physical claim",
+                        ));
+                    }
+                }
+            }
+        }
+        let physical_capacity = if backing_by_domain.is_empty() {
+            CapacityVector::empty()
+        } else {
+            CapacityVector::new(
+                backing_by_domain
+                    .into_iter()
+                    .map(|(domain, bytes)| CapacityEntry::new(domain, CapacityUnits::new(bytes)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?
+        };
+        let allocations = backing_slices
+            .iter()
+            .map(|slice| Arc::clone(&slice.evidence.allocation))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ferrum.runtime-vnext.backing-claim-certificate.v1\0");
+        for allocation in &allocations {
+            let fingerprint = allocation.fingerprint.as_bytes();
+            hasher.update(
+                u64::try_from(fingerprint.len())
+                    .map_err(|_| {
+                        invalid_resource(
+                            "backing allocation fingerprint length exceeds portable range",
+                        )
+                    })?
+                    .to_be_bytes(),
+            );
+            hasher.update(fingerprint);
+        }
+        Ok(Self {
+            allocations,
+            physical_capacity,
+            reusable_execution_bucket_id,
+            physical_claim_count: physical_claims.len(),
+            has_shared_physical_claims,
+            fingerprint: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    pub(super) fn bind(
+        &self,
+        backing_slices: &[LogicalBackingSliceAuthority],
+        demand: &super::AdmissionDemand,
+    ) -> Result<BoundBackingClaimCertificate, VNextError> {
+        if backing_slices.len() != self.allocations.len() {
+            return Err(invalid_resource(
+                "bound backing projection count differs from its physical certificate",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"ferrum.runtime-vnext.bound-backing-claim.v1\0");
+        hasher.update(self.fingerprint.as_bytes());
+        for (slice, allocation) in backing_slices.iter().zip(&self.allocations) {
+            if !Arc::ptr_eq(&slice.evidence.allocation, allocation)
+                || slice.evidence.size_bytes() == 0
+                || slice.evidence.size_bytes() > allocation.capacity_size_bytes
+            {
+                return Err(invalid_resource(
+                    "bound logical projection differs from its certified allocation",
+                ));
+            }
+            hasher.update(slice.evidence.size_bytes().to_be_bytes());
+        }
+        let physical_covers_logical = self.physical_capacity.entries().len()
+            == demand.immediate_claim().entries().len()
+            && self.physical_capacity.entries().iter().all(|physical| {
+                demand
+                    .immediate_claim()
+                    .units_for(physical.domain())
+                    .is_some_and(|logical| physical.units().get() >= logical.get())
+            });
+        let claim_matches = if self.reusable_execution_bucket_id.is_some() {
+            physical_covers_logical
+        } else {
+            self.physical_capacity == *demand.immediate_claim()
+        };
+        if !claim_matches {
+            return Err(invalid_resource(
+                "certified physical backing does not cover the evaluated logical demand",
+            ));
+        }
+        Ok(BoundBackingClaimCertificate {
+            fingerprint: format!("{:x}", hasher.finalize()),
+            physical_claim_count: self.physical_claim_count,
+            has_shared_physical_claims: self.has_shared_physical_claims,
+        })
+    }
+}
+
 pub(super) struct CommittedLaneBackingClaim {
     backing_slices: Vec<LogicalBackingSliceAuthority>,
+    certificate: Arc<BackingClaimCertificate>,
     slot_lease: Option<LaneStableArenaSlotLease>,
 }
 
 impl CommittedLaneBackingClaim {
+    #[cfg(test)]
+    pub(super) fn certificate(&self) -> &Arc<BackingClaimCertificate> {
+        &self.certificate
+    }
+
+    #[cfg(test)]
     pub(super) fn into_parts(
         self,
     ) -> (
@@ -1359,17 +1573,53 @@ impl CommittedLaneBackingClaim {
     ) {
         (self.backing_slices, self.slot_lease)
     }
+
+    pub(super) fn into_certified_parts(
+        self,
+    ) -> (
+        Vec<LogicalBackingSliceAuthority>,
+        Arc<BackingClaimCertificate>,
+        Option<LaneStableArenaSlotLease>,
+    ) {
+        (self.backing_slices, self.certificate, self.slot_lease)
+    }
 }
 
 pub(super) struct PreparedLaneBackingClaim {
     stable: Vec<LogicalBackingSliceAuthority>,
+    certificate: Arc<BackingClaimCertificate>,
     slot_lease: Option<LaneStableArenaSlotLease>,
 }
 
 impl PreparedLaneBackingClaim {
+    fn new(
+        stable: Vec<LogicalBackingSliceAuthority>,
+        slot_lease: Option<LaneStableArenaSlotLease>,
+    ) -> Result<Self, VNextError> {
+        let certificate = Arc::new(BackingClaimCertificate::from_slices(&stable)?);
+        Ok(Self {
+            stable,
+            certificate,
+            slot_lease,
+        })
+    }
+
+    fn certified(
+        stable: Vec<LogicalBackingSliceAuthority>,
+        certificate: Arc<BackingClaimCertificate>,
+        slot_lease: LaneStableArenaSlotLease,
+    ) -> Self {
+        Self {
+            stable,
+            certificate,
+            slot_lease: Some(slot_lease),
+        }
+    }
+
     pub(super) fn commit(self) -> CommittedLaneBackingClaim {
         CommittedLaneBackingClaim {
             backing_slices: self.stable,
+            certificate: self.certificate,
             slot_lease: self.slot_lease,
         }
     }
@@ -1396,6 +1646,7 @@ struct LaneStableProjectionBinding {
 struct LaneStableArenaSlot {
     slot_id: u64,
     authorities: Vec<LogicalBackingSliceAuthority>,
+    certificate: Arc<BackingClaimCertificate>,
     projection_bindings: Vec<LaneStableProjectionBinding>,
     availability_domains: Vec<CapacityDomainId>,
     in_use: bool,
@@ -1521,6 +1772,7 @@ impl LaneStableArenaEntry {
         Option<(
             u64,
             Vec<LogicalBackingSliceAuthority>,
+            Arc<BackingClaimCertificate>,
             Vec<CapacityDomainId>,
         )>,
         VNextError,
@@ -1569,6 +1821,7 @@ impl LaneStableArenaEntry {
         Ok(Some((
             slot.slot_id,
             stable,
+            Arc::clone(&slot.certificate),
             slot.availability_domains.clone(),
         )))
     }
@@ -1920,10 +2173,6 @@ impl LogicalBackingSliceEvidence {
 
     pub fn initialization(&self) -> StateInitialization {
         self.initialization
-    }
-
-    pub(super) fn allocation_fingerprint(&self) -> &str {
-        &self.fingerprint
     }
 }
 
@@ -2921,25 +3170,21 @@ where
         }
         if requests.is_empty() {
             return Ok(LaneBackingPrepareDecision::Prepared(
-                PreparedLaneBackingClaim {
-                    stable: Vec::new(),
-                    slot_lease: None,
-                },
+                PreparedLaneBackingClaim::new(Vec::new(), None)?,
             ));
         }
         let reusable_capacity_shape = self.reusable_capacity_shape_for_requests(requests)?;
         if reusable_capacity_shape.is_none() {
-            return self.prepare_claim(requests).map(|decision| match decision {
+            return match self.prepare_claim(requests)? {
                 BackingPrepareDecision::Prepared(prepared) => {
-                    LaneBackingPrepareDecision::Prepared(PreparedLaneBackingClaim {
-                        stable: prepared.commit(),
-                        slot_lease: None,
-                    })
+                    Ok(LaneBackingPrepareDecision::Prepared(
+                        PreparedLaneBackingClaim::new(prepared.commit(), None)?,
+                    ))
                 }
                 BackingPrepareDecision::Deferred(deferred) => {
-                    LaneBackingPrepareDecision::Deferred(deferred)
+                    Ok(LaneBackingPrepareDecision::Deferred(deferred))
                 }
-            });
+            };
         }
         let lifetime = requests
             .first()
@@ -2989,20 +3234,21 @@ where
                             "lane-stable arena identity aliases another execution lane",
                         ));
                     }
-                    if let Some((slot_id, stable, slot_domains)) =
+                    if let Some((slot_id, stable, certificate, slot_domains)) =
                         entry.claim_idle_slot(lane.id(), now, &canonical_requests)?
                     {
                         return Ok(LaneBackingPrepareDecision::Prepared(
-                            PreparedLaneBackingClaim {
+                            PreparedLaneBackingClaim::certified(
                                 stable,
-                                slot_lease: Some(LaneStableArenaSlotLease {
+                                certificate,
+                                LaneStableArenaSlotLease {
                                     arenas: Arc::clone(&self.lane_stable_arenas),
                                     logical_admission: self.logical_admission.clone(),
                                     availability_domains: slot_domains,
                                     key: key.clone(),
                                     slot_id,
-                                }),
-                            },
+                                },
+                            ),
                         ));
                     }
                 }
@@ -3029,28 +3275,30 @@ where
                                 "lane-stable arena identity aliases another execution lane",
                             ));
                         }
-                        if let Some((slot_id, stable, slot_domains)) =
+                        if let Some((slot_id, stable, certificate, slot_domains)) =
                             entry.claim_idle_slot(lane.id(), now, &canonical_requests)?
                         {
                             drop(arenas);
                             drop(prepared);
                             return Ok(LaneBackingPrepareDecision::Prepared(
-                                PreparedLaneBackingClaim {
+                                PreparedLaneBackingClaim::certified(
                                     stable,
-                                    slot_lease: Some(LaneStableArenaSlotLease {
+                                    certificate,
+                                    LaneStableArenaSlotLease {
                                         arenas: Arc::clone(&self.lane_stable_arenas),
                                         logical_admission: self.logical_admission.clone(),
                                         availability_domains: slot_domains,
                                         key: key.clone(),
                                         slot_id,
-                                    }),
-                                },
+                                    },
+                                ),
                             ));
                         }
                     }
                     let authorities = prepared.commit();
                     let projection_bindings =
                         bind_lane_stable_slot_projections(&authorities, &canonical_requests)?;
+                    let certificate = Arc::new(BackingClaimCertificate::from_slices(&authorities)?);
                     let stable = authorities
                         .iter()
                         .map(|authority| authority.retained_for_lane(lane.id()))
@@ -3077,6 +3325,7 @@ where
                             LaneStableArenaSlot {
                                 slot_id,
                                 authorities,
+                                certificate: Arc::clone(&certificate),
                                 projection_bindings,
                                 availability_domains: availability_domains.clone(),
                                 in_use: true,
@@ -3091,16 +3340,17 @@ where
                         ));
                     }
                     return Ok(LaneBackingPrepareDecision::Prepared(
-                        PreparedLaneBackingClaim {
+                        PreparedLaneBackingClaim::certified(
                             stable,
-                            slot_lease: Some(LaneStableArenaSlotLease {
+                            certificate,
+                            LaneStableArenaSlotLease {
                                 arenas: Arc::clone(&self.lane_stable_arenas),
                                 logical_admission: self.logical_admission.clone(),
                                 availability_domains: availability_domains.clone(),
                                 key: key.clone(),
                                 slot_id,
-                            }),
-                        },
+                            },
+                        ),
                     ));
                 }
                 BackingPrepareDecision::Deferred(deferred) => {
@@ -3123,22 +3373,23 @@ where
                                 "lane-stable arena identity aliases another execution lane",
                             ));
                         }
-                        if let Some((slot_id, stable, slot_domains)) =
+                        if let Some((slot_id, stable, certificate, slot_domains)) =
                             entry.claim_idle_slot(lane.id(), now, &canonical_requests)?
                         {
                             drop(arenas);
                             drop(deferred);
                             return Ok(LaneBackingPrepareDecision::Prepared(
-                                PreparedLaneBackingClaim {
+                                PreparedLaneBackingClaim::certified(
                                     stable,
-                                    slot_lease: Some(LaneStableArenaSlotLease {
+                                    certificate,
+                                    LaneStableArenaSlotLease {
                                         arenas: Arc::clone(&self.lane_stable_arenas),
                                         logical_admission: self.logical_admission.clone(),
                                         availability_domains: slot_domains,
                                         key: key.clone(),
                                         slot_id,
-                                    }),
-                                },
+                                    },
+                                ),
                             ));
                         }
                     }

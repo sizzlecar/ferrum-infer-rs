@@ -1039,7 +1039,7 @@ where
                 }
             }
         };
-        let (backing_slices, lane_slot_lease) = prepared_backing.commit().into_parts();
+        let committed_backing = prepared_backing.commit();
         let has_program_binding_nodes = plan_nodes
             .iter()
             .any(|node| node.binding_resource().is_some());
@@ -1065,9 +1065,8 @@ where
             Arc::clone(&work_shape),
             demand,
             logical_capacity,
-            backing_slices,
+            committed_backing,
             program_binding_layout,
-            lane_slot_lease,
         )?;
         let wave_fingerprint =
             submission_wave_fingerprint(self, &prepared_nodes, &claimed_backing)?;
@@ -2531,13 +2530,12 @@ where
         );
 
         let phase_started = step_admission_profile_start::<PROFILE>();
-        let (backing_slices, lane_slot_lease) = prepared.commit().into_parts();
-        let claimed_backing = ClaimedBackingTransaction::new(
+        let committed_backing = prepared.commit();
+        let claimed_backing = ClaimedBackingTransaction::new_lane_stable(
             work_shape,
             demand,
             logical_capacity,
-            backing_slices,
-            lane_slot_lease,
+            committed_backing,
         )?;
         record_step_admission_profile::<PROFILE, _>(
             &mut observer,
