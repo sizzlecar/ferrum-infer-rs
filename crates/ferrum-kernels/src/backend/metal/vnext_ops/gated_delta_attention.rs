@@ -490,6 +490,14 @@ impl AttentionShape {
                 checked_product(&[tokens, self.qkv_features])?,
             ),
             (
+                "QKVZ activation elements",
+                checked_product(&[tokens, self.qkvz_features])?,
+            ),
+            (
+                "BA activation elements",
+                checked_product(&[tokens, self.ba_features])?,
+            ),
+            (
                 "QK activation elements",
                 checked_product(&[tokens, qk_features])?,
             ),

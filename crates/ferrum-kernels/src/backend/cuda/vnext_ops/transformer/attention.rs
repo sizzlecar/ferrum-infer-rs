@@ -396,6 +396,14 @@ impl AttentionShape {
                 checked_product(&[tokens, self.qkv_features])?,
             ),
             (
+                "QKVZ activation elements",
+                checked_product(&[tokens, self.qkvz_features])?,
+            ),
+            (
+                "BA activation elements",
+                checked_product(&[tokens, self.ba_features])?,
+            ),
+            (
                 "QK activation elements",
                 checked_product(&[tokens, qk_features])?,
             ),
@@ -1832,5 +1840,43 @@ fn value_head_mapping_attribute(
 fn invalid_plan(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_extent_validation_covers_packed_projection_strides() {
+        let mut shape = AttentionShape {
+            hidden_size: 16,
+            key_heads: 2,
+            value_heads: 8,
+            key_head_dim: 16,
+            value_head_dim: 16,
+            qkv_features: 192,
+            value_features: 128,
+            qkvz_features: 320,
+            ba_features: 16,
+            conv_kernel: 4,
+            conv_state_width: 3,
+            epsilon: 1.0e-6,
+            layer_index: 0,
+            decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+            value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
+        };
+
+        let tokens = i32::MAX as u64 / shape.qkvz_features + 1;
+        assert!(shape
+            .validate_launch_extents(tokens)
+            .unwrap_err()
+            .contains("QKVZ activation elements"));
+
+        shape.ba_features = i32::MAX as u64;
+        assert!(shape
+            .validate_launch_extents(2)
+            .unwrap_err()
+            .contains("BA activation elements"));
     }
 }
