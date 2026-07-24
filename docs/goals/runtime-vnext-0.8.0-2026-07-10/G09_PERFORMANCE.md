@@ -907,6 +907,70 @@ machine-readable JSONL attribution. After that checkpoint, the next kernel
 candidate must name one measured physical span/fingerprint, predict its
 device-time change, and retain the existing absolute throughput floor.
 
+### 2026-07-25 Compiled Wave Identity Candidate
+
+The bounded profiler prerequisite is now closed by clean source `a199da56`.
+Its validator printed:
+
+```text
+CUDA DIRECT REPLAY PRODUCT PROFILE WIRING PASS: /workspace/ferrum-artifacts/runtime-vnext-direct-replay-profiler-wiring-a199da56-20260724T194156Z
+```
+
+That artifact is an observability PASS, not a throughput result. Its two
+captured decode waves measured `wave_identity_bind=1.986930 ms/wave`,
+`provider_node_encode=1.185340 ms/wave`, and
+`device_runtime_submit=0.351861 ms/wave`. The identity stage alone was
+`5.65x` the host device-submit stage. Source review found that the product
+executor rebuilt and fingerprinted every immutable-plan node identity and
+every participant projection for every physical wave, even when the typed
+direct reusable program needed only the input boundary, per-wave binding
+nodes, and explicit eager nodes. Successful submission and completion
+receipts then eagerly rebuilt the same full participant projection.
+
+The source candidate therefore changes the ownership boundary rather than
+adding a CUDA/model special case:
+
+- plan, node, operation, provider, runtime, and lane topology compile once
+  into an immutable `CompiledSubmissionWaveIdentity`;
+- each wave binds only live participant/frame/session seeds and validates
+  their authority;
+- exact node identities materialize lazily for input, binding, eager,
+  failure, serialization, or profile/event consumers;
+- successful submission/completion receipts retain the compact batch
+  identity and lazily expand participant projections; failure
+  classification still requires and preserves exact identities;
+- `ferrum run` and `ferrum serve` use the same product executor path;
+  there is no model name, GPU name, backend name, fixed concurrency, or
+  hidden environment branch;
+- health evidence exposes `identity_materialization.waves`,
+  `logical_nodes`, `nodes_materialized_before_submit`, and
+  `full_participant_materializations_before_submit`.
+
+The first source slice is not G09 progress until a clean paid artifact
+passes the following bounded decision contract:
+
+1. Existing actual-model `run`, non-streaming `serve`, and streaming
+   `serve` correctness remain `3/3`; request/quality/blocker errors remain
+   `0`.
+2. Direct fallback, catalog miss, and catalog-epoch miss remain `0`.
+3. For decode direct waves,
+   `full_participant_materializations_before_submit == 0` and
+   `nodes_materialized_before_submit / logical_nodes <= 0.30`.
+4. Same-session Basic `A-B-B-A` must report candidate
+   `wave_identity_bind <=0.750 ms/wave` and at most `0.60x` its adjacent
+   baseline aggregate. Each reversed adjacent pair must move in the
+   predicted direction.
+5. Only after item 4 passes may profile-off `A-B-B-A` run. Candidate mean
+   throughput must improve by at least `5%`, neither reversed adjacent pair
+   may regress, completion/device time may not regress by more than `3%`,
+   and the unchanged absolute `76.1583 tok/s` gap must be reported.
+
+Missing the materialization or identity-stage signal is
+`REJECT_COMPILED_WAVE_IDENTITY`; hitting it without the profile-off product
+gain is `STRUCTURAL_KEEP_PERFORMANCE_REJECT`. Either result stops the paid
+lane after artifacts are copied back. No full sweep is authorized by this
+source slice.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
