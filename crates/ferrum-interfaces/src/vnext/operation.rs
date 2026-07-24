@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -25,12 +25,17 @@ use super::{
     NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
     PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
     ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
-    ResolvedWeightBinding, ResourceId, SemanticValue, SequenceBackingSnapshot,
-    SequenceSessionEpoch, SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment,
-    StepResourceLease, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence,
-    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
-    EXECUTION_IDENTITY_VERSION,
+    RequestIdentity, ResolvedWeightBinding, ResourceId, ResourcePoolId, RunId, SemanticValue,
+    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
+    StepParticipantFrameAssignment, StepResourceLease, TransactionId, TrustedActiveSequenceBinding,
+    TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
+    WeightId, EXECUTION_IDENTITY_VERSION,
 };
+
+mod compiled_submission_wave;
+
+pub use compiled_submission_wave::CompiledSubmissionWaveIdentity;
+use compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
 pub const MAX_OPERATION_PROVIDER_ROWS: usize = 16384;
@@ -3370,7 +3375,7 @@ impl BatchOperationNodeIdentity {
 
 /// One physical command-batch attempt identity. It may contain one operation
 /// or the entire immutable-plan wave, but it always maps to one submit/fence.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug)]
 struct BatchOperationIdentityData {
     batch_step_id: BatchStepId,
     batch_invocation_id: BatchInvocationId,
@@ -3380,22 +3385,89 @@ struct BatchOperationIdentityData {
     runtime_implementation_fingerprint: String,
     lane_id: ExecutionLaneId,
     claimed_backing_fingerprint: String,
-    nodes: Vec<BatchOperationNodeIdentity>,
-    participants: Vec<BatchOperationParticipantIdentity>,
+    nodes: OnceLock<Vec<BatchOperationNodeIdentity>>,
+    participants: OnceLock<Vec<BatchOperationParticipantIdentity>>,
+    deferred_recipe: Option<DeferredBatchOperationIdentityRecipe>,
     fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BatchOperationIdentity {
     data: Arc<BatchOperationIdentityData>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BatchOperationIdentityMaterializationSnapshot {
+    logical_nodes: u32,
+    materialized_nodes: u32,
+    full_participant_projection: bool,
+}
+
+impl BatchOperationIdentityMaterializationSnapshot {
+    pub const fn logical_nodes(self) -> u32 {
+        self.logical_nodes
+    }
+
+    pub const fn materialized_nodes(self) -> u32 {
+        self.materialized_nodes
+    }
+
+    pub const fn full_participant_projection(self) -> bool {
+        self.full_participant_projection
+    }
+}
+
+impl PartialEq for BatchOperationIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.batch_step_id == other.data.batch_step_id
+            && self.data.batch_invocation_id == other.data.batch_invocation_id
+            && self.data.plan_id == other.data.plan_id
+            && self.data.plan_hash == other.data.plan_hash
+            && self.data.device_id == other.data.device_id
+            && self.data.runtime_implementation_fingerprint
+                == other.data.runtime_implementation_fingerprint
+            && self.data.lane_id == other.data.lane_id
+            && self.data.claimed_backing_fingerprint == other.data.claimed_backing_fingerprint
+            && self.data.fingerprint == other.data.fingerprint
+    }
+}
+
+impl Eq for BatchOperationIdentity {}
 
 impl Serialize for BatchOperationIdentity {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        self.data.as_ref().serialize(serializer)
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            plan_id: &'a PlanId,
+            plan_hash: &'a PlanHash,
+            device_id: &'a DeviceId,
+            runtime_implementation_fingerprint: &'a str,
+            lane_id: ExecutionLaneId,
+            claimed_backing_fingerprint: &'a str,
+            nodes: &'a [BatchOperationNodeIdentity],
+            participants: &'a [BatchOperationParticipantIdentity],
+            fingerprint: &'a str,
+        }
+
+        Wire {
+            batch_step_id: self.data.batch_step_id,
+            batch_invocation_id: self.data.batch_invocation_id,
+            plan_id: &self.data.plan_id,
+            plan_hash: &self.data.plan_hash,
+            device_id: &self.data.device_id,
+            runtime_implementation_fingerprint: &self.data.runtime_implementation_fingerprint,
+            lane_id: self.data.lane_id,
+            claimed_backing_fingerprint: &self.data.claimed_backing_fingerprint,
+            nodes: self.nodes(),
+            participants: self.participants(),
+            fingerprint: &self.data.fingerprint,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -3506,8 +3578,9 @@ impl BatchOperationIdentity {
                 runtime_implementation_fingerprint,
                 lane_id,
                 claimed_backing_fingerprint,
-                nodes,
-                participants,
+                nodes: OnceLock::from(nodes),
+                participants: OnceLock::from(participants),
+                deferred_recipe: None,
                 fingerprint,
             }),
         })
@@ -3545,16 +3618,162 @@ impl BatchOperationIdentity {
         &self.data.claimed_backing_fingerprint
     }
 
+    pub fn node_count(&self) -> usize {
+        self.data.nodes.get().map_or_else(
+            || {
+                self.data
+                    .deferred_recipe
+                    .as_ref()
+                    .map_or(0, |recipe| recipe.topology.node_count())
+            },
+            Vec::len,
+        )
+    }
+
+    fn materialized_node_count(&self) -> usize {
+        self.data.nodes.get().map_or_else(
+            || {
+                self.data.deferred_recipe.as_ref().map_or(0, |recipe| {
+                    recipe
+                        .node_identities
+                        .iter()
+                        .filter(|identity| identity.get().is_some())
+                        .count()
+                })
+            },
+            Vec::len,
+        )
+    }
+
+    pub fn materialization_snapshot(&self) -> BatchOperationIdentityMaterializationSnapshot {
+        BatchOperationIdentityMaterializationSnapshot {
+            logical_nodes: u32::try_from(self.node_count())
+                .expect("validated physical batch node count fits u32"),
+            materialized_nodes: u32::try_from(self.materialized_node_count())
+                .expect("materialized physical batch node count fits u32"),
+            full_participant_projection: self.data.participants.get().is_some(),
+        }
+    }
+
+    pub fn node_participant_count(&self, node_index: usize) -> Option<usize> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.get(node_index).map(|node| node.participants().len());
+        }
+        let recipe = self.data.deferred_recipe.as_ref()?;
+        (node_index < recipe.topology.node_count()).then_some(recipe.participant_seeds.len())
+    }
+
+    pub fn node_id_at(&self, node_index: usize) -> Option<&NodeId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::node_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .node_id_at(node_index)
+    }
+
+    pub fn operation_id_at(&self, node_index: usize) -> Option<&OperationId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::operation_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .operation_id_at(node_index)
+    }
+
+    pub fn provider_id_at(&self, node_index: usize) -> Option<&ProviderId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::provider_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .provider_id_at(node_index)
+    }
+
+    pub fn work_shape_fingerprint_at(&self, node_index: usize) -> Option<&str> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::work_shape_fingerprint);
+        }
+        let recipe = self.data.deferred_recipe.as_ref()?;
+        (node_index < recipe.topology.node_count()).then_some(recipe.work_shape_fingerprint())
+    }
+
+    pub fn node_index(&self, node_id: &NodeId) -> Option<usize> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.iter().position(|node| node.node_id() == node_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .node_index(node_id)
+    }
+
+    pub(crate) fn materialize_node(
+        &self,
+        node_index: usize,
+    ) -> Result<&BatchOperationNodeIdentity, VNextError> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .ok_or_else(|| invalid_operation("physical batch node index is out of bounds"));
+        }
+        let recipe = self.data.deferred_recipe.as_ref().ok_or_else(|| {
+            invalid_operation("physical batch has neither materialized nodes nor a compiled recipe")
+        })?;
+        let slot = recipe.node_identities.get(node_index).ok_or_else(|| {
+            invalid_operation("compiled physical batch node index is out of bounds")
+        })?;
+        if let Some(identity) = slot.get() {
+            return Ok(identity);
+        }
+        let identity = recipe.materialize_node(node_index)?;
+        let _ = slot.set(identity);
+        slot.get().ok_or_else(|| {
+            invalid_operation("compiled physical batch node identity publication failed")
+        })
+    }
+
     pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
-        &self.data.nodes
+        self.data.nodes.get_or_init(|| {
+            (0..self.node_count())
+                .map(|node_index| {
+                    self.materialize_node(node_index)
+                        .expect("validated compiled physical batch node must materialize")
+                        .clone()
+                })
+                .collect()
+        })
     }
 
     pub fn single_node(&self) -> Option<&BatchOperationNodeIdentity> {
-        (self.data.nodes.len() == 1).then(|| &self.data.nodes[0])
+        (self.node_count() == 1).then(|| {
+            self.materialize_node(0)
+                .expect("validated single-node physical batch must materialize")
+        })
     }
 
     pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
-        &self.data.participants
+        self.data.participants.get_or_init(|| {
+            self.nodes()
+                .iter()
+                .flat_map(|node| node.participants().iter().cloned())
+                .collect()
+        })
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -3562,8 +3781,7 @@ impl BatchOperationIdentity {
     }
 
     fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
-        self.data
-            .participants
+        self.participants()
             .iter()
             .any(|participant| participant.identity() == identity)
     }
@@ -4787,12 +5005,15 @@ impl BoundDeviceSubmissionAttribution {
                 let Ok(node_index_usize) = usize::try_from(node_index) else {
                     return true;
                 };
-                let Some(node) = batch_identity.nodes().get(node_index_usize) else {
+                if batch_identity.node_id_at(node_index_usize).is_none() {
                     return true;
-                };
-                node.node_index() != node_index
-                    || u32::try_from(node.participants().len())
-                        .map_or(true, |count| count != command.participant_count())
+                }
+                u32::try_from(
+                    batch_identity
+                        .node_participant_count(node_index_usize)
+                        .unwrap_or_default(),
+                )
+                .map_or(true, |count| count != command.participant_count())
             })
         }) {
             return Err(invalid_operation(
@@ -5890,15 +6111,11 @@ impl OperationDispatch {
             timing_sink,
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
         );
-        let identity_participant_count = batch_identity.participants().len();
         let active_participant_count = active_bindings.len();
-        let expected_identity_participant_count =
-            active_participant_count.checked_mul(batch_identity.nodes().len());
         if providers.is_empty()
             || providers.len() != wave.nodes().len()
-            || providers.len() != batch_identity.nodes().len()
+            || providers.len() != batch_identity.node_count()
             || active_participant_count == 0
-            || expected_identity_participant_count != Some(identity_participant_count)
             || batch_identity.batch_step_id() != wave.batch_step_id()
             || batch_identity.batch_invocation_id() != wave.batch_invocation_id()
             || batch_identity.claimed_backing_fingerprint() != wave.fingerprint()
@@ -5911,23 +6128,33 @@ impl OperationDispatch {
                 "wave execution lane, resources, nodes, or participants differ from batch identity",
             )));
         }
-        for ((provider, node_identity), prepared_node) in providers
-            .iter()
-            .zip(batch_identity.nodes())
-            .zip(wave.nodes())
+        for (node_index, (provider, prepared_node)) in
+            providers.iter().zip(wave.nodes()).enumerate()
         {
+            let node_id = batch_identity.node_id_at(node_index).ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "physical batch is missing a compiled plan node",
+                ))
+            })?;
             provider
-                .validate_binding(resolved, node_identity.node_id())
+                .validate_binding(resolved, node_id)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
-            if prepared_node.node_id() != node_identity.node_id()
+            if prepared_node.node_id() != node_id
                 || prepared_node.work_shape().fingerprint()
-                    != node_identity.work_shape_fingerprint()
-                || provider.descriptor().provider_id() != node_identity.provider_id()
-                || provider.descriptor().operation_id() != node_identity.operation_id()
-                || node_identity.participants().len()
-                    != usize::try_from(prepared_node.participant_count())
-                        .expect("prepared wave participant count fits usize")
-                || node_identity.participants().len() != active_participant_count
+                    != batch_identity
+                        .work_shape_fingerprint_at(node_index)
+                        .expect("compiled physical batch node has work identity")
+                || Some(provider.descriptor().provider_id())
+                    != batch_identity.provider_id_at(node_index)
+                || Some(provider.descriptor().operation_id())
+                    != batch_identity.operation_id_at(node_index)
+                || batch_identity.node_participant_count(node_index)
+                    != Some(
+                        usize::try_from(prepared_node.participant_count())
+                            .expect("prepared wave participant count fits usize"),
+                    )
+                || batch_identity.node_participant_count(node_index)
+                    != Some(active_participant_count)
             {
                 return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
                     "wave provider or node identity differs from its prepared node",
@@ -6037,7 +6264,9 @@ impl OperationDispatch {
                                 ))
                             })?;
                         let provider = &providers[binding_node_index];
-                        let node_identity = &batch_identity.nodes()[binding_node_index];
+                        let node_identity = batch_identity
+                            .materialize_node(binding_node_index)
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
                         let invocation = BatchedOperationInvocation::from_wave_node(
                             runtime,
                             resolved,
@@ -6149,7 +6378,9 @@ impl OperationDispatch {
                     )));
                 }
                 let provider = &providers[node_index];
-                let node_identity = &batch_identity.nodes()[node_index];
+                let node_identity = batch_identity
+                    .materialize_node(node_index)
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
                 let invocation = BatchedOperationInvocation::from_wave_node(
                     runtime,
                     resolved,
@@ -6524,15 +6755,14 @@ where
                     "submission input upload references an unknown plan node",
                 ))
             })?;
+        let identity_node_index = batch_identity.node_index(upload.node_id()).ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "submission input upload has no physical node identity",
+            ))
+        })?;
         let node_identity = batch_identity
-            .nodes()
-            .iter()
-            .find(|identity| identity.node_id() == upload.node_id())
-            .ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission input upload has no physical node identity",
-                ))
-            })?;
+            .materialize_node(identity_node_index)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let participant = node_identity
             .participants()
             .get(usize::try_from(upload.participant_index()).map_err(|_| {

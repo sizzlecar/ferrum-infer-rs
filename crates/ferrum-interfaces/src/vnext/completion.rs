@@ -5,7 +5,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
 
 use super::{
@@ -718,26 +718,50 @@ impl CompletionSlotId {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug)]
 struct SubmittedOperationReceiptData {
     slot_id: CompletionSlotId,
     batch_identity: BatchOperationIdentity,
-    participants: Vec<SubmittedOperationParticipantReceipt>,
+    participants: OnceLock<Vec<SubmittedOperationParticipantReceipt>>,
     fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[must_use = "physical submission evidence must be recorded"]
 pub struct SubmittedOperationReceipt {
     data: Arc<SubmittedOperationReceiptData>,
 }
+
+impl PartialEq for SubmittedOperationReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.slot_id == other.data.slot_id
+            && self.data.batch_identity == other.data.batch_identity
+            && self.data.fingerprint == other.data.fingerprint
+    }
+}
+
+impl Eq for SubmittedOperationReceipt {}
 
 impl Serialize for SubmittedOperationReceipt {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        self.data.as_ref().serialize(serializer)
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            slot_id: CompletionSlotId,
+            batch_identity: &'a BatchOperationIdentity,
+            participants: &'a [SubmittedOperationParticipantReceipt],
+            fingerprint: &'a str,
+        }
+
+        Wire {
+            slot_id: self.data.slot_id,
+            batch_identity: &self.data.batch_identity,
+            participants: self.participants(),
+            fingerprint: &self.data.fingerprint,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -786,14 +810,13 @@ impl SubmittedOperationReceipt {
     fn new(
         slot_id: CompletionSlotId,
         batch_identity: BatchOperationIdentity,
-        participants: Vec<SubmittedOperationParticipantReceipt>,
         fingerprint: String,
     ) -> Self {
         Self {
             data: Arc::new(SubmittedOperationReceiptData {
                 slot_id,
                 batch_identity,
-                participants,
+                participants: OnceLock::new(),
                 fingerprint,
             }),
         }
@@ -808,7 +831,26 @@ impl SubmittedOperationReceipt {
     }
 
     pub fn participants(&self) -> &[SubmittedOperationParticipantReceipt] {
-        &self.data.participants
+        self.data.participants.get_or_init(|| {
+            self.data
+                .batch_identity
+                .participants()
+                .iter()
+                .map(|participant| {
+                    SubmittedOperationParticipantReceipt::new(
+                        self.data.slot_id,
+                        participant.participant_index(),
+                        participant.identity().clone(),
+                        self.data.fingerprint.clone(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn has_materialized_participant_receipts(&self) -> bool {
+        self.data.participants.get().is_some()
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -967,15 +1009,54 @@ impl CompletionReadbackTiming {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone)]
 #[must_use = "a terminal completion receipt releases one exact invocation"]
 pub struct OperationCompletionReceipt {
     submission: SubmittedOperationReceipt,
     disposition: OperationCompletionDisposition,
     fence_timing: CompletionFenceTiming,
     submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
-    participants: Vec<OperationParticipantCompletionReceipt>,
+    participants: OnceLock<Vec<OperationParticipantCompletionReceipt>>,
     fingerprint: String,
+}
+
+impl PartialEq for OperationCompletionReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.submission == other.submission
+            && self.disposition == other.disposition
+            && self.fence_timing == other.fence_timing
+            && self.submission_timing == other.submission_timing
+            && self.fingerprint == other.fingerprint
+    }
+}
+
+impl Eq for OperationCompletionReceipt {}
+
+impl Serialize for OperationCompletionReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            submission: &'a SubmittedOperationReceipt,
+            disposition: &'a OperationCompletionDisposition,
+            fence_timing: CompletionFenceTiming,
+            submission_timing: &'a DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+            participants: &'a [OperationParticipantCompletionReceipt],
+            fingerprint: &'a str,
+        }
+
+        Wire {
+            submission: &self.submission,
+            disposition: &self.disposition,
+            fence_timing: self.fence_timing,
+            submission_timing: &self.submission_timing,
+            participants: self.participants(),
+            fingerprint: &self.fingerprint,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl OperationCompletionReceipt {
@@ -985,12 +1066,9 @@ impl OperationCompletionReceipt {
         fence_timing: CompletionFenceTiming,
         submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
     ) -> Result<Self, VNextError> {
-        let participant_dispositions = match &disposition {
-            OperationCompletionDisposition::Succeeded => submission
-                .participants()
-                .iter()
-                .map(|_| OperationParticipantCompletionDisposition::Succeeded)
-                .collect::<Vec<_>>(),
+        match &disposition {
+            OperationCompletionDisposition::Succeeded
+            | OperationCompletionDisposition::ContractFailedButQuiescent(_) => {}
             OperationCompletionDisposition::FailedButQuiescent(failures) => {
                 if failures.len() != submission.participants().len()
                     || failures
@@ -1002,22 +1080,8 @@ impl OperationCompletionReceipt {
                         "batch completion failures differ from participant submission projections",
                     ));
                 }
-                failures
-                    .iter()
-                    .cloned()
-                    .map(OperationParticipantCompletionDisposition::FailedButQuiescent)
-                    .collect()
             }
-            OperationCompletionDisposition::ContractFailedButQuiescent(failure) => submission
-                .participants()
-                .iter()
-                .map(|_| {
-                    OperationParticipantCompletionDisposition::ContractFailedButQuiescent(
-                        failure.clone(),
-                    )
-                })
-                .collect(),
-        };
+        }
         #[derive(Serialize)]
         struct CompletionFingerprintInput<'a> {
             domain: &'static str,
@@ -1029,25 +1093,12 @@ impl OperationCompletionReceipt {
             submission_fingerprint: submission.fingerprint(),
             disposition: &disposition,
         });
-        let participants = submission
-            .participants()
-            .iter()
-            .cloned()
-            .zip(participant_dispositions)
-            .map(
-                |(submission, disposition)| OperationParticipantCompletionReceipt {
-                    submission,
-                    disposition,
-                    batch_completion_fingerprint: fingerprint.clone(),
-                },
-            )
-            .collect();
         Ok(Self {
             submission,
             disposition,
             fence_timing,
             submission_timing,
-            participants,
+            participants: OnceLock::new(),
             fingerprint,
         })
     }
@@ -1071,7 +1122,35 @@ impl OperationCompletionReceipt {
     }
 
     pub fn participants(&self) -> &[OperationParticipantCompletionReceipt] {
-        &self.participants
+        self.participants.get_or_init(|| {
+            self.submission
+                .participants()
+                .iter()
+                .enumerate()
+                .map(|(index, submission)| {
+                    let disposition = match &self.disposition {
+                        OperationCompletionDisposition::Succeeded => {
+                            OperationParticipantCompletionDisposition::Succeeded
+                        }
+                        OperationCompletionDisposition::FailedButQuiescent(failures) => {
+                            OperationParticipantCompletionDisposition::FailedButQuiescent(
+                                failures[index].clone(),
+                            )
+                        }
+                        OperationCompletionDisposition::ContractFailedButQuiescent(failure) => {
+                            OperationParticipantCompletionDisposition::ContractFailedButQuiescent(
+                                failure.clone(),
+                            )
+                        }
+                    };
+                    OperationParticipantCompletionReceipt {
+                        submission: submission.clone(),
+                        disposition,
+                        batch_completion_fingerprint: self.fingerprint.clone(),
+                    }
+                })
+                .collect()
+        })
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -1682,24 +1761,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             slot_id,
             batch_identity_fingerprint: batch_identity.fingerprint(),
         });
-        let participant_receipts = batch_identity
-            .participants()
-            .iter()
-            .map(|participant| {
-                SubmittedOperationParticipantReceipt::new(
-                    slot_id,
-                    participant.participant_index(),
-                    participant.identity().clone(),
-                    fingerprint.clone(),
-                )
-            })
-            .collect();
-        let receipt = SubmittedOperationReceipt::new(
-            slot_id,
-            batch_identity.clone(),
-            participant_receipts,
-            fingerprint,
-        );
+        let receipt = SubmittedOperationReceipt::new(slot_id, batch_identity.clone(), fingerprint);
         let record_receipt = receipt.clone();
         Ok(CompletionReservation {
             reaper: Arc::clone(reaper),
@@ -2614,14 +2676,15 @@ impl CompletionReadbackBatchRequest {
 
     fn validate_for(&self, batch_identity: &BatchOperationIdentity) -> Result<(), VNextError> {
         let node_id = self.requests[0].node_id();
-        let node = batch_identity
-            .nodes()
-            .iter()
-            .find(|node| node.node_id() == node_id)
+        let node_index = batch_identity.node_index(node_id).ok_or_else(|| {
+            invalid_completion("completion readback batch node is absent from its submission")
+        })?;
+        let participant_count = batch_identity
+            .node_participant_count(node_index)
             .ok_or_else(|| {
                 invalid_completion("completion readback batch node is absent from its submission")
             })?;
-        if node.participants().len() != self.requests.len() {
+        if participant_count != self.requests.len() {
             return Err(invalid_completion(
                 "completion readback batch must cover every submitted node participant exactly once",
             ));
