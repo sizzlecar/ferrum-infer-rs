@@ -1175,7 +1175,7 @@ fn encode_attention(
     })
     .map_err(|error| error.to_string())?;
 
-    Ok(EncodedDeviceOperation::compute(compute_command).with_dynamic_binding(binding_command))
+    Ok(EncodedDeviceOperation::compute(compute_command).with_program_binding(binding_command))
 }
 
 fn enqueue_bindings(

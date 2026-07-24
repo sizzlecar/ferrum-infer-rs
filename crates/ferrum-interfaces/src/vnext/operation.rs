@@ -5846,6 +5846,9 @@ impl OperationDispatch {
         );
         let pre_provider_command_count = commands.len();
         let mut encoded_provider_command_count = 0_usize;
+        let mut program_bindings = Vec::new();
+        let mut program_binding_resources = BTreeSet::new();
+        let mut encoded_operations = Vec::with_capacity(providers.len());
         for (node_index, (provider, node_identity)) in
             providers.iter().zip(batch_identity.nodes()).enumerate()
         {
@@ -5875,6 +5878,25 @@ impl OperationDispatch {
                     )));
                 }
             };
+            let program_binding_count = operation.program_binding_count();
+            if program_binding_count > 0 {
+                let binding_resource = resolved
+                    .execution_plan()
+                    .payload()
+                    .nodes()
+                    .get(node_index)
+                    .and_then(PlanNode::binding_resource)
+                    .ok_or_else(|| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "program binding requires a provider-owned binding workspace",
+                        ))
+                    })?;
+                if !program_binding_resources.insert(binding_resource.clone()) {
+                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "program bindings from different nodes alias one binding workspace",
+                    )));
+                }
+            }
             let operation_command_count = operation
                 .dynamic_binding_count()
                 .checked_add(1)
@@ -5891,14 +5913,43 @@ impl OperationDispatch {
                         "submission wave command count overflows usize",
                     ))
                 })?;
-            commands.push_operation(
-                u32::try_from(node_index).map_err(|_| {
-                    SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission wave node index exceeds u32",
-                    ))
-                })?,
-                operation,
-            );
+            let node_index = u32::try_from(node_index).map_err(|_| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission wave node index exceeds u32",
+                ))
+            })?;
+            let (mut node_program_bindings, dynamic_bindings, compute, result_bindings) =
+                operation.into_parts();
+            program_bindings.append(&mut node_program_bindings);
+            encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
+        }
+        let uncoalesced_program_binding_count = program_bindings.len();
+        let coalesced_program_bindings = runtime
+            .coalesce_program_bindings(program_bindings)
+            .map_err(|error| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(format!(
+                    "device runtime could not coalesce program bindings: {error}"
+                )))
+            })?;
+        if (uncoalesced_program_binding_count == 0) != coalesced_program_bindings.is_empty()
+            || coalesced_program_bindings.len() > uncoalesced_program_binding_count
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "device runtime changed the program binding boundary cardinality illegally",
+            )));
+        }
+        encoded_provider_command_count = encoded_provider_command_count
+            .checked_add(coalesced_program_bindings.len())
+            .ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "coalesced program binding command count overflows usize",
+                ))
+            })?;
+        for command in coalesced_program_bindings {
+            commands.push_dynamic_binding(command);
+        }
+        for (node_index, dynamic_bindings, compute, result_bindings) in encoded_operations {
+            commands.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
         }
         if commands.len()
             != pre_provider_command_count.saturating_add(encoded_provider_command_count)

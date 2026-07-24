@@ -886,6 +886,30 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
       value_dim, use_qk_l2norm, scale);
 }
 
+extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_indirect(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const unsigned long long* __restrict__ state_bindings,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int use_qk_l2norm,
+    const float scale) {
+  float* state = reinterpret_cast<float*>(state_bindings[1]);
+  recurrent_gated_delta_rule_varlen_f32_impl<float>(
+      query, key, value, g, beta, state, cu_seqlens, out, state, batch,
+      total_tokens, key_heads, value_heads, key_dim, value_dim,
+      use_qk_l2norm, scale);
+}
+
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_state_f16(
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -1091,6 +1115,28 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32(
       query, key, value, g, beta, initial_states, cu_seqlens, out,
       final_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_indirect(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const unsigned long long* __restrict__ state_bindings,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  float* state = reinterpret_cast<float*>(state_bindings[1]);
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16>(
+      query, key, value, g, beta, state, cu_seqlens, out, state, batch,
+      total_tokens, key_heads, value_heads, key_dim, value_dim, scale);
 }
 
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_state_f16(

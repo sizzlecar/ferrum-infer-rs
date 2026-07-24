@@ -37,16 +37,18 @@ const PROVIDER_ID: &str = "provider.cuda.gated_delta_recurrent_attention.f16";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attention.f16";
 
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
-const PREPARE_FUNCTION: &str = "linear_attention_prepare_varlen_f16_params_f32_state_f16";
+const PREPARE_FUNCTION: &str = "linear_attention_prepare_varlen_f16_params_f32_state_f16_indirect";
+const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
-const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32";
-const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32";
+const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
+const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
 
 const SCRATCH_ALIGNMENT: u64 = 16;
 const CONTROL_BYTES: u64 = 16;
+const STATE_BINDING_SLOT_BYTES: u64 = 16;
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionProvider {
     descriptor: OperationProviderDescriptor,
@@ -58,6 +60,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 struct AttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
+    conv_state_commit: CudaFunction,
     qk_norm: CudaFunction,
     delta: CudaFunction,
     delta_tiled: CudaFunction,
@@ -137,6 +140,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let functions = AttentionFunctions {
             rms_norm: load_function(&rms_module, RMS_NORM_FUNCTION, "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
+            conv_state_commit: load_function(
+                &linear_module,
+                CONV_STATE_COMMIT_FUNCTION,
+                "attention convolution-state commit",
+            )?,
             qk_norm: load_function(&linear_module, QK_NORM_FUNCTION, "attention QK norm")?,
             delta: load_function(&delta_module, DELTA_FUNCTION, "attention delta")?,
             delta_tiled: load_function(
@@ -195,11 +203,16 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
             ProviderWorkspaceScope::Invocation,
             DynamicStorageRequirement::contiguous(),
         )?;
-        Ok(estimate(
-            &self.descriptor,
-            request.input_fingerprint(),
-            Some(scratch),
-        ))
+        let binding = ProviderWorkspaceRequirement::from_formula(
+            ProviderWorkspaceSizeFormula::actual_sequences(STATE_BINDING_SLOT_BYTES)?,
+            SCRATCH_ALIGNMENT,
+            ProviderWorkspaceScope::Invocation,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(
+            estimate(&self.descriptor, request.input_fingerprint(), Some(scratch))
+                .with_binding(binding),
+        )
     }
 }
 
@@ -215,7 +228,6 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             self.execution_capabilities,
             invocation,
         )
-        .map(EncodedDeviceOperation::compute)
         .map_err(|message| {
             OperationFailure::new(
                 identity,
@@ -546,15 +558,55 @@ impl ScratchLayout {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct StateBindingLayout {
+    required_bytes: u64,
+}
+
+impl StateBindingLayout {
+    fn new(participant_count: usize) -> Result<Self, String> {
+        let participant_count = u64::try_from(participant_count)
+            .map_err(|_| "attention state binding participant count exceeds u64".to_owned())?;
+        let required_bytes = STATE_BINDING_SLOT_BYTES
+            .checked_mul(participant_count)
+            .ok_or_else(|| "attention state binding workspace size overflows".to_owned())?;
+        if required_bytes == 0 {
+            return Err("attention state binding cannot be empty".to_owned());
+        }
+        Ok(Self { required_bytes })
+    }
+
+    fn offset(self, participant_index: usize) -> Result<u64, String> {
+        let participant_index = u64::try_from(participant_index)
+            .map_err(|_| "attention state binding index exceeds u64".to_owned())?;
+        participant_index
+            .checked_mul(STATE_BINDING_SLOT_BYTES)
+            .filter(|offset| {
+                offset
+                    .checked_add(STATE_BINDING_SLOT_BYTES)
+                    .is_some_and(|end| end <= self.required_bytes)
+            })
+            .ok_or_else(|| "attention state binding offset exceeds its workspace".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct AttentionLaunch {
     input_region: usize,
     output_region: usize,
-    conv_state_region: usize,
-    delta_state_region: usize,
+    state_binding_offset: u64,
     host_control: usize,
     execution_form: GatedDeltaExecutionForm,
     tokens: u64,
     tokens_i32: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttentionStateBinding {
+    first_state_region: usize,
+    host_binding: usize,
+    binding_offset: u64,
+    conv_state_bytes: u64,
+    delta_state_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -570,6 +622,7 @@ struct SharedRegions {
     norm: usize,
     output: usize,
     scratch: usize,
+    binding: usize,
 }
 
 fn encode_attention(
@@ -577,7 +630,7 @@ fn encode_attention(
     functions: &AttentionFunctions,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<CudaDeviceCommand, String> {
+) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
         || invocation.operation().id.as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID
     {
@@ -595,6 +648,7 @@ fn encode_attention(
 
     let total_tokens = invocation.work_shape().immediate_tokens();
     let layout = ScratchLayout::new(shape, total_tokens)?;
+    let binding_layout = StateBindingLayout::new(invocation.participants().len())?;
     let cuda_shape = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -609,33 +663,51 @@ fn encode_attention(
         ElementType::F16,
     )?;
 
-    let mut regions = Vec::new();
+    let mut compute_regions = Vec::new();
     let shared = SharedRegions {
-        input_norm: push_shared_weight(&mut regions, &invocation, 1, ElementType::F16)?,
-        qkv: push_shared_weight(&mut regions, &invocation, 2, ElementType::F16)?,
-        z: push_shared_weight(&mut regions, &invocation, 3, ElementType::F16)?,
-        b: push_shared_weight(&mut regions, &invocation, 4, ElementType::F16)?,
-        a: push_shared_weight(&mut regions, &invocation, 5, ElementType::F16)?,
-        conv: push_shared_weight(&mut regions, &invocation, 6, ElementType::F16)?,
-        a_log: push_shared_weight(&mut regions, &invocation, 7, ElementType::F32)?,
-        dt_bias: push_shared_weight(&mut regions, &invocation, 8, ElementType::F32)?,
-        norm: push_shared_weight(&mut regions, &invocation, 9, ElementType::F32)?,
-        output: push_shared_weight(&mut regions, &invocation, 10, ElementType::F16)?,
+        input_norm: push_shared_weight(&mut compute_regions, &invocation, 1, ElementType::F16)?,
+        qkv: push_shared_weight(&mut compute_regions, &invocation, 2, ElementType::F16)?,
+        z: push_shared_weight(&mut compute_regions, &invocation, 3, ElementType::F16)?,
+        b: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F16)?,
+        a: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F16)?,
+        conv: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F16)?,
+        a_log: push_shared_weight(&mut compute_regions, &invocation, 7, ElementType::F32)?,
+        dt_bias: push_shared_weight(&mut compute_regions, &invocation, 8, ElementType::F32)?,
+        norm: push_shared_weight(&mut compute_regions, &invocation, 9, ElementType::F32)?,
+        output: push_shared_weight(&mut compute_regions, &invocation, 10, ElementType::F16)?,
         scratch: {
-            let index = regions.len();
-            regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
+            let index = compute_regions.len();
+            compute_regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
+            index
+        },
+        binding: {
+            let index = compute_regions.len();
+            compute_regions.push(super::shared_binding_region(
+                &invocation,
+                binding_layout.required_bytes,
+            )?);
             index
         },
     };
+    let mut binding_regions = vec![compute_regions[shared.binding].clone()];
+    let mut binding_host_storage = Vec::with_capacity(invocation.participants().len());
+    let mut state_bindings = Vec::with_capacity(invocation.participants().len());
+    let mut compute_fence_dependencies =
+        Vec::with_capacity(invocation.participants().len().saturating_mul(2));
     let mut host_storage = Vec::with_capacity(invocation.participants().len());
     let mut launches = Vec::with_capacity(invocation.participants().len());
-    for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
+    for (participant_index, (participant, token_range)) in invocation
+        .participants()
+        .iter()
+        .zip(token_ranges)
+        .enumerate()
+    {
         let tokens = token_range.immediate_tokens();
         shape.validate_launch_extents(tokens)?;
         let source = token_range.source_token_range();
         let packed = token_range.immediate_token_range();
-        let input_region = regions.len();
-        regions.push(contiguous_token_region(
+        let input_region = compute_regions.len();
+        compute_regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
             ElementType::F16,
@@ -646,8 +718,8 @@ fn encode_attention(
             },
             tokens,
         )?);
-        let output_region = regions.len();
-        regions.push(contiguous_token_region(
+        let output_region = compute_regions.len();
+        compute_regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
             ElementType::F16,
@@ -658,18 +730,31 @@ fn encode_attention(
             },
             tokens,
         )?);
-        let conv_state_region = regions.len();
-        regions.push(contiguous_region(
+        let conv_state = contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 11)?,
             ElementType::F16,
-        )?);
-        let delta_state_region = regions.len();
-        regions.push(contiguous_region(
+        )?;
+        let delta_state = contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 12)?,
             ElementType::F32,
-        )?);
+        )?;
+        let first_state_region = binding_regions.len();
+        binding_regions.push(conv_state.clone());
+        binding_regions.push(delta_state.clone());
+        compute_fence_dependencies.push(conv_state.clone());
+        compute_fence_dependencies.push(delta_state.clone());
+        let binding_offset = binding_layout.offset(participant_index)?;
+        let host_binding = binding_host_storage.len();
+        binding_host_storage.push(state_binding_payload(&conv_state, &delta_state));
+        state_bindings.push(AttentionStateBinding {
+            first_state_region,
+            host_binding,
+            binding_offset,
+            conv_state_bytes: conv_state.length_bytes(),
+            delta_state_bytes: delta_state.length_bytes(),
+        });
         let tokens_i32 = checked_i32(tokens, "attention participant token count")?;
         let execution_form = execution_capabilities
             .select(tokens, GatedDeltaExecutionPreference::RecurrentScan)
@@ -686,8 +771,7 @@ fn encode_attention(
         launches.push(AttentionLaunch {
             input_region,
             output_region,
-            conv_state_region,
-            delta_state_region,
+            state_binding_offset: binding_offset,
             host_control,
             execution_form,
             tokens,
@@ -713,13 +797,14 @@ fn encode_attention(
     .u64(shape.layer_index)
     .u64(total_tokens)
     .u64(layout.required_bytes)
+    .u64(binding_layout.required_bytes)
+    .u64(STATE_BINDING_SLOT_BYTES)
     .u64(launches.len() as u64);
     for launch in &launches {
         replay_key = replay_key
             .u64(launch.input_region as u64)
             .u64(launch.output_region as u64)
-            .u64(launch.conv_state_region as u64)
-            .u64(launch.delta_state_region as u64)
+            .u64(launch.state_binding_offset)
             .u64(launch.host_control as u64)
             .bytes(launch.execution_form.as_str().as_bytes())
             .u64(launch.tokens)
@@ -727,27 +812,18 @@ fn encode_attention(
     }
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
-    CudaDeviceCommand::replayable_operation_with_host_storage_and_blas(
-        "vnext_gated_delta_recurrent_attention",
-        regions,
-        host_storage,
-        replay_key.finish(),
-        move |stream, blas, regions, host_storage| {
-            for launch in &launches {
-                enqueue_attention(
-                    stream,
-                    blas,
-                    &functions,
-                    cuda_shape,
-                    shape,
-                    layout,
-                    shared,
-                    *launch,
-                    regions,
-                    host_storage,
-                )?;
-            }
-            Ok(())
+    let binding_command = CudaDeviceCommand::operation_with_host_storage_and_blas(
+        "vnext_gated_delta_recurrent_attention_bindings",
+        binding_regions,
+        binding_host_storage,
+        move |stream, _blas, regions, host_storage| {
+            enqueue_state_bindings(
+                stream,
+                binding_layout,
+                &state_bindings,
+                regions,
+                host_storage,
+            )
         },
     )
     .and_then(|command| {
@@ -755,11 +831,125 @@ fn encode_attention(
             DeviceBatchingForm::ParticipantLoop,
             participant_count,
             total_tokens,
-            u64::from(participant_count) * 12,
-            u64::from(participant_count) * 3,
+            0,
+            u64::from(participant_count),
         )
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+
+    let compute_command =
+        CudaDeviceCommand::replayable_operation_with_host_storage_blas_and_fence_dependencies(
+            "vnext_gated_delta_recurrent_attention",
+            compute_regions,
+            host_storage,
+            compute_fence_dependencies,
+            replay_key.finish(),
+            move |stream, blas, regions, host_storage| {
+                for launch in &launches {
+                    enqueue_attention(
+                        stream,
+                        blas,
+                        &functions,
+                        cuda_shape,
+                        shape,
+                        layout,
+                        shared,
+                        *launch,
+                        regions,
+                        host_storage,
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .and_then(|command| {
+            command.with_work_attribution(
+                DeviceBatchingForm::ParticipantLoop,
+                participant_count,
+                total_tokens,
+                u64::from(participant_count) * 13,
+                u64::from(participant_count) * 2,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+
+    Ok(EncodedDeviceOperation::compute(compute_command).with_program_binding(binding_command))
+}
+
+fn state_binding_payload(
+    conv_state: &CudaBufferRegion,
+    delta_state: &CudaBufferRegion,
+) -> Box<[u8]> {
+    let mut payload = Vec::with_capacity(STATE_BINDING_SLOT_BYTES as usize);
+    payload.extend_from_slice(&conv_state.device_ptr().to_le_bytes());
+    payload.extend_from_slice(&delta_state.device_ptr().to_le_bytes());
+    payload.into_boxed_slice()
+}
+
+fn enqueue_state_bindings(
+    stream: &CudaStream,
+    layout: StateBindingLayout,
+    bindings: &[AttentionStateBinding],
+    regions: &[CudaBufferRegion],
+    host_storage: &[Box<[u8]>],
+) -> Result<(), CudaDeviceRuntimeError> {
+    let workspace = regions.first().ok_or_else(|| {
+        CudaDeviceRuntimeError::contract("attention state binding workspace is missing")
+    })?;
+    if workspace.element_type() != ElementType::U8
+        || workspace.length_bytes() < layout.required_bytes
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "attention state binding workspace differs from its admitted estimate",
+        ));
+    }
+    for binding in bindings {
+        let states = regions
+            .get(binding.first_state_region..binding.first_state_region.saturating_add(2))
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "attention state binding physical regions are missing",
+                )
+            })?;
+        let payload = host_storage.get(binding.host_binding).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("attention state binding payload is missing")
+        })?;
+        if states[0].element_type() != ElementType::F16
+            || states[0].length_bytes() != binding.conv_state_bytes
+            || states[1].element_type() != ElementType::F32
+            || states[1].length_bytes() != binding.delta_state_bytes
+            || payload.len() != STATE_BINDING_SLOT_BYTES as usize
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "attention state binding payload differs from its physical state",
+            ));
+        }
+        let conv_pointer = u64::from_le_bytes(
+            payload[0..8]
+                .try_into()
+                .expect("validated recurrent binding pointer width"),
+        );
+        let delta_pointer = u64::from_le_bytes(
+            payload[8..16]
+                .try_into()
+                .expect("validated recurrent binding pointer width"),
+        );
+        if conv_pointer != states[0].device_ptr() || delta_pointer != states[1].device_ptr() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "attention state binding pointers changed after encoding",
+            ));
+        }
+        let destination = scratch_pointer(workspace.device_ptr(), binding.binding_offset)?;
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                destination,
+                payload.as_ref(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention state binding upload", error))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -781,6 +971,8 @@ fn enqueue_attention(
             "recurrent attention scratch is smaller than its admitted estimate",
         ));
     }
+    let binding = &regions[shared.binding];
+    let state_binding = scratch_pointer(binding.device_ptr(), launch.state_binding_offset)?;
     let scratch_base = scratch.device_ptr();
     let cu_seqlens = scratch_base;
     let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
@@ -813,8 +1005,6 @@ fn enqueue_attention(
 
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
-    let conv_state = regions[launch.conv_state_region].device_ptr();
-    let delta_state = regions[launch.delta_state_region].device_ptr();
     let normalized = scratch_pointer(scratch_base, layout.normalized)?;
     let qkv = scratch_pointer(scratch_base, layout.qkv)?;
     let z = scratch_pointer(scratch_base, layout.z_or_activation)?;
@@ -863,7 +1053,7 @@ fn enqueue_attention(
         &functions.prepare,
         qkv,
         regions[shared.conv].device_ptr(),
-        conv_state,
+        state_binding,
         a,
         b,
         regions[shared.a_log].device_ptr(),
@@ -881,23 +1071,21 @@ fn enqueue_attention(
         cuda,
         shape,
     )?;
-    let conv_state_bytes = usize::try_from(
+    let conv_state_elements = i32::try_from(
         shape
             .conv_state_elements()
-            .map_err(CudaDeviceRuntimeError::contract)?
-            .checked_mul(ElementType::F16.size_bytes())
-            .ok_or_else(|| CudaDeviceRuntimeError::contract("conv state copy size overflows"))?,
+            .map_err(CudaDeviceRuntimeError::contract)?,
     )
-    .map_err(|_| CudaDeviceRuntimeError::contract("conv state copy size exceeds usize"))?;
-    unsafe {
-        cudarc::driver::result::memcpy_dtod_async(
-            conv_state,
-            final_conv_state,
-            conv_state_bytes,
-            stream.cu_stream(),
-        )
-    }
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention conv state commit", error))?;
+    .map_err(|_| {
+        CudaDeviceRuntimeError::contract("attention convolution state elements exceed i32")
+    })?;
+    launch_conv_state_commit(
+        stream,
+        &functions.conv_state_commit,
+        final_conv_state,
+        state_binding,
+        conv_state_elements,
+    )?;
     launch_qk_norm(
         stream,
         &functions.qk_norm,
@@ -915,7 +1103,7 @@ fn enqueue_attention(
         value,
         g,
         beta,
-        delta_state,
+        state_binding,
         cu_seqlens,
         core,
         launch.tokens_i32,
@@ -970,7 +1158,7 @@ fn launch_prepare(
     function: &CudaFunction,
     qkv: u64,
     conv_weight: u64,
-    initial_conv_state: u64,
+    state_binding: u64,
     a: u64,
     b: u64,
     a_log: u64,
@@ -1008,7 +1196,7 @@ fn launch_prepare(
     let pointers = [
         qkv,
         conv_weight,
-        initial_conv_state,
+        state_binding,
         a,
         b,
         a_log,
@@ -1046,6 +1234,43 @@ fn launch_prepare(
     }
     .map(|_| ())
     .map_err(|error| CudaDeviceRuntimeError::driver("attention prepare launch", error))
+}
+
+fn launch_conv_state_commit(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    source: u64,
+    state_binding: u64,
+    elements: i32,
+) -> Result<(), CudaDeviceRuntimeError> {
+    if elements <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "attention convolution state commit is empty",
+        ));
+    }
+    let mut builder = stream.launch_builder(function);
+    builder.arg(&source);
+    builder.arg(&state_binding);
+    builder.arg(&elements);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (
+                checked_grid(
+                    elements as u64,
+                    THREADS_PER_BLOCK,
+                    "attention convolution state commit",
+                )?,
+                1,
+                1,
+            ),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| {
+        CudaDeviceRuntimeError::driver("attention convolution state commit launch", error)
+    })
 }
 
 fn launch_rms_norm(
@@ -1120,7 +1345,7 @@ fn launch_delta(
     value: u64,
     g: u64,
     beta: u64,
-    state: u64,
+    state_binding: u64,
     cu_seqlens: u64,
     output: u64,
     tokens: i32,
@@ -1132,7 +1357,16 @@ fn launch_delta(
     } else {
         &functions.delta
     };
-    let pointers = [query, key, value, g, beta, state, cu_seqlens, output, state];
+    let pointers = [
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_binding,
+        cu_seqlens,
+        output,
+    ];
     let dimensions = [
         batch,
         tokens,
