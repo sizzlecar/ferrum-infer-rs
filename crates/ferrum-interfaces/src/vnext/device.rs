@@ -1639,6 +1639,7 @@ impl DeviceSubmissionAttribution {
 /// either dynamic boundary into a reusable executable.
 #[must_use = "encoded device operations must be appended to a submission batch"]
 pub struct EncodedDeviceOperation<C> {
+    program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
     compute: C,
     result_bindings: Vec<C>,
@@ -1647,10 +1648,21 @@ pub struct EncodedDeviceOperation<C> {
 impl<C> EncodedDeviceOperation<C> {
     pub fn compute(command: C) -> Self {
         Self {
+            program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
             compute: command,
             result_bindings: Vec::new(),
         }
+    }
+
+    /// Adds a binding that may execute in the wave-level program prelude.
+    ///
+    /// Providers may use this only for writes into their own non-aliasing
+    /// binding workspace. The command must not read provider outputs or depend
+    /// on earlier compute in the same wave.
+    pub fn with_program_binding(mut self, command: C) -> Self {
+        self.program_bindings.push(command);
+        self
     }
 
     pub fn with_dynamic_binding(mut self, command: C) -> Self {
@@ -1667,12 +1679,21 @@ impl<C> EncodedDeviceOperation<C> {
         self.dynamic_bindings.len()
     }
 
+    pub fn program_binding_count(&self) -> usize {
+        self.program_bindings.len()
+    }
+
     pub fn result_binding_count(&self) -> usize {
         self.result_bindings.len()
     }
 
-    fn into_parts(self) -> (Vec<C>, C, Vec<C>) {
-        (self.dynamic_bindings, self.compute, self.result_bindings)
+    pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, C, Vec<C>) {
+        (
+            self.program_bindings,
+            self.dynamic_bindings,
+            self.compute,
+            self.result_bindings,
+        )
     }
 }
 
@@ -1773,7 +1794,24 @@ impl<C> DeviceCommandBatch<C> {
     }
 
     pub(crate) fn push_operation(&mut self, node_index: u32, operation: EncodedDeviceOperation<C>) {
-        let (dynamic_bindings, compute, result_bindings) = operation.into_parts();
+        let (program_bindings, dynamic_bindings, compute, result_bindings) = operation.into_parts();
+        for command in program_bindings {
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::DynamicBinding,
+                node_index: Some(node_index),
+                command,
+            });
+        }
+        self.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
+    }
+
+    pub(crate) fn push_operation_parts(
+        &mut self,
+        node_index: u32,
+        dynamic_bindings: Vec<C>,
+        compute: C,
+        result_bindings: Vec<C>,
+    ) {
         for command in dynamic_bindings {
             self.commands.push(DeviceCommandEntry {
                 phase: DeviceCommandPhase::DynamicBinding,
@@ -1938,6 +1976,18 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         destination_offset_bytes: u64,
         length_bytes: u64,
     ) -> Result<Self::Command, Self::Error>;
+
+    /// Coalesces independent provider binding writes into a wave prelude.
+    ///
+    /// The default preserves one command per provider. Backends may return a
+    /// smaller ordered set, but must retain every command-owned resource and
+    /// preserve the exact enqueue order and failure semantics.
+    fn coalesce_program_bindings(
+        &self,
+        commands: Vec<Self::Command>,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        Ok(commands)
+    }
 
     /// Submits one non-empty ordered command batch and returns its exact
     /// completion fence. A backend must preserve command order and must not
@@ -2161,12 +2211,13 @@ mod deferred_cleanup_tests {
     }
 
     #[test]
-    fn encoded_operation_preserves_typed_dynamic_compute_and_result_boundaries() {
+    fn encoded_operation_preserves_program_dynamic_compute_and_result_boundaries() {
         let operation = EncodedDeviceOperation::compute("compute")
+            .with_program_binding("program-bind")
             .with_dynamic_binding("bind-a")
             .with_dynamic_binding("bind-b")
             .with_result_binding("writeback");
-        let mut batch = DeviceCommandBatch::with_capacity(4);
+        let mut batch = DeviceCommandBatch::with_capacity(5);
         batch.push_operation(0, operation);
 
         let entries = batch.into_entries();
@@ -2176,6 +2227,7 @@ mod deferred_cleanup_tests {
                 .map(DeviceCommandEntry::phase)
                 .collect::<Vec<_>>(),
             vec![
+                DeviceCommandPhase::DynamicBinding,
                 DeviceCommandPhase::DynamicBinding,
                 DeviceCommandPhase::DynamicBinding,
                 DeviceCommandPhase::Compute,
@@ -2188,7 +2240,7 @@ mod deferred_cleanup_tests {
                 .map(DeviceCommandEntry::into_parts)
                 .map(|(_, _, command)| command)
                 .collect::<Vec<_>>(),
-            vec!["bind-a", "bind-b", "compute", "writeback"]
+            vec!["program-bind", "bind-a", "bind-b", "compute", "writeback",]
         );
     }
 

@@ -317,7 +317,7 @@ pub(crate) fn operation_with_zero_state(zero_state: bool) -> OperationDescriptor
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
             scratch: ResourcePresenceRequirement::Forbidden,
-            binding: ResourcePresenceRequirement::Forbidden,
+            binding: ResourcePresenceRequirement::Optional,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: OracleSpec::Exact,
@@ -404,6 +404,7 @@ impl OperationContract for TestOperationContract {
 pub(crate) enum ProviderBehavior {
     Success,
     SplitPhases,
+    ProgramBinding,
     WrongIdentity,
     WrongPhase,
 }
@@ -432,7 +433,7 @@ impl OperationResourceEstimator for TestProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        Ok(OperationResourceEstimate::new(
+        let estimate = OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
             self.descriptor
@@ -441,7 +442,19 @@ impl OperationResourceEstimator for TestProvider {
             16,
             None,
             None,
-        ))
+        );
+        if *self.behavior.lock().unwrap() == ProviderBehavior::ProgramBinding {
+            Ok(
+                estimate.with_binding(ProviderWorkspaceRequirement::from_formula(
+                    ProviderWorkspaceSizeFormula::actual_sequences(16)?,
+                    16,
+                    ProviderWorkspaceScope::Invocation,
+                    DynamicStorageRequirement::contiguous(),
+                )?),
+            )
+        } else {
+            Ok(estimate)
+        }
     }
 }
 
@@ -477,6 +490,10 @@ impl OperationProvider<TestRuntime> for TestProvider {
                 Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
                     .with_dynamic_binding(TestCommand::DynamicBinding)
                     .with_result_binding(TestCommand::ResultBinding))
+            }
+            ProviderBehavior::ProgramBinding => {
+                Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
+                    .with_program_binding(TestCommand::ProgramBinding))
             }
             ProviderBehavior::WrongIdentity => {
                 let mut parts = participant.identity().parts().clone();
@@ -674,6 +691,8 @@ pub(crate) struct TestStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCommand {
     Provider,
+    ProgramBinding,
+    CoalescedProgramBinding,
     DynamicBinding,
     ResultBinding,
     Copy,
@@ -775,6 +794,8 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submitted_command_counts: Vec<usize>,
     pub(crate) submitted_command_phases: Vec<Vec<DeviceCommandPhase>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
+    pub(crate) program_binding_coalesce_calls: u64,
+    pub(crate) program_binding_input_counts: Vec<usize>,
     pub(crate) readback_calls: u64,
     pub(crate) readback_lengths: Vec<u64>,
     pub(crate) synchronize_calls: u64,
@@ -951,6 +972,26 @@ impl DeviceRuntime for TestRuntime {
         Ok(TestCommand::Zero)
     }
 
+    fn coalesce_program_bindings(
+        &self,
+        commands: Vec<Self::Command>,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.program_binding_coalesce_calls += 1;
+        trace.program_binding_input_counts.push(commands.len());
+        drop(trace);
+        if commands.is_empty() {
+            Ok(commands)
+        } else if commands
+            .iter()
+            .all(|command| *command == TestCommand::ProgramBinding)
+        {
+            Ok(vec![TestCommand::CoalescedProgramBinding])
+        } else {
+            Err(TestRuntimeError("unexpected program binding command"))
+        }
+    }
+
     fn submit(
         &self,
         _stream: &mut Self::Stream,
@@ -968,6 +1009,10 @@ impl DeviceRuntime for TestRuntime {
                     let (native_op_id, compute_dispatch_count, transfer_command_count) =
                         match entry.command() {
                             TestCommand::Provider => ("test_provider", 1, 0),
+                            TestCommand::ProgramBinding => ("test_program_binding", 0, 1),
+                            TestCommand::CoalescedProgramBinding => {
+                                ("test_coalesced_program_binding", 0, 1)
+                            }
                             TestCommand::DynamicBinding => ("test_dynamic_binding", 0, 1),
                             TestCommand::ResultBinding => ("test_result_binding", 0, 1),
                             TestCommand::Copy => ("test_copy", 0, 1),
@@ -1958,8 +2003,15 @@ pub(crate) fn fixture() -> Fixture {
 }
 
 pub(crate) fn fixture_with_zero_state(zero_state: bool) -> Fixture {
+    fixture_with_provider_behavior(zero_state, ProviderBehavior::Success)
+}
+
+pub(crate) fn fixture_with_provider_behavior(
+    zero_state: bool,
+    behavior: ProviderBehavior,
+) -> Fixture {
     let catalog = catalog_with_zero_state(zero_state);
-    let provider_behavior = Arc::new(Mutex::new(ProviderBehavior::Success));
+    let provider_behavior = Arc::new(Mutex::new(behavior));
     let provider_trace = Arc::new(Mutex::new(ProviderTrace::default()));
     let registry = operation_registry(
         &catalog,

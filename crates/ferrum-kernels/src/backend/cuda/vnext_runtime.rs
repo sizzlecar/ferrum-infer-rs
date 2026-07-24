@@ -456,6 +456,31 @@ impl CudaDeviceCommand {
         )
     }
 
+    pub(crate) fn replayable_operation_with_host_storage_blas_and_fence_dependencies(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        host_storage: Vec<Box<[u8]>>,
+        fence_dependencies: Vec<CudaBufferRegion>,
+        replay_key: CudaCommandReplayKey,
+        enqueue: impl Fn(
+                &CudaStream,
+                &CudaBlas,
+                &[CudaBufferRegion],
+                &[Box<[u8]>],
+            ) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_with_host_storage_and_blas_inner(
+            operation,
+            regions,
+            host_storage,
+            fence_dependencies,
+            Some(replay_key),
+            enqueue,
+        )
+    }
+
     fn operation_with_host_storage_and_blas_inner(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
@@ -583,6 +608,63 @@ impl CudaDeviceCommand {
         self.compute_dispatch_count = compute_dispatch_count;
         self.transfer_command_count = transfer_command_count;
         Ok(self)
+    }
+
+    fn coalesced_program_bindings(
+        commands: Vec<Self>,
+    ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
+        if commands.len() <= 1 {
+            return Ok(commands);
+        }
+        let runtime_instance = commands[0].runtime_instance;
+        let participant_count = commands[0].participant_count;
+        let token_count = commands[0].token_count;
+        if participant_count == 0
+            || commands.iter().any(|command| {
+                command.runtime_instance != runtime_instance
+                    || command.participant_count != participant_count
+                    || command.token_count != token_count
+                    || command.compute_dispatch_count != 0
+                    || command.transfer_command_count == 0
+                    || command.replay_key.is_some()
+                    || command.reusable_address_scope.is_some()
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA program bindings are not one compatible eager prelude",
+            ));
+        }
+        let transfer_command_count = commands.iter().try_fold(0_u64, |total, command| {
+            total
+                .checked_add(command.transfer_command_count)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA program binding transfer count overflows u64",
+                    )
+                })
+        })?;
+        let executable = Arc::new(CudaCommandExecutable {
+            regions: Vec::new(),
+            host_storage: Vec::new(),
+            enqueue: Mutex::new(Box::new(move |stream, blas, _regions, _host_storage| {
+                commands
+                    .iter()
+                    .try_for_each(|command| command.enqueue(stream, blas))
+            })),
+        });
+        Ok(vec![Self {
+            runtime_instance,
+            operation: "vnext_program_binding_prelude",
+            batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            token_count,
+            compute_dispatch_count: 0,
+            transfer_command_count,
+            executable,
+            fence_dependencies: Vec::new(),
+            replay_key: None,
+            reusable_address_scope: None,
+        }])
     }
 
     pub(crate) fn enqueue(
@@ -1403,6 +1485,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 .map_err(|error| CudaDeviceRuntimeError::driver("device zero", error))
             }),
         ))
+    }
+
+    fn coalesce_program_bindings(
+        &self,
+        commands: Vec<Self::Command>,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        CudaDeviceCommand::coalesced_program_bindings(commands)
     }
 
     fn submit(

@@ -427,6 +427,49 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32_state_
       value_dim, conv_kernel);
 }
 
+extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32_state_f16_indirect(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const unsigned long long* __restrict__ state_bindings,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __half* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const __half* initial_conv_states =
+      reinterpret_cast<const __half*>(state_bindings[0]);
+  linear_attention_prepare_varlen_impl<__half, float, __half>(
+      mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
+}
+
+extern "C" __global__ void recurrent_conv_state_commit_f16_indirect(
+    const __half* __restrict__ source,
+    const unsigned long long* __restrict__ state_bindings,
+    const int elements) {
+  __half* destination = reinterpret_cast<__half*>(state_bindings[0]);
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    destination[index] = source[index];
+  }
+}
+
 template <typename InputT, typename ParamT>
 static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const InputT* __restrict__ mixed_qkvz_raw,
