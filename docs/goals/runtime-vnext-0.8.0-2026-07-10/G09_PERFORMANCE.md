@@ -468,6 +468,25 @@ artifact、GitHub commit `804cb22a` 和 SHA256
 `b6f0558f98675ad043d31f5958aa45e60f1c0ed38b6fad7f0173d45d02d8a143`
 记录在 [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md)。
 
+后续 clean source `32c53a6b` 的同范围 bounded diagnostic 已命中全部 correlation stop
+condition，精确结果记录在 [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md)。
+这只关闭 profiler instrumentation blocker，不改变 G09 Open 状态或 `76.1583 tok/s` floor。
+dominant decode graph 的 owner kernel work 为 recurrent attention `46.0304%`、MoE
+`40.3663%`、causal attention `11.8639%`；paged-attention kernel 本体仅 `1.2260%`。
+
+recurrent attention 内部第一组可修改瓶颈是五个 F16 projection，其中 QKV GEMV 占全部
+kernel work `16.7828%`、Z GEMV `8.7463%`、output GEMV `8.8117%`，B/A 各约 `0.95%`。
+当前 vNext 每层分别提交 QKV、Z、B、A 四次 projection；当前 vLLM Qwen GDN 则把它们组织为
+QKVZ 和 BA 两个 merged projection。Ferrum 采用自己的 typed weight/program 合同：在模型
+prepare 时把现有 immutable source weight 物化为 QKVZ/BA composite，热路径只执行两次
+projection，不引入 model-name/GPU-name 分支，也不复制 Python runtime 设计。
+
+下一项 CUDA candidate 的必需信号为：30 个 recurrent layer 每层 projection kernel 从
+`4` 降到 `2`，dominant decode graph 总 kernel node 至少减少 `60`；`c03/c05/c06` 正确性
+必须先通过，replay wall 和 profile-off throughput 均不得回退。若 graph-node 信号未命中，
+立即 REJECT source contract；只有命中且窄 profile 显示绝对时间改善，才运行一次
+profile-off c1 smoke，不直接运行 G09 full sweep。
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

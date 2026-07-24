@@ -223,6 +223,43 @@ source fix `8f44dd8c` 将 replay correlation 改为显式
 CUDA feature compile 与上述四项真实 artifact 仍待下一次 bounded reuse 验证。在它们 PASS
 以前，不得接受 top kernel、不得运行 throughput sweep，也不得计入 G06/G09 formal progress。
 
+### CUDA replay kernel 关联 PASS 检查点（2026-07-24）
+
+clean source `32c53a6bf2124771aa823b2982c6b9bc7d3280db`、CUDA binary SHA256
+`6f0b0941851850f7f198dbaffc6e5d91793eb7e484d5a1ff6e90cce1d6f9c8d9` 已按上述
+bounded stop condition 完成验证。`c03 run`、`c05 serve`、`c06 streaming` 正确性先行
+通过；随后只运行 c1 `random 64/16`、4 requests、1 repeat 的 Nsight diagnostic，没有运行
+throughput sweep。
+
+12/12 fingerprint、405/405 replay range 逐项匹配，missing/foreign fingerprint 和 range
+count mismatch 均为 `0`；nested/child/invalid projected range 为 `0`。Ferrum replay wall
+为 `935102656ns`，Nsight projected GPU wall 为 `930620798ns`，projection coverage
+`0.995207`；kernel work 为 `887828908ns`，占 projected wall `0.954018`。因此关联生命周期
+和 coverage 口径均命中预声明硬线：
+
+```text
+CUDA REPLAY KERNEL ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-kernel-attribution-v2-32c53a6b-20260724T060439Z/kernel-profile/kernel-attribution-summary.json
+```
+
+artifact 通过 GitHub branch
+`artifact/runtime-vnext-replay-kernel-attribution-v2-32c53a6b-20260724` 回传，artifact
+commit 为 `058cd0a61f3973a5cc8099359793c150c063c83f`，archive SHA256 为
+`c1b89ffac996e6c862d62dfa212ea4634c574d024c3c07b72abd57204faf3bfb`。本轮约
+`14.850min`、估算 `$0.116187`；Vast `45319871` 已确认 `stopped/exited`，无 billable
+sibling。decision 为 `KEEP_OBSERVABILITY_CHECKPOINT`，不是 G09 正式性能进展。
+
+对 dominant decode graph 的原始 graph-node 离线重放进一步得到 1081 个 kernel node、
+30 个 memcpy node、110 个 memset node；75 个 replay range 中每个 kernel node 恰好出现
+75 次。按 immutable plan owner 聚合后的 kernel work 为：gated-delta recurrent attention
+`46.0304%`、routed/shared MoE `40.3663%`、causal attention `11.8639%`、RMS norm
+`1.2022%`、residual `0.5372%`。paged-attention kernel 本体仅占 `1.2260%`，不得再作为
+首个优化项。
+
+当前声明式 `compute_dispatch_count` 会漏掉 cuBLAS 算法内部生成的 split-K reduction；
+因此下一项本地 profiler 改造必须在 capture 时记录每个 command 的实际 graph-node 增量，
+而不是把本次 graph 的 `13` 个 MoE kernel 硬编码回模型合同。完成该元数据和本地合同测试前
+不得启动下一次 paid diagnostic。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
