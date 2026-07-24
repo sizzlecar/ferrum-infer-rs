@@ -1042,6 +1042,83 @@ candidate mean is still `4.5949 tok/s` below the best prior Ferrum point and
 comparison ran. The next performance work must use these artifacts to name
 one remaining completion/resource bottleneck before another paid run.
 
+### 2026-07-25 Lane-Stable Backing Certificate CUDA Decision
+
+The follow-up source audit found that lane-stable physical backing was already
+retained, but every wave still rebuilt physical-claim maps, revalidated
+immutable lease/layout facts, and re-encoded all allocation fingerprints.
+Clean source `24a2c6516680fc5b0db988725fab1bc766919f43` moved that cold proof
+into a `BackingClaimCertificate` owned by each lane-stable arena slot. A wave
+still binds current logical projection sizes, claims current logical
+capacity, and follows the existing defer, wait, retry, fence, and release
+paths. The change therefore does not hard-code capacity or bypass dynamic
+backpressure.
+
+Before CUDA, formatting, the bounded submission-wave and operation-wave
+contracts, adjacent batch/cancel/completion/dispatch contracts, and
+`cargo check --workspace --all-targets` passed. The CUDA release build took
+`5m08s`; its binary SHA256 was
+`84187c7cf1dd68fe1b67cb2d3ce09ca605eddc763c5ade843020a9d8aed43a2c`.
+Actual-model Qwen3.5-35B-A3B-GPTQ correctness then passed `3/3`:
+
+- resident three-turn `ferrum run` returned the exact expected identifier;
+- non-streaming `ferrum serve` returned `Paris`;
+- streaming `ferrum serve` returned `Paris`, one `[DONE]`, and usage-derived
+  output-token counts;
+- direct fallback, correctness catalog miss, and catalog-epoch miss remained
+  `0`, and full-participant materialization before submit remained `0`.
+
+The bounded Basic random `64/32`, c1, `25 + 5` warmup, seed `9271` slot
+measured the intended phases directly:
+
+| phase | prior adjacent candidate mean | certificate candidate | reduction |
+|---|---:|---:|---:|
+| transaction validate/fingerprint | `1064.203 us` | `4.101 us` | `99.61%` |
+| submission-wave prepare | `1139.794 us` | `169.975 us` | `85.09%` |
+
+The Basic slot completed `25/25` at `71.4755 tok/s` with zero request or
+quality error. The subsequent profile-off diagnostic completed `25/25` at
+`60.1407 tok/s`, also with zero error and usage-derived token counts. That
+single profile-off slot is `8.77%` above the preceding compiled-identity
+candidate mean, but it is not a formal comparison: it has one repeat, no
+adjacent reversal, and no confidence interval. It remains `16.0176 tok/s`
+below the unchanged `76.1583 tok/s` floor, reaching `78.97%` of the floor.
+
+The bounded decision is `KEEP_LANE_STABLE_BACKING_CERTIFICATE`. The validator
+printed:
+
+```text
+CUDA BACKING CERTIFICATE BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-backing-certificate-cuda-24a2c651-20260724T222019Z
+```
+
+The locally verified artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-backing-certificate-cuda-24a2c651-20260724T222019Z/`.
+GitHub artifact branch
+`artifact/runtime-vnext-backing-certificate-24a2c651-20260725` is at commit
+`5c4ef937`. At artifact finalization, the paid-lane record covered `20m57s`
+and an estimated `$0.1639`; GitHub transfer and shutdown followed immediately.
+Retained Vast instance `45319871` is verified `stopped/exited`, with no sibling
+instance.
+
+This closes repeated physical-claim validation as a G09 bottleneck. It does
+not complete G09. The retained Basic artifact now localizes the next work
+without another discovery run:
+
+| phase | prefill | decode |
+|---|---:|---:|
+| device execution | `13.7444 ms` | `7.2507 ms` |
+| completion round trip | `13.1125 ms` | `7.7148 ms` |
+| provider-node encode | `1.2640 ms` | `0.7615 ms` |
+| command enqueue | `1.3003 ms` | `0.2468 ms` |
+| resource prepare | `0.7510 ms` | `0.4021 ms` |
+
+No repeat CUDA run is authorized merely to reconfirm that device execution is
+now dominant. The next source candidate must use these saved phase values and
+the current vLLM implementation to predict a specific prefill or decode
+device/provider signal. Previously rejected packed-decode launch-count
+variants remain closed; they may not be rerun under a new label without a
+different source-level mechanism and a new falsifiable artifact prediction.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
