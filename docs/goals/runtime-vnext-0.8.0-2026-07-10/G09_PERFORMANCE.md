@@ -1119,6 +1119,86 @@ device/provider signal. Previously rejected packed-decode launch-count
 variants remain closed; they may not be rerun under a new label without a
 different source-level mechanism and a new falsifiable artifact prediction.
 
+### 2026-07-25 Elastic Prefill Budget CUDA Decision
+
+The backing-certificate artifact also showed that the default
+`max_batched_tokens=192`, `max_sequences=16` policy was silently deriving a
+static `prefill_step_chunk=12`. Clean source `1e6ea782` removed that derived
+cap while retaining explicit CLI/config overrides. The default scheduler now
+spends the live step budget and reports
+`prefill_first_until_active:16+prefill_token_budget:elastic`; no hidden
+`FERRUM_SCHED_PREFILL_STEP_CHUNK` setting was used.
+
+The first correctness attempt produced a bounded REJECT before any performance
+command ran:
+
+```text
+CUDA ELASTIC PREFILL BOUNDED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-1e6ea782-20260724T231246Z
+```
+
+Its exact failure class was
+`compiled-program-binding-slot-provider-patch-cardinality`. The larger eager
+prefill shape exposed that CUDA recurrent GDN and causal attention always
+registered provider patches as compiled-program bindings even when the core
+plan supplied no compiled slot. Commit `58ea9761` repaired the shared CUDA
+provider boundary: compiled invocations use program bindings and eager
+invocations use dynamic bindings. The local CUDA reusable-execution contract
+passed `9/9` before the follow-up paid run.
+
+The follow-up release build took `4m58s`. Its source tree was clean at
+`58ea9761d6e22aefec9c4075e92cad1cff4dbc5b`; binary SHA256 was
+`23e478b5801cfe32cab4147b48d7212a749baa9cfb6dd050592890a406f2466d`.
+Actual-model correctness passed all product paths before performance:
+
+- resident three-turn `ferrum run`;
+- non-streaming `ferrum serve`;
+- streaming `ferrum serve` with exactly one `[DONE]` and usage;
+- no malformed stream, request error, failed wave, direct fallback, or catalog
+  miss.
+
+The exact Basic c1 random `64/32`, `25 + 5` warmup, seed `9271` workload then
+completed `25/25` at `73.3855 tok/s` with zero errors and usage-derived token
+counts. The adjacent backing-certificate artifact is the comparison baseline:
+
+| metric | `24a2c651` baseline | `58ea9761` elastic | delta |
+|---|---:|---:|---:|
+| throughput | `71.4755 tok/s` | `73.3855 tok/s` | `+2.67%` |
+| prefill waves | `210` | `30` | `-85.71%` |
+| prefill device total | `2.8863 s` | `1.1342 s` | `-60.71%` |
+| prefill device mean | `13.7444 ms` | `37.8053 ms` | larger useful wave |
+| decode waves | `930` | `930` | unchanged |
+| decode device total | `6.7432 s` | `6.7565 s` | `+0.20%` |
+| failed waves | `0` | `0` | unchanged |
+
+The accepted decision is `KEEP_ELASTIC_PREFILL_TOKEN_BUDGET`. It preserves
+dynamic capacity rather than fixing a per-request chunk size and materially
+reduces wasted prefill fragmentation. The validator printed:
+
+```text
+CUDA ELASTIC PREFILL CORRECTNESS PASS: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/correctness
+CUDA ELASTIC PREFILL BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z
+```
+
+This remains bounded G09 development evidence, not formal G09 completion.
+The `76.1583 tok/s` floor is still open by `2.7728 tok/s` (`3.64%`).
+The SHA256-verified local artifacts are
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-1e6ea782-20260724T231246Z/`
+and
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/`;
+GitHub artifact branch
+`artifact/runtime-vnext-elastic-prefill-58ea9761-20260725` is at
+`25cc00a2cf1df9b50bc516210d6bc7bb001b90f8`. Vast instance `45319871` is
+verified `stopped/exited`.
+
+The new phase attribution changes the next lever. Prefill is now only
+`1.1342 s` while decode is `6.7565 s`, so CUDA chunked GDN prefill is not the
+next c1 candidate and no paid run is authorized for it merely because vLLM
+has a chunked implementation. Offline work must first audit the recurrent GDN
+decode state's repeated load/store and same-state copy behavior against the
+current vLLM implementation, then define a source-level specialization with
+one predicted trace/device counter. The rejected packed-decode
+launch-count lineage remains closed.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
