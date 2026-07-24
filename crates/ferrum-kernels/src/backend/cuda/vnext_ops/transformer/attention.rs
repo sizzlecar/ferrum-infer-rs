@@ -9,10 +9,10 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
     CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement,
-    ElementType, EncodedDeviceOperation, GatedDeltaDecayParameterization,
-    GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm, GatedDeltaExecutionPreference,
-    GatedDeltaValueHeadMapping, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
+    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
+    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationContract, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
@@ -234,6 +234,23 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
                 identity,
                 ProfilePhase::Forward,
                 "cuda.gated_delta_recurrent_attention.encode",
+                message.chars().take(2048).collect::<String>(),
+                false,
+            )
+            .expect("core-issued CUDA attention identity must be valid")
+        })
+    }
+
+    fn encode_reusable_execution_bindings(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_reusable_attention_bindings(invocation).map_err(|message| {
+            OperationFailure::new(
+                identity,
+                ProfilePhase::Forward,
+                "cuda.gated_delta_recurrent_attention.encode_reusable_bindings",
                 message.chars().take(2048).collect::<String>(),
                 false,
             )
@@ -916,6 +933,71 @@ fn encode_attention(
         .map_err(|error| error.to_string())?;
 
     Ok(EncodedDeviceOperation::compute(compute_command).with_program_binding(binding_command))
+}
+
+fn encode_reusable_attention_bindings(
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, String> {
+    if invocation.participants().is_empty()
+        || invocation.operation().id.as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID
+    {
+        return Err("CUDA recurrent attention received another or empty operation".to_owned());
+    }
+    let program_binding = invocation.program_binding().cloned().ok_or_else(|| {
+        "CUDA recurrent direct execution requires a compiled program binding".to_owned()
+    })?;
+    let total_tokens = invocation.work_shape().immediate_tokens();
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
+    let binding_layout = StateBindingLayout::new(invocation.participants().len())?;
+    let destination = super::shared_binding_region(&invocation, binding_layout.required_bytes)?;
+    let mut writes = Vec::with_capacity(invocation.participants().len());
+    let mut fence_dependencies =
+        Vec::with_capacity(invocation.participants().len().saturating_mul(2));
+
+    // The sealed program identity already binds static attributes, weights,
+    // scratch, launch topology, and provider implementation. The hot path
+    // materializes only live recurrent-state addresses.
+    for (participant_index, participant) in invocation.participants().iter().enumerate() {
+        let conv_state = contiguous_region(
+            participant,
+            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+            ElementType::F16,
+        )?;
+        let delta_state = contiguous_region(
+            participant,
+            binding(participant.bindings(), ResolvedValueRole::Input, 10)?,
+            ElementType::F32,
+        )?;
+        writes.push(
+            super::CudaProgramBindingWrite::new(
+                binding_layout.offset(participant_index)?,
+                state_binding_payload(&conv_state, &delta_state),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        fence_dependencies.push(conv_state);
+        fence_dependencies.push(delta_state);
+    }
+
+    let binding_command = CudaDeviceCommand::program_binding_patch(
+        "vnext_gated_delta_recurrent_attention_bindings",
+        program_binding,
+        destination,
+        writes,
+        fence_dependencies,
+    )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            total_tokens,
+            0,
+            u64::from(participant_count),
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(EncodedReusableExecutionBindings::empty().with_program_binding(binding_command))
 }
 
 fn state_binding_payload(
