@@ -275,7 +275,9 @@ pub struct SchedulerConfig {
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
-    /// Cap per-request prefill chunks at the scheduler token-budget layer.
+    /// Optional hard cap for per-request prefill chunks. `None` spends the
+    /// live per-step token budget and lets capacity feedback narrow or regrow
+    /// each request independently.
     #[serde(default)]
     pub prefill_step_chunk: Option<usize>,
     /// Cap prefill admission chunks only while decode requests are already active.
