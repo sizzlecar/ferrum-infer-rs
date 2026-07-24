@@ -4006,9 +4006,6 @@ impl VNextProfileEventContext {
         };
         let mut events = Vec::with_capacity(attribution.device().commands().len());
         for (attribution_index, command) in attribution.device().commands().iter().enumerate() {
-            let Some(node_index) = command.node_index() else {
-                continue;
-            };
             let command_timing =
                 measured_timings.and_then(|timings| timings.get(attribution_index));
             let device_elapsed_ns = command_timing.map(|timing| timing.elapsed_ns());
@@ -4026,25 +4023,48 @@ impl VNextProfileEventContext {
                     })
                     .collect::<Vec<_>>()
             });
-            let node_index_usize = usize::try_from(node_index).map_err(|_| {
-                ExecutionEventSinkError::new(
-                    "device attribution node index exceeds the host index range",
-                )
-            })?;
-            let node = batch.nodes().get(node_index_usize).ok_or_else(|| {
-                ExecutionEventSinkError::new(
-                    "device attribution node index is absent from its batch identity",
-                )
-            })?;
-            let first = node.participants().first().ok_or_else(|| {
-                ExecutionEventSinkError::new("device attribution node has no participants")
-            })?;
+            let (node_index, node, first, participant_request_ids) = if let Some(node_index) =
+                command.node_index()
+            {
+                let node_index_usize = usize::try_from(node_index).map_err(|_| {
+                    ExecutionEventSinkError::new(
+                        "device attribution node index exceeds the host index range",
+                    )
+                })?;
+                let node = batch.nodes().get(node_index_usize).ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "device attribution node index is absent from its batch identity",
+                    )
+                })?;
+                let first = node.participants().first().ok_or_else(|| {
+                    ExecutionEventSinkError::new("device attribution node has no participants")
+                })?;
+                let participant_request_ids = node
+                    .participants()
+                    .iter()
+                    .map(|participant| participant.identity().parts().request_id.to_string())
+                    .collect::<Vec<_>>();
+                (Some(node_index), Some(node), first, participant_request_ids)
+            } else {
+                let first_node = batch.nodes().first().ok_or_else(|| {
+                    ExecutionEventSinkError::new("wave-level device attribution has no batch nodes")
+                })?;
+                let first = first_node.participants().first().ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "wave-level device attribution has no participants",
+                    )
+                })?;
+                let mut participant_request_ids = batch
+                    .nodes()
+                    .iter()
+                    .flat_map(|node| node.participants())
+                    .map(|participant| participant.identity().parts().request_id.to_string())
+                    .collect::<Vec<_>>();
+                participant_request_ids.sort();
+                participant_request_ids.dedup();
+                (None, None, first, participant_request_ids)
+            };
             let first_identity = first.identity().parts();
-            let participant_request_ids = node
-                .participants()
-                .iter()
-                .map(|participant| participant.identity().parts().request_id.to_string())
-                .collect::<Vec<_>>();
             let shape = BTreeMap::from([
                 ("node_index".to_string(), serde_json::json!(node_index)),
                 (
@@ -4081,6 +4101,10 @@ impl VNextProfileEventContext {
                     )),
                 ),
                 (
+                    "attribution_scope".to_string(),
+                    serde_json::json!(if node.is_some() { "node" } else { "wave" }),
+                ),
+                (
                     "backend_device".to_string(),
                     serde_json::json!(self.backend_device),
                 ),
@@ -4110,14 +4134,6 @@ impl VNextProfileEventContext {
                     serde_json::json!(command.native_op_id()),
                 ),
                 (
-                    "node_id".to_string(),
-                    serde_json::json!(node.node_id().to_string()),
-                ),
-                (
-                    "operation_id".to_string(),
-                    serde_json::json!(node.operation_id().to_string()),
-                ),
-                (
                     "participant_request_ids".to_string(),
                     serde_json::json!(participant_request_ids),
                 ),
@@ -4134,10 +4150,6 @@ impl VNextProfileEventContext {
                     serde_json::json!(self.profile_detail.as_str()),
                 ),
                 (
-                    "provider_id".to_string(),
-                    serde_json::json!(node.provider_id().to_string()),
-                ),
-                (
                     "physical_submission_fingerprint".to_string(),
                     serde_json::json!(attribution.submission_fingerprint()),
                 ),
@@ -4146,6 +4158,20 @@ impl VNextProfileEventContext {
                     serde_json::json!(batch.runtime_implementation_fingerprint()),
                 ),
             ]);
+            if let Some(node) = node {
+                attributes.insert(
+                    "node_id".to_string(),
+                    serde_json::json!(node.node_id().to_string()),
+                );
+                attributes.insert(
+                    "operation_id".to_string(),
+                    serde_json::json!(node.operation_id().to_string()),
+                );
+                attributes.insert(
+                    "provider_id".to_string(),
+                    serde_json::json!(node.provider_id().to_string()),
+                );
+            }
             attributes.insert(
                 "device_timing_status".to_string(),
                 serde_json::json!(match attribution.terminal_timing() {
@@ -4176,7 +4202,7 @@ impl VNextProfileEventContext {
                 event_id: format!(
                     "evt-vnext-native-{}-{}-{}",
                     attribution.submission_fingerprint(),
-                    node_index,
+                    node_index.map_or_else(|| "wave".to_owned(), |index| index.to_string()),
                     command.command_index()
                 ),
                 request_id: first_identity.request_id.to_string(),
