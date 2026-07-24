@@ -330,6 +330,17 @@ impl PlanNode {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_test_node_with_binding(
+        id: NodeId,
+        binding_resource: ResourceId,
+    ) -> Self {
+        let mut node = Self::resource_test_node(id);
+        node.binding_resource = Some(binding_resource.clone());
+        node.resources = vec![binding_resource];
+        node
+    }
+
     pub fn id(&self) -> &NodeId {
         &self.id
     }

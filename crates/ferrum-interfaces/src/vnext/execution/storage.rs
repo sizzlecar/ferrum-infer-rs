@@ -69,6 +69,14 @@ impl DynamicStorageContract {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_test_contract(
+        profile: DynamicStorageProfile,
+        logical_layout_fingerprint: String,
+    ) -> Result<Self, VNextError> {
+        Self::new(profile, logical_layout_fingerprint)
+    }
+
     pub const fn profile(&self) -> DynamicStorageProfile {
         self.profile
     }
@@ -648,6 +656,29 @@ impl DynamicResourceDescriptor {
         descriptor
             .evaluate_request_bytes_for_shape(descriptor.demand.theoretical_maximum_shape())?;
         Ok(descriptor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resource_test_binding(
+        base_resource_id: ResourceId,
+        demand: DynamicResourceDemand,
+        alignment_bytes: u64,
+        node_id: NodeId,
+        storage: DynamicStorageContract,
+        theoretical_maximum_instances: u32,
+    ) -> Result<Self, VNextError> {
+        Self::new(
+            base_resource_id,
+            demand,
+            alignment_bytes,
+            BufferUsage::Binding,
+            ElementType::U8,
+            AllocationLifetime::Invocation,
+            AllocationKind::Binding { node_id },
+            storage,
+            StateInitialization::None,
+            theoretical_maximum_instances,
+        )
     }
 
     pub fn base_resource_id(&self) -> &ResourceId {

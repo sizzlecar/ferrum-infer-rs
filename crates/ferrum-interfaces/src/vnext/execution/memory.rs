@@ -386,7 +386,7 @@ impl MemoryPlan {
     }
 
     #[cfg(test)]
-    pub(super) fn derive_dynamic_pools(
+    pub(crate) fn derive_dynamic_pools(
         dynamic_descriptors: &[DynamicResourceDescriptor],
         nodes: &[PlanNode],
         dynamic_capacity_bytes: u64,
