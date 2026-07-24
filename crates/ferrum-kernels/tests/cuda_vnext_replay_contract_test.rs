@@ -6,6 +6,8 @@ const RUNTIME_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime.rs"
 const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
+const MOE_PROVIDER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer/moe.rs");
+const MOE_ROUTER_KERNEL_SOURCE: &str = include_str!("../kernels/moe_router.cu");
 
 #[test]
 fn causal_pages_are_fence_dependencies_not_captured_regions() {
@@ -98,4 +100,17 @@ fn recurrent_attention_uses_two_packed_input_projections() {
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.z,"));
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.a,"));
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.b,"));
+}
+
+#[test]
+fn single_token_moe_router_materializes_marlin_blocks_without_generic_align() {
+    assert!(MOE_PROVIDER_SOURCE.contains("MoeRoutingPlan::SingleTokenDirectMarlin"));
+    assert!(MOE_PROVIDER_SOURCE.contains("launch_single_token_router"));
+    assert!(MOE_PROVIDER_SOURCE.contains("MoeRoutingPlan::GenericAlign"));
+    assert!(MOE_PROVIDER_SOURCE.contains("kernels.launch_align("));
+    assert!(MOE_ROUTER_KERNEL_SOURCE.contains("moe_router_topk_softmax_f16_single_token_marlin"));
+    assert!(MOE_ROUTER_KERNEL_SOURCE.contains("other == expert && k < tid"));
+    assert!(MOE_ROUTER_KERNEL_SOURCE.contains("expert_block_ids[expert_rank] = expert"));
+    assert!(MOE_ROUTER_KERNEL_SOURCE.contains("sorted_token_ids[block_start] = tid"));
+    assert!(MOE_ROUTER_KERNEL_SOURCE.contains("total_tokens_post_pad[0] = padded_pair_count"));
 }
