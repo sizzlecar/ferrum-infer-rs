@@ -1017,6 +1017,59 @@ the GitHub artifact branch is
 `5c4ef937`. Detailed phase evidence and the next paid-run restriction are
 owned by `G09_PERFORMANCE.md`.
 
+### 2026-07-25 Elastic Prefill Budget CUDA Keep
+
+The default scheduler had converted the product-visible
+`max_batched_tokens=192` and `max_sequences=16` ceilings into a static
+`prefill_step_chunk=12`. That policy forced every 64-token prompt through
+seven prefill waves even when the live step had enough capacity. Clean source
+`1e6ea782` removed that derived cap: an explicit CLI/config chunk override is
+still honored, while the default policy now spends the live per-step token
+budget. The decision trace records
+`prefill_first_until_active:16+prefill_token_budget:elastic`.
+
+The first actual-model CUDA correctness run exposed a provider-contract defect
+before performance started:
+
+```text
+CUDA ELASTIC PREFILL BOUNDED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-1e6ea782-20260724T231246Z
+```
+
+CUDA recurrent GDN and causal attention had always classified their binding
+patch as a compiled-program binding even when the core invocation supplied no
+compiled slot. Commit `58ea9761` added one shared CUDA binding classifier:
+compiled slots receive program bindings; eager invocations receive dynamic
+bindings. This is an execution-contract repair, not a Qwen3.5 model-name or
+shape special case.
+
+On clean source `58ea9761d6e22aefec9c4075e92cad1cff4dbc5b`, actual-model
+Qwen3.5-35B-A3B-GPTQ `ferrum run`, non-streaming `ferrum serve`, and streaming
+`ferrum serve` all passed. Streaming produced exactly one `[DONE]` and
+usage-derived output-token counts. The release binary SHA256 was
+`23e478b5801cfe32cab4147b48d7212a749baa9cfb6dd050592890a406f2466d`.
+
+The bounded Basic c1 random `64/32`, `25 + 5` warmup, seed `9271` diagnostic
+completed `25/25` with zero errors at `73.3855 tok/s`. Against the adjacent
+backing-certificate Basic artifact, prefill waves fell from `210` to `30` and
+prefill device time fell from `2.8863 s` to `1.1342 s` (`60.7%`). Decode
+remained `930` waves and `6.7565 s`; total throughput improved from
+`71.4755` to `73.3855 tok/s` (`2.67%`). This is a KEEP, not G08B or G09 PASS:
+the unchanged formal floor remains `76.1583 tok/s`, a `2.7728 tok/s` gap.
+
+```text
+CUDA ELASTIC PREFILL CORRECTNESS PASS: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/correctness
+CUDA ELASTIC PREFILL BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z
+```
+
+The SHA256-verified local artifacts are
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-1e6ea782-20260724T231246Z/`
+and
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/`.
+GitHub artifact branch
+`artifact/runtime-vnext-elastic-prefill-58ea9761-20260725` is at commit
+`25cc00a2cf1df9b50bc516210d6bc7bb001b90f8`. Retained Vast instance
+`45319871` was verified `stopped/exited` after artifact capture.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
