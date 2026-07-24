@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
@@ -438,6 +438,7 @@ struct VNextReusableExecutionStartupReport {
     eager_warmup_waves: usize,
     capture_waves: usize,
     replay_validation_waves: usize,
+    prepared_programs: usize,
     device_preparation: DeviceReusableExecutionPreparation,
     elapsed_ms: u64,
 }
@@ -492,6 +493,11 @@ struct VNextIoBinding {
     output_elements: usize,
 }
 
+struct VNextReusableExecutionCatalog {
+    lane_epoch: u64,
+    programs: BTreeMap<DeviceReusableExecutionProgramId, DeviceReusableExecutionProgram>,
+}
+
 #[derive(Default)]
 struct VNextExecutorMetrics {
     prefill_operations: AtomicU64,
@@ -501,6 +507,13 @@ struct VNextExecutorMetrics {
     submitted_waves: AtomicU64,
     completed_waves: AtomicU64,
     failed_waves: AtomicU64,
+    direct_reusable_waves: AtomicU64,
+    direct_reusable_segments: AtomicU64,
+    direct_reusable_logical_nodes: AtomicU64,
+    direct_reusable_binding_nodes: AtomicU64,
+    direct_reusable_fallbacks: AtomicU64,
+    reusable_catalog_misses: AtomicU64,
+    reusable_catalog_epoch_misses: AtomicU64,
     definitely_not_submitted_retries: AtomicU64,
     request_deferrals: AtomicU64,
     sequence_deferrals: AtomicU64,
@@ -1098,6 +1111,13 @@ impl VNextExecutorMetrics {
             &self.submitted_waves,
             &self.completed_waves,
             &self.failed_waves,
+            &self.direct_reusable_waves,
+            &self.direct_reusable_segments,
+            &self.direct_reusable_logical_nodes,
+            &self.direct_reusable_binding_nodes,
+            &self.direct_reusable_fallbacks,
+            &self.reusable_catalog_misses,
+            &self.reusable_catalog_epoch_misses,
             &self.definitely_not_submitted_retries,
             &self.request_deferrals,
             &self.sequence_deferrals,
@@ -2480,6 +2500,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     device_reusable_execution_enabled: bool,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
+    reusable_execution_catalog: OnceLock<VNextReusableExecutionCatalog>,
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
@@ -2807,6 +2828,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
             reusable_execution_supported,
             reusable_execution_startup_plan,
+            reusable_execution_catalog: OnceLock::new(),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
             event_sink: RwLock::new(None),
@@ -2986,6 +3008,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<VNextReusableExecutionStartupReport> {
         let started = Instant::now();
         let Some(plan) = self.reusable_execution_startup_plan.clone() else {
+            self.reusable_execution_catalog
+                .set(VNextReusableExecutionCatalog {
+                    lane_epoch: self.lane.reusable_execution_epoch(),
+                    programs: BTreeMap::new(),
+                })
+                .map_err(|_| {
+                    FerrumError::internal("vNext reusable execution catalog was already installed")
+                })?;
             return Ok(VNextReusableExecutionStartupReport {
                 enabled: self.device_reusable_execution_enabled,
                 supported: self.reusable_execution_supported,
@@ -3001,6 +3031,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 eager_warmup_waves: 0,
                 capture_waves: 0,
                 replay_validation_waves: 0,
+                prepared_programs: 0,
                 device_preparation: DeviceReusableExecutionPreparation::unsupported(),
                 elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             });
@@ -3176,6 +3207,43 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext reusable execution sealing produced an unusable receipt: {device_preparation:?}"
             )));
         }
+        let catalog = self.lane.reusable_execution_catalog().map_err(|error| {
+            FerrumError::device(format!(
+                "vNext reusable execution catalog inspection failed: {error}"
+            ))
+        })?;
+        let (catalog_epoch, catalog) = catalog.into_parts();
+        let mut catalog_by_id = BTreeMap::new();
+        for program in catalog {
+            let program_id = program.program_id();
+            if program_id.plan_hash() != self.resolved_plan.execution_plan().plan_hash()
+                || program_id.runtime_implementation_fingerprint()
+                    != self.runtime.descriptor().runtime_implementation_fingerprint
+                || program_id.lane_id() != self.lane.id()
+                || program.segments().iter().any(|segment| {
+                    segment.end_node_index() as usize
+                        > self.resolved_plan.execution_plan().payload().nodes().len()
+                })
+            {
+                return Err(FerrumError::internal(
+                    "vNext reusable execution catalog differs from its immutable plan or lane",
+                ));
+            }
+            if catalog_by_id.insert(program_id.clone(), program).is_some() {
+                return Err(FerrumError::internal(
+                    "vNext reusable execution catalog contains a duplicate program identity",
+                ));
+            }
+        }
+        let prepared_programs = catalog_by_id.len();
+        self.reusable_execution_catalog
+            .set(VNextReusableExecutionCatalog {
+                lane_epoch: catalog_epoch,
+                programs: catalog_by_id,
+            })
+            .map_err(|_| {
+                FerrumError::internal("vNext reusable execution catalog was already installed")
+            })?;
         let prepared_descriptors = prepared_decode_widths
             .iter()
             .copied()
@@ -3204,6 +3272,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             capture_waves: prepared_wave_shapes * REUSABLE_EXECUTION_CAPTURE_PASSES,
             replay_validation_waves: prepared_wave_shapes
                 * REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+            prepared_programs,
             device_preparation,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })
@@ -4130,6 +4199,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         let mut wave = wave;
         let mut retries = 0;
+        let mut reusable_direct_attempted = false;
         loop {
             let identity = match {
                 let _timing = self
@@ -4152,6 +4222,52 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 aggregate: &self.metrics.wave_timing,
                 phase: phase_timing,
             };
+            let device_timing_mode = self.device_timing_mode();
+            let mut reusable_catalog_miss = false;
+            let mut reusable_catalog_epoch_miss = false;
+            let reusable_program =
+                if device_timing_mode == DeviceTimingMode::Kernel || reusable_direct_attempted {
+                    None
+                } else {
+                    let program_id = match wave.claimed_backing().reusable_execution_program_id(
+                        &self.runtime.descriptor().runtime_implementation_fingerprint,
+                        self.lane.id(),
+                    ) {
+                        Ok(program_id) => program_id,
+                        Err(error) => {
+                            return DispatchOutcome::QuiescentFailure(error.to_string());
+                        }
+                    };
+                    match (program_id, self.reusable_execution_catalog.get()) {
+                        (Some(_), Some(catalog))
+                            if !catalog.programs.is_empty()
+                                && catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
+                        {
+                            reusable_catalog_epoch_miss = true;
+                            None
+                        }
+                        (Some(program_id), Some(catalog)) if !catalog.programs.is_empty() => {
+                            let program = catalog.programs.get(&program_id);
+                            reusable_catalog_miss = program.is_none();
+                            program
+                        }
+                        _ => None,
+                    }
+                };
+            reusable_direct_attempted |= reusable_program.is_some();
+            let reusable_program_stats = reusable_program.map(|program| {
+                (
+                    program.segments().len() as u64,
+                    program
+                        .segments()
+                        .iter()
+                        .map(|segment| {
+                            u64::from(segment.end_node_index() - segment.start_node_index())
+                        })
+                        .sum::<u64>(),
+                    program.per_wave_binding_node_indices().len() as u64,
+                )
+            });
             let submission = {
                 let _timing = self
                     .metrics
@@ -4159,13 +4275,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .provider_encode_submit
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                if timing_enabled {
+                if let Some(reusable_program) = reusable_program {
+                    if timing_enabled {
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
+                            self.providers.providers(),
+                            &self.resolved_plan,
+                            &identity,
+                            active_bindings(),
+                            device_timing_mode,
+                            &uploads,
+                            reusable_program,
+                            &timing_sink,
+                            wave,
+                            &self.lane,
+                            &self.reaper,
+                        )
+                        .map(ProfiledSubmissionHandle::into_parts)
+                    } else {
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+                            self.providers.providers(),
+                            &self.resolved_plan,
+                            &identity,
+                            active_bindings(),
+                            device_timing_mode,
+                            &uploads,
+                            reusable_program,
+                            wave,
+                            &self.lane,
+                            &self.reaper,
+                        )
+                        .map(|completion| (completion, None))
+                    }
+                } else if timing_enabled {
                     OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
                         active_bindings(),
-                        self.device_timing_mode(),
+                        device_timing_mode,
                         &uploads,
                         &timing_sink,
                         wave,
@@ -4179,7 +4326,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &self.resolved_plan,
                         &identity,
                         active_bindings(),
-                        self.device_timing_mode(),
+                        device_timing_mode,
                         &uploads,
                         wave,
                         &self.lane,
@@ -4191,6 +4338,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             match submission {
                 Ok((completion, attribution)) => {
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
+                    if let Some((segments, logical_nodes, binding_nodes)) = reusable_program_stats {
+                        self.metrics
+                            .direct_reusable_waves
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .direct_reusable_segments
+                            .fetch_add(segments, Ordering::Relaxed);
+                        self.metrics
+                            .direct_reusable_logical_nodes
+                            .fetch_add(logical_nodes, Ordering::Relaxed);
+                        self.metrics
+                            .direct_reusable_binding_nodes
+                            .fetch_add(binding_nodes, Ordering::Relaxed);
+                    } else if reusable_catalog_miss {
+                        self.metrics
+                            .reusable_catalog_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else if reusable_catalog_epoch_miss {
+                        self.metrics
+                            .reusable_catalog_epoch_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     return DispatchOutcome::Submitted {
                         completion,
                         attribution,
@@ -4200,6 +4369,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if retries < MAX_DEFINITELY_NOT_SUBMITTED_RETRIES =>
                 {
                     retries += 1;
+                    if reusable_program_stats.is_some() {
+                        self.metrics
+                            .direct_reusable_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     self.metrics
                         .definitely_not_submitted_retries
                         .fetch_add(1, Ordering::Relaxed);
@@ -5618,6 +5792,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "submitted_waves": self.metrics.submitted_waves.load(Ordering::Relaxed),
                 "completed_waves": self.metrics.completed_waves.load(Ordering::Relaxed),
                 "failed_waves": self.metrics.failed_waves.load(Ordering::Relaxed),
+                "reusable_execution": {
+                    "direct_waves": self.metrics.direct_reusable_waves.load(Ordering::Relaxed),
+                    "direct_segments": self.metrics.direct_reusable_segments.load(Ordering::Relaxed),
+                    "direct_logical_nodes": self.metrics.direct_reusable_logical_nodes.load(Ordering::Relaxed),
+                    "direct_binding_nodes": self.metrics.direct_reusable_binding_nodes.load(Ordering::Relaxed),
+                    "direct_fallbacks": self.metrics.direct_reusable_fallbacks.load(Ordering::Relaxed),
+                    "catalog_misses": self.metrics.reusable_catalog_misses.load(Ordering::Relaxed),
+                    "catalog_epoch_misses": self.metrics.reusable_catalog_epoch_misses.load(Ordering::Relaxed),
+                },
                 "definitely_not_submitted_retries": self.metrics.definitely_not_submitted_retries.load(Ordering::Relaxed),
                 "request_deferrals": self.metrics.request_deferrals.load(Ordering::Relaxed),
                 "sequence_deferrals": self.metrics.sequence_deferrals.load(Ordering::Relaxed),

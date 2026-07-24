@@ -17,8 +17,11 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, DeviceReusableAddressScope, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, ElementType,
+    DeviceCommandPhase, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
+    DeviceReusableExecutionSegment, ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -533,8 +536,21 @@ unsafe impl Send for CudaExecutableSegment {}
 pub(crate) struct CudaExecutableCache {
     entries: HashMap<CudaExecutableSegmentKey, CudaExecutableSegment>,
     rejected: HashMap<CudaExecutableSegmentKey, u64>,
+    programs: HashMap<DeviceReusableExecutionProgramId, CudaExecutableProgram>,
     preparation: ReusableExecutionPreparationTracker,
     clock: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CudaExecutableProgramSegment {
+    descriptor: DeviceReusableExecutionSegment,
+    key: CudaExecutableSegmentKey,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CudaExecutableProgram {
+    descriptor: DeviceReusableExecutionProgram,
+    segments: Vec<CudaExecutableProgramSegment>,
 }
 
 pub(crate) struct CudaExecutableLaunch {
@@ -610,6 +626,7 @@ impl CudaExecutableCache {
         Self {
             entries: HashMap::new(),
             rejected: HashMap::new(),
+            programs: HashMap::new(),
             preparation: ReusableExecutionPreparationTracker::default(),
             clock: 0,
         }
@@ -636,6 +653,15 @@ impl CudaExecutableCache {
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.wrapping_add(1).max(1);
         self.clock
+    }
+
+    fn remove_entry_and_dependent_programs(&mut self, key: CudaExecutableSegmentKey) -> bool {
+        if self.entries.remove(&key).is_none() {
+            return false;
+        }
+        self.programs
+            .retain(|_, program| !program.segments.iter().any(|segment| segment.key == key));
+        true
     }
 
     pub(crate) fn prepare_all(
@@ -728,7 +754,7 @@ impl CudaExecutableCache {
         }
 
         for key in plan.required_evictions(captured.len()) {
-            if self.entries.remove(key).is_some() {
+            if self.remove_entry_and_dependent_programs(*key) {
                 report.evicted_segments += 1;
             }
         }
@@ -785,6 +811,219 @@ impl CudaExecutableCache {
         self.rejected.insert(key, now);
     }
 
+    pub(crate) fn register_program(
+        &mut self,
+        capture: &DeviceReusableExecutionCapture,
+        candidates: &[CudaExecutableCandidate],
+        command_node_indices: &[Option<u32>],
+    ) -> Result<(), CudaReplayError> {
+        if !self.preparation.capture_is_open() {
+            return Ok(());
+        }
+        let mut segments = Vec::new();
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| self.entries.contains_key(&candidate.key))
+        {
+            let node_indices = command_node_indices
+                .get(candidate.range.clone())
+                .ok_or_else(|| CudaReplayError {
+                    stage: "register reusable execution program",
+                    detail: "candidate command range exceeds node attribution".to_owned(),
+                    eager_fallback_safe: false,
+                })?;
+            let Some(start_node_index) = node_indices.first().copied().flatten() else {
+                return Err(CudaReplayError {
+                    stage: "register reusable execution program",
+                    detail: "resident segment has no first plan node".to_owned(),
+                    eager_fallback_safe: false,
+                });
+            };
+            if node_indices.iter().enumerate().any(|(offset, observed)| {
+                let expected = start_node_index.checked_add(offset as u32);
+                *observed != expected
+            }) {
+                return Err(CudaReplayError {
+                    stage: "register reusable execution program",
+                    detail: "resident segment does not cover one contiguous plan-node range"
+                        .to_owned(),
+                    eager_fallback_safe: false,
+                });
+            }
+            let end_node_index = start_node_index
+                .checked_add(
+                    u32::try_from(node_indices.len()).map_err(|_| CudaReplayError {
+                        stage: "register reusable execution program",
+                        detail: "resident segment node count exceeds u32".to_owned(),
+                        eager_fallback_safe: false,
+                    })?,
+                )
+                .ok_or_else(|| CudaReplayError {
+                    stage: "register reusable execution program",
+                    detail: "resident segment node range overflows u32".to_owned(),
+                    eager_fallback_safe: false,
+                })?;
+            let ordinal = u32::try_from(segments.len()).map_err(|_| CudaReplayError {
+                stage: "register reusable execution program",
+                detail: "resident segment ordinal exceeds u32".to_owned(),
+                eager_fallback_safe: false,
+            })?;
+            let logical_command_count = u32::try_from(candidate.end() - candidate.start())
+                .map_err(|_| CudaReplayError {
+                    stage: "register reusable execution program",
+                    detail: "resident segment command count exceeds u32".to_owned(),
+                    eager_fallback_safe: false,
+                })?;
+            let descriptor = DeviceReusableExecutionSegment::new(
+                ordinal,
+                start_node_index,
+                end_node_index,
+                logical_command_count,
+            )
+            .map_err(|error| CudaReplayError {
+                stage: "register reusable execution program",
+                detail: error.to_string(),
+                eager_fallback_safe: false,
+            })?;
+            segments.push(CudaExecutableProgramSegment {
+                descriptor,
+                key: candidate.key,
+            });
+        }
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let binding_node_indices = capture
+            .per_wave_binding_node_indices()
+            .iter()
+            .copied()
+            .filter(|node_index| {
+                segments
+                    .iter()
+                    .any(|segment| segment.descriptor.contains_node(*node_index))
+            })
+            .collect::<Vec<_>>();
+        let descriptor = DeviceReusableExecutionProgram::new(
+            capture.program_id().clone(),
+            segments
+                .iter()
+                .map(|segment| segment.descriptor.clone())
+                .collect(),
+            binding_node_indices,
+        )
+        .map_err(|error| CudaReplayError {
+            stage: "register reusable execution program",
+            detail: error.to_string(),
+            eager_fallback_safe: false,
+        })?;
+        let program = CudaExecutableProgram {
+            descriptor,
+            segments,
+        };
+        match self.programs.get(capture.program_id()) {
+            Some(current) if current == &program => Ok(()),
+            Some(_) => Err(CudaReplayError {
+                stage: "register reusable execution program",
+                detail: "one typed program id resolved to different resident segments".to_owned(),
+                eager_fallback_safe: false,
+            }),
+            None => {
+                self.programs.insert(capture.program_id().clone(), program);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn catalog(&self) -> Result<Vec<DeviceReusableExecutionProgram>, String> {
+        let preparation = self
+            .preparation
+            .snapshot(self.entries.len(), self.rejected.len())?;
+        if preparation.state() != DeviceReusableExecutionPreparationState::Ready {
+            return Err("reusable execution catalog requires a sealed cache".to_owned());
+        }
+        if self.programs.values().any(|program| {
+            program
+                .segments
+                .iter()
+                .any(|segment| !self.entries.contains_key(&segment.key))
+        }) {
+            return Err(
+                "reusable execution catalog references a non-resident executable".to_owned(),
+            );
+        }
+        let mut catalog = self
+            .programs
+            .values()
+            .map(|program| program.descriptor.clone())
+            .collect::<Vec<_>>();
+        catalog.sort_by(|left, right| left.program_id().cmp(right.program_id()));
+        Ok(catalog)
+    }
+
+    pub(crate) fn launch_program_segment(
+        &mut self,
+        stream: &CudaStream,
+        invocation: &DeviceReusableExecutionInvocation,
+        tool_correlation: bool,
+    ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
+        let Some(program) = self.programs.get(invocation.program_id()) else {
+            return Ok(None);
+        };
+        let Some(segment) = program
+            .segments
+            .get(invocation.segment().ordinal() as usize)
+            .filter(|segment| &segment.descriptor == invocation.segment())
+        else {
+            return Err(CudaReplayError {
+                stage: "launch reusable execution program",
+                detail: "segment reference differs from the sealed program catalog".to_owned(),
+                eager_fallback_safe: false,
+            });
+        };
+        let key = segment.key;
+        let now = self.tick();
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return Err(CudaReplayError {
+                stage: "launch reusable execution program",
+                detail: "sealed program executable is no longer resident".to_owned(),
+                eager_fallback_safe: false,
+            });
+        };
+        let (reusable_executable_fingerprint, reusable_graph_node_counts) =
+            entry.launch(stream, now, tool_correlation)?;
+        Ok(Some(CudaExecutableLaunch {
+            reusable_executable_fingerprint,
+            reusable_graph_node_counts,
+        }))
+    }
+
+    pub(crate) fn contains_program_segment(
+        &self,
+        invocation: &DeviceReusableExecutionInvocation,
+    ) -> Result<bool, CudaReplayError> {
+        let Some(program) = self.programs.get(invocation.program_id()) else {
+            return Ok(false);
+        };
+        let Some(segment) = program
+            .segments
+            .get(invocation.segment().ordinal() as usize)
+        else {
+            return Err(CudaReplayError {
+                stage: "validate reusable execution program",
+                detail: "segment ordinal is outside the sealed program catalog".to_owned(),
+                eager_fallback_safe: true,
+            });
+        };
+        if &segment.descriptor != invocation.segment() {
+            return Err(CudaReplayError {
+                stage: "validate reusable execution program",
+                detail: "segment reference differs from the sealed program catalog".to_owned(),
+                eager_fallback_safe: true,
+            });
+        }
+        Ok(self.entries.contains_key(&segment.key))
+    }
+
     pub(crate) fn launch(
         &mut self,
         stream: &CudaStream,
@@ -812,10 +1051,12 @@ impl CudaExecutableCache {
         let released_rejections = self.rejected.len();
         self.entries.clear();
         self.rejected.clear();
+        self.programs.clear();
         (released_executables, released_rejections)
     }
 
     pub(crate) fn leak_if_in_flight(&mut self) {
+        self.programs.clear();
         for (_, entry) in self.entries.drain() {
             std::mem::forget(entry);
         }

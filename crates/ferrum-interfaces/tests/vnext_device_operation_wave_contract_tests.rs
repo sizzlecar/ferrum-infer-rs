@@ -947,6 +947,17 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
         &lane,
     )
     .unwrap();
+    let expected_program_id = wave
+        .claimed_backing()
+        .reusable_execution_program_id(
+            &fixture
+                .runtime
+                .descriptor()
+                .runtime_implementation_fingerprint,
+            lane.id(),
+        )
+        .unwrap()
+        .expect("program-binding wave must expose reusable capture identity");
 
     let handle = OperationDispatch::encode_and_submit_wave(
         &providers,
@@ -981,6 +992,12 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
                 TestCommand::Provider,
             ]]
         );
+        assert_eq!(trace.submitted_reusable_captures.len(), 1);
+        let capture = trace.submitted_reusable_captures[0]
+            .as_ref()
+            .expect("full encode must carry reusable capture metadata");
+        assert_eq!(capture.program_id(), &expected_program_id);
+        assert_eq!(capture.per_wave_binding_node_indices(), &[0, 1]);
     }
     {
         let trace = fixture.provider_trace.lock().unwrap();
@@ -1004,6 +1021,100 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
                 AllocationLifetime::Invocation
             ]
         );
+    }
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let program_id = wave
+        .claimed_backing()
+        .reusable_execution_program_id(
+            &fixture
+                .runtime
+                .descriptor()
+                .runtime_implementation_fingerprint,
+            lane.id(),
+        )
+        .unwrap()
+        .expect("program-binding wave must have a reusable program identity");
+    let node_count = u32::try_from(providers.len()).unwrap();
+    let segment = DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap();
+    let program =
+        DeviceReusableExecutionProgram::new(program_id, vec![segment], (0..node_count).collect())
+            .unwrap();
+
+    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        &program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(trace.program_binding_coalesce_calls, 1);
+        assert_eq!(trace.program_binding_input_counts, vec![2]);
+        assert_eq!(trace.submitted_command_counts, vec![2]);
+        assert_eq!(
+            trace.submitted_command_phases,
+            vec![vec![
+                DeviceCommandPhase::DynamicBinding,
+                DeviceCommandPhase::Compute,
+            ]]
+        );
+        assert_eq!(
+            trace.submitted_commands,
+            vec![vec![
+                TestCommand::CoalescedProgramBinding,
+                TestCommand::ReusableExecution,
+            ]]
+        );
+        assert_eq!(trace.submitted_reusable_captures, vec![None]);
+    }
+    {
+        let trace = fixture.provider_trace.lock().unwrap();
+        assert_eq!(trace.encode_calls, 0);
+        assert_eq!(trace.reusable_binding_encode_calls, 2);
+        assert_eq!(trace.program_binding_slots.len(), 2);
     }
     assert!(matches!(
         handle.wait().unwrap(),

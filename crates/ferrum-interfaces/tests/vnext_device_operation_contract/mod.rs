@@ -412,6 +412,7 @@ pub(crate) enum ProviderBehavior {
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
     pub(crate) encode_calls: u64,
+    pub(crate) reusable_binding_encode_calls: u64,
     pub(crate) last_participant_count: usize,
     pub(crate) last_work_sequences: u32,
     pub(crate) component_resources: BTreeSet<ResourceId>,
@@ -539,6 +540,39 @@ impl OperationProvider<TestRuntime> for TestProvider {
             )
             .unwrap()),
         }
+    }
+
+    fn encode_reusable_execution_bindings(
+        &self,
+        invocation: BatchedOperationInvocation<'_, TestBuffer>,
+    ) -> Result<EncodedReusableExecutionBindings<TestCommand>, OperationFailure> {
+        if *self.behavior.lock().unwrap() != ProviderBehavior::ProgramBinding {
+            return self
+                .encode_selected(invocation)
+                .map(EncodedReusableExecutionBindings::from_operation);
+        }
+        let mut trace = self.trace.lock().unwrap();
+        trace.reusable_binding_encode_calls += 1;
+        let binding = invocation
+            .program_binding()
+            .expect("program-binding behavior requires a compiled binding slot");
+        trace
+            .program_binding_slots
+            .insert(binding.node_index(), binding.slot().resource_id().clone());
+        trace
+            .program_binding_plan_hashes
+            .insert(binding.plan_hash().as_str().to_owned());
+        trace
+            .program_binding_layout_fingerprints
+            .insert(binding.layout().fingerprint().to_owned());
+        trace
+            .program_binding_lane_slot_ids
+            .insert(binding.lane_slot_identity().slot_id());
+        trace
+            .program_binding_lifetimes
+            .push(binding.lane_slot_identity().lifetime());
+        Ok(EncodedReusableExecutionBindings::empty()
+            .with_program_binding(TestCommand::ProgramBinding))
     }
 }
 
@@ -732,6 +766,7 @@ pub(crate) struct TestStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCommand {
     Provider,
+    ReusableExecution,
     ProgramBinding,
     CoalescedProgramBinding,
     DynamicBinding,
@@ -835,6 +870,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submitted_command_counts: Vec<usize>,
     pub(crate) submitted_command_phases: Vec<Vec<DeviceCommandPhase>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
+    pub(crate) submitted_reusable_captures: Vec<Option<DeviceReusableExecutionCapture>>,
     pub(crate) program_binding_coalesce_calls: u64,
     pub(crate) program_binding_input_counts: Vec<usize>,
     pub(crate) readback_calls: u64,
@@ -1033,6 +1069,13 @@ impl DeviceRuntime for TestRuntime {
         }
     }
 
+    fn encode_reusable_execution(
+        &self,
+        _invocation: DeviceReusableExecutionInvocation,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        Ok(Some(TestCommand::ReusableExecution))
+    }
+
     fn submit(
         &self,
         _stream: &mut Self::Stream,
@@ -1040,6 +1083,7 @@ impl DeviceRuntime for TestRuntime {
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
+        let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands.into_entries();
         let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
         let attribution = timing_mode.kernel_attribution_enabled().then(|| {
@@ -1050,6 +1094,7 @@ impl DeviceRuntime for TestRuntime {
                     let (native_op_id, compute_dispatch_count, transfer_command_count) =
                         match entry.command() {
                             TestCommand::Provider => ("test_provider", 1, 0),
+                            TestCommand::ReusableExecution => ("test_reusable_execution", 1, 0),
                             TestCommand::ProgramBinding => ("test_program_binding", 0, 1),
                             TestCommand::CoalescedProgramBinding => {
                                 ("test_coalesced_program_binding", 0, 1)
@@ -1089,6 +1134,9 @@ impl DeviceRuntime for TestRuntime {
             trace.submitted_command_counts.push(command_count);
             trace.submitted_command_phases.push(command_phases);
             trace.submitted_commands.push(commands);
+            trace
+                .submitted_reusable_captures
+                .push(reusable_execution_capture);
             trace.next_fence += 1;
             (
                 trace.drift_on_submit,

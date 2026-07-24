@@ -13,7 +13,8 @@ use super::{
     SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
     TrustedPlanRuntimeEvidence, VNextError,
 };
-use crate::vnext::ReusableExecutionBucketSpec;
+use crate::vnext::DeviceReusableExecutionProgramId;
+use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
 
 /// Resources whose lifetime is one exact continuous-batch execution frame.
 /// Child invocation leases retain this scope through `Arc`, so shared frame
@@ -1969,6 +1970,60 @@ impl ClaimedSubmissionWaveBacking {
         self.program_binding
             .as_ref()
             .map(|binding| binding.layout())
+    }
+
+    pub fn program_binding_lane_slot_identity(&self) -> Option<&LaneStableArenaSlotIdentity> {
+        self.program_binding
+            .as_ref()
+            .map(|binding| binding.lane_slot_identity())
+    }
+
+    pub fn reusable_execution_bucket_id(&self) -> Option<&ReusableExecutionBucketId> {
+        self.program_binding_layout()
+            .map(ProgramBindingLayout::reusable_execution_bucket_id)
+            .or_else(|| {
+                self.backing_slices
+                    .iter()
+                    .find_map(|slice| slice.evidence().reusable_execution_bucket_id())
+            })
+    }
+
+    pub fn reusable_execution_program_id(
+        &self,
+        runtime_implementation_fingerprint: &str,
+        lane_id: super::ExecutionLaneId,
+    ) -> Result<Option<DeviceReusableExecutionProgramId>, VNextError> {
+        let Some(layout) = self.program_binding_layout() else {
+            if self.program_binding_lane_slot_identity().is_some() {
+                return Err(invalid_resource(
+                    "reusable execution lane slot has no compiled program binding layout",
+                ));
+            }
+            return Ok(None);
+        };
+        let lane_slot = self.program_binding_lane_slot_identity().ok_or_else(|| {
+            invalid_resource("compiled program binding layout has no lane-stable slot identity")
+        })?;
+        if lane_slot.lane_id() != lane_id
+            || lane_slot.reusable_execution_bucket_id() != layout.reusable_execution_bucket_id()
+        {
+            return Err(invalid_resource(
+                "reusable execution program layout differs from its lane-stable slot",
+            ));
+        }
+        DeviceReusableExecutionProgramId::new(
+            self.plan_hash.clone(),
+            runtime_implementation_fingerprint.to_owned(),
+            lane_id,
+            layout.reusable_execution_bucket_id().clone(),
+            layout.fingerprint().to_owned(),
+            lane_slot.layout_fingerprint().to_owned(),
+            lane_slot.slot_id(),
+            self.work_shape.immediate_sequences(),
+            self.work_shape.immediate_tokens(),
+            self.work_shape.immediate_pages(),
+        )
+        .map(Some)
     }
 
     pub fn fingerprint(&self) -> &str {
