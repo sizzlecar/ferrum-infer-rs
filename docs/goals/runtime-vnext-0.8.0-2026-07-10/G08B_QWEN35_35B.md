@@ -581,6 +581,75 @@ address scope, and zero model/hardware hard-codes. The next paid artifact must p
 a decode eager count below `43` and recurrent eager count below `30`; otherwise it
 cannot justify GPU time.
 
+### 2026-07-24 Recurrent Program-Binding Result
+
+Clean source `393a9a401a17cb261fc8dab159fe412e75437845` contains the recurrent
+state-indirection implementation from `c1792e87` plus the standard-operation contract
+correction in `393a9a40`. The CUDA release build completed in `310.184429s`; its
+binary SHA256 is
+`7139a4aca004d1b79008c438cbcbb66c294125e43d1ad94d8117bad5fb00fd3f`.
+The same binary then passed the bounded product paths before any performance run:
+
+- `c03-001`: resident `ferrum run` multi-turn correctness;
+- `c05-001`: non-streaming OpenAI-compatible `ferrum serve`;
+- `c06-001`: streaming `ferrum serve`;
+- result: `3/3 pass`, measured request errors `0`, and blocker-scan matches `0`.
+
+The decode structural prediction also matched across all 75 sampled waves. The trace
+directly observed `161 replay / 2 node-attributed eager` commands per wave. The
+already-tested CUDA coalescer contributes exactly one non-node program-binding
+prelude, and the input upload remains one explicit boundary. Therefore the complete
+decode split is `161 replay / 3 eager provider / 1 upload`, or `161/4`, versus the
+previous `131/42/1` (`131/43`). This is a structural KEEP, not a performance PASS.
+
+The canonical profile-off c1 `random 64/32`, `100 x 3`, ten warmups, seed `9271`
+completed `300/300` measured requests with usage token counts, zero errors, and zero
+quality issues. Throughput nevertheless regressed to
+`44.947749 +/- 3.671515 tok/s`. It is `3.424380 tok/s` (`7.079%`) below the
+`4df3d63a` candidate, `10.641951 tok/s` (`19.144%`) below the predeclared
+`55.5897 tok/s` KEEP threshold, and `31.210551 tok/s` (`40.981%`) below the
+unchanged `76.1583 tok/s` formal floor. The immutable result is:
+
+```text
+CUDA PROGRAM BINDING PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-program-binding-393a9a40-20260724T004652Z/diagnostic-summary.json
+```
+
+Same-hardware profile-off timing localizes the regression:
+
+| decode host boundary | `4df3d63a` | `393a9a40` | delta |
+|---|---:|---:|---:|
+| resource prepare | `1.507994ms` | `1.894054ms` | `+25.601%` |
+| host encode/submit | `6.122343ms` | `5.066258ms` | `-17.250%` |
+| completion round trip | `6.689556ms` | `8.351333ms` | `+24.841%` |
+| host postprocess | `0.812439ms` | `1.013550ms` | `+24.754%` |
+| submitted wave total | `13.626184ms` | `14.433627ms` | `+5.926%` |
+
+Thus the replay/host-submit direction is validated, but the current binding abstraction
+is incomplete. `coalesce_program_bindings` coalesces Rust command ownership while
+still executing one native transfer into each provider-owned binding workspace.
+Qwen3.5 has 30 recurrent and 10 causal binding patches per wave; the recurrent change
+also admits one invocation binding workspace per recurrent node. The next checkpoint
+must replace these per-node workspaces with a compiled, typed
+`ProgramBindingLayout`, one lane-owned device binding arena, and one contiguous
+per-wave patch/upload. Provider compute commands must be compiled once against stable
+layout offsets instead of being rebuilt per node per wave.
+
+No repeat of `393a9a40` is authorized. Before another paid run, local evidence must
+prove one aggregate binding workspace, at most one native binding upload per wave,
+no request-owned address in the cached program, complete RAII/fence retention, and
+zero model/GPU/VRAM hard-codes. The next CUDA prediction is to retain `161/4`, reduce
+binding native transfers to `<=1`, restore decode resource prepare to
+`<=1.507994ms`, completion round trip to `<=6.689556ms`, and total wave time to
+`<=13.626184ms` before requiring throughput `>=55.5897 tok/s`.
+
+The complete archive is retained on Vast instance `45319871` as
+`/workspace/ferrum-artifacts/runtime-vnext-program-binding-393a9a40-20260724T004652Z.tar.zst`
+with SHA256
+`38dba973258d622f40d550794b2b2d5b829fe4a85fe0ce075d913382aa2e4146`.
+The instance is confirmed `stopped/exited`; no sibling instance is running or
+scheduling. GitHub transfer is still pending and does not authorize restarting the
+instance solely for another benchmark.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
