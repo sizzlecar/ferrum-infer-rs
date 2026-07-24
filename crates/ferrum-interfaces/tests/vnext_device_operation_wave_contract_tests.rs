@@ -80,7 +80,12 @@ fn setup_with_fixture(
     );
     let session = sequence.open_session().unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(&fixture.plan_resources, &batch);
+    let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    let step = begin_single_participant_step_on_lane_with_bucket(
+        &batch,
+        &lane,
+        fixture.reusable_execution_bucket.as_ref(),
+    );
     (fixture, sequence, session, batch, step)
 }
 
@@ -974,6 +979,29 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
                 TestCommand::Provider,
                 TestCommand::Provider,
             ]]
+        );
+    }
+    {
+        let trace = fixture.provider_trace.lock().unwrap();
+        assert_eq!(trace.program_binding_slots.len(), 2);
+        for (node_index, node) in fixture.plan.payload().nodes().iter().enumerate() {
+            assert_eq!(
+                trace.program_binding_slots.get(&node_index),
+                node.binding_resource()
+            );
+        }
+        assert_eq!(
+            trace.program_binding_plan_hashes,
+            BTreeSet::from([fixture.plan.plan_hash().as_str().to_owned()])
+        );
+        assert_eq!(trace.program_binding_layout_fingerprints.len(), 1);
+        assert_eq!(trace.program_binding_lane_slot_ids.len(), 1);
+        assert_eq!(
+            trace.program_binding_lifetimes,
+            vec![
+                AllocationLifetime::Invocation,
+                AllocationLifetime::Invocation
+            ]
         );
     }
     assert!(matches!(

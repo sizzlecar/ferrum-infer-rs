@@ -21,12 +21,13 @@ use super::{
     IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
     LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
     NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
-    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedWeightBinding, ResourceId,
-    SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
-    SpanId, StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
-    TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId, EXECUTION_IDENTITY_VERSION,
+    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
+    ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
+    ResolvedWeightBinding, ResourceId, SemanticValue, SequenceBackingSnapshot,
+    SequenceSessionEpoch, SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment,
+    StepResourceLease, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence,
+    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
+    EXECUTION_IDENTITY_VERSION,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -3653,6 +3654,15 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
+    fn program_binding_node(self) -> Option<ProgramBindingNodeBinding> {
+        match self {
+            Self::Invocation(_) => None,
+            Self::Wave { wave, node_index } => {
+                wave.claimed_backing().program_binding_node(node_index)
+            }
+        }
+    }
+
     fn participant_count(self) -> Result<usize, VNextError> {
         match self {
             Self::Invocation(invocation) => usize::try_from(invocation.participant_count())
@@ -4489,6 +4499,7 @@ pub struct BatchedOperationInvocation<'a, B> {
     batch_identity: &'a BatchOperationIdentity,
     node_identity: &'a BatchOperationNodeIdentity,
     participants: Vec<OperationInvocation<'a, B>>,
+    program_binding: Option<ProgramBindingNodeBinding>,
 }
 
 impl<'a, B> BatchedOperationInvocation<'a, B> {
@@ -4606,10 +4617,12 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let program_binding = resources.program_binding_node();
         Ok(Self {
             batch_identity,
             node_identity,
             participants,
+            program_binding,
         })
     }
 
@@ -4639,6 +4652,10 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
 
     pub fn work_contract(&self) -> &NodeWorkContract {
         self.participants[0].work()
+    }
+
+    pub fn program_binding(&self) -> Option<&ProgramBindingNodeBinding> {
+        self.program_binding.as_ref()
     }
 
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
@@ -5864,6 +5881,7 @@ impl OperationDispatch {
             )
             .map_err(SubmissionWaveDispatchError::Contract)?;
             let expected_phase = invocation.operation().profile_phase;
+            let program_binding = invocation.program_binding().cloned();
             let operation = match provider.provider().encode_selected(invocation) {
                 Ok(operation) => operation,
                 Err(failure)
@@ -5879,6 +5897,11 @@ impl OperationDispatch {
                 }
             };
             let program_binding_count = operation.program_binding_count();
+            if program_binding.is_some() && program_binding_count != 1 {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "compiled program binding slot requires exactly one provider patch",
+                )));
+            }
             if program_binding_count > 0 {
                 let binding_resource = resolved
                     .execution_plan()
@@ -5891,6 +5914,15 @@ impl OperationDispatch {
                             "program binding requires a provider-owned binding workspace",
                         ))
                     })?;
+                if program_binding.as_ref().is_some_and(|binding| {
+                    binding.node_index() != node_index
+                        || binding.slot().node_id() != node_identity.node_id()
+                        || binding.slot().resource_id() != binding_resource
+                }) {
+                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "provider program binding differs from its compiled node slot",
+                    )));
+                }
                 if !program_binding_resources.insert(binding_resource.clone()) {
                     return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
                         "program bindings from different nodes alias one binding workspace",
@@ -5922,6 +5954,22 @@ impl OperationDispatch {
                 operation.into_parts();
             program_bindings.append(&mut node_program_bindings);
             encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
+        }
+        if completion
+            .wave()
+            .claimed_backing()
+            .program_binding_layout()
+            .is_some_and(|layout| {
+                program_binding_resources.len() != layout.slots().len()
+                    || layout
+                        .slots()
+                        .iter()
+                        .any(|slot| !program_binding_resources.contains(slot.resource_id()))
+            })
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "provider program binding patches do not cover the compiled layout exactly",
+            )));
         }
         let uncoalesced_program_binding_count = program_bindings.len();
         let coalesced_program_bindings = runtime
