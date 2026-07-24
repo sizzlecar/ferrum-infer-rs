@@ -39,10 +39,14 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attent
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect";
+const DECODE_FUSED_CONV_QK_NORM_PACK_FUNCTION: &str =
+    "linear_attention_decode_fused_conv_qk_norm_pack_f16_to_f32_state_f16_z_f16_indirect";
 const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
 const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32_indirect";
+const DECODE_PRENORMALIZED_PACKED_DELTA_FUNCTION: &str =
+    "recurrent_gated_delta_rule_decode_prenormalized_packed_f32_ba_f16_params_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
@@ -61,10 +65,12 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 struct AttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
+    decode_fused_conv_qk_norm_pack: CudaFunction,
     conv_state_commit: CudaFunction,
     qk_norm: CudaFunction,
     delta: CudaFunction,
     delta_tiled: CudaFunction,
+    decode_prenormalized_packed_delta: CudaFunction,
     gated_norm: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
@@ -141,6 +147,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let functions = AttentionFunctions {
             rms_norm: load_function(&rms_module, RMS_NORM_FUNCTION, "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
+            decode_fused_conv_qk_norm_pack: load_function(
+                &linear_module,
+                DECODE_FUSED_CONV_QK_NORM_PACK_FUNCTION,
+                "attention decode fused convolution QK normalization pack",
+            )?,
             conv_state_commit: load_function(
                 &linear_module,
                 CONV_STATE_COMMIT_FUNCTION,
@@ -152,6 +163,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 &delta_module,
                 DELTA_TILED_FUNCTION,
                 "attention tiled delta",
+            )?,
+            decode_prenormalized_packed_delta: load_function(
+                &delta_module,
+                DECODE_PRENORMALIZED_PACKED_DELTA_FUNCTION,
+                "attention decode pre-normalized packed delta",
             )?,
             gated_norm: load_function(&linear_module, GATED_NORM_FUNCTION, "attention gated norm")?,
             f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
@@ -465,6 +481,58 @@ struct CudaAttentionShape {
     tiled_delta: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CudaRecurrentAttentionTopology {
+    // A provider-local physical specialization of RecurrentScan. The public
+    // execution form remains model- and backend-independent.
+    SingleTokenFusedNormalizedPackedDecode,
+    VarlenRecurrentScan,
+}
+
+impl CudaRecurrentAttentionTopology {
+    fn select(
+        execution_form: GatedDeltaExecutionForm,
+        tokens: u64,
+        shape: CudaAttentionShape,
+    ) -> Self {
+        if matches!(execution_form, GatedDeltaExecutionForm::RecurrentScan)
+            && tokens == 1
+            && shape.tiled_delta
+        {
+            Self::SingleTokenFusedNormalizedPackedDecode
+        } else {
+            Self::VarlenRecurrentScan
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleTokenFusedNormalizedPackedDecode => {
+                "single_token_fused_normalized_packed_decode"
+            }
+            Self::VarlenRecurrentScan => "varlen_recurrent_scan",
+        }
+    }
+
+    const fn compute_dispatches(self) -> u64 {
+        match self {
+            Self::SingleTokenFusedNormalizedPackedDecode => 9,
+            Self::VarlenRecurrentScan => 11,
+        }
+    }
+
+    const fn transfer_commands(self) -> u64 {
+        match self {
+            Self::SingleTokenFusedNormalizedPackedDecode => 0,
+            Self::VarlenRecurrentScan => 2,
+        }
+    }
+
+    const fn requires_sequence_control(self) -> bool {
+        matches!(self, Self::VarlenRecurrentScan)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
@@ -474,6 +542,7 @@ struct ScratchLayout {
     qkvz: u64,
     z_or_activation: u64,
     ba: u64,
+    decode_mixed_qkv: u64,
     query: u64,
     key: u64,
     value: u64,
@@ -538,6 +607,21 @@ impl ScratchLayout {
             ElementType::F32,
             total_tokens,
         )?;
+        // Packed decode reuses the otherwise disjoint q/k/value/g/beta span.
+        // Its one-token extent must stay inside that intermediate union.
+        let decode_mixed_qkv = query;
+        let decode_mixed_end = decode_mixed_qkv
+            .checked_add(aligned_bytes(
+                shape.qkv_features,
+                ElementType::F32.size_bytes(),
+            )?)
+            .ok_or_else(|| "attention packed decode scratch span overflows".to_owned())?;
+        if decode_mixed_end > offset {
+            return Err(
+                "attention packed decode scratch exceeds the recurrent intermediate union"
+                    .to_owned(),
+            );
+        }
         let core = reserve_tokens(
             &mut offset,
             shape.value_features,
@@ -576,6 +660,7 @@ impl ScratchLayout {
             qkvz,
             z_or_activation,
             ba,
+            decode_mixed_qkv,
             query,
             key,
             value,
@@ -625,8 +710,9 @@ struct AttentionLaunch {
     input_region: usize,
     output_region: usize,
     state_binding_offset: u64,
-    host_control: usize,
+    host_control: Option<usize>,
     execution_form: GatedDeltaExecutionForm,
+    topology: CudaRecurrentAttentionTopology,
     tokens: u64,
     tokens_i32: i32,
 }
@@ -794,14 +880,19 @@ fn encode_attention(
                 plan.token_count()
             ));
         }
-        let host_control = host_storage.len();
-        host_storage.push(sequence_control(tokens_i32 as u32));
+        let topology = CudaRecurrentAttentionTopology::select(execution_form, tokens, cuda_shape);
+        let host_control = topology.requires_sequence_control().then(|| {
+            let index = host_storage.len();
+            host_storage.push(sequence_control(tokens_i32 as u32));
+            index
+        });
         launches.push(AttentionLaunch {
             input_region,
             output_region,
             state_binding_offset: binding_offset,
             host_control,
             execution_form,
+            topology,
             tokens,
             tokens_i32,
         });
@@ -835,11 +926,24 @@ fn encode_attention(
             .u64(launch.input_region as u64)
             .u64(launch.output_region as u64)
             .u64(launch.state_binding_offset)
-            .u64(launch.host_control as u64)
+            .u64(launch.host_control.map_or(u64::MAX, |index| index as u64))
             .bytes(launch.execution_form.as_str().as_bytes())
+            .bytes(launch.topology.as_str().as_bytes())
             .u64(launch.tokens)
             .i32(launch.tokens_i32);
     }
+    let compute_dispatches = launches
+        .iter()
+        .try_fold(0_u64, |total, launch| {
+            total.checked_add(launch.topology.compute_dispatches())
+        })
+        .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())?;
+    let transfer_commands = launches
+        .iter()
+        .try_fold(0_u64, |total, launch| {
+            total.checked_add(launch.topology.transfer_commands())
+        })
+        .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
     let binding_command = if let Some(program_binding) = program_binding {
@@ -926,8 +1030,8 @@ fn encode_attention(
                 DeviceBatchingForm::ParticipantLoop,
                 participant_count,
                 total_tokens,
-                u64::from(participant_count) * 11,
-                u64::from(participant_count) * 2,
+                compute_dispatches,
+                transfer_commands,
             )
         })
         .map_err(|error| error.to_string())?;
@@ -1098,34 +1202,41 @@ fn enqueue_attention(
     let binding = &regions[shared.binding];
     let state_binding = scratch_pointer(binding.device_ptr(), launch.state_binding_offset)?;
     let scratch_base = scratch.device_ptr();
-    let cu_seqlens = scratch_base;
-    let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
-    unsafe {
-        cudarc::driver::result::memcpy_htod_async(
-            cu_seqlens,
-            host_storage[launch.host_control].as_ref(),
-            stream.cu_stream(),
+    let sequence_control = if let Some(host_control) = launch.host_control {
+        let cu_seqlens = scratch_base;
+        let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                cu_seqlens,
+                host_storage[host_control].as_ref(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention sequence upload", error))?;
+        let token_index_bytes = usize::try_from(
+            launch
+                .tokens
+                .checked_mul(ElementType::U32.size_bytes())
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("attention token index size overflows")
+                })?,
         )
-    }
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention sequence upload", error))?;
-    let token_index_bytes = usize::try_from(
-        launch
-            .tokens
-            .checked_mul(ElementType::U32.size_bytes())
-            .ok_or_else(|| {
-                CudaDeviceRuntimeError::contract("attention token index size overflows")
-            })?,
-    )
-    .map_err(|_| CudaDeviceRuntimeError::contract("attention token index size exceeds usize"))?;
-    unsafe {
-        cudarc::driver::result::memset_d8_async(
-            token_seq_indices,
-            0,
-            token_index_bytes,
-            stream.cu_stream(),
-        )
-    }
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
+        .map_err(|_| {
+            CudaDeviceRuntimeError::contract("attention token index size exceeds usize")
+        })?;
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                token_seq_indices,
+                0,
+                token_index_bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
+        Some((cu_seqlens, token_seq_indices))
+    } else {
+        None
+    };
 
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
@@ -1133,6 +1244,7 @@ fn enqueue_attention(
     let qkvz = scratch_pointer(scratch_base, layout.qkvz)?;
     let ba = scratch_pointer(scratch_base, layout.ba)?;
     let z = scratch_pointer(scratch_base, layout.z_or_activation)?;
+    let decode_mixed_qkv = scratch_pointer(scratch_base, layout.decode_mixed_qkv)?;
     let query = scratch_pointer(scratch_base, layout.query)?;
     let key = scratch_pointer(scratch_base, layout.key)?;
     let value = scratch_pointer(scratch_base, layout.value)?;
@@ -1181,67 +1293,99 @@ fn enqueue_attention(
         )?;
     }
 
-    launch_prepare(
-        stream,
-        &functions.prepare,
-        qkvz,
-        ba,
-        regions[shared.conv].device_ptr(),
-        state_binding,
-        regions[shared.a_log].device_ptr(),
-        regions[shared.dt_bias].device_ptr(),
-        cu_seqlens,
-        token_seq_indices,
-        query,
-        key,
-        value,
-        z,
-        g,
-        beta,
-        final_conv_state,
-        launch.tokens,
-        launch.tokens_i32,
-        cuda,
-        shape,
-    )?;
-    let conv_state_elements = i32::try_from(
-        shape
-            .conv_state_elements()
-            .map_err(CudaDeviceRuntimeError::contract)?,
-    )
-    .map_err(|_| {
-        CudaDeviceRuntimeError::contract("attention convolution state elements exceed i32")
-    })?;
-    launch_conv_state_commit(
-        stream,
-        &functions.conv_state_commit,
-        final_conv_state,
-        state_binding,
-        conv_state_elements,
-    )?;
-    launch_qk_norm(
-        stream,
-        &functions.qk_norm,
-        query,
-        key,
-        launch.tokens,
-        launch.tokens_i32,
-        cuda,
-    )?;
-    launch_delta(
-        stream,
-        functions,
-        query,
-        key,
-        value,
-        g,
-        beta,
-        state_binding,
-        cu_seqlens,
-        core,
-        launch.tokens_i32,
-        cuda,
-    )?;
+    match launch.topology {
+        CudaRecurrentAttentionTopology::SingleTokenFusedNormalizedPackedDecode => {
+            launch_decode_fused_conv_qk_norm_pack(
+                stream,
+                &functions.decode_fused_conv_qk_norm_pack,
+                qkvz,
+                regions[shared.conv].device_ptr(),
+                state_binding,
+                decode_mixed_qkv,
+                z,
+                cuda,
+            )?;
+            launch_decode_prenormalized_packed_delta(
+                stream,
+                &functions.decode_prenormalized_packed_delta,
+                decode_mixed_qkv,
+                ba,
+                regions[shared.a_log].device_ptr(),
+                regions[shared.dt_bias].device_ptr(),
+                state_binding,
+                core,
+                cuda,
+            )?;
+        }
+        CudaRecurrentAttentionTopology::VarlenRecurrentScan => {
+            let (cu_seqlens, token_seq_indices) = sequence_control.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "varlen recurrent attention is missing sequence control",
+                )
+            })?;
+            launch_prepare(
+                stream,
+                &functions.prepare,
+                qkvz,
+                ba,
+                regions[shared.conv].device_ptr(),
+                state_binding,
+                regions[shared.a_log].device_ptr(),
+                regions[shared.dt_bias].device_ptr(),
+                cu_seqlens,
+                token_seq_indices,
+                query,
+                key,
+                value,
+                z,
+                g,
+                beta,
+                final_conv_state,
+                launch.tokens,
+                launch.tokens_i32,
+                cuda,
+                shape,
+            )?;
+            let conv_state_elements = i32::try_from(
+                shape
+                    .conv_state_elements()
+                    .map_err(CudaDeviceRuntimeError::contract)?,
+            )
+            .map_err(|_| {
+                CudaDeviceRuntimeError::contract("attention convolution state elements exceed i32")
+            })?;
+            launch_conv_state_commit(
+                stream,
+                &functions.conv_state_commit,
+                final_conv_state,
+                state_binding,
+                conv_state_elements,
+            )?;
+            launch_qk_norm(
+                stream,
+                &functions.qk_norm,
+                query,
+                key,
+                launch.tokens,
+                launch.tokens_i32,
+                cuda,
+            )?;
+            launch_delta(
+                stream,
+                functions,
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state_binding,
+                cu_seqlens,
+                core,
+                launch.tokens_i32,
+                cuda,
+            )?;
+        }
+    }
     launch_gated_norm(
         stream,
         &functions.gated_norm,
@@ -1283,6 +1427,124 @@ fn enqueue_attention(
             .checked_mul(shape.hidden_size)
             .ok_or_else(|| CudaDeviceRuntimeError::contract("attention residual size overflows"))?,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_decode_fused_conv_qk_norm_pack(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    qkvz: u64,
+    conv_weight: u64,
+    state_binding: u64,
+    mixed_qkv: u64,
+    z: u64,
+    shape: CudaAttentionShape,
+) -> Result<(), CudaDeviceRuntimeError> {
+    if shape.key_heads <= 0 || shape.value_heads <= 0 || shape.value_heads % shape.key_heads != 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "attention decode requires value heads grouped evenly by key head",
+        ));
+    }
+    let repeat_factor = shape
+        .value_heads
+        .checked_div(shape.key_heads)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("attention decode value-head mapping is invalid")
+        })?;
+    let owned_conv_channels = shape
+        .key_head_dim
+        .checked_mul(2)
+        .and_then(|qk| {
+            repeat_factor
+                .checked_mul(shape.value_head_dim)
+                .and_then(|value| qk.checked_add(value))
+        })
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "attention decode fused convolution channel count overflows",
+            )
+        })?;
+    let block_threads = u32::try_from(owned_conv_channels)
+        .map_err(|_| {
+            CudaDeviceRuntimeError::contract(
+                "attention decode fused convolution channel count exceeds u32",
+            )
+        })?
+        .min(1024)
+        .next_power_of_two();
+    let mut builder = stream.launch_builder(function);
+    let pointers = [qkvz, conv_weight, state_binding, mixed_qkv, z];
+    for pointer in &pointers {
+        builder.arg(pointer);
+    }
+    let dimensions = [
+        shape.key_heads,
+        shape.value_heads,
+        shape.key_head_dim,
+        shape.value_head_dim,
+        shape.conv_kernel,
+    ];
+    for dimension in &dimensions {
+        builder.arg(dimension);
+    }
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (shape.key_heads as u32, 1, 1),
+            block_dim: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| {
+        CudaDeviceRuntimeError::driver(
+            "attention decode fused convolution QK normalization pack launch",
+            error,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_decode_prenormalized_packed_delta(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    mixed_qkv: u64,
+    ba: u64,
+    a_log: u64,
+    dt_bias: u64,
+    state_binding: u64,
+    output: u64,
+    shape: CudaAttentionShape,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let mut builder = stream.launch_builder(function);
+    let pointers = [mixed_qkv, ba, a_log, dt_bias, state_binding, output];
+    for pointer in &pointers {
+        builder.arg(pointer);
+    }
+    let dimensions = [
+        shape.key_heads,
+        shape.value_heads,
+        shape.key_head_dim,
+        shape.value_head_dim,
+    ];
+    for dimension in &dimensions {
+        builder.arg(dimension);
+    }
+    builder.arg(&shape.scale);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (
+                (shape.value_head_dim as u32).div_ceil(16),
+                shape.value_heads as u32,
+                1,
+            ),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| {
+        CudaDeviceRuntimeError::driver("attention decode pre-normalized packed delta launch", error)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1928,6 +2190,19 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{cuda::CudaBackend, Backend};
+    use cudarc::driver::DevicePtr;
+    use half::f16;
+
+    fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "index={index} actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+    }
 
     #[test]
     fn launch_extent_validation_covers_packed_projection_strides() {
@@ -1960,5 +2235,282 @@ mod tests {
             .validate_launch_extents(2)
             .unwrap_err()
             .contains("BA activation elements"));
+    }
+
+    #[test]
+    fn fused_normalized_packed_decode_matches_varlen_cuda_state_and_output() {
+        let shape = AttentionShape {
+            hidden_size: 512,
+            key_heads: 2,
+            value_heads: 4,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            qkv_features: 1024,
+            value_features: 512,
+            qkvz_features: 1536,
+            ba_features: 8,
+            conv_kernel: 4,
+            conv_state_width: 3,
+            epsilon: 1.0e-6,
+            layer_index: 0,
+            decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+            value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
+        };
+        let cuda = shape.cuda_shape().expect("test attention shape");
+        assert!(cuda.tiled_delta);
+
+        let qkvz_host = (0..shape.qkvz_features as usize)
+            .map(|index| f16::from_f32(((index * 17 % 101) as f32 - 50.0) * 0.004))
+            .collect::<Vec<_>>();
+        let conv_weight_host = (0..(shape.qkv_features * shape.conv_kernel) as usize)
+            .map(|index| f16::from_f32(((index * 7 % 41) as f32 - 20.0) * 0.002))
+            .collect::<Vec<_>>();
+        let ba_host = [-0.35, 0.6, -0.2, 0.45, 0.2, -0.45, 0.3, -0.1]
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let a_log_host = vec![0.5_f32.ln(), 0.8_f32.ln(), 0.65_f32.ln(), 1.1_f32.ln()];
+        let dt_bias_host = vec![-0.15_f32, 0.25_f32, 0.05_f32, -0.3_f32];
+        let conv_state_host = (0..shape.conv_state_elements().expect("conv state") as usize)
+            .map(|index| f16::from_f32(((index * 11 % 29) as f32 - 14.0) * 0.005))
+            .collect::<Vec<_>>();
+        let delta_state_len =
+            (shape.value_heads * shape.value_head_dim * shape.key_head_dim) as usize;
+        let delta_state_host = (0..delta_state_len)
+            .map(|index| ((index * 13 % 37) as f32 - 18.0) * 0.001)
+            .collect::<Vec<_>>();
+
+        let mut context = CudaBackend::new_context();
+        let stream = context.stream.clone();
+        let functions = AttentionFunctions {
+            rms_norm: context.func(
+                "vnext_attention_parity_rms",
+                crate::ptx::RMS_NORM,
+                RMS_NORM_FUNCTION,
+            ),
+            prepare: context.func(
+                "vnext_attention_parity_linear",
+                crate::ptx::LINEAR_ATTENTION,
+                PREPARE_FUNCTION,
+            ),
+            decode_fused_conv_qk_norm_pack: context.func(
+                "vnext_attention_parity_linear",
+                crate::ptx::LINEAR_ATTENTION,
+                DECODE_FUSED_CONV_QK_NORM_PACK_FUNCTION,
+            ),
+            conv_state_commit: context.func(
+                "vnext_attention_parity_linear",
+                crate::ptx::LINEAR_ATTENTION,
+                CONV_STATE_COMMIT_FUNCTION,
+            ),
+            qk_norm: context.func(
+                "vnext_attention_parity_linear",
+                crate::ptx::LINEAR_ATTENTION,
+                QK_NORM_FUNCTION,
+            ),
+            delta: context.func(
+                "vnext_attention_parity_delta",
+                crate::ptx::GATED_DELTA_RULE,
+                DELTA_FUNCTION,
+            ),
+            delta_tiled: context.func(
+                "vnext_attention_parity_delta",
+                crate::ptx::GATED_DELTA_RULE,
+                DELTA_TILED_FUNCTION,
+            ),
+            decode_prenormalized_packed_delta: context.func(
+                "vnext_attention_parity_delta",
+                crate::ptx::GATED_DELTA_RULE,
+                DECODE_PRENORMALIZED_PACKED_DELTA_FUNCTION,
+            ),
+            gated_norm: context.func(
+                "vnext_attention_parity_linear",
+                crate::ptx::LINEAR_ATTENTION,
+                GATED_NORM_FUNCTION,
+            ),
+            f32_to_f16: context.func(
+                "vnext_attention_parity_sandwich",
+                crate::ptx::SANDWICH_NORM,
+                F32_TO_F16_FUNCTION,
+            ),
+            residual_add: context.func(
+                "vnext_attention_parity_residual",
+                crate::ptx::RESIDUAL_ADD,
+                RESIDUAL_ADD_FUNCTION,
+            ),
+        };
+
+        let qkvz = stream.clone_htod(&qkvz_host).expect("qkvz upload");
+        let ba = stream.clone_htod(&ba_host).expect("ba upload");
+        let conv_weight = stream
+            .clone_htod(&conv_weight_host)
+            .expect("conv weight upload");
+        let a_log = stream.clone_htod(&a_log_host).expect("a_log upload");
+        let dt_bias = stream.clone_htod(&dt_bias_host).expect("dt_bias upload");
+        let cu_seqlens = stream
+            .clone_htod(&[0_u32, 1_u32])
+            .expect("cu_seqlens upload");
+        let token_seq_indices = stream.clone_htod(&[0_u32]).expect("token sequence upload");
+
+        let old_conv_state = stream
+            .clone_htod(&conv_state_host)
+            .expect("old conv state upload");
+        let old_delta_state = stream
+            .clone_htod(&delta_state_host)
+            .expect("old delta state upload");
+        let new_conv_state = stream
+            .clone_htod(&conv_state_host)
+            .expect("new conv state upload");
+        let new_delta_state = stream
+            .clone_htod(&delta_state_host)
+            .expect("new delta state upload");
+        stream.synchronize().expect("initial CUDA uploads");
+
+        let old_state_bindings = stream
+            .clone_htod(&[
+                old_conv_state.device_ptr(&stream).0,
+                old_delta_state.device_ptr(&stream).0,
+            ])
+            .expect("old state bindings upload");
+        let new_state_bindings = stream
+            .clone_htod(&[
+                new_conv_state.device_ptr(&stream).0,
+                new_delta_state.device_ptr(&stream).0,
+            ])
+            .expect("new state bindings upload");
+
+        let qk_features = shape.qk_features().expect("QK features") as usize;
+        let value_features = shape.value_features as usize;
+        let old_query = stream.alloc_zeros::<f32>(qk_features).expect("old query");
+        let old_key = stream.alloc_zeros::<f32>(qk_features).expect("old key");
+        let old_value = stream
+            .alloc_zeros::<f32>(value_features)
+            .expect("old value");
+        let old_z = stream.alloc_zeros::<f16>(value_features).expect("old z");
+        let old_g = stream
+            .alloc_zeros::<f32>(shape.value_heads as usize)
+            .expect("old g");
+        let old_beta = stream
+            .alloc_zeros::<f32>(shape.value_heads as usize)
+            .expect("old beta");
+        let old_final_conv = stream
+            .alloc_zeros::<f16>(conv_state_host.len())
+            .expect("old final conv");
+        let old_core = stream.alloc_zeros::<f32>(value_features).expect("old core");
+
+        let new_mixed_qkv = stream
+            .alloc_zeros::<f32>(shape.qkv_features as usize)
+            .expect("new mixed QKV");
+        let new_z = stream.alloc_zeros::<f16>(value_features).expect("new z");
+        let new_core = stream.alloc_zeros::<f32>(value_features).expect("new core");
+        stream.synchronize().expect("CUDA parity allocations");
+
+        launch_prepare(
+            &stream,
+            &functions.prepare,
+            qkvz.device_ptr(&stream).0,
+            ba.device_ptr(&stream).0,
+            conv_weight.device_ptr(&stream).0,
+            old_state_bindings.device_ptr(&stream).0,
+            a_log.device_ptr(&stream).0,
+            dt_bias.device_ptr(&stream).0,
+            cu_seqlens.device_ptr(&stream).0,
+            token_seq_indices.device_ptr(&stream).0,
+            old_query.device_ptr(&stream).0,
+            old_key.device_ptr(&stream).0,
+            old_value.device_ptr(&stream).0,
+            old_z.device_ptr(&stream).0,
+            old_g.device_ptr(&stream).0,
+            old_beta.device_ptr(&stream).0,
+            old_final_conv.device_ptr(&stream).0,
+            1,
+            1,
+            cuda,
+            shape,
+        )
+        .expect("varlen prepare");
+        launch_conv_state_commit(
+            &stream,
+            &functions.conv_state_commit,
+            old_final_conv.device_ptr(&stream).0,
+            old_state_bindings.device_ptr(&stream).0,
+            i32::try_from(conv_state_host.len()).expect("conv state i32"),
+        )
+        .expect("varlen conv state commit");
+        launch_qk_norm(
+            &stream,
+            &functions.qk_norm,
+            old_query.device_ptr(&stream).0,
+            old_key.device_ptr(&stream).0,
+            1,
+            1,
+            cuda,
+        )
+        .expect("varlen QK norm");
+        launch_delta(
+            &stream,
+            &functions,
+            old_query.device_ptr(&stream).0,
+            old_key.device_ptr(&stream).0,
+            old_value.device_ptr(&stream).0,
+            old_g.device_ptr(&stream).0,
+            old_beta.device_ptr(&stream).0,
+            old_state_bindings.device_ptr(&stream).0,
+            cu_seqlens.device_ptr(&stream).0,
+            old_core.device_ptr(&stream).0,
+            1,
+            cuda,
+        )
+        .expect("varlen delta");
+
+        launch_decode_fused_conv_qk_norm_pack(
+            &stream,
+            &functions.decode_fused_conv_qk_norm_pack,
+            qkvz.device_ptr(&stream).0,
+            conv_weight.device_ptr(&stream).0,
+            new_state_bindings.device_ptr(&stream).0,
+            new_mixed_qkv.device_ptr(&stream).0,
+            new_z.device_ptr(&stream).0,
+            cuda,
+        )
+        .expect("packed decode fused convolution QK normalization");
+        launch_decode_prenormalized_packed_delta(
+            &stream,
+            &functions.decode_prenormalized_packed_delta,
+            new_mixed_qkv.device_ptr(&stream).0,
+            ba.device_ptr(&stream).0,
+            a_log.device_ptr(&stream).0,
+            dt_bias.device_ptr(&stream).0,
+            new_state_bindings.device_ptr(&stream).0,
+            new_core.device_ptr(&stream).0,
+            cuda,
+        )
+        .expect("pre-normalized packed delta");
+        stream.synchronize().expect("CUDA parity execution");
+
+        let old_core_host = stream.clone_dtoh(&old_core).expect("old core download");
+        let new_core_host = stream.clone_dtoh(&new_core).expect("new core download");
+        assert_f32_close(&new_core_host, &old_core_host, 5.0e-5);
+
+        let old_delta_host = stream
+            .clone_dtoh(&old_delta_state)
+            .expect("old delta state download");
+        let new_delta_host = stream
+            .clone_dtoh(&new_delta_state)
+            .expect("new delta state download");
+        assert_f32_close(&new_delta_host, &old_delta_host, 5.0e-5);
+
+        assert_eq!(
+            stream
+                .clone_dtoh(&new_conv_state)
+                .expect("new conv state download"),
+            stream
+                .clone_dtoh(&old_conv_state)
+                .expect("old conv state download")
+        );
+        assert_eq!(
+            stream.clone_dtoh(&new_z).expect("new z download"),
+            stream.clone_dtoh(&old_z).expect("old z download")
+        );
     }
 }
