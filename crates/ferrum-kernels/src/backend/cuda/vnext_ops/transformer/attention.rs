@@ -1445,25 +1445,33 @@ fn launch_decode_fused_conv_qk_norm_pack(
             "attention decode requires value heads grouped evenly by key head",
         ));
     }
-    let qk_worker_channels = shape.key_head_dim.checked_mul(2).ok_or_else(|| {
-        CudaDeviceRuntimeError::contract("attention decode fused QK worker channel count overflows")
-    })?;
-    let worker_channels = qk_worker_channels.max(shape.value_head_dim);
-    let block_threads = u32::try_from(worker_channels)
+    let repeat_factor = shape
+        .value_heads
+        .checked_div(shape.key_heads)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("attention decode value-head mapping is invalid")
+        })?;
+    let owned_conv_channels = shape
+        .key_head_dim
+        .checked_mul(2)
+        .and_then(|qk| {
+            repeat_factor
+                .checked_mul(shape.value_head_dim)
+                .and_then(|value| qk.checked_add(value))
+        })
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "attention decode fused convolution channel count overflows",
+            )
+        })?;
+    let block_threads = u32::try_from(owned_conv_channels)
         .map_err(|_| {
             CudaDeviceRuntimeError::contract(
-                "attention decode fused worker channel count exceeds u32",
+                "attention decode fused convolution channel count exceeds u32",
             )
         })?
         .min(1024)
         .next_power_of_two();
-    let grid_blocks = shape
-        .key_heads
-        .checked_add(shape.value_heads)
-        .and_then(|blocks| u32::try_from(blocks).ok())
-        .ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("attention decode fused worker grid exceeds u32")
-        })?;
     let mut builder = stream.launch_builder(function);
     let pointers = [qkvz, conv_weight, state_binding, mixed_qkv, z];
     for pointer in &pointers {
@@ -1481,7 +1489,7 @@ fn launch_decode_fused_conv_qk_norm_pack(
     }
     unsafe {
         builder.launch(LaunchConfig {
-            grid_dim: (grid_blocks, 1, 1),
+            grid_dim: (shape.key_heads as u32, 1, 1),
             block_dim: (block_threads, 1, 1),
             shared_mem_bytes: 0,
         })
