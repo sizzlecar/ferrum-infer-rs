@@ -138,6 +138,52 @@ command-index join、mixed eager/replay 顺序和 terminal RAII；profile `off` 
 coverage `100%`，并把 exact decode device time 分成 replay program 与
 binding/embedding/logits eager work；在此之前禁止再次运行完整吞吐 sweep。
 
+### CUDA replay timing 合同检查点（2026-07-24）
+
+clean source `33fc6e46a64b56cc5f3f7d53020bc16b3db3c630` 已关闭上述物理计时盲区。
+公共合同现在用有序、无重叠、完整覆盖 submission command range 的 typed execution span
+表达 eager command 与 reusable executable；logical replay command 只保留 identity 和
+`covered_by_physical_span` 状态，不复制 physical span elapsed。profile `off` 路径不创建
+CUDA event 或 timing vector。CUDA release binary SHA256 为
+`7e2b279eb8899c3dd3c7a0da938b00cbc11580dca679986347844ebb78101eb6`，实际增量 release
+编译耗时 `293.913041s`。
+
+真实 1x RTX 4090 bounded lane 先通过 `c03 run`、`c05 serve`、`c06 streaming` 三个
+正确性场景，再执行 c1 `random 64/16`、4 requests、1 repeat 的 full-profile 诊断。该
+benchmark 只用于 profile shape，不是正式 throughput evidence。trace 的硬结果为：
+
+- native event `18,450`，logical replay command `16,605`；
+- physical replay span `405/405 measured`，coverage `100%`；
+- replay `BackendUnsupported=0`，logical replay elapsed 非空数 `0`；
+- eager `1,845/1,845 measured`，command ownership/range error `0`；
+- decode 每 submission 的最后 device interval end 平均 `8.203624ms`，其中 replay
+  `6.995859ms`（`85.3879%`）、eager `1.197175ms`、inter-interval gap `6.527573us`；
+- prefill measured work 平均 `14.653414ms`，其中 replay `10.679442ms`
+  （`72.8802%`）、eager `3.973972ms`、gap `80.459886us`。
+
+这证明旧 artifact 的 `8.206444ms` exact device boundary 不是 scheduler gap 或
+program-binding upload 主导；当前第一瓶颈已经收敛到 decode CUDA graph replay body。
+eager 次级瓶颈为 `vnext_last_token_dense_linear=1.069725ms/decode frame`。对应硬 PASS
+行为：
+
+```text
+CUDA REPLAY EXECUTION SPAN TRACE PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-span-summary.json
+CUDA REPLAY EXECUTION BREAKDOWN PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-breakdown-summary.json
+```
+
+decision 为 `KEEP_OBSERVABILITY_CHECKPOINT`，`formal_performance_goal_progress=false`。
+完整 artifact 已通过 GitHub branch
+`artifact/runtime-vnext-replay-span-33fc6e46-20260724` 回传；生命周期提交为
+`d3f703816f7b1a1835c357fa9457730113c3e1d9`，archive SHA256 为
+`74c0e665fd7e2830e12c681831deb7775b35b504d45811462e6a18155ab679d3`，本机校验路径为
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/`。
+Vast `45319871` 已轮询到 `stopped/exited`，无 running/scheduling sibling。
+
+下一步只允许对 decode replay body 运行一次 kernel-activity scoped diagnostic。预期 signal
+是按 kernel/native operation 分类 `>=95%` replay duration，并输出剩余 unattributed time；
+未达到即 REJECT profiler path 并回到源码分析，不运行 throughput sweep。达到后只选择占比最高的
+一个 kernel family 形成源码预测；不得再次用 submission/replay 总时间做同层排除。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
