@@ -419,6 +419,39 @@ segment duration 复制到多个 logical command。完成本地 contract 和 CUD
 `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-phase-b-trace-e5a6e6c1-20260724T030818Z/`。
 retained instance `45319871` 已再次确认 `stopped/exited`，无 billable sibling。
 
+clean source `33fc6e46` 随后实现 typed physical execution span，并用同一 retained
+1x RTX 4090 完成一次 bounded diagnostic。CUDA binary SHA256 为
+`7e2b279eb8899c3dd3c7a0da938b00cbc11580dca679986347844ebb78101eb6`；`c03 run`、
+`c05 serve`、`c06 streaming` 均为 `KEEP`。本轮没有重跑 `100 x 3`，只用
+c1 `random 64/16`、4 requests、1 repeat 获取 full-profile shape。
+
+物理计时覆盖已经从 replay 全部 unavailable 收敛为 `405/405 measured`，logical replay
+command `16,605` 条的 duplicated elapsed 为 `0`，ownership/range error 为 `0`。decode
+device interval 平均 `8.203624ms`，精确拆为 replay `6.995859ms`（`85.3879%`）、
+eager `1.197175ms` 和 gap `6.527573us`。这把下一瓶颈从“device program”进一步收敛为
+“CUDA graph replay body”；program binding、scheduler gap 和 completion queue 不再是本轮
+第一假设。eager 的主要次级项是 last-token dense projection
+`1.069725ms/decode frame`。
+
+```text
+CUDA REPLAY EXECUTION SPAN TRACE PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-span-summary.json
+CUDA REPLAY EXECUTION BREAKDOWN PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-breakdown-summary.json
+```
+
+该 artifact 的 decision 为 `KEEP_OBSERVABILITY_CHECKPOINT`，
+`formal_performance_goal_progress=false`，因此不改变 `76.1583 tok/s` floor 或 G09 Open
+状态。archive SHA256 为
+`74c0e665fd7e2830e12c681831deb7775b35b504d45811462e6a18155ab679d3`，已通过
+GitHub branch `artifact/runtime-vnext-replay-span-33fc6e46-20260724` 回传并在本机验证；
+branch 最新 lifecycle commit 为 `d3f70381`。Vast `45319871` 已
+`stopped/exited`，无 billable sibling。
+
+下一 paid performance work 仍被 source/profile hypothesis 阻塞。只允许先对 decode graph
+运行 kernel-activity scoped diagnostic，要求 `>=95%` replay duration 被 kernel/native-op
+分类；未命中则停止并修复 profiler，不运行吞吐。命中后只优化累计占比最高的一个 kernel
+family，并预先声明该 family 的 device-time 降幅及对 `8.203624ms` decode interval 的预测，
+再决定是否值得运行 profile-off performance smoke。
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
