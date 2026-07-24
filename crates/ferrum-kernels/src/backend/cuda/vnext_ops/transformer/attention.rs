@@ -39,14 +39,10 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attent
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect";
-const DECODE_CONV_PACK_FUNCTION: &str =
-    "linear_attention_decode_prepare_packed_qkvz_to_mixed_f16_to_f32_state_f16_z_f16_indirect";
 const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
 const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32_indirect";
-const DECODE_PACKED_DELTA_FUNCTION: &str =
-    "recurrent_gated_delta_rule_decode_packed_f32_ba_f16_params_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
@@ -65,12 +61,10 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 struct AttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
-    decode_conv_pack: CudaFunction,
     conv_state_commit: CudaFunction,
     qk_norm: CudaFunction,
     delta: CudaFunction,
     delta_tiled: CudaFunction,
-    decode_packed_delta: CudaFunction,
     gated_norm: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
@@ -147,11 +141,6 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let functions = AttentionFunctions {
             rms_norm: load_function(&rms_module, RMS_NORM_FUNCTION, "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
-            decode_conv_pack: load_function(
-                &linear_module,
-                DECODE_CONV_PACK_FUNCTION,
-                "attention decode convolution pack",
-            )?,
             conv_state_commit: load_function(
                 &linear_module,
                 CONV_STATE_COMMIT_FUNCTION,
@@ -163,11 +152,6 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 &delta_module,
                 DELTA_TILED_FUNCTION,
                 "attention tiled delta",
-            )?,
-            decode_packed_delta: load_function(
-                &delta_module,
-                DECODE_PACKED_DELTA_FUNCTION,
-                "attention decode packed delta",
             )?,
             gated_norm: load_function(&linear_module, GATED_NORM_FUNCTION, "attention gated norm")?,
             f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
@@ -481,56 +465,6 @@ struct CudaAttentionShape {
     tiled_delta: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CudaRecurrentAttentionTopology {
-    // A provider-local physical specialization of RecurrentScan. The public
-    // execution form remains model- and backend-independent.
-    SingleTokenPackedDecode,
-    VarlenRecurrentScan,
-}
-
-impl CudaRecurrentAttentionTopology {
-    fn select(
-        execution_form: GatedDeltaExecutionForm,
-        tokens: u64,
-        shape: CudaAttentionShape,
-    ) -> Self {
-        if matches!(execution_form, GatedDeltaExecutionForm::RecurrentScan)
-            && tokens == 1
-            && shape.tiled_delta
-        {
-            Self::SingleTokenPackedDecode
-        } else {
-            Self::VarlenRecurrentScan
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::SingleTokenPackedDecode => "single_token_packed_decode",
-            Self::VarlenRecurrentScan => "varlen_recurrent_scan",
-        }
-    }
-
-    const fn compute_dispatches(self) -> u64 {
-        match self {
-            Self::SingleTokenPackedDecode => 9,
-            Self::VarlenRecurrentScan => 11,
-        }
-    }
-
-    const fn transfer_commands(self) -> u64 {
-        match self {
-            Self::SingleTokenPackedDecode => 0,
-            Self::VarlenRecurrentScan => 2,
-        }
-    }
-
-    const fn requires_sequence_control(self) -> bool {
-        matches!(self, Self::VarlenRecurrentScan)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
@@ -540,7 +474,6 @@ struct ScratchLayout {
     qkvz: u64,
     z_or_activation: u64,
     ba: u64,
-    decode_mixed_qkv: u64,
     query: u64,
     key: u64,
     value: u64,
@@ -605,21 +538,6 @@ impl ScratchLayout {
             ElementType::F32,
             total_tokens,
         )?;
-        // Packed decode reuses the otherwise disjoint q/k/value/g/beta span.
-        // Its one-token extent must stay inside that intermediate union.
-        let decode_mixed_qkv = query;
-        let decode_mixed_end = decode_mixed_qkv
-            .checked_add(aligned_bytes(
-                shape.qkv_features,
-                ElementType::F32.size_bytes(),
-            )?)
-            .ok_or_else(|| "attention packed decode scratch span overflows".to_owned())?;
-        if decode_mixed_end > offset {
-            return Err(
-                "attention packed decode scratch exceeds the recurrent intermediate union"
-                    .to_owned(),
-            );
-        }
         let core = reserve_tokens(
             &mut offset,
             shape.value_features,
@@ -658,7 +576,6 @@ impl ScratchLayout {
             qkvz,
             z_or_activation,
             ba,
-            decode_mixed_qkv,
             query,
             key,
             value,
@@ -708,9 +625,8 @@ struct AttentionLaunch {
     input_region: usize,
     output_region: usize,
     state_binding_offset: u64,
-    host_control: Option<usize>,
+    host_control: usize,
     execution_form: GatedDeltaExecutionForm,
-    topology: CudaRecurrentAttentionTopology,
     tokens: u64,
     tokens_i32: i32,
 }
@@ -878,19 +794,14 @@ fn encode_attention(
                 plan.token_count()
             ));
         }
-        let topology = CudaRecurrentAttentionTopology::select(execution_form, tokens, cuda_shape);
-        let host_control = topology.requires_sequence_control().then(|| {
-            let index = host_storage.len();
-            host_storage.push(sequence_control(tokens_i32 as u32));
-            index
-        });
+        let host_control = host_storage.len();
+        host_storage.push(sequence_control(tokens_i32 as u32));
         launches.push(AttentionLaunch {
             input_region,
             output_region,
             state_binding_offset: binding_offset,
             host_control,
             execution_form,
-            topology,
             tokens,
             tokens_i32,
         });
@@ -924,24 +835,11 @@ fn encode_attention(
             .u64(launch.input_region as u64)
             .u64(launch.output_region as u64)
             .u64(launch.state_binding_offset)
-            .u64(launch.host_control.map_or(u64::MAX, |index| index as u64))
+            .u64(launch.host_control as u64)
             .bytes(launch.execution_form.as_str().as_bytes())
-            .bytes(launch.topology.as_str().as_bytes())
             .u64(launch.tokens)
             .i32(launch.tokens_i32);
     }
-    let compute_dispatches = launches
-        .iter()
-        .try_fold(0_u64, |total, launch| {
-            total.checked_add(launch.topology.compute_dispatches())
-        })
-        .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())?;
-    let transfer_commands = launches
-        .iter()
-        .try_fold(0_u64, |total, launch| {
-            total.checked_add(launch.topology.transfer_commands())
-        })
-        .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
     let binding_command = if let Some(program_binding) = program_binding {
@@ -1028,8 +926,8 @@ fn encode_attention(
                 DeviceBatchingForm::ParticipantLoop,
                 participant_count,
                 total_tokens,
-                compute_dispatches,
-                transfer_commands,
+                u64::from(participant_count) * 11,
+                u64::from(participant_count) * 2,
             )
         })
         .map_err(|error| error.to_string())?;
@@ -1200,41 +1098,34 @@ fn enqueue_attention(
     let binding = &regions[shared.binding];
     let state_binding = scratch_pointer(binding.device_ptr(), launch.state_binding_offset)?;
     let scratch_base = scratch.device_ptr();
-    let sequence_control = if let Some(host_control) = launch.host_control {
-        let cu_seqlens = scratch_base;
-        let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(
-                cu_seqlens,
-                host_storage[host_control].as_ref(),
-                stream.cu_stream(),
-            )
-        }
-        .map_err(|error| CudaDeviceRuntimeError::driver("attention sequence upload", error))?;
-        let token_index_bytes = usize::try_from(
-            launch
-                .tokens
-                .checked_mul(ElementType::U32.size_bytes())
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract("attention token index size overflows")
-                })?,
+    let cu_seqlens = scratch_base;
+    let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
+    unsafe {
+        cudarc::driver::result::memcpy_htod_async(
+            cu_seqlens,
+            host_storage[launch.host_control].as_ref(),
+            stream.cu_stream(),
         )
-        .map_err(|_| {
-            CudaDeviceRuntimeError::contract("attention token index size exceeds usize")
-        })?;
-        unsafe {
-            cudarc::driver::result::memset_d8_async(
-                token_seq_indices,
-                0,
-                token_index_bytes,
-                stream.cu_stream(),
-            )
-        }
-        .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
-        Some((cu_seqlens, token_seq_indices))
-    } else {
-        None
-    };
+    }
+    .map_err(|error| CudaDeviceRuntimeError::driver("attention sequence upload", error))?;
+    let token_index_bytes = usize::try_from(
+        launch
+            .tokens
+            .checked_mul(ElementType::U32.size_bytes())
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("attention token index size overflows")
+            })?,
+    )
+    .map_err(|_| CudaDeviceRuntimeError::contract("attention token index size exceeds usize"))?;
+    unsafe {
+        cudarc::driver::result::memset_d8_async(
+            token_seq_indices,
+            0,
+            token_index_bytes,
+            stream.cu_stream(),
+        )
+    }
+    .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
 
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
@@ -1242,7 +1133,6 @@ fn enqueue_attention(
     let qkvz = scratch_pointer(scratch_base, layout.qkvz)?;
     let ba = scratch_pointer(scratch_base, layout.ba)?;
     let z = scratch_pointer(scratch_base, layout.z_or_activation)?;
-    let decode_mixed_qkv = scratch_pointer(scratch_base, layout.decode_mixed_qkv)?;
     let query = scratch_pointer(scratch_base, layout.query)?;
     let key = scratch_pointer(scratch_base, layout.key)?;
     let value = scratch_pointer(scratch_base, layout.value)?;
@@ -1291,100 +1181,67 @@ fn enqueue_attention(
         )?;
     }
 
-    match launch.topology {
-        CudaRecurrentAttentionTopology::SingleTokenPackedDecode => {
-            launch_decode_conv_pack(
-                stream,
-                &functions.decode_conv_pack,
-                qkvz,
-                regions[shared.conv].device_ptr(),
-                state_binding,
-                decode_mixed_qkv,
-                z,
-                shape,
-                cuda,
-            )?;
-            launch_decode_packed_delta(
-                stream,
-                &functions.decode_packed_delta,
-                decode_mixed_qkv,
-                ba,
-                regions[shared.a_log].device_ptr(),
-                regions[shared.dt_bias].device_ptr(),
-                state_binding,
-                core,
-                cuda,
-            )?;
-        }
-        CudaRecurrentAttentionTopology::VarlenRecurrentScan => {
-            let (cu_seqlens, token_seq_indices) = sequence_control.ok_or_else(|| {
-                CudaDeviceRuntimeError::contract(
-                    "varlen recurrent attention is missing sequence control",
-                )
-            })?;
-            launch_prepare(
-                stream,
-                &functions.prepare,
-                qkvz,
-                ba,
-                regions[shared.conv].device_ptr(),
-                state_binding,
-                regions[shared.a_log].device_ptr(),
-                regions[shared.dt_bias].device_ptr(),
-                cu_seqlens,
-                token_seq_indices,
-                query,
-                key,
-                value,
-                z,
-                g,
-                beta,
-                final_conv_state,
-                launch.tokens,
-                launch.tokens_i32,
-                cuda,
-                shape,
-            )?;
-            let conv_state_elements = i32::try_from(
-                shape
-                    .conv_state_elements()
-                    .map_err(CudaDeviceRuntimeError::contract)?,
-            )
-            .map_err(|_| {
-                CudaDeviceRuntimeError::contract("attention convolution state elements exceed i32")
-            })?;
-            launch_conv_state_commit(
-                stream,
-                &functions.conv_state_commit,
-                final_conv_state,
-                state_binding,
-                conv_state_elements,
-            )?;
-            launch_qk_norm(
-                stream,
-                &functions.qk_norm,
-                query,
-                key,
-                launch.tokens,
-                launch.tokens_i32,
-                cuda,
-            )?;
-            launch_delta(
-                stream,
-                functions,
-                query,
-                key,
-                value,
-                g,
-                beta,
-                state_binding,
-                cu_seqlens,
-                core,
-                launch.tokens_i32,
-                cuda,
-            )?;
-        }
-    }
+    launch_prepare(
+        stream,
+        &functions.prepare,
+        qkvz,
+        ba,
+        regions[shared.conv].device_ptr(),
+        state_binding,
+        regions[shared.a_log].device_ptr(),
+        regions[shared.dt_bias].device_ptr(),
+        cu_seqlens,
+        token_seq_indices,
+        query,
+        key,
+        value,
+        z,
+        g,
+        beta,
+        final_conv_state,
+        launch.tokens,
+        launch.tokens_i32,
+        cuda,
+        shape,
+    )?;
+    let conv_state_elements = i32::try_from(
+        shape
+            .conv_state_elements()
+            .map_err(CudaDeviceRuntimeError::contract)?,
+    )
+    .map_err(|_| {
+        CudaDeviceRuntimeError::contract("attention convolution state elements exceed i32")
+    })?;
+    launch_conv_state_commit(
+        stream,
+        &functions.conv_state_commit,
+        final_conv_state,
+        state_binding,
+        conv_state_elements,
+    )?;
+    launch_qk_norm(
+        stream,
+        &functions.qk_norm,
+        query,
+        key,
+        launch.tokens,
+        launch.tokens_i32,
+        cuda,
+    )?;
+    launch_delta(
+        stream,
+        functions,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_binding,
+        cu_seqlens,
+        core,
+        launch.tokens_i32,
+        cuda,
+    )?;
     launch_gated_norm(
         stream,
         &functions.gated_norm,
@@ -1426,97 +1283,6 @@ fn enqueue_attention(
             .checked_mul(shape.hidden_size)
             .ok_or_else(|| CudaDeviceRuntimeError::contract("attention residual size overflows"))?,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn launch_decode_conv_pack(
-    stream: &CudaStream,
-    function: &CudaFunction,
-    qkvz: u64,
-    conv_weight: u64,
-    state_binding: u64,
-    mixed_qkv: u64,
-    z: u64,
-    logical: AttentionShape,
-    shape: CudaAttentionShape,
-) -> Result<(), CudaDeviceRuntimeError> {
-    let total = logical.qkv_features.max(logical.value_features);
-    let mut builder = stream.launch_builder(function);
-    let pointers = [qkvz, conv_weight, state_binding, mixed_qkv, z];
-    for pointer in &pointers {
-        builder.arg(pointer);
-    }
-    let dimensions = [
-        shape.key_heads,
-        shape.value_heads,
-        shape.key_head_dim,
-        shape.value_head_dim,
-        shape.conv_kernel,
-    ];
-    for dimension in &dimensions {
-        builder.arg(dimension);
-    }
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (
-                checked_grid(
-                    total,
-                    THREADS_PER_BLOCK,
-                    "attention decode convolution pack",
-                )?,
-                1,
-                1,
-            ),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| {
-        CudaDeviceRuntimeError::driver("attention decode convolution pack launch", error)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn launch_decode_packed_delta(
-    stream: &CudaStream,
-    function: &CudaFunction,
-    mixed_qkv: u64,
-    ba: u64,
-    a_log: u64,
-    dt_bias: u64,
-    state_binding: u64,
-    output: u64,
-    shape: CudaAttentionShape,
-) -> Result<(), CudaDeviceRuntimeError> {
-    let mut builder = stream.launch_builder(function);
-    let pointers = [mixed_qkv, ba, a_log, dt_bias, state_binding, output];
-    for pointer in &pointers {
-        builder.arg(pointer);
-    }
-    let dimensions = [
-        shape.key_heads,
-        shape.value_heads,
-        shape.key_head_dim,
-        shape.value_head_dim,
-    ];
-    for dimension in &dimensions {
-        builder.arg(dimension);
-    }
-    builder.arg(&shape.scale);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (
-                (shape.value_head_dim as u32).div_ceil(16),
-                shape.value_heads as u32,
-                1,
-            ),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention decode packed delta launch", error))
 }
 
 #[allow(clippy::too_many_arguments)]
