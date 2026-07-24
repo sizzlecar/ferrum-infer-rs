@@ -1339,11 +1339,12 @@ impl CudaExecutionSpanEventTiming {
                 )
             }
         }?;
-        self.reusable_executable_fingerprint
-            .as_ref()
-            .map_or(Some(span), |fingerprint| {
+        match &self.reusable_executable_fingerprint {
+            Some(fingerprint) => {
                 span.with_reusable_executable_fingerprint(fingerprint.as_ref().to_owned())
-            })
+            }
+            None => Some(span),
+        }
     }
 }
 
