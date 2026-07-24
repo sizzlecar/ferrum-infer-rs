@@ -1442,16 +1442,18 @@ fn launch_decode_conv_pack(
 ) -> Result<(), CudaDeviceRuntimeError> {
     let total = logical.qkv_features.max(logical.value_features);
     let mut builder = stream.launch_builder(function);
-    for pointer in &[qkvz, conv_weight, state_binding, mixed_qkv, z] {
+    let pointers = [qkvz, conv_weight, state_binding, mixed_qkv, z];
+    for pointer in &pointers {
         builder.arg(pointer);
     }
-    for dimension in &[
+    let dimensions = [
         shape.key_heads,
         shape.value_heads,
         shape.key_head_dim,
         shape.value_head_dim,
         shape.conv_kernel,
-    ] {
+    ];
+    for dimension in &dimensions {
         builder.arg(dimension);
     }
     unsafe {
@@ -1488,15 +1490,17 @@ fn launch_decode_packed_delta(
     shape: CudaAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let mut builder = stream.launch_builder(function);
-    for pointer in &[mixed_qkv, ba, a_log, dt_bias, state_binding, output] {
+    let pointers = [mixed_qkv, ba, a_log, dt_bias, state_binding, output];
+    for pointer in &pointers {
         builder.arg(pointer);
     }
-    for dimension in &[
+    let dimensions = [
         shape.key_heads,
         shape.value_heads,
         shape.key_head_dim,
         shape.value_head_dim,
-    ] {
+    ];
+    for dimension in &dimensions {
         builder.arg(dimension);
     }
     builder.arg(&shape.scale);
