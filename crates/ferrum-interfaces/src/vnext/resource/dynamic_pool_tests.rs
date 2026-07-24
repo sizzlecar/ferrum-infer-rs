@@ -1542,7 +1542,9 @@ fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
     else {
         panic!("resident reusable capacity bucket must prepare")
     };
-    let (first_slices, first_slot) = first_prepared.commit().into_parts();
+    let first_committed = first_prepared.commit();
+    let first_certificate = Arc::clone(first_committed.certificate());
+    let (first_slices, first_slot) = first_committed.into_parts();
     let first_evidence = first_slices[0].evidence().clone();
     assert_eq!(first_evidence.size_bytes(), 64);
     assert_eq!(first_evidence.capacity_size_bytes(), 256);
@@ -1582,7 +1584,12 @@ fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
     else {
         panic!("same reusable bucket must reclaim its idle stable slot")
     };
-    let (second_slices, second_slot) = second_prepared.commit().into_parts();
+    let second_committed = second_prepared.commit();
+    assert!(
+        Arc::ptr_eq(&first_certificate, second_committed.certificate()),
+        "an idle lane slot must reuse its cold physical backing certificate"
+    );
+    let (second_slices, second_slot) = second_committed.into_parts();
     let second_evidence = second_slices[0].evidence();
     assert_eq!(second_evidence.size_bytes(), 128);
     assert_eq!(second_evidence.capacity_size_bytes(), 256);
