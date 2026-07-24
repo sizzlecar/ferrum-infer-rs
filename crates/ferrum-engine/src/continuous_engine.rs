@@ -4155,6 +4155,10 @@ impl VNextProfileEventContext {
             };
             let first_identity = first.identity().parts();
             let shape = BTreeMap::from([
+                (
+                    "command_index".to_string(),
+                    serde_json::json!(command.command_index()),
+                ),
                 ("node_index".to_string(), serde_json::json!(node_index)),
                 (
                     "participant_count".to_string(),
