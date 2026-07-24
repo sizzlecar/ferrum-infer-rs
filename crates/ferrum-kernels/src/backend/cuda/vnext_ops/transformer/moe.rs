@@ -109,6 +109,36 @@ struct MoeLaunchShape {
     device_ordinal: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoeRoutingPlan {
+    SingleTokenDirectMarlin,
+    GenericAlign,
+}
+
+impl MoeRoutingPlan {
+    fn for_tokens(tokens: i32) -> Self {
+        if tokens == 1 {
+            Self::SingleTokenDirectMarlin
+        } else {
+            Self::GenericAlign
+        }
+    }
+
+    fn replay_tag(self) -> &'static [u8] {
+        match self {
+            Self::SingleTokenDirectMarlin => b"single-token-direct-marlin",
+            Self::GenericAlign => b"generic-align",
+        }
+    }
+
+    fn compute_dispatch_count(self) -> u64 {
+        match self {
+            Self::SingleTokenDirectMarlin => 11,
+            Self::GenericAlign => 12,
+        }
+    }
+}
+
 pub(in crate::backend::cuda::vnext_ops) struct CudaRoutedSharedSwiGluMoeProvider {
     descriptor: OperationProviderDescriptor,
     kernels: MoeCudaKernels,
@@ -363,6 +393,7 @@ fn encode_moe(
             .map_err(|_| "MoE down group size exceeds i32".to_owned())?,
         device_ordinal,
     };
+    let routing_plan = MoeRoutingPlan::for_tokens(shape.tokens);
     let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, COMMAND_NAME)
         .i32(shape.tokens)
         .i32(shape.expert_count)
@@ -374,6 +405,7 @@ fn encode_moe(
         .i32(shape.gate_up_group_size)
         .i32(shape.down_group_size)
         .i32(shape.device_ordinal)
+        .bytes(routing_plan.replay_tag())
         .u64(layout.total_bytes)
         .u64(MOE_BLOCK_SIZE)
         .finish();
@@ -403,26 +435,44 @@ fn encode_moe(
                 shape.hidden_size,
                 "vNext MoE router GEMM",
             )?;
-            kernels.launch_router(
-                stream,
-                pointers.router_logits,
-                pointers.route_ids,
-                pointers.route_weights,
-                shape.tokens,
-                shape.expert_count,
-                shape.experts_per_token,
-                shape.normalize_topk,
-            )?;
-            kernels.launch_align(
-                stream,
-                pointers.route_ids,
-                pointers.sorted_token_ids,
-                pointers.expert_block_ids,
-                pointers.total_tokens_post_pad,
-                shape.pair_count,
-                shape.expert_count,
-                shape.sorted_capacity,
-            )?;
+            match routing_plan {
+                MoeRoutingPlan::SingleTokenDirectMarlin => {
+                    kernels.launch_single_token_router(
+                        stream,
+                        pointers.router_logits,
+                        pointers.route_ids,
+                        pointers.route_weights,
+                        pointers.sorted_token_ids,
+                        pointers.expert_block_ids,
+                        pointers.total_tokens_post_pad,
+                        shape.expert_count,
+                        shape.experts_per_token,
+                        shape.normalize_topk,
+                    )?;
+                }
+                MoeRoutingPlan::GenericAlign => {
+                    kernels.launch_router(
+                        stream,
+                        pointers.router_logits,
+                        pointers.route_ids,
+                        pointers.route_weights,
+                        shape.tokens,
+                        shape.expert_count,
+                        shape.experts_per_token,
+                        shape.normalize_topk,
+                    )?;
+                    kernels.launch_align(
+                        stream,
+                        pointers.route_ids,
+                        pointers.sorted_token_ids,
+                        pointers.expert_block_ids,
+                        pointers.total_tokens_post_pad,
+                        shape.pair_count,
+                        shape.expert_count,
+                        shape.sorted_capacity,
+                    )?;
+                }
+            }
 
             zero_region(stream, scratch.device_ptr(), layout.marlin_workspace)?;
             launch_marlin(
@@ -545,7 +595,13 @@ fn encode_moe(
         },
     )
     .and_then(|command| {
-        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 12, 2)
+        command.with_work_attribution(
+            DeviceBatchingForm::Packed,
+            participant_count,
+            tokens,
+            routing_plan.compute_dispatch_count(),
+            2,
+        )
     })
     .map_err(|error| error.to_string())
 }
@@ -823,5 +879,28 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(error.contains("router contract"), "{error}");
+    }
+
+    #[test]
+    fn selects_direct_marlin_routing_only_for_single_token_decode() {
+        assert_eq!(
+            MoeRoutingPlan::for_tokens(1),
+            MoeRoutingPlan::SingleTokenDirectMarlin
+        );
+        for tokens in [2, 32, 1024] {
+            assert_eq!(
+                MoeRoutingPlan::for_tokens(tokens),
+                MoeRoutingPlan::GenericAlign
+            );
+        }
+    }
+
+    #[test]
+    fn single_token_routing_removes_exactly_one_compute_dispatch() {
+        assert_eq!(
+            MoeRoutingPlan::SingleTokenDirectMarlin.compute_dispatch_count(),
+            11
+        );
+        assert_eq!(MoeRoutingPlan::GenericAlign.compute_dispatch_count(), 12);
     }
 }

@@ -9,6 +9,8 @@ use super::super::super::vnext_runtime::{CudaDeviceRuntime, CudaDeviceRuntimeErr
 use super::moe_workspace::{WorkspaceRegion, MOE_BLOCK_SIZE};
 
 pub(super) const ROUTER_FUNCTION_NAME: &str = "moe_router_topk_softmax_f16";
+pub(super) const SINGLE_TOKEN_ROUTER_FUNCTION_NAME: &str =
+    "moe_router_topk_softmax_f16_single_token_marlin";
 pub(super) const ALIGN_FUNCTION_NAME: &str = "moe_align_block_size_pair_ids_f32";
 pub(super) const WEIGHTED_SUM_FUNCTION_NAME: &str = "weighted_sum_batched_f16";
 pub(super) const TOKEN_GATE_ADD_FUNCTION_NAME: &str = "apply_token_gate_and_add_inplace_f16";
@@ -17,6 +19,7 @@ pub(super) const SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_interleaved_f16"
 #[derive(Clone)]
 pub(super) struct MoeCudaKernels {
     router: CudaFunction,
+    single_token_router: CudaFunction,
     align: CudaFunction,
     weighted_sum: CudaFunction,
     token_gate_add: CudaFunction,
@@ -45,6 +48,11 @@ impl MoeCudaKernels {
             .map_err(|error| CudaDeviceRuntimeError::driver("MoE SiLU module load", error))?;
         Ok(Self {
             router: load_function(&router_module, ROUTER_FUNCTION_NAME, "MoE router")?,
+            single_token_router: load_function(
+                &router_module,
+                SINGLE_TOKEN_ROUTER_FUNCTION_NAME,
+                "MoE single-token router",
+            )?,
             align: load_function(&align_module, ALIGN_FUNCTION_NAME, "MoE align")?,
             weighted_sum: load_function(
                 &combine_module,
@@ -58,6 +66,52 @@ impl MoeCudaKernels {
             )?,
             silu_mul: load_function(&silu_module, SILU_MUL_FUNCTION_NAME, "MoE SiLU")?,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn launch_single_token_router(
+        &self,
+        stream: &CudaStream,
+        logits: u64,
+        route_ids: u64,
+        route_weights: u64,
+        sorted_token_ids: u64,
+        expert_block_ids: u64,
+        total_tokens_post_pad: u64,
+        expert_count: i32,
+        experts_per_token: i32,
+        normalize_topk: bool,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let tokens = 1_i32;
+        let normalize_topk = i32::from(normalize_topk);
+        let block_size = MOE_BLOCK_SIZE as i32;
+        let shared_mem_bytes = u32::try_from(expert_count)
+            .ok()
+            .and_then(|experts| experts.checked_mul(4))
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("MoE router shared memory overflows")
+            })?;
+        let mut builder = stream.launch_builder(&self.single_token_router);
+        builder.arg(&logits);
+        builder.arg(&route_ids);
+        builder.arg(&route_weights);
+        builder.arg(&sorted_token_ids);
+        builder.arg(&expert_block_ids);
+        builder.arg(&total_tokens_post_pad);
+        builder.arg(&tokens);
+        builder.arg(&expert_count);
+        builder.arg(&experts_per_token);
+        builder.arg(&normalize_topk);
+        builder.arg(&block_size);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("MoE single-token router launch", error))
     }
 
     #[allow(clippy::too_many_arguments)]
