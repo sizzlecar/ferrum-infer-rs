@@ -1915,11 +1915,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .into_iter()
             .map(DeviceCommandEntry::into_parts)
             .collect::<Vec<_>>();
-        if u32::try_from(entries.len()).is_err() {
-            return Err(DefinitelyNotSubmitted::new(
-                CudaDeviceRuntimeError::contract("CUDA command count exceeds u32"),
-            ));
-        }
+        let command_count = u32::try_from(entries.len()).map_err(|_| {
+            DefinitelyNotSubmitted::new(CudaDeviceRuntimeError::contract(
+                "CUDA command count exceeds u32",
+            ))
+        })?;
         let command_phases = entries
             .iter()
             .map(|(phase, _, _)| *phase)
@@ -1934,8 +1934,6 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .into_iter()
             .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
-        let command_count =
-            u32::try_from(commands.len()).expect("CUDA command count was validated above");
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
         let mut execution_paths =
             kernel_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
