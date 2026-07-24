@@ -452,6 +452,22 @@ branch 最新 lifecycle commit 为 `d3f70381`。Vast `45319871` 已
 family，并预先声明该 family 的 device-time 降幅及对 `8.203624ms` decode interval 的预测，
 再决定是否值得运行 profile-off performance smoke。
 
+该 scoped diagnostic 已在 clean source `36b1b3af` 上按停止规则执行并
+`REJECT_INSTRUMENTATION_LIFECYCLE`：12 个 fingerprint 全部 join，但 405 个 NVTX replay
+range 未正常闭合，kernel-duration sum / Ferrum replay wall-time=`1.170497`；原始 SQLite
+显示 405 个 start 共享同一个 profiler terminal end，v2 projection 重放把 405/405 标记为
+nested。它没有运行 throughput，也没有产生 G09 performance progress；受污染的 GEMV/Marlin/
+MoE-align 排名不得用于选择优化项。
+
+修复提交 `8f44dd8c` 改为显式成对标记，并把 analyzer coverage 口径切到 projected GPU
+wall-time。下一次 paid work 仍只允许复用同一 stopped 4090 做一次 bounded attribution：
+CUDA feature compile、`c03/c05/c06` 必须先 PASS；range count 必须逐 fingerprint 对齐、
+nesting/child=`0`、projection coverage=`0.95..1.10`。任一条件失败即保存 REJECT 并停机；
+全部命中后才接受 top kernel family，仍不直接运行 `100 x 3` 或 G09 full sweep。完整失败
+artifact、GitHub commit `804cb22a` 和 SHA256
+`b6f0558f98675ad043d31f5958aa45e60f1c0ed38b6fad7f0173d45d02d8a143`
+记录在 [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md)。
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
