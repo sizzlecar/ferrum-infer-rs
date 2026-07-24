@@ -260,6 +260,52 @@ sibling。decision 为 `KEEP_OBSERVABILITY_CHECKPOINT`，不是 G09 正式性能
 而不是把本次 graph 的 `13` 个 MoE kernel 硬编码回模型合同。完成该元数据和本地合同测试前
 不得启动下一次 paid diagnostic。
 
+### Full-profile 与产品执行路径等价性缺口（2026-07-24）
+
+后续源码审计确认，现有 `full` profile 与默认产品路径不能直接用于同一类性能归因：
+
+- `off` 映射到 `DeviceTimingMode::Off`，`basic/debug` 映射到
+  `DeviceTimingMode::Completion`，`full` 映射到 `DeviceTimingMode::Kernel`；
+- typed direct-program 只在非 `Kernel` timing 下选择；`Kernel` timing 明确要求完整 logical
+  provider encoding，以保留逐 command attribution；
+- 因此 `full` 只有在 reusable CUDA executable 和 graph fingerprint 与 direct path
+  匹配时才能解释 device composition；其 provider encode/submit、allocation 和 product
+  throughput 不是 `off/basic` direct-program 热路径的证据。
+
+该区别解释了为何 kernel/replay profile 可以稳定显示 device-time 改善，而历史
+profile-off 吞吐仍可能反向或高方差。不得再把 `full` 的 throughput、host stage 或 logical
+dispatch count 外推为产品性能。最终 G06 必须新增并验证以下机器可读合同：
+
+- 每个 profile artifact 保存 `device_timing_mode`、`host_execution_path`、
+  `reusable_program_id/fingerprint`、direct wave/segment/binding count、fallback count 和
+  catalog-epoch miss count，字段完整率 `100%`；
+- 同 binary、同 workload 的 `off` 与 `basic` 必须都走 typed direct-program，direct fallback
+  和 epoch miss 均为 `0`；
+- `full` 若仍使用 logical provider encoding，必须标记
+  `product_path_equivalent=false`，且不得产生产品 throughput claim；
+- `full` 与 paired `basic` 的 reusable executable fingerprint 集合、逐 fingerprint replay
+  count 和 captured graph-node fingerprint 必须 `100%` 一致，才能用 `full` 给 direct
+  product path 排 kernel；任一 mismatch 使该归因 artifact REJECT；
+- 正式候选先用 `full` 验证预声明的 topology/device signal，再用同机、同缓存、同 session
+  的 direct-path `basic` 进行 bounded `A-B-B-A` stage attribution，最后才允许
+  profile-off `A-B-B-A`；正式 G09 仍执行完整 `ABBA-BAAB`，不因该诊断流程降级。
+
+已有
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-ab-attribution-20260724T130106Z/`
+证明 direct-path `basic` 可以用于有界归因：100/100 measured requests 通过，
+4,440 direct waves 的 fallback/epoch miss 都为 `0`；specialized binding source 相对
+baseline 将 provider-node encode 降低 `42.60%`、host encode/submit 降低 `29.56%`，
+而 completion round trip 仅变化 `-0.93%`。该 artifact 的 KEEP line 为：
+
+```text
+CUDA DIRECT BINDING AB ATTRIBUTION KEEP: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-ab-attribution-20260724T130106Z/diagnostic-summary.json
+```
+
+这关闭了 binding-only 的 host attribution 歧义，但不关闭 basic profiling overhead
+`<=2%` 或 G09 正式性能门。后续 profiler 实现应优先让 direct program 获得 segment/graph
+级 device attribution；在此之前使用上述双路径合同，不得再以反复 profile-off sweep
+代替归因。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
@@ -285,6 +331,9 @@ sibling。decision 为 `KEEP_OBSERVABILITY_CHECKPOINT`，不是 G09 正式性能
   ITL ratio 数 `0`，client SSE source 冒充 engine token-commit 数 `0`。
 - 三主模型 performance/concurrency row 的 active timeline、eligible interval、max-active 和 duty-cycle
   字段完整率 `100%`；MODEL_MATRIX active floor/duty-cycle 计算可从原始事件确定性重放 `100/100`。
+- profile execution-path 字段完整率 `100%`；`off/basic` direct fallback 和 catalog-epoch
+  miss 为 `0`；用于 direct product path kernel 排名的 `full/basic` reusable executable 与
+  graph fingerprint/count 一致率 `100%`。
 
 ## 产物与 PASS
 
