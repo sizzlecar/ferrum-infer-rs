@@ -120,6 +120,7 @@ struct ContinuousEngineRuntimeConfig {
     max_model_len: Option<usize>,
     next_batch_prof: bool,
     profile_entrypoint: Option<ProfileEntrypoint>,
+    profile_jsonl: Option<PathBuf>,
     prefix_cache_enabled: bool,
     rbd_prof: bool,
     scheduler_trace_jsonl: Option<PathBuf>,
@@ -142,6 +143,7 @@ impl ContinuousEngineRuntimeConfig {
             max_model_len: r.max_model_len,
             next_batch_prof: r.next_batch_prof,
             profile_entrypoint: r.profile_entrypoint,
+            profile_jsonl: r.profile_jsonl.clone(),
             prefix_cache_enabled: r.prefix_cache_enabled,
             rbd_prof: r.rbd_prof,
             scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
@@ -172,6 +174,9 @@ impl ContinuousEngineRuntimeConfig {
             profile_entrypoint: vars
                 .get("FERRUM_PROFILE_ENTRYPOINT")
                 .and_then(|value| ProfileEntrypoint::parse(value)),
+            profile_jsonl: vars
+                .get("FERRUM_PROFILE_JSONL")
+                .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             prefix_cache_enabled: vars
                 .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
                 .is_some_and(|v| v == "1"),
@@ -2507,6 +2512,7 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
+    profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
     scheduler_trace_none_streak: AtomicU64,
@@ -3701,6 +3707,7 @@ struct VNextProfileEventContext {
     capture_policy: ExecutionEventCapturePolicy,
 }
 
+#[derive(Clone)]
 struct DeferredVNextProfileEvent {
     event: ExecutionEvent,
     timestamp: chrono::DateTime<chrono::Utc>,
@@ -3784,10 +3791,14 @@ impl SchedulerTraceJournal {
     fn close(&self) -> std::result::Result<(), JsonlJournalError> {
         self.inner.close()
     }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
 }
 
 struct VNextProfileExecutionEventSink {
-    journal: SchedulerTraceJournal,
+    journals: Box<[SchedulerTraceJournal]>,
     context: Arc<VNextProfileEventContext>,
 }
 
@@ -3865,13 +3876,26 @@ fn project_device_command_timing<'a>(
 }
 
 impl VNextProfileExecutionEventSink {
+    #[cfg(test)]
     fn new(
         journal: SchedulerTraceJournal,
         entrypoint: ProfileEntrypoint,
         config: &EngineConfig,
     ) -> Self {
+        Self::with_journals(vec![journal], entrypoint, config)
+    }
+
+    fn with_journals(
+        journals: Vec<SchedulerTraceJournal>,
+        entrypoint: ProfileEntrypoint,
+        config: &EngineConfig,
+    ) -> Self {
+        assert!(
+            !journals.is_empty(),
+            "vNext profile sink requires at least one JSONL journal"
+        );
         Self {
-            journal,
+            journals: journals.into_boxed_slice(),
             context: Arc::new(VNextProfileEventContext {
                 entrypoint,
                 model: config.model.model_id.to_string(),
@@ -3888,6 +3912,55 @@ impl VNextProfileExecutionEventSink {
                 },
             }),
         }
+    }
+
+    fn enqueue_profile_batch(
+        &self,
+        events: Vec<FerrumProfileEvent>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        for journal in &self.journals {
+            journal.enqueue_batch(events.clone()).map_err(|error| {
+                ExecutionEventSinkError::new(format!(
+                    "enqueue vNext profile events to {}: {error}",
+                    journal.path().display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_deferred_event(
+        &self,
+        event: DeferredVNextProfileEvent,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        for journal in &self.journals {
+            journal
+                .enqueue_deferred_vnext(event.clone())
+                .map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "enqueue deferred vNext profile event to {}: {error}",
+                        journal.path().display()
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_deferred_batch(
+        &self,
+        events: Vec<DeferredVNextProfileEvent>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        for journal in &self.journals {
+            journal
+                .enqueue_deferred_vnext_batch(events.clone())
+                .map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "enqueue deferred vNext profile batch to {}: {error}",
+                        journal.path().display()
+                    ))
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -4785,13 +4858,7 @@ impl VNextProfileExecutionEventSink {
                 context: Arc::clone(&self.context),
             });
         }
-        self.journal
-            .enqueue_deferred_vnext_batch(deferred)
-            .map_err(|error| {
-                ExecutionEventSinkError::new(format!(
-                    "enqueue deferred vNext profile batch: {error}"
-                ))
-            })
+        self.enqueue_deferred_batch(deferred)
     }
 }
 
@@ -4827,11 +4894,7 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         if events.is_empty() {
             return Ok(());
         }
-        self.journal.enqueue_batch(events).map_err(|error| {
-            ExecutionEventSinkError::new(format!(
-                "enqueue vNext device attribution profile batch: {error}"
-            ))
-        })
+        self.enqueue_profile_batch(events)
     }
 
     fn record_physical_device_submission_timing(
@@ -4844,11 +4907,7 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         else {
             return Ok(());
         };
-        self.journal.enqueue_batch(vec![event]).map_err(|error| {
-            ExecutionEventSinkError::new(format!(
-                "enqueue vNext physical submission timing event: {error}"
-            ))
-        })
+        self.enqueue_profile_batch(vec![event])
     }
 
     fn record(
@@ -4860,9 +4919,7 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
             timestamp: chrono::Utc::now(),
             context: Arc::clone(&self.context),
         };
-        self.journal.enqueue_deferred_vnext(event).map_err(|error| {
-            ExecutionEventSinkError::new(format!("enqueue deferred vNext profile event: {error}"))
-        })
+        self.enqueue_deferred_event(event)
     }
 
     fn record_batch(
@@ -5093,19 +5150,52 @@ impl ContinuousBatchEngine {
             recurrent_state_manager
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
-        let scheduler_trace_jsonl =
-            create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
+        let profile_trace_jsonl = runtime_config
+            .profile_jsonl
+            .as_ref()
+            .map(|path| {
+                SchedulerTraceJournal::create(path.clone()).map_err(|error| {
+                    FerrumError::io(format!(
+                        "open product profile JSONL {}: {error}",
+                        path.display()
+                    ))
+                })
+            })
+            .transpose()?;
+        let scheduler_trace_jsonl = match runtime_config.scheduler_trace_jsonl.as_deref() {
+            Some(path)
+                if profile_trace_jsonl
+                    .as_ref()
+                    .is_some_and(|journal| journal.path() == path) =>
+            {
+                profile_trace_jsonl.clone()
+            }
+            path => create_scheduler_trace_sink(path),
+        };
         let legacy_scheduler_trace_jsonl = create_legacy_scheduler_trace_sink(
             runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
         );
+        let mut execution_profile_journals = Vec::with_capacity(2);
+        if let Some(journal) = profile_trace_jsonl.as_ref() {
+            execution_profile_journals.push(journal.clone());
+        }
         if let Some(journal) = scheduler_trace_jsonl.as_ref() {
-            let sink: Arc<dyn ExecutionEventSink> = Arc::new(VNextProfileExecutionEventSink::new(
-                journal.clone(),
-                runtime_config
-                    .profile_entrypoint
-                    .unwrap_or(ProfileEntrypoint::Synthetic),
-                &config,
-            ));
+            if execution_profile_journals
+                .iter()
+                .all(|existing| existing.path() != journal.path())
+            {
+                execution_profile_journals.push(journal.clone());
+            }
+        }
+        if !execution_profile_journals.is_empty() {
+            let sink: Arc<dyn ExecutionEventSink> =
+                Arc::new(VNextProfileExecutionEventSink::with_journals(
+                    execution_profile_journals,
+                    runtime_config
+                        .profile_entrypoint
+                        .unwrap_or(ProfileEntrypoint::Synthetic),
+                    &config,
+                ));
             model_executor.attach_execution_event_sink(Arc::clone(&sink));
             if let Some(draft_executor) = draft_executor.as_ref() {
                 draft_executor.attach_execution_event_sink(sink);
@@ -5132,6 +5222,7 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
+                profile_trace_jsonl,
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
                 scheduler_trace_none_streak: AtomicU64::new(0),
@@ -5565,16 +5656,34 @@ impl InferenceEngine for ContinuousBatchEngine {
             None => Ok(()),
         };
 
-        let trace_result = match self.inner.scheduler_trace_jsonl.clone() {
-            Some(journal) => tokio::task::spawn_blocking(move || journal.close())
-                .await
-                .map_err(|error| {
-                    FerrumError::internal(format!("scheduler trace close task failed: {error}"))
-                })?
-                .map_err(|error| {
-                    FerrumError::internal(format!("scheduler trace close failed: {error}"))
-                }),
-            None => Ok(()),
+        let mut trace_journals = Vec::with_capacity(2);
+        if let Some(journal) = self.inner.profile_trace_jsonl.clone() {
+            trace_journals.push(journal);
+        }
+        if let Some(journal) = self.inner.scheduler_trace_jsonl.clone() {
+            if trace_journals
+                .iter()
+                .all(|existing| existing.path() != journal.path())
+            {
+                trace_journals.push(journal);
+            }
+        }
+        let trace_result = if trace_journals.is_empty() {
+            Ok(())
+        } else {
+            tokio::task::spawn_blocking(move || {
+                for journal in trace_journals {
+                    journal.close()?;
+                }
+                Ok::<(), JsonlJournalError>(())
+            })
+            .await
+            .map_err(|error| {
+                FerrumError::internal(format!("scheduler trace close task failed: {error}"))
+            })?
+            .map_err(|error| {
+                FerrumError::internal(format!("scheduler trace close failed: {error}"))
+            })
         };
 
         loop_result?;
