@@ -419,6 +419,45 @@ participant projection，failure/replay/serialization 仍可取得精确投影�
 KEEP/REJECT 合同由 [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) 定义；在真实 CUDA artifact
 产生前，本节只算 source observability contract，不关闭 G06。
 
+### Identity materialization CUDA evidence（2026-07-25）
+
+Clean source `790f29ce699460e08eb9c2f90476810c52ce1eee` 在单张 RTX 4090 上完成真实
+Qwen3.5-35B-A3B-GPTQ-Int4 验证，candidate binary SHA256 为
+`dcfde7bc7a4f3a7d5c3a1d34a8c048ac38bd5230cdab6904b45196e0442895e8`。`ferrum run`、
+non-streaming `serve` 和 streaming `serve` 正确性为 `3/3`，错误数为 `0`；streaming
+响应包含唯一 `[DONE]`、唯一 usage row 和非零 output token。
+
+同一 product correctness health snapshot 报告：
+
+```text
+waves                                      6
+logical_nodes                              978
+nodes_materialized_before_submit           252
+full_participant_materializations_before_submit 0
+direct_fallbacks / catalog_misses / epoch_misses 0 / 0 / 0
+```
+
+profile-off A-B-B-A 的两个 candidate slot 各自报告 `51,510 / 185,820 = 27.7204%`
+提交前 node materialization，完整 participant materialization 仍为 `0`；profile-only
+`wave_identity_bind` breakdown samples 为 `0`，证明这些 atomic health counters 不依赖
+profile sink。Basic A-B-B-A 则把 candidate `wave_identity_bind` 从相邻 baseline 的
+`1.693364 ms/wave` 降到 `0.032536 ms/wave`。
+
+有界验证器打印：
+
+```text
+CUDA COMPILED WAVE IDENTITY BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-compiled-identity-cuda-790f29ce-20260724T210959Z
+```
+
+本机 artifact 位于
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-compiled-identity-cuda-790f29ce-20260724T210959Z/`；
+GitHub artifact branch 为
+`artifact/runtime-vnext-compiled-identity-790f29ce-20260725`，cleanup commit 为
+`38c58b3b3acf312942600efaac2b1f68ae91bb90`。Vast `45319871` 已确认
+`stopped/exited`，额外 billable/transitional sibling 为 `0`。该证据关闭本 source contract
+的真实 CUDA attribution 检查，但没有运行 G06 全套 replay/historical/profile-overhead 门，
+因此不关闭 G06。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
