@@ -662,6 +662,33 @@ requires existing full-profile or bounded same-process attribution to isolate
 `provider_node_encode` from host-wide variance, followed by one source-level
 hypothesis with a named stage delta.
 
+### 2026-07-24 Same-Session Direct-Binding Attribution
+
+The requested bounded attribution subsequently completed on the same retained
+RTX 4090 with both binaries, one model cache, and `A-B-B-A` ordering. Each slot
+used `profile-detail=basic`, random `64/32`, c1, 25 measured requests plus five
+warmups, and seed `9271`. All `100/100` measured requests passed with usage
+token counts, and all 4,440 direct waves completed with zero direct fallback
+or catalog-epoch miss.
+
+The reversal followed the binary in both halves:
+
+| direct-path metric | A `f435bec9` | B `8c58e3ea` | B vs A |
+|---|---:|---:|---:|
+| provider-node encode | `1498.316 us` | `860.026 us` | `-42.60%` |
+| host encode/submit | `3598.252 us` | `2534.590 us` | `-29.56%` |
+| completion round trip | `7565.833 us` | `7495.563 us` | `-0.93%` |
+| diagnostic throughput | `47.0844 tok/s` | `54.8719 tok/s` | `+16.54%` |
+
+This resolves the earlier unpaired profile-off ambiguity in favor of retaining
+the specialized binding-only source. It does not satisfy the formal
+`76.1583 tok/s` floor and is not a G09 performance PASS. The immutable result
+is:
+
+```text
+CUDA DIRECT BINDING AB ATTRIBUTION KEEP: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-ab-attribution-20260724T130106Z/diagnostic-summary.json
+```
+
 ### 2026-07-24 Rejected Single-Token Packed-Decode Candidate
 
 Clean candidate `67921b1c55a093c43e5e6a4ea5f60c7916a962df`, binary SHA256
@@ -717,12 +744,101 @@ It was verified locally under
 Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
 
 This exact candidate must not be rerun. Source review found that its packed
-delta kernel normalizes Q/K inside each value-tile block. A successor must
-first move normalization to a once-per-key-head stage, preserve the typed
-topology and indirect-state lifetime contract, and pass local numeric/ABI
-coverage. Before another paid run it must predict both a physical replay span
-below `6.195692 ms` and profile-off throughput at or above
-`59.887970 tok/s`; otherwise work remains offline.
+delta kernel normalizes Q/K inside each value-tile block. The initial successor
+hypothesis was to move normalization to a once-per-key-head stage while
+preserving the typed topology and indirect-state lifetime contract. That exact
+hypothesis has now been evaluated and rejected below; it must not be proposed
+again as an untested next step.
+
+### 2026-07-24 Rejected Separate-Normalization Packed Decode
+
+Clean source `a884f5d44e9bb68542e2dfe67d8310fb2071f227`, binary SHA256
+`64e137337df0f120d7a4d415198a2d9a7a0921df4c34f3d8b7808fd6992bf357`,
+implemented the once-per-key-head normalization hypothesis as a separate CUDA
+dispatch followed by a prenormalized packed-delta kernel. The release build
+completed in `296.234294 s`. Correctness preceded performance:
+
+- the actual RTX 4090 CUDA parity test
+  `normalized_packed_decode_matches_varlen_cuda_state_and_output` passed `1/1`;
+- actual-model `c03 run`, `c05 serve`, and `c06 streaming serve` passed `3/3`;
+- request errors, quality issues, and blocker-log matches were all `0`.
+
+The topology reached its exact prediction of `10 compute + 0 transfer` per
+recurrent layer, but the physical result missed its predeclared stop
+condition. Across 75 decode correlations and 2,250 recurrent observations,
+mean replay was `6.221576 ms`, which is `0.025885 ms` or `0.4178%` slower than
+the `67921b1c` packed candidate's `6.195692 ms`. The additional normalization
+dispatch cost more than the removed per-value-tile normalization saved.
+Profile-off was intentionally not run after the structural miss.
+
+The immutable decision is:
+
+```text
+CUDA NORMALIZED PACKED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commit `784d5bf2` reverted the candidate; the active source contains neither
+rejected packed-decode implementation. The GitHub-transfer artifact is
+[runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z-sanitized.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z-sanitized.tar.zst),
+asset id `488576890`, size `27,926,534` bytes, SHA256
+`38e715a12017b0771f8da38b2c80b7b4fbdab358c23a67f61ccba3ad77e67080`.
+It was downloaded and revalidated locally under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
+
+Neither `67921b1c` nor `a884f5d4` may repeat the old unpaired benchmark
+protocol. Because the profiling-path audit below invalidates the historical
+mean comparison used to reject `67921b1c`, one final bounded re-attribution of
+the already-built baseline and `67921b1c` binaries is allowed: correctness
+first, direct-path basic `A-B-B-A`, then profile-off `A-B-B-A` only if basic
+follows the binary in both reversed pairs. Any miss permanently rejects that
+candidate without another build or full sweep.
+
+If `67921b1c` is permanently rejected, a future GDN candidate must avoid both
+known failure modes: value-tile repeated Q/K normalization and a separate
+normalization launch. It must retain at most `9 compute + 0 transfer`, pass
+local numeric/ABI/graph contracts, predict replay below `6.195692 ms`, and
+then prove a same-session direct-path improvement rather than compare against
+a historical product mean.
+
+### 2026-07-24 vLLM Source Comparison And Measurement Amendment
+
+The current source comparison uses local vLLM commit
+`426d48bfa149582664d48f89df21ec9beae5c37b`. For Qwen3.5 non-speculative
+decode, vLLM runs `causal_conv1d_update` and then
+`fused_recurrent_gated_delta_rule_packed_decode`
+(`qwen_gdn_linear_attn.py:1206-1218,1564-1615`). Its Triton program uses grid
+`(NV, B * HV)` and reloads and normalizes Q/K inside every value tile
+(`third_party/flash_linear_attention/ops/fused_recurrent.py:282-315,448-475`).
+This deliberately accepts repeated normalization to avoid another launch.
+Accordingly, `67921b1c` was structurally closest to vLLM, while `a884f5d4`
+tested a Rust/CUDA-specific alternative and proved that a separate launch is
+worse. Ferrum must use this evidence to improve the trade-off, not copy either
+implementation blindly.
+
+The same review also corrected a profiling assumption. Current Ferrum maps
+`off -> DeviceTimingMode::Off`, `basic/debug -> Completion`, and
+`full -> Kernel`. The typed direct-program path is selected only outside
+`Kernel`; full kernel attribution explicitly falls back to complete logical
+provider encoding. Therefore:
+
+- `full` is authoritative for topology, graph-node composition, and device
+  replay deltas only when its reusable executable/graph fingerprints match the
+  paired direct path;
+- `full` host-stage timings and throughput are not product-path evidence;
+- `basic` is the bounded direct-path attribution lane, with fallback and epoch
+  miss required to remain `0`;
+- candidate triage uses same-instance, same-cache `A-B-B-A`; each reversed
+  adjacent pair must move in the predicted direction. Only after it passes may
+  profile-off `A-B-B-A` run;
+- formal G09 evidence remains the complete `ABBA-BAAB`, the unchanged
+  `76.1583 tok/s` floor, and the external/legacy ratio gates above.
+
+For a device candidate, structural KEEP alone is insufficient. It must also
+improve direct-path completion/device time or paired profile-off throughput.
+Comparing a 25-request candidate mean against a stale 300-request historical
+mean is no longer an acceptance method. The G06 execution-path fingerprint
+contract is a dependency of the next paid GDN run.
 
 ### M3 Qwen3-30B historical floors
 

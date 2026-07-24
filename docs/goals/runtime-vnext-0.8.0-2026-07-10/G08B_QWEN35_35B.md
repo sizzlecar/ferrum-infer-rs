@@ -816,6 +816,27 @@ Vast `45319871` is again `stopped/exited`; active or transitional siblings are
 bounded same-process attribution must separate provider-node encode cost from
 host-wide variance and name the next measurable source signal.
 
+### 2026-07-24 Same-Session Direct-Binding Attribution
+
+The bounded attribution subsequently ran both `f435bec9` and `8c58e3ea`
+binaries in `A-B-B-A` order on the same retained RTX 4090 and model cache.
+All 100 measured requests passed, all 4,440 waves used the typed direct
+program, and direct fallback and catalog-epoch miss remained `0`.
+
+Relative to `f435bec9`, the specialized binding source reduced aggregate
+provider-node encode from `1498.316 us` to `860.026 us` (`-42.60%`) and host
+encode/submit from `3598.252 us` to `2534.590 us` (`-29.56%`). Completion
+round trip was effectively unchanged (`7565.833 us` to `7495.563 us`), while
+diagnostic throughput followed the binary in both reversed pairs and moved
+from `47.0844` to `54.8719 tok/s`. The source is therefore retained:
+
+```text
+CUDA DIRECT BINDING AB ATTRIBUTION KEEP: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-ab-attribution-20260724T130106Z/diagnostic-summary.json
+```
+
+This resolves the earlier unpaired host-variance result; it does not satisfy
+G08B or the unchanged G09 `76.1583 tok/s` floor.
+
 ### 2026-07-24 Single-Token Packed-Decode Rejection
 
 Clean source `67921b1c55a093c43e5e6a4ea5f60c7916a962df` and CUDA binary
@@ -863,10 +884,48 @@ The locally verified evidence root is
 `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z/`.
 Vast `45319871` is `stopped/exited`; there is no paid sibling.
 
-No repeat benchmark is authorized. A successor must compute Q/K normalization
-once per key head instead of once per value-tile block, retain the indirect
-state and fence contracts, and prove numeric/ABI behavior locally before a
-new paid lane.
+No repeat benchmark is authorized. The initial successor hypothesis was to
+compute Q/K normalization once per key head in a separate dispatch; the next
+section records that this hypothesis has already been tested and rejected.
+
+### 2026-07-24 Separate-Normalization Packed-Decode Rejection
+
+Clean source `a884f5d44e9bb68542e2dfe67d8310fb2071f227`, binary SHA256
+`64e137337df0f120d7a4d415198a2d9a7a0921df4c34f3d8b7808fd6992bf357`,
+implemented decode conv-pack, a once-per-key-head Q/K normalization dispatch,
+and a prenormalized packed-delta kernel. The actual RTX 4090 CUDA parity test
+passed `1/1`, and actual-model `c03 run`, `c05 serve`, and `c06 streaming
+serve` passed `3/3` with zero request or quality error.
+
+The topology reached `10 compute / 0 transfer`, but mean physical replay over
+75 decode correlations was `6.221576 ms`: `0.025885 ms` or `0.4178%` slower
+than `67921b1c` at `6.195692 ms`. The predeclared structural stop condition
+therefore rejected the candidate before profile-off:
+
+```text
+CUDA NORMALIZED PACKED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commit `784d5bf2` reverted the source. The verified local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z/`;
+the GitHub archive has asset id `488576890`, size `27,926,534` bytes, and
+SHA256
+`38e715a12017b0771f8da38b2c80b7b4fbdab358c23a67f61ccba3ad77e67080`.
+Vast `45319871` is `stopped/exited` with no paid sibling.
+
+Current vLLM source `426d48bfa149582664d48f89df21ec9beae5c37b`
+uses `causal_conv1d_update` followed by packed recurrent delta. Its Triton grid
+is `(NV, B * HV)` and normalizes Q/K inside every value tile, deliberately
+trading repeated arithmetic for one fewer launch. Thus `67921b1c` was closest
+to vLLM; `a884f5d4` was a distinct Ferrum alternative, not a copied design.
+A future candidate must avoid both repeated per-value-tile normalization and
+the extra normalization dispatch, retain at most `9 compute / 0 transfer`,
+and prove direct-path performance with same-session paired evidence. G09 owns
+the detailed `full` versus `basic/off` measurement amendment. It permits one
+final bounded `A-B-B-A` re-attribution of the already-built baseline and
+`67921b1c` binaries because the original rejection compared different
+sessions and sample sizes; it does not permit rebuilding or repeating the old
+unpaired sweep.
 
 ## Metal Matrix Workflow
 
