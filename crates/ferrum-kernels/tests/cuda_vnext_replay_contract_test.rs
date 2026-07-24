@@ -81,3 +81,21 @@ fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
     assert!(GATED_DELTA_KERNEL_SOURCE
         .contains("recurrent_gated_delta_rule_varlen_tiled16_f32_indirect"));
 }
+
+#[test]
+fn recurrent_attention_uses_two_packed_input_projections() {
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("contiguous_bindings(11)"));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("shared.qkvz"));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("shared.ba"));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains(
+        "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect"
+    ));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("u64::from(participant_count) * 11"));
+    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains(
+        "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect"
+    ));
+    assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.qkv,"));
+    assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.z,"));
+    assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.a,"));
+    assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.b,"));
+}

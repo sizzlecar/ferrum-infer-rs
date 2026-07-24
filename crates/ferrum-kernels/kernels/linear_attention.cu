@@ -470,12 +470,13 @@ extern "C" __global__ void recurrent_conv_state_commit_f16_indirect(
   }
 }
 
-template <typename InputT, typename ParamT>
+template <typename InputT, typename ParamT, typename StateT = float,
+          typename ZT = float>
 static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const InputT* __restrict__ mixed_qkvz_raw,
     const InputT* __restrict__ ba_raw,
     const InputT* __restrict__ conv_weight,
-    const float* __restrict__ initial_conv_states,
+    const StateT* __restrict__ initial_conv_states,
     const ParamT* __restrict__ a_log,
     const ParamT* __restrict__ dt_bias,
     const unsigned int* __restrict__ cu_seqlens,
@@ -483,10 +484,10 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
-    float* __restrict__ z,
+    ZT* __restrict__ z,
     float* __restrict__ g,
     float* __restrict__ beta,
-    float* __restrict__ final_conv_states,
+    StateT* __restrict__ final_conv_states,
     const int batch,
     const int total_tokens,
     const int key_heads,
@@ -525,7 +526,9 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
                           ? ferrum_load_value(
                                 mixed_qkvz_raw,
                                 (token_start + source) * qkvz_width + channel)
-                          : initial_conv_states[state_base + state_len + source];
+                          : ferrum_load_value(
+                                initial_conv_states,
+                                state_base + state_len + source);
       acc += x *
              ferrum_load_value(conv_weight,
                                channel * conv_kernel + kernel_idx);
@@ -543,8 +546,10 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
   if (idx < z_total) {
     const int token = idx / value_total;
     const int offset = idx - token * value_total;
-    z[idx] = ferrum_load_value(
-        mixed_qkvz_raw, token * qkvz_width + conv_channels + offset);
+    ferrum_store_value(
+        z, idx,
+        ferrum_load_value(
+            mixed_qkvz_raw, token * qkvz_width + conv_channels + offset));
   }
 
   if (idx < gate_total) {
@@ -568,11 +573,13 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const int seq_tokens = token_end - token_start;
     const int source = seq_tokens + pos - state_len;
     const int state_base = seq * conv_state_len + channel * state_len;
-    final_conv_states[idx] =
+    const float final_value =
         source >= 0
             ? ferrum_load_value(mixed_qkvz_raw,
                                 (token_start + source) * qkvz_width + channel)
-            : initial_conv_states[state_base + state_len + source];
+            : ferrum_load_value(initial_conv_states,
+                                state_base + state_len + source);
+    ferrum_store_value(final_conv_states, idx, final_value);
   }
 }
 
@@ -660,6 +667,40 @@ extern "C" __global__ void linear_attention_prepare_varlen_packed_qkvz_ba_f16_pa
     const int value_dim,
     const int conv_kernel) {
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<__half, float>(
+      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, a_log, dt_bias,
+      cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
+}
+
+extern "C" __global__ void
+linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect(
+    const __half* __restrict__ mixed_qkvz_raw,
+    const __half* __restrict__ ba_raw,
+    const __half* __restrict__ conv_weight,
+    const unsigned long long* __restrict__ state_bindings,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    __half* __restrict__ z,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __half* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const __half* initial_conv_states =
+      reinterpret_cast<const __half*>(state_bindings[0]);
+  linear_attention_prepare_varlen_packed_qkvz_ba_impl<
+      __half, float, __half, __half>(
       mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, a_log, dt_bias,
       cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,

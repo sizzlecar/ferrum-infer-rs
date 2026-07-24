@@ -177,34 +177,58 @@ impl WeightComponentSource for SafetensorsArchive {
         };
 
         let [external_name] = component.external_names.as_slice() else {
-            if component.external_names.len() < 2
-                || component.dimensions.first().copied()
-                    != u64::try_from(component.external_names.len()).ok()
-            {
+            if component.external_names.len() < 2 {
                 return Err(VNextError::InvalidExecutionPlan {
                     reason: format!(
-                        "stacked component `{}` source count differs from its leading dimension",
+                        "multi-source component `{}` has fewer than two sources",
                         component.id
                     ),
                 });
             }
-            let source_dimensions = &component.dimensions[1..];
+            let tensors = component
+                .external_names
+                .iter()
+                .map(|external_name| {
+                    self.tensor(external_name)
+                        .map_err(|error| VNextError::InvalidExecutionPlan {
+                            reason: error.to_string(),
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, VNextError>>()?;
+            let stacked = component.dimensions.first().copied()
+                == u64::try_from(component.external_names.len()).ok()
+                && tensors
+                    .iter()
+                    .all(|tensor| tensor.shape() == &component.dimensions[1..]);
+            let row_concatenated = !component.dimensions.is_empty()
+                && tensors.iter().all(|tensor| {
+                    tensor.shape().len() == component.dimensions.len()
+                        && tensor.shape()[1..] == component.dimensions[1..]
+                })
+                && tensors.iter().try_fold(0_u64, |rows, tensor| {
+                    u64::try_from(tensor.shape()[0])
+                        .ok()
+                        .and_then(|source_rows| rows.checked_add(source_rows))
+                }) == component.dimensions.first().copied();
+            if !stacked && !row_concatenated {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: format!(
+                        "multi-source component `{}` is neither an exact stack nor an axis-0 concatenation",
+                        component.id
+                    ),
+                });
+            }
             let mut source_files = Vec::with_capacity(component.external_names.len());
             let mut bytes =
                 Vec::with_capacity(usize::try_from(component.physical_bytes()?).map_err(|_| {
                     VNextError::InvalidExecutionPlan {
                         reason: format!(
-                            "stacked component `{}` exceeds host address space",
+                            "multi-source component `{}` exceeds host address space",
                             component.id
                         ),
                     }
                 })?);
-            for external_name in &component.external_names {
-                let tensor = self.tensor(external_name).map_err(|error| {
-                    VNextError::InvalidExecutionPlan {
-                        reason: error.to_string(),
-                    }
-                })?;
+            for (external_name, tensor) in component.external_names.iter().zip(tensors) {
                 let actual_element_type = element_type(tensor.dtype()).ok_or_else(|| {
                     VNextError::InvalidExecutionPlan {
                         reason: format!(
@@ -213,14 +237,6 @@ impl WeightComponentSource for SafetensorsArchive {
                         ),
                     }
                 })?;
-                if tensor.shape() != source_dimensions {
-                    return Err(VNextError::InvalidExecutionPlan {
-                        reason: format!(
-                            "tensor {external_name:?} shape differs from stacked component `{}` partition shape",
-                            component.id
-                        ),
-                    });
-                }
                 let materialized = transcode_dense_bytes(
                     tensor.bytes(),
                     actual_element_type,

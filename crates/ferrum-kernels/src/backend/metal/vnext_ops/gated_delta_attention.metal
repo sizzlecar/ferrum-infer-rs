@@ -20,6 +20,8 @@ struct GatedDeltaParams {
     uint value_dim;
     uint qkv_features;
     uint value_features;
+    uint qkvz_features;
+    uint ba_features;
     uint conv_kernel;
     float epsilon;
     float scale;
@@ -36,26 +38,32 @@ static inline float ferrum_softplus(float value) {
 }
 
 kernel void vnext_gated_delta_prepare_conv_f16(
-    device const half * mixed_qkv [[buffer(0)]],
+    device const half * mixed_qkvz [[buffer(0)]],
     device const half * conv_weight [[buffer(1)]],
     device const half * initial_state [[buffer(2)]],
     device float * query [[buffer(3)]],
     device float * key [[buffer(4)]],
     device float * value [[buffer(5)]],
-    constant GatedDeltaParams & params [[buffer(6)]],
+    device half * z [[buffer(6)]],
+    constant GatedDeltaParams & params [[buffer(7)]],
     uint index [[thread_position_in_grid]]) {
-    const uint total = params.tokens * params.qkv_features;
+    const uint total = params.tokens * params.qkvz_features;
     if (index >= total) {
         return;
     }
-    const uint token = index / params.qkv_features;
-    const uint channel = index - token * params.qkv_features;
+    const uint token = index / params.qkvz_features;
+    const uint channel = index - token * params.qkvz_features;
+    if (channel >= params.qkv_features) {
+        z[ulong(token) * params.value_features + channel - params.qkv_features] =
+            mixed_qkvz[index];
+        return;
+    }
     const uint state_width = params.conv_kernel - 1;
     float sum = 0.0f;
     for (uint kernel_index = 0; kernel_index < params.conv_kernel; ++kernel_index) {
         const int source = int(token) + int(kernel_index) - int(state_width);
         const float activation = source >= 0
-            ? float(mixed_qkv[ulong(source) * params.qkv_features + channel])
+            ? float(mixed_qkvz[ulong(source) * params.qkvz_features + channel])
             : float(initial_state[ulong(channel) * state_width + uint(int(state_width) + source)]);
         sum += activation
             * float(conv_weight[ulong(channel) * params.conv_kernel + kernel_index]);
@@ -72,21 +80,22 @@ kernel void vnext_gated_delta_prepare_conv_f16(
 }
 
 kernel void vnext_gated_delta_prepare_gates_f16(
-    device const half * a_raw [[buffer(0)]],
-    device const half * b_raw [[buffer(1)]],
-    device const float * a_log [[buffer(2)]],
-    device const float * dt_bias [[buffer(3)]],
-    device float * g [[buffer(4)]],
-    device float * beta [[buffer(5)]],
-    constant GatedDeltaParams & params [[buffer(6)]],
+    device const half * ba_raw [[buffer(0)]],
+    device const float * a_log [[buffer(1)]],
+    device const float * dt_bias [[buffer(2)]],
+    device float * g [[buffer(3)]],
+    device float * beta [[buffer(4)]],
+    constant GatedDeltaParams & params [[buffer(5)]],
     uint index [[thread_position_in_grid]]) {
     const uint total = params.tokens * params.value_heads;
     if (index >= total) {
         return;
     }
+    const uint token = index / params.value_heads;
     const uint head = index % params.value_heads;
-    const float a = float(a_raw[index]) + dt_bias[head];
-    const float b = float(b_raw[index]);
+    const ulong base = ulong(token) * params.ba_features;
+    const float b = float(ba_raw[base + head]);
+    const float a = float(ba_raw[base + params.value_heads + head]) + dt_bias[head];
     const float decay_rate = params.decay_parameterization == 0
         ? -exp(a_log[head])
         : a_log[head];
@@ -95,7 +104,7 @@ kernel void vnext_gated_delta_prepare_gates_f16(
 }
 
 kernel void vnext_gated_delta_collect_conv_state_f16(
-    device const half * mixed_qkv [[buffer(0)]],
+    device const half * mixed_qkvz [[buffer(0)]],
     device const half * initial_state [[buffer(1)]],
     device half * final_state [[buffer(2)]],
     constant GatedDeltaParams & params [[buffer(3)]],
@@ -109,7 +118,7 @@ kernel void vnext_gated_delta_collect_conv_state_f16(
     const uint position = index - channel * state_width;
     const int source = int(params.tokens) + int(position) - int(state_width);
     final_state[index] = source >= 0
-        ? mixed_qkv[ulong(source) * params.qkv_features + channel]
+        ? mixed_qkvz[ulong(source) * params.qkvz_features + channel]
         : initial_state[ulong(channel) * state_width + uint(int(state_width) + source)];
 }
 
