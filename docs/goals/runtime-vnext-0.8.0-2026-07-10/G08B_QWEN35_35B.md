@@ -689,6 +689,52 @@ The archive and bound binary were revalidated locally under
 `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/`.
 Vast instance `45319871` is confirmed `stopped/exited`; no paid sibling remains.
 
+### 2026-07-24 Single-Token MoE Direct-Alignment Checkpoint
+
+Clean source `992153a4de14bee734c97f54d2b78b754d7737f7` and CUDA binary
+SHA256
+`393f377659560db9c5df564bf544fbf7d435780059c2fb71fbfbe1e797d1ae1a`
+passed the focused actual-model product paths:
+
+- `c03-001`: resident multi-turn `ferrum run`;
+- `c05-001`: non-streaming OpenAI-compatible `ferrum serve`;
+- `c06-001`: streaming `ferrum serve`;
+- result: `3/3 pass`, zero positive blocker-log match, and zero structured
+  request-quality issue.
+
+The typed `SingleTokenDirectMarlin` plan fuses route output and Marlin
+alignment metadata only for decode. Across 75 decode correlations, all 3,000
+single-token MoE node observations moved from `12` to `11` physical compute
+dispatches, while prefill remained at `12`. Mean replay time improved from
+`6.888088 ms` to `6.233041 ms` (`9.51%`).
+
+The canonical profile-off c1 random `64/32`, `100 x 3`, ten-warmup, seed
+`9271` workload completed `300/300` with usage token counts and zero errors.
+Its `47.547946 +/- 6.296316 tok/s` mean did not exceed the prior
+`50.079974 tok/s` candidate and remains `37.57%` below the formal floor.
+Consequently this is a structural optimization checkpoint, not G08B or G09
+performance PASS:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/focused-c03-c05-c06-report.json
+CUDA MOE DIRECT ALIGN STRUCTURAL KEEP: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/diagnostic-summary.json
+CUDA MOE DIRECT ALIGN CANONICAL PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/diagnostic-summary.json
+```
+
+The complete GitHub asset is
+[runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z.tar.zst),
+asset id `488260567`, size `29,911,858` bytes, SHA256
+`0550e682170a20bed55a53627ac879c98cd2a522d1d1f8dc3f115cd02fc51eff`.
+The local copy and checksum are under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`; no paid sibling remains.
+
+The local workspace all-target source gate is not claimed: after compiling, two
+pre-existing CLI E2E cases were intercepted by the host proxy and received a
+Hugging Face `404` instead of their expected local missing-model message.
+Targeted kernel contracts and the real CUDA product paths above passed, but
+they do not replace the full unit PASS line.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

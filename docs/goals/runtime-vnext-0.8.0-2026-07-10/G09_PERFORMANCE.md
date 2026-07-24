@@ -555,6 +555,76 @@ change before another paid run. The retained `330` dispatch count, `6.888088 ms`
 replay time, product `3/3`, and zero-error profile-off result become no-regression
 requirements for that candidate.
 
+### 2026-07-24 Single-Token MoE Direct-Alignment Result
+
+Clean source `992153a4de14bee734c97f54d2b78b754d7737f7` replaces the
+single-token Qwen3.5 MoE route-plus-generic-align sequence with one typed
+`SingleTokenDirectMarlin` plan. The CUDA router writes the stable
+expert/token/block metadata required by Marlin directly; multi-token prefill
+continues to use the generic alignment path. The bound one-RTX-4090 binary
+SHA256 is
+`393f377659560db9c5df564bf544fbf7d435780059c2fb71fbfbe1e797d1ae1a`.
+
+Correctness ran before performance:
+
+- the focused replay source contract passed `8/8` and the kernel library tests
+  passed `17/17`;
+- actual Qwen3.5-35B `c03-001 ferrum run`, `c05-001 ferrum serve`, and
+  `c06-001` streaming serve passed `3/3`;
+- the focused runner printed
+  `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`;
+- positive blocker-log matches and structured request-quality issues were both
+  `0`.
+
+The full-profile structural result exactly matched the predeclared prediction.
+Across 75 decode correlations and 3,000 MoE node observations, the old
+`cefb4de2` candidate used `12` physical compute dispatches per single-token MoE
+node; `992153a4` uses `11`. Multi-token prefill remains at `12`, so the change
+did not broaden into the generic route. Mean replay device time moved from
+`6.888088 ms` to `6.233041 ms`, a reduction of `0.655048 ms` or `9.51%`.
+This agrees with the prior Nsight attribution of about `0.679 ms/token` to
+`moe_align_block_size_pair_ids_f32`.
+
+The canonical profile-off c1 workload remained random `64/32`, 100 measured
+requests plus ten warmups per repeat, three repeats, seed `9271`,
+`--fail-on-error --require-ci`, and usage-derived token counts. It completed
+`300/300` with zero request or quality error. Repeat throughput was
+`45.7588 / 46.4369 / 50.4481 tok/s`, with mean
+`47.5479 +/- 6.2963 tok/s`. This is `2.5320 tok/s` (`5.06%`) below the
+`cefb4de2` mean; the two three-repeat confidence intervals overlap, so this run
+does not prove an end-to-end regression or improvement. It remains
+`28.6104 tok/s` (`37.57%`) below the unchanged `76.1583 tok/s` formal floor.
+
+The decision therefore separates the deterministic structural evidence from
+the noisy product metric:
+
+```text
+CUDA MOE DIRECT ALIGN STRUCTURAL KEEP: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/diagnostic-summary.json
+CUDA MOE DIRECT ALIGN CANONICAL PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/diagnostic-summary.json
+```
+
+The complete GitHub-transfer archive is
+[runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z.tar.zst),
+asset id `488260567`, size `29,911,858` bytes, SHA256
+`0550e682170a20bed55a53627ac879c98cd2a522d1d1f8dc3f115cd02fc51eff`.
+It was range-resumed after an interrupted download and revalidated locally at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
+
+The workspace all-target test compiled and then encountered two existing
+network-sensitive CLI E2E failures: the inherited host proxy returned a
+Hugging Face `404 Repository not found` before the tests could observe their
+expected local missing-model message. Therefore this checkpoint does not claim
+the unit source-gate PASS line.
+
+No repeat of `992153a4` or G09 full sweep is authorized. Offline work must now
+rank the post-fusion projection/GEMV, recurrent kernel, Marlin, and
+shared-versus-routed scheduling costs against current source and the vLLM
+baseline. Another paid run requires one falsifiable lever, a named device-time
+or trace-shape delta, and a reject threshold; the current `11` MoE dispatches,
+`6.233041 ms` replay time, product `3/3`, and zero-error c1 result are the new
+structural no-regression requirements.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
