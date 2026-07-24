@@ -148,14 +148,12 @@ fn recurrent_single_token_decode_fuses_conv_and_qk_norm_per_key_head() {
     ));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE
         .contains("__half* conv_state =\n      reinterpret_cast<__half*>(state_bindings[0])"));
-    assert!(
-        LINEAR_ATTENTION_KERNEL_SOURCE.contains("const int worker = static_cast<int>(blockIdx.x)")
-    );
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("if (worker >= key_heads)"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("const int value_head = worker - key_heads"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("const int key_head = worker"));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE
-        .contains("linear_attention_decode_conv_update_f16_state_f16("));
+        .contains("const int key_head = static_cast<int>(blockIdx.x)"));
+    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
+        .contains("const int repeat_factor = value_heads / key_heads"));
+    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
+        .contains("const int owned_conv_channels = 2 * key_dim + owned_value_features"));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("__shared__ float q_reduce[1024]"));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("__shared__ float k_reduce[1024]"));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("mixed_qkv[key_head * key_dim + d] *= q_inv"));
@@ -198,7 +196,6 @@ fn recurrent_single_token_decode_fuses_conv_and_qk_norm_per_key_head() {
     assert!(!decode_branch.contains("Qwen"));
     assert!(!decode_branch.contains("4090"));
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("fn packed_decode_key_pointer("));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains(".checked_add(shape.value_heads)"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains(".min(1024)"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains(".next_power_of_two()"));
 
