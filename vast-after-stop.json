@@ -1,0 +1,14 @@
+{
+  "id": 45319871,
+  "label": "ferrum-vnext-s1-telemetry-eaf76778",
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "num_gpus": 1,
+  "gpu_name": "RTX 4090",
+  "dph_total": 0.46944444444444444,
+  "ssh_host": "ssh2.vast.ai",
+  "ssh_port": 39870,
+  "public_ipaddr": "81.167.235.66",
+  "disk_space": 150.0,
+  "start_date": 1784478745.5514355
+}
