@@ -625,6 +625,43 @@ or trace-shape delta, and a reject threshold; the current `11` MoE dispatches,
 `6.233041 ms` replay time, product `3/3`, and zero-error c1 result are the new
 structural no-regression requirements.
 
+### 2026-07-24 Typed Direct-Program And Binding-Only Results
+
+Clean source `f435bec9498d51e77c0e08b71ea29016f3eb74ed` moved cache hits onto
+the exact typed CUDA direct-program path. Qwen3.5-35B `c03/c05/c06` passed
+`3/3`; the canonical c1 run completed `300/300` requests at
+`59.887970 +/- 17.927647 tok/s`. Health evidence reported `12,210` direct
+waves, `32,010` direct segments, `468,600` binding-node applications, and zero
+direct fallback or catalog-epoch miss. This is the best current-path mean in
+the immediate sequence of CUDA direct-program candidates, but it remains
+`16.270330 tok/s` (`21.36%`) below the unchanged `76.1583 tok/s` floor and
+therefore does not satisfy G09.
+
+Clean follow-up `8c58e3ea0017c85865c5b5f56d0b02e94f36063a` installed specialized
+binding-only encoders for recurrent and causal attention. It retained the same
+direct counts and again passed `c03/c05/c06` `3/3`, but the same c1 command
+produced only `50.272873 +/- 3.385823 tok/s`. The predeclared
+`host_encode_submit <2.319187 ms` signal also missed at `3.076369 ms`.
+Resource preparation and host postprocess regressed by similar proportions,
+while completion changed only from `7.482255 ms` to `7.628776 ms`; the run is
+classified as
+`profile-off-host-wide-latency-regression-with-specialized-binding-coverage`.
+It cannot prove that the simpler binding source path caused or fixed the
+end-to-end delta.
+
+The immutable local evidence roots are:
+
+- `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-direct-program-cuda-f435bec9-20260724T115319Z-gated/`
+- `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-only-cuda-8c58e3ea-20260724T122544Z/`
+
+The latter contains `diagnostic-summary.json` with the paired stage metrics,
+binary SHA256, clean source SHA, correctness KEEP line, command evidence, and
+stopped-instance receipt. Both source checkpoints remain below the absolute
+floor, so no repeat c1 or full sweep is authorized. The next paid diagnostic
+requires existing full-profile or bounded same-process attribution to isolate
+`provider_node_encode` from host-wide variance, followed by one source-level
+hypothesis with a named stage delta.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

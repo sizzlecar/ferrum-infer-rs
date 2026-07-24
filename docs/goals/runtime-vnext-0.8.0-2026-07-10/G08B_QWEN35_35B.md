@@ -735,6 +735,87 @@ Hugging Face `404` instead of their expected local missing-model message.
 Targeted kernel contracts and the real CUDA product paths above passed, but
 they do not replace the full unit PASS line.
 
+### 2026-07-24 Typed Direct-Program Checkpoint
+
+Clean source `f435bec9498d51e77c0e08b71ea29016f3eb74ed` replaced the cache-hit
+path's per-node provider encode with an exact typed CUDA program reference and
+per-wave binding patches. The release-feature build printed its required READY
+line; the bound binary SHA256 is
+`ebc70b8ee0cd55d448db3f3585e45211d350c837476514f77a67b5f813680377`.
+The same binary passed `c03-001`, `c05-001`, and `c06-001` (`3/3`) before
+performance.
+
+Post-request health evidence proves that this is the production path, not a
+source-only abstraction:
+
+- `12,210` direct waves and `32,010` direct segments;
+- `1,946,010` logical nodes covered by direct programs;
+- `468,600` typed binding-node applications;
+- direct fallback and catalog-epoch miss counts both `0`;
+- `330` catalog misses remained on non-prepared shapes and used the normal full
+  encode path without retrying a possibly-submitted wave.
+
+Canonical profile-off c1 random `64/32`, `100 x 3`, ten warmups, seed `9271`
+completed `300/300` measured requests with usage token counts and zero errors.
+Throughput was `59.887970 +/- 17.927647 tok/s`, `25.95%` above the
+`992153a4` mean, but still `16.270330 tok/s` (`21.36%`) below the unchanged
+`76.1583 tok/s` floor. Decode timing localized the remaining wall time to
+`2.319187 ms` host encode/submit, `7.482255 ms` completion round trip, and
+`10.524822 ms` submitted-wave total. The structural direct-program change is
+kept; this artifact is not G08B or G09 performance PASS.
+
+The local evidence root is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-direct-program-cuda-f435bec9-20260724T115319Z-gated/`.
+The large rebuildable binary remains on retained Vast instance `45319871`;
+only the build receipt, command lines, correctness cases, health snapshots,
+benchmark report, and logs were copied through SSH. The instance was stopped
+to `actual_status=exited`, with no paid sibling.
+
+### 2026-07-24 Specialized Binding-Only Result
+
+Clean follow-up `8c58e3ea0017c85865c5b5f56d0b02e94f36063a` makes the CUDA recurrent
+and causal attention providers override the binding-only contract. Recurrent
+attention now materializes only live convolution/delta-state addresses; causal
+attention materializes only the current KV page table and sequence frontier.
+Static weights, scratch, launch topology, replay keys, and compute closures are
+not rebuilt by those direct helpers. The source contract first failed, then
+passed after both overrides were installed; all nine CUDA replay source
+contracts passed. The release-feature build printed READY with binary SHA256
+`997ec95a9d864e2dbb588f42c5e0993e947d5dfbba3053c8868107128b406b36`.
+
+Actual-model correctness again passed `c03-001`, `c05-001`, and `c06-001`
+(`3/3`). Direct coverage was unchanged at `12,210` waves, `32,010` segments,
+and `468,600` binding-node applications, with direct fallback and epoch miss
+counts both `0`.
+
+The predeclared performance signal did not hold. The same profile-off command
+completed `300/300` requests but produced
+`50.272873 +/- 3.385823 tok/s`, `9.615097 tok/s` below the preceding mean and
+`25.885427 tok/s` (`33.99%`) below the formal floor. The host boundaries moved
+together rather than isolating the provider change:
+
+| decode boundary | `f435bec9` | `8c58e3ea` |
+|---|---:|---:|
+| resource prepare | `1.607868 ms` | `2.435552 ms` |
+| host encode/submit | `2.319187 ms` | `3.076369 ms` |
+| completion round trip | `7.482255 ms` | `7.628776 ms` |
+| host postprocess | `0.721329 ms` | `1.137567 ms` |
+| submitted wave total | `10.524822 ms` | `11.845352 ms` |
+
+Because resource preparation and postprocess regressed alongside encode/submit
+while completion remained close, this profile-off run cannot attribute the
+change to binding-only encoding. Its exact failure class is
+`profile-off-host-wide-latency-regression-with-specialized-binding-coverage`.
+The source remains a correctness-preserving architectural cleanup, but this
+paid result is performance REJECT and authorizes no repeat benchmark.
+
+The diagnostic summary is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-only-cuda-8c58e3ea-20260724T122544Z/diagnostic-summary.json`.
+Vast `45319871` is again `stopped/exited`; active or transitional siblings are
+`0`. Before another paid run, existing full-profile stage boundaries or a
+bounded same-process attribution must separate provider-node encode cost from
+host-wide variance and name the next measurable source signal.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
