@@ -971,6 +971,77 @@ gain is `STRUCTURAL_KEEP_PERFORMANCE_REJECT`. Either result stops the paid
 lane after artifacts are copied back. No full sweep is authorized by this
 source slice.
 
+### 2026-07-25 Compiled Wave Identity CUDA Decision
+
+Clean source `790f29ce699460e08eb9c2f90476810c52ce1eee` was built on the retained
+single RTX 4090 in `5m09s`. The adjacent baseline and candidate binary
+SHA256 values were respectively
+`ac6179f2765a98fa9fb89fc1207b525baac8272a8f5b31853ded25a8dbff20ab`
+and
+`dcfde7bc7a4f3a7d5c3a1d34a8c048ac38bd5230cdab6904b45196e0442895e8`.
+Actual-model `run`, non-streaming `serve`, and streaming `serve` passed
+`3/3` with zero errors. Their health snapshot reported zero direct
+fallback, catalog miss, and catalog-epoch miss.
+
+The Basic `A-B-B-A` result was:
+
+| metric | baseline mean | candidate mean | candidate delta |
+|---|---:|---:|---:|
+| output throughput | `48.8984 tok/s` | `52.5072 tok/s` | `+7.38%` |
+| `wave_identity_bind` | `1.693364 ms` | `0.032536 ms` | `0.0192x` |
+| identity + provider encode | `2.763606 ms` | `1.604235 ms` | `-1.159371 ms` |
+| device submit | `0.359569 ms` | `0.365174 ms` | `+1.56%` |
+| completion round trip | `7.453175 ms` | `7.497199 ms` | `+0.59%` |
+
+Both reversed identity pairs followed the binary. Candidate node
+materialization was `51,510 / 185,820 = 27.7204%` in each slot and full
+participant materialization was `0`. Provider-node encode increased because
+the nodes that are actually required now materialize at the first real
+consumer; the combined identity-plus-provider interval still fell by
+`1.159371 ms/wave`. Each Basic slot recorded `30` initial shape catalog
+population misses on both binaries, with zero direct fallback and zero epoch
+miss. The predeclared zero-miss product correctness check remained `0/0/0`;
+the symmetric Basic population count is preserved in the artifact rather
+than being hidden.
+
+Only after those checks passed, typed product config `--profile-detail off`
+ran the second `A-B-B-A`:
+
+| slot | binary | throughput |
+|---|---|---:|
+| A1 | baseline | `48.5239 tok/s` |
+| B1 | candidate | `56.5147 tok/s` |
+| B2 | candidate | `54.0715 tok/s` |
+| A2 | baseline | `49.7432 tok/s` |
+
+The baseline and candidate means were `49.1335` and `55.2931 tok/s`,
+respectively: `+12.54%`. The two reversed pairs were `+16.47%` and
+`+8.70%`; profile-off outer host encode/submit fell `40.23%`, while
+completion improved `1.12%`. All `100` measured Basic requests and all
+`100` measured profile-off requests completed without request or quality
+error and used usage-derived output token counts.
+
+The bounded decision is `KEEP_COMPILED_WAVE_IDENTITY`, and its validator
+printed:
+
+```text
+CUDA COMPILED WAVE IDENTITY BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-compiled-identity-cuda-790f29ce-20260724T210959Z
+```
+
+The local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-compiled-identity-cuda-790f29ce-20260724T210959Z/`.
+GitHub artifact branch
+`artifact/runtime-vnext-compiled-identity-790f29ce-20260725` is at cleanup
+commit `38c58b3b3acf312942600efaac2b1f68ae91bb90`. Vast instance `45319871`
+is verified `stopped/exited`, with no billable or transitional sibling.
+
+This is bounded G09 development progress, not formal G09 completion. The
+candidate mean is still `4.5949 tok/s` below the best prior Ferrum point and
+`20.8652 tok/s` below the unchanged `76.1583 tok/s` floor, reaching only
+`72.60%` of that floor. No concurrency sweep or formal `n_repeats=3`
+comparison ran. The next performance work must use these artifacts to name
+one remaining completion/resource bottleneck before another paid run.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
