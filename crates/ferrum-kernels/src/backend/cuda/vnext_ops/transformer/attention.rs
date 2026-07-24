@@ -645,6 +645,7 @@ fn encode_attention(
         }
         validate_signature(participant, shape)?;
     }
+    let program_binding = invocation.program_binding().cloned();
 
     let total_tokens = invocation.work_shape().immediate_tokens();
     let layout = ScratchLayout::new(shape, total_tokens)?;
@@ -812,20 +813,49 @@ fn encode_attention(
     }
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
-    let binding_command = CudaDeviceCommand::operation_with_host_storage_and_blas(
-        "vnext_gated_delta_recurrent_attention_bindings",
-        binding_regions,
-        binding_host_storage,
-        move |stream, _blas, regions, host_storage| {
-            enqueue_state_bindings(
-                stream,
-                binding_layout,
-                &state_bindings,
-                regions,
-                host_storage,
-            )
-        },
-    )
+    let binding_command = if let Some(program_binding) = program_binding {
+        let mut regions = binding_regions.into_iter();
+        let destination = regions
+            .next()
+            .ok_or_else(|| "CUDA recurrent binding destination is missing".to_owned())?;
+        let fence_dependencies = regions.collect::<Vec<_>>();
+        let mut writes = Vec::with_capacity(state_bindings.len());
+        for (index, (state_binding, payload)) in state_bindings
+            .into_iter()
+            .zip(binding_host_storage)
+            .enumerate()
+        {
+            if state_binding.host_binding != index {
+                return Err("CUDA recurrent binding payload order is not canonical".to_owned());
+            }
+            writes.push(
+                super::CudaProgramBindingWrite::new(state_binding.binding_offset, payload)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        CudaDeviceCommand::program_binding_patch(
+            "vnext_gated_delta_recurrent_attention_bindings",
+            program_binding,
+            destination,
+            writes,
+            fence_dependencies,
+        )
+    } else {
+        CudaDeviceCommand::operation_with_host_storage_and_blas(
+            "vnext_gated_delta_recurrent_attention_bindings",
+            binding_regions,
+            binding_host_storage,
+            move |stream, _blas, regions, host_storage| {
+                enqueue_state_bindings(
+                    stream,
+                    binding_layout,
+                    &state_bindings,
+                    regions,
+                    host_storage,
+                )
+            },
+        )
+    }
     .and_then(|command| {
         command.with_work_attribution(
             DeviceBatchingForm::ParticipantLoop,

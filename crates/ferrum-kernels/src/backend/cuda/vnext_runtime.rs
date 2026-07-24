@@ -26,7 +26,7 @@ use ferrum_interfaces::vnext::{
     DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
     DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, HostTransferLayout, StreamState, VNextError,
+    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, StreamState, VNextError,
 };
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
@@ -261,6 +261,35 @@ pub(crate) struct CudaCommandExecutable {
     enqueue: Mutex<EnqueueAction>,
 }
 
+pub(crate) struct CudaProgramBindingWrite {
+    destination_offset_bytes: u64,
+    payload: Box<[u8]>,
+}
+
+impl CudaProgramBindingWrite {
+    pub(crate) fn new(
+        destination_offset_bytes: u64,
+        payload: Box<[u8]>,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if payload.is_empty() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA program binding write payload is empty",
+            ));
+        }
+        Ok(Self {
+            destination_offset_bytes,
+            payload,
+        })
+    }
+}
+
+struct CudaProgramBindingPatch {
+    binding: ProgramBindingNodeBinding,
+    destination: CudaBufferRegion,
+    writes: Vec<CudaProgramBindingWrite>,
+    fence_dependencies: Vec<CudaBufferRegion>,
+}
+
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
 /// returned fence reaches a terminal state.
 pub struct CudaDeviceCommand {
@@ -275,6 +304,7 @@ pub struct CudaDeviceCommand {
     fence_dependencies: Vec<CudaBufferRegion>,
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
+    program_binding_patch: Option<CudaProgramBindingPatch>,
 }
 
 impl fmt::Debug for CudaDeviceCommand {
@@ -295,6 +325,10 @@ impl fmt::Debug for CudaDeviceCommand {
             )
             .field("fence_dependency_count", &self.fence_dependencies.len())
             .field("replayable", &self.replay_key.is_some())
+            .field(
+                "typed_program_binding_patch",
+                &self.program_binding_patch.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -521,6 +555,7 @@ impl CudaDeviceCommand {
             fence_dependencies,
             replay_key,
             reusable_address_scope,
+            program_binding_patch: None,
         })
     }
 
@@ -559,6 +594,7 @@ impl CudaDeviceCommand {
             fence_dependencies,
             replay_key,
             reusable_address_scope,
+            program_binding_patch: None,
         })
     }
 
@@ -586,7 +622,78 @@ impl CudaDeviceCommand {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            program_binding_patch: None,
         }
+    }
+
+    pub(crate) fn program_binding_patch(
+        operation: &'static str,
+        binding: ProgramBindingNodeBinding,
+        destination: CudaBufferRegion,
+        mut writes: Vec<CudaProgramBindingWrite>,
+        fence_dependencies: Vec<CudaBufferRegion>,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let runtime_instance = destination.runtime_instance;
+        validate_fence_dependencies(runtime_instance, &fence_dependencies)?;
+        let slot = binding.slot();
+        if destination.element_type != ElementType::U8
+            || destination.length_bytes == 0
+            || destination.length_bytes > slot.capacity_size_bytes()
+            || writes.is_empty()
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA program binding destination differs from its compiled slot",
+            ));
+        }
+        writes.sort_by_key(|write| write.destination_offset_bytes);
+        let mut prior_end = 0_u64;
+        for write in &writes {
+            let payload_bytes = u64::try_from(write.payload.len()).map_err(|_| {
+                CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
+            })?;
+            let end = write
+                .destination_offset_bytes
+                .checked_add(payload_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA program binding write range overflows u64",
+                    )
+                })?;
+            if write.destination_offset_bytes < prior_end || end > destination.length_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA program binding writes overlap or exceed the logical slot",
+                ));
+            }
+            prior_end = end;
+        }
+        let executable = Arc::new(CudaCommandExecutable {
+            regions: Vec::new(),
+            host_storage: Vec::new(),
+            enqueue: Mutex::new(Box::new(|_, _, _, _| {
+                Err(CudaDeviceRuntimeError::contract(
+                    "uncoalesced CUDA program binding patch cannot enqueue",
+                ))
+            })),
+        });
+        Ok(Self {
+            runtime_instance,
+            operation,
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_count: 0,
+            token_count: 0,
+            compute_dispatch_count: 0,
+            transfer_command_count: 0,
+            executable,
+            fence_dependencies: Vec::new(),
+            replay_key: None,
+            reusable_address_scope: None,
+            program_binding_patch: Some(CudaProgramBindingPatch {
+                binding,
+                destination,
+                writes,
+                fence_dependencies,
+            }),
+        })
     }
 
     pub(crate) fn with_work_attribution(
@@ -611,11 +718,207 @@ impl CudaDeviceCommand {
     }
 
     fn coalesced_program_bindings(
-        commands: Vec<Self>,
+        mut commands: Vec<Self>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
-        if commands.len() <= 1 {
+        if commands.is_empty() {
             return Ok(commands);
         }
+        let typed_patch_count = commands
+            .iter()
+            .filter(|command| command.program_binding_patch.is_some())
+            .count();
+        if typed_patch_count == 0 {
+            if commands.len() == 1 {
+                return Ok(commands);
+            }
+            return Self::coalesced_opaque_program_bindings(commands);
+        }
+        if typed_patch_count != commands.len() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA program binding prelude mixes typed and opaque patches",
+            ));
+        }
+
+        let runtime_instance = commands[0].runtime_instance;
+        let participant_count = commands[0].participant_count;
+        let token_count = commands[0].token_count;
+        if participant_count == 0
+            || commands.iter().any(|command| {
+                command.runtime_instance != runtime_instance
+                    || command.participant_count != participant_count
+                    || command.token_count != token_count
+                    || command.compute_dispatch_count != 0
+                    || command.transfer_command_count == 0
+                    || command.replay_key.is_some()
+                    || command.reusable_address_scope.is_some()
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA typed program bindings are not one compatible prelude",
+            ));
+        }
+
+        let mut patches = commands
+            .iter_mut()
+            .map(|command| {
+                command.program_binding_patch.take().ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA typed program binding patch disappeared during coalescing",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        patches.sort_by_key(|patch| patch.binding.node_index());
+        let first = patches.first().expect("non-empty typed patch set");
+        let layout = first.binding.layout();
+        let lane_slot = first.binding.lane_slot_identity();
+        let plan_hash = first.binding.plan_hash();
+        if patches.len() != layout.slots().len()
+            || patches.iter().zip(layout.slots()).any(|(patch, slot)| {
+                patch.binding.node_index() != slot.node_index()
+                    || patch.binding.plan_hash() != plan_hash
+                    || patch.binding.layout().fingerprint() != layout.fingerprint()
+                    || patch.binding.lane_slot_identity() != lane_slot
+                    || patch.binding.slot() != slot
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA typed program bindings do not cover one compiled layout exactly",
+            ));
+        }
+
+        let layout_physical_size_bytes = layout.physical_size_bytes();
+        let patch_bytes = checked_usize(
+            layout_physical_size_bytes,
+            "CUDA aggregate program binding patch size",
+        )?;
+        let mut host_patch = vec![0_u8; patch_bytes];
+        let first_destination = first.destination.clone();
+        let first_slot_offset_bytes = first.binding.slot().physical_offset_bytes();
+        let arena_device_ptr = first_destination
+            .device_ptr
+            .checked_sub(first_slot_offset_bytes)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA program binding arena base pointer underflows",
+                )
+            })?;
+        let allocation_end = first_destination
+            ._allocation
+            .aligned_ptr
+            .checked_add(first_destination._allocation.requested_bytes)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("CUDA program binding allocation end overflows")
+            })?;
+        let arena_end = arena_device_ptr
+            .checked_add(layout_physical_size_bytes)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("CUDA program binding arena end overflows")
+            })?;
+        if arena_device_ptr < first_destination._allocation.aligned_ptr
+            || arena_end > allocation_end
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA compiled program binding arena exceeds its admitted allocation",
+            ));
+        }
+
+        let mut fence_dependencies = Vec::new();
+        for patch in patches {
+            let slot = patch.binding.slot();
+            let expected_device_ptr = arena_device_ptr
+                .checked_add(slot.physical_offset_bytes())
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("CUDA program binding slot pointer overflows")
+                })?;
+            if patch.destination.runtime_instance != runtime_instance
+                || patch.destination.device_ptr != expected_device_ptr
+                || patch.destination.element_type != ElementType::U8
+                || !Arc::ptr_eq(
+                    &patch.destination._allocation,
+                    &first_destination._allocation,
+                )
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA program binding patch destination differs from its arena slot",
+                ));
+            }
+            for write in patch.writes {
+                let destination_start = slot
+                    .physical_offset_bytes()
+                    .checked_add(write.destination_offset_bytes)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA aggregate program binding write offset overflows",
+                        )
+                    })?;
+                let destination_start = checked_usize(
+                    destination_start,
+                    "CUDA aggregate program binding write offset",
+                )?;
+                let destination_end = destination_start
+                    .checked_add(write.payload.len())
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA aggregate program binding write end overflows",
+                        )
+                    })?;
+                let destination = host_patch
+                    .get_mut(destination_start..destination_end)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA aggregate program binding write exceeds its arena",
+                        )
+                    })?;
+                destination.copy_from_slice(&write.payload);
+            }
+            fence_dependencies.extend(patch.fence_dependencies);
+        }
+
+        let arena_region = CudaBufferRegion {
+            _allocation: Arc::clone(&first_destination._allocation),
+            _core_retention: first_destination._core_retention.clone(),
+            reusable_address_scope: first_destination.reusable_address_scope,
+            runtime_instance,
+            device_ptr: arena_device_ptr,
+            length_bytes: layout_physical_size_bytes,
+            element_type: ElementType::U8,
+        };
+        let executable = Arc::new(CudaCommandExecutable {
+            regions: vec![arena_region],
+            host_storage: vec![host_patch.into_boxed_slice()],
+            enqueue: Mutex::new(Box::new(|stream, _blas, regions, host_storage| {
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        regions[0].device_ptr,
+                        host_storage[0].as_ref(),
+                        stream.cu_stream(),
+                    )
+                }
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("aggregate program binding upload", error)
+                })
+            })),
+        });
+        Ok(vec![Self {
+            runtime_instance,
+            operation: "vnext_program_binding_prelude",
+            batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_count,
+            token_count,
+            compute_dispatch_count: 0,
+            transfer_command_count: 1,
+            executable,
+            fence_dependencies,
+            replay_key: None,
+            reusable_address_scope: None,
+            program_binding_patch: None,
+        }])
+    }
+
+    fn coalesced_opaque_program_bindings(
+        commands: Vec<Self>,
+    ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         let runtime_instance = commands[0].runtime_instance;
         let participant_count = commands[0].participant_count;
         let token_count = commands[0].token_count;
@@ -664,6 +967,7 @@ impl CudaDeviceCommand {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            program_binding_patch: None,
         }])
     }
 
@@ -1994,6 +2298,7 @@ mod tests {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            program_binding_patch: None,
         }
     }
 
