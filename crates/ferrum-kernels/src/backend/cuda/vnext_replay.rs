@@ -6,10 +6,12 @@
 //! scalars, physical regions, and retained host bytes.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
+use std::fmt::Write;
 use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
@@ -26,6 +28,7 @@ use crate::backend::reusable_execution::{
 };
 
 use super::vnext_runtime::{CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError};
+use super::vnext_tool_correlation::CudaReplayToolRange;
 
 const COMMAND_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.command-replay.v1\0";
 const SEGMENT_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.executable-segment.v1\0";
@@ -150,6 +153,15 @@ impl CudaExecutableSegmentKey {
         }
         Some(Self(digest.finalize().into()))
     }
+
+    fn fingerprint(self) -> String {
+        let mut fingerprint = String::with_capacity(64);
+        for byte in self.0 {
+            write!(&mut fingerprint, "{byte:02x}")
+                .expect("writing a byte to an allocated String cannot fail");
+        }
+        fingerprint
+    }
 }
 
 pub(crate) struct CudaExecutableCandidate {
@@ -247,6 +259,7 @@ impl fmt::Display for CudaReplayError {
 }
 
 struct CudaExecutableSegment {
+    key: CudaExecutableSegmentKey,
     graph: sys::CUgraph,
     executable: sys::CUgraphExec,
     context: Arc<CudaContext>,
@@ -255,10 +268,29 @@ struct CudaExecutableSegment {
     _executables: Vec<Arc<CudaCommandExecutable>>,
     uploaded: bool,
     last_used: u64,
+    profile_identity: OnceLock<CudaExecutableProfileIdentity>,
+}
+
+struct CudaExecutableProfileIdentity {
+    fingerprint: Arc<str>,
+    nvtx_label: CString,
+}
+
+impl CudaExecutableProfileIdentity {
+    fn new(key: CudaExecutableSegmentKey) -> Self {
+        let fingerprint = Arc::<str>::from(key.fingerprint());
+        let nvtx_label = CString::new(format!("ferrum.cuda.replay/{fingerprint}"))
+            .expect("a lowercase hexadecimal fingerprint contains no NUL bytes");
+        Self {
+            fingerprint,
+            nvtx_label,
+        }
+    }
 }
 
 impl CudaExecutableSegment {
     fn capture(
+        key: CudaExecutableSegmentKey,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         blas: &Arc<CudaBlas>,
@@ -341,6 +373,7 @@ impl CudaExecutableSegment {
             ));
         }
         Ok(Self {
+            key,
             graph,
             executable,
             context: Arc::clone(context),
@@ -349,6 +382,7 @@ impl CudaExecutableSegment {
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             uploaded: false,
             last_used,
+            profile_identity: OnceLock::new(),
         })
     }
 
@@ -365,7 +399,12 @@ impl CudaExecutableSegment {
         Ok(())
     }
 
-    fn launch(&mut self, stream: &CudaStream, last_used: u64) -> Result<(), CudaReplayError> {
+    fn launch(
+        &mut self,
+        stream: &CudaStream,
+        last_used: u64,
+        tool_correlation: bool,
+    ) -> Result<Option<Arc<str>>, CudaReplayError> {
         if !self.uploaded {
             return Err(CudaReplayError {
                 stage: "launch reusable executable",
@@ -373,6 +412,12 @@ impl CudaExecutableSegment {
                 eager_fallback_safe: false,
             });
         }
+        let profile_identity = tool_correlation.then(|| {
+            self.profile_identity
+                .get_or_init(|| CudaExecutableProfileIdentity::new(self.key))
+        });
+        let _tool_range =
+            profile_identity.map(|identity| CudaReplayToolRange::enter(&identity.nvtx_label));
         let status = unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) };
         if status != sys::CUresult::CUDA_SUCCESS {
             return Err(CudaReplayError::cuda(
@@ -382,7 +427,7 @@ impl CudaExecutableSegment {
             ));
         }
         self.last_used = last_used;
-        Ok(())
+        Ok(profile_identity.map(|identity| Arc::clone(&identity.fingerprint)))
     }
 }
 
@@ -412,6 +457,18 @@ pub(crate) struct CudaExecutableCache {
     rejected: HashMap<CudaExecutableSegmentKey, u64>,
     preparation: ReusableExecutionPreparationTracker,
     clock: u64,
+}
+
+pub(crate) struct CudaExecutableLaunch {
+    reusable_executable_fingerprint: Option<Arc<str>>,
+}
+
+impl CudaExecutableLaunch {
+    pub(crate) fn reusable_executable_fingerprint(&self) -> Option<Arc<str>> {
+        self.reusable_executable_fingerprint
+            .as_ref()
+            .map(Arc::clone)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -566,6 +623,7 @@ impl CudaExecutableCache {
                 .expect("admitted CUDA executable key came from its candidate set");
             let now = self.tick();
             match CudaExecutableSegment::capture(
+                key,
                 context,
                 stream,
                 blas,
@@ -648,13 +706,16 @@ impl CudaExecutableCache {
         &mut self,
         stream: &CudaStream,
         candidate: &CudaExecutableCandidate,
-    ) -> Result<bool, CudaReplayError> {
+        tool_correlation: bool,
+    ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let now = self.tick();
         let Some(entry) = self.entries.get_mut(&candidate.key) else {
-            return Ok(false);
+            return Ok(None);
         };
-        entry.launch(stream, now)?;
-        Ok(true)
+        let reusable_executable_fingerprint = entry.launch(stream, now, tool_correlation)?;
+        Ok(Some(CudaExecutableLaunch {
+            reusable_executable_fingerprint,
+        }))
     }
 
     pub(crate) fn contains(&self, candidate: &CudaExecutableCandidate) -> bool {

@@ -1318,6 +1318,8 @@ pub struct DeviceSubmissionExecutionSpan {
     end_command_index: u32,
     kind: DeviceExecutionSpanKind,
     measurement: DeviceExecutionSpanMeasurement,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reusable_executable_fingerprint: Option<Box<str>>,
 }
 
 impl DeviceSubmissionExecutionSpan {
@@ -1362,7 +1364,21 @@ impl DeviceSubmissionExecutionSpan {
             end_command_index,
             kind,
             measurement,
+            reusable_executable_fingerprint: None,
         })
+    }
+
+    pub fn with_reusable_executable_fingerprint(mut self, fingerprint: String) -> Option<Self> {
+        if self.kind != DeviceExecutionSpanKind::ReusableExecutable
+            || fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        self.reusable_executable_fingerprint = Some(fingerprint.into_boxed_str());
+        Some(self)
     }
 
     fn from_command(command: DeviceCommandExecutionTiming) -> Option<Self> {
@@ -1393,6 +1409,10 @@ impl DeviceSubmissionExecutionSpan {
 
     pub const fn measurement(&self) -> &DeviceExecutionSpanMeasurement {
         &self.measurement
+    }
+
+    pub fn reusable_executable_fingerprint(&self) -> Option<&str> {
+        self.reusable_executable_fingerprint.as_deref()
     }
 
     pub const fn contains_command(&self, command_index: u32) -> bool {
@@ -2364,6 +2384,8 @@ mod execution_timing_tests {
             )
             .unwrap()],
         )
+        .unwrap()
+        .with_reusable_executable_fingerprint("a".repeat(64))
         .unwrap();
         let unavailable = DeviceSubmissionExecutionSpan::unavailable(
             4,
@@ -2380,6 +2402,21 @@ mod execution_timing_tests {
         assert_eq!(
             timing.span_for_command(2).unwrap().kind(),
             DeviceExecutionSpanKind::ReusableExecutable
+        );
+        assert_eq!(
+            timing
+                .span_for_command(2)
+                .unwrap()
+                .reusable_executable_fingerprint(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            serde_json::to_value(timing.span_for_command(2).unwrap())
+                .unwrap()
+                .get("reusable_executable_fingerprint"),
+            Some(&serde_json::json!(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
         );
         assert_eq!(
             timing
@@ -2404,6 +2441,24 @@ mod execution_timing_tests {
             interval(),
         )
         .is_none());
+        assert!(DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .unwrap()
+        .with_reusable_executable_fingerprint("a".repeat(64))
+        .is_none());
+        assert!(DeviceSubmissionExecutionSpan::measured(
+            0,
+            2,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            interval(),
+        )
+        .unwrap()
+        .with_reusable_executable_fingerprint("A".repeat(64))
+        .is_none());
         let first = DeviceSubmissionExecutionSpan::measured(
             0,
             1,
@@ -2411,6 +2466,10 @@ mod execution_timing_tests {
             interval(),
         )
         .unwrap();
+        assert!(serde_json::to_value(&first)
+            .unwrap()
+            .get("reusable_executable_fingerprint")
+            .is_none());
         let gap = DeviceSubmissionExecutionSpan::measured(
             2,
             3,
