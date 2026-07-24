@@ -6858,6 +6858,36 @@ mod tests {
     }
 
     #[test]
+    fn elastic_prefill_budget_uses_live_capacity_not_configured_concurrency() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 16,
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(16),
+            prefill_step_chunk: None,
+            ..SchedulerConfig::default()
+        });
+
+        enqueue_waiting(
+            &scheduler,
+            create_test_request_with_prompt_tokens(Priority::Normal, 64),
+        );
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 16,
+                max_tokens: 192,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(batch.requests.len(), 1);
+        assert_eq!(batch.requests[0].tokens_to_process, Some(64));
+        assert_eq!(batch.resource_requirements.gpu_memory, 64 * 16);
+    }
+
+    #[test]
     fn active_decode_prefill_chunk_only_caps_when_decode_is_active() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             prompt_token_estimate: true,
