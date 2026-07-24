@@ -416,6 +416,11 @@ pub(crate) struct ProviderTrace {
     pub(crate) last_work_sequences: u32,
     pub(crate) component_resources: BTreeSet<ResourceId>,
     pub(crate) view_resources: BTreeSet<ResourceId>,
+    pub(crate) program_binding_slots: BTreeMap<usize, ResourceId>,
+    pub(crate) program_binding_plan_hashes: BTreeSet<String>,
+    pub(crate) program_binding_layout_fingerprints: BTreeSet<String>,
+    pub(crate) program_binding_lane_slot_ids: BTreeSet<u64>,
+    pub(crate) program_binding_lifetimes: Vec<AllocationLifetime>,
 }
 
 pub(crate) struct TestProvider {
@@ -467,6 +472,23 @@ impl OperationProvider<TestRuntime> for TestProvider {
         trace.encode_calls += 1;
         trace.last_participant_count = invocation.participants().len();
         trace.last_work_sequences = invocation.work_shape().immediate_sequences();
+        if let Some(binding) = invocation.program_binding() {
+            trace
+                .program_binding_slots
+                .insert(binding.node_index(), binding.slot().resource_id().clone());
+            trace
+                .program_binding_plan_hashes
+                .insert(binding.plan_hash().as_str().to_owned());
+            trace
+                .program_binding_layout_fingerprints
+                .insert(binding.layout().fingerprint().to_owned());
+            trace
+                .program_binding_lane_slot_ids
+                .insert(binding.lane_slot_identity().slot_id());
+            trace
+                .program_binding_lifetimes
+                .push(binding.lane_slot_identity().lifetime());
+        }
         let participant = &invocation.participants()[0];
         trace.component_resources = participant
             .bindings()
@@ -520,7 +542,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
     }
 }
 
-pub(crate) fn policy() -> ResolvedRuntimePolicy {
+fn policy_with_reusable_execution(
+    reusable_execution: Option<ReusableExecutionPolicy>,
+) -> ResolvedRuntimePolicy {
     ResolvedRuntimePolicy::new(
         "runtime-policy.device-operation",
         ContractVersion::new(1, 0),
@@ -538,9 +562,26 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
-        None,
+        reusable_execution,
     )
     .unwrap()
+}
+
+pub(crate) fn policy() -> ResolvedRuntimePolicy {
+    policy_with_reusable_execution(None)
+}
+
+fn reusable_policy() -> (ResolvedRuntimePolicy, ReusableExecutionBucketSpec) {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("execution.device-operation").unwrap(),
+        ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let reusable_execution = ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap();
+    (
+        policy_with_reusable_execution(Some(reusable_execution)),
+        bucket,
+    )
 }
 
 pub(crate) fn resolved_tensor() -> ResolvedTensorSpec {
@@ -1536,6 +1577,15 @@ pub(crate) fn resolved_model_plan_with_zero_state(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
+    let runtime_policy = policy();
+    resolved_model_plan_with_zero_state_and_policy(registry, zero_state, &runtime_policy)
+}
+
+fn resolved_model_plan_with_zero_state_and_policy(
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    zero_state: bool,
+    runtime_policy: &ResolvedRuntimePolicy,
+) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
     let raw_config = if zero_state {
         json!({"width": 4, "zero_state": true})
@@ -1544,19 +1594,18 @@ pub(crate) fn resolved_model_plan_with_zero_state(
     };
     let family = model_registry.registration.prepare(&raw_config).unwrap();
     let catalog = catalog_with_zero_state(zero_state);
-    let runtime_policy = policy();
     let resolutions = vec![
-        node_resolution_with_zero_state(&family, &catalog, &runtime_policy, registry, zero_state),
+        node_resolution_with_zero_state(&family, &catalog, runtime_policy, registry, zero_state),
         tail_node_resolution_with_zero_state(
             &family,
             &catalog,
-            &runtime_policy,
+            runtime_policy,
             registry,
             zero_state,
         ),
     ];
     let plan = ExecutionPlan::build(
-        PlanBuildRequest::new(&family, &catalog, &runtime_policy, resolutions.clone()).unwrap(),
+        PlanBuildRequest::new(&family, &catalog, runtime_policy, resolutions.clone()).unwrap(),
     )
     .unwrap();
     let config_fingerprint = family.config_fingerprint().to_owned();
@@ -1679,7 +1728,7 @@ pub(crate) fn resolved_model_plan_with_zero_state(
         &resolutions,
         catalog.device(),
         &catalog,
-        &runtime_policy,
+        runtime_policy,
     );
     (
         ResolvedModelPlan::new(inputs, bindings, &context).unwrap(),
@@ -1695,6 +1744,15 @@ pub(crate) fn plan_for_registry_with_zero_state(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
 ) -> ExecutionPlan {
+    let runtime_policy = policy();
+    plan_for_registry_with_zero_state_and_policy(registry, zero_state, &runtime_policy)
+}
+
+fn plan_for_registry_with_zero_state_and_policy(
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    zero_state: bool,
+    runtime_policy: &ResolvedRuntimePolicy,
+) -> ExecutionPlan {
     let raw_config = if zero_state {
         json!({"width": 4, "zero_state": true})
     } else {
@@ -1704,24 +1762,23 @@ pub(crate) fn plan_for_registry_with_zero_state(
         .prepare(&raw_config)
         .unwrap();
     let catalog = catalog_with_zero_state(zero_state);
-    let runtime_policy = policy();
     ExecutionPlan::build(
         PlanBuildRequest::new(
             &family,
             &catalog,
-            &runtime_policy,
+            runtime_policy,
             vec![
                 node_resolution_with_zero_state(
                     &family,
                     &catalog,
-                    &runtime_policy,
+                    runtime_policy,
                     registry,
                     zero_state,
                 ),
                 tail_node_resolution_with_zero_state(
                     &family,
                     &catalog,
-                    &runtime_policy,
+                    runtime_policy,
                     registry,
                     zero_state,
                 ),
@@ -1852,12 +1909,20 @@ pub(crate) fn begin_single_participant_step(
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let lane = plan_resources.create_execution_lane().unwrap();
-    begin_single_participant_step_on_lane(batch, &lane)
+    begin_single_participant_step_on_lane_with_bucket(batch, &lane, None)
 }
 
 pub(crate) fn begin_single_participant_step_on_lane(
     batch: &ExecutionBatchParticipants<TestRuntime>,
     lane: &Arc<ExecutionLane<TestRuntime>>,
+) -> Arc<StepResourceLease<TestRuntime>> {
+    begin_single_participant_step_on_lane_with_bucket(batch, lane, None)
+}
+
+pub(crate) fn begin_single_participant_step_on_lane_with_bucket(
+    batch: &ExecutionBatchParticipants<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+    bucket: Option<&ReusableExecutionBucketSpec>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
         batch.bind_work_shape(vec![one_token_span()]).unwrap(),
@@ -1865,6 +1930,10 @@ pub(crate) fn begin_single_participant_step_on_lane(
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
+    let request = match bucket {
+        Some(bucket) => request.with_reusable_execution_bucket(bucket.bucket_id().clone()),
+        None => request,
+    };
     for attempt in 0..=3 {
         match batch.try_begin_step(request.clone(), lane).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => {
@@ -1996,6 +2065,7 @@ pub(crate) struct Fixture {
     pub(crate) provider_behavior: Arc<Mutex<ProviderBehavior>>,
     pub(crate) provider_trace: Arc<Mutex<ProviderTrace>>,
     pub(crate) plan_resources: Arc<PlanRuntimeResources<TestRuntime>>,
+    pub(crate) reusable_execution_bucket: Option<ReusableExecutionBucketSpec>,
 }
 
 pub(crate) fn fixture() -> Fixture {
@@ -2011,6 +2081,13 @@ pub(crate) fn fixture_with_provider_behavior(
     behavior: ProviderBehavior,
 ) -> Fixture {
     let catalog = catalog_with_zero_state(zero_state);
+    let (runtime_policy, reusable_execution_bucket) =
+        if behavior == ProviderBehavior::ProgramBinding {
+            let (policy, bucket) = reusable_policy();
+            (policy, Some(bucket))
+        } else {
+            (policy(), None)
+        };
     let provider_behavior = Arc::new(Mutex::new(behavior));
     let provider_trace = Arc::new(Mutex::new(ProviderTrace::default()));
     let registry = operation_registry(
@@ -2025,15 +2102,20 @@ pub(crate) fn fixture_with_provider_behavior(
         )
         .unwrap();
     assert_eq!(derived_catalog, catalog);
-    let (resolved, plan) = resolved_model_plan_with_zero_state(&registry, zero_state);
+    let (resolved, plan) =
+        resolved_model_plan_with_zero_state_and_policy(&registry, zero_state, &runtime_policy);
     let impostor_registry = operation_registry(
         &catalog,
         Arc::new(Mutex::new(ProviderBehavior::WrongPhase)),
         Arc::new(Mutex::new(ProviderTrace::default())),
     );
-    let impostor_plan_hash = plan_for_registry_with_zero_state(&impostor_registry, zero_state)
-        .plan_hash()
-        .clone();
+    let impostor_plan_hash = plan_for_registry_with_zero_state_and_policy(
+        &impostor_registry,
+        zero_state,
+        &runtime_policy,
+    )
+    .plan_hash()
+    .clone();
     let (runtime, runtime_trace) = runtime(&catalog);
     let plan_resources = plan_runtime_resources(&plan, Arc::clone(&runtime));
     Fixture {
@@ -2047,6 +2129,7 @@ pub(crate) fn fixture_with_provider_behavior(
         provider_behavior,
         provider_trace,
         plan_resources,
+        reusable_execution_bucket,
     }
 }
 

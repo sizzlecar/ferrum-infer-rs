@@ -1,9 +1,9 @@
 use super::{
-    invalid_resource, AllocationKind, AllocationLifetime, BTreeMap, BufferUsage,
+    invalid_resource, AllocationKind, AllocationLifetime, Arc, BTreeMap, BufferUsage,
     DynamicPoolDomainSpec, DynamicStorageView, ElementType, EvaluatedBackingRequest,
-    ExecutionLaneId, InvocationLivenessMode, NodeId, PhysicalBackingClaimIdentity, PlanNode,
-    ResourceId, Serialize, SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout,
-    VNextError,
+    ExecutionLaneId, InvocationLivenessMode, LogicalBackingSliceAuthority, NodeId,
+    PhysicalBackingClaimIdentity, PlanHash, PlanNode, ResourceId, Serialize,
+    SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, VNextError,
 };
 use crate::vnext::ReusableExecutionBucketId;
 use sha2::{Digest, Sha256};
@@ -129,6 +129,126 @@ impl LaneStableArenaSlotIdentity {
 
     pub const fn slot_id(&self) -> u64 {
         self.slot_id
+    }
+}
+
+/// One exact plan/lane binding of a cold-compiled layout to a live reusable
+/// arena slot. The wave owns this authority through its terminal fence; node
+/// commands retain only an `Arc` plus their immutable plan index.
+#[derive(Debug)]
+pub struct ProgramBindingExecutionBinding {
+    plan_hash: PlanHash,
+    layout: Arc<ProgramBindingLayout>,
+    lane_slot_identity: LaneStableArenaSlotIdentity,
+}
+
+impl ProgramBindingExecutionBinding {
+    pub(super) fn bind(
+        plan_hash: PlanHash,
+        node_count: usize,
+        layout: Arc<ProgramBindingLayout>,
+        lane_slot_identity: LaneStableArenaSlotIdentity,
+        backing_slices: &[LogicalBackingSliceAuthority],
+    ) -> Result<Arc<Self>, VNextError> {
+        if node_count == 0
+            || layout.slots().is_empty()
+            || layout
+                .slots()
+                .iter()
+                .any(|slot| slot.node_index() >= node_count)
+            || lane_slot_identity.lifetime() != AllocationLifetime::Invocation
+            || layout.reusable_execution_bucket_id()
+                != lane_slot_identity.reusable_execution_bucket_id()
+        {
+            return Err(invalid_resource(
+                "program binding layout differs from its plan or lane slot",
+            ));
+        }
+        for slot in layout.slots() {
+            let evidence = backing_slices
+                .binary_search_by(|slice| slice.resource_id().cmp(slot.resource_id()))
+                .ok()
+                .and_then(|index| backing_slices.get(index))
+                .map(LogicalBackingSliceAuthority::evidence)
+                .ok_or_else(|| {
+                    invalid_resource(
+                        "program binding slot has no claimed logical backing projection",
+                    )
+                })?;
+            if evidence.physical_claim_identity() != layout.claim_identity()
+                || evidence.reusable_execution_bucket_id()
+                    != Some(layout.reusable_execution_bucket_id())
+                || evidence.physical_offset_bytes() != slot.physical_offset_bytes()
+                || evidence.capacity_size_bytes() != slot.capacity_size_bytes()
+                || evidence.physical_size_bytes() != layout.physical_size_bytes()
+                || evidence.alignment_bytes() != slot.alignment_bytes()
+                || evidence.usage() != BufferUsage::Binding
+                || evidence.element_type() != ElementType::U8
+            {
+                return Err(invalid_resource(
+                    "program binding slot differs from its claimed physical projection",
+                ));
+            }
+        }
+        Ok(Arc::new(Self {
+            plan_hash,
+            layout,
+            lane_slot_identity,
+        }))
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.plan_hash
+    }
+
+    pub fn layout(&self) -> &ProgramBindingLayout {
+        &self.layout
+    }
+
+    pub fn lane_slot_identity(&self) -> &LaneStableArenaSlotIdentity {
+        &self.lane_slot_identity
+    }
+
+    pub(super) fn node(self: &Arc<Self>, node_index: usize) -> Option<ProgramBindingNodeBinding> {
+        self.layout
+            .slot_for_node(node_index)
+            .map(|_| ProgramBindingNodeBinding {
+                execution: Arc::clone(self),
+                node_index,
+            })
+    }
+}
+
+/// Backend-visible authority for exactly one provider-owned binding slot.
+/// Cloning this handle is allocation-free and cannot change the selected slot.
+#[derive(Debug, Clone)]
+pub struct ProgramBindingNodeBinding {
+    execution: Arc<ProgramBindingExecutionBinding>,
+    node_index: usize,
+}
+
+impl ProgramBindingNodeBinding {
+    pub const fn node_index(&self) -> usize {
+        self.node_index
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        self.execution.plan_hash()
+    }
+
+    pub fn layout(&self) -> &ProgramBindingLayout {
+        self.execution.layout()
+    }
+
+    pub fn slot(&self) -> &ProgramBindingSlot {
+        self.execution
+            .layout()
+            .slot_for_node(self.node_index)
+            .expect("program binding node handle is constructed from one compiled slot")
+    }
+
+    pub fn lane_slot_identity(&self) -> &LaneStableArenaSlotIdentity {
+        self.execution.lane_slot_identity()
     }
 }
 

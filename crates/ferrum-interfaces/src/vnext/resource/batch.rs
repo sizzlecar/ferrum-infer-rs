@@ -7,6 +7,7 @@ use super::{
     LaneStableArenaSlotIdentity, LaneStableArenaSlotLease, LogicalBackingSliceAuthority,
     LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
     PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash,
+    ProgramBindingExecutionBinding, ProgramBindingLayout, ProgramBindingNodeBinding,
     RequestAuthorityId, SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession,
     SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
     SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
@@ -1818,6 +1819,7 @@ pub struct ClaimedSubmissionWaveBacking {
     work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
+    program_binding: Option<Arc<ProgramBindingExecutionBinding>>,
     // Occupancy releases only after terminal completion readback drops this claim.
     _lane_slot_lease: Option<LaneStableArenaSlotLease>,
 }
@@ -1830,6 +1832,7 @@ impl ClaimedSubmissionWaveBacking {
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
+        program_binding_layout: Option<Arc<ProgramBindingLayout>>,
         lane_slot_lease: Option<LaneStableArenaSlotLease>,
     ) -> Result<Self, VNextError> {
         let participants = work_shape.participants();
@@ -1849,6 +1852,25 @@ impl ClaimedSubmissionWaveBacking {
                 "submission wave capacity differs from its participants or evaluated demand",
             ));
         }
+        let program_binding = program_binding_layout
+            .map(|layout| {
+                let lane_slot_identity = lane_slot_lease
+                    .as_ref()
+                    .map(LaneStableArenaSlotLease::identity)
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "compiled program binding layout has no lane-stable slot authority",
+                        )
+                    })?;
+                ProgramBindingExecutionBinding::bind(
+                    plan_hash.clone(),
+                    node_count,
+                    layout,
+                    lane_slot_identity,
+                    &backing_slices,
+                )
+            })
+            .transpose()?;
 
         #[derive(Serialize)]
         struct BackingFingerprint<'a> {
@@ -1904,6 +1926,7 @@ impl ClaimedSubmissionWaveBacking {
             work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            program_binding,
             _lane_slot_lease: lane_slot_lease,
         })
     }
@@ -1934,6 +1957,18 @@ impl ClaimedSubmissionWaveBacking {
 
     pub fn demand(&self) -> &AdmissionDemand {
         &self.demand
+    }
+
+    pub fn program_binding_node(&self, node_index: usize) -> Option<ProgramBindingNodeBinding> {
+        self.program_binding
+            .as_ref()
+            .and_then(|binding| binding.node(node_index))
+    }
+
+    pub fn program_binding_layout(&self) -> Option<&ProgramBindingLayout> {
+        self.program_binding
+            .as_ref()
+            .map(|binding| binding.layout())
     }
 
     pub fn fingerprint(&self) -> &str {

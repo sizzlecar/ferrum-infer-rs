@@ -1753,7 +1753,8 @@ where
     pub(super) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(super) submission_wave_reusable_capacity_layouts:
         BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
-    pub(super) program_binding_layouts: BTreeMap<ReusableExecutionBucketId, ProgramBindingLayout>,
+    pub(super) program_binding_layouts:
+        BTreeMap<ReusableExecutionBucketId, Arc<ProgramBindingLayout>>,
     pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) budget: Arc<DeviceCapacityBudget>,
@@ -2096,7 +2097,10 @@ where
             &nodes,
             &submission_wave_layouts,
             &submission_wave_reusable_capacity_layouts,
-        )?;
+        )?
+        .into_iter()
+        .map(|(bucket_id, layout)| (bucket_id, Arc::new(layout)))
+        .collect();
         let mut pools = BTreeMap::new();
         for domain in &domains {
             let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
@@ -2146,7 +2150,7 @@ where
     pub(super) fn program_binding_layout(
         &self,
         bucket_id: &ReusableExecutionBucketId,
-    ) -> Option<&ProgramBindingLayout> {
+    ) -> Option<&Arc<ProgramBindingLayout>> {
         self.program_binding_layouts.get(bucket_id)
     }
 

@@ -143,6 +143,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         provider_behavior,
         provider_trace,
         plan_resources,
+        reusable_execution_bucket: _,
     } = fixture;
     let node = &plan.payload().nodes()[0];
     check(passed, plan.plan_hash() == &impostor_plan_hash);

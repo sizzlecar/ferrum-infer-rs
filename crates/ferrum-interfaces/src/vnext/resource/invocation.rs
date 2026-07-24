@@ -1040,6 +1040,25 @@ where
             }
         };
         let (backing_slices, lane_slot_lease) = prepared_backing.commit().into_parts();
+        let has_program_binding_nodes = plan_nodes
+            .iter()
+            .any(|node| node.binding_resource().is_some());
+        let program_binding_layout = match (
+            self.reusable_execution_bucket.as_ref(),
+            has_program_binding_nodes,
+        ) {
+            (Some(bucket), true) => Some(
+                plan.dynamic_pools()
+                    .program_binding_layout(bucket.bucket_id())
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "reusable submission wave has no compiled program binding layout",
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
         let claimed_backing = ClaimedSubmissionWaveBacking::new(
             plan.plan_hash().clone(),
             plan_nodes.len(),
@@ -1047,6 +1066,7 @@ where
             demand,
             logical_capacity,
             backing_slices,
+            program_binding_layout,
             lane_slot_lease,
         )?;
         let wave_fingerprint =
