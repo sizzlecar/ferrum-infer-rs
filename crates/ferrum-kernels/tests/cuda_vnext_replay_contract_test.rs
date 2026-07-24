@@ -53,6 +53,19 @@ fn dynamic_attention_addresses_use_one_hoistable_program_binding_boundary() {
 }
 
 #[test]
+fn typed_program_binding_patches_form_one_layout_owned_upload() {
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("CudaDeviceCommand::program_binding_patch("));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("CudaDeviceCommand::program_binding_patch("));
+    assert!(RUNTIME_SOURCE.contains("struct CudaProgramBindingPatch"));
+    assert!(RUNTIME_SOURCE
+        .contains("\"CUDA typed program bindings do not cover one compiled layout exactly\""));
+    assert!(RUNTIME_SOURCE.contains("let mut host_patch = vec![0_u8; patch_bytes]"));
+    assert!(RUNTIME_SOURCE.contains("\"aggregate program binding upload\""));
+    assert!(RUNTIME_SOURCE.contains("transfer_command_count: 1"));
+    assert!(RUNTIME_SOURCE.contains("fence_dependencies.extend(patch.fence_dependencies)"));
+}
+
+#[test]
 fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("compute_fence_dependencies.push(conv_state"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("compute_fence_dependencies.push(delta_state"));

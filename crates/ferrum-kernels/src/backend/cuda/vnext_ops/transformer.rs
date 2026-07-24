@@ -26,7 +26,7 @@ use ferrum_interfaces::vnext::{
 
 use super::super::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime,
-    CudaDeviceRuntimeError,
+    CudaDeviceRuntimeError, CudaProgramBindingWrite,
 };
 use super::{
     binding, contiguous_region, contiguous_token_region, contract_error,
