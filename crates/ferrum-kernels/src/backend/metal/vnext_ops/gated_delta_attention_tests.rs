@@ -15,6 +15,8 @@ const VALUE_DIM: usize = 128;
 const QK_FEATURES: usize = KEY_HEADS * KEY_DIM;
 const VALUE_FEATURES: usize = VALUE_HEADS * VALUE_DIM;
 const QKV_FEATURES: usize = 2 * QK_FEATURES + VALUE_FEATURES;
+const QKVZ_FEATURES: usize = QKV_FEATURES + VALUE_FEATURES;
+const BA_FEATURES: usize = 2 * VALUE_HEADS;
 const CONV_KERNEL: usize = 4;
 const CONV_STATE_WIDTH: usize = CONV_KERNEL - 1;
 // This stricter diagnostic never substitutes for a catalog-bound release comparison.
@@ -334,6 +336,8 @@ fn launch_extent_validation_rejects_msl_uint_overflow() {
         value_dim: 16,
         qkv_features: QKV_FEATURES as u64,
         value_features: VALUE_FEATURES as u64,
+        qkvz_features: QKVZ_FEATURES as u64,
+        ba_features: BA_FEATURES as u64,
         conv_kernel: CONV_KERNEL as u64,
         conv_state_width: CONV_STATE_WIDTH as u64,
         epsilon: 1.0e-6,
@@ -504,6 +508,9 @@ fn run_chunked_core(
         qkv_features: (2 * shape.key_heads * shape.key_dim + shape.value_heads * shape.value_dim)
             as u32,
         value_features: (shape.value_heads * shape.value_dim) as u32,
+        qkvz_features: (2 * shape.key_heads * shape.key_dim
+            + 2 * shape.value_heads * shape.value_dim) as u32,
+        ba_features: (2 * shape.value_heads) as u32,
         conv_kernel: 2,
         epsilon: 1.0e-6,
         scale: (shape.key_dim as f32).sqrt().recip(),
@@ -774,9 +781,18 @@ fn run_segment(
 ) -> Vec<f32> {
     let tokens = inputs.mixed_qkv.len() / QKV_FEATURES;
     let params = test_params(tokens, semantics);
-    let mixed_qkv = shared_buffer(device, inputs.mixed_qkv);
-    let a_raw = shared_buffer(device, inputs.a_raw);
-    let b_raw = shared_buffer(device, inputs.b_raw);
+    let mut packed_qkvz = Vec::with_capacity(tokens * QKVZ_FEATURES);
+    let mut packed_ba = Vec::with_capacity(tokens * BA_FEATURES);
+    for token in 0..tokens {
+        packed_qkvz
+            .extend_from_slice(&inputs.mixed_qkv[token * QKV_FEATURES..(token + 1) * QKV_FEATURES]);
+        packed_qkvz
+            .extend_from_slice(&inputs.z[token * VALUE_FEATURES..(token + 1) * VALUE_FEATURES]);
+        packed_ba.extend_from_slice(&inputs.b_raw[token * VALUE_HEADS..(token + 1) * VALUE_HEADS]);
+        packed_ba.extend_from_slice(&inputs.a_raw[token * VALUE_HEADS..(token + 1) * VALUE_HEADS]);
+    }
+    let mixed_qkvz = shared_buffer(device, &packed_qkvz);
+    let ba_raw = shared_buffer(device, &packed_ba);
     let z = shared_buffer(device, inputs.z);
     let query = output_buffer::<f32>(device, tokens * QK_FEATURES);
     let key = output_buffer::<f32>(device, tokens * QK_FEATURES);
@@ -791,25 +807,25 @@ fn run_segment(
     let encoder = command.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipelines.prepare_conv);
     for (index, buffer) in [
-        &*mixed_qkv,
+        &*mixed_qkvz,
         weights.conv,
         conv_state,
         &*query,
         &*key,
         &*value,
+        &*z,
     ]
     .into_iter()
     .enumerate()
     {
         set_raw(encoder, index as u64, buffer);
     }
-    set_params(encoder, 6, &params);
-    dispatch_elements(encoder, (tokens * QKV_FEATURES) as u64);
+    set_params(encoder, 7, &params);
+    dispatch_elements(encoder, (tokens * QKVZ_FEATURES) as u64);
 
     encoder.set_compute_pipeline_state(&pipelines.prepare_gates);
     for (index, buffer) in [
-        &*a_raw,
-        &*b_raw,
+        &*ba_raw,
         weights.decay_parameter,
         weights.dt_bias,
         &*g,
@@ -820,11 +836,11 @@ fn run_segment(
     {
         set_raw(encoder, index as u64, buffer);
     }
-    set_params(encoder, 6, &params);
+    set_params(encoder, 5, &params);
     dispatch_elements(encoder, (tokens * VALUE_HEADS) as u64);
 
     encoder.set_compute_pipeline_state(&pipelines.collect_conv_state);
-    set_raw(encoder, 0, &mixed_qkv);
+    set_raw(encoder, 0, &mixed_qkvz);
     set_raw(encoder, 1, conv_state);
     set_raw(encoder, 2, &next_conv);
     set_params(encoder, 3, &params);
@@ -1039,6 +1055,8 @@ fn test_params(tokens: usize, semantics: TestSemantics) -> GatedDeltaParams {
         value_dim: VALUE_DIM as u32,
         qkv_features: QKV_FEATURES as u32,
         value_features: VALUE_FEATURES as u32,
+        qkvz_features: QKVZ_FEATURES as u32,
+        ba_features: BA_FEATURES as u32,
         conv_kernel: CONV_KERNEL as u32,
         epsilon: 1.0e-6,
         scale: (KEY_DIM as f32).sqrt().recip(),

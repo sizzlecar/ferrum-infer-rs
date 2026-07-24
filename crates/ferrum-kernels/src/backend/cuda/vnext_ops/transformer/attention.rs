@@ -37,7 +37,8 @@ const PROVIDER_ID: &str = "provider.cuda.gated_delta_recurrent_attention.f16";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attention.f16";
 
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
-const PREPARE_FUNCTION: &str = "linear_attention_prepare_varlen_f16_params_f32_state_f16_indirect";
+const PREPARE_FUNCTION: &str =
+    "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect";
 const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
@@ -110,7 +111,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
             ]),
             BTreeSet::new(),
-            contiguous_bindings(13),
+            contiguous_bindings(11),
             ESTIMATOR_ID,
             ContractVersion::new(1, 0),
             estimator_fingerprint,
@@ -250,6 +251,8 @@ struct AttentionShape {
     value_head_dim: u64,
     qkv_features: u64,
     value_features: u64,
+    qkvz_features: u64,
+    ba_features: u64,
     conv_kernel: u64,
     conv_state_width: u64,
     epsilon: f32,
@@ -268,6 +271,8 @@ impl AttentionShape {
             value_head_dim: unsigned_attribute(attributes, "value_head_dim")?,
             qkv_features: unsigned_attribute(attributes, "qkv_features")?,
             value_features: unsigned_attribute(attributes, "value_features")?,
+            qkvz_features: unsigned_attribute(attributes, "qkvz_features")?,
+            ba_features: unsigned_attribute(attributes, "ba_features")?,
             conv_kernel: unsigned_attribute(attributes, "conv_kernel")?,
             conv_state_width: unsigned_attribute(attributes, "conv_state_width")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
@@ -301,6 +306,16 @@ impl AttentionShape {
             || shape.value_heads % shape.key_heads != 0
             || shape.qkv_features != expected_qkv
             || shape.value_features != expected_value
+            || shape.qkvz_features
+                != shape
+                    .qkv_features
+                    .checked_add(shape.value_features)
+                    .ok_or_else(|| "attention QKVZ width overflows".to_owned())?
+            || shape.ba_features
+                != shape
+                    .value_heads
+                    .checked_mul(2)
+                    .ok_or_else(|| "attention BA width overflows".to_owned())?
             || shape.conv_state_width != shape.conv_kernel - 1
         {
             return Err("recurrent attention attributes are inconsistent".to_owned());
@@ -332,10 +347,9 @@ impl AttentionShape {
         [
             (1, ElementType::U32),
             (self.hidden_size, ElementType::F16),
-            (self.qkv_features, ElementType::F16),
+            (self.qkvz_features, ElementType::F16),
+            (self.ba_features, ElementType::F16),
             (self.value_features, ElementType::F16),
-            (self.value_heads, ElementType::F16),
-            (self.value_heads, ElementType::F16),
             (qk_features, ElementType::F32),
             (qk_features, ElementType::F32),
             (self.value_features, ElementType::F32),
@@ -432,10 +446,9 @@ struct ScratchLayout {
     conv_state: u64,
     token_seq_indices: u64,
     normalized: u64,
-    qkv: u64,
+    qkvz: u64,
     z_or_activation: u64,
-    b: u64,
-    a: u64,
+    ba: u64,
     query: u64,
     key: u64,
     value: u64,
@@ -461,27 +474,21 @@ impl ScratchLayout {
             ElementType::F16,
             total_tokens,
         )?;
-        let qkv = reserve_tokens(
+        let qkvz = reserve_tokens(
             &mut offset,
-            shape.qkv_features,
+            shape.qkvz_features,
+            ElementType::F16,
+            total_tokens,
+        )?;
+        let ba = reserve_tokens(
+            &mut offset,
+            shape.ba_features,
             ElementType::F16,
             total_tokens,
         )?;
         let z_or_activation = reserve_tokens(
             &mut offset,
             shape.value_features,
-            ElementType::F16,
-            total_tokens,
-        )?;
-        let b = reserve_tokens(
-            &mut offset,
-            shape.value_heads,
-            ElementType::F16,
-            total_tokens,
-        )?;
-        let a = reserve_tokens(
-            &mut offset,
-            shape.value_heads,
             ElementType::F16,
             total_tokens,
         )?;
@@ -541,10 +548,9 @@ impl ScratchLayout {
             conv_state,
             token_seq_indices,
             normalized,
-            qkv,
+            qkvz,
             z_or_activation,
-            b,
-            a,
+            ba,
             query,
             key,
             value,
@@ -612,10 +618,8 @@ struct AttentionStateBinding {
 #[derive(Debug, Clone, Copy)]
 struct SharedRegions {
     input_norm: usize,
-    qkv: usize,
-    z: usize,
-    b: usize,
-    a: usize,
+    qkvz: usize,
+    ba: usize,
     conv: usize,
     a_log: usize,
     dt_bias: usize,
@@ -667,15 +671,13 @@ fn encode_attention(
     let mut compute_regions = Vec::new();
     let shared = SharedRegions {
         input_norm: push_shared_weight(&mut compute_regions, &invocation, 1, ElementType::F16)?,
-        qkv: push_shared_weight(&mut compute_regions, &invocation, 2, ElementType::F16)?,
-        z: push_shared_weight(&mut compute_regions, &invocation, 3, ElementType::F16)?,
-        b: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F16)?,
-        a: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F16)?,
-        conv: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F16)?,
-        a_log: push_shared_weight(&mut compute_regions, &invocation, 7, ElementType::F32)?,
-        dt_bias: push_shared_weight(&mut compute_regions, &invocation, 8, ElementType::F32)?,
-        norm: push_shared_weight(&mut compute_regions, &invocation, 9, ElementType::F32)?,
-        output: push_shared_weight(&mut compute_regions, &invocation, 10, ElementType::F16)?,
+        qkvz: push_shared_weight(&mut compute_regions, &invocation, 2, ElementType::F16)?,
+        ba: push_shared_weight(&mut compute_regions, &invocation, 3, ElementType::F16)?,
+        conv: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F16)?,
+        a_log: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F32)?,
+        dt_bias: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F32)?,
+        norm: push_shared_weight(&mut compute_regions, &invocation, 7, ElementType::F32)?,
+        output: push_shared_weight(&mut compute_regions, &invocation, 8, ElementType::F16)?,
         scratch: {
             let index = compute_regions.len();
             compute_regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
@@ -733,12 +735,12 @@ fn encode_attention(
         )?);
         let conv_state = contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 11)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
             ElementType::F16,
         )?;
         let delta_state = contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 12)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 10)?,
             ElementType::F32,
         )?;
         let first_state_region = binding_regions.len();
@@ -792,6 +794,8 @@ fn encode_attention(
     .u64(shape.value_head_dim)
     .u64(shape.qkv_features)
     .u64(shape.value_features)
+    .u64(shape.qkvz_features)
+    .u64(shape.ba_features)
     .u64(shape.conv_kernel)
     .u64(shape.conv_state_width)
     .f32(shape.epsilon)
@@ -897,7 +901,7 @@ fn encode_attention(
                 DeviceBatchingForm::ParticipantLoop,
                 participant_count,
                 total_tokens,
-                u64::from(participant_count) * 13,
+                u64::from(participant_count) * 11,
                 u64::from(participant_count) * 2,
             )
         })
@@ -1036,10 +1040,9 @@ fn enqueue_attention(
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
     let normalized = scratch_pointer(scratch_base, layout.normalized)?;
-    let qkv = scratch_pointer(scratch_base, layout.qkv)?;
+    let qkvz = scratch_pointer(scratch_base, layout.qkvz)?;
+    let ba = scratch_pointer(scratch_base, layout.ba)?;
     let z = scratch_pointer(scratch_base, layout.z_or_activation)?;
-    let b = scratch_pointer(scratch_base, layout.b)?;
-    let a = scratch_pointer(scratch_base, layout.a)?;
     let query = scratch_pointer(scratch_base, layout.query)?;
     let key = scratch_pointer(scratch_base, layout.key)?;
     let value = scratch_pointer(scratch_base, layout.value)?;
@@ -1061,10 +1064,20 @@ fn enqueue_attention(
         cuda.epsilon,
     )?;
     for (weight, destination, out_features, operation) in [
-        (shared.qkv, qkv, cuda.qkv_features, "attention QKV GEMM"),
-        (shared.z, z, cuda.value_features, "attention Z GEMM"),
-        (shared.b, b, cuda.value_heads, "attention B GEMM"),
-        (shared.a, a, cuda.value_heads, "attention A GEMM"),
+        (
+            shared.qkvz,
+            qkvz,
+            checked_i32(shape.qkvz_features, "attention QKVZ width")
+                .map_err(CudaDeviceRuntimeError::contract)?,
+            "attention QKVZ GEMM",
+        ),
+        (
+            shared.ba,
+            ba,
+            checked_i32(shape.ba_features, "attention BA width")
+                .map_err(CudaDeviceRuntimeError::contract)?,
+            "attention BA GEMM",
+        ),
     ] {
         launch_gemm_f16(
             blas,
@@ -1081,11 +1094,10 @@ fn enqueue_attention(
     launch_prepare(
         stream,
         &functions.prepare,
-        qkv,
+        qkvz,
+        ba,
         regions[shared.conv].device_ptr(),
         state_binding,
-        a,
-        b,
         regions[shared.a_log].device_ptr(),
         regions[shared.dt_bias].device_ptr(),
         cu_seqlens,
@@ -1093,6 +1105,7 @@ fn enqueue_attention(
         query,
         key,
         value,
+        z,
         g,
         beta,
         final_conv_state,
@@ -1186,11 +1199,10 @@ fn enqueue_attention(
 fn launch_prepare(
     stream: &CudaStream,
     function: &CudaFunction,
-    qkv: u64,
+    qkvz: u64,
+    ba: u64,
     conv_weight: u64,
     state_binding: u64,
-    a: u64,
-    b: u64,
     a_log: u64,
     dt_bias: u64,
     cu_seqlens: u64,
@@ -1198,6 +1210,7 @@ fn launch_prepare(
     query: u64,
     key: u64,
     value: u64,
+    z: u64,
     g: u64,
     beta: u64,
     final_conv_state: u64,
@@ -1224,11 +1237,10 @@ fn launch_prepare(
     let grid = checked_grid(total, THREADS_PER_BLOCK, "attention prepare")?;
     let mut builder = stream.launch_builder(function);
     let pointers = [
-        qkv,
+        qkvz,
+        ba,
         conv_weight,
         state_binding,
-        a,
-        b,
         a_log,
         dt_bias,
         cu_seqlens,
@@ -1236,6 +1248,7 @@ fn launch_prepare(
         query,
         key,
         value,
+        z,
         g,
         beta,
         final_conv_state,
@@ -1555,44 +1568,34 @@ fn validate_signature(
         (value(1)?, vec![shape.hidden_size], ElementType::F16),
         (
             value(2)?,
-            vec![shape.qkv_features, shape.hidden_size],
+            vec![shape.qkvz_features, shape.hidden_size],
             ElementType::F16,
         ),
         (
             value(3)?,
-            vec![shape.value_features, shape.hidden_size],
+            vec![shape.ba_features, shape.hidden_size],
             ElementType::F16,
         ),
         (
             value(4)?,
-            vec![shape.value_heads, shape.hidden_size],
-            ElementType::F16,
-        ),
-        (
-            value(5)?,
-            vec![shape.value_heads, shape.hidden_size],
-            ElementType::F16,
-        ),
-        (
-            value(6)?,
             vec![shape.qkv_features, shape.conv_kernel],
             ElementType::F16,
         ),
-        (value(7)?, vec![shape.value_heads], ElementType::F32),
-        (value(8)?, vec![shape.value_heads], ElementType::F32),
-        (value(9)?, vec![shape.value_head_dim], ElementType::F32),
+        (value(5)?, vec![shape.value_heads], ElementType::F32),
+        (value(6)?, vec![shape.value_heads], ElementType::F32),
+        (value(7)?, vec![shape.value_head_dim], ElementType::F32),
         (
-            value(10)?,
+            value(8)?,
             vec![shape.hidden_size, shape.value_features],
             ElementType::F16,
         ),
         (
-            value(11)?,
+            value(9)?,
             vec![shape.qkv_features, shape.conv_state_width],
             ElementType::F16,
         ),
         (
-            value(12)?,
+            value(10)?,
             vec![shape.value_heads, shape.value_head_dim, shape.key_head_dim],
             ElementType::F32,
         ),

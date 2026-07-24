@@ -583,7 +583,7 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
 pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(4, 0),
+        version: ContractVersion::new(5, 0),
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
@@ -596,22 +596,12 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
-                vec![symbol("qkv_features"), symbol("hidden_size")],
+                vec![symbol("qkvz_features"), symbol("hidden_size")],
                 [ElementType::F16],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
-                vec![symbol("value_features"), symbol("hidden_size")],
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
-            contiguous_tensor(
-                vec![symbol("value_heads"), symbol("hidden_size")],
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
-            contiguous_tensor(
-                vec![symbol("value_heads"), symbol("hidden_size")],
+                vec![symbol("ba_features"), symbol("hidden_size")],
                 [ElementType::F16],
                 TensorAccess::Read,
             )?,
@@ -669,6 +659,8 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
             unsigned_attribute("value_head_dim")?,
             unsigned_attribute("qkv_features")?,
             unsigned_attribute("value_features")?,
+            unsigned_attribute("qkvz_features")?,
+            unsigned_attribute("ba_features")?,
             unsigned_attribute("conv_kernel")?,
             unsigned_attribute("conv_state_width")?,
             positive_epsilon_attribute("epsilon")?,
@@ -686,7 +678,7 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(
             GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-            ContractVersion::new(4, 0),
+            ContractVersion::new(5, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -1209,8 +1201,8 @@ mod tests {
                 .validate_signature(&descriptor.inputs, &descriptor.outputs)
                 .unwrap();
         }
-        assert_eq!(linear.descriptor().inputs.len(), 13);
-        assert_eq!(linear.descriptor().version, ContractVersion::new(4, 0));
+        assert_eq!(linear.descriptor().inputs.len(), 11);
+        assert_eq!(linear.descriptor().version, ContractVersion::new(5, 0));
         assert_eq!(
             linear.descriptor().resources.binding,
             ResourcePresenceRequirement::Optional
@@ -1221,7 +1213,7 @@ mod tests {
         );
         assert_eq!(
             linear.descriptor().provider.minimum_version,
-            ContractVersion::new(4, 0)
+            ContractVersion::new(5, 0)
         );
         for (name, values) in [
             (
@@ -1250,18 +1242,18 @@ mod tests {
                 AttributeConstraint::TextChoices { values }
             );
         }
-        for ordinal in [7, 8, 9, 12] {
+        for ordinal in [5, 6, 7, 10] {
             assert_eq!(
                 linear.descriptor().inputs[ordinal].element_types(),
                 &BTreeSet::from([ElementType::F32])
             );
         }
         assert_eq!(
-            linear.descriptor().inputs[11].access(),
+            linear.descriptor().inputs[9].access(),
             TensorAccess::ReadWrite
         );
         assert_eq!(
-            linear.descriptor().inputs[12].access(),
+            linear.descriptor().inputs[10].access(),
             TensorAccess::ReadWrite
         );
         assert_eq!(full.descriptor().inputs.len(), 9);

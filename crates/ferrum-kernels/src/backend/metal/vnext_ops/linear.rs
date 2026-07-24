@@ -1356,6 +1356,119 @@ pub(super) fn append_shared_matrix_weight(
     Ok(part)
 }
 
+pub(super) fn append_shared_partitioned_matrix_weight(
+    regions: &mut Vec<MetalBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    ordinal: u32,
+    out_features: u64,
+    in_features: u64,
+    context: &str,
+) -> Result<Vec<PreparedLinearPart>, String> {
+    let first = &invocation.participants()[0];
+    let resolved = resolve_weight(
+        first,
+        binding(first.bindings(), ResolvedValueRole::Input, ordinal)?,
+    )?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = resolve_weight(
+            participant,
+            binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
+        )?;
+        if !same_resolved_weight(&resolved, &candidate) {
+            return Err(format!("{context} participants do not share one weight"));
+        }
+    }
+    let prepared = prepare_partitioned_matrix_weight(resolved, out_features, in_features)?;
+    let region_base = regions.len();
+    let parts = prepared
+        .parts
+        .into_iter()
+        .map(|part| {
+            Ok(PreparedLinearPart {
+                region: part
+                    .region
+                    .checked_add(region_base)
+                    .ok_or_else(|| format!("{context} region index overflows"))?,
+                ..part
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if parts.is_empty() {
+        return Err(format!("{context} resolved no physical matrix"));
+    }
+    regions.extend(prepared.regions);
+    Ok(parts)
+}
+
+fn prepare_partitioned_matrix_weight(
+    weight: MetalResolvedWeight,
+    out_features: u64,
+    in_features: u64,
+) -> Result<PreparedLinearWeight, String> {
+    if weight.logical_element_type() != ElementType::F16
+        || weight.logical_dimensions() != [out_features, in_features]
+    {
+        return Err("Metal partitioned linear logical weight differs from its contract".to_owned());
+    }
+    let format_id = weight.format_id().as_str().to_owned();
+    let (regions, components, layout) = weight.into_command_parts();
+    let mut parts = match &layout {
+        MetalResolvedWeightLayout::Composite { parts } => {
+            let mut prepared = Vec::with_capacity(parts.len());
+            for part in parts {
+                if part.logical_offsets.len() != 2
+                    || part.extents.len() != 2
+                    || part.logical_offsets[1] != 0
+                    || part.extents[1] != in_features
+                {
+                    return Err(
+                        "Metal partitioned linear composite has invalid row placement".to_owned(),
+                    );
+                }
+                prepared.push(prepare_leaf_part(
+                    &format_id,
+                    &regions,
+                    &components,
+                    &part.layout,
+                    part.extents[0],
+                    in_features,
+                    1,
+                    part.logical_offsets[0],
+                )?);
+            }
+            prepared
+        }
+        _ => vec![prepare_leaf_part(
+            &format_id,
+            &regions,
+            &components,
+            &layout,
+            out_features,
+            in_features,
+            1,
+            0,
+        )?],
+    };
+    parts.sort_by_key(|part| part.output_offset);
+    let mut next_output = 0_u64;
+    for part in &parts {
+        if u64::from(part.output_offset) != next_output {
+            return Err(
+                "Metal partitioned linear composite overlaps or leaves a row gap".to_owned(),
+            );
+        }
+        next_output = next_output
+            .checked_add(u64::from(part.out_features))
+            .ok_or_else(|| "Metal partitioned linear output width overflows".to_owned())?;
+    }
+    if next_output != out_features {
+        return Err(
+            "Metal partitioned linear composite does not cover its output width".to_owned(),
+        );
+    }
+    Ok(PreparedLinearWeight { regions, parts })
+}
+
 pub(super) fn append_shared_gate_up_weight(
     regions: &mut Vec<MetalBufferRegion>,
     invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
