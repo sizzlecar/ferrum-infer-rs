@@ -393,6 +393,32 @@ Vast `45319871` 已确认 `stopped/exited`，库存中 billable/transitional sib
 本检查点只关闭 product profile wiring failure class；没有运行 throughput sweep，
 `formal_g06_complete=false`、`formal_g09_performance_progress=false`。
 
+### Identity materialization attribution source contract（2026-07-25）
+
+现有 `wave_identity_bind` 只能报告总耗时，不能区分“一个 physical wave 的逻辑拓扑规模”与
+“提交前真正需要构造的 exact identity 数”，因此无法验证 immutable plan 是否仍在热路径被完整
+重建。新的 source contract 在 executor health 中增加：
+
+```text
+counters.identity_materialization.waves
+counters.identity_materialization.logical_nodes
+counters.identity_materialization.nodes_materialized_before_submit
+counters.identity_materialization.full_participant_materializations_before_submit
+```
+
+这些字段是四个有界 atomic counter 的 snapshot，不创建 profile sink、采集线程或事件序列化；
+profile 默认关闭时仍可用于 release artifact 的结构检查。`logical_nodes` 统计提交成功的逻辑 plan
+nodes；`nodes_materialized_before_submit` 统计 encode/submit 实际要求的 exact node identities；
+`full_participant_materializations_before_submit` 只要完整聚合 participant projection 在 submit
+返回前被构造就递增。failed/definitely-not-submitted attempt 不伪装成成功 wave，仍由既有 failure
+和 retry counters 解释。
+
+本地 contract 必须证明 lazy identity 展开后与既有 eager path 的 node/participant execution
+identity 逐项相同，成功 submission/completion 在无 event/profile consumer 时不强制展开完整
+participant projection，failure/replay/serialization 仍可取得精确投影。CUDA 的数值门和
+KEEP/REJECT 合同由 [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) 定义；在真实 CUDA artifact
+产生前，本节只算 source observability contract，不关闭 G06。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
