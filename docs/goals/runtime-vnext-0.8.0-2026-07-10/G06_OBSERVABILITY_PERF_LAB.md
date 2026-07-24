@@ -339,6 +339,60 @@ validation：clean SHA CUDA feature build/type-check 后先通过一个 `run` �
 direct fallback 与 catalog-epoch miss 均为 `0`。任一条件失败即 copy back REJECT artifact
 并停止实例；本轮不得运行 throughput sweep。当前实例已确认 `stopped/exited`。
 
+### Direct-path Replay 产品接线 REJECT -> PASS 检查点（2026-07-25）
+
+第一次 bounded CUDA validation 使用 clean source
+`4959c9495e7d9e82e437f3c0f950abdebd8ce340`、binary SHA256
+`d132cbaa8c3772a3e198a62599f799cbcbb5623e7ea298d13b315b196387644f`。Qwen3.5
+三轮 `ferrum run` 正确输出 `ACKNOWLEDGED`、`CONTINUE`、`G06-replay-001-OK`，但公开
+`--profile-detail replay --profile-jsonl <path>` 没有创建 JSONL。源码确认
+`ContinuousBatchEngine` 当时只从 `scheduler_trace_jsonl` 创建 vNext execution event
+journal，`profile_jsonl` 虽出现在 CLI effective config，却没有进入 typed engine runtime
+config。该轮按预声明停止线产出
+`REJECT_PRODUCT_PROFILE_WIRING`，failure class 为
+`profile_jsonl_not_connected_to_vnext_execution_event_journal`，没有继续 `serve` 或
+throughput。artifact 位于 GitHub branch
+`artifact/runtime-vnext-direct-replay-profiler-4959c949-20260724`，commit
+`79853322343884ad49bf9d68785f5107ada7e662`；本机路径为
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-direct-replay-profiler-4959c949-20260724T185543Z/`。
+
+source fix `a199da562f8df6a39c203a8b4dc930fc633e51ee` 将 product profile path 加入
+`RuntimeKnobs`，由 `run`/`serve` 的同一 typed snapshot 注入引擎；vNext event sink
+可同时写 product profile 与 scheduler journal，相同路径只保留一个 journal。product
+profile journal 打开失败会阻止引擎构造，scheduler compatibility path 仍保留既有
+fail-soft 行为。关闭时所有唯一 journal 都执行 drain/close。提交前通过 typed config、
+product journal construction、双 journal fan-out、Replay physical timing 和三 crate
+check；没有用第二个 hidden setting 绕过产品接线。
+
+随后在同一 retained 1x RTX 4090 上使用 clean source `a199da56` 构建 CUDA release
+binary，构建耗时 `5m11s`，binary SHA256 为
+`ac6179f2765a98fa9fb89fc1207b525baac8272a8f5b31853ded25a8dbff20ab`。真实产品验证结果：
+
+- `ferrum run` 三轮正确性继续通过；`run.profile.jsonl` 为 `9,360` 行且逐行可解析，
+  `19/19` physical submission measured，`16/16` reusable span 带 fingerprint，
+  missing fingerprint 为 `0`；
+- 同 binary 的 `ferrum serve` 非流式返回 `Paris` 和完整 usage；流式返回 `Paris`、
+  唯一 `[DONE]`、唯一 usage row；`serve.profile.jsonl` 为 `2,974` 行且逐行可解析，
+  `6/6` physical submission measured，`46/46` reusable span 带 fingerprint；
+- serve health 的 typed executor counters 为 `direct_waves=6`、`direct_segments=46`、
+  `direct_fallbacks=0`、`catalog_misses=0`、`catalog_epoch_misses=0`；两端 failure scan
+  均无 panic、OOM、CUDA error、乱码、`<unk>` 或 `[PAD]`。
+
+最终 validator 从原始 stdout、SSE、health 和两份 profile 重新计算以上结果，并打印：
+
+```text
+CUDA DIRECT REPLAY PRODUCT PROFILE WIRING PASS: /workspace/ferrum-artifacts/runtime-vnext-direct-replay-profiler-wiring-a199da56-20260724T194156Z
+```
+
+完整 artifact 已通过 GitHub branch
+`artifact/runtime-vnext-direct-replay-profiler-wiring-a199da56-20260724` 回传，最新 commit
+为 `88851350871639d1671a84f900342f4e81cb2576`；archive SHA256 为
+`17ac7b531d14b232d38b1b1163729f75e108f16f092e2c517d5bb22d54fab74e`，本机路径为
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-direct-replay-profiler-wiring-a199da56-20260724T194156Z/`。
+Vast `45319871` 已确认 `stopped/exited`，库存中 billable/transitional sibling 为 `0`。
+本检查点只关闭 product profile wiring failure class；没有运行 throughput sweep，
+`formal_g06_complete=false`、`formal_g09_performance_progress=false`。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
