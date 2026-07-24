@@ -1006,9 +1006,9 @@ impl MetalSubmissionEncoder {
 
     fn begin_command(&mut self, command_index: u32, command_label: &'static str) {
         if self.profile_enabled {
-            // A full-profile run deliberately gives every native command an
-            // encoder boundary so Metal System Trace can attribute GPU time
-            // to the same native_op_id emitted by Ferrum's typed profile.
+            // Physical-span profiling gives every core command an encoder
+            // boundary. Full profiling additionally maps those intervals to
+            // native operations; replay profiling retains only physical time.
             self.end_compute();
             self.current_command_index = Some(command_index);
             self.command_label = Some(command_label);
@@ -1736,18 +1736,21 @@ impl MetalDeviceRuntime {
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => MetalFenceTiming::NotRequested,
-            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
+            DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
                 MetalFenceTiming::CommandBuffer
             }
         };
         drop(begin_timing_stage);
 
         let command_buffer = stream.queue.new_command_buffer().to_owned();
+        let physical_span_attribution = timing_mode.physical_span_attribution_enabled();
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
         if kernel_attribution {
             command_buffer.set_label("ferrum.vnext.full_profile");
+        } else if physical_span_attribution {
+            command_buffer.set_label("ferrum.vnext.replay_profile");
         }
-        let counter_capture = if kernel_attribution {
+        let counter_capture = if physical_span_attribution {
             match self.timestamp_counter_support() {
                 MetalTimestampCounterSupport::Supported(counter_set) => Some(
                     MetalCounterCaptureBuilder::new(self.device.clone(), counter_set),
@@ -1757,8 +1760,11 @@ impl MetalDeviceRuntime {
         } else {
             None
         };
-        let mut encoder =
-            MetalSubmissionEncoder::new(&command_buffer, kernel_attribution, counter_capture);
+        let mut encoder = MetalSubmissionEncoder::new(
+            &command_buffer,
+            physical_span_attribution,
+            counter_capture,
+        );
         let mut attribution = kernel_attribution.then(|| Vec::with_capacity(entries.len()));
         let enqueue_stage =
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
@@ -1789,7 +1795,7 @@ impl MetalDeviceRuntime {
             }
         }
         let counter_capture = encoder.finish();
-        let command_timing = match (kernel_attribution, counter_capture) {
+        let command_timing = match (physical_span_attribution, counter_capture) {
             (false, _) => MetalFenceCommandTiming::NotRequested,
             (true, Some(capture)) => MetalFenceCommandTiming::Captured {
                 capture,
@@ -2667,6 +2673,40 @@ mod tests {
         assert_eq!(intervals.len(), 1);
         assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
         assert!(timing.measurement().elapsed_ns().unwrap() > 0);
+    }
+
+    #[test]
+    fn replay_profile_reports_physical_timing_without_native_attribution() {
+        let runtime = runtime();
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/replay-profile-destination"))
+            .expect("destination allocation");
+        let command = runtime
+            .encode_zero(&destination, 0, 8)
+            .expect("zero command");
+        let mut stream = runtime.create_stream().expect("stream");
+
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                compute_entries(vec![command]),
+                DeviceTimingMode::Replay,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .expect("replay-profiled submission");
+        assert!(runtime.submission_attribution(&fence).is_none());
+
+        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+        assert!(terminal.terminal().is_succeeded());
+        assert!(matches!(
+            terminal.execution_timing(),
+            DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
+        ));
+        let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
+            panic!("Metal replay profile must report physical command timing")
+        };
+        assert_eq!(timing.command_count(), 1);
+        assert_eq!(timing.spans().len(), 1);
     }
 
     #[test]

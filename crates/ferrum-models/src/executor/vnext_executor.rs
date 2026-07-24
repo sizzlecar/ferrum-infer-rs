@@ -57,6 +57,7 @@ const DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS: u32 = 1;
 const MAX_DEFINITELY_NOT_SUBMITTED_RETRIES: u32 = 1;
 const MAX_BACKING_MAINTENANCE_ATTEMPTS: u32 = 2;
 const MAX_EXTENSION_RECHECKS: u32 = 2;
+const MAX_PROFILED_REUSABLE_EXECUTABLES: usize = 256;
 
 type VNextDriver<R> = RuntimeResourceDriver<R>;
 
@@ -965,10 +966,137 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingSink<'_> {
 }
 
 #[derive(Default)]
+struct VNextPhysicalSpanDurationSummary {
+    samples: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+
+impl VNextPhysicalSpanDurationSummary {
+    fn record(&mut self, elapsed_ns: u64) {
+        self.samples = self.samples.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(elapsed_ns);
+        self.max_ns = self.max_ns.max(elapsed_ns);
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "samples": self.samples,
+            "total_ns": self.total_ns,
+            "average_us": if self.samples == 0 {
+                0.0
+            } else {
+                self.total_ns as f64 / self.samples as f64 / 1_000.0
+            },
+            "max_us": self.max_ns as f64 / 1_000.0,
+        })
+    }
+}
+
+#[derive(Default)]
+struct VNextPhysicalSpanTimingMetrics {
+    measured_submissions: AtomicU64,
+    unavailable_submissions: AtomicU64,
+    eager_commands: AtomicDurationMetrics,
+    reusable_executables: AtomicDurationMetrics,
+    unavailable_spans: AtomicU64,
+    reusable_without_fingerprint: AtomicU64,
+    fingerprint_capacity_exhausted: AtomicU64,
+    reusable_by_fingerprint: Mutex<BTreeMap<String, VNextPhysicalSpanDurationSummary>>,
+}
+
+impl VNextPhysicalSpanTimingMetrics {
+    fn record(&self, measurement: &DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>) {
+        let timing = match measurement {
+            DeviceTimingMeasurement::Measured(timing) => {
+                self.measured_submissions.fetch_add(1, Ordering::Relaxed);
+                timing
+            }
+            DeviceTimingMeasurement::Unavailable(_) => {
+                self.unavailable_submissions.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            DeviceTimingMeasurement::NotRequested => return,
+        };
+        for span in timing.spans() {
+            let Some(elapsed_ns) = span.measurement().elapsed_ns() else {
+                self.unavailable_spans.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match span.kind() {
+                DeviceExecutionSpanKind::EagerCommand => {
+                    self.eager_commands.record(Duration::from_nanos(elapsed_ns));
+                }
+                DeviceExecutionSpanKind::ReusableExecutable => {
+                    self.reusable_executables
+                        .record(Duration::from_nanos(elapsed_ns));
+                    let Some(fingerprint) = span.reusable_executable_fingerprint() else {
+                        self.reusable_without_fingerprint
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    let mut summaries = self.reusable_by_fingerprint.lock();
+                    if let Some(summary) = summaries.get_mut(fingerprint) {
+                        summary.record(elapsed_ns);
+                    } else if summaries.len() < MAX_PROFILED_REUSABLE_EXECUTABLES {
+                        let mut summary = VNextPhysicalSpanDurationSummary::default();
+                        summary.record(elapsed_ns);
+                        summaries.insert(fingerprint.to_owned(), summary);
+                    } else {
+                        self.fingerprint_capacity_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let reusable_by_fingerprint = self
+            .reusable_by_fingerprint
+            .lock()
+            .iter()
+            .map(|(fingerprint, summary)| {
+                serde_json::json!({
+                    "reusable_executable_fingerprint": fingerprint,
+                    "timing": summary.snapshot(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "scope": "physical_execution_span",
+            "measured_submissions": self.measured_submissions.load(Ordering::Relaxed),
+            "unavailable_submissions": self.unavailable_submissions.load(Ordering::Relaxed),
+            "eager_commands": self.eager_commands.snapshot(),
+            "reusable_executables": self.reusable_executables.snapshot(),
+            "unavailable_spans": self.unavailable_spans.load(Ordering::Relaxed),
+            "reusable_without_fingerprint": self.reusable_without_fingerprint.load(Ordering::Relaxed),
+            "fingerprint_capacity": MAX_PROFILED_REUSABLE_EXECUTABLES,
+            "fingerprint_capacity_exhausted": self.fingerprint_capacity_exhausted.load(Ordering::Relaxed),
+            "reusable_by_fingerprint": reusable_by_fingerprint,
+        })
+    }
+
+    fn reset(&self) {
+        self.measured_submissions.store(0, Ordering::Relaxed);
+        self.unavailable_submissions.store(0, Ordering::Relaxed);
+        self.eager_commands.reset();
+        self.reusable_executables.reset();
+        self.unavailable_spans.store(0, Ordering::Relaxed);
+        self.reusable_without_fingerprint
+            .store(0, Ordering::Relaxed);
+        self.fingerprint_capacity_exhausted
+            .store(0, Ordering::Relaxed);
+        self.reusable_by_fingerprint.lock().clear();
+    }
+}
+
+#[derive(Default)]
 struct VNextDeviceTimingMetrics {
     device_execution: AtomicDurationMetrics,
     fence_wait_host: AtomicDurationMetrics,
     readback_host: AtomicDurationMetrics,
+    physical_spans: VNextPhysicalSpanTimingMetrics,
     readback_calls: AtomicU64,
     readback_bytes: AtomicU64,
     device_unavailable: AtomicU64,
@@ -979,6 +1107,8 @@ struct VNextDeviceTimingMetrics {
 impl VNextDeviceTimingMetrics {
     fn record(&self, receipt: &CompletionReadbackBatchReceipt) {
         let fence = receipt.completion().fence_timing();
+        self.physical_spans
+            .record(receipt.completion().submission_timing());
         match fence.device_execution() {
             DeviceTimingMeasurement::Measured(timing) => self
                 .device_execution
@@ -1023,6 +1153,7 @@ impl VNextDeviceTimingMetrics {
             "device_execution": self.device_execution.snapshot(),
             "fence_wait_host": self.fence_wait_host.snapshot(),
             "readback_host": self.readback_host.snapshot(),
+            "physical_submission_spans": self.physical_spans.snapshot(),
             "readback_calls": self.readback_calls.load(Ordering::Relaxed),
             "readback_bytes": self.readback_bytes.load(Ordering::Relaxed),
             "unavailable": {
@@ -1047,6 +1178,7 @@ impl VNextDeviceTimingMetrics {
         self.device_execution.reset();
         self.fence_wait_host.reset();
         self.readback_host.reset();
+        self.physical_spans.reset();
         for counter in [
             &self.readback_calls,
             &self.readback_bytes,
@@ -3296,6 +3428,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn device_timing_mode(&self) -> DeviceTimingMode {
         match self.device_timing_mode.load(Ordering::Acquire) {
             value if value == DeviceTimingMode::Kernel as u8 => DeviceTimingMode::Kernel,
+            value if value == DeviceTimingMode::Replay as u8 => DeviceTimingMode::Replay,
             value if value == DeviceTimingMode::Completion as u8 => DeviceTimingMode::Completion,
             _ => DeviceTimingMode::Off,
         }
@@ -4707,6 +4840,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     }
                 }
                 Err(error) => {
+                    execution_event_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        } else if !matches!(
+            receipt.completion().submission_timing(),
+            DeviceTimingMeasurement::NotRequested
+        ) {
+            let sink = self.event_sink.read().clone();
+            if let Some(sink) = sink {
+                if let Err(error) =
+                    sink.record_physical_device_submission_timing(receipt.completion())
+                {
                     execution_event_error.get_or_insert_with(|| error.to_string());
                 }
             }
@@ -6430,13 +6575,16 @@ mod tests {
         reported_allocated_bytes, resolve_reusable_execution_policy, resolved_sequence_fit_policy,
         reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
         AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
-        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPreparedWaveTopologyMetrics,
-        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
+        VNextPreparedWaveTopologyMetrics, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
+        VNextWaveTimingSink,
     };
     use ferrum_interfaces::vnext::{
+        DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionSpanKind,
         DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-        DeviceReusableExecutionPreparation, DeviceSubmissionTimingSink,
+        DeviceReusableExecutionPreparation, DeviceSubmissionExecutionSpan,
+        DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTimingMeasurement,
         StepResourceAdmissionProfilePhase,
     };
 
@@ -6735,6 +6883,50 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.as_str().unwrap().contains("must not be added")));
+    }
+
+    #[test]
+    fn physical_span_metrics_group_replay_time_by_executable_fingerprint() {
+        let eager = DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            vec![
+                DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 0, 10).unwrap(),
+            ],
+        )
+        .unwrap();
+        let replay = DeviceSubmissionExecutionSpan::measured(
+            1,
+            2,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            vec![
+                DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 50).unwrap(),
+            ],
+        )
+        .unwrap()
+        .with_reusable_executable_fingerprint("a".repeat(64))
+        .unwrap();
+        let timing = DeviceSubmissionExecutionTiming::from_spans(2, vec![eager, replay]).unwrap();
+        let metrics = VNextPhysicalSpanTimingMetrics::default();
+
+        metrics.record(&DeviceTimingMeasurement::Measured(timing));
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot["measured_submissions"], 1);
+        assert_eq!(snapshot["eager_commands"]["total_ns"], 10);
+        assert_eq!(snapshot["reusable_executables"]["total_ns"], 40);
+        assert_eq!(
+            snapshot["reusable_by_fingerprint"][0]["reusable_executable_fingerprint"],
+            "a".repeat(64)
+        );
+        assert_eq!(
+            snapshot["reusable_by_fingerprint"][0]["timing"]["total_ns"],
+            40
+        );
+
+        metrics.reset();
+        assert_eq!(metrics.snapshot()["measured_submissions"], 0);
     }
 
     #[test]

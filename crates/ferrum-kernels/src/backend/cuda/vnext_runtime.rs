@@ -2036,6 +2036,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .into_iter()
             .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
+        let physical_span_attribution = timing_mode.physical_span_attribution_enabled();
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
         if kernel_attribution {
             vnext_tool_correlation::prepare();
@@ -2192,7 +2193,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
-            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
+            DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
                 match stream
                     .stream
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -2206,17 +2207,46 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
-        let mut command_spans = kernel_attribution.then(|| Vec::with_capacity(commands.len()));
+        let mut command_spans =
+            physical_span_attribution.then(|| Vec::with_capacity(commands.len()));
         let mut index = 0;
         let mut executable_candidate_index = 0;
         while index < commands.len() {
             if let Some(invocation) = commands[index].reusable_execution_invocation() {
-                match stream.executable_cache.launch_program_segment(
+                let start = command_spans.as_ref().and_then(|_| {
+                    stream
+                        .stream
+                        .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .ok()
+                });
+                let launched = stream.executable_cache.launch_program_segment(
                     &stream.stream,
                     invocation,
+                    physical_span_attribution,
                     false,
-                ) {
-                    Ok(Some(_)) => {
+                );
+                let end = command_spans.as_ref().and_then(|_| {
+                    stream
+                        .stream
+                        .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .ok()
+                });
+                match launched {
+                    Ok(Some(launch)) => {
+                        if let Some(command_spans) = command_spans.as_mut() {
+                            command_spans.push(
+                                CudaExecutionSpanEventTiming::new(
+                                    index,
+                                    index + 1,
+                                    DeviceExecutionSpanKind::ReusableExecutable,
+                                    DeviceExecutionIntervalKind::Compute,
+                                    "cuda direct reusable executable",
+                                    launch.reusable_executable_fingerprint(),
+                                    start.zip(end),
+                                )
+                                .expect("CUDA direct replay index was validated as u32"),
+                            );
+                        }
                         if S::ENABLED {
                             replay_observation.observe_replayed_segment(
                                 invocation.segment().logical_command_count() as usize,
@@ -2250,7 +2280,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 .filter(|candidate| candidate.start() == index);
             let replayed = match replay_candidate {
                 Some(candidate)
-                    if kernel_attribution && stream.executable_cache.contains(candidate) =>
+                    if physical_span_attribution && stream.executable_cache.contains(candidate) =>
                 {
                     let start = command_spans.as_ref().and_then(|_| {
                         stream
@@ -2260,9 +2290,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             ))
                             .ok()
                     });
-                    let launched = stream
-                        .executable_cache
-                        .launch(&stream.stream, candidate, true);
+                    let launched = stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        physical_span_attribution,
+                        kernel_attribution,
+                    );
                     let end = command_spans.as_ref().and_then(|_| {
                         stream
                             .stream
@@ -2282,10 +2315,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
                         Err(error) => Some(Err(error)),
                     }
                 }
-                Some(candidate) if !kernel_attribution => {
+                Some(candidate) if !physical_span_attribution => {
                     match stream
                         .executable_cache
-                        .launch(&stream.stream, candidate, false)
+                        .launch(&stream.stream, candidate, false, false)
                     {
                         Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
                         Ok(None) => None,
@@ -2414,7 +2447,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             DeviceTimingMode::Off | DeviceTimingMode::Completion => {
                 CudaFenceCommandTiming::NotRequested
             }
-            DeviceTimingMode::Kernel => command_spans.map_or(
+            DeviceTimingMode::Replay | DeviceTimingMode::Kernel => command_spans.map_or(
                 CudaFenceCommandTiming::Unavailable(
                     DeviceTimingUnavailableReason::BackendMeasurementFailed,
                 ),
@@ -2431,7 +2464,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         );
         let fence_flags = match timing_mode {
             DeviceTimingMode::Off => None,
-            DeviceTimingMode::Completion | DeviceTimingMode::Kernel => {
+            DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
                 Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)
             }
         };

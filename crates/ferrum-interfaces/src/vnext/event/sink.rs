@@ -112,6 +112,13 @@ pub trait ExecutionEventSink: Send + Sync {
         Ok(())
     }
 
+    fn record_physical_device_submission_timing(
+        &self,
+        _completion: &super::super::OperationCompletionReceipt,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+
     fn record(&self, permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError>;
 
     /// Records one cursor-ordered batch. Sinks with a buffered transport should

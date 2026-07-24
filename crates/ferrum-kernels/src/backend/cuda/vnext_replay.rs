@@ -474,6 +474,7 @@ impl CudaExecutableSegment {
         &mut self,
         stream: &CudaStream,
         last_used: u64,
+        retain_profile_identity: bool,
         tool_correlation: bool,
     ) -> Result<(Option<Arc<str>>, Option<Arc<[u32]>>), CudaReplayError> {
         if !self.uploaded {
@@ -483,7 +484,8 @@ impl CudaExecutableSegment {
                 eager_fallback_safe: false,
             });
         }
-        let profile_identity = tool_correlation.then(|| {
+        debug_assert!(!tool_correlation || retain_profile_identity);
+        let profile_identity = retain_profile_identity.then(|| {
             self.profile_identity
                 .get_or_init(|| CudaExecutableProfileIdentity::new(self.key))
         });
@@ -964,6 +966,7 @@ impl CudaExecutableCache {
         &mut self,
         stream: &CudaStream,
         invocation: &DeviceReusableExecutionInvocation,
+        retain_profile_identity: bool,
         tool_correlation: bool,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let Some(program) = self.programs.get(invocation.program_id()) else {
@@ -990,7 +993,7 @@ impl CudaExecutableCache {
             });
         };
         let (reusable_executable_fingerprint, reusable_graph_node_counts) =
-            entry.launch(stream, now, tool_correlation)?;
+            entry.launch(stream, now, retain_profile_identity, tool_correlation)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,
@@ -1028,6 +1031,7 @@ impl CudaExecutableCache {
         &mut self,
         stream: &CudaStream,
         candidate: &CudaExecutableCandidate,
+        retain_profile_identity: bool,
         tool_correlation: bool,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let now = self.tick();
@@ -1035,7 +1039,7 @@ impl CudaExecutableCache {
             return Ok(None);
         };
         let (reusable_executable_fingerprint, reusable_graph_node_counts) =
-            entry.launch(stream, now, tool_correlation)?;
+            entry.launch(stream, now, retain_profile_identity, tool_correlation)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,
