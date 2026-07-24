@@ -1506,14 +1506,16 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
       key_heads, value_heads, key_dim, value_dim, conv_kernel);
 }
 
-template <typename InputT, typename StateT>
+template <typename InputT, typename StateT, typename ZT,
+          bool INDIRECT_STATE>
 static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl(
     const InputT* __restrict__ mixed_qkvz_raw,
     const InputT* __restrict__ conv_weight,
-    StateT* __restrict__ conv_state_slots,
+    StateT* __restrict__ direct_conv_state_slots,
+    const unsigned long long* __restrict__ state_bindings,
     const unsigned int* __restrict__ slot_indices,
     float* __restrict__ mixed_qkv,
-    float* __restrict__ z,
+    ZT* __restrict__ z,
     const int batch,
     const int max_slots,
     const int key_heads,
@@ -1534,9 +1536,16 @@ static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz
 
   const int row = global / row_total;
   const int idx = global - row * row_total;
-  const unsigned int slot_u = slot_indices[row];
-  if (slot_u >= static_cast<unsigned int>(max_slots)) return;
-  const int slot = static_cast<int>(slot_u);
+  StateT* conv_state_slots = direct_conv_state_slots;
+  int slot = 0;
+  if (INDIRECT_STATE) {
+    if (row != 0) return;
+    conv_state_slots = reinterpret_cast<StateT*>(state_bindings[0]);
+  } else {
+    const unsigned int slot_u = slot_indices[row];
+    if (slot_u >= static_cast<unsigned int>(max_slots)) return;
+    slot = static_cast<int>(slot_u);
+  }
 
   if (idx < conv_channels) {
     const int channel = idx;
@@ -1568,8 +1577,10 @@ static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz
   }
 
   if (idx < value_total) {
-    z[row * value_total + idx] =
-        ferrum_load_value(mixed_qkvz_raw, row * qkvz_width + conv_channels + idx);
+    ferrum_store_value(
+        z, row * value_total + idx,
+        ferrum_load_value(mixed_qkvz_raw,
+                          row * qkvz_width + conv_channels + idx));
   }
 }
 
@@ -1587,10 +1598,11 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<float, float>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
-      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
+      float, float, float, false>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
+      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32_state_f16(
@@ -1607,10 +1619,11 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<float, __half>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
-      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
+      float, __half, float, false>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
+      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32(
@@ -1627,10 +1640,11 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<__half, float>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
-      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
+      __half, float, float, false>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
+      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32_state_f16(
@@ -1647,10 +1661,29 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<__half, __half>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
-      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
+      __half, __half, float, false>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
+      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
+}
+
+extern "C" __global__ void
+linear_attention_decode_prepare_packed_qkvz_to_mixed_f16_to_f32_state_f16_z_f16_indirect(
+    const __half* __restrict__ mixed_qkvz_raw,
+    const __half* __restrict__ conv_weight,
+    const unsigned long long* __restrict__ state_bindings,
+    float* __restrict__ mixed_qkv,
+    __half* __restrict__ z,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
+      __half, __half, __half, true>(
+      mixed_qkvz_raw, conv_weight, nullptr, state_bindings, nullptr, mixed_qkv,
+      z, 1, 1, key_heads, value_heads, key_dim, value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_qk_l2norm_f32(
