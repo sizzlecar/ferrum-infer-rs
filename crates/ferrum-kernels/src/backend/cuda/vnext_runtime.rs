@@ -30,6 +30,7 @@ use ferrum_interfaces::vnext::{
 };
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
+use super::vnext_tool_correlation;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -1268,6 +1269,7 @@ struct CudaExecutionSpanEventTiming {
     span_kind: DeviceExecutionSpanKind,
     interval_kind: DeviceExecutionIntervalKind,
     operation: &'static str,
+    reusable_executable_fingerprint: Option<Arc<str>>,
     measurement: CudaExecutionSpanEventMeasurement,
 }
 
@@ -1278,6 +1280,7 @@ impl CudaExecutionSpanEventTiming {
         span_kind: DeviceExecutionSpanKind,
         interval_kind: DeviceExecutionIntervalKind,
         operation: &'static str,
+        reusable_executable_fingerprint: Option<Arc<str>>,
         events: Option<(CudaEvent, CudaEvent)>,
     ) -> Option<Self> {
         let start_command_index = u32::try_from(start_command_index).ok()?;
@@ -1294,12 +1297,13 @@ impl CudaExecutionSpanEventTiming {
             span_kind,
             interval_kind,
             operation,
+            reusable_executable_fingerprint,
             measurement,
         })
     }
 
     fn resolve(&self, origin: &CudaEvent) -> Option<DeviceSubmissionExecutionSpan> {
-        match &self.measurement {
+        let span = match &self.measurement {
             CudaExecutionSpanEventMeasurement::Events { start, end } => {
                 let interval = cuda_event_elapsed_ns(origin, start)
                     .zip(cuda_event_elapsed_ns(origin, end))
@@ -1334,7 +1338,12 @@ impl CudaExecutionSpanEventTiming {
                     *reason,
                 )
             }
-        }
+        }?;
+        self.reusable_executable_fingerprint
+            .as_ref()
+            .map_or(Some(span), |fingerprint| {
+                span.with_reusable_executable_fingerprint(fingerprint.as_ref().to_owned())
+            })
     }
 }
 
@@ -1935,6 +1944,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
+        if kernel_attribution {
+            vnext_tool_correlation::prepare();
+        }
         let mut execution_paths =
             kernel_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
         if commands
@@ -2071,7 +2083,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             ))
                             .ok()
                     });
-                    let launched = stream.executable_cache.launch(&stream.stream, candidate);
+                    let launched = stream
+                        .executable_cache
+                        .launch(&stream.stream, candidate, true);
                     let end = command_spans.as_ref().and_then(|_| {
                         stream
                             .stream
@@ -2081,22 +2095,29 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             .ok()
                     });
                     match launched {
-                        Ok(true) => Some(Ok((candidate.end(), start.zip(end)))),
-                        Ok(false) => None,
+                        Ok(Some(launch)) => Some(Ok((
+                            candidate.end(),
+                            start.zip(end),
+                            launch.reusable_executable_fingerprint(),
+                        ))),
+                        Ok(None) => None,
                         Err(error) => Some(Err(error)),
                     }
                 }
                 Some(candidate) if !kernel_attribution => {
-                    match stream.executable_cache.launch(&stream.stream, candidate) {
-                        Ok(true) => Some(Ok((candidate.end(), None))),
-                        Ok(false) => None,
+                    match stream
+                        .executable_cache
+                        .launch(&stream.stream, candidate, false)
+                    {
+                        Ok(Some(_)) => Some(Ok((candidate.end(), None, None))),
+                        Ok(None) => None,
                         Err(error) => Some(Err(error)),
                     }
                 }
                 Some(_) | None => None,
             };
             match replayed {
-                Some(Ok((segment_end, events))) => {
+                Some(Ok((segment_end, events, reusable_executable_fingerprint))) => {
                     if let Some(execution_paths) = execution_paths.as_mut() {
                         execution_paths[index..segment_end].fill(DeviceExecutionPath::Replayed);
                     }
@@ -2108,6 +2129,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                                 DeviceExecutionSpanKind::ReusableExecutable,
                                 DeviceExecutionIntervalKind::Compute,
                                 "cuda reusable executable",
+                                reusable_executable_fingerprint,
                                 events,
                             )
                             .expect("CUDA replay range was validated as u32"),
@@ -2157,6 +2179,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                         DeviceExecutionSpanKind::EagerCommand,
                         interval_kind,
                         command.operation,
+                        None,
                         command_start.zip(command_end),
                     )
                     .expect("CUDA eager command index was validated as u32"),

@@ -4292,6 +4292,12 @@ impl VNextProfileEventContext {
                     "device_timing_span_kind".to_string(),
                     serde_json::json!(span.kind().as_str()),
                 );
+                if let Some(fingerprint) = span.reusable_executable_fingerprint() {
+                    attributes.insert(
+                        "reusable_executable_fingerprint".to_string(),
+                        serde_json::json!(fingerprint),
+                    );
+                }
             }
             if let Some(reason) = timing.unavailable {
                 attributes.insert(
@@ -4487,6 +4493,12 @@ impl VNextProfileEventContext {
                     attributes.insert(
                         "device_timing_unavailable_reason".to_string(),
                         serde_json::json!(format!("{reason:?}").to_ascii_lowercase()),
+                    );
+                }
+                if let Some(fingerprint) = span.reusable_executable_fingerprint() {
+                    attributes.insert(
+                        "reusable_executable_fingerprint".to_string(),
+                        serde_json::json!(fingerprint),
                     );
                 }
                 let event = FerrumProfileEvent {

@@ -5789,6 +5789,8 @@ fn replay_device_timing_is_owned_once_by_its_physical_span() {
         DeviceExecutionSpanKind::ReusableExecutable,
         vec![DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 40).unwrap()],
     )
+    .unwrap()
+    .with_reusable_executable_fingerprint("a".repeat(64))
     .unwrap();
     let timing = DeviceSubmissionExecutionTiming::from_spans(4, vec![eager, replay]).unwrap();
     let terminal = DeviceTimingMeasurement::Measured(timing);
@@ -5811,6 +5813,12 @@ fn replay_device_timing_is_owned_once_by_its_physical_span() {
                 .physical_span
                 .and_then(|span| span.measurement().elapsed_ns()),
             Some(30)
+        );
+        assert_eq!(
+            replay_projection
+                .physical_span
+                .and_then(DeviceSubmissionExecutionSpan::reusable_executable_fingerprint),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
