@@ -20,7 +20,7 @@ import runtime_vnext_numerical_tolerances as tolerances
 PASS_PREFIX = "RUNTIME VNEXT QWEN35 LINEAR ATTENTION NUMERICS PASS"
 SELF_TEST_PASS = "RUNTIME VNEXT QWEN35 LINEAR ATTENTION NUMERICS SELF-TEST PASS"
 TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.linear-attention.v4.layer."
+    "runtime-vnext.metal.qwen35-4b.linear-attention.v5.layer."
     "fp16.gguf-q4-k-m.tokens-24"
 )
 EXPECTED_MISSING = [

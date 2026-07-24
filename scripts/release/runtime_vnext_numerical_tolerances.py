@@ -68,11 +68,14 @@ G08A_REQUIRED_COVERAGE = frozenset(
         "checkpoint.full_vocab_logits",
         "layer.full_attention",
         "layer.linear_attention",
+        "layer.linear_attention@5.0",
         "operation.causal_paged_attention@2.0.fixed_page_split",
         "operation.dense_linear@1.0",
         "operation.dense_swiglu@1.0",
         "operation.gated_delta_recurrent_attention@4.0.log_rate_grouped",
         "operation.gated_delta_recurrent_attention@4.0.negative_rate_interleaved",
+        "operation.gated_delta_recurrent_attention@5.0.log_rate_grouped",
+        "operation.gated_delta_recurrent_attention@5.0.negative_rate_interleaved",
         "operation.last_token_dense_linear@1.0",
         "operation.last_token_dense_linear@1.1",
         "operation.residual_add@1.0",
@@ -84,6 +87,10 @@ G08A_REQUIRED_COVERAGE = frozenset(
         "state.gated_delta.conv_state.negative_rate_interleaved",
         "state.gated_delta.delta_state.log_rate_grouped",
         "state.gated_delta.delta_state.negative_rate_interleaved",
+        "state.gated_delta@5.0.conv_state.log_rate_grouped",
+        "state.gated_delta@5.0.conv_state.negative_rate_interleaved",
+        "state.gated_delta@5.0.delta_state.log_rate_grouped",
+        "state.gated_delta@5.0.delta_state.negative_rate_interleaved",
     }
 )
 G08A_SCOPE = (
@@ -506,7 +513,7 @@ G08A_COVERAGE_RULES: dict[str, dict[str, Any]] = {
     ),
 }
 
-_qwen35_linear_attention_selector = _coverage_selector(
+_qwen35_linear_attention_v4_selector = _coverage_selector(
     model_scope="qwen3.5-4b",
     operation_id="operation.gated_delta_recurrent_attention",
     operation_schema_version="4.0",
@@ -532,7 +539,19 @@ _qwen35_linear_attention_selector = _coverage_selector(
     oracle_identity="cpu.fp32.python.qwen35_gguf_linear_attention_reference",
 )
 for _marker in ("layer.linear_attention", "quant_format.gguf_q4_k_m"):
-    G08A_COVERAGE_RULES[_marker] = copy.deepcopy(_qwen35_linear_attention_selector)
+    G08A_COVERAGE_RULES[_marker] = copy.deepcopy(_qwen35_linear_attention_v4_selector)
+
+G08A_COVERAGE_RULES["layer.linear_attention@5.0"] = _coverage_selector(
+    model_scope="qwen3.5-4b",
+    operation_id="operation.gated_delta_recurrent_attention",
+    operation_schema_version="5.0",
+    checkpoint_kind="layer_output",
+    checkpoint_name="layer_0_attention_residual",
+    dtype="fp16",
+    quant_format="gguf_q4_k_m",
+    shape_domain=copy.deepcopy(_qwen35_linear_attention_v4_selector["shape_domain"]),
+    oracle_identity="cpu.fp32.python.qwen35_gguf_linear_attention_reference",
+)
 
 G08A_COVERAGE_RULES["layer.full_attention"] = _coverage_selector(
     model_scope="qwen3.5-4b",
@@ -624,49 +643,53 @@ G08A_COVERAGE_RULES["checkpoint.full_vocab_logits"] = _coverage_selector(
     oracle_identity="cpu.fp32.python.qwen35_gguf_model_reference",
 )
 
-for _decay, _mapping, _suffix in (
-    ("log_rate", "grouped_by_key_head", "log_rate_grouped"),
-    ("negative_rate", "interleaved_by_key_head", "negative_rate_interleaved"),
-):
-    G08A_COVERAGE_RULES[
-        f"operation.gated_delta_recurrent_attention@4.0.{_suffix}"
-    ] = _coverage_selector(
-        model_scope="qwen3.5-4b",
-        operation_id="operation.gated_delta_recurrent_attention",
-        operation_schema_version="4.0",
-        checkpoint_kind="operation_output",
-        checkpoint_name="output",
-        dtype="fp16",
-        quant_format="none",
-        shape_domain=_gated_delta_shape_domain("output", _decay, _mapping),
-        oracle_identity="cpu.fp32.rust.gated_delta_reference",
+for _version in ("4.0", "5.0"):
+    _state_marker_prefix = (
+        "state.gated_delta" if _version == "4.0" else "state.gated_delta@5.0"
     )
-    G08A_COVERAGE_RULES[f"state.gated_delta.conv_state.{_suffix}"] = (
-        _coverage_selector(
+    for _decay, _mapping, _suffix in (
+        ("log_rate", "grouped_by_key_head", "log_rate_grouped"),
+        ("negative_rate", "interleaved_by_key_head", "negative_rate_interleaved"),
+    ):
+        G08A_COVERAGE_RULES[
+            f"operation.gated_delta_recurrent_attention@{_version}.{_suffix}"
+        ] = _coverage_selector(
             model_scope="qwen3.5-4b",
             operation_id="operation.gated_delta_recurrent_attention",
-            operation_schema_version="4.0",
-            checkpoint_kind="state",
-            checkpoint_name="conv_state",
+            operation_schema_version=_version,
+            checkpoint_kind="operation_output",
+            checkpoint_name="output",
             dtype="fp16",
             quant_format="none",
-            shape_domain=_gated_delta_shape_domain("conv_state", _decay, _mapping),
-            oracle_identity="cpu.fp32.rust.gated_delta_conv_state_reference",
+            shape_domain=_gated_delta_shape_domain("output", _decay, _mapping),
+            oracle_identity="cpu.fp32.rust.gated_delta_reference",
         )
-    )
-    G08A_COVERAGE_RULES[f"state.gated_delta.delta_state.{_suffix}"] = (
-        _coverage_selector(
-            model_scope="qwen3.5-4b",
-            operation_id="operation.gated_delta_recurrent_attention",
-            operation_schema_version="4.0",
-            checkpoint_kind="state",
-            checkpoint_name="delta_state",
-            dtype="fp32",
-            quant_format="none",
-            shape_domain=_gated_delta_shape_domain("delta_state", _decay, _mapping),
-            oracle_identity="cpu.fp32.rust.gated_delta_delta_state_reference",
+        G08A_COVERAGE_RULES[f"{_state_marker_prefix}.conv_state.{_suffix}"] = (
+            _coverage_selector(
+                model_scope="qwen3.5-4b",
+                operation_id="operation.gated_delta_recurrent_attention",
+                operation_schema_version=_version,
+                checkpoint_kind="state",
+                checkpoint_name="conv_state",
+                dtype="fp16",
+                quant_format="none",
+                shape_domain=_gated_delta_shape_domain("conv_state", _decay, _mapping),
+                oracle_identity="cpu.fp32.rust.gated_delta_conv_state_reference",
+            )
         )
-    )
+        G08A_COVERAGE_RULES[f"{_state_marker_prefix}.delta_state.{_suffix}"] = (
+            _coverage_selector(
+                model_scope="qwen3.5-4b",
+                operation_id="operation.gated_delta_recurrent_attention",
+                operation_schema_version=_version,
+                checkpoint_kind="state",
+                checkpoint_name="delta_state",
+                dtype="fp32",
+                quant_format="none",
+                shape_domain=_gated_delta_shape_domain("delta_state", _decay, _mapping),
+                oracle_identity="cpu.fp32.rust.gated_delta_delta_state_reference",
+            )
+        )
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9][a-z0-9._@-]{0,191}$")
 OPERATION_ID_RE = re.compile(r"^operation\.[a-z0-9][a-z0-9._-]{0,182}$")
@@ -1501,12 +1524,12 @@ def _self_test() -> None:
 
     state_catalog = load_worktree_catalog()
     removed_state_id = (
-        "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped"
+        "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.log-rate-grouped"
     )
     state_catalog["rows"] = [
         row for row in state_catalog["rows"] if row["tolerance_id"] != removed_state_id
     ]
-    expected_state_gap = "state.gated_delta.conv_state.log_rate_grouped"
+    expected_state_gap = "state.gated_delta@5.0.conv_state.log_rate_grouped"
     state_catalog["coverage"]["missing_required_coverage"] = sorted(
         set(state_catalog["coverage"]["missing_required_coverage"])
         | {expected_state_gap}

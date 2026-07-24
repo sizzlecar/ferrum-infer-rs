@@ -266,15 +266,15 @@ fn cpu_output_tolerance(semantics: TestSemantics) -> (&'static str, &'static str
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.log-rate-grouped",
-            "042cde4824acf50ff0c5fd4d77f0ae4c7e7424bca0ff4a09fcf176e3369c7935",
+            "runtime-vnext.metal.gated-delta.v5.operation.fp16.none.log-rate-grouped",
+            "04ff1b536cf92e28b75828530037a28f3263e05337afbff2c7212212a4e92120",
         ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.negative-rate-interleaved",
-            "2cc1888ca5453ff990ab09e788e49b3d90ffddea6e0c1e2669b81d62ee531f95",
+            "runtime-vnext.metal.gated-delta.v5.operation.fp16.none.negative-rate-interleaved",
+            "99bd1257837b73e11152351115a9fac1994c14e36093ba59f6f0bc05d1577530",
         ),
         _ => panic!("unreviewed gated-delta output tolerance selector"),
     }
@@ -289,15 +289,15 @@ fn cpu_conv_state_tolerance(semantics: TestSemantics) -> (&'static str, &'static
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped",
-            "be3d2caf3c6b0b7fe6b28e00639a6dd6e3f04e56f9b16e8ed11dae07e314ff98",
+            "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.log-rate-grouped",
+            "38763b499cf1b17f7213273e8c46b7ea56010b58f6e4e95ecd4f78f2e4ac2070",
         ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.negative-rate-interleaved",
-            "fd0a279ca3aea3684f60625e09d130295af6ad0afca771d640eda8567b7a827c",
+            "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.negative-rate-interleaved",
+            "02c8fa5aa3e1415ec1f5cc2c4b07d97b68f131c8d391cce11417ac4d623130a0",
         ),
         _ => panic!("unreviewed gated-delta conv-state tolerance selector"),
     }
@@ -312,15 +312,15 @@ fn cpu_delta_state_tolerance(semantics: TestSemantics) -> (&'static str, &'stati
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.log-rate-grouped",
-            "a779e9b4045c63023ac9250463b71cef5993f70933a013a6c749da6ae2c753ab",
+            "runtime-vnext.metal.gated-delta.v5.state.delta.fp32.none.log-rate-grouped",
+            "2a6d8a74c8f8932da969c600e716a130326bafcec4b4905ecf45a363d7e64c8d",
         ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.negative-rate-interleaved",
-            "0dbe4774a52f662adb015b47792eb4ffb481b5a82c1acb9ee85378fc417c935d",
+            "runtime-vnext.metal.gated-delta.v5.state.delta.fp32.none.negative-rate-interleaved",
+            "cf8e2efbb669c6bf4c3a1f1d742a351e831795f1b1432f7df8a6cc166a79ebd7",
         ),
         _ => panic!("unreviewed gated-delta delta-state tolerance selector"),
     }
@@ -328,7 +328,7 @@ fn cpu_delta_state_tolerance(semantics: TestSemantics) -> (&'static str, &'stati
 
 #[test]
 fn launch_extent_validation_rejects_msl_uint_overflow() {
-    let shape = AttentionShape {
+    let mut shape = AttentionShape {
         hidden_size: 16,
         key_heads: 2,
         value_heads: 8,
@@ -350,6 +350,18 @@ fn launch_extent_validation_rejects_msl_uint_overflow() {
         .validate_launch_extents(tokens)
         .unwrap_err()
         .contains("QKV activation elements"));
+
+    let tokens = u64::from(u32::MAX) / shape.qkvz_features + 1;
+    assert!(shape
+        .validate_launch_extents(tokens)
+        .unwrap_err()
+        .contains("QKVZ activation elements"));
+
+    shape.ba_features = u64::from(u32::MAX);
+    assert!(shape
+        .validate_launch_extents(2)
+        .unwrap_err()
+        .contains("BA activation elements"));
 }
 
 #[test]

@@ -985,8 +985,10 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
     }
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
-        layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.packed_gate_up")?,
-        version: ContractVersion::new(1, 2),
+        layout_id: WeightLayoutId::new(
+            "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_inputs",
+        )?,
+        version: ContractVersion::new(1, 3),
         components,
         tensors,
     })
@@ -1144,14 +1146,14 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.safetensors.gptq-marlin-int4")?,
         layout_id: WeightLayoutId::new(if text.is_moe() {
-            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major"
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_inputs"
         } else {
-            "weight-layout.qwen3_5.dense_hybrid.gptq_marlin"
+            "weight-layout.qwen3_5.dense_hybrid.gptq_marlin.packed_gdn_inputs"
         })?,
         version: if text.is_moe() {
-            ContractVersion::new(3, 0)
+            ContractVersion::new(3, 1)
         } else {
-            ContractVersion::new(2, 0)
+            ContractVersion::new(2, 1)
         },
         components,
         tensors,
@@ -1737,14 +1739,14 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.gguf.native-block")?,
         layout_id: WeightLayoutId::new(if text.is_moe() {
-            "weight-layout.qwen3_5.hybrid_moe.gguf.native"
+            "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_inputs"
         } else {
-            "weight-layout.qwen3_5.dense_hybrid.gguf.native"
+            "weight-layout.qwen3_5.dense_hybrid.gguf.native.packed_gdn_inputs"
         })?,
         version: if text.is_moe() {
-            ContractVersion::new(2, 0)
+            ContractVersion::new(2, 1)
         } else {
-            ContractVersion::new(1, 0)
+            ContractVersion::new(1, 1)
         },
         components,
         tensors,
@@ -3747,10 +3749,10 @@ mod tests {
             schema.quantization_formats(),
             BTreeSet::from([QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID).unwrap()])
         );
-        assert_eq!(schema.version, ContractVersion::new(3, 0));
+        assert_eq!(schema.version, ContractVersion::new(3, 1));
         assert_eq!(
             schema.layout_id.as_str(),
-            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major"
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_inputs"
         );
         let routed = schema
             .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
@@ -3975,8 +3977,9 @@ mod tests {
         ));
         assert_eq!(
             prepared.weight_schema().layout_id.as_str(),
-            "weight-layout.qwen3_5.hybrid_moe.gguf.native"
+            "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_inputs"
         );
+        assert_eq!(prepared.weight_schema().version, ContractVersion::new(2, 1));
     }
 
     #[test]
@@ -4206,7 +4209,11 @@ mod tests {
                 })
                 .count()
         );
-        assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 2));
+        assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 3));
+        assert_eq!(
+            prepared.weight_schema().layout_id.as_str(),
+            "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_inputs"
+        );
         for component in prepared
             .weight_schema()
             .components
