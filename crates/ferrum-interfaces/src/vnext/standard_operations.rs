@@ -870,7 +870,7 @@ fn attention_resources() -> ResourceRequirements {
     ResourceRequirements {
         minimum_value_alignment_bytes: 16,
         scratch: ResourcePresenceRequirement::Required,
-        binding: ResourcePresenceRequirement::Forbidden,
+        binding: ResourcePresenceRequirement::Optional,
         persistent: ResourcePresenceRequirement::Forbidden,
     }
 }
@@ -1212,6 +1212,14 @@ mod tests {
         assert_eq!(linear.descriptor().inputs.len(), 13);
         assert_eq!(linear.descriptor().version, ContractVersion::new(4, 0));
         assert_eq!(
+            linear.descriptor().resources.binding,
+            ResourcePresenceRequirement::Optional
+        );
+        assert_eq!(
+            full.descriptor().resources.binding,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
             linear.descriptor().provider.minimum_version,
             ContractVersion::new(4, 0)
         );
@@ -1242,10 +1250,6 @@ mod tests {
                 AttributeConstraint::TextChoices { values }
             );
         }
-        assert_eq!(
-            linear.descriptor().resources.binding,
-            ResourcePresenceRequirement::Forbidden
-        );
         for ordinal in [7, 8, 9, 12] {
             assert_eq!(
                 linear.descriptor().inputs[ordinal].element_types(),
