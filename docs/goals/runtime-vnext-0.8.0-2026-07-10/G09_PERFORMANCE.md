@@ -487,6 +487,74 @@ projection，不引入 model-name/GPU-name 分支，也不复制 Python runtime 
 立即 REJECT source contract；只有命中且窄 profile 显示绝对时间改善，才运行一次
 profile-off c1 smoke，不直接运行 G09 full sweep。
 
+### 2026-07-24 GDN Input Fusion Result
+
+Clean source `cefb4de25036a818fd3d0628a63b4fde3b74d81d` implements the typed
+QKVZ/BA input fusion and the reviewed v5 operation, weight-layout, numerical
+tolerance, and backend extent contracts. The bound one-RTX-4090 CUDA binary
+SHA256 is
+`fa76fc9af5cdef07d6a887cc821b4347d139263a6b1618b542af0f29cb947800`;
+the final incremental release build took `295.619278 s`.
+
+Correctness preceded every performance measurement:
+
+- the CUDA packed-extent, CUDA/CPU packed numerical parity, and production replay
+  symbol tests each passed `1/1`;
+- actual-model `c03-001 ferrum run`, `c05-001 ferrum serve`, and `c06-001`
+  streaming serve passed `3/3`;
+- the focused runner printed
+  `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`, with zero blocker-scan match.
+
+The predeclared structural signal was exact. The same Qwen3.5 program has 30
+recurrent layers; the `32c53a6b` trace reported `13` compute dispatches per layer
+and `390` per correlation, while `cefb4de2` reported `11` and `330`. This is an
+observed reduction of exactly `60` compute dispatches per correlation, not a
+source-count estimate.
+
+The same-hardware full-profile timing also moved in the predicted direction over
+75 decode correlations:
+
+| signal | `32c53a6b` | `cefb4de2` | delta |
+|---|---:|---:|---:|
+| replay elapsed | `7.362019 ms` | `6.888088 ms` | `-0.473931 ms` (`-6.44%`) |
+| complete device span | `8.608580 ms` | `8.097945 ms` | `-0.510635 ms` (`-5.93%`) |
+| GDN dispatches/correlation | `390` | `330` | `-60` |
+
+Profile-off c1 used the canonical diagnostic workload: random `64/32`, 100
+measured requests and 10 warmups per repeat, three repeats, seed `9271`,
+`--fail-on-error --require-ci`, and usage-derived token counts. It completed
+`300/300` with zero request, stream, output, or quality error. Repeat throughput
+was `48.2964 / 46.4895 / 55.4540 tok/s`, with mean
+`50.0800 +/- 11.7781 tok/s` and CV `9.4667%`.
+
+This is `4.1480 tok/s` (`9.03%`) above the latest available current-path
+profile-off checkpoint at `45.931942 tok/s`, so the optimization source is kept.
+It remains `5.5097 tok/s` (`9.91%`) below the higher `55.5897 tok/s` KEEP line
+and `26.0783 tok/s` (`34.24%`) below the unchanged `76.1583 tok/s` formal floor.
+The decision is therefore:
+
+```text
+CUDA GDN INPUT FUSION CHECKPOINT KEEP: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/diagnostic-summary.json
+CUDA GDN INPUT FUSION FORMAL PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/diagnostic-summary.json
+```
+
+The complete GitHub-transfer archive is
+[runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z.tar.zst),
+asset id `488205719`, size `30,043,998` bytes, SHA256
+`0521a5baa3b98398ce2e4683576b3e558500da74f6cf2479b369d53fef41e144`.
+It was downloaded and revalidated locally at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no running or
+scheduling sibling.
+
+No repeat of this candidate or G09 full sweep is authorized. The next work is
+offline source/profile analysis of the post-fusion graph. It must compare the
+remaining recurrent output projection against the MoE routing/alignment/Marlin
+family, select one predicted high-return lever, and name an absolute device-time
+change before another paid run. The retained `330` dispatch count, `6.888088 ms`
+replay time, product `3/3`, and zero-error profile-off result become no-regression
+requirements for that candidate.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

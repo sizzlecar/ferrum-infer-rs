@@ -650,6 +650,45 @@ The instance is confirmed `stopped/exited`; no sibling instance is running or
 scheduling. GitHub transfer is still pending and does not authorize restarting the
 instance solely for another benchmark.
 
+### 2026-07-24 Fused GDN CUDA Checkpoint
+
+Clean source `cefb4de25036a818fd3d0628a63b4fde3b74d81d` and CUDA binary SHA256
+`fa76fc9af5cdef07d6a887cc821b4347d139263a6b1618b542af0f29cb947800`
+passed the bounded actual-model product paths:
+
+- `c03-001`: resident multi-turn `ferrum run`;
+- `c05-001`: non-streaming OpenAI-compatible `ferrum serve`;
+- `c06-001`: streaming `ferrum serve`;
+- result: `3/3 pass`, usage-derived token counts, and zero blocker-scan match.
+
+The candidate uses the v5 typed GDN contract and packed QKVZ/BA model weights.
+CUDA source tests covered packed extents, packed CUDA/CPU numerical parity, and the
+production replay kernel symbol. Full-profile evidence observed all 30 recurrent
+layers at `11` compute dispatches each, or `330` per correlation, versus
+`13`/`390` in the pre-fusion `32c53a6b` artifact. Decode replay elapsed improved
+from `7.362019 ms` to `6.888088 ms`; the complete device span improved from
+`8.608580 ms` to `8.097945 ms`.
+
+Profile-off c1 random `64/32`, `100 x 3`, ten warmups, and seed `9271` completed
+`300/300` with zero request or quality error. Mean throughput was
+`50.079974 +/- 11.778071 tok/s`: `9.03%` above the latest available current-path
+checkpoint, but still `34.24%` below the unchanged `76.1583 tok/s` formal floor.
+This keeps the model/runtime optimization without satisfying G08B or G09:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/focused-c03-c05-c06-report.json
+CUDA GDN INPUT FUSION CHECKPOINT KEEP: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/diagnostic-summary.json
+CUDA GDN INPUT FUSION FORMAL PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/diagnostic-summary.json
+```
+
+The complete GitHub asset is
+[runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z.tar.zst),
+asset id `488205719`, size `30,043,998` bytes, SHA256
+`0521a5baa3b98398ce2e4683576b3e558500da74f6cf2479b369d53fef41e144`.
+The archive and bound binary were revalidated locally under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`; no paid sibling remains.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
