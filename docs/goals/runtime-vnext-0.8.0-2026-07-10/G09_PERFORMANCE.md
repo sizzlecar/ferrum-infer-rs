@@ -787,19 +787,15 @@ It was downloaded and revalidated locally under
 Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
 
 Neither `67921b1c` nor `a884f5d4` may repeat the old unpaired benchmark
-protocol. Because the profiling-path audit below invalidates the historical
-mean comparison used to reject `67921b1c`, one final bounded re-attribution of
-the already-built baseline and `67921b1c` binaries is allowed: correctness
-first, direct-path basic `A-B-B-A`, then profile-off `A-B-B-A` only if basic
-follows the binary in both reversed pairs. Any miss permanently rejects that
-candidate without another build or full sweep.
-
-If `67921b1c` is permanently rejected, a future GDN candidate must avoid both
-known failure modes: value-tile repeated Q/K normalization and a separate
-normalization launch. It must retain at most `9 compute + 0 transfer`, pass
-local numeric/ABI/graph contracts, predict replay below `6.195692 ms`, and
-then prove a same-session direct-path improvement rather than compare against
-a historical product mean.
+protocol. The one permitted bounded re-attribution of the already-built
+baseline and `67921b1c` binaries has run and stopped after its first Basic
+pair. Both A=`8c58e3ea` and B=`67921b1c` completed 25/25 requests with `1,110`
+direct waves, zero fallback, and zero catalog-epoch miss. B moved throughput
+from `53.239670` to `51.267727 tok/s` (`-3.70%`) and completion from
+`7,540.598` to `7,900.400 us` (`+4.77%`). Because the predeclared adjacent-pair
+direction test failed, B2/A2 and profile-off were not run. `67921b1c` is
+permanently rejected, with immutable evidence at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-paired-ab-20260724T163845Z/diagnostic-summary.json`.
 
 ### 2026-07-24 vLLM Source Comparison And Measurement Amendment
 
@@ -839,6 +835,52 @@ improve direct-path completion/device time or paired profile-off throughput.
 Comparing a 25-request candidate mean against a stale 300-request historical
 mean is no longer an acceptance method. The G06 execution-path fingerprint
 contract is a dependency of the next paid GDN run.
+
+### 2026-07-24 Fused Conv/QK-Norm Packed-Decode Rejection
+
+Candidate `2154fed72e449e2b178191c552c93d11f1524783` tested the remaining
+obvious packed-decode design: convolution-state update, Q/K normalization, and
+QKVZ packing in one launch, with independent key-head and value-head CUDA
+workers. Its release binary SHA256 was
+`3fd5bae299398e3867006907229eb2409dbbec3d856c013600c8dc0ce6af5f3b`.
+
+The candidate first passed CUDA fused-vs-varlen parity `1/1`, actual-model
+`run`/`serve`/streaming correctness `3/3`, and 75 decode correlations covering
+2,250 recurrent-layer records at exactly `9 compute + 0 transfer`. The first
+same-session Basic product pair nevertheless failed its stop condition:
+
+| direct-path metric | A `8c58e3ea` | B `2154fed7` | B vs A |
+|---|---:|---:|---:|
+| throughput | `54.760873 tok/s` | `48.621077 tok/s` | `-11.21%` |
+| completion round trip | `7,575.265 us` | `7,687.385 us` | `+1.48%` |
+| resource prepare | `2,074.006 us` | `2,609.406 us` | `+25.81%` |
+| host encode/submit | `2,589.262 us` | `3,054.133 us` | `+17.95%` |
+| provider-node encode | `866.367 us` | `1,081.315 us` | `+24.81%` |
+
+Both slots completed 25/25 requests with `1,110` direct waves, zero fallback,
+and zero catalog-epoch miss, and both ended at 49 C, 2,715 MHz SM, and
+10,251 MHz memory clocks. The structural result therefore does not excuse the
+product-path regression. The immutable decision is:
+
+```text
+CUDA FUSED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+No second pair or profile-off sweep ran. Commits `d9ebf8ab` and `f07959af`
+reverted the source; targeted replay contracts passed `9/9` after the revert.
+Vast `45319871` is confirmed `stopped/exited`. The local summary is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-fused-decode-cuda-2154fed7-20260724T173030Z/diagnostic-summary.json`;
+the complete artifact remains on the retained stopped instance.
+
+This permanently rejects both tested packed-decode trade-offs: repeated
+per-value-tile normalization and separate normalization dispatch were already
+rejected, and combining normalization with convolution/packing also failed
+the direct product path. The first-pair evidence does not prove that the fused
+kernel itself caused every host-stage increase. Before another paid GDN run,
+offline attribution must explain why resource preparation, host submission,
+and provider encoding moved together, identify the direct-path boundary
+responsible, and make a falsifiable prediction for a new source delta. A
+launch-count-only kernel proposal is not sufficient.
 
 ### M3 Qwen3-30B historical floors
 

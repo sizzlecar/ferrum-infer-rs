@@ -921,11 +921,75 @@ to vLLM; `a884f5d4` was a distinct Ferrum alternative, not a copied design.
 A future candidate must avoid both repeated per-value-tile normalization and
 the extra normalization dispatch, retain at most `9 compute / 0 transfer`,
 and prove direct-path performance with same-session paired evidence. G09 owns
-the detailed `full` versus `basic/off` measurement amendment. It permits one
-final bounded `A-B-B-A` re-attribution of the already-built baseline and
-`67921b1c` binaries because the original rejection compared different
-sessions and sample sizes; it does not permit rebuilding or repeating the old
-unpaired sweep.
+the detailed `full` versus `basic/off` measurement amendment.
+
+That final bounded re-attribution has now run. The first adjacent pair used
+clean `8c58e3ea` as A and the already-built `67921b1c` as B. Both slots passed
+25/25 requests with `1,110` direct waves, zero direct fallback, and zero
+catalog-epoch miss. B nevertheless moved throughput from `53.239670` to
+`51.267727 tok/s` (`-3.70%`) and completion from `7,540.598` to
+`7,900.400 us` (`+4.77%`). The predeclared direction test failed, so B2/A2 and
+profile-off were not run. This permanently closes `67921b1c`; neither its
+unpaired sweep nor paired attribution may run again. The immutable artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-paired-ab-20260724T163845Z/diagnostic-summary.json`.
+
+### 2026-07-24 Fused Conv/QK-Norm Packed-Decode Rejection
+
+Clean source `2154fed72e449e2b178191c552c93d11f1524783`, built on the
+single-launch foundation `3ccdf6c7`, fused convolution-state update, Q/K
+normalization, and QKVZ packing. It assigned independent CUDA workers to key
+heads and value heads, so Qwen3.5 used six blocks in one launch instead of
+binding all work to two key-head blocks. The release binary SHA256 was
+`3fd5bae299398e3867006907229eb2409dbbec3d856c013600c8dc0ce6af5f3b`.
+
+Correctness preceded performance:
+
+- the CUDA fused-vs-varlen output, convolution-state, delta-state, and Z parity
+  test passed `1/1`;
+- actual-model `c03 run`, `c05 serve`, and `c06 streaming serve` passed `3/3`;
+- 75 decode correlations and 2,250 recurrent-layer records were all exactly
+  `9 compute / 0 transfer`;
+- the four-request Full diagnostic completed without error at
+  `7.927116 tok/s`; this is topology evidence, not product throughput.
+
+The first same-session Basic pair then compared clean `8c58e3ea` A with
+`2154fed7` B under identical random `64/32`, c1, 25-request, five-warmup,
+seed-9271 commands. Both slots had `1,110` direct waves and zero fallback or
+epoch miss; both ended at 49 C, 2,715 MHz SM, and 10,251 MHz memory clocks.
+The candidate failed every predeclared product direction:
+
+| direct-path metric | A `8c58e3ea` | B `2154fed7` | B vs A |
+|---|---:|---:|---:|
+| throughput | `54.760873 tok/s` | `48.621077 tok/s` | `-11.21%` |
+| completion round trip | `7,575.265 us` | `7,687.385 us` | `+1.48%` |
+| resource prepare | `2,074.006 us` | `2,609.406 us` | `+25.81%` |
+| host encode/submit | `2,589.262 us` | `3,054.133 us` | `+17.95%` |
+| provider-node encode | `866.367 us` | `1,081.315 us` | `+24.81%` |
+
+The candidate is therefore correctness KEEP, structural KEEP, and performance
+REJECT:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-fused-decode-cuda-2154fed7-20260724T173030Z/focused-c03-c05-c06-report.json
+CUDA FUSED DECODE STRUCTURAL KEEP: /workspace/ferrum-artifacts/runtime-vnext-fused-decode-cuda-2154fed7-20260724T173030Z/dispatch-diagnostic/dispatch-summary.json
+CUDA FUSED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commits `d9ebf8ab` and `f07959af` reverted the candidate. Targeted replay
+contracts passed `9/9` after the revert, and the active branch again contains
+only the accepted direct-program baseline. Vast `45319871` is confirmed
+`stopped/exited`; no second pair or profile-off sweep ran. The local summary
+is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-fused-decode-cuda-2154fed7-20260724T173030Z/diagnostic-summary.json`;
+the complete build, correctness, Full, and Basic artifacts remain on the
+retained stopped instance.
+
+This result forbids another packed-decode kernel proposal based only on fewer
+launches or repeated-normalization removal. Before any new paid run, saved
+Basic health and scheduler evidence must explain the simultaneous
+resource/host/provider increase and predict which direct-path boundary will
+move. A new source delta must be derived from that attribution, not stacked on
+either rejected kernel.
 
 ## Metal Matrix Workflow
 
