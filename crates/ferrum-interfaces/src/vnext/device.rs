@@ -1748,6 +1748,7 @@ pub struct DeviceNativeWorkAttribution {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
+    reusable_graph_node_count: Option<u64>,
 }
 
 impl DeviceNativeWorkAttribution {
@@ -1763,10 +1764,13 @@ impl DeviceNativeWorkAttribution {
         token_count: u64,
         compute_dispatch_count: u64,
         transfer_command_count: u64,
+        reusable_graph_node_count: Option<u64>,
     ) -> Option<Self> {
         if native_op_id.is_empty()
             || (compute_dispatch_count == 0 && transfer_command_count == 0)
             || (node_index.is_some() && participant_count == 0)
+            || (reusable_graph_node_count.is_some()
+                && execution_path != DeviceExecutionPath::Replayed)
         {
             return None;
         }
@@ -1781,6 +1785,7 @@ impl DeviceNativeWorkAttribution {
             token_count,
             compute_dispatch_count,
             transfer_command_count,
+            reusable_graph_node_count,
         })
     }
 
@@ -1822,6 +1827,14 @@ impl DeviceNativeWorkAttribution {
 
     pub const fn transfer_command_count(&self) -> u64 {
         self.transfer_command_count
+    }
+
+    /// Actual native graph nodes captured for this replayed command.
+    ///
+    /// This observation may include kernels, copies, memsets, and dependency
+    /// nodes selected internally by a native library.
+    pub const fn reusable_graph_node_count(&self) -> Option<u64> {
+        self.reusable_graph_node_count
     }
 }
 
@@ -2486,6 +2499,33 @@ mod execution_timing_tests {
         )
         .unwrap();
         assert!(DeviceSubmissionExecutionTiming::from_spans(2, vec![first, overlap]).is_none());
+    }
+
+    #[test]
+    fn native_graph_node_observation_belongs_only_to_replayed_work() {
+        let row = |execution_path, graph_nodes| {
+            DeviceNativeWorkAttribution::new(
+                0,
+                Some(0),
+                DeviceCommandPhase::Compute,
+                "test.compute",
+                execution_path,
+                DeviceBatchingForm::Scalar,
+                1,
+                1,
+                1,
+                0,
+                graph_nodes,
+            )
+        };
+
+        assert!(row(DeviceExecutionPath::Eager, Some(2)).is_none());
+        let replayed = row(DeviceExecutionPath::Replayed, Some(2)).unwrap();
+        assert_eq!(replayed.reusable_graph_node_count(), Some(2));
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap()["reusable_graph_node_count"],
+            serde_json::json!(2)
+        );
     }
 }
 

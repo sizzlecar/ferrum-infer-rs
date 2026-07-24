@@ -1071,6 +1071,7 @@ impl DeviceRuntime for TestRuntime {
                         u64::from(entry.node_index().is_some()),
                         compute_dispatch_count,
                         transfer_command_count,
+                        None,
                     )
                 })
                 .collect()

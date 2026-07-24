@@ -1081,10 +1081,12 @@ fn cuda_submission_attribution(
     command_node_indices: &[Option<u32>],
     commands: &[CudaDeviceCommand],
     execution_paths: &[DeviceExecutionPath],
+    reusable_graph_node_counts: Option<&[Option<u32>]>,
 ) -> Result<DeviceSubmissionAttribution, CudaDeviceRuntimeError> {
     if command_phases.len() != commands.len()
         || command_node_indices.len() != commands.len()
         || execution_paths.len() != commands.len()
+        || reusable_graph_node_counts.is_some_and(|counts| counts.len() != commands.len())
     {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA command attribution differs from its submitted batch",
@@ -1107,6 +1109,9 @@ fn cuda_submission_attribution(
                 command.token_count,
                 command.compute_dispatch_count,
                 command.transfer_command_count,
+                reusable_graph_node_counts
+                    .and_then(|counts| counts[command_index as usize])
+                    .map(u64::from),
             )
             .ok_or_else(|| {
                 CudaDeviceRuntimeError::contract(
@@ -1950,6 +1955,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let mut execution_paths =
             kernel_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
+        let mut reusable_graph_node_counts = kernel_attribution.then(|| vec![None; commands.len()]);
         if commands
             .iter()
             .any(|command| command.runtime_instance != self.runtime_instance)
@@ -1968,6 +1974,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 command_node_indices,
                 &commands,
                 execution_paths,
+                reusable_graph_node_counts.as_deref(),
             ) {
                 return Err(DefinitelyNotSubmitted::new(error));
             }
@@ -2100,6 +2107,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             candidate.end(),
                             start.zip(end),
                             launch.reusable_executable_fingerprint(),
+                            launch.reusable_graph_node_counts(),
                         ))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
@@ -2110,7 +2118,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                         .executable_cache
                         .launch(&stream.stream, candidate, false)
                     {
-                        Ok(Some(_)) => Some(Ok((candidate.end(), None, None))),
+                        Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
                     }
@@ -2118,9 +2126,25 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 Some(_) | None => None,
             };
             match replayed {
-                Some(Ok((segment_end, events, reusable_executable_fingerprint))) => {
+                Some(Ok((
+                    segment_end,
+                    events,
+                    reusable_executable_fingerprint,
+                    graph_node_counts,
+                ))) => {
                     if let Some(execution_paths) = execution_paths.as_mut() {
                         execution_paths[index..segment_end].fill(DeviceExecutionPath::Replayed);
+                    }
+                    if let (Some(target), Some(observed)) =
+                        (reusable_graph_node_counts.as_mut(), graph_node_counts)
+                    {
+                        debug_assert_eq!(observed.len(), segment_end - index);
+                        for (target, observed) in target[index..segment_end]
+                            .iter_mut()
+                            .zip(observed.iter().copied())
+                        {
+                            *target = Some(observed);
+                        }
                     }
                     if let Some(command_spans) = command_spans.as_mut() {
                         command_spans.push(
@@ -2204,6 +2228,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     command_node_indices,
                     &commands,
                     execution_paths,
+                    reusable_graph_node_counts.as_deref(),
                 )
             }) {
             None => None,
@@ -2454,6 +2479,7 @@ mod tests {
             &[Some(0), Some(0)],
             &[compute, binding],
             &[DeviceExecutionPath::Eager, DeviceExecutionPath::Replayed],
+            Some(&[None, Some(2)]),
         )
         .unwrap();
 
@@ -2474,6 +2500,7 @@ mod tests {
         assert_eq!(binding.command_index(), 1);
         assert_eq!(binding.command_phase(), DeviceCommandPhase::DynamicBinding);
         assert_eq!(binding.execution_path(), DeviceExecutionPath::Replayed);
+        assert_eq!(binding.reusable_graph_node_count(), Some(2));
         assert_eq!(binding.compute_dispatch_count(), 0);
         assert_eq!(binding.transfer_command_count(), 2);
     }
