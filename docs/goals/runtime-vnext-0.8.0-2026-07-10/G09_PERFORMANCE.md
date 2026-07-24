@@ -882,6 +882,31 @@ and provider encoding moved together, identify the direct-path boundary
 responsible, and make a falsifiable prediction for a new source delta. A
 launch-count-only kernel proposal is not sufficient.
 
+### 2026-07-25 Attribution correction checkpoint
+
+The recovered first-pair artifact remains an immutable candidate REJECT, but
+offline source/artifact review did not establish that the fused kernel caused
+the co-moving resource-prepare, provider-encode, and host-submit increase.
+Both slots used `1,110` direct waves with zero fallback and zero catalog-epoch
+miss, while historical adjacent slots show that the three host counters can
+move together under CPU scheduling/order noise. Repeating another Basic pair
+would therefore re-measure the same ambiguity rather than isolate a source
+boundary.
+
+Commit `6a2c49a65077161f988ac04e372ff5a6fcc1adc3` implements the prerequisite
+direct-path Replay profiler described by G06. It records physical
+reusable/eager spans and executable fingerprints without switching CUDA to
+the `full/Kernel` logical-provider path. This is observability infrastructure,
+not a performance candidate and not formal G09 progress.
+
+The next paid action is limited to validating that profiler on the retained
+1x RTX 4090 after product correctness. No packed-decode source delta, Basic
+pair, profile-off pair, or throughput sweep may start until the resulting
+artifact proves direct reusable span coverage, zero fallback/epoch miss, and
+machine-readable JSONL attribution. After that checkpoint, the next kernel
+candidate must name one measured physical span/fingerprint, predict its
+device-time change, and retain the existing absolute throughput floor.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
