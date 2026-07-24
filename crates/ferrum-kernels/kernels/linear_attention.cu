@@ -1506,16 +1506,14 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
       key_heads, value_heads, key_dim, value_dim, conv_kernel);
 }
 
-template <typename InputT, typename StateT, typename ZT,
-          bool INDIRECT_STATE>
+template <typename InputT, typename StateT>
 static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl(
     const InputT* __restrict__ mixed_qkvz_raw,
     const InputT* __restrict__ conv_weight,
-    StateT* __restrict__ direct_conv_state_slots,
-    const unsigned long long* __restrict__ state_bindings,
+    StateT* __restrict__ conv_state_slots,
     const unsigned int* __restrict__ slot_indices,
     float* __restrict__ mixed_qkv,
-    ZT* __restrict__ z,
+    float* __restrict__ z,
     const int batch,
     const int max_slots,
     const int key_heads,
@@ -1536,16 +1534,9 @@ static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz
 
   const int row = global / row_total;
   const int idx = global - row * row_total;
-  StateT* conv_state_slots = direct_conv_state_slots;
-  int slot = 0;
-  if (INDIRECT_STATE) {
-    if (row != 0) return;
-    conv_state_slots = reinterpret_cast<StateT*>(state_bindings[0]);
-  } else {
-    const unsigned int slot_u = slot_indices[row];
-    if (slot_u >= static_cast<unsigned int>(max_slots)) return;
-    slot = static_cast<int>(slot_u);
-  }
+  const unsigned int slot_u = slot_indices[row];
+  if (slot_u >= static_cast<unsigned int>(max_slots)) return;
+  const int slot = static_cast<int>(slot_u);
 
   if (idx < conv_channels) {
     const int channel = idx;
@@ -1577,10 +1568,8 @@ static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz
   }
 
   if (idx < value_total) {
-    ferrum_store_value(
-        z, row * value_total + idx,
-        ferrum_load_value(mixed_qkvz_raw,
-                          row * qkvz_width + conv_channels + idx));
+    z[row * value_total + idx] =
+        ferrum_load_value(mixed_qkvz_raw, row * qkvz_width + conv_channels + idx);
   }
 }
 
@@ -1598,11 +1587,10 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
-      float, float, float, false>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
-      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
-      value_dim, conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<float, float>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
+      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32_state_f16(
@@ -1619,11 +1607,10 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
-      float, __half, float, false>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
-      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
-      value_dim, conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<float, __half>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
+      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32(
@@ -1640,11 +1627,10 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
-      __half, float, float, false>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
-      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
-      value_dim, conv_kernel);
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<__half, float>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
+      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32_state_f16(
@@ -1661,113 +1647,10 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<
-      __half, __half, float, false>(
-      mixed_qkvz_raw, conv_weight, conv_state_slots, nullptr, slot_indices,
-      mixed_qkv, z, batch, max_slots, key_heads, value_heads, key_dim,
-      value_dim, conv_kernel);
-}
-
-extern "C" __global__ void
-linear_attention_decode_fused_conv_qk_norm_pack_f16_to_f32_state_f16_z_f16_indirect(
-    const __half* __restrict__ mixed_qkvz_raw,
-    const __half* __restrict__ conv_weight,
-    const unsigned long long* __restrict__ state_bindings,
-    float* __restrict__ mixed_qkv,
-    __half* __restrict__ z,
-    const int key_heads,
-    const int value_heads,
-    const int key_dim,
-    const int value_dim,
-    const int conv_kernel) {
-  const int key_head = static_cast<int>(blockIdx.x);
-  if (key_head >= key_heads || key_heads <= 0 ||
-      value_heads % key_heads != 0) {
-    return;
-  }
-
-  const int qk_total = key_heads * key_dim;
-  const int value_total = value_heads * value_dim;
-  const int conv_channels = 2 * qk_total + value_total;
-  const int state_len = conv_kernel - 1;
-  const int repeat_factor = value_heads / key_heads;
-  const int first_value_feature = key_head * repeat_factor * value_dim;
-  const int owned_value_features = repeat_factor * value_dim;
-  const int owned_conv_channels = 2 * key_dim + owned_value_features;
-  __half* conv_state =
-      reinterpret_cast<__half*>(state_bindings[0]);
-
-  float q_sum = 0.0f;
-  float k_sum = 0.0f;
-  for (int local = threadIdx.x; local < owned_conv_channels;
-       local += blockDim.x) {
-    int channel;
-    if (local < key_dim) {
-      channel = key_head * key_dim + local;
-    } else if (local < 2 * key_dim) {
-      channel = qk_total + key_head * key_dim + local - key_dim;
-    } else {
-      channel =
-          2 * qk_total + first_value_feature + local - 2 * key_dim;
-    }
-
-    const int state_base = channel * state_len;
-    float acc = 0.0f;
-    for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
-      const float x =
-          kernel_idx < state_len
-              ? ferrum_load_value(conv_state, state_base + kernel_idx)
-              : ferrum_load_value(mixed_qkvz_raw, channel);
-      acc += x * ferrum_load_value(
-                     conv_weight, channel * conv_kernel + kernel_idx);
-    }
-    if (state_len > 0) {
-      for (int pos = 0; pos < state_len; ++pos) {
-        ferrum_store_value(
-            conv_state, state_base + pos,
-            pos + 1 < state_len
-                ? ferrum_load_value(conv_state, state_base + pos + 1)
-                : ferrum_load_value(mixed_qkvz_raw, channel));
-      }
-    }
-
-    const float conv = ferrum_silu(acc);
-    mixed_qkv[channel] = conv;
-    if (local < key_dim) {
-      q_sum += conv * conv;
-    } else if (local < 2 * key_dim) {
-      k_sum += conv * conv;
-    }
-  }
-
-  for (int local = threadIdx.x; local < owned_value_features;
-       local += blockDim.x) {
-    const int value_feature = first_value_feature + local;
-    ferrum_store_value(
-        z, value_feature,
-        ferrum_load_value(mixed_qkvz_raw,
-                          conv_channels + value_feature));
-  }
-
-  __shared__ float q_reduce[1024];
-  __shared__ float k_reduce[1024];
-  q_reduce[threadIdx.x] = q_sum;
-  k_reduce[threadIdx.x] = k_sum;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      q_reduce[threadIdx.x] += q_reduce[threadIdx.x + stride];
-      k_reduce[threadIdx.x] += k_reduce[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-
-  const float q_inv = rsqrtf(q_reduce[0] + 1.0e-6f);
-  const float k_inv = rsqrtf(k_reduce[0] + 1.0e-6f);
-  for (int d = threadIdx.x; d < key_dim; d += blockDim.x) {
-    mixed_qkv[key_head * key_dim + d] *= q_inv;
-    mixed_qkv[qk_total + key_head * key_dim + d] *= k_inv;
-  }
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<__half, __half>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
+      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_qk_l2norm_f32(

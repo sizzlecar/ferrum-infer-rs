@@ -116,7 +116,7 @@ fn recurrent_attention_uses_two_packed_input_projections() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains(
         "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect"
     ));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("launch.topology.compute_dispatches()"));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("u64::from(participant_count) * 11"));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains(
         "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect"
     ));
@@ -124,103 +124,6 @@ fn recurrent_attention_uses_two_packed_input_projections() {
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.z,"));
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.a,"));
     assert!(!RECURRENT_ATTENTION_SOURCE.contains("shared.b,"));
-}
-
-#[test]
-fn recurrent_single_token_decode_fuses_conv_and_qk_norm_per_key_head() {
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("enum CudaRecurrentAttentionTopology"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("SingleTokenFusedNormalizedPackedDecode"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("VarlenRecurrentScan"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("tokens == 1"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("&& shape.tiled_delta"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains(".bytes(launch.topology.as_str().as_bytes())"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("launch.topology.transfer_commands()"));
-    assert!(
-        RECURRENT_ATTENTION_SOURCE.contains("Self::SingleTokenFusedNormalizedPackedDecode => 9")
-    );
-    assert!(
-        RECURRENT_ATTENTION_SOURCE.contains("Self::SingleTokenFusedNormalizedPackedDecode => 0")
-    );
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("launch_decode_fused_conv_qk_norm_pack("));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("launch_decode_prenormalized_packed_delta("));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains(
-        "linear_attention_decode_fused_conv_qk_norm_pack_f16_to_f32_state_f16_z_f16_indirect"
-    ));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
-        .contains("__half* conv_state =\n      reinterpret_cast<__half*>(state_bindings[0])"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
-        .contains("const int key_head = static_cast<int>(blockIdx.x)"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
-        .contains("const int repeat_factor = value_heads / key_heads"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
-        .contains("const int owned_conv_channels = 2 * key_dim + owned_value_features"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("__shared__ float q_reduce[1024]"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("__shared__ float k_reduce[1024]"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("mixed_qkv[key_head * key_dim + d] *= q_inv"));
-    assert!(LINEAR_ATTENTION_KERNEL_SOURCE
-        .contains("mixed_qkv[qk_total + key_head * key_dim + d] *= k_inv"));
-    assert!(GATED_DELTA_KERNEL_SOURCE.contains(
-        "recurrent_gated_delta_rule_decode_prenormalized_packed_f32_ba_f16_params_f32_indirect"
-    ));
-    assert!(GATED_DELTA_KERNEL_SOURCE
-        .contains("state_slots = reinterpret_cast<StateT*>(state_bindings[1])"));
-    assert!(GATED_DELTA_KERNEL_SOURCE.contains("bool QK_PRENORMALIZED"));
-    assert!(GATED_DELTA_KERNEL_SOURCE.contains("if constexpr (!QK_PRENORMALIZED)"));
-    assert_eq!(
-        GATED_DELTA_KERNEL_SOURCE
-            .matches("16, false, false>")
-            .count(),
-        6
-    );
-    assert_eq!(
-        GATED_DELTA_KERNEL_SOURCE.matches("16, true, true>").count(),
-        1
-    );
-
-    let decode_branch = RECURRENT_ATTENTION_SOURCE
-        .split("CudaRecurrentAttentionTopology::SingleTokenFusedNormalizedPackedDecode => {")
-        .nth(1)
-        .expect("CUDA recurrent provider must define a fused normalized single-token branch")
-        .split("CudaRecurrentAttentionTopology::VarlenRecurrentScan => {")
-        .next()
-        .expect("fused normalized single-token branch must precede the varlen branch");
-    assert!(!decode_branch.contains("launch_conv_state_commit("));
-    assert!(!decode_branch.contains("launch_qk_norm("));
-    let fused = decode_branch
-        .find("launch_decode_fused_conv_qk_norm_pack(")
-        .expect("decode branch must fuse convolution, QK normalization, and packing");
-    let delta = decode_branch
-        .find("launch_decode_prenormalized_packed_delta(")
-        .expect("decode branch must consume pre-normalized packed Q/K");
-    assert!(fused < delta);
-    assert!(!decode_branch.contains("Qwen"));
-    assert!(!decode_branch.contains("4090"));
-    assert!(!RECURRENT_ATTENTION_SOURCE.contains("fn packed_decode_key_pointer("));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains(".min(1024)"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains(".next_power_of_two()"));
-
-    let packed_delta_export = GATED_DELTA_KERNEL_SOURCE
-        .split(
-            "recurrent_gated_delta_rule_decode_prenormalized_packed_f32_ba_f16_params_f32_indirect",
-        )
-        .nth(1)
-        .expect("CUDA kernel must export the pre-normalized packed delta ABI")
-        .split("\ntemplate <typename StateT>")
-        .next()
-        .expect("pre-normalized packed delta export must have a bounded body");
-    assert!(packed_delta_export.contains("__half, float, float, 16, true, true"));
-
-    let varlen_branch = RECURRENT_ATTENTION_SOURCE
-        .split("CudaRecurrentAttentionTopology::VarlenRecurrentScan => {")
-        .nth(1)
-        .expect("CUDA recurrent provider must retain the varlen branch")
-        .split("\n        }")
-        .next()
-        .expect("varlen branch must have a bounded body");
-    assert!(varlen_branch.contains("launch_prepare("));
-    assert!(varlen_branch.contains("launch_conv_state_commit("));
-    assert!(varlen_branch.contains("launch_qk_norm("));
-    assert!(varlen_branch.contains("launch_delta("));
 }
 
 #[test]
