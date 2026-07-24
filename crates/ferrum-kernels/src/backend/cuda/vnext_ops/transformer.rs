@@ -67,6 +67,18 @@ const SWIGLU_SCRATCH_PARTS: u64 = 3;
 static CUDA_GEMM_ALPHA_F32: f32 = 1.0;
 static CUDA_GEMM_BETA_F32: f32 = 0.0;
 
+fn attach_invocation_binding<C>(
+    operation: EncodedDeviceOperation<C>,
+    binding_command: C,
+    has_compiled_program_slot: bool,
+) -> EncodedDeviceOperation<C> {
+    if has_compiled_program_slot {
+        operation.with_program_binding(binding_command)
+    } else {
+        operation.with_dynamic_binding(binding_command)
+    }
+}
+
 pub(super) struct CudaRmsNormProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,

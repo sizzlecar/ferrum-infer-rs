@@ -2,6 +2,7 @@ const CAUSAL_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/causal_attention.rs");
 const RECURRENT_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/attention.rs");
+const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
 const RUNTIME_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime.rs");
 const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
@@ -48,8 +49,11 @@ fn causal_replay_identity_uses_a_partition_capacity_envelope() {
 
 #[test]
 fn dynamic_attention_addresses_use_one_hoistable_program_binding_boundary() {
-    assert!(CAUSAL_ATTENTION_SOURCE.contains(".with_program_binding(binding_command)"));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains(".with_program_binding(binding_command)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("attach_invocation_binding("));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("attach_invocation_binding("));
+    assert!(TRANSFORMER_SOURCE.contains("has_compiled_program_slot"));
+    assert!(TRANSFORMER_SOURCE.contains("operation.with_program_binding(binding_command)"));
+    assert!(TRANSFORMER_SOURCE.contains("operation.with_dynamic_binding(binding_command)"));
     assert!(RUNTIME_SOURCE.contains("vnext_program_binding_prelude"));
     assert!(RUNTIME_SOURCE.contains("coalesced_program_bindings"));
 }

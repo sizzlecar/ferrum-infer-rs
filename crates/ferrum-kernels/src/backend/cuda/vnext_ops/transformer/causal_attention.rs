@@ -19,7 +19,7 @@ use ferrum_interfaces::vnext::{
     WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 
-use super::{ensure_estimator_request, estimate, launch_gemm_f16};
+use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 #[cfg(feature = "vllm-paged-attn-v2")]
 use crate::backend::cuda::vllm_paged_attn::{
     dispatch_vnext_addressed_paged_attention_raw, VnextAddressedPagedAttentionKernel,
@@ -1077,49 +1077,57 @@ fn encode_attention(
 
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA causal attention participant count exceeds u32".to_owned())?;
-    let binding_command = if let Some(program_binding) = program_binding {
-        let mut regions = binding_regions.into_iter();
-        let destination = regions
-            .next()
-            .ok_or_else(|| "CUDA causal binding destination is missing".to_owned())?;
-        let fence_dependencies = regions.collect::<Vec<_>>();
-        let mut writes = Vec::with_capacity(bindings.len());
-        for (index, (binding, payload)) in bindings.into_iter().zip(host_storage).enumerate() {
-            if binding.host_binding != index {
-                return Err("CUDA causal binding payload order is not canonical".to_owned());
+    let (binding_command, has_compiled_program_slot) =
+        if let Some(program_binding) = program_binding {
+            let mut regions = binding_regions.into_iter();
+            let destination = regions
+                .next()
+                .ok_or_else(|| "CUDA causal binding destination is missing".to_owned())?;
+            let fence_dependencies = regions.collect::<Vec<_>>();
+            let mut writes = Vec::with_capacity(bindings.len());
+            for (index, (binding, payload)) in bindings.into_iter().zip(host_storage).enumerate() {
+                if binding.host_binding != index {
+                    return Err("CUDA causal binding payload order is not canonical".to_owned());
+                }
+                writes.push(
+                    super::CudaProgramBindingWrite::new(binding.binding_offset, payload)
+                        .map_err(|error| error.to_string())?,
+                );
             }
-            writes.push(
-                super::CudaProgramBindingWrite::new(binding.binding_offset, payload)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        CudaDeviceCommand::program_binding_patch(
-            "vnext_causal_paged_attention_bindings",
-            program_binding,
-            destination,
-            writes,
-            fence_dependencies,
-        )
-    } else {
-        CudaDeviceCommand::operation_with_host_storage_and_blas(
-            "vnext_causal_paged_attention_bindings",
-            binding_regions,
-            host_storage,
-            move |stream, _blas, regions, host_storage| {
-                enqueue_bindings(stream, binding_layout, &bindings, regions, host_storage)
-            },
-        )
-    }
-    .and_then(|command| {
-        command.with_work_attribution(
-            DeviceBatchingForm::ParticipantLoop,
-            participant_count,
-            total_tokens,
-            0,
-            u64::from(participant_count),
-        )
-    })
-    .map_err(|error| error.to_string())?;
+            (
+                CudaDeviceCommand::program_binding_patch(
+                    "vnext_causal_paged_attention_bindings",
+                    program_binding,
+                    destination,
+                    writes,
+                    fence_dependencies,
+                ),
+                true,
+            )
+        } else {
+            (
+                CudaDeviceCommand::operation_with_host_storage_and_blas(
+                    "vnext_causal_paged_attention_bindings",
+                    binding_regions,
+                    host_storage,
+                    move |stream, _blas, regions, host_storage| {
+                        enqueue_bindings(stream, binding_layout, &bindings, regions, host_storage)
+                    },
+                ),
+                false,
+            )
+        };
+    let binding_command = binding_command
+        .and_then(|command| {
+            command.with_work_attribution(
+                DeviceBatchingForm::ParticipantLoop,
+                participant_count,
+                total_tokens,
+                0,
+                u64::from(participant_count),
+            )
+        })
+        .map_err(|error| error.to_string())?;
 
     let compute_operation = launches
         .first()
@@ -1218,7 +1226,11 @@ fn encode_attention(
     })
     .map_err(|error| error.to_string())?;
 
-    Ok(EncodedDeviceOperation::compute(compute_command).with_program_binding(binding_command))
+    Ok(attach_invocation_binding(
+        EncodedDeviceOperation::compute(compute_command),
+        binding_command,
+        has_compiled_program_slot,
+    ))
 }
 
 fn encode_reusable_attention_bindings(
