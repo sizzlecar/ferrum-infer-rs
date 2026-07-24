@@ -28,7 +28,7 @@ use crate::backend::reusable_execution::{
 };
 
 use super::vnext_runtime::{CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError};
-use super::vnext_tool_correlation::CudaReplayToolRange;
+use super::vnext_tool_correlation::correlate_replay_launch;
 
 const COMMAND_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.command-replay.v1\0";
 const SEGMENT_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.executable-segment.v1\0";
@@ -416,9 +416,14 @@ impl CudaExecutableSegment {
             self.profile_identity
                 .get_or_init(|| CudaExecutableProfileIdentity::new(self.key))
         });
-        let _tool_range =
-            profile_identity.map(|identity| CudaReplayToolRange::enter(&identity.nvtx_label));
-        let status = unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) };
+        let status = profile_identity.map_or_else(
+            || unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) },
+            |identity| {
+                correlate_replay_launch(&identity.nvtx_label, || unsafe {
+                    sys::cuGraphLaunch(self.executable, stream.cu_stream())
+                })
+            },
+        );
         if status != sys::CUresult::CUDA_SUCCESS {
             return Err(CudaReplayError::cuda(
                 "launch reusable executable",
