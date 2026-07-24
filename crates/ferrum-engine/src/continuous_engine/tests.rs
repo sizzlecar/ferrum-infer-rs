@@ -2704,6 +2704,7 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
             (NEXT_BATCH_PROF_ENV, "1"),
             (WHOLE_PROMPT_PREFIX_CACHE_ENV, "1"),
             (RBD_PROF_ENV, "1"),
+            ("FERRUM_PROFILE_JSONL", "/tmp/profile.jsonl"),
             ("FERRUM_SCHEDULER_TRACE_JSONL", "/tmp/scheduler-trace.jsonl"),
             (UNIFIED_POST_PROF_ENV, "1"),
         ],
@@ -2720,6 +2721,10 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
     assert!(cfg.next_batch_prof);
     assert!(cfg.prefix_cache_enabled);
     assert!(cfg.rbd_prof);
+    assert_eq!(
+        cfg.profile_jsonl.as_deref(),
+        Some(std::path::Path::new("/tmp/profile.jsonl"))
+    );
     assert_eq!(
         cfg.scheduler_trace_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/scheduler-trace.jsonl"))
@@ -2816,6 +2821,22 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
+}
+
+#[test]
+fn product_profile_path_constructs_a_vnext_execution_journal() {
+    let trace_path = resource_trace_temp_path("profile-runtime-journal");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut config = EngineConfig::default();
+    config.runtime.profile_jsonl = Some(trace_path.clone());
+
+    let engine = test_continuous_engine_with_config(config);
+
+    assert!(engine.inner.profile_trace_jsonl.is_some());
+    assert!(engine.inner.scheduler_trace_jsonl.is_none());
+    assert!(trace_path.exists());
+    drop(engine);
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[tokio::test]
@@ -5736,6 +5757,38 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
     );
 
     let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+fn vnext_execution_events_fan_out_to_profile_and_scheduler_journals() {
+    let profile_path = resource_trace_temp_path("vnext-profile-fanout");
+    let scheduler_path = resource_trace_temp_path("vnext-scheduler-fanout");
+    let _ = std::fs::remove_file(&profile_path);
+    let _ = std::fs::remove_file(&scheduler_path);
+    let profile_journal = create_scheduler_trace_sink(Some(&profile_path)).unwrap();
+    let scheduler_journal = create_scheduler_trace_sink(Some(&scheduler_path)).unwrap();
+    let config = EngineConfig::default();
+    let sink = VNextProfileExecutionEventSink::with_journals(
+        vec![profile_journal.clone(), scheduler_journal.clone()],
+        ProfileEntrypoint::Run,
+        &config,
+    );
+    let (_, _, event) = vnext_profile_test_event();
+
+    sink.enqueue_events(vec![event]).unwrap();
+    profile_journal.flush().unwrap();
+    scheduler_journal.flush().unwrap();
+
+    let profile_events = read_engine_profile_events(&profile_path);
+    let scheduler_events = read_engine_profile_events(&scheduler_path);
+    assert_eq!(profile_events, scheduler_events);
+    assert_eq!(profile_events.len(), 1);
+    assert_eq!(profile_events[0].phase, "vnext.request_accepted");
+
+    profile_journal.close().unwrap();
+    scheduler_journal.close().unwrap();
+    let _ = std::fs::remove_file(profile_path);
+    let _ = std::fs::remove_file(scheduler_path);
 }
 
 #[test]

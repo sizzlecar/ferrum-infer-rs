@@ -65,6 +65,8 @@ pub struct RuntimeKnobs {
     pub batch_decode_prof: bool,
     pub next_batch_prof: bool,
     pub rbd_prof: bool,
+    #[serde(default)]
+    pub profile_jsonl: Option<PathBuf>,
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
@@ -162,6 +164,9 @@ impl EngineConfig {
         self.runtime.next_batch_prof |=
             runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
         self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_JSONL") {
+            self.runtime.profile_jsonl = Some(parse_path_env_value(value)?);
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHEDULER_TRACE_JSONL") {
             self.runtime.scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
         }
@@ -1003,6 +1008,22 @@ mod tests {
         assert_eq!(
             config.runtime.profile_detail,
             ObservabilityProfileDetail::Replay
+        );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_profile_jsonl_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_JSONL", "/tmp/profile.jsonl")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_jsonl.as_deref(),
+            Some(std::path::Path::new("/tmp/profile.jsonl"))
         );
     }
 
