@@ -74,23 +74,61 @@ pub(super) fn prepare() {
     let _ = nvtx_api();
 }
 
-pub(super) struct CudaReplayToolRange {
-    api: Option<&'static NvtxApi>,
+pub(super) fn correlate_replay_launch<T>(label: &CStr, launch: impl FnOnce() -> T) -> T {
+    let Some(api) = nvtx_api() else {
+        return launch();
+    };
+    correlate_replay_launch_with_api(api, label, launch)
 }
 
-impl CudaReplayToolRange {
-    pub(super) fn enter(label: &CStr) -> Self {
-        let api = nvtx_api().filter(|api| unsafe { (api.range_push)(label.as_ptr()) } >= 0);
-        Self { api }
+fn correlate_replay_launch_with_api<T>(
+    api: &NvtxApi,
+    label: &CStr,
+    launch: impl FnOnce() -> T,
+) -> T {
+    let push_status = unsafe { (api.range_push)(label.as_ptr()) };
+    let result = launch();
+    let pop_status = unsafe { (api.range_pop)() };
+    if push_status < 0 || pop_status < 0 {
+        tracing::debug!(
+            push_status,
+            pop_status,
+            "CUDA reusable executable NVTX correlation reported an unbalanced range"
+        );
     }
+    result
 }
 
-impl Drop for CudaReplayToolRange {
-    fn drop(&mut self) {
-        if let Some(api) = self.api {
-            unsafe {
-                (api.range_pop)();
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static CALL_ORDER: AtomicU8 = AtomicU8::new(0);
+
+    unsafe extern "C" fn rejected_push(_label: *const c_char) -> c_int {
+        assert_eq!(CALL_ORDER.fetch_add(1, Ordering::SeqCst), 0);
+        -1
+    }
+
+    unsafe extern "C" fn required_pop() -> c_int {
+        assert_eq!(CALL_ORDER.fetch_add(1, Ordering::SeqCst), 2);
+        0
+    }
+
+    #[test]
+    fn replay_correlation_always_balances_a_recorded_push() {
+        CALL_ORDER.store(0, Ordering::SeqCst);
+        let api = NvtxApi {
+            _handle: std::ptr::null_mut(),
+            range_push: rejected_push,
+            range_pop: required_pop,
+        };
+        let result = correlate_replay_launch_with_api(&api, c"ferrum.cuda.replay/test", || {
+            assert_eq!(CALL_ORDER.fetch_add(1, Ordering::SeqCst), 1);
+            7
+        });
+        assert_eq!(result, 7);
+        assert_eq!(CALL_ORDER.load(Ordering::SeqCst), 3);
     }
 }
