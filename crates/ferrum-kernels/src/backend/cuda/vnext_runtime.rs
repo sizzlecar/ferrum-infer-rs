@@ -17,12 +17,12 @@ use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
-    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
-    DeviceCommandExecutionTiming, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
-    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionTiming, DeviceId,
-    DeviceNativeWorkAttribution, DeviceReusableAddressScope, DeviceReusableExecutionObservation,
-    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim,
-    DeviceRuntime, DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming,
+    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceDescriptor,
+    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
+    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
+    DeviceReusableAddressScope, DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
     DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
     DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
@@ -1248,47 +1248,130 @@ enum CudaFenceTiming {
     Unavailable,
 }
 
-struct CudaCommandEventTiming {
-    command_index: u32,
-    kind: DeviceExecutionIntervalKind,
+impl CudaFenceTiming {
+    fn origin(&self) -> Option<&CudaEvent> {
+        match self {
+            Self::Events { start } => Some(start),
+            Self::NotRequested | Self::Unavailable => None,
+        }
+    }
+}
+
+enum CudaExecutionSpanEventMeasurement {
+    Events { start: CudaEvent, end: CudaEvent },
+    Unavailable(DeviceTimingUnavailableReason),
+}
+
+struct CudaExecutionSpanEventTiming {
+    start_command_index: u32,
+    end_command_index: u32,
+    span_kind: DeviceExecutionSpanKind,
+    interval_kind: DeviceExecutionIntervalKind,
     operation: &'static str,
-    start: CudaEvent,
-    end: CudaEvent,
+    measurement: CudaExecutionSpanEventMeasurement,
+}
+
+impl CudaExecutionSpanEventTiming {
+    fn new(
+        start_command_index: usize,
+        end_command_index: usize,
+        span_kind: DeviceExecutionSpanKind,
+        interval_kind: DeviceExecutionIntervalKind,
+        operation: &'static str,
+        events: Option<(CudaEvent, CudaEvent)>,
+    ) -> Option<Self> {
+        let start_command_index = u32::try_from(start_command_index).ok()?;
+        let end_command_index = u32::try_from(end_command_index).ok()?;
+        let measurement = events.map_or(
+            CudaExecutionSpanEventMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            ),
+            |(start, end)| CudaExecutionSpanEventMeasurement::Events { start, end },
+        );
+        Some(Self {
+            start_command_index,
+            end_command_index,
+            span_kind,
+            interval_kind,
+            operation,
+            measurement,
+        })
+    }
+
+    fn resolve(&self, origin: &CudaEvent) -> Option<DeviceSubmissionExecutionSpan> {
+        match &self.measurement {
+            CudaExecutionSpanEventMeasurement::Events { start, end } => {
+                let interval = cuda_event_elapsed_ns(origin, start)
+                    .zip(cuda_event_elapsed_ns(origin, end))
+                    .and_then(|(start_offset_ns, end_offset_ns)| {
+                        DeviceExecutionInterval::new_labeled(
+                            self.interval_kind,
+                            start_offset_ns,
+                            end_offset_ns,
+                            self.operation,
+                        )
+                    });
+                match interval {
+                    Some(interval) => DeviceSubmissionExecutionSpan::measured(
+                        self.start_command_index,
+                        self.end_command_index,
+                        self.span_kind,
+                        vec![interval],
+                    ),
+                    None => DeviceSubmissionExecutionSpan::unavailable(
+                        self.start_command_index,
+                        self.end_command_index,
+                        self.span_kind,
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    ),
+                }
+            }
+            CudaExecutionSpanEventMeasurement::Unavailable(reason) => {
+                DeviceSubmissionExecutionSpan::unavailable(
+                    self.start_command_index,
+                    self.end_command_index,
+                    self.span_kind,
+                    *reason,
+                )
+            }
+        }
+    }
 }
 
 enum CudaFenceCommandTiming {
     NotRequested,
     Unavailable(DeviceTimingUnavailableReason),
-    Events(Vec<CudaCommandEventTiming>),
+    Spans {
+        command_count: u32,
+        spans: Vec<CudaExecutionSpanEventTiming>,
+    },
 }
 
 impl CudaFenceCommandTiming {
-    fn measurement(&self) -> DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+    fn measurement(
+        &self,
+        origin: Option<&CudaEvent>,
+    ) -> DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
         match self {
             Self::NotRequested => DeviceTimingMeasurement::NotRequested,
             Self::Unavailable(reason) => DeviceTimingMeasurement::Unavailable(*reason),
-            Self::Events(events) => {
-                let Some(origin) = events.first().map(|event| &event.start) else {
+            Self::Spans {
+                command_count,
+                spans,
+            } => {
+                let Some(origin) = origin else {
                     return DeviceTimingMeasurement::Unavailable(
                         DeviceTimingUnavailableReason::BackendMeasurementFailed,
                     );
                 };
-                let commands = events
+                let spans = spans
                     .iter()
-                    .map(|event| {
-                        let start_offset_ns = cuda_event_elapsed_ns(origin, &event.start)?;
-                        let end_offset_ns = cuda_event_elapsed_ns(origin, &event.end)?;
-                        let interval = DeviceExecutionInterval::new_labeled(
-                            event.kind,
-                            start_offset_ns,
-                            end_offset_ns,
-                            event.operation,
-                        )?;
-                        DeviceCommandExecutionTiming::new(event.command_index, vec![interval])
-                    })
+                    .map(|span| span.resolve(origin))
                     .collect::<Option<Vec<_>>>()
-                    .and_then(DeviceSubmissionExecutionTiming::new);
-                commands.map_or_else(
+                    .and_then(|spans| {
+                        DeviceSubmissionExecutionTiming::from_spans(*command_count, spans)
+                    });
+                spans.map_or_else(
                     || {
                         DeviceTimingMeasurement::Unavailable(
                             DeviceTimingUnavailableReason::BackendMeasurementFailed,
@@ -1352,11 +1435,12 @@ impl CudaDeviceFence {
                     CudaFenceCommandTiming::NotRequested => {
                         DeviceTerminalReceipt::profiled(terminal, self.execution_timing())
                     }
-                    CudaFenceCommandTiming::Unavailable(_) | CudaFenceCommandTiming::Events(_) => {
+                    CudaFenceCommandTiming::Unavailable(_)
+                    | CudaFenceCommandTiming::Spans { .. } => {
                         DeviceTerminalReceipt::profiled_with_submission_timing(
                             terminal,
                             self.execution_timing(),
-                            self.command_timing.measurement(),
+                            self.command_timing.measurement(self.timing.origin()),
                         )
                     }
                 }
@@ -1850,6 +1934,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .into_iter()
             .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
+        let command_count =
+            u32::try_from(commands.len()).expect("CUDA command count was validated above");
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
         let mut execution_paths =
             kernel_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
@@ -1962,8 +2048,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
-        let mut command_events = kernel_attribution.then(|| Vec::with_capacity(commands.len()));
-        let mut command_timing_unavailable = None;
+        let mut command_spans = kernel_attribution.then(|| Vec::with_capacity(commands.len()));
         let mut index = 0;
         let mut executable_candidate_index = 0;
         while index < commands.len() {
@@ -1973,25 +2058,62 @@ impl DeviceRuntime for CudaDeviceRuntime {
             {
                 executable_candidate_index += 1;
             }
-            let replayed_end = executable_candidates
+            let replay_candidate = executable_candidates
                 .get(executable_candidate_index)
-                .filter(|candidate| candidate.start() == index)
-                .and_then(|candidate| {
-                    match stream.executable_cache.launch(&stream.stream, candidate) {
-                        Ok(true) => Some(Ok(candidate.end())),
+                .filter(|candidate| candidate.start() == index);
+            let replayed = match replay_candidate {
+                Some(candidate)
+                    if kernel_attribution && stream.executable_cache.contains(candidate) =>
+                {
+                    let start = command_spans.as_ref().and_then(|_| {
+                        stream
+                            .stream
+                            .record_event(Some(
+                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+                            ))
+                            .ok()
+                    });
+                    let launched = stream.executable_cache.launch(&stream.stream, candidate);
+                    let end = command_spans.as_ref().and_then(|_| {
+                        stream
+                            .stream
+                            .record_event(Some(
+                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+                            ))
+                            .ok()
+                    });
+                    match launched {
+                        Ok(true) => Some(Ok((candidate.end(), start.zip(end)))),
                         Ok(false) => None,
                         Err(error) => Some(Err(error)),
                     }
-                });
-            match replayed_end {
-                Some(Ok(segment_end)) => {
+                }
+                Some(candidate) if !kernel_attribution => {
+                    match stream.executable_cache.launch(&stream.stream, candidate) {
+                        Ok(true) => Some(Ok((candidate.end(), None))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                }
+                Some(_) | None => None,
+            };
+            match replayed {
+                Some(Ok((segment_end, events))) => {
                     if let Some(execution_paths) = execution_paths.as_mut() {
                         execution_paths[index..segment_end].fill(DeviceExecutionPath::Replayed);
                     }
-                    if kernel_attribution {
-                        command_events = None;
-                        command_timing_unavailable =
-                            Some(DeviceTimingUnavailableReason::BackendUnsupported);
+                    if let Some(command_spans) = command_spans.as_mut() {
+                        command_spans.push(
+                            CudaExecutionSpanEventTiming::new(
+                                index,
+                                segment_end,
+                                DeviceExecutionSpanKind::ReusableExecutable,
+                                DeviceExecutionIntervalKind::Compute,
+                                "cuda reusable executable",
+                                events,
+                            )
+                            .expect("CUDA replay range was validated as u32"),
+                        );
                     }
                     if S::ENABLED {
                         replay_observation.observe_replayed_segment(segment_end - index);
@@ -2008,7 +2130,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 None => {}
             }
-            let command_start = command_events.as_ref().and_then(|_| {
+            let command_start = command_spans.as_ref().and_then(|_| {
                 stream
                     .stream
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -2019,36 +2141,28 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 self.quarantine(stream, commands);
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
             }
-            if command_events.is_some() {
+            if let Some(command_spans) = command_spans.as_mut() {
                 let command_end = stream
                     .stream
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                     .ok();
-                match command_start.zip(command_end) {
-                    Some((start, end)) => {
-                        let command = &commands[index];
-                        let kind = if command.compute_dispatch_count > 0 {
-                            DeviceExecutionIntervalKind::Compute
-                        } else {
-                            DeviceExecutionIntervalKind::Transfer
-                        };
-                        command_events
-                            .as_mut()
-                            .expect("CUDA command event collection was checked")
-                            .push(CudaCommandEventTiming {
-                                command_index: index as u32,
-                                kind,
-                                operation: command.operation,
-                                start,
-                                end,
-                            });
-                    }
-                    None => {
-                        command_events = None;
-                        command_timing_unavailable =
-                            Some(DeviceTimingUnavailableReason::BackendMeasurementFailed);
-                    }
-                }
+                let command = &commands[index];
+                let interval_kind = if command.compute_dispatch_count > 0 {
+                    DeviceExecutionIntervalKind::Compute
+                } else {
+                    DeviceExecutionIntervalKind::Transfer
+                };
+                command_spans.push(
+                    CudaExecutionSpanEventTiming::new(
+                        index,
+                        index + 1,
+                        DeviceExecutionSpanKind::EagerCommand,
+                        interval_kind,
+                        command.operation,
+                        command_start.zip(command_end),
+                    )
+                    .expect("CUDA eager command index was validated as u32"),
+                );
             }
             if S::ENABLED {
                 replay_observation.observe_eager_command();
@@ -2084,15 +2198,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
             DeviceTimingMode::Off | DeviceTimingMode::Completion => {
                 CudaFenceCommandTiming::NotRequested
             }
-            DeviceTimingMode::Kernel => match command_timing_unavailable {
-                Some(reason) => CudaFenceCommandTiming::Unavailable(reason),
-                None => command_events.map_or(
-                    CudaFenceCommandTiming::Unavailable(
-                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
-                    ),
-                    CudaFenceCommandTiming::Events,
+            DeviceTimingMode::Kernel => command_spans.map_or(
+                CudaFenceCommandTiming::Unavailable(
+                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
                 ),
-            },
+                |spans| CudaFenceCommandTiming::Spans {
+                    command_count,
+                    spans,
+                },
+            ),
         };
 
         let fence_stage = CudaSubmissionStageTimer::start(

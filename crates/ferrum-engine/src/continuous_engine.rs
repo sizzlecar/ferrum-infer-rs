@@ -29,9 +29,11 @@ use ferrum_interfaces::{
     vnext::{
         AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
         CapacityAvailabilityEpoch, DeferredAction, DeviceCapacityPressureScope,
-        DeviceTimingMeasurement, EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent,
-        ExecutionEventCapturePolicy, ExecutionEventDetail,
-        ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
+        DeviceExecutionSpanKind, DeviceExecutionSpanMeasurement, DeviceSubmissionExecutionSpan,
+        DeviceSubmissionExecutionTiming, DeviceTimingMeasurement, DeviceTimingUnavailableReason,
+        EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy,
+        ExecutionEventDetail, ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink,
+        ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
@@ -3789,6 +3791,79 @@ struct VNextProfileExecutionEventSink {
     context: Arc<VNextProfileEventContext>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceCommandTimingUnavailable {
+    Backend(DeviceTimingUnavailableReason),
+    MissingSpan,
+}
+
+impl DeviceCommandTimingUnavailable {
+    fn label(self) -> String {
+        match self {
+            Self::Backend(reason) => format!("{reason:?}").to_ascii_lowercase(),
+            Self::MissingSpan => "missing_span".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeviceCommandTimingProjection<'a> {
+    physical_span: Option<&'a DeviceSubmissionExecutionSpan>,
+    command_measurement: Option<&'a DeviceExecutionSpanMeasurement>,
+    status: &'static str,
+    unavailable: Option<DeviceCommandTimingUnavailable>,
+}
+
+fn project_device_command_timing<'a>(
+    terminal_timing: &'a DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    command_index: u32,
+) -> DeviceCommandTimingProjection<'a> {
+    match terminal_timing {
+        DeviceTimingMeasurement::NotRequested => DeviceCommandTimingProjection {
+            physical_span: None,
+            command_measurement: None,
+            status: "not_requested",
+            unavailable: None,
+        },
+        DeviceTimingMeasurement::Unavailable(reason) => DeviceCommandTimingProjection {
+            physical_span: None,
+            command_measurement: None,
+            status: "unavailable",
+            unavailable: Some(DeviceCommandTimingUnavailable::Backend(*reason)),
+        },
+        DeviceTimingMeasurement::Measured(timing) => {
+            let physical_span = timing.span_for_command(command_index);
+            let Some(physical_span) = physical_span else {
+                return DeviceCommandTimingProjection {
+                    physical_span: None,
+                    command_measurement: None,
+                    status: "unavailable",
+                    unavailable: Some(DeviceCommandTimingUnavailable::MissingSpan),
+                };
+            };
+            let measured = physical_span.measurement().elapsed_ns().is_some();
+            let replayed = physical_span.kind() == DeviceExecutionSpanKind::ReusableExecutable;
+            DeviceCommandTimingProjection {
+                physical_span: Some(physical_span),
+                command_measurement: (!replayed).then(|| physical_span.measurement()),
+                status: if measured {
+                    if replayed {
+                        "covered_by_physical_span"
+                    } else {
+                        "measured"
+                    }
+                } else {
+                    "unavailable"
+                },
+                unavailable: physical_span
+                    .measurement()
+                    .unavailable_reason()
+                    .map(DeviceCommandTimingUnavailable::Backend),
+            }
+        }
+    }
+}
+
 impl VNextProfileExecutionEventSink {
     fn new(
         journal: SchedulerTraceJournal,
@@ -4001,28 +4076,42 @@ impl VNextProfileEventContext {
     ) -> std::result::Result<Vec<FerrumProfileEvent>, ExecutionEventSinkError> {
         let batch = attribution.batch_identity();
         let measured_timings = match attribution.terminal_timing() {
-            DeviceTimingMeasurement::Measured(timing) => Some(timing.commands()),
+            DeviceTimingMeasurement::Measured(timing) => Some(timing),
             DeviceTimingMeasurement::NotRequested | DeviceTimingMeasurement::Unavailable(_) => None,
         };
-        let mut events = Vec::with_capacity(attribution.device().commands().len());
-        for (attribution_index, command) in attribution.device().commands().iter().enumerate() {
-            let command_timing =
-                measured_timings.and_then(|timings| timings.get(attribution_index));
-            let device_elapsed_ns = command_timing.map(|timing| timing.elapsed_ns());
-            let device_intervals = command_timing.map(|timing| {
-                timing
-                    .intervals()
-                    .iter()
-                    .map(|interval| {
-                        serde_json::json!({
-                            "kind": interval.kind().as_str(),
-                            "start_offset_ns": interval.start_offset_ns(),
-                            "end_offset_ns": interval.end_offset_ns(),
-                            "subwork_id": interval.subwork_id(),
+        let reusable_span_count = measured_timings.map_or(0, |timing| {
+            timing
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::ReusableExecutable)
+                .count()
+        });
+        let mut events =
+            Vec::with_capacity(attribution.device().commands().len() + reusable_span_count);
+        for command in attribution.device().commands() {
+            let timing = project_device_command_timing(
+                attribution.terminal_timing(),
+                command.command_index(),
+            );
+            let physical_span = timing.physical_span;
+            let command_measurement = timing.command_measurement;
+            let device_elapsed_ns =
+                command_measurement.and_then(DeviceExecutionSpanMeasurement::elapsed_ns);
+            let device_intervals = command_measurement
+                .and_then(DeviceExecutionSpanMeasurement::intervals)
+                .map(|intervals| {
+                    intervals
+                        .iter()
+                        .map(|interval| {
+                            serde_json::json!({
+                                "kind": interval.kind().as_str(),
+                                "start_offset_ns": interval.start_offset_ns(),
+                                "end_offset_ns": interval.end_offset_ns(),
+                                "subwork_id": interval.subwork_id(),
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
-            });
+                        .collect::<Vec<_>>()
+                });
             let (node_index, node, first, participant_request_ids) = if let Some(node_index) =
                 command.node_index()
             {
@@ -4085,11 +4174,21 @@ impl VNextProfileEventContext {
                 ),
                 (
                     "device_interval_count".to_string(),
-                    serde_json::json!(command_timing.map_or(0, |timing| timing.intervals().len())),
+                    serde_json::json!(command_measurement
+                        .and_then(DeviceExecutionSpanMeasurement::intervals)
+                        .map_or(0, |intervals| intervals.len())),
                 ),
                 (
                     "device_elapsed_ns".to_string(),
                     serde_json::json!(device_elapsed_ns),
+                ),
+                (
+                    "device_span_start_command_index".to_string(),
+                    serde_json::json!(physical_span.map(|span| span.start_command_index())),
+                ),
+                (
+                    "device_span_end_command_index".to_string(),
+                    serde_json::json!(physical_span.map(|span| span.end_command_index())),
                 ),
             ]);
             let mut attributes = BTreeMap::from([
@@ -4174,11 +4273,7 @@ impl VNextProfileEventContext {
             }
             attributes.insert(
                 "device_timing_status".to_string(),
-                serde_json::json!(match attribution.terminal_timing() {
-                    DeviceTimingMeasurement::Measured(_) => "measured",
-                    DeviceTimingMeasurement::NotRequested => "not_requested",
-                    DeviceTimingMeasurement::Unavailable(_) => "unavailable",
-                }),
+                serde_json::json!(timing.status),
             );
             attributes.insert(
                 "device_timing_semantics".to_string(),
@@ -4188,10 +4283,16 @@ impl VNextProfileEventContext {
                 "formal_device_busy_time_eligible".to_string(),
                 serde_json::json!(false),
             );
-            if let DeviceTimingMeasurement::Unavailable(reason) = attribution.terminal_timing() {
+            if let Some(span) = physical_span {
+                attributes.insert(
+                    "device_timing_span_kind".to_string(),
+                    serde_json::json!(span.kind().as_str()),
+                );
+            }
+            if let Some(reason) = timing.unavailable {
                 attributes.insert(
                     "device_timing_unavailable_reason".to_string(),
-                    serde_json::json!(format!("{reason:?}").to_ascii_lowercase()),
+                    serde_json::json!(reason.label()),
                 );
             }
             let event = FerrumProfileEvent {
@@ -4243,6 +4344,197 @@ impl VNextProfileEventContext {
                 ))
             })?;
             events.push(event);
+        }
+        if let Some(timing) = measured_timings {
+            let first_node = batch.nodes().first().ok_or_else(|| {
+                ExecutionEventSinkError::new("physical device timing span has no batch nodes")
+            })?;
+            let first = first_node.participants().first().ok_or_else(|| {
+                ExecutionEventSinkError::new("physical device timing span has no participants")
+            })?;
+            let first_identity = first.identity().parts();
+            let mut participant_request_ids = batch
+                .nodes()
+                .iter()
+                .flat_map(|node| node.participants())
+                .map(|participant| participant.identity().parts().request_id.to_string())
+                .collect::<Vec<_>>();
+            participant_request_ids.sort();
+            participant_request_ids.dedup();
+            for span in timing
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::ReusableExecutable)
+            {
+                let device_intervals = span.measurement().intervals().map(|intervals| {
+                    intervals
+                        .iter()
+                        .map(|interval| {
+                            serde_json::json!({
+                                "kind": interval.kind().as_str(),
+                                "start_offset_ns": interval.start_offset_ns(),
+                                "end_offset_ns": interval.end_offset_ns(),
+                                "subwork_id": interval.subwork_id(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let shape = BTreeMap::from([
+                    (
+                        "start_command_index".to_string(),
+                        serde_json::json!(span.start_command_index()),
+                    ),
+                    (
+                        "end_command_index".to_string(),
+                        serde_json::json!(span.end_command_index()),
+                    ),
+                    (
+                        "command_count".to_string(),
+                        serde_json::json!(span.command_count()),
+                    ),
+                    (
+                        "participant_count".to_string(),
+                        serde_json::json!(participant_request_ids.len()),
+                    ),
+                    (
+                        "device_interval_count".to_string(),
+                        serde_json::json!(span
+                            .measurement()
+                            .intervals()
+                            .map_or(0, |intervals| intervals.len())),
+                    ),
+                    (
+                        "device_elapsed_ns".to_string(),
+                        serde_json::json!(span.measurement().elapsed_ns()),
+                    ),
+                ]);
+                let mut attributes = BTreeMap::from([
+                    (
+                        "actual_model_smoke".to_string(),
+                        serde_json::json!(matches!(
+                            self.entrypoint,
+                            ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                        )),
+                    ),
+                    (
+                        "attribution_scope".to_string(),
+                        serde_json::json!("physical_span"),
+                    ),
+                    (
+                        "backend_device".to_string(),
+                        serde_json::json!(self.backend_device),
+                    ),
+                    (
+                        "backend_type".to_string(),
+                        serde_json::json!(self.backend_type),
+                    ),
+                    (
+                        "device_id".to_string(),
+                        serde_json::json!(batch.device_id().to_string()),
+                    ),
+                    ("diagnostic_only".to_string(), serde_json::json!(true)),
+                    (
+                        "device_timing_semantics".to_string(),
+                        serde_json::json!("submission_relative_duration_only"),
+                    ),
+                    (
+                        "device_timing_span_kind".to_string(),
+                        serde_json::json!(span.kind().as_str()),
+                    ),
+                    (
+                        "device_timing_status".to_string(),
+                        serde_json::json!(if span.measurement().elapsed_ns().is_some() {
+                            "measured"
+                        } else {
+                            "unavailable"
+                        }),
+                    ),
+                    ("execution_path".to_string(), serde_json::json!("replayed")),
+                    (
+                        "formal_device_busy_time_eligible".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    (
+                        "participant_request_ids".to_string(),
+                        serde_json::json!(participant_request_ids),
+                    ),
+                    (
+                        "physical_submission_fingerprint".to_string(),
+                        serde_json::json!(attribution.submission_fingerprint()),
+                    ),
+                    (
+                        "plan_hash".to_string(),
+                        serde_json::json!(batch.plan_hash().to_string()),
+                    ),
+                    (
+                        "plan_id".to_string(),
+                        serde_json::json!(batch.plan_id().to_string()),
+                    ),
+                    (
+                        "profile_detail".to_string(),
+                        serde_json::json!(self.profile_detail.as_str()),
+                    ),
+                    (
+                        "runtime_implementation_fingerprint".to_string(),
+                        serde_json::json!(batch.runtime_implementation_fingerprint()),
+                    ),
+                ]);
+                if let Some(reason) = span.measurement().unavailable_reason() {
+                    attributes.insert(
+                        "device_timing_unavailable_reason".to_string(),
+                        serde_json::json!(format!("{reason:?}").to_ascii_lowercase()),
+                    );
+                }
+                let event = FerrumProfileEvent {
+                    schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                    ts_unix_nanos: timestamp
+                        .timestamp_nanos_opt()
+                        .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+                    event_id: format!(
+                        "evt-vnext-device-span-{}-{}-{}",
+                        attribution.submission_fingerprint(),
+                        span.start_command_index(),
+                        span.end_command_index()
+                    ),
+                    request_id: first_identity.request_id.to_string(),
+                    correlation_id: Some(attribution.submission_fingerprint().to_owned()),
+                    entrypoint: self.entrypoint,
+                    backend: "actual".to_string(),
+                    runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+                    phase: "vnext.device_execution_span".to_string(),
+                    event_kind: ProfileEventKind::Instant,
+                    timestamp,
+                    status: ProfileStatus::DiagnosticOnly,
+                    model: Some(self.model.clone()),
+                    duration_us: None,
+                    memory: None,
+                    resource: None,
+                    error: None,
+                    replay: None,
+                    shape,
+                    backend_detail: Some(BTreeMap::from([
+                        (
+                            "backend_device".to_string(),
+                            serde_json::json!(self.backend_device),
+                        ),
+                        (
+                            "backend_type".to_string(),
+                            serde_json::json!(self.backend_type),
+                        ),
+                        (
+                            "device_intervals".to_string(),
+                            serde_json::json!(device_intervals),
+                        ),
+                    ])),
+                    attributes,
+                };
+                event.validate().map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "invalid vNext physical device timing span event: {error}"
+                    ))
+                })?;
+                events.push(event);
+            }
         }
         Ok(events)
     }

@@ -5773,6 +5773,61 @@ fn full_vnext_profile_enables_kernel_attribution_and_all_frames() {
 }
 
 #[test]
+fn replay_device_timing_is_owned_once_by_its_physical_span() {
+    use ferrum_interfaces::vnext::{DeviceExecutionInterval, DeviceExecutionIntervalKind};
+
+    let eager = DeviceSubmissionExecutionSpan::measured(
+        0,
+        1,
+        DeviceExecutionSpanKind::EagerCommand,
+        vec![DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 0, 10).unwrap()],
+    )
+    .unwrap();
+    let replay = DeviceSubmissionExecutionSpan::measured(
+        1,
+        4,
+        DeviceExecutionSpanKind::ReusableExecutable,
+        vec![DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 40).unwrap()],
+    )
+    .unwrap();
+    let timing = DeviceSubmissionExecutionTiming::from_spans(4, vec![eager, replay]).unwrap();
+    let terminal = DeviceTimingMeasurement::Measured(timing);
+
+    let eager_projection = project_device_command_timing(&terminal, 0);
+    assert_eq!(eager_projection.status, "measured");
+    assert_eq!(
+        eager_projection
+            .command_measurement
+            .and_then(DeviceExecutionSpanMeasurement::elapsed_ns),
+        Some(10)
+    );
+
+    for command_index in 1..4 {
+        let replay_projection = project_device_command_timing(&terminal, command_index);
+        assert_eq!(replay_projection.status, "covered_by_physical_span");
+        assert!(replay_projection.command_measurement.is_none());
+        assert_eq!(
+            replay_projection
+                .physical_span
+                .and_then(|span| span.measurement().elapsed_ns()),
+            Some(30)
+        );
+    }
+
+    let DeviceTimingMeasurement::Measured(timing) = &terminal else {
+        unreachable!()
+    };
+    assert_eq!(
+        timing
+            .spans()
+            .iter()
+            .filter_map(|span| span.measurement().elapsed_ns())
+            .sum::<u64>(),
+        40
+    );
+}
+
+#[test]
 fn scheduler_trace_journal_preserves_ready_and_deferred_fifo_order() {
     let trace_path = resource_trace_temp_path("vnext-deferred-fifo");
     let _ = std::fs::remove_file(&trace_path);

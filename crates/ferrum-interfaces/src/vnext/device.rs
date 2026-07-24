@@ -1237,30 +1237,228 @@ impl DeviceCommandExecutionTiming {
     }
 }
 
-/// Terminal backend-counter evidence for one exact submission. Command rows
-/// are ordered by the core-issued command index and can be joined to
-/// `DeviceSubmissionAttribution` without parsing backend labels.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DeviceSubmissionExecutionTiming {
-    commands: Box<[DeviceCommandExecutionTiming]>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecutionSpanKind {
+    EagerCommand,
+    ReusableExecutable,
 }
 
-impl DeviceSubmissionExecutionTiming {
-    pub fn new(commands: Vec<DeviceCommandExecutionTiming>) -> Option<Self> {
-        if commands.is_empty()
-            || commands
+impl DeviceExecutionSpanKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EagerCommand => "eager_command",
+            Self::ReusableExecutable => "reusable_executable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum DeviceExecutionSpanMeasurement {
+    Measured {
+        intervals: Box<[DeviceExecutionInterval]>,
+        elapsed_ns: u64,
+    },
+    Unavailable(DeviceTimingUnavailableReason),
+}
+
+impl DeviceExecutionSpanMeasurement {
+    pub fn measured(intervals: Vec<DeviceExecutionInterval>) -> Option<Self> {
+        if intervals.is_empty()
+            || intervals
                 .windows(2)
-                .any(|pair| pair[0].command_index() >= pair[1].command_index())
+                .any(|pair| pair[0].end_offset_ns() > pair[1].start_offset_ns())
+        {
+            return None;
+        }
+        let elapsed_ns = intervals.iter().try_fold(0_u64, |total, interval| {
+            total.checked_add(interval.elapsed_ns())
+        })?;
+        Some(Self::Measured {
+            intervals: intervals.into_boxed_slice(),
+            elapsed_ns,
+        })
+    }
+
+    pub const fn unavailable(reason: DeviceTimingUnavailableReason) -> Self {
+        Self::Unavailable(reason)
+    }
+
+    pub fn intervals(&self) -> Option<&[DeviceExecutionInterval]> {
+        match self {
+            Self::Measured { intervals, .. } => Some(intervals),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub const fn elapsed_ns(&self) -> Option<u64> {
+        match self {
+            Self::Measured { elapsed_ns, .. } => Some(*elapsed_ns),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub const fn unavailable_reason(&self) -> Option<DeviceTimingUnavailableReason> {
+        match self {
+            Self::Measured { .. } => None,
+            Self::Unavailable(reason) => Some(*reason),
+        }
+    }
+}
+
+/// One physical device interval owner inside an exact submission.
+///
+/// Eager spans own one core command. Reusable executable spans own one
+/// contiguous command range, because a single CUDA graph launch cannot be
+/// truthfully duplicated across each logical command it contains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionExecutionSpan {
+    start_command_index: u32,
+    end_command_index: u32,
+    kind: DeviceExecutionSpanKind,
+    measurement: DeviceExecutionSpanMeasurement,
+}
+
+impl DeviceSubmissionExecutionSpan {
+    pub fn measured(
+        start_command_index: u32,
+        end_command_index: u32,
+        kind: DeviceExecutionSpanKind,
+        intervals: Vec<DeviceExecutionInterval>,
+    ) -> Option<Self> {
+        let measurement = DeviceExecutionSpanMeasurement::measured(intervals)?;
+        Self::new(start_command_index, end_command_index, kind, measurement)
+    }
+
+    pub fn unavailable(
+        start_command_index: u32,
+        end_command_index: u32,
+        kind: DeviceExecutionSpanKind,
+        reason: DeviceTimingUnavailableReason,
+    ) -> Option<Self> {
+        Self::new(
+            start_command_index,
+            end_command_index,
+            kind,
+            DeviceExecutionSpanMeasurement::unavailable(reason),
+        )
+    }
+
+    fn new(
+        start_command_index: u32,
+        end_command_index: u32,
+        kind: DeviceExecutionSpanKind,
+        measurement: DeviceExecutionSpanMeasurement,
+    ) -> Option<Self> {
+        if end_command_index <= start_command_index
+            || (kind == DeviceExecutionSpanKind::EagerCommand
+                && end_command_index != start_command_index.checked_add(1)?)
         {
             return None;
         }
         Some(Self {
-            commands: commands.into_boxed_slice(),
+            start_command_index,
+            end_command_index,
+            kind,
+            measurement,
         })
     }
 
-    pub fn commands(&self) -> &[DeviceCommandExecutionTiming] {
-        &self.commands
+    fn from_command(command: DeviceCommandExecutionTiming) -> Option<Self> {
+        let end_command_index = command.command_index.checked_add(1)?;
+        Self::measured(
+            command.command_index,
+            end_command_index,
+            DeviceExecutionSpanKind::EagerCommand,
+            command.intervals.into_vec(),
+        )
+    }
+
+    pub const fn start_command_index(&self) -> u32 {
+        self.start_command_index
+    }
+
+    pub const fn end_command_index(&self) -> u32 {
+        self.end_command_index
+    }
+
+    pub const fn command_count(&self) -> u32 {
+        self.end_command_index - self.start_command_index
+    }
+
+    pub const fn kind(&self) -> DeviceExecutionSpanKind {
+        self.kind
+    }
+
+    pub const fn measurement(&self) -> &DeviceExecutionSpanMeasurement {
+        &self.measurement
+    }
+
+    pub const fn contains_command(&self, command_index: u32) -> bool {
+        command_index >= self.start_command_index && command_index < self.end_command_index
+    }
+}
+
+/// Terminal backend-counter evidence for one exact submission. Physical spans
+/// cover every core command exactly once, remain ordered, and may explicitly
+/// mark a range unavailable without discarding measured sibling spans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionExecutionTiming {
+    command_count: u32,
+    spans: Box<[DeviceSubmissionExecutionSpan]>,
+}
+
+impl DeviceSubmissionExecutionTiming {
+    pub fn new(commands: Vec<DeviceCommandExecutionTiming>) -> Option<Self> {
+        let command_count = commands.last()?.command_index().checked_add(1)?;
+        let spans = commands
+            .into_iter()
+            .map(DeviceSubmissionExecutionSpan::from_command)
+            .collect::<Option<Vec<_>>>()?;
+        Self::from_spans(command_count, spans)
+    }
+
+    pub fn from_spans(
+        command_count: u32,
+        spans: Vec<DeviceSubmissionExecutionSpan>,
+    ) -> Option<Self> {
+        if command_count == 0 || spans.is_empty() {
+            return None;
+        }
+        let mut expected_start = 0_u32;
+        for span in &spans {
+            if span.start_command_index() != expected_start
+                || span.end_command_index() > command_count
+            {
+                return None;
+            }
+            expected_start = span.end_command_index();
+        }
+        if expected_start != command_count {
+            return None;
+        }
+        Some(Self {
+            command_count,
+            spans: spans.into_boxed_slice(),
+        })
+    }
+
+    pub const fn command_count(&self) -> u32 {
+        self.command_count
+    }
+
+    pub fn spans(&self) -> &[DeviceSubmissionExecutionSpan] {
+        &self.spans
+    }
+
+    pub fn span_for_command(&self, command_index: u32) -> Option<&DeviceSubmissionExecutionSpan> {
+        let index = self
+            .spans
+            .partition_point(|span| span.end_command_index() <= command_index);
+        self.spans
+            .get(index)
+            .filter(|span| span.contains_command(command_index))
     }
 }
 
@@ -2120,7 +2318,7 @@ mod execution_timing_tests {
     }
 
     #[test]
-    fn submission_timing_requires_strict_command_order() {
+    fn submission_timing_requires_complete_nonoverlapping_command_coverage() {
         let command = |command_index| {
             DeviceCommandExecutionTiming::new(
                 command_index,
@@ -2131,9 +2329,104 @@ mod execution_timing_tests {
             )
             .unwrap()
         };
-        assert!(DeviceSubmissionExecutionTiming::new(vec![command(0), command(2)]).is_some());
+        let commands = DeviceSubmissionExecutionTiming::new(vec![command(0), command(1)]).unwrap();
+        assert_eq!(commands.command_count(), 2);
+        assert_eq!(commands.spans().len(), 2);
+        assert!(commands
+            .spans()
+            .iter()
+            .all(|span| span.kind() == DeviceExecutionSpanKind::EagerCommand));
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(0), command(2)]).is_none());
         assert!(DeviceSubmissionExecutionTiming::new(vec![command(1), command(1)]).is_none());
         assert!(DeviceSubmissionExecutionTiming::new(vec![command(2), command(1)]).is_none());
+    }
+
+    #[test]
+    fn submission_timing_preserves_measured_and_unavailable_physical_spans() {
+        let eager = DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            vec![
+                DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 0, 10).unwrap(),
+            ],
+        )
+        .unwrap();
+        let replay = DeviceSubmissionExecutionSpan::measured(
+            1,
+            4,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            vec![DeviceExecutionInterval::new_labeled(
+                DeviceExecutionIntervalKind::Compute,
+                10,
+                40,
+                "cuda reusable executable",
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let unavailable = DeviceSubmissionExecutionSpan::unavailable(
+            4,
+            5,
+            DeviceExecutionSpanKind::EagerCommand,
+            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+        )
+        .unwrap();
+
+        let timing =
+            DeviceSubmissionExecutionTiming::from_spans(5, vec![eager, replay, unavailable])
+                .unwrap();
+        assert_eq!(timing.command_count(), 5);
+        assert_eq!(
+            timing.span_for_command(2).unwrap().kind(),
+            DeviceExecutionSpanKind::ReusableExecutable
+        );
+        assert_eq!(
+            timing
+                .span_for_command(4)
+                .unwrap()
+                .measurement()
+                .unavailable_reason(),
+            Some(DeviceTimingUnavailableReason::BackendMeasurementFailed)
+        );
+        assert!(timing.span_for_command(5).is_none());
+    }
+
+    #[test]
+    fn physical_spans_reject_gaps_overlaps_and_invalid_eager_ranges() {
+        let interval = || {
+            vec![DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 0, 1).unwrap()]
+        };
+        assert!(DeviceSubmissionExecutionSpan::measured(
+            0,
+            2,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .is_none());
+        let first = DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .unwrap();
+        let gap = DeviceSubmissionExecutionSpan::measured(
+            2,
+            3,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .unwrap();
+        assert!(DeviceSubmissionExecutionTiming::from_spans(3, vec![first.clone(), gap]).is_none());
+        let overlap = DeviceSubmissionExecutionSpan::measured(
+            0,
+            2,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            interval(),
+        )
+        .unwrap();
+        assert!(DeviceSubmissionExecutionTiming::from_spans(2, vec![first, overlap]).is_none());
     }
 }
 
