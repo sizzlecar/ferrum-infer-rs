@@ -1782,6 +1782,7 @@ impl MetalDeviceRuntime {
                     command.token_count,
                     compute_dispatch_count,
                     transfer_command_count,
+                    None,
                 ) {
                     attribution.push(observation);
                 }

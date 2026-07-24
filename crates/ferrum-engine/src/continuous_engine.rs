@@ -4177,6 +4177,10 @@ impl VNextProfileEventContext {
                     serde_json::json!(command.transfer_command_count()),
                 ),
                 (
+                    "reusable_graph_node_count".to_string(),
+                    serde_json::json!(command.reusable_graph_node_count()),
+                ),
+                (
                     "device_interval_count".to_string(),
                     serde_json::json!(command_measurement
                         .and_then(DeviceExecutionSpanMeasurement::intervals)

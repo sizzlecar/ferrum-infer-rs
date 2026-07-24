@@ -266,6 +266,7 @@ struct CudaExecutableSegment {
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
     _executables: Vec<Arc<CudaCommandExecutable>>,
+    command_graph_node_counts: Option<Arc<[u32]>>,
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
@@ -286,6 +287,41 @@ impl CudaExecutableProfileIdentity {
             nvtx_label,
         }
     }
+}
+
+fn graph_node_count(graph: sys::CUgraph) -> Option<usize> {
+    if graph.is_null() {
+        return None;
+    }
+    let mut node_count = 0;
+    let status = unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut node_count) };
+    (status == sys::CUresult::CUDA_SUCCESS).then_some(node_count)
+}
+
+fn capture_graph_node_count(stream: &CudaStream) -> Option<usize> {
+    let mut capture_state = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED;
+    let mut capture_id = 0;
+    let mut graph: sys::CUgraph = std::ptr::null_mut();
+    let mut dependencies: *const sys::CUgraphNode = std::ptr::null();
+    let mut edge_data: *const sys::CUgraphEdgeData = std::ptr::null();
+    let mut dependency_count = 0;
+    let status = unsafe {
+        sys::cuStreamGetCaptureInfo_v3(
+            stream.cu_stream(),
+            &mut capture_state,
+            &mut capture_id,
+            &mut graph,
+            &mut dependencies,
+            &mut edge_data,
+            &mut dependency_count,
+        )
+    };
+    if status != sys::CUresult::CUDA_SUCCESS
+        || capture_state != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+    {
+        return None;
+    }
+    graph_node_count(graph)
 }
 
 impl CudaExecutableSegment {
@@ -311,10 +347,32 @@ impl CudaExecutableSegment {
             ));
         }
 
+        let mut previous_graph_node_count = capture_graph_node_count(stream);
+        let mut command_graph_node_counts = Vec::with_capacity(commands.len());
         let encoded = catch_unwind(AssertUnwindSafe(|| {
-            commands
-                .iter()
-                .try_for_each(|command| command.enqueue(stream, blas))
+            for command in commands {
+                command.enqueue(stream, blas)?;
+                if let Some(previous) = previous_graph_node_count {
+                    let observed = capture_graph_node_count(stream)
+                        .and_then(|current| {
+                            current.checked_sub(previous).map(|delta| (current, delta))
+                        })
+                        .and_then(|(current, delta)| {
+                            u32::try_from(delta).ok().map(|delta| (current, delta))
+                        });
+                    match observed {
+                        Some((current, delta)) => {
+                            command_graph_node_counts.push(delta);
+                            previous_graph_node_count = Some(current);
+                        }
+                        None => {
+                            command_graph_node_counts.clear();
+                            previous_graph_node_count = None;
+                        }
+                    }
+                }
+            }
+            Ok::<(), CudaDeviceRuntimeError>(())
         }));
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let end_status = unsafe { sys::cuStreamEndCapture(stream.cu_stream(), &mut graph) };
@@ -358,6 +416,15 @@ impl CudaExecutableSegment {
                 capture_terminated,
             ));
         }
+        let command_graph_node_counts = (command_graph_node_counts.len() == commands.len())
+            .then(|| {
+                command_graph_node_counts
+                    .iter()
+                    .map(|count| *count as usize)
+                    .sum::<usize>()
+            })
+            .filter(|captured_count| graph_node_count(graph) == Some(*captured_count))
+            .map(|_| Arc::<[u32]>::from(command_graph_node_counts));
 
         let mut executable: sys::CUgraphExec = std::ptr::null_mut();
         let instantiate_status =
@@ -380,6 +447,7 @@ impl CudaExecutableSegment {
             _stream: Arc::clone(stream),
             _blas: Arc::clone(blas),
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
+            command_graph_node_counts,
             uploaded: false,
             last_used,
             profile_identity: OnceLock::new(),
@@ -404,7 +472,7 @@ impl CudaExecutableSegment {
         stream: &CudaStream,
         last_used: u64,
         tool_correlation: bool,
-    ) -> Result<Option<Arc<str>>, CudaReplayError> {
+    ) -> Result<(Option<Arc<str>>, Option<Arc<[u32]>>), CudaReplayError> {
         if !self.uploaded {
             return Err(CudaReplayError {
                 stage: "launch reusable executable",
@@ -432,7 +500,12 @@ impl CudaExecutableSegment {
             ));
         }
         self.last_used = last_used;
-        Ok(profile_identity.map(|identity| Arc::clone(&identity.fingerprint)))
+        Ok((
+            profile_identity.map(|identity| Arc::clone(&identity.fingerprint)),
+            tool_correlation
+                .then(|| self.command_graph_node_counts.as_ref().map(Arc::clone))
+                .flatten(),
+        ))
     }
 }
 
@@ -466,6 +539,7 @@ pub(crate) struct CudaExecutableCache {
 
 pub(crate) struct CudaExecutableLaunch {
     reusable_executable_fingerprint: Option<Arc<str>>,
+    reusable_graph_node_counts: Option<Arc<[u32]>>,
 }
 
 impl CudaExecutableLaunch {
@@ -473,6 +547,10 @@ impl CudaExecutableLaunch {
         self.reusable_executable_fingerprint
             .as_ref()
             .map(Arc::clone)
+    }
+
+    pub(crate) fn reusable_graph_node_counts(&self) -> Option<Arc<[u32]>> {
+        self.reusable_graph_node_counts.as_ref().map(Arc::clone)
     }
 }
 
@@ -717,9 +795,11 @@ impl CudaExecutableCache {
         let Some(entry) = self.entries.get_mut(&candidate.key) else {
             return Ok(None);
         };
-        let reusable_executable_fingerprint = entry.launch(stream, now, tool_correlation)?;
+        let (reusable_executable_fingerprint, reusable_graph_node_counts) =
+            entry.launch(stream, now, tool_correlation)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint,
+            reusable_graph_node_counts,
         }))
     }
 
