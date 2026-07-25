@@ -17,12 +17,23 @@ exact-precision performance`。`0b72bab2` 的隐式 F16 -> FP8 candidate 虽曾�
 dispatch 和 `7.6973 ms` device-duration target；bounded c1 为 `73.3800 tok/s`，与
 `73.3855 tok/s` exact reference 持平，但仍比 `76.1583 tok/s` floor 低 `3.65%`。
 2026-07-25 owner 决定按 G09 的窄范围 M2 CUDA c1 修订把该差距作为 development
-checkpoint 接受，并停止继续进行 c1-only 优化；下一生产 lever 是 typed device token
-selection，以减少 decode 全量 logits readback。原 artifact 只有一次 repeat 且没有 CI，
-所以仍不是 G03、G08B 或 G09 canonical PASS，也不降低 same-host vLLM、并发矩阵、正确性
-或最终发布标准。完整证据在 GitHub branch
-`artifact/runtime-vnext-exact-qkvzba-557cdcf5-20260725` commit `b161d69e`，
-付费实例已确认 `stopped/exited`。
+checkpoint 接受，并停止继续进行 c1-only 优化。
+
+后续 clean `acf9a669` 首次把 typed device token selection 接入产品执行，但默认
+`repetition_penalty=1.1` 仍触发 full-logits fallback；同机 bounded c32 为
+`109.1643 tok/s`，trace 是 `greedy_token_waves=0`、
+`greedy_policy_fallback_waves=164`、readback `1,167,104,000 bytes`，因此形成
+product-default integration REJECT。commit `90057af1` 把 selection contract 升级到 v2，
+用固定容量 typed token IDs、offsets 和 penalty 在 CUDA/Metal provider 内精确执行 sparse
+repetition，再返回单个 token。clean 1x RTX 4090 release build 用时 `5m12s`，9 个
+C03/C05/C06/C17 `run`/`serve`/stream/Unicode 用例全部通过；相同 c32 workload 为
+`121.0025 tok/s`，比 `acf9a669` 提升 `10.84%`，decode fallback 降为 `0`，readback 降至
+`61,592,288 bytes`（`-94.72%`）。该 artifact 仍只有一次 repeat、无 CI，且不是 703-case
+CUDA matrix，所以仍不是 G03、G08B 或 G09 canonical PASS，也不降低 same-host vLLM、
+并发矩阵、正确性或最终发布标准。最新证据在 GitHub branch
+`artifact/runtime-vnext-sparse-repetition-90057af1-20260725` commit `65dfab41`，
+archive SHA256 `1cd3b1fc3e656ecce8cd9f71f23877404f208665ed4e1596b1304917983637d2`；
+付费实例已确认 `stopped/exited`，无 paid/transitional sibling。
 
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
