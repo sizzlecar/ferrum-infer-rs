@@ -918,10 +918,13 @@ uses `causal_conv1d_update` followed by packed recurrent delta. Its Triton grid
 is `(NV, B * HV)` and normalizes Q/K inside every value tile, deliberately
 trading repeated arithmetic for one fewer launch. Thus `67921b1c` was closest
 to vLLM; `a884f5d4` was a distinct Ferrum alternative, not a copied design.
-A future candidate must avoid both repeated per-value-tile normalization and
-the extra normalization dispatch, retain at most `9 compute / 0 transfer`,
-and prove direct-path performance with same-session paired evidence. G09 owns
-the detailed `full` versus `basic/off` measurement amendment.
+A future packed-topology candidate must avoid both repeated per-value-tile
+normalization and the extra normalization dispatch, retain at most
+`9 compute / 0 transfer`, and prove direct-path performance with same-session
+paired evidence. State-traffic candidates that retain the accepted topology
+are governed by the later elastic-prefill decision and its device-time stop
+condition. G09 owns the detailed `full` versus `basic/off` measurement
+amendment.
 
 That final bounded re-attribution has now run. The first adjacent pair used
 clean `8c58e3ea` as A and the already-built `67921b1c` as B. Both slots passed
