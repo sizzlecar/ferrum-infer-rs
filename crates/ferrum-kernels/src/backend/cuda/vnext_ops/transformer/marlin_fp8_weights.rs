@@ -10,9 +10,7 @@ use ferrum_interfaces::vnext::{
 };
 
 use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
-use crate::marlin_fp8_materializer::{
-    MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
-};
+use crate::marlin_fp8_materializer::MARLIN_FP8_QUANTIZATION_FORMAT_ID;
 
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
 pub(super) const MARLIN_FP8_CHANNELWISE_GROUP_SIZE: i32 = -1;
@@ -46,6 +44,7 @@ impl CudaMarlinFp8Weight {
     }
 }
 
+#[derive(Debug)]
 struct MarlinFp8Metadata {
     packed_component_id: WeightId,
     scales_component_id: WeightId,
@@ -148,13 +147,6 @@ fn validate_marlin_fp8_contract(
     weight
         .validate_logical(bound_logical_dimensions, logical_element_type)
         .map_err(|error| format!("CUDA Marlin FP8 logical contract is invalid: {error}"))?;
-    if weight.format_id().as_str() != MARLIN_FP8_WEIGHT_FORMAT_ID {
-        return Err(format!(
-            "CUDA Marlin FP8 requires weight format `{MARLIN_FP8_WEIGHT_FORMAT_ID}`, got `{}`",
-            weight.format_id()
-        ));
-    }
-
     let PhysicalWeightLayout::Quantized {
         packed_values,
         packed_dimensions,
@@ -375,4 +367,105 @@ fn retain_component_region(
         ));
     }
     Ok(region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
+    use ferrum_interfaces::vnext::{
+        ContractVersion, PhysicalWeightComponentBinding, QuantizationFormatId, QuantizationSpec,
+        WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema, WeightTensorSpec,
+    };
+
+    fn id(value: &str) -> WeightId {
+        WeightId::new(value).unwrap()
+    }
+
+    fn valid_schema(schema_format_id: &str) -> WeightSchema {
+        let packed_id = id("component.fp8.packed");
+        let scales_id = id("component.fp8.scales");
+        WeightSchema {
+            format_id: WeightFormatId::new(schema_format_id).unwrap(),
+            layout_id: WeightLayoutId::new("weight-layout.test.mixed-fp8").unwrap(),
+            version: ContractVersion::new(1, 0),
+            components: vec![
+                WeightComponentSpec {
+                    id: packed_id.clone(),
+                    role: WeightComponentRole::PackedValues,
+                    external_names: vec!["projection.fp8".to_owned()],
+                    dimensions: vec![256, 128],
+                    encoding: WeightEncoding::Quantized(QuantizationSpec {
+                        format_id: QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                            .unwrap(),
+                        bits_per_weight: 8,
+                        grouping: QuantizationGrouping::WholeAxis,
+                        packing: QuantizationPacking::Tiled,
+                        scale_type: ElementType::F16,
+                        zero_point_type: None,
+                    }),
+                    required: true,
+                },
+                WeightComponentSpec {
+                    id: scales_id.clone(),
+                    role: WeightComponentRole::Scales,
+                    external_names: vec!["projection.scale".to_owned()],
+                    dimensions: vec![256, 1],
+                    encoding: WeightEncoding::Dense {
+                        element_type: ElementType::F16,
+                    },
+                    required: true,
+                },
+            ],
+            tensors: vec![WeightTensorSpec {
+                id: id("weight.projection"),
+                dimensions: vec![256, 128],
+                logical_element_type: ElementType::F16,
+                physical_layout: PhysicalWeightLayout::Quantized {
+                    packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+                    packed_dimensions: vec![256, 128],
+                    scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+                    zero_points: None,
+                    axis_indices: None,
+                    permutation: None,
+                    codebook: None,
+                    group_axis: 1,
+                    group_padding: PhysicalWeightPadding::Exact,
+                },
+                required: true,
+            }],
+        }
+    }
+
+    fn validate(schema: &WeightSchema) -> Result<MarlinFp8Metadata, String> {
+        validate_marlin_fp8_contract(
+            &ResolvedWeightBinding::from_schema(schema, &schema.tensors[0].id).unwrap(),
+            &schema.tensors[0].dimensions,
+            schema.tensors[0].logical_element_type,
+            &schema.tensors[0].dimensions,
+        )
+    }
+
+    #[test]
+    fn component_abi_does_not_depend_on_the_enclosing_schema_format() {
+        for schema_format_id in [
+            MARLIN_FP8_WEIGHT_FORMAT_ID,
+            "weight-format.execution.test.next-mixed-container",
+        ] {
+            let metadata = validate(&valid_schema(schema_format_id)).unwrap();
+            assert_eq!(metadata.output_features, 256);
+            assert_eq!(metadata.input_features, 128);
+        }
+    }
+
+    #[test]
+    fn rejects_a_different_component_quantization_abi() {
+        let mut schema = valid_schema(MARLIN_FP8_WEIGHT_FORMAT_ID);
+        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
+            unreachable!();
+        };
+        spec.format_id = QuantizationFormatId::new("quantization.test.other").unwrap();
+        let error = validate(&schema).unwrap_err();
+        assert!(error.contains("not channelwise E4M3"), "{error}");
+    }
 }

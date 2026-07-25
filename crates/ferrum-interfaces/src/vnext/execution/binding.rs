@@ -257,7 +257,7 @@ pub(super) fn node_weight_requirements(
         // (embedding, norms, routers) that legitimately live beside quantized
         // components in one mixed checkpoint.
         if !binding_quantization_formats.is_empty() {
-            weight_formats.insert(weight.format_id().clone());
+            weight_formats.insert(weight.schema_format_id().clone());
         }
         quantization_formats.extend(binding_quantization_formats);
     }

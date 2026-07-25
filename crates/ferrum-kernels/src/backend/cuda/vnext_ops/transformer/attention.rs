@@ -553,8 +553,7 @@ impl AttentionProjection {
             if quantization_formats.is_empty() {
                 continue;
             }
-            if weight.format_id().as_str() != MARLIN_FP8_WEIGHT_FORMAT_ID
-                || quantization_formats.len() != 1
+            if quantization_formats.len() != 1
                 || !quantization_formats
                     .iter()
                     .any(|format| format.as_str() == MARLIN_FP8_QUANTIZATION_FORMAT_ID)

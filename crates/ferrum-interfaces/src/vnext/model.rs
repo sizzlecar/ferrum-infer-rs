@@ -491,10 +491,16 @@ impl ResolvedWeightComponentLayout {
 /// Immutable physical weight contract carried by an execution-plan binding.
 /// This prevents the provider boundary from collapsing a quantized/composite
 /// layout into only resource ranges and a synthetic `u8` dtype.
+///
+/// `schema_format_id` identifies the enclosing source or materialized schema.
+/// It is a planning compatibility key, not the physical ABI of every component
+/// referenced by this binding. Providers must decode components from
+/// `physical_layout` and `components`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedWeightBinding {
     weight_id: WeightId,
-    format_id: WeightFormatId,
+    #[serde(rename = "format_id")]
+    schema_format_id: WeightFormatId,
     layout_id: WeightLayoutId,
     schema_version: ContractVersion,
     physical_layout: PhysicalWeightLayout,
@@ -520,7 +526,7 @@ impl<'de> Deserialize<'de> for ResolvedWeightBinding {
         let wire = ResolvedWeightBindingWire::deserialize(deserializer)?;
         let binding = Self {
             weight_id: wire.weight_id,
-            format_id: wire.format_id,
+            schema_format_id: wire.format_id,
             layout_id: wire.layout_id,
             schema_version: wire.schema_version,
             physical_layout: wire.physical_layout,
@@ -548,7 +554,7 @@ impl ResolvedWeightBinding {
         components.sort_by(|left, right| left.component_id.cmp(&right.component_id));
         let binding = Self {
             weight_id: weight_id.clone(),
-            format_id: schema.format_id.clone(),
+            schema_format_id: schema.format_id.clone(),
             layout_id: schema.layout_id.clone(),
             schema_version: schema.version,
             physical_layout: tensor.physical_layout.clone(),
@@ -610,7 +616,7 @@ impl ResolvedWeightBinding {
     ) -> Result<(), VNextError> {
         self.validate_structure()?;
         let schema = WeightSchema {
-            format_id: self.format_id.clone(),
+            format_id: self.schema_format_id.clone(),
             layout_id: self.layout_id.clone(),
             version: self.schema_version,
             components: self
@@ -633,8 +639,11 @@ impl ResolvedWeightBinding {
         &self.weight_id
     }
 
-    pub fn format_id(&self) -> &WeightFormatId {
-        &self.format_id
+    /// Enclosing schema/container identity used by provider selection.
+    ///
+    /// This must not be used to infer a bound component's physical encoding.
+    pub(crate) fn schema_format_id(&self) -> &WeightFormatId {
+        &self.schema_format_id
     }
 
     pub fn layout_id(&self) -> &WeightLayoutId {
