@@ -1199,6 +1199,44 @@ current vLLM implementation, then define a source-level specialization with
 one predicted trace/device counter. The rejected packed-decode
 launch-count lineage remains closed.
 
+#### Register-resident GDN state candidate
+
+The offline audit selected one bounded source candidate. The accepted vNext
+path invokes `recurrent_gated_delta_rule_varlen_tiled16_f32_indirect`; its
+indirect wrapper supplies one F32 state buffer as both initial and final state.
+The old implementation nevertheless copied that buffer to itself, wrote the
+decayed state, reloaded it for the delta update, and wrote it again. The
+candidate keeps each thread's eight official-shape state elements resident
+across the reduction barriers and token loop, then writes final state once.
+F16 state retains the old per-token store/reload behavior so batching does not
+silently change its quantization semantics. Scheduler, provider topology,
+resource authority, and launch count are unchanged.
+
+The artifact's typed config reports `64,389,120` recurrent-state bytes per
+sequence. A full state read/write pass is therefore `128,778,240` bytes. For
+standard decode the candidate removes two of three passes, predicting
+`257,556,480` fewer logical global-memory bytes per token/sequence. Current
+vLLM source `33c4f3551ce9b4dc75864f16c40496d8d64f8e9d` uses the same
+principle in its Triton GDN kernel: load the state tile into `b_h`, apply decay
+and delta in that tile, then store it. The Ferrum implementation remains a
+native CUDA kernel with its own typed binding and execution contracts.
+
+This source is not yet a KEEP and does not change G09 status. Before an
+actual-model benchmark, baseline and candidate cubins must show:
+
+- the target kernel exists in both builds;
+- candidate local/spill bytes are `0`;
+- candidate theoretical active blocks per SM do not fall below baseline.
+
+After CUDA numerical parity and the same `run`/non-streaming
+`serve`/streaming `serve` correctness lane, only one Basic c1 random `64/32`,
+`25 + 5`, seed `9271` diagnostic is authorized. The predeclared KEEP signal is
+decode device total `<=6.5538 s` (at least `3%` below `6.7565 s`), throughput
+`>=73.3855 tok/s`, prefill device total `<=1.1909 s`, zero request/quality
+error, zero failed wave, and unchanged direct-path miss/fallback counters.
+Missing any condition produces a REJECT and source revert; it does not
+authorize a full sweep or another kernel change.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

@@ -934,17 +934,17 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_state_f16(
       value_dim, use_qk_l2norm, scale);
 }
 
-template <typename StateT, int BV_TILE>
+template <typename StateT, int BV_TILE, bool REGISTER_RESIDENT>
 static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
     const float* __restrict__ value,
     const float* __restrict__ g,
     const float* __restrict__ beta,
-    const StateT* __restrict__ initial_states,
+    const StateT* initial_states,
     const unsigned int* __restrict__ cu_seqlens,
     float* __restrict__ out,
-    StateT* __restrict__ final_states,
+    StateT* final_states,
     const int batch,
     const int total_tokens,
     const int key_heads,
@@ -964,28 +964,54 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
   }
 
   const int value_start = value_tile * BV_TILE;
+  if (value_start >= value_dim) return;
   const int repeat_factor = value_heads / key_heads;
   const int key_head = value_head / repeat_factor;
   const int state_len = value_heads * value_dim * key_dim;
   const int row_state_base = seq * state_len;
 
+  constexpr int TILED_KEY_DIM = 128;
+  constexpr int TILED_VALUE_DIM = 128;
+  constexpr int TILED_THREADS = 256;
+  constexpr int STATE_VALUES_PER_THREAD =
+      BV_TILE * TILED_KEY_DIM / TILED_THREADS;
+  static_assert(BV_TILE * TILED_KEY_DIM % TILED_THREADS == 0);
   __shared__ float partial[BV_TILE][256];
   __shared__ float delta[BV_TILE];
   float local[BV_TILE];
+  float resident_state[STATE_VALUES_PER_THREAD];
 
-  for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
-    const int local_v = i / key_dim;
-    const int kd = i - local_v * key_dim;
-    const int value_offset = value_start + local_v;
-    if (value_offset >= value_dim) continue;
+  if constexpr (REGISTER_RESIDENT) {
+    if (key_dim != TILED_KEY_DIM || value_dim != TILED_VALUE_DIM ||
+        blockDim.x != TILED_THREADS)
+      return;
+#pragma unroll
+    for (int lane = 0; lane < STATE_VALUES_PER_THREAD; ++lane) {
+      const int i = static_cast<int>(threadIdx.x) + lane * TILED_THREADS;
+      const int local_v = i / TILED_KEY_DIM;
+      const int kd = i - local_v * TILED_KEY_DIM;
+      const int value_offset = value_start + local_v;
+      const int state_idx =
+          row_state_base +
+          (value_head * TILED_VALUE_DIM + value_offset) * TILED_KEY_DIM + kd;
+      resident_state[lane] =
+          ferrum_gdr_load_value(initial_states, state_idx);
+    }
+  } else {
+    for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+      const int local_v = i / key_dim;
+      const int kd = i - local_v * key_dim;
+      const int value_offset = value_start + local_v;
+      if (value_offset >= value_dim) continue;
 
-    const int state_idx =
-        row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
-    ferrum_gdr_store_value(
-        final_states, state_idx,
-        ferrum_gdr_load_value(initial_states, state_idx));
+      const int state_idx =
+          row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+      ferrum_gdr_store_value(
+          final_states, state_idx,
+          ferrum_gdr_load_value(initial_states, state_idx));
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   for (int token = token_start; token < token_end; ++token) {
     const int gate_idx = token * value_heads + value_head;
@@ -997,19 +1023,32 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
       local[i] = 0.0f;
     }
 
-    for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
-      const int local_v = i / key_dim;
-      const int kd = i - local_v * key_dim;
-      const int value_offset = value_start + local_v;
-      if (value_offset >= value_dim) continue;
+    if constexpr (REGISTER_RESIDENT) {
+#pragma unroll
+      for (int lane = 0; lane < STATE_VALUES_PER_THREAD; ++lane) {
+        const int i = static_cast<int>(threadIdx.x) + lane * TILED_THREADS;
+        const int local_v = i / TILED_KEY_DIM;
+        const int kd = i - local_v * TILED_KEY_DIM;
+        const int qk_idx =
+            ((token * key_heads + key_head) * TILED_KEY_DIM) + kd;
+        resident_state[lane] *= decay;
+        local[local_v] += resident_state[lane] * key[qk_idx];
+      }
+    } else {
+      for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+        const int local_v = i / key_dim;
+        const int kd = i - local_v * key_dim;
+        const int value_offset = value_start + local_v;
+        if (value_offset >= value_dim) continue;
 
-      const int state_idx =
-          row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
-      const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-      const float state =
-          ferrum_gdr_load_value(final_states, state_idx) * decay;
-      ferrum_gdr_store_value(final_states, state_idx, state);
-      local[local_v] += state * key[qk_idx];
+        const int state_idx =
+            row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+        const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+        const float state =
+            ferrum_gdr_load_value(final_states, state_idx) * decay;
+        ferrum_gdr_store_value(final_states, state_idx, state);
+        local[local_v] += state * key[qk_idx];
+      }
     }
 
 #pragma unroll
@@ -1048,19 +1087,34 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
       local[i] = 0.0f;
     }
 
-    for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
-      const int local_v = i / key_dim;
-      const int kd = i - local_v * key_dim;
-      const int value_offset = value_start + local_v;
-      if (value_offset >= value_dim) continue;
+    if constexpr (REGISTER_RESIDENT) {
+#pragma unroll
+      for (int lane = 0; lane < STATE_VALUES_PER_THREAD; ++lane) {
+        const int i = static_cast<int>(threadIdx.x) + lane * TILED_THREADS;
+        const int local_v = i / TILED_KEY_DIM;
+        const int kd = i - local_v * TILED_KEY_DIM;
+        const int qk_idx =
+            ((token * key_heads + key_head) * TILED_KEY_DIM) + kd;
+        const float updated =
+            resident_state[lane] + delta[local_v] * key[qk_idx];
+        resident_state[lane] = updated;
+        local[local_v] += updated * (query[qk_idx] * scale);
+      }
+    } else {
+      for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+        const int local_v = i / key_dim;
+        const int kd = i - local_v * key_dim;
+        const int value_offset = value_start + local_v;
+        if (value_offset >= value_dim) continue;
 
-      const int state_idx =
-          row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
-      const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-      const float updated = ferrum_gdr_load_value(final_states, state_idx) +
-                            delta[local_v] * key[qk_idx];
-      ferrum_gdr_store_value(final_states, state_idx, updated);
-      local[local_v] += updated * (query[qk_idx] * scale);
+        const int state_idx =
+            row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+        const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+        const float updated = ferrum_gdr_load_value(final_states, state_idx) +
+                              delta[local_v] * key[qk_idx];
+        ferrum_gdr_store_value(final_states, state_idx, updated);
+        local[local_v] += updated * (query[qk_idx] * scale);
+      }
     }
 
 #pragma unroll
@@ -1092,6 +1146,20 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     }
     __syncthreads();
   }
+
+  if constexpr (REGISTER_RESIDENT) {
+#pragma unroll
+    for (int lane = 0; lane < STATE_VALUES_PER_THREAD; ++lane) {
+      const int i = static_cast<int>(threadIdx.x) + lane * TILED_THREADS;
+      const int local_v = i / TILED_KEY_DIM;
+      const int kd = i - local_v * TILED_KEY_DIM;
+      const int value_offset = value_start + local_v;
+      const int state_idx =
+          row_state_base +
+          (value_head * TILED_VALUE_DIM + value_offset) * TILED_KEY_DIM + kd;
+      ferrum_gdr_store_value(final_states, state_idx, resident_state[lane]);
+    }
+  }
 }
 
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32(
@@ -1111,7 +1179,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32(
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16>(
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true>(
       query, key, value, g, beta, initial_states, cu_seqlens, out,
       final_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, scale);
@@ -1134,7 +1202,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_indirec
     const int value_dim,
     const float scale) {
   float* state = reinterpret_cast<float*>(state_bindings[1]);
-  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16>(
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true>(
       query, key, value, g, beta, state, cu_seqlens, out, state, batch,
       total_tokens, key_heads, value_heads, key_dim, value_dim, scale);
 }
@@ -1156,7 +1224,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_state_f
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_varlen_tiled_f32_impl<__half, 16>(
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<__half, 16, false>(
       query, key, value, g, beta, initial_states, cu_seqlens, out,
       final_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, scale);
