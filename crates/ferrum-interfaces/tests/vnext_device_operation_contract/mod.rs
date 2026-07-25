@@ -870,6 +870,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submitted_command_counts: Vec<usize>,
     pub(crate) submitted_command_phases: Vec<Vec<DeviceCommandPhase>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
+    pub(crate) uploaded_payloads: Vec<Vec<u8>>,
     pub(crate) submitted_reusable_captures: Vec<Option<DeviceReusableExecutionCapture>>,
     pub(crate) program_binding_coalesce_calls: u64,
     pub(crate) program_binding_input_counts: Vec<usize>,
@@ -1032,11 +1033,16 @@ impl DeviceRuntime for TestRuntime {
 
     fn encode_upload(
         &self,
-        _source: &[u8],
+        source: &[u8],
         _source_layout: HostTransferLayout,
         _destination: &Self::Buffer,
         _destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
+        self.trace
+            .lock()
+            .unwrap()
+            .uploaded_payloads
+            .push(source.to_vec());
         Ok(TestCommand::Upload)
     }
 

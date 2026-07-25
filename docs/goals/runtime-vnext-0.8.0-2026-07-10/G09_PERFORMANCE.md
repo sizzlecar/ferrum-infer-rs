@@ -1409,10 +1409,67 @@ CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo check --workspace --all-targets
 Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.60s
 ```
 
-This is still source-only evidence and makes no performance claim. Runtime
-component materialization and the CUDA Marlin FP8 W8A16 provider remain
-unimplemented, so the paid CUDA lane remains closed and Vast `45319871`
-remains `stopped/exited`.
+This checkpoint alone was source-only evidence and made no performance claim.
+The runtime authority is completed by the following checkpoint; the CUDA
+Marlin FP8 W8A16 provider remains separate.
+
+### 2026-07-25 Trusted Runtime Weight Materialization Checkpoint
+
+The third source slice replaces the planning-only materializer trait with one
+`WeightMaterializer` authority retained by the immutable execution plan. The
+same process-local implementation now owns both the transformed schema and the
+cold-path bytes uploaded for that schema. Static initialization can no longer
+call a checkpoint source directly for an execution component.
+
+Execution plan schema v7 adds an exact, ordered
+`execution_component -> [source_component...]` map. Validation requires:
+
+- map keys exactly equal the execution schema's component identities;
+- every source list is non-empty and duplicate-free;
+- every referenced source component exists in the prepared family;
+- every required source component participates in at least one mapping;
+- wire changes to the mapping fail semantic revalidation;
+- the retained implementation descriptor still matches the catalog and
+  non-serializable witness at materialization time.
+
+The lookup path uses normalized-schema binary search per component, rather
+than repeating whole-schema validation inside the upload loop. Transform work
+remains cold-path and component-at-a-time, so owned derived bytes do not retain
+a second full-model copy.
+
+A focused integration materializer gives two execution components new IDs and
+synthetic external names while explicitly mapping them to two original source
+components. Its source rejects the derived IDs, proving that initialization
+must resolve the source map first. The retained materializer emits distinct
+`0xa1` and `0xb2` payloads; the test runtime observes those exact uploaded
+bytes, proving that raw checkpoint bytes did not bypass the authority.
+
+Validation:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces \
+  --test vnext_program_plan_compiler_contract_tests \
+  --test vnext_plan_wire_contract_tests \
+  --test vnext_static_initialization_contract_tests -- --test-threads=2
+
+vnext_plan_wire_contract_tests: 12 passed
+vnext_program_plan_compiler_contract_tests: 10 passed
+vnext_static_initialization_contract_tests: 6 passed
+```
+
+```text
+CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.63s
+```
+
+This remains source-only correctness evidence, not a G09 performance PASS.
+The accepted CUDA reference remains
+`runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z` at
+`73.385528 tok/s`, `2.77277 tok/s` (`3.64%`) below the formal floor. The next
+slice is the generic Marlin FP8 W8A16 CPU transform, CUDA FFI, dense provider,
+and typed product selection. Vast `45319871` remains `stopped/exited`; the paid
+lane remains closed until that source slice has local correctness evidence and
+a counter-level KEEP/REJECT prediction.
 
 ### M3 Qwen3-30B historical floors
 

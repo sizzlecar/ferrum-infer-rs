@@ -25,7 +25,10 @@ use super::{
     EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
-use crate::vnext::{CompletionReadbackRequest, HostTransferLayout, ResourceWorkShape};
+use crate::vnext::{
+    CompletionReadbackRequest, HostTransferLayout, ResourceWorkShape, WeightComponentPayload,
+    WeightComponentSource, WeightComponentSpec,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPlan {
@@ -2402,6 +2405,16 @@ impl ExecutionPlan {
 
     pub(crate) fn operation_registry_authority(&self) -> &OperationRegistryAuthority {
         &self.operation_registry_authority
+    }
+
+    pub(crate) fn materialize_weight_component<'source>(
+        &self,
+        family: &PreparedModelFamily,
+        source: &'source dyn WeightComponentSource,
+        component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        self.trusted_execution_weights
+            .materialize_component(family, source, component)
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>, VNextError> {

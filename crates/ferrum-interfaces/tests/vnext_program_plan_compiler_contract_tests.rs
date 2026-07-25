@@ -42,7 +42,7 @@ impl PaddedDenseMaterializer {
     }
 }
 
-impl WeightMaterializerPlanner for PaddedDenseMaterializer {
+impl WeightMaterializer for PaddedDenseMaterializer {
     fn descriptor(&self) -> &WeightMaterializerDescriptor {
         &self.descriptor
     }
@@ -67,6 +67,36 @@ impl WeightMaterializerPlanner for PaddedDenseMaterializer {
         };
         Ok(schema)
     }
+
+    fn materialize_component<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        let [source_component] = source_components else {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "padded test materializer requires one source component".to_owned(),
+            });
+        };
+        let source_payload = source.component(source_component)?;
+        let output_bytes =
+            usize::try_from(execution_component.physical_bytes()?).map_err(|_| {
+                VNextError::InvalidExecutionPlan {
+                    reason: "padded test component exceeds host address space".to_owned(),
+                }
+            })?;
+        let mut bytes = source_payload.bytes().to_vec();
+        bytes.resize(output_bytes, 0);
+        WeightComponentPayload::from_ordered_sources(
+            execution_component,
+            execution_component.external_names.clone(),
+            source_payload.source_files().to_vec(),
+            execution_component.dimensions.clone(),
+            execution_component.physical_element_type(),
+            bytes,
+        )
+    }
 }
 
 struct LogicalMutationMaterializer {
@@ -87,7 +117,7 @@ impl LogicalMutationMaterializer {
     }
 }
 
-impl WeightMaterializerPlanner for LogicalMutationMaterializer {
+impl WeightMaterializer for LogicalMutationMaterializer {
     fn descriptor(&self) -> &WeightMaterializerDescriptor {
         &self.descriptor
     }
@@ -101,6 +131,17 @@ impl WeightMaterializerPlanner for LogicalMutationMaterializer {
         schema.components[0].dimensions = vec![5];
         schema.tensors[0].dimensions = vec![5];
         Ok(schema)
+    }
+
+    fn materialize_component<'source>(
+        &self,
+        _source: &'source dyn WeightComponentSource,
+        _source_components: &[&WeightComponentSpec],
+        _execution_component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        Err(VNextError::InvalidExecutionPlan {
+            reason: "logically invalid test materializer must never initialize weights".to_owned(),
+        })
     }
 }
 
