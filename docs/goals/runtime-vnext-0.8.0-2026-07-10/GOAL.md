@@ -4,6 +4,13 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
+correctness matrix 仍为 `0/6`。当前生产纵切是
+`G03 physical weight ABI -> G08B M2 CUDA current-HEAD correctness -> G09 Marlin FP8
+candidate`。`0b72bab2` 已取得 current-HEAD Qwen3.5-35B CUDA `run`/`serve`
+correctness PASS、Marlin dispatch profile PASS 和单次 c1 bounded KEEP；这些是开发
+checkpoint，不是 G03、G08B 或 G09 canonical PASS。
+
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
 为准。G00-G10 继续定义最终能力与验收维度；S0-S7 定义实际生产纵切顺序。修订不降低本文件的
