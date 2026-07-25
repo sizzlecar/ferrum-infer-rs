@@ -16,8 +16,11 @@ exact-precision performance`。`0b72bab2` 的隐式 F16 -> FP8 candidate 虽曾�
 9 个 C03/C05/C06/C17 用例、`4,500` 个 GDN projection GEMV、每 correlation `300`
 dispatch 和 `7.6973 ms` device-duration target；bounded c1 为 `73.3800 tok/s`，与
 `73.3855 tok/s` exact reference 持平，但仍比 `76.1583 tok/s` floor 低 `3.65%`。
-因此只保留 exact structural checkpoint，G09 performance REJECT；这些仍不是 G03、
-G08B 或 G09 canonical PASS。完整证据在 GitHub branch
+2026-07-25 owner 决定按 G09 的窄范围 M2 CUDA c1 修订把该差距作为 development
+checkpoint 接受，并停止继续进行 c1-only 优化；下一生产 lever 是 typed device token
+selection，以减少 decode 全量 logits readback。原 artifact 只有一次 repeat 且没有 CI，
+所以仍不是 G03、G08B 或 G09 canonical PASS，也不降低 same-host vLLM、并发矩阵、正确性
+或最终发布标准。完整证据在 GitHub branch
 `artifact/runtime-vnext-exact-qkvzba-557cdcf5-20260725` commit `b161d69e`，
 付费实例已确认 `stopped/exited`。
 
