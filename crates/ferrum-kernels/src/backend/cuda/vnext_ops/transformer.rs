@@ -1,7 +1,6 @@
 //! CUDA implementations of backend-neutral dense transformer operations.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "vllm-marlin")]
 use std::ffi::c_void;
 
 use cudarc::cublas::{
