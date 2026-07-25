@@ -8820,8 +8820,8 @@ fn model_decode_logits_policy_keeps_repetition_penalty_on_greedy_argmax_path() {
         panic!("greedy repetition penalty should use model-side argmax policy");
     };
     assert_eq!(mask.valid_token_mask[2], 0);
-    assert_eq!(penalty.penalty, 1.1);
-    assert_eq!(penalty.token_ids.as_ref(), &[3, 0]);
+    assert_eq!(penalty.penalty(), 1.1);
+    assert_eq!(penalty.token_ids(), &[3, 0]);
 }
 
 #[test]

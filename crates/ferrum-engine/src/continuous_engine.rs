@@ -1685,13 +1685,11 @@ impl SequenceState {
         if penalty == 1.0 || self.generated_tokens.is_empty() {
             return None;
         }
-        let mut seen = HashSet::new();
-        let mut token_ids = Vec::new();
-        for token in &self.generated_tokens {
-            if seen.insert(token.get()) {
-                token_ids.push(token.get());
-            }
-        }
+        let token_ids: Vec<u32> = self
+            .generated_tokens
+            .iter()
+            .map(|token| token.get())
+            .collect();
         if token_ids.is_empty() {
             None
         } else {

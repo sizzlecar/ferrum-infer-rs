@@ -281,7 +281,7 @@ impl MetalLastTokenMaskedArgmaxProvider {
             LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID,
             LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
             LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID,
-            contiguous_bindings(2),
+            contiguous_bindings(5),
             &[],
             &[],
             implementation_fingerprint(&[
@@ -741,6 +741,7 @@ fn valid_residual_add(
 #[derive(Debug, Clone, Copy)]
 struct LastTokenMaskedArgmaxParams {
     vocabulary_size: u32,
+    repetition_capacity: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -754,21 +755,47 @@ fn encode_last_token_masked_argmax(
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
     ensure_invocation(&invocation, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?;
-    let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
+    let mut regions = Vec::with_capacity(invocation.participants().len() * 6);
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for participant in invocation.participants() {
         let logits = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let valid_mask = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
+        let repetition_token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 2)?;
+        let repetition_offsets = binding(participant.bindings(), ResolvedValueRole::Input, 3)?;
+        let repetition_penalty = binding(participant.bindings(), ResolvedValueRole::Input, 4)?;
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        if !valid_last_token_masked_argmax(logits, valid_mask, output, vocabulary_size) {
+        let Some(repetition_capacity) = valid_last_token_masked_argmax(
+            logits,
+            valid_mask,
+            repetition_token_ids,
+            repetition_offsets,
+            repetition_penalty,
+            output,
+            vocabulary_size,
+        ) else {
             return Err(
                 "Metal masked argmax participant differs from its resolved signature".to_owned(),
             );
-        }
+        };
         let first_region = regions.len();
         regions.push(contiguous_region(participant, logits, ElementType::F16)?);
         regions.push(contiguous_region(participant, valid_mask, ElementType::U8)?);
+        regions.push(contiguous_region(
+            participant,
+            repetition_token_ids,
+            ElementType::U32,
+        )?);
+        regions.push(contiguous_region(
+            participant,
+            repetition_offsets,
+            ElementType::U32,
+        )?);
+        regions.push(contiguous_region(
+            participant,
+            repetition_penalty,
+            ElementType::F32,
+        )?);
         regions.push(contiguous_region(participant, output, ElementType::U32)?);
         launches.push(LastTokenMaskedArgmaxLaunch {
             first_region,
@@ -777,6 +804,7 @@ fn encode_last_token_masked_argmax(
                     vocabulary_size,
                     "Metal masked argmax vocabulary size",
                 )?,
+                repetition_capacity,
             },
         });
     }
@@ -797,6 +825,9 @@ fn encode_last_token_masked_argmax(
                     &regions[launch.first_region],
                     &regions[launch.first_region + 1],
                     &regions[launch.first_region + 2],
+                    &regions[launch.first_region + 3],
+                    &regions[launch.first_region + 4],
+                    &regions[launch.first_region + 5],
                     launch.params,
                 );
             }
@@ -819,21 +850,43 @@ fn encode_last_token_masked_argmax(
 fn valid_last_token_masked_argmax(
     logits: &ResolvedValueBinding,
     valid_mask: &ResolvedValueBinding,
+    repetition_token_ids: &ResolvedValueBinding,
+    repetition_offsets: &ResolvedValueBinding,
+    repetition_penalty: &ResolvedValueBinding,
     output: &ResolvedValueBinding,
     vocabulary_size: u64,
-) -> bool {
+) -> Option<u32> {
     let contiguous = |binding: &ResolvedValueBinding| {
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
-    logits.tensor().element_type() == ElementType::F16
+    let valid = logits.tensor().element_type() == ElementType::F16
         && valid_mask.tensor().element_type() == ElementType::U8
+        && repetition_token_ids.tensor().element_type() == ElementType::U32
+        && repetition_offsets.tensor().element_type() == ElementType::U32
+        && repetition_penalty.tensor().element_type() == ElementType::F32
         && output.tensor().element_type() == ElementType::U32
         && logits.tensor().dimensions() == [1, vocabulary_size]
         && valid_mask.tensor().dimensions() == [vocabulary_size]
+        && repetition_token_ids.tensor().dimensions().len() == 1
+        && repetition_token_ids.tensor().dimensions()[0] != 0
+        && repetition_offsets.tensor().dimensions() == [2]
+        && repetition_penalty.tensor().dimensions() == [1]
         && output.tensor().dimensions() == [1]
         && contiguous(logits)
         && contiguous(valid_mask)
-        && contiguous(output)
+        && contiguous(repetition_token_ids)
+        && contiguous(repetition_offsets)
+        && contiguous(repetition_penalty)
+        && contiguous(output);
+    valid
+        .then(|| {
+            checked_u32(
+                repetition_token_ids.tensor().dimensions()[0],
+                "Metal masked argmax repetition capacity",
+            )
+            .ok()
+        })
+        .flatten()
 }
 
 fn set_region(encoder: &ComputeCommandEncoderRef, index: u64, region: &MetalBufferRegion) {
@@ -858,15 +911,21 @@ fn dispatch_last_token_masked_argmax(
     encoder: &ComputeCommandEncoderRef,
     logits: &MetalBufferRegion,
     valid_mask: &MetalBufferRegion,
+    repetition_token_ids: &MetalBufferRegion,
+    repetition_offsets: &MetalBufferRegion,
+    repetition_penalty: &MetalBufferRegion,
     output: &MetalBufferRegion,
     params: LastTokenMaskedArgmaxParams,
 ) {
     encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax);
     set_region(encoder, 0, logits);
     set_region(encoder, 1, valid_mask);
-    set_region(encoder, 2, output);
+    set_region(encoder, 2, repetition_token_ids);
+    set_region(encoder, 3, repetition_offsets);
+    set_region(encoder, 4, repetition_penalty);
+    set_region(encoder, 5, output);
     encoder.set_bytes(
-        3,
+        6,
         std::mem::size_of::<LastTokenMaskedArgmaxParams>() as u64,
         &params as *const _ as *const c_void,
     );
@@ -1116,8 +1175,20 @@ mod tests {
         let argmax_logits_buffer = shared_buffer(&device, &argmax_logits);
         let argmax_mask_buffer = shared_buffer(&device, &[1_u8, 1, 1, 0, 0]);
         let argmax_empty_mask_buffer = shared_buffer(&device, &[0_u8; 5]);
+        let argmax_repetition_token_ids_buffer = shared_buffer(&device, &[0_u32]);
+        let argmax_repetition_disabled_offsets_buffer = shared_buffer(&device, &[0_u32, 0_u32]);
+        let argmax_repetition_disabled_penalty_buffer = shared_buffer(&device, &[1.0_f32]);
         let argmax_output = output_buffer::<u32>(&device, 1);
         let argmax_empty_output = output_buffer::<u32>(&device, 1);
+        let repetition_logits = [4.0_f32, 3.0, 2.0]
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let repetition_logits_buffer = shared_buffer(&device, &repetition_logits);
+        let repetition_mask_buffer = shared_buffer(&device, &[1_u8; 3]);
+        let repetition_offsets_buffer = shared_buffer(&device, &[0_u32, 1_u32]);
+        let repetition_penalty_buffer = shared_buffer(&device, &[2.0_f32]);
+        let repetition_output = output_buffer::<u32>(&device, 1);
 
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
@@ -1174,16 +1245,42 @@ mod tests {
             encoder,
             &argmax_logits_buffer,
             &argmax_mask_buffer,
+            &argmax_repetition_token_ids_buffer,
+            &argmax_repetition_disabled_offsets_buffer,
+            &argmax_repetition_disabled_penalty_buffer,
             &argmax_output,
-            LastTokenMaskedArgmaxParams { vocabulary_size: 5 },
+            LastTokenMaskedArgmaxParams {
+                vocabulary_size: 5,
+                repetition_capacity: 1,
+            },
         );
         dispatch_raw_last_token_masked_argmax(
             &pipelines,
             encoder,
             &argmax_logits_buffer,
             &argmax_empty_mask_buffer,
+            &argmax_repetition_token_ids_buffer,
+            &argmax_repetition_disabled_offsets_buffer,
+            &argmax_repetition_disabled_penalty_buffer,
             &argmax_empty_output,
-            LastTokenMaskedArgmaxParams { vocabulary_size: 5 },
+            LastTokenMaskedArgmaxParams {
+                vocabulary_size: 5,
+                repetition_capacity: 1,
+            },
+        );
+        dispatch_raw_last_token_masked_argmax(
+            &pipelines,
+            encoder,
+            &repetition_logits_buffer,
+            &repetition_mask_buffer,
+            &argmax_repetition_token_ids_buffer,
+            &repetition_offsets_buffer,
+            &repetition_penalty_buffer,
+            &repetition_output,
+            LastTokenMaskedArgmaxParams {
+                vocabulary_size: 3,
+                repetition_capacity: 1,
+            },
         );
         encoder.end_encoding();
         command.commit();
@@ -1267,6 +1364,11 @@ mod tests {
             empty_selected,
             u32::MAX,
             "an all-invalid selection mask must return the typed sentinel"
+        );
+        let repetition_selected = unsafe { *(repetition_output.contents() as *const u32) };
+        assert_eq!(
+            repetition_selected, 1,
+            "sparse positive-logit repetition penalty must apply before argmax"
         );
     }
 
@@ -1358,15 +1460,21 @@ mod tests {
         encoder: &ComputeCommandEncoderRef,
         logits: &BufferRef,
         valid_mask: &BufferRef,
+        repetition_token_ids: &BufferRef,
+        repetition_offsets: &BufferRef,
+        repetition_penalty: &BufferRef,
         output: &BufferRef,
         params: LastTokenMaskedArgmaxParams,
     ) {
         encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax);
         set_raw(encoder, 0, logits);
         set_raw(encoder, 1, valid_mask);
-        set_raw(encoder, 2, output);
+        set_raw(encoder, 2, repetition_token_ids);
+        set_raw(encoder, 3, repetition_offsets);
+        set_raw(encoder, 4, repetition_penalty);
+        set_raw(encoder, 5, output);
         encoder.set_bytes(
-            3,
+            6,
             std::mem::size_of::<LastTokenMaskedArgmaxParams>() as u64,
             &params as *const _ as *const c_void,
         );

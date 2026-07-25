@@ -349,12 +349,18 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
 }
 
 /// Selects one token from a final-position F16 logits row after applying an
-/// exact per-vocabulary validity mask. The mask is a semantic input so product
-/// policy remains visible to planning and cannot be hidden in a backend flag.
+/// exact per-vocabulary validity mask and an optional sparse repetition
+/// penalty. Selection policy is carried by typed inputs so it remains visible
+/// to planning and cannot be hidden in backend flags.
+///
+/// The repetition token ids are unique and occupy
+/// `offsets[0]..offsets[1]` within the fixed-capacity input. A penalty of `1.0`
+/// or an empty range leaves logits unchanged. Backends apply any non-trivial
+/// penalty to logits in place before masked argmax.
 pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-        version: ContractVersion::new(1, 0),
+        version: ContractVersion::new(2, 0),
         inputs: vec![
             contiguous_tensor(
                 vec![
@@ -362,11 +368,28 @@ pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, 
                     DimensionConstraint::Symbol("vocab_size".to_owned()),
                 ],
                 [ElementType::F16],
-                TensorAccess::Read,
+                TensorAccess::ReadWrite,
             )?,
             contiguous_tensor(
                 vec![DimensionConstraint::Symbol("vocab_size".to_owned())],
                 [ElementType::U8],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![DimensionConstraint::Symbol(
+                    "repetition_capacity".to_owned(),
+                )],
+                [ElementType::U32],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![DimensionConstraint::Exact(2)],
+                [ElementType::U32],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![DimensionConstraint::Exact(1)],
+                [ElementType::F32],
                 TensorAccess::Read,
             )?,
         ],
@@ -385,7 +408,7 @@ pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, 
         oracle: OracleSpec::Exact,
         provider: provider_requirement(
             LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
-            ContractVersion::new(1, 0),
+            ContractVersion::new(2, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -1141,10 +1164,24 @@ mod tests {
             descriptor.id.as_str(),
             LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
         );
-        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(descriptor.version, ContractVersion::new(2, 0));
+        assert_eq!(descriptor.inputs.len(), 5);
+        assert_eq!(descriptor.inputs[0].access(), TensorAccess::ReadWrite);
         assert_eq!(
             descriptor.inputs[1].element_types(),
             &BTreeSet::from([ElementType::U8])
+        );
+        assert_eq!(
+            descriptor.inputs[2].element_types(),
+            &BTreeSet::from([ElementType::U32])
+        );
+        assert_eq!(
+            descriptor.inputs[3].dimensions(),
+            &[DimensionConstraint::Exact(2)]
+        );
+        assert_eq!(
+            descriptor.inputs[4].element_types(),
+            &BTreeSet::from([ElementType::F32])
         );
         assert_eq!(
             descriptor.outputs[0].element_types(),

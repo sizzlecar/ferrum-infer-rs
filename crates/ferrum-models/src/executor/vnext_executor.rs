@@ -487,6 +487,9 @@ impl VNextStartupPreparationState {
 struct VNextLanguageIoIds {
     token_input: ProgramValueId,
     token_mask_input: ProgramValueId,
+    repetition_token_ids_input: ProgramValueId,
+    repetition_offsets_input: ProgramValueId,
+    repetition_penalty_input: ProgramValueId,
     logits_output: ProgramValueId,
     greedy_token_output: ProgramValueId,
 }
@@ -497,6 +500,13 @@ struct VNextIoBinding {
     input_ordinal: u32,
     token_mask_input_node_id: NodeId,
     token_mask_input_ordinal: u32,
+    repetition_token_ids_input_node_id: NodeId,
+    repetition_token_ids_input_ordinal: u32,
+    repetition_offsets_input_node_id: NodeId,
+    repetition_offsets_input_ordinal: u32,
+    repetition_penalty_input_node_id: NodeId,
+    repetition_penalty_input_ordinal: u32,
+    repetition_capacity: usize,
     output_node_id: NodeId,
     output_resource_id: ResourceId,
     output_offset_bytes: u64,
@@ -548,6 +558,9 @@ struct VNextExecutorMetrics {
     greedy_policy_fallback_waves: AtomicU64,
     token_mask_upload_participants: AtomicU64,
     token_mask_cache_hit_participants: AtomicU64,
+    sparse_repetition_waves: AtomicU64,
+    sparse_repetition_participants: AtomicU64,
+    sparse_repetition_token_ids_uploaded: AtomicU64,
     total_prefill_us: AtomicU64,
     total_decode_us: AtomicU64,
     wave_timing: VNextWaveTimingMetrics,
@@ -577,6 +590,23 @@ enum VNextProductTokenMaskKey {
     Selection { fingerprint: u64, source_len: usize },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VNextProductRepetitionInput<'a> {
+    token_ids: &'a [u32],
+    penalty: f32,
+}
+
+impl VNextProductRepetitionInput<'_> {
+    const NONE: Self = Self {
+        token_ids: &[],
+        penalty: 1.0,
+    };
+
+    fn is_active(self) -> bool {
+        !self.token_ids.is_empty() && self.penalty != 1.0
+    }
+}
+
 fn product_output_mode_for_policies<'a>(
     kind: VNextExecutionWaveKind,
     policies: impl IntoIterator<Item = Option<&'a LogitsReturnPolicy>>,
@@ -587,13 +617,7 @@ fn product_output_mode_for_policies<'a>(
     let mut has_participant = false;
     for policy in policies {
         has_participant = true;
-        if !matches!(
-            policy,
-            Some(LogitsReturnPolicy::GreedyArgmax {
-                repetition_penalty: None,
-                ..
-            })
-        ) {
+        if !matches!(policy, Some(LogitsReturnPolicy::GreedyArgmax { .. })) {
             return VNextProductOutputMode::FullLogits;
         }
     }
@@ -611,7 +635,7 @@ fn product_token_mask_key(
     if output_mode == VNextProductOutputMode::GreedyToken {
         if let Some(LogitsReturnPolicy::GreedyArgmax {
             token_mask: Some(token_mask),
-            repetition_penalty: None,
+            ..
         }) = policy
         {
             return VNextProductTokenMaskKey::Selection {
@@ -641,7 +665,7 @@ fn normalized_product_token_mask(
     }
     let Some(LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(token_mask),
-        repetition_penalty: None,
+        ..
     }) = policy
     else {
         return output;
@@ -654,6 +678,30 @@ fn normalized_product_token_mask(
         *destination = u8::from(source != 0);
     }
     output
+}
+
+fn product_repetition_input(
+    policy: Option<&LogitsReturnPolicy>,
+    output_mode: VNextProductOutputMode,
+) -> VNextProductRepetitionInput<'_> {
+    if output_mode != VNextProductOutputMode::GreedyToken {
+        return VNextProductRepetitionInput::NONE;
+    }
+    let Some(LogitsReturnPolicy::GreedyArgmax {
+        repetition_penalty: Some(repetition),
+        ..
+    }) = policy
+    else {
+        return VNextProductRepetitionInput::NONE;
+    };
+    if repetition.is_empty() {
+        VNextProductRepetitionInput::NONE
+    } else {
+        VNextProductRepetitionInput {
+            token_ids: repetition.token_ids(),
+            penalty: repetition.penalty(),
+        }
+    }
 }
 
 fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<Vec<f32>> {
@@ -1411,6 +1459,9 @@ impl VNextExecutorMetrics {
             &self.greedy_policy_fallback_waves,
             &self.token_mask_upload_participants,
             &self.token_mask_cache_hit_participants,
+            &self.sparse_repetition_waves,
+            &self.sparse_repetition_participants,
+            &self.sparse_repetition_token_ids_uploaded,
             &self.total_prefill_us,
             &self.total_decode_us,
         ] {
@@ -2905,9 +2956,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 argmax_nodes.len()
             )));
         };
-        let [logits_output, token_mask_input] = argmax.inputs.as_slice() else {
+        let [logits_output, token_mask_input, repetition_token_ids_input, repetition_offsets_input, repetition_penalty_input] =
+            argmax.inputs.as_slice()
+        else {
             return Err(FerrumError::model(
-                "vNext masked argmax operation must consume logits and a token mask",
+                "vNext masked argmax operation must consume logits, a token mask, and typed sparse repetition policy",
             ));
         };
         let [greedy_token_output] = argmax.outputs.as_slice() else {
@@ -2915,14 +2968,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext masked argmax operation must produce one token",
             ));
         };
-        let expected_inputs = [&token_input, token_mask_input];
+        let expected_inputs = [
+            &token_input,
+            token_mask_input,
+            repetition_token_ids_input,
+            repetition_offsets_input,
+            repetition_penalty_input,
+        ];
         if program.inputs().len() != expected_inputs.len()
             || expected_inputs
                 .iter()
                 .any(|expected| !program.inputs().contains(expected))
         {
             return Err(FerrumError::model(
-                "vNext language program inputs must be the token ids and typed selection mask",
+                "vNext language program inputs must expose token ids plus typed selection and repetition policy",
             ));
         }
         let expected_outputs = [logits_output, greedy_token_output];
@@ -2938,6 +2997,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Ok(VNextLanguageIoIds {
             token_input,
             token_mask_input: token_mask_input.clone(),
+            repetition_token_ids_input: repetition_token_ids_input.clone(),
+            repetition_offsets_input: repetition_offsets_input.clone(),
+            repetition_penalty_input: repetition_penalty_input.clone(),
             logits_output: logits_output.clone(),
             greedy_token_output: greedy_token_output.clone(),
         })
@@ -2975,6 +3037,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|_| FerrumError::config("vNext model length exceeds u64"))?;
         let vocabulary_size = u64::try_from(info.vocab_size)
             .map_err(|_| FerrumError::config("vNext vocabulary exceeds u64"))?;
+        let repetition_capacity = input_capacity.min(vocabulary_size);
         let mut compile_options = ProgramPlanCompileOptions::new(BTreeMap::from([
             (
                 language_io.token_input.clone(),
@@ -2989,6 +3052,30 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ProgramTensorSpec {
                     dimensions: vec![vocabulary_size],
                     element_type: ElementType::U8,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+            ),
+            (
+                language_io.repetition_token_ids_input.clone(),
+                ProgramTensorSpec {
+                    dimensions: vec![repetition_capacity],
+                    element_type: ElementType::U32,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+            ),
+            (
+                language_io.repetition_offsets_input.clone(),
+                ProgramTensorSpec {
+                    dimensions: vec![2],
+                    element_type: ElementType::U32,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+            ),
+            (
+                language_io.repetition_penalty_input.clone(),
+                ProgramTensorSpec {
+                    dimensions: vec![1],
+                    element_type: ElementType::F32,
                     layout: ResolvedTensorLayout::Contiguous,
                 },
             ),
@@ -3020,7 +3107,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .bind_plan(&resolved_plan)
             .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;
         resolve_bind_phase.finish();
-        let io = Self::resolve_io(&resolved_plan, &language_io, info.vocab_size)?;
+        let io = Self::resolve_io(
+            &resolved_plan,
+            &language_io,
+            info.vocab_size,
+            usize::try_from(repetition_capacity)
+                .map_err(|_| FerrumError::config("vNext repetition capacity exceeds usize"))?,
+        )?;
         let family_fingerprint = family
             .fingerprint()
             .map_err(|error| FerrumError::model(error.to_string()))?;
@@ -3674,6 +3767,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         executable: &impl ExecutablePlanView,
         language_io: &VNextLanguageIoIds,
         expected_vocab: usize,
+        expected_repetition_capacity: usize,
     ) -> Result<VNextIoBinding> {
         let nodes = executable.execution_plan().payload().nodes();
         let input_matches = nodes
@@ -3689,6 +3783,30 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
             .filter(|(_, value)| {
                 value.value_id() == &language_io.token_mask_input
+                    && value.role() == ResolvedValueRole::Input
+            })
+            .collect::<Vec<_>>();
+        let repetition_token_ids_input_matches = nodes
+            .iter()
+            .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
+            .filter(|(_, value)| {
+                value.value_id() == &language_io.repetition_token_ids_input
+                    && value.role() == ResolvedValueRole::Input
+            })
+            .collect::<Vec<_>>();
+        let repetition_offsets_input_matches = nodes
+            .iter()
+            .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
+            .filter(|(_, value)| {
+                value.value_id() == &language_io.repetition_offsets_input
+                    && value.role() == ResolvedValueRole::Input
+            })
+            .collect::<Vec<_>>();
+        let repetition_penalty_input_matches = nodes
+            .iter()
+            .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
+            .filter(|(_, value)| {
+                value.value_id() == &language_io.repetition_penalty_input
                     && value.role() == ResolvedValueRole::Input
             })
             .collect::<Vec<_>>();
@@ -3719,6 +3837,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "compiled vNext plan must bind the token-selection mask exactly once",
             ));
         };
+        let [(repetition_token_ids_input_node_id, repetition_token_ids_input)] =
+            repetition_token_ids_input_matches.as_slice()
+        else {
+            return Err(FerrumError::model(
+                "compiled vNext plan must bind sparse repetition token ids exactly once",
+            ));
+        };
+        let [(repetition_offsets_input_node_id, repetition_offsets_input)] =
+            repetition_offsets_input_matches.as_slice()
+        else {
+            return Err(FerrumError::model(
+                "compiled vNext plan must bind sparse repetition offsets exactly once",
+            ));
+        };
+        let [(repetition_penalty_input_node_id, repetition_penalty_input)] =
+            repetition_penalty_input_matches.as_slice()
+        else {
+            return Err(FerrumError::model(
+                "compiled vNext plan must bind sparse repetition penalty exactly once",
+            ));
+        };
         let [(output_node_id, output)] = logits_output_matches.as_slice() else {
             return Err(FerrumError::model(
                 "compiled vNext plan must bind the logits output exactly once",
@@ -3747,6 +3886,36 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         {
             return Err(FerrumError::model(
                 "compiled vNext token-selection mask must be contiguous U8[vocab]",
+            ));
+        }
+        let expected_repetition_capacity_u64 = u64::try_from(expected_repetition_capacity)
+            .map_err(|_| FerrumError::model("vNext repetition capacity exceeds u64"))?;
+        let contiguous = |value: &ResolvedValueBinding| {
+            matches!(value.tensor().layout(), ResolvedTensorLayout::Contiguous)
+        };
+        if repetition_token_ids_input.tensor().element_type() != ElementType::U32
+            || repetition_token_ids_input.tensor().dimensions()
+                != [expected_repetition_capacity_u64]
+            || !contiguous(repetition_token_ids_input)
+        {
+            return Err(FerrumError::model(
+                "compiled vNext sparse repetition ids must be contiguous U32[capacity]",
+            ));
+        }
+        if repetition_offsets_input.tensor().element_type() != ElementType::U32
+            || repetition_offsets_input.tensor().dimensions() != [2]
+            || !contiguous(repetition_offsets_input)
+        {
+            return Err(FerrumError::model(
+                "compiled vNext sparse repetition offsets must be contiguous U32[2]",
+            ));
+        }
+        if repetition_penalty_input.tensor().element_type() != ElementType::F32
+            || repetition_penalty_input.tensor().dimensions() != [1]
+            || !contiguous(repetition_penalty_input)
+        {
+            return Err(FerrumError::model(
+                "compiled vNext sparse repetition penalty must be contiguous F32[1]",
             ));
         }
         let [component] = output.storage().components() else {
@@ -3797,6 +3966,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             input_ordinal: input.ordinal(),
             token_mask_input_node_id: (*token_mask_input_node_id).clone(),
             token_mask_input_ordinal: token_mask_input.ordinal(),
+            repetition_token_ids_input_node_id: (*repetition_token_ids_input_node_id).clone(),
+            repetition_token_ids_input_ordinal: repetition_token_ids_input.ordinal(),
+            repetition_offsets_input_node_id: (*repetition_offsets_input_node_id).clone(),
+            repetition_offsets_input_ordinal: repetition_offsets_input.ordinal(),
+            repetition_penalty_input_node_id: (*repetition_penalty_input_node_id).clone(),
+            repetition_penalty_input_ordinal: repetition_penalty_input.ordinal(),
+            repetition_capacity: expected_repetition_capacity,
             output_node_id: (*output_node_id).clone(),
             output_resource_id: component.resource_id().clone(),
             output_offset_bytes: component.offset_bytes(),
@@ -4686,6 +4862,89 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok(token_mask_uploads) => uploads.extend(token_mask_uploads.into_iter().flatten()),
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         }
+        let repetition_uploads = participants
+            .iter()
+            .enumerate()
+            .map(|(participant_index, participant)| {
+                let repetition = product_repetition_input(participant.logits_policy, output_mode);
+                if !repetition.penalty.is_finite() || repetition.penalty <= 0.0 {
+                    return Err(FerrumError::backend(
+                        "vNext sparse repetition penalty must be finite and positive",
+                    ));
+                }
+                if repetition.token_ids.len() > self.io.repetition_capacity {
+                    return Err(FerrumError::backend(format!(
+                        "vNext sparse repetition input contains {} ids, capacity is {}",
+                        repetition.token_ids.len(),
+                        self.io.repetition_capacity
+                    )));
+                }
+                if repetition.token_ids.iter().any(|token| {
+                    usize::try_from(*token).map_or(true, |token| token >= self.io.output_elements)
+                }) {
+                    return Err(FerrumError::backend(
+                        "vNext sparse repetition input contains an out-of-vocabulary token",
+                    ));
+                }
+                let participant_index = u32::try_from(participant_index).map_err(|_| {
+                    FerrumError::backend("vNext repetition participant index exceeds u32")
+                })?;
+                let repetition_count = u32::try_from(repetition.token_ids.len()).map_err(|_| {
+                    FerrumError::backend("vNext repetition token count exceeds u32")
+                })?;
+                let mut participant_uploads = Vec::with_capacity(3);
+                if repetition_count != 0 {
+                    participant_uploads.push(
+                        SubmissionWaveInputUpload::new(
+                            self.io.repetition_token_ids_input_node_id.clone(),
+                            participant_index,
+                            self.io.repetition_token_ids_input_ordinal,
+                            0,
+                            HostTransferLayout::new(ElementType::U32, u64::from(repetition_count))
+                                .map_err(|error| FerrumError::backend(error.to_string()))?,
+                            repetition
+                                .token_ids
+                                .iter()
+                                .flat_map(|token| token.to_le_bytes())
+                                .collect(),
+                        )
+                        .map_err(|error| FerrumError::backend(error.to_string()))?,
+                    );
+                }
+                participant_uploads.push(
+                    SubmissionWaveInputUpload::new(
+                        self.io.repetition_offsets_input_node_id.clone(),
+                        participant_index,
+                        self.io.repetition_offsets_input_ordinal,
+                        0,
+                        HostTransferLayout::new(ElementType::U32, 2)
+                            .map_err(|error| FerrumError::backend(error.to_string()))?,
+                        [0_u32, repetition_count]
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect(),
+                    )
+                    .map_err(|error| FerrumError::backend(error.to_string()))?,
+                );
+                participant_uploads.push(
+                    SubmissionWaveInputUpload::new(
+                        self.io.repetition_penalty_input_node_id.clone(),
+                        participant_index,
+                        self.io.repetition_penalty_input_ordinal,
+                        0,
+                        HostTransferLayout::new(ElementType::F32, 1)
+                            .map_err(|error| FerrumError::backend(error.to_string()))?,
+                        repetition.penalty.to_le_bytes().to_vec(),
+                    )
+                    .map_err(|error| FerrumError::backend(error.to_string()))?,
+                );
+                Ok(participant_uploads)
+            })
+            .collect::<Result<Vec<_>>>();
+        match repetition_uploads {
+            Ok(repetition_uploads) => uploads.extend(repetition_uploads.into_iter().flatten()),
+            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+        }
         let uploaded_bytes = uploads.iter().fold(0_u64, |total, upload| {
             total.saturating_add(upload.source_layout().byte_len().unwrap_or(0))
         });
@@ -5133,6 +5392,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 })
                 .collect::<Vec<_>>()
         };
+        {
+            // A submitted upload may outlive an indeterminate or failed wave.
+            // Keep the host cache empty until terminal success commits the key.
+            let mut slots = self.product_token_mask_slots.lock();
+            for (target, upload_required) in token_mask_targets.iter().zip(&token_mask_uploads) {
+                if *upload_required {
+                    if let Some(target) = target {
+                        slots.remove(target);
+                    }
+                }
+            }
+        }
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_index, output_mode)?;
         let dispatch = {
@@ -5448,6 +5719,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .token_mask_cache_hit_participants
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+        let (sparse_repetition_participants, sparse_repetition_token_ids) = participants
+            .iter()
+            .map(|participant| product_repetition_input(participant.logits_policy, output_mode))
+            .filter(|input| input.is_active())
+            .fold((0_u64, 0_u64), |(participants, token_ids), input| {
+                (
+                    participants.saturating_add(1),
+                    token_ids.saturating_add(input.token_ids.len() as u64),
+                )
+            });
+        if sparse_repetition_participants != 0 {
+            self.metrics
+                .sparse_repetition_waves
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .sparse_repetition_participants
+                .fetch_add(sparse_repetition_participants, Ordering::Relaxed);
+            self.metrics
+                .sparse_repetition_token_ids_uploaded
+                .fetch_add(sparse_repetition_token_ids, Ordering::Relaxed);
         }
         match output_mode {
             VNextProductOutputMode::FullLogits => {
@@ -6445,6 +6737,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
             "token_mask_upload_participants": self.metrics.token_mask_upload_participants.load(Ordering::Relaxed),
             "token_mask_cache_hit_participants": self.metrics.token_mask_cache_hit_participants.load(Ordering::Relaxed),
+            "sparse_repetition_waves": self.metrics.sparse_repetition_waves.load(Ordering::Relaxed),
+            "sparse_repetition_participants": self.metrics.sparse_repetition_participants.load(Ordering::Relaxed),
+            "sparse_repetition_token_ids_uploaded": self.metrics.sparse_repetition_token_ids_uploaded.load(Ordering::Relaxed),
         });
         serde_json::json!({
             "schema": "ferrum.runtime-vnext.executor-trace.v1",
@@ -7122,8 +7417,8 @@ mod tests {
 
     use super::{
         decode_output_width, decode_selected_token, normalized_product_token_mask,
-        product_output_mode_for_policies, product_token_mask_key, reported_allocated_bytes,
-        resolve_reusable_execution_policy, resolved_sequence_fit_policy,
+        product_output_mode_for_policies, product_repetition_input, product_token_mask_key,
+        reported_allocated_bytes, resolve_reusable_execution_policy, resolved_sequence_fit_policy,
         reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
         token_mask_upload_required, AdmissionFitPolicy, DecodeFailureDisposition, FerrumError,
         SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
@@ -7131,7 +7426,9 @@ mod tests {
         VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
         VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
-    use ferrum_interfaces::model_executor::{LogitsReturnPolicy, TokenSelectionMask};
+    use ferrum_interfaces::model_executor::{
+        GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
+    };
     use ferrum_interfaces::vnext::{
         DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionSpanKind,
         DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
@@ -7526,11 +7823,22 @@ mod tests {
             repetition_penalty: None,
         };
         let full = LogitsReturnPolicy::FullLogits;
+        let repetition = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: Some(GreedyRepetitionPenalty::new(1.1, vec![7, 11])),
+        };
 
         assert_eq!(
             product_output_mode_for_policies(
                 VNextExecutionWaveKind::Decode,
                 [Some(&greedy), Some(&greedy)],
+            ),
+            VNextProductOutputMode::GreedyToken
+        );
+        assert_eq!(
+            product_output_mode_for_policies(
+                VNextExecutionWaveKind::Decode,
+                [Some(&greedy), Some(&repetition)],
             ),
             VNextProductOutputMode::GreedyToken
         );
@@ -7549,6 +7857,23 @@ mod tests {
             product_output_mode_for_policies(VNextExecutionWaveKind::Decode, std::iter::empty(),),
             VNextProductOutputMode::FullLogits
         );
+    }
+
+    #[test]
+    fn product_repetition_input_is_typed_and_neutral_outside_greedy_decode() {
+        let policy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: Some(GreedyRepetitionPenalty::new(1.25, vec![3, 9])),
+        };
+        let active = product_repetition_input(Some(&policy), VNextProductOutputMode::GreedyToken);
+        assert_eq!(active.token_ids, [3, 9]);
+        assert_eq!(active.penalty, 1.25);
+        assert!(active.is_active());
+
+        let neutral = product_repetition_input(Some(&policy), VNextProductOutputMode::FullLogits);
+        assert!(neutral.token_ids.is_empty());
+        assert_eq!(neutral.penalty, 1.0);
+        assert!(!neutral.is_active());
     }
 
     #[test]
