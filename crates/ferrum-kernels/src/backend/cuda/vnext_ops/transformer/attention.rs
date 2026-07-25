@@ -26,7 +26,10 @@ use super::{
     launch_gemm_f16,
 };
 #[cfg(feature = "vllm-marlin")]
-use super::{marlin_fp8_weights::resolve_marlin_fp8_weight, MarlinFp8ProjectionRuntime};
+use super::{
+    marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE},
+    MarlinFp8ProjectionRuntime,
+};
 use crate::backend::cuda::vnext_ops::{
     binding, contiguous_region, contiguous_token_region, contract_error,
     implementation_fingerprint, DENSE_SAFETENSORS_FORMAT_ID, THREADS_PER_BLOCK,
@@ -2039,11 +2042,7 @@ fn push_shared_projection_weight(
                     binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
                     logical_dimensions,
                 )?;
-                if candidate.group_size() != first.group_size()
-                    || !super::same_physical_region(
-                        first.packed_region(),
-                        candidate.packed_region(),
-                    )
+                if !super::same_physical_region(first.packed_region(), candidate.packed_region())
                     || !super::same_physical_region(
                         first.scales_region(),
                         candidate.scales_region(),
@@ -2054,9 +2053,6 @@ fn push_shared_projection_weight(
                     ));
                 }
             }
-            let group_size = i32::try_from(first.group_size()).map_err(|_| {
-                format!("attention projection input {ordinal} group size exceeds i32")
-            })?;
             let [packed, scales] = first.into_regions();
             let packed_region = regions.len();
             regions.push(packed);
@@ -2065,7 +2061,7 @@ fn push_shared_projection_weight(
             return Ok(SharedProjectionWeight::MarlinFp8 {
                 packed_region,
                 scales_region,
-                group_size,
+                group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
             });
         }
     }

@@ -10,10 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use ferrum_interfaces::vnext::{
     CapabilityId, ContractVersion, DeviceDescriptor, ElementType, PhysicalWeightComponentBinding,
     PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, QuantizationFormatId,
-    QuantizationPacking, QuantizationSpec, VNextError, WeightComponentPayload, WeightComponentRole,
-    WeightComponentSource, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
-    WeightLayoutId, WeightMaterializer, WeightMaterializerDescriptor, WeightMaterializerId,
-    WeightSchema, DENSE_LINEAR_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec, VNextError,
+    WeightComponentPayload, WeightComponentRole, WeightComponentSource, WeightComponentSpec,
+    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightMaterializer,
+    WeightMaterializerDescriptor, WeightMaterializerId, WeightSchema, DENSE_LINEAR_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -90,8 +91,6 @@ impl MarlinFp8WeightMaterializer {
                     element_type: ElementType::F16,
                 })
             || !marlin_fp8_projection_shape_supported(n, k)
-            || u32::try_from(k).is_err()
-            || !k.is_power_of_two()
         {
             return Err(invalid_plan(format!(
                 "source component `{}` is not an eligible Marlin FP8 F16 matrix",
@@ -300,10 +299,7 @@ fn marlin_fp8_candidates(
             (Ok(n), Ok(k)) => (n, k),
             _ => continue,
         };
-        if !marlin_fp8_projection_shape_supported(n_usize, k_usize)
-            || u32::try_from(k_usize).is_err()
-            || !k_usize.is_power_of_two()
-        {
+        if !marlin_fp8_projection_shape_supported(n_usize, k_usize) {
             continue;
         }
         let PhysicalWeightLayout::Dense {
@@ -339,15 +335,7 @@ fn marlin_fp8_candidates(
 
         let packed_id = derived_component_id(source_component_id, DerivedComponentKind::Packed)?;
         let scales_id = derived_component_id(source_component_id, DerivedComponentKind::Scales)?;
-        let quantization = QuantizationSpec {
-            format_id: QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)?,
-            bits_per_weight: 8,
-            group_size: u32::try_from(k_usize)
-                .map_err(|_| invalid_plan("Marlin FP8 group size exceeds u32"))?,
-            packing: QuantizationPacking::Tiled,
-            scale_type: ElementType::F16,
-            zero_point_type: None,
-        };
+        let quantization = marlin_fp8_quantization_spec()?;
         quantization.validate()?;
         candidates.push(MarlinFp8Candidate {
             weight_id: reference.weight_id.clone(),
@@ -382,6 +370,17 @@ fn marlin_fp8_candidates(
         });
     }
     Ok(candidates)
+}
+
+fn marlin_fp8_quantization_spec() -> Result<QuantizationSpec, VNextError> {
+    Ok(QuantizationSpec {
+        format_id: QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)?,
+        bits_per_weight: 8,
+        grouping: QuantizationGrouping::WholeAxis,
+        packing: QuantizationPacking::Tiled,
+        scale_type: ElementType::F16,
+        zero_point_type: None,
+    })
 }
 
 /// The shared execution provider must support every admitted token count.
@@ -535,5 +534,14 @@ mod tests {
         assert!(!marlin_fp8_projection_shape_supported(64, 2_048));
         assert!(!marlin_fp8_projection_shape_supported(128, 2_048));
         assert!(!marlin_fp8_projection_shape_supported(256, 96));
+    }
+
+    #[test]
+    fn channelwise_quantization_abi_is_shape_relative() {
+        let quantization = marlin_fp8_quantization_spec().unwrap();
+        assert_eq!(quantization.grouping, QuantizationGrouping::WholeAxis);
+        assert_eq!(quantization.grouping.resolved_size(2_048), 2_048);
+        assert_eq!(quantization.grouping.resolved_size(4_096), 4_096);
+        quantization.validate().unwrap();
     }
 }

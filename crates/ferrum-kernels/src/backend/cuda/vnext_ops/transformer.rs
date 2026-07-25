@@ -840,7 +840,7 @@ fn encode_marlin_fp8_dense_linear(
     projection_runtime: MarlinFp8ProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    use marlin_fp8_weights::resolve_marlin_fp8_weight;
+    use marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE};
 
     ensure_invocation(&invocation, DENSE_LINEAR_OPERATION_ID)?;
     let first = &invocation.participants()[0];
@@ -881,7 +881,7 @@ fn encode_marlin_fp8_dense_linear(
 
     let workspace_bytes = projection_runtime.workspace_bytes()?;
     let [packed_region, scales_region] = first_weight.into_regions();
-    let group_size = checked_i32(in_features, "Marlin FP8 group size")?;
+    let group_size = MARLIN_FP8_CHANNELWISE_GROUP_SIZE;
     let mut regions = vec![
         packed_region,
         scales_region,

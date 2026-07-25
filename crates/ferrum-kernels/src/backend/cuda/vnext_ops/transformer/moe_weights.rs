@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
     ElementType, OperationInvocation, PhysicalStorageLayout, PhysicalWeightLayout,
-    PhysicalWeightPadding, QuantizationPacking, ResolvedValueBinding, ResolvedWeightBinding,
-    ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding, WeightId,
+    PhysicalWeightPadding, QuantizationGrouping, QuantizationPacking, ResolvedValueBinding,
+    ResolvedWeightBinding, ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,
+    WeightId,
 };
 
 use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
@@ -291,9 +292,12 @@ fn validate_gptq_marlin_moe_contract(
     quantization
         .validate()
         .map_err(|error| format!("CUDA Marlin-MoE quantization ABI is invalid: {error}"))?;
+    let group_size = quantization
+        .grouping
+        .fixed_size()
+        .ok_or_else(|| "CUDA Marlin-MoE requires fixed-size GPTQ quantization groups".to_owned())?;
     if quantization.format_id.as_str() != GPTQ_MARLIN_QUANTIZATION_FORMAT_ID
         || quantization.bits_per_weight != 4
-        || quantization.group_size == 0
         || quantization.packing != QuantizationPacking::Tiled
         || quantization.scale_type != ElementType::F16
         || quantization.zero_point_type.is_some()
@@ -332,15 +336,15 @@ fn validate_gptq_marlin_moe_contract(
         ));
     }
 
-    let group_size = u64::from(quantization.group_size);
+    let group_size_u64 = u64::from(group_size);
     let mut expected_scales_dimensions = bound_logical_dimensions.to_vec();
-    if !expected_scales_dimensions[last_axis].is_multiple_of(group_size) {
+    if !expected_scales_dimensions[last_axis].is_multiple_of(group_size_u64) {
         return Err(format!(
-            "CUDA Marlin-MoE final logical axis {} is not divisible by group size {group_size}",
+            "CUDA Marlin-MoE final logical axis {} is not divisible by group size {group_size_u64}",
             expected_scales_dimensions[last_axis]
         ));
     }
-    expected_scales_dimensions[last_axis] /= group_size;
+    expected_scales_dimensions[last_axis] /= group_size_u64;
     if scales_component.physical_dimensions() != expected_scales_dimensions {
         return Err(format!(
             "CUDA Marlin-MoE scales physical shape must be {expected_scales_dimensions:?}"
@@ -393,7 +397,7 @@ fn validate_gptq_marlin_moe_contract(
         scales_bytes,
         packed_expert_stride_bytes,
         scales_expert_stride_bytes,
-        group_size: quantization.group_size,
+        group_size,
     })
 }
 
@@ -566,7 +570,7 @@ mod tests {
                         format_id: QuantizationFormatId::new(GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
                             .unwrap(),
                         bits_per_weight: 4,
-                        group_size: 128,
+                        grouping: QuantizationGrouping::fixed(128),
                         packing: QuantizationPacking::Tiled,
                         scale_type: ElementType::F16,
                         zero_point_type: None,
