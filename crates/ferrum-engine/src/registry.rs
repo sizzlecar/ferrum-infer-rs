@@ -1232,13 +1232,21 @@ fn create_registered_vnext_executor(
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
                     })?;
-                let (runtime, operation_registry, catalog) = composition.into_parts();
+                let (
+                    runtime,
+                    operation_registry,
+                    weight_materializers,
+                    weight_materializer_id,
+                    catalog,
+                ) = composition.into_parts();
                 let executor = crate::product_composition::create_vnext_executor(
                     &config.engine_config,
                     prepared.as_ref(),
                     model_info,
                     runtime,
                     operation_registry,
+                    weight_materializers,
+                    weight_materializer_id,
                     catalog,
                 )?;
                 info!(
@@ -1290,13 +1298,21 @@ fn create_registered_vnext_executor(
                 .map_err(|error| {
                     FerrumError::device(format!("create vNext Metal runtime: {error}"))
                 })?;
-            let (runtime, operation_registry, catalog) = composition.into_parts();
+            let (
+                runtime,
+                operation_registry,
+                weight_materializers,
+                weight_materializer_id,
+                catalog,
+            ) = composition.into_parts();
             let executor = crate::product_composition::create_vnext_executor(
                 &config.engine_config,
                 prepared.as_ref(),
                 model_info,
                 runtime,
                 operation_registry,
+                weight_materializers,
+                weight_materializer_id,
                 catalog,
             )?;
             info!(

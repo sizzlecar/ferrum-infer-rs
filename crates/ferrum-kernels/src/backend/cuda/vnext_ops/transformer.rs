@@ -1,6 +1,7 @@
 //! CUDA implementations of backend-neutral dense transformer operations.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "vllm-marlin")]
 use std::ffi::c_void;
 
 use cudarc::cublas::{
@@ -8,6 +9,8 @@ use cudarc::cublas::{
     sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType_t},
     CudaBlas,
 };
+#[cfg(feature = "vllm-marlin")]
+use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
@@ -18,10 +21,11 @@ use ferrum_interfaces::vnext::{
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
     ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
+    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    SemanticValue, VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
+    RMS_NORM_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -33,10 +37,18 @@ use super::{
     implementation_fingerprint, same_physical_region, DENSE_SAFETENSORS_FORMAT_ID,
     THREADS_PER_BLOCK, VALUE_ALIGNMENT_BYTES,
 };
+#[cfg(feature = "vllm-marlin")]
+use crate::backend::cuda::vllm_marlin::{launch_marlin_mm_f16_weight, MarlinF16WeightType};
 use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
+#[cfg(feature = "vllm-marlin")]
+use crate::marlin_fp8_materializer::{
+    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
+};
 
 mod attention;
 mod causal_attention;
+#[cfg(feature = "vllm-marlin")]
+mod marlin_fp8_weights;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe;
 #[cfg(feature = "vllm-moe-marlin")]
@@ -55,6 +67,11 @@ const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.cublas";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_linear.f16.cublas";
+#[cfg(feature = "vllm-marlin")]
+const MARLIN_FP8_DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.marlin-fp8-w8a16";
+#[cfg(feature = "vllm-marlin")]
+const MARLIN_FP8_DENSE_LINEAR_ESTIMATOR_ID: &str =
+    "resource-estimator.cuda.dense_linear.f16.marlin-fp8-w8a16";
 const DENSE_SWIGLU_PROVIDER_ID: &str = "provider.cuda.dense_swiglu.f16.cublas";
 const DENSE_SWIGLU_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_swiglu.f16.cublas";
 const RESIDUAL_ADD_PROVIDER_ID: &str = "provider.cuda.residual_add.f16";
@@ -191,6 +208,126 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
         )
         .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.dense_linear.encode", message))
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+pub(super) struct CudaMarlinFp8DenseLinearProvider {
+    descriptor: OperationProviderDescriptor,
+    projection_runtime: MarlinFp8ProjectionRuntime,
+}
+
+#[cfg(feature = "vllm-marlin")]
+impl CudaMarlinFp8DenseLinearProvider {
+    pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = dense_linear_contract().map_err(contract_error)?;
+        let operation_capability =
+            CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID).map_err(contract_error)?;
+        let marlin_capability =
+            CapabilityId::new(MARLIN_FP8_CAPABILITY_ID).map_err(contract_error)?;
+        if !runtime
+            .descriptor()
+            .capabilities
+            .contains(&operation_capability)
+            || !runtime
+                .descriptor()
+                .capabilities
+                .contains(&marlin_capability)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA runtime does not advertise dense-linear Marlin FP8 capabilities",
+            ));
+        }
+        let provider_fingerprint = implementation_fingerprint(&[
+            include_str!("transformer.rs").as_bytes(),
+            include_str!("transformer/marlin_fp8_weights.rs").as_bytes(),
+            include_str!("../vllm_marlin.rs").as_bytes(),
+            MARLIN_FP8_DENSE_LINEAR_PROVIDER_ID.as_bytes(),
+        ]);
+        let estimator_fingerprint = implementation_fingerprint(&[
+            include_str!("transformer.rs").as_bytes(),
+            MARLIN_FP8_DENSE_LINEAR_ESTIMATOR_ID.as_bytes(),
+            provider_fingerprint.as_bytes(),
+        ]);
+        let descriptor = OperationProviderDescriptor::new(
+            ProviderId::new(MARLIN_FP8_DENSE_LINEAR_PROVIDER_ID).map_err(contract_error)?,
+            contract.descriptor().id.clone(),
+            contract
+                .descriptor()
+                .fingerprint()
+                .map_err(contract_error)?,
+            provider_fingerprint,
+            contract.descriptor().version,
+            runtime.descriptor().id.clone(),
+            BTreeSet::from([operation_capability, marlin_capability]),
+            BTreeSet::from([
+                WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?
+            ]),
+            BTreeSet::from(
+                [QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?],
+            ),
+            contiguous_bindings(2),
+            MARLIN_FP8_DENSE_LINEAR_ESTIMATOR_ID,
+            ContractVersion::new(1, 0),
+            estimator_fingerprint,
+        )
+        .map_err(contract_error)?;
+        let projection_runtime = MarlinFp8ProjectionRuntime::query(runtime)?;
+        Ok(Self {
+            descriptor,
+            projection_runtime,
+        })
+    }
+
+    fn workspace_bytes(&self) -> Result<u64, VNextError> {
+        self.projection_runtime
+            .workspace_bytes()
+            .map_err(invalid_plan)
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+impl OperationResourceEstimator for CudaMarlinFp8DenseLinearProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        ensure_estimator_request(&self.descriptor, &request, DENSE_LINEAR_OPERATION_ID)?;
+        let scratch = ProviderWorkspaceRequirement::from_formula(
+            ProviderWorkspaceSizeFormula::fixed(self.workspace_bytes()?)?,
+            VALUE_ALIGNMENT_BYTES,
+            ProviderWorkspaceScope::Invocation,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(estimate(
+            &self.descriptor,
+            request.input_fingerprint(),
+            Some(scratch),
+        ))
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+impl OperationProvider<CudaDeviceRuntime> for CudaMarlinFp8DenseLinearProvider {
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_marlin_fp8_dense_linear(
+            self.descriptor.provider_implementation_fingerprint(),
+            self.projection_runtime,
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| {
+            provider_failure(identity, "cuda.dense_linear.marlin_fp8.encode", message)
+        })
     }
 }
 
@@ -695,6 +832,303 @@ fn encode_dense_linear(
         )
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn encode_marlin_fp8_dense_linear(
+    provider_fingerprint: &str,
+    projection_runtime: MarlinFp8ProjectionRuntime,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    use marlin_fp8_weights::resolve_marlin_fp8_weight;
+
+    ensure_invocation(&invocation, DENSE_LINEAR_OPERATION_ID)?;
+    let first = &invocation.participants()[0];
+    let first_input = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
+    let first_weight_binding = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
+    let first_output = binding(first.bindings(), ResolvedValueRole::Output, 0)?;
+    let in_features = unsigned_attribute(first.attributes(), "in_features")?;
+    let out_features = unsigned_attribute(first.attributes(), "out_features")?;
+    validate_dense_linear(
+        first_input,
+        first_weight_binding,
+        first_output,
+        in_features,
+        out_features,
+    )?;
+    let first_weight =
+        resolve_marlin_fp8_weight(first, first_weight_binding, &[out_features, in_features])?;
+    for participant in &invocation.participants()[1..] {
+        let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
+        let weight_binding = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
+        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+        if unsigned_attribute(participant.attributes(), "in_features")? != in_features
+            || unsigned_attribute(participant.attributes(), "out_features")? != out_features
+        {
+            return Err("CUDA Marlin FP8 dense linear participant attributes disagree".to_owned());
+        }
+        validate_dense_linear(input, weight_binding, output, in_features, out_features)?;
+        let candidate =
+            resolve_marlin_fp8_weight(participant, weight_binding, &[out_features, in_features])?;
+        if !same_physical_region(first_weight.packed_region(), candidate.packed_region())
+            || !same_physical_region(first_weight.scales_region(), candidate.scales_region())
+        {
+            return Err(
+                "CUDA Marlin FP8 dense linear participants do not share one weight".to_owned(),
+            );
+        }
+    }
+
+    let workspace_bytes = projection_runtime.workspace_bytes()?;
+    let [packed_region, scales_region] = first_weight.into_regions();
+    let group_size = checked_i32(in_features, "Marlin FP8 group size")?;
+    let mut regions = vec![
+        packed_region,
+        scales_region,
+        shared_scratch_region(&invocation, workspace_bytes)?,
+    ];
+    let token_ranges = invocation.participant_token_ranges();
+    if token_ranges.len() != invocation.participants().len() {
+        return Err("CUDA Marlin FP8 dense linear participant ranges are incomplete".to_owned());
+    }
+    let input_shared =
+        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
+    let output_shared =
+        token_binding_is_shared(&invocation, ResolvedValueRole::Output, 0, ElementType::F16)?;
+    let mut launches = Vec::new();
+    if input_shared && output_shared {
+        let rows = invocation.work_shape().immediate_tokens();
+        let input_region = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            rows,
+        )?);
+        let output_region = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            rows,
+        )?);
+        launches.push(GemmLaunch {
+            input_region,
+            output_region,
+            rows: checked_i32(rows, "Marlin FP8 dense linear row count")?,
+            out_features: checked_i32(out_features, "Marlin FP8 dense linear output width")?,
+            in_features: checked_i32(in_features, "Marlin FP8 dense linear input width")?,
+        });
+    } else {
+        for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
+            let packed = token_range.immediate_token_range();
+            let source = token_range.source_token_range();
+            let rows = token_range.immediate_tokens();
+            let input_region = regions.len();
+            regions.push(contiguous_token_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+                ElementType::F16,
+                if input_shared {
+                    packed.start
+                } else {
+                    source.start
+                },
+                rows,
+            )?);
+            let output_region = regions.len();
+            regions.push(contiguous_token_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+                ElementType::F16,
+                if output_shared {
+                    packed.start
+                } else {
+                    source.start
+                },
+                rows,
+            )?);
+            launches.push(GemmLaunch {
+                input_region,
+                output_region,
+                rows: checked_i32(rows, "Marlin FP8 dense linear row count")?,
+                out_features: checked_i32(out_features, "Marlin FP8 dense linear output width")?,
+                in_features: checked_i32(in_features, "Marlin FP8 dense linear input width")?,
+            });
+        }
+    }
+
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Marlin FP8 dense linear participant count",
+    )?;
+    let token_count = invocation.work_shape().immediate_tokens();
+    let batching_form = if input_shared && output_shared {
+        DeviceBatchingForm::Packed
+    } else {
+        DeviceBatchingForm::ParticipantLoop
+    };
+    let compute_dispatch_count = launches.len() as u64;
+    let mut replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_linear_marlin_fp8")
+            .i32(projection_runtime.multiprocessor_count)
+            .i32(projection_runtime.device_ordinal)
+            .i32(group_size)
+            .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64)
+            .i32(launch.rows)
+            .i32(launch.out_features)
+            .i32(launch.in_features);
+    }
+    CudaDeviceCommand::replayable_operation(
+        "vnext_dense_linear_marlin_fp8",
+        regions,
+        replay_key.finish(),
+        move |stream, regions| {
+            let workspace = &regions[2];
+            if workspace.length_bytes() < workspace_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "Marlin FP8 workspace is smaller than its admitted estimate",
+                ));
+            }
+            for launch in &launches {
+                projection_runtime.launch(
+                    stream,
+                    regions[launch.input_region].device_ptr(),
+                    regions[0].device_ptr(),
+                    regions[1].device_ptr(),
+                    regions[launch.output_region].device_ptr(),
+                    workspace.device_ptr(),
+                    workspace.length_bytes(),
+                    launch.rows,
+                    launch.out_features,
+                    launch.in_features,
+                    group_size,
+                    "Marlin FP8 dense linear",
+                )?;
+            }
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(
+            batching_form,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            0,
+        )
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MarlinFp8ProjectionRuntime {
+    multiprocessor_count: i32,
+    device_ordinal: i32,
+}
+
+#[cfg(feature = "vllm-marlin")]
+impl MarlinFp8ProjectionRuntime {
+    pub(super) fn query(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let multiprocessor_count = runtime
+            .context()
+            .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|error| CudaDeviceRuntimeError::driver("multiprocessor count query", error))?;
+        if multiprocessor_count <= 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA multiprocessor count is not positive",
+            ));
+        }
+        let device_ordinal = i32::try_from(runtime.descriptor().ordinal)
+            .map_err(|_| CudaDeviceRuntimeError::contract("CUDA device ordinal exceeds i32"))?;
+        Ok(Self {
+            multiprocessor_count,
+            device_ordinal,
+        })
+    }
+
+    pub(super) fn workspace_bytes(self) -> Result<u64, String> {
+        u64::try_from(self.multiprocessor_count)
+            .ok()
+            .and_then(|sms| sms.checked_mul(std::mem::size_of::<i32>() as u64))
+            .ok_or_else(|| "CUDA Marlin FP8 workspace size overflows".to_owned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn launch(
+        self,
+        stream: &CudaStream,
+        input: u64,
+        packed_weight: u64,
+        scales: u64,
+        output: u64,
+        workspace: u64,
+        workspace_length_bytes: u64,
+        rows: i32,
+        output_features: i32,
+        input_features: i32,
+        group_size: i32,
+        operation: &'static str,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let required_workspace = self
+            .workspace_bytes()
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        if workspace_length_bytes < required_workspace {
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "{operation} workspace differs from its admitted estimate"
+            )));
+        }
+        let workspace_bytes = usize::try_from(required_workspace).map_err(|_| {
+            CudaDeviceRuntimeError::contract(format!("{operation} workspace exceeds usize"))
+        })?;
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                workspace,
+                0,
+                workspace_bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| {
+            CudaDeviceRuntimeError::driver(format!("{operation} workspace zero"), error)
+        })?;
+        unsafe {
+            launch_marlin_mm_f16_weight(
+                MarlinF16WeightType::E4M3Fn,
+                input as *const c_void,
+                packed_weight as *const c_void,
+                output as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                scales as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                rows,
+                output_features,
+                input_features,
+                input_features,
+                workspace as *mut c_void,
+                false,
+                true,
+                1,
+                group_size,
+                self.device_ordinal,
+                stream.cu_stream(),
+                self.multiprocessor_count,
+                false,
+                false,
+            );
+        }
+        Ok(())
+    }
 }
 
 fn encode_dense_swiglu(

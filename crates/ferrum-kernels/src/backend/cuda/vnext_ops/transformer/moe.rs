@@ -33,6 +33,7 @@ use super::{
     contiguous_bindings, ensure_estimator_request, estimate, f16_contiguous, launch_gemm_f16,
     shared_full_region, shared_scratch_region, shared_token_region,
 };
+use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
 
 const PROVIDER_ID: &str = "provider.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
@@ -187,9 +188,11 @@ impl CudaRoutedSharedSwiGluMoeProvider {
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),
-            BTreeSet::from([
-                WeightFormatId::new(GPTQ_MARLIN_WEIGHT_FORMAT_ID).map_err(contract_error)?
-            ]),
+            [GPTQ_MARLIN_WEIGHT_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID]
+                .into_iter()
+                .map(WeightFormatId::new)
+                .collect::<Result<BTreeSet<_>, _>>()
+                .map_err(contract_error)?,
             BTreeSet::from([
                 QuantizationFormatId::new(GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
                     .map_err(contract_error)?,
