@@ -1729,7 +1729,28 @@ CUDA VNEXT PACKED GDN CODE KEEP PENDING TRACE: affacd2c2a5fdc1274f5a77b014c2a2af
 No full sweep is authorized from this result. The next paid action is a short
 trace-closure diagnostic on the retained instance with `--profile-jsonl`,
 asserting packed attribution for a participant count greater than one; it does
-not need to repeat the full performance matrix. The remote artifact archive is
+not need to repeat the full performance matrix. The closure validator is:
+
+```text
+python3 scripts/release/native_work_attribution_gate.py \
+  --profile-jsonl <artifact>/profile.jsonl \
+  --operation-id operation.gated_delta_recurrent_attention \
+  --native-op-id vnext_gated_delta_recurrent_attention \
+  --batching-form packed \
+  --min-participants 2 \
+  --exact-compute-dispatches 10 \
+  --exact-transfer-commands 2 \
+  --require-all-eligible \
+  --source-git-sha <sha> \
+  --binary-sha256 <sha256> \
+  --out <artifact>/native-work-attribution
+```
+
+It must print
+`FERRUM NATIVE WORK ATTRIBUTION PASS: <artifact>/native-work-attribution`;
+missing profile output, no multi-participant compute event, participant-loop
+fallback, or a physical command-count mismatch is a hard REJECT. The remote
+artifact archive is
 `runtime-vnext-packed-gdn-cuda-affacd2c-20260725T153414Z.tar.gz`, SHA256
 `7116188660add41efa654d4256fc0c1d2f9b8d6ffef08e7230853125b2c65a49`.
 Its pending artifact commit is `a8bf6d6a` on
