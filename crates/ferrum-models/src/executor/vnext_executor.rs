@@ -723,6 +723,10 @@ fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<Vec<f32
     Ok(vec![token as f32])
 }
 
+fn nonterminal_completion_message(observation: &CompletionReadbackBatchObservation) -> String {
+    format!("vNext completion did not reach a quiescent terminal: {observation:?}")
+}
+
 fn decode_output_width(output_elements: usize, vocabulary_size: usize) -> Result<usize> {
     if output_elements == 1 || output_elements == vocabulary_size {
         return Ok(output_elements);
@@ -5520,11 +5524,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let receipt = match observation {
             CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
             other => {
-                self.metrics
-                    .record_failure(format!("vNext completion remained nonterminal: {other:?}"));
-                return Err(FerrumError::backend(
-                    "vNext completion did not reach a quiescent terminal",
-                ));
+                let message = nonterminal_completion_message(&other);
+                self.metrics.record_failure(message.clone());
+                return Err(FerrumError::backend(message));
             }
         };
         self.metrics.device_timing.record(&receipt);
@@ -7416,26 +7418,37 @@ mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
     use super::{
-        decode_output_width, decode_selected_token, normalized_product_token_mask,
-        product_output_mode_for_policies, product_repetition_input, product_token_mask_key,
-        reported_allocated_bytes, resolve_reusable_execution_policy, resolved_sequence_fit_policy,
-        reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
-        token_mask_upload_required, AdmissionFitPolicy, DecodeFailureDisposition, FerrumError,
-        SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
-        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
-        VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        decode_output_width, decode_selected_token, nonterminal_completion_message,
+        normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
+        product_token_mask_key, reported_allocated_bytes, resolve_reusable_execution_policy,
+        resolved_sequence_fit_policy, reusable_executable_inventory_matches,
+        reusable_execution_requires_eager_fallback, token_mask_upload_required, AdmissionFitPolicy,
+        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
+        VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics,
+        VNextProductOutputMode, VNextProductTokenMaskKey, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
+        VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
         GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
     };
     use ferrum_interfaces::vnext::{
-        DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionSpanKind,
-        DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+        CompletionReadbackBatchObservation, DeviceExecutionInterval, DeviceExecutionIntervalKind,
+        DeviceExecutionSpanKind, DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
         DeviceReusableExecutionPreparation, DeviceSubmissionExecutionSpan,
         DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTimingMeasurement,
         StepResourceAdmissionProfilePhase,
     };
+
+    #[test]
+    fn nonterminal_completion_message_preserves_typed_failure_class() {
+        assert_eq!(
+            nonterminal_completion_message(
+                &CompletionReadbackBatchObservation::ObservationPanicked
+            ),
+            "vNext completion did not reach a quiescent terminal: ObservationPanicked"
+        );
+    }
 
     #[test]
     fn reusable_execution_metrics_aggregate_typed_preparation_outcomes() {
