@@ -228,7 +228,7 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
             PROVIDER_ID,
             GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
             ESTIMATOR_ID,
-            contiguous_bindings(11),
+            contiguous_bindings(10),
             &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
             &[
                 Q4_K_FORMAT_ID,
@@ -335,6 +335,7 @@ struct AttentionShape {
     value_features: u64,
     qkvz_features: u64,
     ba_features: u64,
+    qkvzba_features: u64,
     conv_kernel: u64,
     conv_state_width: u64,
     epsilon: f32,
@@ -355,6 +356,7 @@ impl AttentionShape {
             value_features: unsigned_attribute(attributes, "value_features")?,
             qkvz_features: unsigned_attribute(attributes, "qkvz_features")?,
             ba_features: unsigned_attribute(attributes, "ba_features")?,
+            qkvzba_features: unsigned_attribute(attributes, "qkvzba_features")?,
             conv_kernel: unsigned_attribute(attributes, "conv_kernel")?,
             conv_state_width: unsigned_attribute(attributes, "conv_state_width")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
@@ -389,6 +391,11 @@ impl AttentionShape {
                     .value_heads
                     .checked_mul(2)
                     .ok_or_else(|| "Metal gated-delta BA width overflows".to_owned())?
+            || shape.qkvzba_features
+                != shape
+                    .qkvz_features
+                    .checked_add(shape.ba_features)
+                    .ok_or_else(|| "Metal gated-delta QKVZBA width overflows".to_owned())?
             || shape.conv_kernel < 2
             || shape.conv_state_width != shape.conv_kernel - 1
         {
@@ -425,8 +432,7 @@ impl AttentionShape {
         let qk = self.qk_features()?;
         Ok(vec![
             (self.hidden_size, ElementType::F16),
-            (self.qkvz_features, ElementType::F16),
-            (self.ba_features, ElementType::F16),
+            (self.qkvzba_features, ElementType::F16),
             (self.value_features, ElementType::F16),
             (qk, ElementType::F32),
             (qk, ElementType::F32),
@@ -490,12 +496,8 @@ impl AttentionShape {
                 checked_product(&[tokens, self.qkv_features])?,
             ),
             (
-                "QKVZ activation elements",
-                checked_product(&[tokens, self.qkvz_features])?,
-            ),
-            (
-                "BA activation elements",
-                checked_product(&[tokens, self.ba_features])?,
+                "QKVZBA activation elements",
+                checked_product(&[tokens, self.qkvzba_features])?,
             ),
             (
                 "QK activation elements",
@@ -650,8 +652,7 @@ struct ScratchLayout {
     required_bytes: u64,
     conv_state: u64,
     normalized: u64,
-    qkvz: u64,
-    ba: u64,
+    qkvzba: u64,
     z: u64,
     query: u64,
     key: u64,
@@ -670,8 +671,7 @@ impl ScratchLayout {
         let conv_state =
             reserve_fixed(&mut offset, shape.conv_state_elements()?, ElementType::F16)?;
         let normalized = reserve_tokens(&mut offset, shape.hidden_size, ElementType::F16, tokens)?;
-        let qkvz = reserve_tokens(&mut offset, shape.qkvz_features, ElementType::F16, tokens)?;
-        let ba = reserve_tokens(&mut offset, shape.ba_features, ElementType::F16, tokens)?;
+        let qkvzba = reserve_tokens(&mut offset, shape.qkvzba_features, ElementType::F16, tokens)?;
         let z = reserve_tokens(&mut offset, shape.value_features, ElementType::F16, tokens)?;
         let qk = shape.qk_features()?;
         let query = reserve_tokens(&mut offset, qk, ElementType::F32, tokens)?;
@@ -696,8 +696,7 @@ impl ScratchLayout {
             required_bytes: offset,
             conv_state,
             normalized,
-            qkvz,
-            ba,
+            qkvzba,
             z,
             query,
             key,
@@ -741,8 +740,7 @@ struct ParticipantLaunch {
     conv_state: usize,
     delta_state: usize,
     normalized: u64,
-    qkvz: u64,
-    ba: u64,
+    qkvzba: u64,
     z: u64,
     query: u64,
     key: u64,
@@ -754,8 +752,7 @@ struct ParticipantLaunch {
     conv_state_elements: u32,
     execution_form: GatedDeltaExecutionForm,
     params: GatedDeltaParams,
-    qkvz_projections: Vec<LinearLaunch>,
-    ba_projections: Vec<LinearLaunch>,
+    input_projections: Vec<LinearLaunch>,
     output_projection: LinearLaunch,
 }
 
@@ -765,8 +762,7 @@ struct PackedLaunch {
     output: usize,
     residual_elements: u32,
     params: GatedDeltaParams,
-    qkvz_projections: Vec<LinearLaunch>,
-    ba_projections: Vec<LinearLaunch>,
+    input_projections: Vec<LinearLaunch>,
     output_projection: LinearLaunch,
 }
 
@@ -796,36 +792,28 @@ fn encode_attention(
     }
 
     let mut regions = Vec::new();
-    let qkvz_weights = append_shared_partitioned_matrix_weight(
+    let input_weights = append_shared_partitioned_matrix_weight(
         &mut regions,
         &invocation,
         2,
-        shape.qkvz_features,
+        shape.qkvzba_features,
         shape.hidden_size,
-        "Metal gated-delta QKVZ projection",
-    )?;
-    let ba_weights = append_shared_partitioned_matrix_weight(
-        &mut regions,
-        &invocation,
-        3,
-        shape.ba_features,
-        shape.hidden_size,
-        "Metal gated-delta BA projection",
+        "Metal gated-delta QKVZBA projection",
     )?;
     let output_weight = append_shared_matrix_weight(
         &mut regions,
         &invocation,
-        8,
+        7,
         shape.hidden_size,
         shape.value_features,
         "Metal gated-delta output projection",
     )?;
     let shared = SharedRegions {
         input_norm: push_shared_region(&mut regions, &invocation, 1, ElementType::F16)?,
-        conv: push_shared_region(&mut regions, &invocation, 4, ElementType::F16)?,
-        a_log: push_shared_region(&mut regions, &invocation, 5, ElementType::F32)?,
-        dt_bias: push_shared_region(&mut regions, &invocation, 6, ElementType::F32)?,
-        norm: push_shared_region(&mut regions, &invocation, 7, ElementType::F32)?,
+        conv: push_shared_region(&mut regions, &invocation, 3, ElementType::F16)?,
+        a_log: push_shared_region(&mut regions, &invocation, 4, ElementType::F32)?,
+        dt_bias: push_shared_region(&mut regions, &invocation, 5, ElementType::F32)?,
+        norm: push_shared_region(&mut regions, &invocation, 6, ElementType::F32)?,
         scratch: {
             let index = regions.len();
             regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
@@ -881,13 +869,13 @@ fn encode_attention(
         let conv_state = regions.len();
         regions.push(contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
             CONV_STATE_ELEMENT_TYPE,
         )?);
         let delta_state = regions.len();
         regions.push(contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 10)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
             DELTA_STATE_ELEMENT_TYPE,
         )?);
         let normalized = layout.token_offset(
@@ -896,14 +884,12 @@ fn encode_attention(
             shape.hidden_size,
             ElementType::F16,
         )?;
-        let qkvz = layout.token_offset(
-            layout.qkvz,
+        let qkvzba = layout.token_offset(
+            layout.qkvzba,
             packed_start,
-            shape.qkvz_features,
+            shape.qkvzba_features,
             ElementType::F16,
         )?;
-        let ba =
-            layout.token_offset(layout.ba, packed_start, shape.ba_features, ElementType::F16)?;
         let z = layout.token_offset(
             layout.z,
             packed_start,
@@ -932,7 +918,7 @@ fn encode_attention(
             shape.value_features,
             ElementType::F32,
         )?;
-        let qkvz_projections = qkvz_weights
+        let input_projections = input_weights
             .iter()
             .map(|part| {
                 linear_launch(
@@ -941,24 +927,9 @@ fn encode_attention(
                     shared.scratch,
                     tokens,
                     shape.hidden_size,
-                    shape.qkvz_features,
+                    shape.qkvzba_features,
                     normalized,
-                    qkvz,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let ba_projections = ba_weights
-            .iter()
-            .map(|part| {
-                linear_launch(
-                    *part,
-                    shared.scratch,
-                    shared.scratch,
-                    tokens,
-                    shape.hidden_size,
-                    shape.ba_features,
-                    normalized,
-                    ba,
+                    qkvzba,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -969,7 +940,7 @@ fn encode_attention(
             tokens,
             shape.value_features,
             shape.hidden_size,
-            qkvz,
+            qkvzba,
             normalized,
         )?;
         let residual_elements = checked_u32(
@@ -986,8 +957,7 @@ fn encode_attention(
             conv_state,
             delta_state,
             normalized,
-            qkvz,
-            ba,
+            qkvzba,
             z,
             query,
             key,
@@ -999,8 +969,7 @@ fn encode_attention(
             conv_state_elements,
             execution_form,
             params: shape.params(tokens)?,
-            qkvz_projections,
-            ba_projections,
+            input_projections,
             output_projection,
         });
     }
@@ -1030,7 +999,7 @@ fn encode_attention(
                 "Metal packed gated-delta residual elements",
             )?,
             params: shape.params(total_tokens)?,
-            qkvz_projections: qkvz_weights
+            input_projections: input_weights
                 .iter()
                 .map(|part| {
                     linear_launch(
@@ -1039,24 +1008,9 @@ fn encode_attention(
                         shared.scratch,
                         total_tokens,
                         shape.hidden_size,
-                        shape.qkvz_features,
+                        shape.qkvzba_features,
                         layout.normalized,
-                        layout.qkvz,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            ba_projections: ba_weights
-                .iter()
-                .map(|part| {
-                    linear_launch(
-                        *part,
-                        shared.scratch,
-                        shared.scratch,
-                        total_tokens,
-                        shape.hidden_size,
-                        shape.ba_features,
-                        layout.normalized,
-                        layout.ba,
+                        layout.qkvzba,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -1067,19 +1021,17 @@ fn encode_attention(
                 total_tokens,
                 shape.value_features,
                 shape.hidden_size,
-                layout.qkvz,
+                layout.qkvzba,
                 layout.normalized,
             )?,
         };
-        let mut projection_launches = packed.qkvz_projections.clone();
-        projection_launches.extend(packed.ba_projections.iter().copied());
+        let mut projection_launches = packed.input_projections.clone();
         projection_launches.push(packed.output_projection);
         validate_launch_regions(&regions, &projection_launches)?;
         Some(packed)
     } else {
         for launch in &launches {
-            let mut projection_launches = launch.qkvz_projections.clone();
-            projection_launches.extend(launch.ba_projections.iter().copied());
+            let mut projection_launches = launch.input_projections.clone();
             projection_launches.push(launch.output_projection);
             validate_launch_regions(&regions, &projection_launches)?;
         }
@@ -1092,8 +1044,7 @@ fn encode_attention(
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
     let dispatch_count = if packed_enabled {
-        let shared_projection_dispatches =
-            qkvz_weights.len().saturating_add(ba_weights.len()) as u64;
+        let shared_projection_dispatches = input_weights.len() as u64;
         launches
             .iter()
             .fold(6_u64 + shared_projection_dispatches, |total, launch| {
@@ -1105,8 +1056,7 @@ fn encode_attention(
         launches.iter().fold(0_u64, |total, launch| {
             total
                 .saturating_add(9)
-                .saturating_add(launch.qkvz_projections.len() as u64)
-                .saturating_add(launch.ba_projections.len() as u64)
+                .saturating_add(launch.input_projections.len() as u64)
                 .saturating_add(delta_dispatch_count(launch.execution_form))
         })
     };
@@ -1202,18 +1152,10 @@ fn enqueue_attention(
         launch.params.hidden_size,
         launch.params.epsilon,
     );
-    for projection in &launch.qkvz_projections {
+    for projection in &launch.input_projections {
         dispatch_linear(
             linear,
-            compute_subwork(encoder, "gated_delta.qkvz_projection"),
-            regions,
-            *projection,
-        );
-    }
-    for projection in &launch.ba_projections {
-        dispatch_linear(
-            linear,
-            compute_subwork(encoder, "gated_delta.ba_projection"),
+            compute_subwork(encoder, "gated_delta.qkvzba_projection"),
             regions,
             *projection,
         );
@@ -1225,7 +1167,7 @@ fn enqueue_attention(
         scratch,
         regions,
         shared,
-        launch.ba,
+        launch.qkvzba,
         launch.g,
         launch.beta,
         &launch.params,
@@ -1298,18 +1240,10 @@ fn enqueue_packed_attention(
         packed.params.hidden_size,
         packed.params.epsilon,
     );
-    for projection in &packed.qkvz_projections {
+    for projection in &packed.input_projections {
         dispatch_linear(
             linear,
-            compute_subwork(encoder, "gated_delta.qkvz_projection"),
-            regions,
-            *projection,
-        );
-    }
-    for projection in &packed.ba_projections {
-        dispatch_linear(
-            linear,
-            compute_subwork(encoder, "gated_delta.ba_projection"),
+            compute_subwork(encoder, "gated_delta.qkvzba_projection"),
             regions,
             *projection,
         );
@@ -1320,7 +1254,7 @@ fn enqueue_packed_attention(
         scratch,
         regions,
         shared,
-        layout.ba,
+        layout.qkvzba,
         layout.g,
         layout.beta,
         &packed.params,
@@ -1356,7 +1290,7 @@ fn enqueue_packed_attention(
         &regions[shared.norm],
         layout.core,
         layout.z,
-        layout.qkvz,
+        layout.qkvzba,
         &packed.params,
     );
     dispatch_linear(
@@ -1389,7 +1323,7 @@ fn dispatch_prepare_conv_and_state(
     let scratch = &regions[shared.scratch];
     let encoder = compute_subwork(submission, "gated_delta.conv_prepare");
     encoder.set_compute_pipeline_state(&pipelines.prepare_conv);
-    set_region_offset(encoder, 0, scratch, launch.qkvz);
+    set_region_offset(encoder, 0, scratch, launch.qkvzba);
     set_region_offset(encoder, 1, &regions[shared.conv], 0);
     set_region_offset(encoder, 2, &regions[launch.conv_state], 0);
     set_region_offset(encoder, 3, scratch, launch.query);
@@ -1404,7 +1338,7 @@ fn dispatch_prepare_conv_and_state(
 
     let encoder = compute_subwork(submission, "gated_delta.conv_state_collect");
     encoder.set_compute_pipeline_state(&pipelines.collect_conv_state);
-    set_region_offset(encoder, 0, scratch, launch.qkvz);
+    set_region_offset(encoder, 0, scratch, launch.qkvzba);
     set_region_offset(encoder, 1, &regions[launch.conv_state], 0);
     set_region_offset(encoder, 2, scratch, layout.conv_state);
     set_params(encoder, 3, &launch.params);
@@ -1438,13 +1372,13 @@ fn dispatch_prepare_gates(
     scratch: &MetalBufferRegion,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
-    ba: u64,
+    qkvzba: u64,
     g: u64,
     beta: u64,
     params: &GatedDeltaParams,
 ) {
     encoder.set_compute_pipeline_state(&pipelines.prepare_gates);
-    set_region_offset(encoder, 0, scratch, ba);
+    set_region_offset(encoder, 0, scratch, qkvzba);
     set_region_offset(encoder, 1, &regions[shared.a_log], 0);
     set_region_offset(encoder, 2, &regions[shared.dt_bias], 0);
     set_region_offset(encoder, 3, scratch, g);
@@ -1581,7 +1515,7 @@ fn dispatch_chunked_delta_c64(
     let uses_precomputed_gram = uses_chunk_k_gram_k128(params);
     if uses_precomputed_gram {
         encoder.set_compute_pipeline_state(&pipelines.chunk_k_gram_k128);
-        for (index, offset) in [launch.key, launch.qkvz].into_iter().enumerate() {
+        for (index, offset) in [launch.key, launch.qkvzba].into_iter().enumerate() {
             set_region_offset(encoder, index as u64, scratch, offset);
         }
         set_params(encoder, 2, params);
@@ -1598,7 +1532,7 @@ fn dispatch_chunked_delta_c64(
     });
     for (index, offset) in [
         if uses_precomputed_gram {
-            launch.qkvz
+            launch.qkvzba
         } else {
             launch.key
         },
@@ -1629,7 +1563,7 @@ fn dispatch_chunked_delta_c64(
         launch.g,
         launch.beta,
         launch.core,
-        launch.qkvz,
+        launch.qkvzba,
     ]
     .into_iter()
     .enumerate()
@@ -1671,7 +1605,7 @@ fn dispatch_chunked_delta_c64(
             &pipelines.chunk_carry_generic
         },
     );
-    for (index, offset) in [launch.query, launch.key, launch.g, launch.qkvz]
+    for (index, offset) in [launch.query, launch.key, launch.g, launch.qkvzba]
         .into_iter()
         .enumerate()
     {
@@ -1690,7 +1624,7 @@ fn dispatch_chunked_delta_c64(
     );
 
     encoder.set_compute_pipeline_state(&pipelines.chunk_output);
-    for (index, offset) in [launch.value, launch.g, launch.qkvz, launch.core]
+    for (index, offset) in [launch.value, launch.g, launch.qkvzba, launch.core]
         .into_iter()
         .enumerate()
     {
@@ -1717,7 +1651,7 @@ fn dispatch_gated_norm(
         weight,
         launch.core,
         launch.z,
-        launch.qkvz,
+        launch.qkvzba,
         &launch.params,
     );
 }
@@ -1808,34 +1742,29 @@ fn validate_signature(
         (value(1)?, vec![shape.hidden_size], ElementType::F16),
         (
             value(2)?,
-            vec![shape.qkvz_features, shape.hidden_size],
+            vec![shape.qkvzba_features, shape.hidden_size],
             ElementType::F16,
         ),
         (
             value(3)?,
-            vec![shape.ba_features, shape.hidden_size],
-            ElementType::F16,
-        ),
-        (
-            value(4)?,
             vec![shape.qkv_features, shape.conv_kernel],
             ElementType::F16,
         ),
+        (value(4)?, vec![shape.value_heads], ElementType::F32),
         (value(5)?, vec![shape.value_heads], ElementType::F32),
-        (value(6)?, vec![shape.value_heads], ElementType::F32),
-        (value(7)?, vec![shape.value_dim], ElementType::F32),
+        (value(6)?, vec![shape.value_dim], ElementType::F32),
         (
-            value(8)?,
+            value(7)?,
             vec![shape.hidden_size, shape.value_features],
             ElementType::F16,
         ),
         (
-            value(9)?,
+            value(8)?,
             vec![shape.qkv_features, shape.conv_state_width],
             CONV_STATE_ELEMENT_TYPE,
         ),
         (
-            value(10)?,
+            value(9)?,
             vec![shape.value_heads, shape.value_dim, shape.key_dim],
             DELTA_STATE_ELEMENT_TYPE,
         ),

@@ -50,7 +50,7 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attent
 
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str =
-    "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_indirect";
+    "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect";
 const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
@@ -157,7 +157,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             provider_capabilities,
             accepted_weight_formats,
             accepted_quantization_formats,
-            contiguous_bindings(11),
+            contiguous_bindings(10),
             ESTIMATOR_ID,
             ContractVersion::new(1, 0),
             estimator_fingerprint,
@@ -333,6 +333,7 @@ struct AttentionShape {
     value_features: u64,
     qkvz_features: u64,
     ba_features: u64,
+    qkvzba_features: u64,
     conv_kernel: u64,
     conv_state_width: u64,
     epsilon: f32,
@@ -353,6 +354,7 @@ impl AttentionShape {
             value_features: unsigned_attribute(attributes, "value_features")?,
             qkvz_features: unsigned_attribute(attributes, "qkvz_features")?,
             ba_features: unsigned_attribute(attributes, "ba_features")?,
+            qkvzba_features: unsigned_attribute(attributes, "qkvzba_features")?,
             conv_kernel: unsigned_attribute(attributes, "conv_kernel")?,
             conv_state_width: unsigned_attribute(attributes, "conv_state_width")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
@@ -396,6 +398,11 @@ impl AttentionShape {
                     .value_heads
                     .checked_mul(2)
                     .ok_or_else(|| "attention BA width overflows".to_owned())?
+            || shape.qkvzba_features
+                != shape
+                    .qkvz_features
+                    .checked_add(shape.ba_features)
+                    .ok_or_else(|| "attention QKVZBA width overflows".to_owned())?
             || shape.conv_state_width != shape.conv_kernel - 1
         {
             return Err("recurrent attention attributes are inconsistent".to_owned());
@@ -427,8 +434,7 @@ impl AttentionShape {
         [
             (1, ElementType::U32),
             (self.hidden_size, ElementType::F16),
-            (self.qkvz_features, ElementType::F16),
-            (self.ba_features, ElementType::F16),
+            (self.qkvzba_features, ElementType::F16),
             (self.value_features, ElementType::F16),
             (qk_features, ElementType::F32),
             (qk_features, ElementType::F32),
@@ -476,12 +482,8 @@ impl AttentionShape {
                 checked_product(&[tokens, self.qkv_features])?,
             ),
             (
-                "QKVZ activation elements",
-                checked_product(&[tokens, self.qkvz_features])?,
-            ),
-            (
-                "BA activation elements",
-                checked_product(&[tokens, self.ba_features])?,
+                "QKVZBA activation elements",
+                checked_product(&[tokens, self.qkvzba_features])?,
             ),
             (
                 "QK activation elements",
@@ -544,7 +546,7 @@ impl AttentionProjection {
         runtime: MarlinFp8ProjectionRuntime,
     ) -> Result<Self, String> {
         let mut uses_marlin = false;
-        for ordinal in [2, 3, 8] {
+        for ordinal in [2, 7] {
             let binding = binding(values, ResolvedValueRole::Input, ordinal)?;
             let weight = binding.weight().ok_or_else(|| {
                 format!("attention projection input {ordinal} lacks its physical weight layout")
@@ -595,9 +597,8 @@ struct ScratchLayout {
     projection_workspace: Option<u64>,
     token_seq_indices: u64,
     normalized: u64,
-    qkvz: u64,
+    qkvzba: u64,
     z_or_activation: u64,
-    ba: u64,
     query: u64,
     key: u64,
     value: u64,
@@ -631,15 +632,9 @@ impl ScratchLayout {
             ElementType::F16,
             total_tokens,
         )?;
-        let qkvz = reserve_tokens(
+        let qkvzba = reserve_tokens(
             &mut offset,
-            shape.qkvz_features,
-            ElementType::F16,
-            total_tokens,
-        )?;
-        let ba = reserve_tokens(
-            &mut offset,
-            shape.ba_features,
+            shape.qkvzba_features,
             ElementType::F16,
             total_tokens,
         )?;
@@ -708,9 +703,8 @@ impl ScratchLayout {
             projection_workspace,
             token_seq_indices,
             normalized,
-            qkvz,
+            qkvzba,
             z_or_activation,
-            ba,
             query,
             key,
             value,
@@ -778,8 +772,7 @@ struct AttentionStateBinding {
 #[derive(Debug, Clone, Copy)]
 struct SharedRegions {
     input_norm: usize,
-    qkvz: SharedProjectionWeight,
-    ba: SharedProjectionWeight,
+    qkvzba: SharedProjectionWeight,
     conv: usize,
     a_log: usize,
     dt_bias: usize,
@@ -859,26 +852,20 @@ fn encode_attention(
     let mut compute_regions = Vec::new();
     let shared = SharedRegions {
         input_norm: push_shared_weight(&mut compute_regions, &invocation, 1, ElementType::F16)?,
-        qkvz: push_shared_projection_weight(
+        qkvzba: push_shared_projection_weight(
             &mut compute_regions,
             &invocation,
             2,
-            &[shape.qkvz_features, shape.hidden_size],
+            &[shape.qkvzba_features, shape.hidden_size],
         )?,
-        ba: push_shared_projection_weight(
-            &mut compute_regions,
-            &invocation,
-            3,
-            &[shape.ba_features, shape.hidden_size],
-        )?,
-        conv: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F16)?,
-        a_log: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F32)?,
-        dt_bias: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F32)?,
-        norm: push_shared_weight(&mut compute_regions, &invocation, 7, ElementType::F32)?,
+        conv: push_shared_weight(&mut compute_regions, &invocation, 3, ElementType::F16)?,
+        a_log: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F32)?,
+        dt_bias: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F32)?,
+        norm: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F32)?,
         output: push_shared_projection_weight(
             &mut compute_regions,
             &invocation,
-            8,
+            7,
             &[shape.hidden_size, shape.value_features],
         )?,
         scratch: {
@@ -938,12 +925,12 @@ fn encode_attention(
         )?);
         let conv_state = contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
             ElementType::F16,
         )?;
         let delta_state = contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 10)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
             ElementType::F32,
         )?;
         let first_state_region = binding_regions.len();
@@ -991,8 +978,7 @@ fn encode_attention(
         "vnext_gated_delta_recurrent_attention",
     )
     .bytes(projection.replay_tag().as_bytes())
-    .bytes(shared.qkvz.replay_tag().as_bytes())
-    .bytes(shared.ba.replay_tag().as_bytes())
+    .bytes(shared.qkvzba.replay_tag().as_bytes())
     .bytes(shared.output.replay_tag().as_bytes())
     .u64(shape.hidden_size)
     .u64(shape.key_heads)
@@ -1117,7 +1103,7 @@ fn encode_attention(
                 DeviceBatchingForm::ParticipantLoop,
                 participant_count,
                 total_tokens,
-                u64::from(participant_count) * 11,
+                u64::from(participant_count) * 10,
                 u64::from(participant_count) * 2,
             )
         })
@@ -1156,12 +1142,12 @@ fn encode_reusable_attention_bindings(
     for (participant_index, participant) in invocation.participants().iter().enumerate() {
         let conv_state = contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
             ElementType::F16,
         )?;
         let delta_state = contiguous_region(
             participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 10)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
             ElementType::F32,
         )?;
         writes.push(
@@ -1326,8 +1312,7 @@ fn enqueue_attention(
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
     let normalized = scratch_pointer(scratch_base, layout.normalized)?;
-    let qkvz = scratch_pointer(scratch_base, layout.qkvz)?;
-    let ba = scratch_pointer(scratch_base, layout.ba)?;
+    let qkvzba = scratch_pointer(scratch_base, layout.qkvzba)?;
     let z = scratch_pointer(scratch_base, layout.z_or_activation)?;
     let query = scratch_pointer(scratch_base, layout.query)?;
     let key = scratch_pointer(scratch_base, layout.key)?;
@@ -1349,44 +1334,27 @@ fn enqueue_attention(
         cuda.hidden_size,
         cuda.epsilon,
     )?;
-    for (weight, destination, out_features, operation) in [
-        (
-            shared.qkvz,
-            qkvz,
-            checked_i32(shape.qkvz_features, "attention QKVZ width")
-                .map_err(CudaDeviceRuntimeError::contract)?,
-            "attention QKVZ GEMM",
-        ),
-        (
-            shared.ba,
-            ba,
-            checked_i32(shape.ba_features, "attention BA width")
-                .map_err(CudaDeviceRuntimeError::contract)?,
-            "attention BA GEMM",
-        ),
-    ] {
-        launch_attention_projection(
-            stream,
-            blas,
-            projection,
-            weight,
-            normalized,
-            destination,
-            scratch,
-            layout,
-            regions,
-            launch.tokens_i32,
-            out_features,
-            cuda.hidden_size,
-            operation,
-        )?;
-    }
+    launch_attention_projection(
+        stream,
+        blas,
+        projection,
+        shared.qkvzba,
+        normalized,
+        qkvzba,
+        scratch,
+        layout,
+        regions,
+        launch.tokens_i32,
+        checked_i32(shape.qkvzba_features, "attention QKVZBA width")
+            .map_err(CudaDeviceRuntimeError::contract)?,
+        cuda.hidden_size,
+        "attention QKVZBA GEMM",
+    )?;
 
     launch_prepare(
         stream,
         &functions.prepare,
-        qkvz,
-        ba,
+        qkvzba,
         regions[shared.conv].device_ptr(),
         state_binding,
         regions[shared.a_log].device_ptr(),
@@ -1571,8 +1539,7 @@ fn launch_attention_projection(
 fn launch_prepare(
     stream: &CudaStream,
     function: &CudaFunction,
-    qkvz: u64,
-    ba: u64,
+    qkvzba: u64,
     conv_weight: u64,
     state_binding: u64,
     a_log: u64,
@@ -1609,8 +1576,7 @@ fn launch_prepare(
     let grid = checked_grid(total, THREADS_PER_BLOCK, "attention prepare")?;
     let mut builder = stream.launch_builder(function);
     let pointers = [
-        qkvz,
-        ba,
+        qkvzba,
         conv_weight,
         state_binding,
         a_log,
@@ -1940,34 +1906,29 @@ fn validate_signature(
         (value(1)?, vec![shape.hidden_size], ElementType::F16),
         (
             value(2)?,
-            vec![shape.qkvz_features, shape.hidden_size],
+            vec![shape.qkvzba_features, shape.hidden_size],
             ElementType::F16,
         ),
         (
             value(3)?,
-            vec![shape.ba_features, shape.hidden_size],
-            ElementType::F16,
-        ),
-        (
-            value(4)?,
             vec![shape.qkv_features, shape.conv_kernel],
             ElementType::F16,
         ),
+        (value(4)?, vec![shape.value_heads], ElementType::F32),
         (value(5)?, vec![shape.value_heads], ElementType::F32),
-        (value(6)?, vec![shape.value_heads], ElementType::F32),
-        (value(7)?, vec![shape.value_head_dim], ElementType::F32),
+        (value(6)?, vec![shape.value_head_dim], ElementType::F32),
         (
-            value(8)?,
+            value(7)?,
             vec![shape.hidden_size, shape.value_features],
             ElementType::F16,
         ),
         (
-            value(9)?,
+            value(8)?,
             vec![shape.qkv_features, shape.conv_state_width],
             ElementType::F16,
         ),
         (
-            value(10)?,
+            value(9)?,
             vec![shape.value_heads, shape.value_head_dim, shape.key_head_dim],
             ElementType::F32,
         ),
@@ -2290,6 +2251,7 @@ mod tests {
             value_features: 128,
             qkvz_features: 320,
             ba_features: 16,
+            qkvzba_features: 336,
             conv_kernel: 4,
             conv_state_width: 3,
             epsilon: 1.0e-6,
@@ -2298,16 +2260,17 @@ mod tests {
             value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
         };
 
-        let tokens = i32::MAX as u64 / shape.qkvz_features + 1;
+        let tokens = i32::MAX as u64 / shape.qkvzba_features + 1;
         assert!(shape
             .validate_launch_extents(tokens)
             .unwrap_err()
-            .contains("QKVZ activation elements"));
+            .contains("QKVZBA activation elements"));
 
         shape.ba_features = i32::MAX as u64;
+        shape.qkvzba_features = shape.qkvz_features + shape.ba_features;
         assert!(shape
             .validate_launch_extents(2)
             .unwrap_err()
-            .contains("BA activation elements"));
+            .contains("QKVZBA activation elements"));
     }
 }
