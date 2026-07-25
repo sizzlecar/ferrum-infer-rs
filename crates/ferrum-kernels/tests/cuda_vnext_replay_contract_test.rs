@@ -107,19 +107,27 @@ fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE
         .contains("linear_attention_prepare_varlen_f16_params_f32_state_f16_indirect"));
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("recurrent_conv_state_commit_f16_indirect"));
+    assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains("state_bindings[seq * 2]"));
     assert!(GATED_DELTA_KERNEL_SOURCE.contains("recurrent_gated_delta_rule_varlen_f32_indirect"));
     assert!(GATED_DELTA_KERNEL_SOURCE
         .contains("recurrent_gated_delta_rule_varlen_tiled16_f32_indirect"));
+    assert!(GATED_DELTA_KERNEL_SOURCE.contains("state_bindings[seq * 2 + 1]"));
 }
 
 #[test]
-fn recurrent_attention_uses_one_exact_packed_input_projection() {
+fn recurrent_attention_packs_wave_projections_and_keeps_exact_qkvzba() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("contiguous_bindings(10)"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("shared.qkvzba"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains(
         "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect"
     ));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("u64::from(participant_count) * 10"));
+    assert!(RECURRENT_ATTENTION_SOURCE
+        .contains("let use_packed = participant_count_usize > 1 && input_shared && output_shared"));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("super::shared_token_region("));
+    assert!(RECURRENT_ATTENTION_SOURCE.contains("DeviceBatchingForm::Packed"));
+    assert!(
+        RECURRENT_ATTENTION_SOURCE.contains("token_sequence_indices(&participant_token_counts)")
+    );
     assert!(LINEAR_ATTENTION_KERNEL_SOURCE.contains(
         "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect"
     ));

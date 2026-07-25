@@ -462,12 +462,16 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32_state_
 extern "C" __global__ void recurrent_conv_state_commit_f16_indirect(
     const __half* __restrict__ source,
     const unsigned long long* __restrict__ state_bindings,
-    const int elements) {
-  __half* destination = reinterpret_cast<__half*>(state_bindings[0]);
+    const int batch,
+    const int elements_per_sequence) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < elements) {
-    destination[index] = source[index];
-  }
+  const int total = batch * elements_per_sequence;
+  if (index >= total) return;
+  const int seq = index / elements_per_sequence;
+  const int sequence_offset = index - seq * elements_per_sequence;
+  __half* destination =
+      reinterpret_cast<__half*>(state_bindings[seq * 2]);
+  destination[sequence_offset] = source[index];
 }
 
 template <typename InputT, typename ParamT, typename StateT = float,
@@ -477,6 +481,7 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const InputT* __restrict__ ba_raw,
     const InputT* __restrict__ conv_weight,
     const StateT* __restrict__ initial_conv_states,
+    const unsigned long long* __restrict__ state_bindings,
     const ParamT* __restrict__ a_log,
     const ParamT* __restrict__ dt_bias,
     const unsigned int* __restrict__ cu_seqlens,
@@ -521,9 +526,13 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const int channel = idx - token * conv_channels;
     const int seq = static_cast<int>(token_seq_indices[token]);
     if (seq < 0 || seq >= batch) return;
+    const StateT* sequence_initial_conv_state =
+        state_bindings == nullptr
+            ? initial_conv_states + seq * conv_state_len
+            : reinterpret_cast<const StateT*>(state_bindings[seq * 2]);
     const int token_start = static_cast<int>(cu_seqlens[seq]);
     const int local_token = token - token_start;
-    const int state_base = seq * conv_state_len + channel * state_len;
+    const int state_base = channel * state_len;
 
     float acc = 0.0f;
     for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
@@ -533,7 +542,7 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
                                 mixed_qkvz_raw,
                                 (token_start + source) * qkvz_stride + channel)
                           : ferrum_load_value(
-                                initial_conv_states,
+                                sequence_initial_conv_state,
                                 state_base + state_len + source);
       acc += x *
              ferrum_load_value(conv_weight,
@@ -574,16 +583,20 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const int state_offset = idx - seq * conv_state_len;
     const int channel = state_offset / state_len;
     const int pos = state_offset - channel * state_len;
+    const StateT* sequence_initial_conv_state =
+        state_bindings == nullptr
+            ? initial_conv_states + seq * conv_state_len
+            : reinterpret_cast<const StateT*>(state_bindings[seq * 2]);
     const int token_start = static_cast<int>(cu_seqlens[seq]);
     const int token_end = static_cast<int>(cu_seqlens[seq + 1]);
     const int seq_tokens = token_end - token_start;
     const int source = seq_tokens + pos - state_len;
-    const int state_base = seq * conv_state_len + channel * state_len;
+    const int state_base = channel * state_len;
     const float final_value =
         source >= 0
             ? ferrum_load_value(mixed_qkvz_raw,
                                 (token_start + source) * qkvz_stride + channel)
-            : ferrum_load_value(initial_conv_states,
+            : ferrum_load_value(sequence_initial_conv_state,
                                 state_base + state_len + source);
     ferrum_store_value(final_conv_states, idx, final_value);
   }
@@ -613,8 +626,8 @@ extern "C" __global__ void linear_attention_prepare_varlen_packed_qkvz_ba_f32(
     const int value_dim,
     const int conv_kernel) {
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<float, float>(
-      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, a_log, dt_bias,
-      cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, nullptr, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, conv_kernel);
 }
@@ -643,8 +656,8 @@ extern "C" __global__ void linear_attention_prepare_varlen_packed_qkvz_ba_f16_to
     const int value_dim,
     const int conv_kernel) {
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<__half, __half>(
-      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, a_log, dt_bias,
-      cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, nullptr, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, conv_kernel);
 }
@@ -673,8 +686,8 @@ extern "C" __global__ void linear_attention_prepare_varlen_packed_qkvz_ba_f16_pa
     const int value_dim,
     const int conv_kernel) {
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<__half, float>(
-      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, a_log, dt_bias,
-      cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, nullptr, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, conv_kernel);
 }
@@ -703,12 +716,10 @@ linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32_state_f16_z_f16_in
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  const __half* initial_conv_states =
-      reinterpret_cast<const __half*>(state_bindings[0]);
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<
       __half, float, __half, __half>(
-      mixed_qkvz_raw, ba_raw, conv_weight, initial_conv_states, a_log, dt_bias,
-      cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      mixed_qkvz_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, conv_kernel);
 }
@@ -741,11 +752,9 @@ linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_ind
   const int qkvz_width = 2 * qk_total + 2 * value_total;
   const int qkvzba_width = qkvz_width + 2 * value_heads;
   const __half* ba_raw = mixed_qkvzba_raw + qkvz_width;
-  const __half* initial_conv_states =
-      reinterpret_cast<const __half*>(state_bindings[0]);
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<
       __half, float, __half, __half>(
-      mixed_qkvzba_raw, ba_raw, conv_weight, initial_conv_states, a_log,
+      mixed_qkvzba_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
       dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, conv_kernel, qkvzba_width, qkvzba_width);

@@ -60,7 +60,8 @@ const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
 
 const SCRATCH_ALIGNMENT: u64 = 16;
-const CONTROL_BYTES: u64 = 16;
+const CONTROL_BASE_BYTES: u64 = 16;
+const CONTROL_BYTES_PER_SEQUENCE: u64 = 16;
 const STATE_BINDING_SLOT_BYTES: u64 = 16;
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionProvider {
@@ -258,7 +259,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                             .ok_or_else(|| "attention fixed scratch size overflows".to_owned())
                     })
                     .map_err(invalid_plan)?,
-                0,
+                shape.scratch_bytes_per_sequence().map_err(invalid_plan)?,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
             SCRATCH_ALIGNMENT,
@@ -424,9 +425,13 @@ impl AttentionShape {
     }
 
     fn fixed_scratch_bytes(self) -> Result<u64, String> {
+        Ok(CONTROL_BASE_BYTES)
+    }
+
+    fn scratch_bytes_per_sequence(self) -> Result<u64, String> {
         aligned_bytes(self.conv_state_elements()?, ElementType::F16.size_bytes())?
-            .checked_add(CONTROL_BYTES)
-            .ok_or_else(|| "attention fixed scratch size overflows".to_owned())
+            .checked_add(CONTROL_BYTES_PER_SEQUENCE)
+            .ok_or_else(|| "attention sequence scratch size overflows".to_owned())
     }
 
     fn scratch_bytes_per_token(self) -> Result<u64, String> {
@@ -613,14 +618,29 @@ impl ScratchLayout {
     fn new(
         shape: AttentionShape,
         total_tokens: u64,
+        participant_count: usize,
         projection: AttentionProjection,
     ) -> Result<Self, String> {
-        if total_tokens == 0 {
+        if total_tokens == 0 || participant_count == 0 {
             return Err("attention scratch cannot be sized for zero tokens".to_owned());
         }
-        let mut offset = CONTROL_BYTES;
-        let conv_state =
-            reserve_fixed(&mut offset, shape.conv_state_elements()?, ElementType::F16)?;
+        let participant_count = u64::try_from(participant_count)
+            .map_err(|_| "attention participant count exceeds u64".to_owned())?;
+        let mut offset = CONTROL_BASE_BYTES
+            .checked_add(
+                CONTROL_BYTES_PER_SEQUENCE
+                    .checked_mul(participant_count)
+                    .ok_or_else(|| "attention control scratch size overflows".to_owned())?,
+            )
+            .ok_or_else(|| "attention control scratch size overflows".to_owned())?;
+        let conv_state = offset;
+        offset = offset
+            .checked_add(
+                aligned_bytes(shape.conv_state_elements()?, ElementType::F16.size_bytes())?
+                    .checked_mul(participant_count)
+                    .ok_or_else(|| "attention convolution state scratch overflows".to_owned())?,
+            )
+            .ok_or_else(|| "attention convolution state scratch overflows".to_owned())?;
         let projection_workspace_bytes = projection.workspace_bytes()?;
         let projection_workspace = (projection_workspace_bytes > 0)
             .then(|| reserve_fixed(&mut offset, projection_workspace_bytes, ElementType::U8))
@@ -689,6 +709,13 @@ impl ScratchLayout {
             .ok_or_else(|| "attention fixed scratch size overflows".to_owned())?
             .checked_add(
                 shape
+                    .scratch_bytes_per_sequence()?
+                    .checked_mul(participant_count)
+                    .ok_or_else(|| "attention sequence scratch size overflows".to_owned())?,
+            )
+            .ok_or_else(|| "attention sequence scratch size overflows".to_owned())?
+            .checked_add(
+                shape
                     .scratch_bytes_per_token()?
                     .checked_mul(total_tokens)
                     .ok_or_else(|| "attention scratch size overflows".to_owned())?,
@@ -755,7 +782,9 @@ struct AttentionLaunch {
     output_region: usize,
     state_binding_offset: u64,
     host_control: usize,
+    host_token_seq_indices: Option<usize>,
     execution_form: GatedDeltaExecutionForm,
+    batch_i32: i32,
     tokens: u64,
     tokens_i32: i32,
 }
@@ -833,8 +862,12 @@ fn encode_attention(
     let program_binding = invocation.program_binding().cloned();
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens, projection)?;
-    let binding_layout = StateBindingLayout::new(invocation.participants().len())?;
+    let participant_count_usize = invocation.participants().len();
+    let participant_count_u64 = u64::try_from(participant_count_usize)
+        .map_err(|_| "CUDA recurrent attention participant count exceeds u64".to_owned())?;
+    shape.validate_launch_extents(total_tokens)?;
+    let layout = ScratchLayout::new(shape, total_tokens, participant_count_usize, projection)?;
+    let binding_layout = StateBindingLayout::new(participant_count_usize)?;
     let cuda_shape = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -848,6 +881,7 @@ fn encode_attention(
         0,
         ElementType::F16,
     )?;
+    let use_packed = participant_count_usize > 1 && input_shared && output_shared;
 
     let mut compute_regions = Vec::new();
     let shared = SharedRegions {
@@ -882,13 +916,45 @@ fn encode_attention(
             index
         },
     };
+    let packed_regions = if use_packed {
+        let input_region = compute_regions.len();
+        compute_regions.push(super::shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        let output_region = compute_regions.len();
+        compute_regions.push(super::shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        Some((input_region, output_region))
+    } else {
+        None
+    };
     let mut binding_regions = vec![compute_regions[shared.binding].clone()];
     let mut binding_host_storage = Vec::with_capacity(invocation.participants().len());
     let mut state_bindings = Vec::with_capacity(invocation.participants().len());
     let mut compute_fence_dependencies =
         Vec::with_capacity(invocation.participants().len().saturating_mul(2));
-    let mut host_storage = Vec::with_capacity(invocation.participants().len());
-    let mut launches = Vec::with_capacity(invocation.participants().len());
+    let mut host_storage = Vec::with_capacity(if use_packed {
+        2
+    } else {
+        participant_count_usize
+    });
+    let mut launches = Vec::with_capacity(if use_packed {
+        1
+    } else {
+        participant_count_usize
+    });
+    let mut participant_token_counts = Vec::with_capacity(participant_count_usize);
+    let mut packed_token_cursor = 0_u64;
+    let mut packed_execution_form = None;
     for (participant_index, (participant, token_range)) in invocation
         .participants()
         .iter()
@@ -897,32 +963,19 @@ fn encode_attention(
     {
         let tokens = token_range.immediate_tokens();
         shape.validate_launch_extents(tokens)?;
-        let source = token_range.source_token_range();
-        let packed = token_range.immediate_token_range();
-        let input_region = compute_regions.len();
-        compute_regions.push(contiguous_token_region(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-            ElementType::F16,
-            if input_shared {
-                packed.start
-            } else {
-                source.start
-            },
-            tokens,
-        )?);
-        let output_region = compute_regions.len();
-        compute_regions.push(contiguous_token_region(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-            ElementType::F16,
-            if output_shared {
-                packed.start
-            } else {
-                source.start
-            },
-            tokens,
-        )?);
+        if use_packed {
+            let packed = token_range.immediate_token_range();
+            let expected_end = packed_token_cursor
+                .checked_add(tokens)
+                .ok_or_else(|| "CUDA packed recurrent token range overflows".to_owned())?;
+            if packed.start != packed_token_cursor || packed.end != expected_end {
+                return Err(
+                    "CUDA packed recurrent attention token ranges are not canonical".to_owned(),
+                );
+            }
+            packed_token_cursor = expected_end;
+        }
+        participant_token_counts.push(tokens);
         let conv_state = contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
@@ -959,16 +1012,80 @@ fn encode_attention(
                 plan.token_count()
             ));
         }
+        if use_packed {
+            if packed_execution_form
+                .replace(execution_form)
+                .is_some_and(|previous| previous != execution_form)
+            {
+                return Err(
+                    "CUDA packed recurrent attention participants selected different execution forms"
+                        .to_owned(),
+                );
+            }
+        } else {
+            let source = token_range.source_token_range();
+            let packed = token_range.immediate_token_range();
+            let input_region = compute_regions.len();
+            compute_regions.push(contiguous_token_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+                ElementType::F16,
+                if input_shared {
+                    packed.start
+                } else {
+                    source.start
+                },
+                tokens,
+            )?);
+            let output_region = compute_regions.len();
+            compute_regions.push(contiguous_token_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+                ElementType::F16,
+                if output_shared {
+                    packed.start
+                } else {
+                    source.start
+                },
+                tokens,
+            )?);
+            let host_control = host_storage.len();
+            host_storage.push(sequence_control(&[tokens])?);
+            launches.push(AttentionLaunch {
+                input_region,
+                output_region,
+                state_binding_offset: binding_offset,
+                host_control,
+                host_token_seq_indices: None,
+                execution_form,
+                batch_i32: 1,
+                tokens,
+                tokens_i32,
+            });
+        }
+    }
+    if let Some((input_region, output_region)) = packed_regions {
+        if packed_token_cursor != total_tokens {
+            return Err(
+                "CUDA packed recurrent attention token ranges do not cover the wave".to_owned(),
+            );
+        }
         let host_control = host_storage.len();
-        host_storage.push(sequence_control(tokens_i32 as u32));
+        host_storage.push(sequence_control(&participant_token_counts)?);
+        let host_token_seq_indices = host_storage.len();
+        host_storage.push(token_sequence_indices(&participant_token_counts)?);
         launches.push(AttentionLaunch {
             input_region,
             output_region,
-            state_binding_offset: binding_offset,
+            state_binding_offset: 0,
             host_control,
-            execution_form,
-            tokens,
-            tokens_i32,
+            host_token_seq_indices: Some(host_token_seq_indices),
+            execution_form: packed_execution_form.ok_or_else(|| {
+                "CUDA packed recurrent attention has no execution form".to_owned()
+            })?,
+            batch_i32: checked_i32(participant_count_u64, "attention packed participant count")?,
+            tokens: total_tokens,
+            tokens_i32: checked_i32(total_tokens, "attention packed token count")?,
         });
     }
 
@@ -997,14 +1114,24 @@ fn encode_attention(
     .u64(layout.required_bytes)
     .u64(binding_layout.required_bytes)
     .u64(STATE_BINDING_SLOT_BYTES)
+    .boolean(use_packed)
     .u64(launches.len() as u64);
+    for tokens in &participant_token_counts {
+        replay_key = replay_key.u64(*tokens);
+    }
     for launch in &launches {
         replay_key = replay_key
             .u64(launch.input_region as u64)
             .u64(launch.output_region as u64)
             .u64(launch.state_binding_offset)
             .u64(launch.host_control as u64)
+            .u64(
+                launch
+                    .host_token_seq_indices
+                    .map_or(u64::MAX, |index| index as u64),
+            )
             .bytes(launch.execution_form.as_str().as_bytes())
+            .i32(launch.batch_i32)
             .u64(launch.tokens)
             .i32(launch.tokens_i32);
     }
@@ -1099,12 +1226,25 @@ fn encode_attention(
             },
         )
         .and_then(|command| {
+            let physical_transfer_commands = if use_packed {
+                2
+            } else {
+                u64::from(participant_count) * 2
+            };
             command.with_work_attribution(
-                DeviceBatchingForm::ParticipantLoop,
+                if use_packed {
+                    DeviceBatchingForm::Packed
+                } else {
+                    DeviceBatchingForm::ParticipantLoop
+                },
                 participant_count,
                 total_tokens,
-                u64::from(participant_count) * 10,
-                u64::from(participant_count) * 2,
+                (if use_packed {
+                    1
+                } else {
+                    u64::from(participant_count)
+                }) * 10,
+                physical_transfer_commands,
             )
         })
         .map_err(|error| error.to_string())?;
@@ -1299,15 +1439,36 @@ fn enqueue_attention(
             })?,
     )
     .map_err(|_| CudaDeviceRuntimeError::contract("attention token index size exceeds usize"))?;
-    unsafe {
-        cudarc::driver::result::memset_d8_async(
-            token_seq_indices,
-            0,
-            token_index_bytes,
-            stream.cu_stream(),
-        )
+    if let Some(host_token_seq_indices) = launch.host_token_seq_indices {
+        let payload = host_storage.get(host_token_seq_indices).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("attention token sequence payload is missing")
+        })?;
+        if payload.len() != token_index_bytes {
+            return Err(CudaDeviceRuntimeError::contract(
+                "attention token sequence payload differs from its admitted token count",
+            ));
+        }
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                token_seq_indices,
+                payload.as_ref(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| {
+            CudaDeviceRuntimeError::driver("attention token sequence upload", error)
+        })?;
+    } else {
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                token_seq_indices,
+                0,
+                token_index_bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
     }
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
 
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
@@ -1370,6 +1531,7 @@ fn enqueue_attention(
         final_conv_state,
         launch.tokens,
         launch.tokens_i32,
+        launch.batch_i32,
         cuda,
         shape,
     )?;
@@ -1386,6 +1548,7 @@ fn enqueue_attention(
         &functions.conv_state_commit,
         final_conv_state,
         state_binding,
+        launch.batch_i32,
         conv_state_elements,
     )?;
     launch_qk_norm(
@@ -1408,6 +1571,7 @@ fn enqueue_attention(
         state_binding,
         cu_seqlens,
         core,
+        launch.batch_i32,
         launch.tokens_i32,
         cuda,
     )?;
@@ -1555,10 +1719,17 @@ fn launch_prepare(
     final_conv_state: u64,
     tokens: u64,
     tokens_i32: i32,
+    batch: i32,
     shape: CudaAttentionShape,
     logical: AttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let batch = 1_i32;
+    if batch <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "attention prepare batch is not positive",
+        ));
+    }
+    let batch_u64 = u64::try_from(batch)
+        .map_err(|_| CudaDeviceRuntimeError::contract("attention batch exceeds u64"))?;
     let total = tokens
         .checked_mul(logical.qkv_features)
         .and_then(|conv| {
@@ -1570,6 +1741,7 @@ fn launch_prepare(
             logical
                 .conv_state_elements()
                 .ok()
+                .and_then(|state| state.checked_mul(batch_u64))
                 .map(|state| work.max(state))
         })
         .ok_or_else(|| CudaDeviceRuntimeError::contract("attention prepare work overflows"))?;
@@ -1622,22 +1794,30 @@ fn launch_conv_state_commit(
     function: &CudaFunction,
     source: u64,
     state_binding: u64,
-    elements: i32,
+    batch: i32,
+    elements_per_sequence: i32,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    if elements <= 0 {
+    if batch <= 0 || elements_per_sequence <= 0 {
         return Err(CudaDeviceRuntimeError::contract(
             "attention convolution state commit is empty",
         ));
     }
+    let elements = i64::from(batch)
+        .checked_mul(i64::from(elements_per_sequence))
+        .and_then(|elements| u64::try_from(elements).ok())
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("attention convolution state commit size overflows")
+        })?;
     let mut builder = stream.launch_builder(function);
     builder.arg(&source);
     builder.arg(&state_binding);
-    builder.arg(&elements);
+    builder.arg(&batch);
+    builder.arg(&elements_per_sequence);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (
                 checked_grid(
-                    elements as u64,
+                    elements,
                     THREADS_PER_BLOCK,
                     "attention convolution state commit",
                 )?,
@@ -1729,10 +1909,15 @@ fn launch_delta(
     state_binding: u64,
     cu_seqlens: u64,
     output: u64,
+    batch: i32,
     tokens: i32,
     shape: CudaAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let batch = 1_i32;
+    if batch <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "attention delta batch is not positive",
+        ));
+    }
     let function = if shape.tiled_delta {
         &functions.delta_tiled
     } else {
@@ -1769,12 +1954,12 @@ fn launch_delta(
         (
             (shape.value_head_dim as u32).div_ceil(16),
             shape.value_heads as u32,
-            1,
+            batch as u32,
         )
     } else {
         builder.arg(&use_qk_l2norm);
         builder.arg(&shape.scale);
-        (shape.value_heads as u32, 1, 1)
+        (shape.value_heads as u32, batch as u32, 1)
     };
     unsafe {
         builder.launch(LaunchConfig {
@@ -2133,12 +2318,51 @@ fn checked_product(factors: &[u64]) -> Result<u64, String> {
     })
 }
 
-fn sequence_control(tokens: u32) -> Box<[u8]> {
-    [0_u32, tokens]
-        .into_iter()
-        .flat_map(u32::to_le_bytes)
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+fn sequence_control(token_counts: &[u64]) -> Result<Box<[u8]>, String> {
+    if token_counts.is_empty() {
+        return Err("attention sequence control cannot be empty".to_owned());
+    }
+    let mut cumulative = 0_u64;
+    let capacity = token_counts
+        .len()
+        .checked_add(1)
+        .and_then(|entries| entries.checked_mul(4))
+        .ok_or_else(|| "attention sequence control size overflows".to_owned())?;
+    let mut control = Vec::with_capacity(capacity);
+    control.extend_from_slice(&0_u32.to_le_bytes());
+    for tokens in token_counts {
+        if *tokens == 0 {
+            return Err("attention sequence control contains an empty sequence".to_owned());
+        }
+        cumulative = cumulative
+            .checked_add(*tokens)
+            .ok_or_else(|| "attention sequence control token count overflows".to_owned())?;
+        let cumulative = u32::try_from(cumulative)
+            .map_err(|_| "attention sequence control exceeds u32".to_owned())?;
+        control.extend_from_slice(&cumulative.to_le_bytes());
+    }
+    Ok(control.into_boxed_slice())
+}
+
+fn token_sequence_indices(token_counts: &[u64]) -> Result<Box<[u8]>, String> {
+    let total_tokens = token_counts.iter().try_fold(0_u64, |total, tokens| {
+        total
+            .checked_add(*tokens)
+            .ok_or_else(|| "attention token sequence index count overflows".to_owned())
+    })?;
+    let capacity = usize::try_from(total_tokens)
+        .map_err(|_| "attention token sequence index count exceeds usize".to_owned())?
+        .checked_mul(4)
+        .ok_or_else(|| "attention token sequence index bytes overflow".to_owned())?;
+    let mut indices = Vec::with_capacity(capacity);
+    for (sequence, tokens) in token_counts.iter().enumerate() {
+        let sequence = u32::try_from(sequence)
+            .map_err(|_| "attention sequence index exceeds u32".to_owned())?;
+        for _ in 0..*tokens {
+            indices.extend_from_slice(&sequence.to_le_bytes());
+        }
+    }
+    Ok(indices.into_boxed_slice())
 }
 
 fn scratch_pointer(base: u64, offset: u64) -> Result<u64, CudaDeviceRuntimeError> {
