@@ -202,13 +202,6 @@ fn validate_gptq_marlin_moe_contract(
     weight
         .validate_logical(bound_logical_dimensions, logical_element_type)
         .map_err(|error| format!("CUDA Marlin-MoE logical contract is invalid: {error}"))?;
-    if weight.format_id().as_str() != GPTQ_MARLIN_WEIGHT_FORMAT_ID {
-        return Err(format!(
-            "CUDA Marlin-MoE requires weight format `{GPTQ_MARLIN_WEIGHT_FORMAT_ID}`, got `{}`",
-            weight.format_id()
-        ));
-    }
-
     let PhysicalWeightLayout::Quantized {
         packed_values,
         packed_dimensions,
@@ -544,6 +537,7 @@ fn validate_region_alignment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
     use ferrum_interfaces::vnext::{
         ContractVersion, PhysicalWeightComponentBinding, QuantizationFormatId, QuantizationSpec,
         WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema, WeightTensorSpec,
@@ -666,12 +660,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_another_weight_or_quantization_format() {
+    fn accepts_gptq_component_abi_inside_a_mixed_execution_schema() {
         let mut schema = valid_schema();
-        schema.format_id = WeightFormatId::new("weight-format.test.other").unwrap();
-        let error = validate(&schema).unwrap_err();
-        assert!(error.contains("requires weight format"), "{error}");
+        schema.format_id = WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).unwrap();
+        let metadata = validate(&schema).unwrap();
+        assert_eq!(metadata.group_size, 128);
+        assert_eq!(metadata.logical_dimensions, [2, 64, 128]);
+    }
 
+    #[test]
+    fn rejects_another_quantization_format() {
         let mut schema = valid_schema();
         let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
             unreachable!();

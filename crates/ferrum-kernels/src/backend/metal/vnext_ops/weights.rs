@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use ferrum_interfaces::vnext::{
     AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, ElementType,
     OperationInvocation, PhysicalWeightLayout, PhysicalWeightPadding, ResolvedValueBinding,
-    ResolvedWeightBinding, ResolvedWeightComponentLayout, WeightEncoding, WeightFormatId, WeightId,
+    ResolvedWeightBinding, ResolvedWeightComponentLayout, WeightEncoding, WeightId,
 };
 
 use super::super::vnext_runtime::{MetalBufferRegion, MetalDeviceBuffer};
@@ -92,7 +92,6 @@ pub(crate) enum MetalResolvedWeightLayout {
 }
 
 pub(crate) struct MetalResolvedWeight {
-    format_id: WeightFormatId,
     logical_dimensions: Vec<u64>,
     logical_element_type: ElementType,
     components: Vec<MetalResolvedWeightComponent>,
@@ -101,10 +100,6 @@ pub(crate) struct MetalResolvedWeight {
 }
 
 impl MetalResolvedWeight {
-    pub(crate) fn format_id(&self) -> &WeightFormatId {
-        &self.format_id
-    }
-
     pub(crate) fn logical_dimensions(&self) -> &[u64] {
         &self.logical_dimensions
     }
@@ -226,7 +221,6 @@ pub(crate) fn resolve_weight(
     }
     let layout = resolve_layout(weight, &index_by_id)?;
     Ok(MetalResolvedWeight {
-        format_id: weight.format_id().clone(),
         logical_dimensions: binding.tensor().dimensions().to_vec(),
         logical_element_type: binding.tensor().element_type(),
         components,
@@ -374,7 +368,8 @@ mod tests {
     use ferrum_interfaces::vnext::{
         BlockQuantizationSpec, CompositeWeightPart, ContractVersion, ModelFamilyId,
         PhysicalStorageLayout, PhysicalWeightComponentBinding, QuantizationFormatId,
-        WeightComponentRole, WeightComponentSpec, WeightLayoutId, WeightSchema, WeightTensorSpec,
+        WeightComponentRole, WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema,
+        WeightTensorSpec,
     };
 
     fn id(value: &str) -> WeightId {

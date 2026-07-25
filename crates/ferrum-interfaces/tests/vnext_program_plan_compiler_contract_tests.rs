@@ -204,7 +204,10 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
         .weight()
         .expect("provider binding must retain the physical weight contract");
     assert_eq!(resolved_weight.weight_id(), &id("weight.matrix"));
-    assert_eq!(resolved_weight.format_id(), &id("weight-format.dense"));
+    assert_eq!(
+        serde_json::to_value(resolved_weight).unwrap()["format_id"],
+        json!("weight-format.dense")
+    );
     assert_eq!(resolved_weight.layout_id(), &id("weight-layout.dense"));
     assert_eq!(resolved_weight.components().len(), 1);
     assert_eq!(resolved_weight.components()[0].physical_dimensions(), &[4]);
@@ -381,8 +384,8 @@ fn dense_binding_in_mixed_checkpoint_does_not_require_the_container_format() {
         .find(|binding| binding.usage() == BufferUsage::Weights)
         .unwrap();
     assert_eq!(
-        weight.weight().unwrap().format_id(),
-        &id("weight-format.safetensors.mixed-gptq")
+        serde_json::to_value(weight.weight().unwrap()).unwrap()["format_id"],
+        json!("weight-format.safetensors.mixed-gptq")
     );
 }
 

@@ -1303,10 +1303,8 @@ fn prepare_matrix_weight(
     {
         return Err("Metal linear logical weight differs from its contract".to_owned());
     }
-    let format_id = weight.format_id().as_str().to_owned();
     let (regions, components, layout) = weight.into_command_parts();
     let part = prepare_leaf_part(
-        &format_id,
         &regions,
         &components,
         &layout,
@@ -1410,7 +1408,6 @@ fn prepare_partitioned_matrix_weight(
     {
         return Err("Metal partitioned linear logical weight differs from its contract".to_owned());
     }
-    let format_id = weight.format_id().as_str().to_owned();
     let (regions, components, layout) = weight.into_command_parts();
     let mut parts = match &layout {
         MetalResolvedWeightLayout::Composite { parts } => {
@@ -1426,7 +1423,6 @@ fn prepare_partitioned_matrix_weight(
                     );
                 }
                 prepared.push(prepare_leaf_part(
-                    &format_id,
                     &regions,
                     &components,
                     &part.layout,
@@ -1439,7 +1435,6 @@ fn prepare_partitioned_matrix_weight(
             prepared
         }
         _ => vec![prepare_leaf_part(
-            &format_id,
             &regions,
             &components,
             &layout,
@@ -1523,23 +1518,16 @@ fn prepare_gate_up_weight(
     {
         return Err("Metal dense SwiGLU gate/up logical weight differs".to_owned());
     }
-    let format_id = weight.format_id().as_str().to_owned();
     let (regions, components, layout) = weight.into_command_parts();
     let parts = match &layout {
-        MetalResolvedWeightLayout::Composite { parts } => prepare_gate_up_composite(
-            &format_id,
-            &regions,
-            &components,
-            parts,
-            intermediate_size,
-            hidden_size,
-        )?,
+        MetalResolvedWeightLayout::Composite { parts } => {
+            prepare_gate_up_composite(&regions, &components, parts, intermediate_size, hidden_size)?
+        }
         _ => {
             let packed = intermediate_size
                 .checked_mul(2)
                 .ok_or_else(|| "Metal dense SwiGLU packed rows overflow".to_owned())?;
             vec![prepare_leaf_part(
-                &format_id,
                 &regions,
                 &components,
                 &layout,
@@ -1554,7 +1542,6 @@ fn prepare_gate_up_weight(
 }
 
 fn prepare_gate_up_composite(
-    format_id: &str,
     regions: &[MetalBufferRegion],
     components: &[MetalResolvedWeightComponent],
     parts: &[MetalResolvedCompositePart],
@@ -1577,7 +1564,6 @@ fn prepare_gate_up_composite(
             .checked_mul(intermediate_size)
             .ok_or_else(|| "Metal dense SwiGLU partition offset overflows".to_owned())?;
         prepared.push(prepare_leaf_part(
-            format_id,
             regions,
             components,
             &part.layout,
@@ -1600,7 +1586,6 @@ fn prepare_gate_up_composite(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_leaf_part(
-    format_id: &str,
     regions: &[MetalBufferRegion],
     components: &[MetalResolvedWeightComponent],
     layout: &MetalResolvedWeightLayout,
@@ -1612,10 +1597,6 @@ fn prepare_leaf_part(
     let (component, format) = match layout {
         MetalResolvedWeightLayout::Dense { component }
         | MetalResolvedWeightLayout::Stored { component } => {
-            if format_id != DENSE_SAFETENSORS_FORMAT_ID && format_id != GGUF_NATIVE_BLOCK_FORMAT_ID
-            {
-                return Err("Metal dense linear uses an unsupported weight format".to_owned());
-            }
             let metadata = component_metadata(components, *component)?;
             if metadata.encoding()
                 != &(WeightEncoding::Dense {
@@ -1637,8 +1618,7 @@ fn prepare_leaf_part(
             block_axis,
             block_padding,
         } => {
-            if format_id != GGUF_NATIVE_BLOCK_FORMAT_ID
-                || *block_axis != expected_block_axis
+            if *block_axis != expected_block_axis
                 || block_padding != &PhysicalWeightPadding::Exact
                 || !in_features.is_multiple_of(u64::from(spec.logical_values_per_block))
             {
@@ -1704,8 +1684,7 @@ pub(super) fn same_resolved_weight(
     left: &MetalResolvedWeight,
     right: &MetalResolvedWeight,
 ) -> bool {
-    left.format_id() == right.format_id()
-        && left.logical_dimensions() == right.logical_dimensions()
+    left.logical_dimensions() == right.logical_dimensions()
         && left.logical_element_type() == right.logical_element_type()
         && left.components() == right.components()
         && left.layout() == right.layout()

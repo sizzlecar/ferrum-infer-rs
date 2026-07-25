@@ -943,8 +943,7 @@ fn append_routed_gate_up(
     attributes: MoeAttributes,
 ) -> Result<RoutedGateUp, String> {
     let resolved = resolve_shared_weight(invocation, 2, "Metal MoE routed gate/up")?;
-    if resolved.format_id().as_str() != GGUF_NATIVE_BLOCK_FORMAT_ID
-        || resolved.logical_element_type() != ElementType::F16
+    if resolved.logical_element_type() != ElementType::F16
         || resolved.logical_dimensions()
             != [
                 attributes.expert_count,
@@ -1015,8 +1014,7 @@ fn append_routed_down(
     attributes: MoeAttributes,
 ) -> Result<Q4ExpertPart, String> {
     let resolved = resolve_shared_weight(invocation, 3, "Metal MoE routed down")?;
-    if resolved.format_id().as_str() != GGUF_NATIVE_BLOCK_FORMAT_ID
-        || resolved.logical_element_type() != ElementType::F16
+    if resolved.logical_element_type() != ElementType::F16
         || resolved.logical_dimensions()
             != [
                 attributes.expert_count,

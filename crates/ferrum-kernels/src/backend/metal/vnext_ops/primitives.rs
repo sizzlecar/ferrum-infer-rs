@@ -384,11 +384,6 @@ fn embedding_weight_format(
                 .components()
                 .get(component)
                 .ok_or_else(|| "Metal dense embedding component is absent".to_owned())?;
-            if weight.format_id().as_str() != DENSE_SAFETENSORS_FORMAT_ID
-                && weight.format_id().as_str() != GGUF_NATIVE_BLOCK_FORMAT_ID
-            {
-                return Err("Metal dense embedding uses an unsupported weight format".to_owned());
-            }
             if metadata.encoding()
                 != &(WeightEncoding::Dense {
                     element_type: ElementType::F16,
@@ -405,10 +400,7 @@ fn embedding_weight_format(
             block_axis,
             block_padding,
         } => {
-            if weight.format_id().as_str() != GGUF_NATIVE_BLOCK_FORMAT_ID
-                || *block_axis != 1
-                || block_padding != &PhysicalWeightPadding::Exact
-            {
+            if *block_axis != 1 || block_padding != &PhysicalWeightPadding::Exact {
                 return Err("Metal quantized embedding physical ABI differs".to_owned());
             }
             let (format, values_per_block) = match (
