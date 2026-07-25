@@ -637,7 +637,7 @@ pub struct WeightSchema {
 }
 
 impl WeightSchema {
-    fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         self.components
             .sort_by(|left, right| left.id.cmp(&right.id));
         for tensor in &mut self.tensors {

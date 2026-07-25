@@ -1365,6 +1365,55 @@ selection must be typed and capability-driven, with no model-name, GPU-name,
 or hidden-environment branch. A later CUDA diagnostic must predict and verify
 movement in the attributed FP16 GEMV launch/time counters before it may run.
 
+### 2026-07-25 Trusted Weight Materializer Registry Checkpoint
+
+The second source slice adds a process-local `WeightMaterializerRegistry`,
+serializable capability descriptors, and a non-serializable
+`TrustedExecutionWeightPlan` witness. A descriptor in a catalog or execution
+plan cannot construct or authorize a transformed schema. The exact registered
+implementation must derive the schema again, and its id, contract version,
+implementation fingerprint, required device capabilities, source-schema
+fingerprint, and logical tensor contract must all match.
+
+`ProgramPlanCompileOptions` now carries an explicit typed materializer id.
+Identity remains the default. Non-identity selection requires
+`ProgramPlanCompiler::compile_with_weight_materializers`; it cannot be enabled
+through an environment variable. The resulting execution schema drives
+provider compatibility, resolved physical bindings, resource identities,
+static allocation bytes, plan hashing, and static initialization. A trusted
+witness selected against one capability catalog is rejected if reused with a
+catalog containing a different implementation descriptor.
+
+A synthetic non-identity materializer expands one physical dense component
+from `16` to `32` bytes without changing its logical tensor. Its focused
+contract proves:
+
+- plan-static memory increases by the exact `16` derived bytes;
+- the in-process semantic rebuild succeeds with the retained witness;
+- ordinary wire revalidation rejects the transformed plan;
+- wire revalidation succeeds only after the exact registry reissues a witness;
+- a materializer that changes logical dimensions is rejected;
+- a same-id catalog with a different implementation or required-capability
+  descriptor is rejected.
+
+Validation:
+
+```text
+cargo test -p ferrum-interfaces \
+  --test vnext_program_plan_compiler_contract_tests -- --test-threads=2
+10 passed; 0 failed
+```
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.60s
+```
+
+This is still source-only evidence and makes no performance claim. Runtime
+component materialization and the CUDA Marlin FP8 W8A16 provider remain
+unimplemented, so the paid CUDA lane remains closed and Vast `45319871`
+remains `stopped/exited`.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

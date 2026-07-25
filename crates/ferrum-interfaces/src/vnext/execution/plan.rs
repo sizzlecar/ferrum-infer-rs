@@ -20,9 +20,9 @@ use super::{
     ResolvedValueBinding, ResolvedValueRole, ResourceAllocation, ResourceId,
     ReusableExecutionMemoryPlan, ReusableExecutionPolicy, RuntimePolicy, Serialize,
     StateCapacityDemand, StateDependencyTracker, StateInitialization, StateLifetime, TensorAccess,
-    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
-    ValueResourceDemand, WeightFormatId, WeightSchema, EXECUTION_PLAN_SCHEMA,
-    MAX_EXECUTION_PLAN_WIRE_BYTES,
+    TrustedExecutionWeightPlan, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError,
+    ValueAllocationAccumulator, ValueResourceDemand, WeightFormatId, WeightSchema,
+    EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 use crate::vnext::{CompletionReadbackRequest, HostTransferLayout, ResourceWorkShape};
@@ -33,6 +33,8 @@ pub struct ExecutionPlan {
     pub(super) plan_hash: PlanHash,
     #[serde(skip)]
     pub(super) operation_registry_authority: OperationRegistryAuthority,
+    #[serde(skip)]
+    pub(super) trusted_execution_weights: TrustedExecutionWeightPlan,
 }
 
 #[derive(Deserialize)]
@@ -93,8 +95,10 @@ impl ExecutionPlan {
         }
         let family = request.family;
         let program = family.program();
-        request.execution_weights.validate_against_family(family)?;
-        let execution_weight_schema = request.execution_weights.schema();
+        request
+            .execution_weights
+            .validate_against_catalog(family, request.capabilities)?;
+        let execution_weight_schema = request.execution_weights.plan().schema();
         let prepared_family_fingerprint = family.fingerprint()?;
         let program_fingerprint = program.fingerprint()?;
         let capability_catalog_fingerprint = request.capabilities.fingerprint()?;
@@ -229,7 +233,7 @@ impl ExecutionPlan {
             policy_version: request.policy.version(),
             policy_fingerprint,
             maximum_scheduled_tokens,
-            execution_weights: request.execution_weights.clone(),
+            execution_weights: request.execution_weights.plan().clone(),
             weight_format,
             quantization_formats,
             retained_completion_values,
@@ -245,6 +249,7 @@ impl ExecutionPlan {
             payload,
             plan_hash,
             operation_registry_authority,
+            trusted_execution_weights: request.execution_weights,
         };
         plan.validate_internal()?;
         Ok(plan)
@@ -1975,7 +1980,8 @@ impl ExecutionPlan {
         self.payload
             .execution_weights
             .validate_structure(&self.payload.family_id)?;
-        if self.payload.weight_format != self.payload.execution_weights.schema().format_id
+        if &self.payload.execution_weights != self.trusted_execution_weights.plan()
+            || self.payload.weight_format != self.payload.execution_weights.schema().format_id
             || self.payload.quantization_formats
                 != self
                     .payload
@@ -2460,6 +2466,25 @@ impl ExecutionPlan {
         )
     }
 
+    pub fn from_json_validated_with_execution_weights<P: RuntimePolicy>(
+        bytes: &[u8],
+        family: &PreparedModelFamily,
+        capabilities: &CapabilityCatalog,
+        policy: &P,
+        node_resolutions: Vec<PlanNodeResolution>,
+        completion_retention: CompletionRetentionSpec,
+        execution_weights: TrustedExecutionWeightPlan,
+    ) -> Result<Self, VNextError> {
+        Self::decode_untrusted(bytes)?.revalidate_with_execution_weights(
+            family,
+            capabilities,
+            policy,
+            node_resolutions,
+            completion_retention,
+            execution_weights,
+        )
+    }
+
     pub fn validate_against<P: RuntimePolicy>(
         &self,
         family: &PreparedModelFamily,
@@ -2486,6 +2511,7 @@ impl ExecutionPlan {
     ) -> Result<(), VNextError> {
         let rebuilt = ExecutionPlan::build(
             PlanBuildRequest::new(family, capabilities, policy, node_resolutions.to_vec())?
+                .with_execution_weights(self.trusted_execution_weights.clone())?
                 .with_completion_retention(completion_retention)?,
         )?;
         if rebuilt.operation_registry_authority != self.operation_registry_authority {
