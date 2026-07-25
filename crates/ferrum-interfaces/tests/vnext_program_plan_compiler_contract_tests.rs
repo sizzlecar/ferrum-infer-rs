@@ -30,11 +30,16 @@ impl PaddedDenseMaterializer {
     }
 
     fn with_implementation_fingerprint(fingerprint_byte: char) -> Self {
+        Self::with_fidelity(fingerprint_byte, WeightMaterializationFidelity::Exact)
+    }
+
+    fn with_fidelity(fingerprint_byte: char, fidelity: WeightMaterializationFidelity) -> Self {
         Self {
             descriptor: WeightMaterializerDescriptor::new(
                 id("weight-materializer.test.padded-dense"),
                 ContractVersion::new(1, 0),
                 sha(fingerprint_byte),
+                fidelity,
                 BTreeSet::from([id("capability.compute")]),
             )
             .unwrap(),
@@ -110,6 +115,7 @@ impl LogicalMutationMaterializer {
                 id("weight-materializer.test.logical-mutation"),
                 ContractVersion::new(1, 0),
                 sha('7'),
+                WeightMaterializationFidelity::Exact,
                 BTreeSet::from([id("capability.compute")]),
             )
             .unwrap(),
@@ -225,6 +231,48 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
 }
 
 #[test]
+fn approximate_materializer_is_not_authorized_by_capability_registration() {
+    let family = TestRegistry::new().prepare();
+    let materializer_id: WeightMaterializerId = id("weight-materializer.test.padded-dense");
+    let materializers = WeightMaterializerRegistry::new(vec![Box::new(
+        PaddedDenseMaterializer::with_fidelity('9', WeightMaterializationFidelity::Approximate),
+    )])
+    .unwrap();
+    let catalog = materializers.augment_catalog(catalog()).unwrap();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let mut options = compile_options();
+    options.require_weight_materializer(materializer_id.clone());
+
+    assert_eq!(
+        catalog
+            .weight_materializer(&materializer_id)
+            .unwrap()
+            .fidelity(),
+        WeightMaterializationFidelity::Approximate
+    );
+    assert_eq!(
+        serde_json::to_value(catalog.weight_materializer(&materializer_id).unwrap()).unwrap()
+            ["fidelity"],
+        json!("approximate")
+    );
+    let error = ProgramPlanCompiler::compile_with_weight_materializers(
+        &family,
+        &catalog,
+        &policy(4096),
+        &registry.planning(),
+        &materializers,
+        &options,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires explicit numerical-quality approval"),
+        "{error}"
+    );
+}
+
+#[test]
 fn trusted_materializer_changes_physical_plan_memory_and_wire_requires_its_witness() {
     let family = TestRegistry::new().prepare();
     let materializers =
@@ -285,7 +333,7 @@ fn trusted_materializer_changes_physical_plan_memory_and_wire_requires_its_witne
     )
     .is_err());
     let trusted_weights = materializers
-        .select(&family, &catalog, &materializer_id)
+        .select_exact(&family, &catalog, &materializer_id)
         .unwrap();
     let mismatched_materializers = WeightMaterializerRegistry::new(vec![Box::new(
         PaddedDenseMaterializer::with_implementation_fingerprint('6'),
@@ -309,6 +357,7 @@ fn trusted_materializer_changes_physical_plan_memory_and_wire_requires_its_witne
                 materializer_id.clone(),
                 ContractVersion::new(1, 0),
                 sha('9'),
+                WeightMaterializationFidelity::Exact,
                 BTreeSet::new(),
             )
             .unwrap(),
@@ -320,6 +369,22 @@ fn trusted_materializer_changes_physical_plan_memory_and_wire_requires_its_witne
     assert!(PlanBuildRequest::new(
         &family,
         &capability_mutated_catalog,
+        &policy,
+        transformed.node_resolutions().to_vec(),
+    )
+    .unwrap()
+    .with_execution_weights(trusted_weights.clone())
+    .is_err());
+    let fidelity_mutated_materializers = WeightMaterializerRegistry::new(vec![Box::new(
+        PaddedDenseMaterializer::with_fidelity('9', WeightMaterializationFidelity::Approximate),
+    )])
+    .unwrap();
+    let fidelity_mutated_catalog = fidelity_mutated_materializers
+        .augment_catalog(vnext_core_contract::catalog())
+        .unwrap();
+    assert!(PlanBuildRequest::new(
+        &family,
+        &fidelity_mutated_catalog,
         &policy,
         transformed.node_resolutions().to_vec(),
     )
@@ -347,7 +412,7 @@ fn materializer_cannot_change_the_prepared_logical_weight_contract() {
             .unwrap();
     let catalog = materializers.augment_catalog(catalog()).unwrap();
     let error = materializers
-        .select(
+        .select_exact(
             &family,
             &catalog,
             &id("weight-materializer.test.logical-mutation"),

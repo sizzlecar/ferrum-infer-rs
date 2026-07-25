@@ -11,8 +11,20 @@ use super::{
 };
 
 pub const IDENTITY_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.identity";
-const IDENTITY_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const IDENTITY_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
 pub const MAX_WEIGHT_MATERIALIZERS: usize = 64;
+
+/// Whether a physical weight transformation preserves source values.
+///
+/// Kernel availability is not authorization to change model precision.
+/// Approximate materializers may be registered for capability discovery, but
+/// require a separate numerical-quality approval path before plan selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeightMaterializationFidelity {
+    Exact,
+    Approximate,
+}
 
 #[derive(Serialize)]
 struct IdentityMaterializerFingerprint<'a> {
@@ -26,7 +38,7 @@ fn identity_materializer_fingerprint() -> Result<String, VNextError> {
         &IdentityMaterializerFingerprint {
             id: IDENTITY_WEIGHT_MATERIALIZER_ID,
             version: IDENTITY_MATERIALIZER_VERSION,
-            contract: "execution-weight-plan.identity.v1",
+            contract: "execution-weight-plan.identity.v2",
         },
         "fingerprint identity weight materializer",
     )
@@ -43,6 +55,7 @@ pub struct WeightMaterializerDescriptor {
     id: WeightMaterializerId,
     version: ContractVersion,
     implementation_fingerprint: String,
+    fidelity: WeightMaterializationFidelity,
     required_capabilities: BTreeSet<CapabilityId>,
 }
 
@@ -51,12 +64,14 @@ impl WeightMaterializerDescriptor {
         id: WeightMaterializerId,
         version: ContractVersion,
         implementation_fingerprint: impl Into<String>,
+        fidelity: WeightMaterializationFidelity,
         required_capabilities: BTreeSet<CapabilityId>,
     ) -> Result<Self, VNextError> {
         let descriptor = Self {
             id,
             version,
             implementation_fingerprint: implementation_fingerprint.into(),
+            fidelity,
             required_capabilities,
         };
         descriptor.validate_structure()?;
@@ -68,6 +83,7 @@ impl WeightMaterializerDescriptor {
             WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
             IDENTITY_MATERIALIZER_VERSION,
             identity_materializer_fingerprint()?,
+            WeightMaterializationFidelity::Exact,
             BTreeSet::new(),
         )
     }
@@ -82,6 +98,10 @@ impl WeightMaterializerDescriptor {
 
     pub fn implementation_fingerprint(&self) -> &str {
         &self.implementation_fingerprint
+    }
+
+    pub const fn fidelity(&self) -> WeightMaterializationFidelity {
+        self.fidelity
     }
 
     pub fn required_capabilities(&self) -> &BTreeSet<CapabilityId> {
@@ -295,7 +315,13 @@ impl WeightMaterializerRegistry {
 
     /// Invokes the selected trusted implementation and returns a witness that
     /// cannot be forged by deserializing an [`ExecutionWeightPlan`].
-    pub fn select(
+    /// Selects a materializer that is value-preserving by contract.
+    ///
+    /// Approximate transforms require a future typed quality approval carrying
+    /// checked-in numerical-tolerance evidence. Keeping that authority out of
+    /// this entrypoint prevents a build feature or backend capability from
+    /// silently changing checkpoint precision.
+    pub fn select_exact(
         &self,
         family: &PreparedModelFamily,
         catalog: &CapabilityCatalog,
@@ -311,6 +337,11 @@ impl WeightMaterializerRegistry {
         if descriptor != catalog_descriptor {
             return Err(invalid_plan(format!(
                 "weight materializer `{materializer_id}` differs from its capability catalog descriptor"
+            )));
+        }
+        if descriptor.fidelity() != WeightMaterializationFidelity::Exact {
+            return Err(invalid_plan(format!(
+                "weight materializer `{materializer_id}` is approximate and requires explicit numerical-quality approval"
             )));
         }
         descriptor.validate_for_device(catalog.device())?;

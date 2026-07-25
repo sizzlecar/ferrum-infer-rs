@@ -68,6 +68,7 @@ impl DerivedComponentMaterializer {
                 id("weight-materializer.test.derived-components"),
                 ContractVersion::new(1, 0),
                 sha('8'),
+                WeightMaterializationFidelity::Exact,
                 BTreeSet::from([id("capability.compute")]),
             )
             .unwrap(),

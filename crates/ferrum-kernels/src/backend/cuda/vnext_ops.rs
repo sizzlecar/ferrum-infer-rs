@@ -219,22 +219,16 @@ impl CudaVNextComposition {
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[cfg(feature = "vllm-marlin")]
-        let (weight_materializers, weight_materializer_id) = (
-            WeightMaterializerRegistry::new(vec![
-                crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
-                    .map_err(contract_error)?,
-            ])
-            .map_err(contract_error)?,
-            WeightMaterializerId::new(
-                crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
-            )
-            .map_err(contract_error)?,
-        );
+        let weight_materializers = WeightMaterializerRegistry::new(vec![
+            crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
+                .map_err(contract_error)?,
+        ])
+        .map_err(contract_error)?;
         #[cfg(not(feature = "vllm-marlin"))]
-        let (weight_materializers, weight_materializer_id) = (
-            WeightMaterializerRegistry::identity_only().map_err(contract_error)?,
-            WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID).map_err(contract_error)?,
-        );
+        let weight_materializers =
+            WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
+        let weight_materializer_id =
+            WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID).map_err(contract_error)?;
         let engine = EngineProviderDescriptor::new(
             ProviderId::new(CUDA_ENGINE_PROVIDER_ID).map_err(contract_error)?,
             ContractVersion::new(1, 0),
