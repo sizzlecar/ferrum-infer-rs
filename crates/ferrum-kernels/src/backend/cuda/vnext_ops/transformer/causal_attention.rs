@@ -2422,7 +2422,7 @@ mod tests {
     #[test]
     fn vllm_page_geometry_covers_goal_model_families() {
         let cases = [
-            ("qwen35-dense-or-moe", goal_shape(16, 4, 256, 32_768), 1),
+            ("qwen35-dense-or-moe", goal_shape(16, 2, 256, 32_768), 2),
             ("qwen3-moe", goal_shape(32, 4, 128, 32_768), 2),
             ("llama-8b-dense", goal_shape(32, 8, 128, 32_768), 1),
         ];
@@ -2479,6 +2479,44 @@ mod tests {
         let addresses = binding_addresses(layout, 3, &[0x10_0000, 0x20_0000]).unwrap();
         assert_eq!(addresses, vec![0x10_0000, 0x10_0000 + 32 * 1024, 0x20_0000]);
         assert!(binding_addresses(layout, 5, &[0x10_0000, 0x20_0000]).is_err());
+    }
+
+    #[test]
+    fn qwen35_block_49_to_50_reuses_the_second_half_of_page_25() {
+        let qwen35 = goal_shape(16, 2, 256, 4_096);
+        let layout = qwen35.kv_layout().unwrap();
+        assert_eq!(
+            layout,
+            CausalKvLayout::VllmBlocks16 {
+                combined_block_bytes: 32 * 1024,
+                blocks_per_page: 2,
+            }
+        );
+        assert_eq!(qwen35.table_entries(784).unwrap(), 49);
+        assert_eq!(qwen35.table_entries(785).unwrap(), 50);
+        assert_eq!(
+            qwen35.physical_state_bytes(784).unwrap(),
+            25 * VNEXT_KV_PAGE_BYTES
+        );
+        assert_eq!(
+            qwen35.physical_state_bytes(785).unwrap(),
+            25 * VNEXT_KV_PAGE_BYTES
+        );
+
+        let pages = (0..25)
+            .map(|index| 0x10_0000 + index * 2 * VNEXT_KV_PAGE_BYTES)
+            .collect::<Vec<_>>();
+        let before = binding_addresses(layout, 49, &pages).unwrap();
+        let after = binding_addresses(layout, 50, &pages).unwrap();
+        assert_eq!(before[48], pages[24]);
+        assert_eq!(after[48], pages[24]);
+        assert_eq!(after[49], pages[24] + 32 * 1024);
+        assert_eq!(after[..49], before);
+
+        let payload_bytes =
+            BINDING_CONTROL_BYTES + u64::try_from(after.len()).unwrap() * POINTER_BYTES;
+        assert_eq!(payload_bytes, 416);
+        assert!(payload_bytes <= qwen35.binding_slot_bytes().unwrap());
     }
 
     #[test]
