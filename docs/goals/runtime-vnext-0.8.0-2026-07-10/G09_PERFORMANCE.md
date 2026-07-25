@@ -1648,6 +1648,54 @@ Implicit requantization is prohibited. The complete package is on GitHub branch
 The paid instance was verified `stopped/exited`, with zero paid or transitional
 sibling instance.
 
+### 2026-07-25 Typed Sparse Repetition c32 Checkpoint
+
+The next bounded lever targeted the product-default decode readback, not another
+c1 kernel change. Clean `acf9a6694a1dbdca723dfd4c84313df4c6dea7ab` completed
+the same-hardware random `64/32` c32 diagnostic at `109.164260 tok/s`, but the
+trace showed that all `164` greedy decode waves fell back to full logits because
+the typed selected-token operation could not express the default
+`repetition_penalty=1.1`. It copied `1,167,104,000` bytes back to the host and
+therefore produced a product-integration REJECT, not evidence for the device
+argmax lever.
+
+Commit `90057af124e43f1525de40db5b293958e2871cb7` adds exact typed sparse
+repetition inputs to the shared operation and both accelerator providers. After
+the nine focused correctness cases passed, the same retained RTX 4090, model
+revision, product config, workload, seed, request count, warmup count, and
+single-repeat benchmark produced:
+
+| metric | `acf9a669` | `90057af1` | delta |
+|---|---:|---:|---:|
+| c32 output throughput | `109.164260 tok/s` | `121.002505 tok/s` | `+10.8444%` |
+| readback bytes | `1,167,104,000` | `61,592,288` | `-94.7226%` |
+| greedy token waves | `0` | `166` | `+166` |
+| greedy policy fallback waves | `164` | `0` | `-164` |
+| sparse repetition waves | n/a | `166` | `+166` |
+
+The new run completed `64/64`, with zero request errors, zero quality counters,
+usage-sourced output token counts, final active/queued counts of zero, and no
+panic/OOM/log corruption. Its `42` remaining full-logits waves are prefill; the
+decode fallback counter is zero.
+
+```text
+CUDA VNEXT SPARSE REPETITION INTEGRATION KEEP: /workspace/ferrum-artifacts/runtime-vnext-sparse-repetition-cuda-90057af1-20260725T131140Z/diagnostic-summary.json
+```
+
+This accepts the typed product integration and rejects the old full-logits
+failure class. It does not produce G09 PASS: `n_repeats=1` has no CI, c1/c4/c16
+were not rerun, same-host vLLM comparison is absent, the three-model/two-backend
+matrix is incomplete, and the absolute c32 competitive floor is not waived.
+Before another paid run, current artifacts must be compared with the best
+historical Ferrum and vLLM source/release baseline to choose a new trace-backed
+bottleneck; the successful readback lever does not authorize an unscoped full
+sweep. Evidence is on GitHub branch
+`artifact/runtime-vnext-sparse-repetition-90057af1-20260725` at
+`65dfab41344a3751e2eff99e7b8d6ffbca6784c8`, archive SHA256
+`1cd3b1fc3e656ecce8cd9f71f23877404f208665ed4e1596b1304917983637d2`.
+The paid instance was verified `stopped/exited`, with zero paid or transitional
+sibling.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

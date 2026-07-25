@@ -1200,6 +1200,54 @@ on GitHub branch
 Vast instance `45319871` reached `stopped/exited`, with no paid or transitional
 sibling instance.
 
+### 2026-07-25 Typed Sparse Repetition Product Integration
+
+Clean `acf9a6694a1dbdca723dfd4c84313df4c6dea7ab` proved that the typed
+selected-token output was present but not selected by the product default.
+The bounded c32 artifact completed `64/64` requests at `109.164260 tok/s`, but
+reported:
+
+- `greedy_token_waves=0`;
+- `greedy_policy_fallback_waves=164`;
+- `full_logits_waves=202`;
+- `readback_bytes=1,167,104,000`.
+
+The failure class was
+`product-default-repetition-penalty-forces-full-logits-fallback`: the default
+`repetition_penalty=1.1` was intentionally preserved, but the v1 masked-argmax
+operation had no typed representation for it.
+
+Commit `90057af124e43f1525de40db5b293958e2871cb7` resolves that contract gap
+without changing the product default or silently changing model precision.
+`LAST_TOKEN_MASKED_ARGMAX` v2 carries a fixed-capacity U32 token-id tensor,
+U32 offsets, and an F32 penalty. CUDA reuses the existing exact sparse
+repetition kernel before masked argmax; Metal applies the same semantics inside
+the argmax kernel. Host upload length is the active unique-token prefix, while
+the resolved plan and replay key retain fixed shapes. Failed or indeterminate
+token-mask uploads invalidate the host slot cache until terminal success.
+
+Local focused contract/model/engine tests, the real Metal numerical primitive
+test, and the Metal CLI test build passed. The clean official-feature CUDA
+release build took `5m12s`; binary SHA256 was
+`91fd54480881f265fd75b74a24d9b2670d9af3db06b8231d850f81201adb430c`.
+The current-HEAD focused runner then selected the same nine C03/C05/C06/C17
+cases and passed all nine:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-sparse-repetition-cuda-90057af1-20260725T131140Z/correctness/m2-qwen35-35b-a3b/cuda/focused-sparse-repetition-report.json
+```
+
+This covers `ferrum run` multi-turn, `serve` non-stream, streaming usage with
+one `[DONE]`, and exact Chinese/emoji/combining-character output. It remains a
+focused KEEP, not G08B PASS: tools, structured output, affected concurrency
+sentinels, the full 703-case CUDA matrix, the full Metal matrix, and legacy
+deletion are still open. The artifact is on GitHub branch
+`artifact/runtime-vnext-sparse-repetition-90057af1-20260725` at
+`65dfab41344a3751e2eff99e7b8d6ffbca6784c8`; archive SHA256 is
+`1cd3b1fc3e656ecce8cd9f71f23877404f208665ed4e1596b1304917983637d2`.
+Vast instance `45319871` was stopped and polled to `stopped/exited`, with no
+paid or transitional sibling.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
