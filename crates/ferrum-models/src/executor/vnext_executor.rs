@@ -23,8 +23,8 @@ use ferrum_interfaces::model_executor::{
     ExecutorMemoryUsage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
     ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
     ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorSequenceCompletion,
-    ExecutorState, ExecutorStatus, MemoryRequirements, PlanRuntimeResourceSnapshot, PrefillChunk,
-    PrefillInput, PrefillOutput,
+    ExecutorState, ExecutorStatus, LogitsReturnPolicy, MemoryRequirements,
+    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -483,15 +483,29 @@ impl VNextStartupPreparationState {
 }
 
 #[derive(Debug, Clone)]
+struct VNextLanguageIoIds {
+    token_input: ProgramValueId,
+    token_mask_input: ProgramValueId,
+    logits_output: ProgramValueId,
+    greedy_token_output: ProgramValueId,
+}
+
+#[derive(Debug, Clone)]
 struct VNextIoBinding {
     input_node_id: NodeId,
     input_ordinal: u32,
+    token_mask_input_node_id: NodeId,
+    token_mask_input_ordinal: u32,
     output_node_id: NodeId,
     output_resource_id: ResourceId,
     output_offset_bytes: u64,
     output_layout: HostTransferLayout,
     output_element_type: ElementType,
     output_elements: usize,
+    greedy_token_output_node_id: NodeId,
+    greedy_token_output_resource_id: ResourceId,
+    greedy_token_output_offset_bytes: u64,
+    greedy_token_output_layout: HostTransferLayout,
 }
 
 struct VNextReusableExecutionCatalog {
@@ -528,6 +542,9 @@ struct VNextExecutorMetrics {
     backing_deferrals: AtomicU64,
     uploaded_bytes: AtomicU64,
     readback_bytes: AtomicU64,
+    full_logits_readback_waves: AtomicU64,
+    greedy_token_readback_waves: AtomicU64,
+    greedy_policy_fallback_waves: AtomicU64,
     total_prefill_us: AtomicU64,
     total_decode_us: AtomicU64,
     wave_timing: VNextWaveTimingMetrics,
@@ -543,6 +560,93 @@ struct VNextExecutorMetrics {
 enum VNextExecutionWaveKind {
     Prefill,
     Decode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VNextProductOutputMode {
+    FullLogits,
+    GreedyToken,
+}
+
+fn product_output_mode_for_policies<'a>(
+    kind: VNextExecutionWaveKind,
+    policies: impl IntoIterator<Item = Option<&'a LogitsReturnPolicy>>,
+) -> VNextProductOutputMode {
+    if kind != VNextExecutionWaveKind::Decode {
+        return VNextProductOutputMode::FullLogits;
+    }
+    let mut has_participant = false;
+    for policy in policies {
+        has_participant = true;
+        if !matches!(
+            policy,
+            Some(LogitsReturnPolicy::GreedyArgmax {
+                repetition_penalty: None,
+                ..
+            })
+        ) {
+            return VNextProductOutputMode::FullLogits;
+        }
+    }
+    if has_participant {
+        VNextProductOutputMode::GreedyToken
+    } else {
+        VNextProductOutputMode::FullLogits
+    }
+}
+
+fn normalized_product_token_mask(
+    policy: Option<&LogitsReturnPolicy>,
+    output_mode: VNextProductOutputMode,
+    vocabulary_size: usize,
+) -> Vec<u8> {
+    let mut output = vec![1_u8; vocabulary_size];
+    if output_mode != VNextProductOutputMode::GreedyToken {
+        return output;
+    }
+    let Some(LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(token_mask),
+        repetition_penalty: None,
+    }) = policy
+    else {
+        return output;
+    };
+    output.fill(0);
+    for (destination, source) in output
+        .iter_mut()
+        .zip(token_mask.valid_token_mask.iter().copied())
+    {
+        *destination = u8::from(source != 0);
+    }
+    output
+}
+
+fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<Vec<f32>> {
+    let token_bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+        FerrumError::backend(format!(
+            "vNext selected-token readback contains {} bytes, expected 4",
+            bytes.len()
+        ))
+    })?;
+    let token = u32::from_le_bytes(token_bytes);
+    if usize::try_from(token)
+        .ok()
+        .is_none_or(|token| token >= vocabulary_size)
+    {
+        return Err(FerrumError::backend(format!(
+            "vNext masked argmax returned invalid token {token} for vocabulary {vocabulary_size}"
+        )));
+    }
+    Ok(vec![token as f32])
+}
+
+fn decode_output_width(output_elements: usize, vocabulary_size: usize) -> Result<usize> {
+    if output_elements == 1 || output_elements == vocabulary_size {
+        return Ok(output_elements);
+    }
+    Err(FerrumError::model(format!(
+        "vNext decode output contains {output_elements} elements, expected one selected token or {vocabulary_size} logits"
+    )))
 }
 
 enum VNextTerminalReadbacks {
@@ -1267,6 +1371,9 @@ impl VNextExecutorMetrics {
             &self.backing_deferrals,
             &self.uploaded_bytes,
             &self.readback_bytes,
+            &self.full_logits_readback_waves,
+            &self.greedy_token_readback_waves,
+            &self.greedy_policy_fallback_waves,
             &self.total_prefill_us,
             &self.total_decode_us,
         ] {
@@ -1785,6 +1892,7 @@ struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
     sequence: &'a Arc<VNextSequence<R>>,
     tokens: &'a [u32],
     span: &'a TokenSpanWork,
+    logits_policy: Option<&'a LogitsReturnPolicy>,
 }
 
 struct VNextDecodeCandidate<R: DeviceRuntime> {
@@ -1792,6 +1900,7 @@ struct VNextDecodeCandidate<R: DeviceRuntime> {
     sequence: Arc<VNextSequence<R>>,
     cache_id: String,
     next_token: u32,
+    logits_policy: LogitsReturnPolicy,
 }
 
 struct VNextPrefillCandidate<R: DeviceRuntime> {
@@ -2729,6 +2838,73 @@ impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
+    fn resolve_language_io_ids(program: &ModelProgram) -> Result<VNextLanguageIoIds> {
+        let embedding_nodes = program
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .filter(|node| node.operation_id.as_str() == TOKEN_EMBEDDING_OPERATION_ID)
+            .collect::<Vec<_>>();
+        let [embedding] = embedding_nodes.as_slice() else {
+            return Err(FerrumError::model(format!(
+                "vNext language program requires exactly one token embedding operation, got {}",
+                embedding_nodes.len()
+            )));
+        };
+        let token_input = embedding.inputs.first().cloned().ok_or_else(|| {
+            FerrumError::model("vNext token embedding operation has no token input")
+        })?;
+
+        let argmax_nodes = program
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .filter(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
+            .collect::<Vec<_>>();
+        let [argmax] = argmax_nodes.as_slice() else {
+            return Err(FerrumError::model(format!(
+                "vNext language program requires exactly one masked argmax operation, got {}",
+                argmax_nodes.len()
+            )));
+        };
+        let [logits_output, token_mask_input] = argmax.inputs.as_slice() else {
+            return Err(FerrumError::model(
+                "vNext masked argmax operation must consume logits and a token mask",
+            ));
+        };
+        let [greedy_token_output] = argmax.outputs.as_slice() else {
+            return Err(FerrumError::model(
+                "vNext masked argmax operation must produce one token",
+            ));
+        };
+        let expected_inputs = [&token_input, token_mask_input];
+        if program.inputs().len() != expected_inputs.len()
+            || expected_inputs
+                .iter()
+                .any(|expected| !program.inputs().contains(expected))
+        {
+            return Err(FerrumError::model(
+                "vNext language program inputs must be the token ids and typed selection mask",
+            ));
+        }
+        let expected_outputs = [logits_output, greedy_token_output];
+        if program.outputs().len() != expected_outputs.len()
+            || expected_outputs
+                .iter()
+                .any(|expected| !program.outputs().contains(expected))
+        {
+            return Err(FerrumError::model(
+                "vNext language program outputs must expose full logits and the selected token",
+            ));
+        }
+        Ok(VNextLanguageIoIds {
+            token_input,
+            token_mask_input: token_mask_input.clone(),
+            logits_output: logits_output.clone(),
+            greedy_token_output: greedy_token_output.clone(),
+        })
+    }
+
     pub fn from_runtime_composition<F>(
         prepared: &PreparedProductionModel,
         info: ModelInfo,
@@ -2756,34 +2932,29 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             engine_config.runtime.vnext_checkpoint_capture.as_ref(),
         )?;
         let family = prepared.family();
-        let input_id = match family.program().inputs() {
-            [input] => input.clone(),
-            inputs => {
-                return Err(FerrumError::model(format!(
-                    "vNext language executor requires exactly one token input, got {}",
-                    inputs.len()
-                )))
-            }
-        };
-        let output_id = match family.program().outputs() {
-            [output] => output.clone(),
-            outputs => {
-                return Err(FerrumError::model(format!(
-                    "vNext language executor requires exactly one logits output, got {}",
-                    outputs.len()
-                )))
-            }
-        };
+        let language_io = Self::resolve_language_io_ids(family.program())?;
         let input_capacity = u64::try_from(config.maximum_model_tokens)
             .map_err(|_| FerrumError::config("vNext model length exceeds u64"))?;
-        let mut compile_options = ProgramPlanCompileOptions::new(BTreeMap::from([(
-            input_id.clone(),
-            ProgramTensorSpec {
-                dimensions: vec![input_capacity],
-                element_type: ElementType::U32,
-                layout: ResolvedTensorLayout::Contiguous,
-            },
-        )]))
+        let vocabulary_size = u64::try_from(info.vocab_size)
+            .map_err(|_| FerrumError::config("vNext vocabulary exceeds u64"))?;
+        let mut compile_options = ProgramPlanCompileOptions::new(BTreeMap::from([
+            (
+                language_io.token_input.clone(),
+                ProgramTensorSpec {
+                    dimensions: vec![input_capacity],
+                    element_type: ElementType::U32,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+            ),
+            (
+                language_io.token_mask_input.clone(),
+                ProgramTensorSpec {
+                    dimensions: vec![vocabulary_size],
+                    element_type: ElementType::U8,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+            ),
+        ]))
         .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?;
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut compile_options);
@@ -2811,7 +2982,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .bind_plan(&resolved_plan)
             .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;
         resolve_bind_phase.finish();
-        let io = Self::resolve_io(&resolved_plan, &input_id, &output_id, info.vocab_size)?;
+        let io = Self::resolve_io(&resolved_plan, &language_io, info.vocab_size)?;
         let family_fingerprint = family
             .fingerprint()
             .map_err(|error| FerrumError::model(error.to_string()))?;
@@ -3462,8 +3633,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn resolve_io(
         executable: &impl ExecutablePlanView,
-        input_id: &ProgramValueId,
-        output_id: &ProgramValueId,
+        language_io: &VNextLanguageIoIds,
         expected_vocab: usize,
     ) -> Result<VNextIoBinding> {
         let nodes = executable.execution_plan().payload().nodes();
@@ -3471,14 +3641,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
             .filter(|(_, value)| {
-                value.value_id() == input_id && value.role() == ResolvedValueRole::Input
+                value.value_id() == &language_io.token_input
+                    && value.role() == ResolvedValueRole::Input
             })
             .collect::<Vec<_>>();
-        let output_matches = nodes
+        let token_mask_input_matches = nodes
             .iter()
             .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
             .filter(|(_, value)| {
-                value.value_id() == output_id && value.role() == ResolvedValueRole::Output
+                value.value_id() == &language_io.token_mask_input
+                    && value.role() == ResolvedValueRole::Input
+            })
+            .collect::<Vec<_>>();
+        let logits_output_matches = nodes
+            .iter()
+            .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
+            .filter(|(_, value)| {
+                value.value_id() == &language_io.logits_output
+                    && value.role() == ResolvedValueRole::Output
+            })
+            .collect::<Vec<_>>();
+        let greedy_token_output_matches = nodes
+            .iter()
+            .flat_map(|node| node.values().iter().map(move |value| (node.id(), value)))
+            .filter(|(_, value)| {
+                value.value_id() == &language_io.greedy_token_output
+                    && value.role() == ResolvedValueRole::Output
             })
             .collect::<Vec<_>>();
         let [(input_node_id, input)] = input_matches.as_slice() else {
@@ -3486,14 +3674,40 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "compiled vNext plan must bind the token input exactly once",
             ));
         };
-        let [(output_node_id, output)] = output_matches.as_slice() else {
+        let [(token_mask_input_node_id, token_mask_input)] = token_mask_input_matches.as_slice()
+        else {
+            return Err(FerrumError::model(
+                "compiled vNext plan must bind the token-selection mask exactly once",
+            ));
+        };
+        let [(output_node_id, output)] = logits_output_matches.as_slice() else {
             return Err(FerrumError::model(
                 "compiled vNext plan must bind the logits output exactly once",
+            ));
+        };
+        let [(greedy_token_output_node_id, greedy_token_output)] =
+            greedy_token_output_matches.as_slice()
+        else {
+            return Err(FerrumError::model(
+                "compiled vNext plan must bind the selected-token output exactly once",
             ));
         };
         if input.tensor().element_type() != ElementType::U32 {
             return Err(FerrumError::model(
                 "compiled vNext token input must use U32 elements",
+            ));
+        }
+        let expected_vocab_u64 = u64::try_from(expected_vocab)
+            .map_err(|_| FerrumError::model("vNext vocabulary exceeds u64"))?;
+        if token_mask_input.tensor().element_type() != ElementType::U8
+            || token_mask_input.tensor().dimensions() != [expected_vocab_u64]
+            || !matches!(
+                token_mask_input.tensor().layout(),
+                ResolvedTensorLayout::Contiguous
+            )
+        {
+            return Err(FerrumError::model(
+                "compiled vNext token-selection mask must be contiguous U8[vocab]",
             ));
         }
         let [component] = output.storage().components() else {
@@ -3525,15 +3739,35 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let output_layout = HostTransferLayout::new(output_element_type, output_elements_u64)
             .map_err(|error| FerrumError::model(error.to_string()))?;
+        let [greedy_token_component] = greedy_token_output.storage().components() else {
+            return Err(FerrumError::model(
+                "compiled vNext selected-token output must use one physical component",
+            ));
+        };
+        if greedy_token_output.tensor().element_type() != ElementType::U32
+            || greedy_token_output.tensor().dimensions() != [1]
+        {
+            return Err(FerrumError::model(
+                "compiled vNext selected-token output must be U32[1]",
+            ));
+        }
+        let greedy_token_output_layout = HostTransferLayout::new(ElementType::U32, 1)
+            .map_err(|error| FerrumError::model(error.to_string()))?;
         Ok(VNextIoBinding {
             input_node_id: (*input_node_id).clone(),
             input_ordinal: input.ordinal(),
+            token_mask_input_node_id: (*token_mask_input_node_id).clone(),
+            token_mask_input_ordinal: token_mask_input.ordinal(),
             output_node_id: (*output_node_id).clone(),
             output_resource_id: component.resource_id().clone(),
             output_offset_bytes: component.offset_bytes(),
             output_layout,
             output_element_type,
             output_elements,
+            greedy_token_output_node_id: (*greedy_token_output_node_id).clone(),
+            greedy_token_output_resource_id: greedy_token_component.resource_id().clone(),
+            greedy_token_output_offset_bytes: greedy_token_component.offset_bytes(),
+            greedy_token_output_layout,
         })
     }
 
@@ -4263,11 +4497,36 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    fn product_output_mode(
+        participants: &[VNextExecutionParticipant<'_, R>],
+        kind: VNextExecutionWaveKind,
+    ) -> VNextProductOutputMode {
+        product_output_mode_for_policies(
+            kind,
+            participants
+                .iter()
+                .map(|participant| participant.logits_policy),
+        )
+    }
+
+    fn product_token_mask(
+        &self,
+        participant: &VNextExecutionParticipant<'_, R>,
+        output_mode: VNextProductOutputMode,
+    ) -> Vec<u8> {
+        normalized_product_token_mask(
+            participant.logits_policy,
+            output_mode,
+            self.io.output_elements,
+        )
+    }
+
     fn dispatch_participant_wave(
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         wave: PreparedStepSubmissionWave<R>,
         kind: VNextExecutionWaveKind,
+        output_mode: VNextProductOutputMode,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() {
             return DispatchOutcome::QuiescentFailure(
@@ -4281,7 +4540,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
-        let uploads = match {
+        let mut uploads = match {
             let _timing = self
                 .metrics
                 .wave_timing
@@ -4345,6 +4604,42 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok(uploads) => uploads,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
+        let token_mask_elements = match u64::try_from(self.io.output_elements) {
+            Ok(elements) => elements,
+            Err(_) => {
+                return DispatchOutcome::QuiescentFailure(
+                    "vNext token-mask length exceeds u64".to_owned(),
+                )
+            }
+        };
+        let token_mask_layout = match HostTransferLayout::new(ElementType::U8, token_mask_elements)
+        {
+            Ok(layout) => layout,
+            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+        };
+        let token_mask_uploads = participants
+            .iter()
+            .enumerate()
+            .map(|(participant_index, participant)| {
+                SubmissionWaveInputUpload::new(
+                    self.io.token_mask_input_node_id.clone(),
+                    u32::try_from(participant_index).map_err(|_| {
+                        FerrumError::backend(
+                            "vNext token-mask upload participant index exceeds u32",
+                        )
+                    })?,
+                    self.io.token_mask_input_ordinal,
+                    0,
+                    token_mask_layout,
+                    self.product_token_mask(participant, output_mode),
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>();
+        match token_mask_uploads {
+            Ok(token_mask_uploads) => uploads.extend(token_mask_uploads),
+            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+        }
         let uploaded_bytes = uploads.iter().fold(0_u64, |total, upload| {
             total.saturating_add(upload.source_layout().byte_len().unwrap_or(0))
         });
@@ -4620,6 +4915,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &Arc<VNextSequence<R>>,
         tokens: &[u32],
         span: TokenSpanWork,
+        logits_policy: &LogitsReturnPolicy,
     ) -> Result<Vec<f32>> {
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
@@ -4643,6 +4939,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             span,
             prepared,
             VNextExecutionWaveKind::Decode,
+            Some(logits_policy),
         )
         .await
     }
@@ -4654,10 +4951,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         token_batches: &[Vec<u32>],
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
+        logits_policies: Option<&[LogitsReturnPolicy]>,
     ) -> Result<VNextExecutionCapacityDecision<Vec<Vec<f32>>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
+            || logits_policies.is_some_and(|policies| policies.len() != sequences.len())
+            || (kind == VNextExecutionWaveKind::Decode) != logits_policies.is_some()
             || sequences.len() != batch.sessions().len()
             || batch
                 .sessions()
@@ -4700,11 +5000,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .zip(token_batches)
             .zip(spans)
-            .map(|((sequence, tokens), span)| VNextExecutionParticipant {
-                sequence,
-                tokens,
-                span,
-            })
+            .enumerate()
+            .map(
+                |(participant_index, ((sequence, tokens), span))| VNextExecutionParticipant {
+                    sequence,
+                    tokens,
+                    span,
+                    logits_policy: logits_policies.map(|policies| &policies[participant_index]),
+                },
+            )
             .collect::<Vec<_>>();
         self.execute_prepared_participants(&participants, prepared, kind)
             .await
@@ -4718,11 +5022,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         span: TokenSpanWork,
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
+        logits_policy: Option<&LogitsReturnPolicy>,
     ) -> Result<Vec<f32>> {
         let participant = VNextExecutionParticipant {
             sequence,
             tokens,
             span: &span,
+            logits_policy,
         };
         let mut logits = self
             .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
@@ -4749,11 +5055,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         } else {
             None
         };
-        let readbacks = self.prepare_terminal_readbacks(participants, capture_index)?;
+        let output_mode = Self::product_output_mode(participants, kind);
+        let readbacks =
+            self.prepare_terminal_readbacks(participants, capture_index, output_mode)?;
         let dispatch = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
             let _phase_timing = phase_timing.host_encode_submit.start();
-            self.dispatch_participant_wave(participants, wave, kind)
+            self.dispatch_participant_wave(participants, wave, kind, output_mode)
         };
         let mut execution_event_error = None;
         let (completion, attribution) = match dispatch {
@@ -4927,39 +5235,49 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 readback_bytes = readback_bytes
                     .saturating_add(output.request().output_layout().byte_len().unwrap_or(0));
                 let request = output.request();
-                let is_logits = request.node_id() == &self.io.output_node_id
-                    && request.resource_id() == &self.io.output_resource_id
-                    && request.logical_offset_bytes() == self.io.output_offset_bytes
-                    && request.output_layout() == self.io.output_layout;
+                let is_product_output = match output_mode {
+                    VNextProductOutputMode::FullLogits => {
+                        request.node_id() == &self.io.output_node_id
+                            && request.resource_id() == &self.io.output_resource_id
+                            && request.logical_offset_bytes() == self.io.output_offset_bytes
+                            && request.output_layout() == self.io.output_layout
+                    }
+                    VNextProductOutputMode::GreedyToken => {
+                        request.node_id() == &self.io.greedy_token_output_node_id
+                            && request.resource_id() == &self.io.greedy_token_output_resource_id
+                            && request.logical_offset_bytes()
+                                == self.io.greedy_token_output_offset_bytes
+                            && request.output_layout() == self.io.greedy_token_output_layout
+                    }
+                };
                 let checkpoint = capture_index
                     .and_then(|_| self.checkpoint_capture.as_ref())
                     .and_then(|capture| capture.checkpoint_for_output(output));
-                if !is_logits && checkpoint.is_none() {
+                if !is_product_output && checkpoint.is_none() {
                     return Err(FerrumError::internal(format!(
                         "vNext terminal readback returned unowned node/resource {}/{}",
                         request.node_id(),
                         request.resource_id()
                     )));
                 }
-                if is_logits {
+                if is_product_output {
                     let participant_index =
                         usize::try_from(request.participant_index()).map_err(|_| {
-                            FerrumError::internal("vNext logits participant index exceeds usize")
+                            FerrumError::internal(
+                                "vNext product-output participant index exceeds usize",
+                            )
                         })?;
                     let slot = logits.get_mut(participant_index).ok_or_else(|| {
                         FerrumError::internal(
-                            "vNext logits participant index exceeds submitted participants",
+                            "vNext product-output participant index exceeds submitted participants",
                         )
                     })?;
                     if slot.is_some() {
                         return Err(FerrumError::internal(
-                            "vNext terminal readback returned duplicate participant logits",
+                            "vNext terminal readback returned duplicate participant output",
                         ));
                     }
-                    *slot = Some(Self::decode_logits(
-                        output.bytes(),
-                        self.io.output_element_type,
-                    )?);
+                    *slot = Some(self.decode_product_output(output.bytes(), output_mode)?);
                 }
                 if let (Some(capture_index), Some(capture), Some(checkpoint)) =
                     (capture_index, self.checkpoint_capture.as_ref(), checkpoint)
@@ -4990,7 +5308,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map(|(participant_index, logits)| {
                     logits.ok_or_else(|| {
                         FerrumError::internal(format!(
-                            "vNext terminal readback omitted participant {participant_index} logits"
+                            "vNext terminal readback omitted participant {participant_index} product output"
                         ))
                     })
                 })
@@ -5021,6 +5339,30 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.metrics
             .readback_bytes
             .fetch_add(readback_bytes, Ordering::Relaxed);
+        match output_mode {
+            VNextProductOutputMode::FullLogits => {
+                self.metrics
+                    .full_logits_readback_waves
+                    .fetch_add(1, Ordering::Relaxed);
+                if kind == VNextExecutionWaveKind::Decode
+                    && participants.iter().any(|participant| {
+                        matches!(
+                            participant.logits_policy,
+                            Some(LogitsReturnPolicy::GreedyArgmax { .. })
+                        )
+                    })
+                {
+                    self.metrics
+                        .greedy_policy_fallback_waves
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            VNextProductOutputMode::GreedyToken => {
+                self.metrics
+                    .greedy_token_readback_waves
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         drop(receipt);
         match step.try_retire_normal() {
             Ok(_) => {
@@ -5045,26 +5387,42 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         capture_index: Option<usize>,
+        output_mode: VNextProductOutputMode,
     ) -> Result<VNextTerminalReadbacks> {
-        let logits_readbacks = participants
+        let (output_node_id, output_resource_id, output_offset_bytes, output_layout) =
+            match output_mode {
+                VNextProductOutputMode::FullLogits => (
+                    &self.io.output_node_id,
+                    &self.io.output_resource_id,
+                    self.io.output_offset_bytes,
+                    self.io.output_layout,
+                ),
+                VNextProductOutputMode::GreedyToken => (
+                    &self.io.greedy_token_output_node_id,
+                    &self.io.greedy_token_output_resource_id,
+                    self.io.greedy_token_output_offset_bytes,
+                    self.io.greedy_token_output_layout,
+                ),
+            };
+        let product_readbacks = participants
             .iter()
             .enumerate()
             .map(|(participant_index, _)| {
                 CompletionReadbackRequest::new(
-                    self.io.output_node_id.clone(),
+                    output_node_id.clone(),
                     u32::try_from(participant_index).map_err(|_| {
                         FerrumError::backend("vNext readback participant index exceeds u32")
                     })?,
-                    self.io.output_resource_id.clone(),
-                    self.io.output_offset_bytes,
-                    self.io.output_layout,
+                    output_resource_id.clone(),
+                    output_offset_bytes,
+                    output_layout,
                 )
                 .map_err(|error| FerrumError::backend(error.to_string()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let logits_readbacks = CompletionReadbackBatchRequest::new(logits_readbacks)
+        let product_readbacks = CompletionReadbackBatchRequest::new(product_readbacks)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let mut readback_batches = vec![logits_readbacks.clone()];
+        let mut readback_batches = vec![product_readbacks.clone()];
         if capture_index.is_some() {
             let capture = self.checkpoint_capture.as_ref().ok_or_else(|| {
                 FerrumError::internal("vNext checkpoint capture index has no capture owner")
@@ -5077,13 +5435,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 capture.readback_batches(self.resolved_plan.execution_plan(), &token_spans)?
             {
                 let first = &batch.requests()[0];
-                let logits_first = &logits_readbacks.requests()[0];
-                if first.node_id() == logits_first.node_id()
-                    && first.resource_id() == logits_first.resource_id()
+                let product_first = &product_readbacks.requests()[0];
+                if first.node_id() == product_first.node_id()
+                    && first.resource_id() == product_first.resource_id()
+                    && first.logical_offset_bytes() == product_first.logical_offset_bytes()
                 {
-                    if batch != logits_readbacks {
+                    if batch != product_readbacks {
                         return Err(FerrumError::internal(
-                            "retained logits readback differs from the product logits layout",
+                            "retained output readback differs from the product output layout",
                         ));
                     }
                     continue;
@@ -5127,6 +5486,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    fn decode_product_output(
+        &self,
+        bytes: &[u8],
+        output_mode: VNextProductOutputMode,
+    ) -> Result<Vec<f32>> {
+        match output_mode {
+            VNextProductOutputMode::FullLogits => {
+                Self::decode_logits(bytes, self.io.output_element_type)
+            }
+            VNextProductOutputMode::GreedyToken => {
+                decode_selected_token(bytes, self.io.output_elements)
+            }
+        }
+    }
+
     fn prefill_tensor(&self, logits: Vec<f32>) -> Result<TensorRef> {
         let tensor = candle_core::Tensor::from_vec(
             logits,
@@ -5138,12 +5512,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn decode_tensor(&self, logits: Vec<f32>) -> Result<TensorRef> {
-        let tensor = candle_core::Tensor::from_vec(
-            logits,
-            (1, self.io.output_elements),
-            &candle_core::Device::Cpu,
-        )
-        .map_err(|error| FerrumError::model(format!("vNext decode logits tensor: {error}")))?;
+        let output_elements = decode_output_width(logits.len(), self.io.output_elements)?;
+        let tensor =
+            candle_core::Tensor::from_vec(logits, (1, output_elements), &candle_core::Device::Cpu)
+                .map_err(|error| {
+                    FerrumError::model(format!("vNext decode logits tensor: {error}"))
+                })?;
         Ok(common::wrap_tensor(tensor))
     }
 
@@ -5227,6 +5601,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 sequence,
                 cache_id,
                 next_token: *next_token,
+                logits_policy: input.logits_policy.clone(),
             });
         }
 
@@ -5325,6 +5700,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|candidate| Arc::clone(&candidate.sequence))
             .collect::<Vec<_>>();
+        let logits_policies = canonical_candidates
+            .iter()
+            .map(|candidate| candidate.logits_policy.clone())
+            .collect::<Vec<_>>();
         let logits = match self
             .execute_batch_step(
                 &batch,
@@ -5332,6 +5711,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &token_batches,
                 &spans,
                 VNextExecutionWaveKind::Decode,
+                Some(&logits_policies),
             )
             .await
         {
@@ -5516,6 +5896,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::slice::from_ref(&tokens),
                     std::slice::from_ref(&span),
                     VNextExecutionWaveKind::Prefill,
+                    None,
                 )
                 .await?
             {
@@ -5801,6 +6182,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &token_batches,
                     &spans,
                     VNextExecutionWaveKind::Prefill,
+                    None,
                 )
                 .await?
             {
@@ -5947,6 +6329,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
             (ready, sequences.active.len(), maintenance, executing)
         };
+        let product_readback = serde_json::json!({
+            "full_logits_waves": self.metrics.full_logits_readback_waves.load(Ordering::Relaxed),
+            "greedy_token_waves": self.metrics.greedy_token_readback_waves.load(Ordering::Relaxed),
+            "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
+        });
         serde_json::json!({
             "schema": "ferrum.runtime-vnext.executor-trace.v1",
             "model_id": self.info.model_id.to_string(),
@@ -6001,6 +6388,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "backing_deferrals": self.metrics.backing_deferrals.load(Ordering::Relaxed),
                 "uploaded_bytes": self.metrics.uploaded_bytes.load(Ordering::Relaxed),
                 "readback_bytes": self.metrics.readback_bytes.load(Ordering::Relaxed),
+                "product_readback": product_readback,
             },
             "wave_timing": self.metrics.wave_timing.snapshot(),
             "wave_timing_by_phase": {
@@ -6462,7 +6850,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         }
         let step_span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let logits = match self.execute_step(&sequence, &tokens, step_span).await {
+        let logits = match self
+            .execute_step(&sequence, &tokens, step_span, &input.logits_policy)
+            .await
+        {
             Ok(logits) => logits,
             Err(error) => {
                 if DecodeFailureDisposition::from_error(&error)
@@ -6618,14 +7009,17 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        reported_allocated_bytes, resolve_reusable_execution_policy, resolved_sequence_fit_policy,
+        decode_output_width, decode_selected_token, normalized_product_token_mask,
+        product_output_mode_for_policies, reported_allocated_bytes,
+        resolve_reusable_execution_policy, resolved_sequence_fit_policy,
         reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
         AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
         VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
-        VNextPreparedWaveTopologyMetrics, VNextReusableExecutionDescriptor,
+        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextReusableExecutionDescriptor,
         VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
         VNextWaveTimingSink,
     };
+    use ferrum_interfaces::model_executor::{LogitsReturnPolicy, TokenSelectionMask};
     use ferrum_interfaces::vnext::{
         DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionSpanKind,
         DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
@@ -7011,5 +7405,76 @@ mod tests {
             DecodeFailureDisposition::from_error(&error),
             DecodeFailureDisposition::AbortSequence
         );
+    }
+
+    #[test]
+    fn product_output_mode_requires_a_uniform_exact_greedy_decode_wave() {
+        let greedy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: None,
+        };
+        let full = LogitsReturnPolicy::FullLogits;
+
+        assert_eq!(
+            product_output_mode_for_policies(
+                VNextExecutionWaveKind::Decode,
+                [Some(&greedy), Some(&greedy)],
+            ),
+            VNextProductOutputMode::GreedyToken
+        );
+        assert_eq!(
+            product_output_mode_for_policies(
+                VNextExecutionWaveKind::Decode,
+                [Some(&greedy), Some(&full)],
+            ),
+            VNextProductOutputMode::FullLogits
+        );
+        assert_eq!(
+            product_output_mode_for_policies(VNextExecutionWaveKind::Prefill, [Some(&greedy)],),
+            VNextProductOutputMode::FullLogits
+        );
+        assert_eq!(
+            product_output_mode_for_policies(VNextExecutionWaveKind::Decode, std::iter::empty(),),
+            VNextProductOutputMode::FullLogits
+        );
+    }
+
+    #[test]
+    fn product_token_mask_preserves_short_mask_semantics_without_hidden_defaults() {
+        let policy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(TokenSelectionMask::new(vec![1, -7, 0])),
+            repetition_penalty: None,
+        };
+        assert_eq!(
+            normalized_product_token_mask(Some(&policy), VNextProductOutputMode::GreedyToken, 5,),
+            [1, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            normalized_product_token_mask(Some(&policy), VNextProductOutputMode::FullLogits, 5,),
+            [1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            normalized_product_token_mask(None, VNextProductOutputMode::GreedyToken, 3),
+            [1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn selected_token_readback_rejects_sentinel_and_out_of_vocabulary_values() {
+        assert_eq!(
+            decode_selected_token(&3_u32.to_le_bytes(), 8).unwrap(),
+            [3.0]
+        );
+        assert!(decode_selected_token(&8_u32.to_le_bytes(), 8).is_err());
+        assert!(decode_selected_token(&u32::MAX.to_le_bytes(), 8).is_err());
+        assert!(decode_selected_token(&[0, 1, 2], 8).is_err());
+    }
+
+    #[test]
+    fn decode_output_width_accepts_only_full_logits_or_one_token_sentinel() {
+        assert_eq!(decode_output_width(1, 248_320).unwrap(), 1);
+        assert_eq!(decode_output_width(248_320, 248_320).unwrap(), 248_320);
+        assert!(decode_output_width(2, 248_320).is_err());
+        assert!(decode_output_width(0, 248_320).is_err());
     }
 }

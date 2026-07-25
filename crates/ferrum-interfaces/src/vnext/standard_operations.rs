@@ -14,6 +14,9 @@ pub const TOKEN_EMBEDDING_F16_CAPABILITY_ID: &str = "capability.operation.token_
 pub const LAST_TOKEN_DENSE_LINEAR_OPERATION_ID: &str = "operation.last_token_dense_linear";
 pub const LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID: &str =
     "capability.operation.last_token_dense_linear.f16";
+pub const LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID: &str = "operation.last_token_masked_argmax";
+pub const LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID: &str =
+    "capability.operation.last_token_masked_argmax.f16";
 pub const RMS_NORM_OPERATION_ID: &str = "operation.rms_norm";
 pub const RMS_NORM_F16_CAPABILITY_ID: &str = "capability.operation.rms_norm.f16";
 pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
@@ -338,6 +341,51 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
         provider: provider_requirement(
             LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
             ContractVersion::new(1, 1),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Selects one token from a final-position F16 logits row after applying an
+/// exact per-vocabulary validity mask. The mask is a semantic input so product
+/// policy remains visible to planning and cannot be hidden in a backend flag.
+pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                vec![
+                    DimensionConstraint::Exact(1),
+                    DimensionConstraint::Symbol("vocab_size".to_owned()),
+                ],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![DimensionConstraint::Symbol("vocab_size".to_owned())],
+                [ElementType::U8],
+                TensorAccess::Read,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor(
+            vec![DimensionConstraint::Exact(1)],
+            [ElementType::U32],
+            TensorAccess::Write,
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([unsigned_attribute("vocab_size")?]))?,
+        resources: ResourceRequirements {
+            minimum_value_alignment_bytes: 16,
+            scratch: ResourcePresenceRequirement::Forbidden,
+            binding: ResourcePresenceRequirement::Forbidden,
+            persistent: ResourcePresenceRequirement::Forbidden,
+        },
+        oracle: OracleSpec::Exact,
+        provider: provider_requirement(
+            LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -1079,6 +1127,32 @@ mod tests {
                 DimensionConstraint::Exact(1),
                 DimensionConstraint::Symbol("out_features".to_owned()),
             ]
+        );
+        contract
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+    }
+
+    #[test]
+    fn last_token_masked_argmax_contract_keeps_policy_in_typed_inputs() {
+        let contract = last_token_masked_argmax_contract().unwrap();
+        let descriptor = contract.descriptor();
+        assert_eq!(
+            descriptor.id.as_str(),
+            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+        );
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(
+            descriptor.inputs[1].element_types(),
+            &BTreeSet::from([ElementType::U8])
+        );
+        assert_eq!(
+            descriptor.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::U32])
+        );
+        assert_eq!(
+            descriptor.outputs[0].dimensions(),
+            &[DimensionConstraint::Exact(1)]
         );
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)

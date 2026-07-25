@@ -21,8 +21,8 @@ use ferrum_interfaces::vnext::{
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
     WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
-    TOKEN_EMBEDDING_OPERATION_ID,
+    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
+    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
 use ferrum_quantization::{
@@ -857,17 +857,28 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 attribute("out_features", config.vocab_size)?,
             ]),
         });
+        let greedy_mask = value_id("value.input.greedy_token_mask")?;
+        let greedy_token = value_id("value.output.greedy_token")?;
+        nodes.push(ProgramNode {
+            id: node_id("node.greedy_token")?,
+            operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
+            required_version: ContractVersion::new(1, 0),
+            work: ProgramNodeWorkSpec::Fixed,
+            inputs: vec![logits.clone(), greedy_mask.clone()],
+            outputs: vec![greedy_token.clone()],
+            attributes: BTreeMap::from([attribute("vocab_size", config.vocab_size)?]),
+        });
 
         ModelProgram::new(
             self.family_id.clone(),
-            vec![value_id("value.input.token_ids")?],
+            vec![value_id("value.input.token_ids")?, greedy_mask],
             vec![ProgramBlock {
                 id: "block.decoder".to_owned(),
                 nodes,
             }],
             states,
             weight_refs,
-            vec![logits],
+            vec![logits, greedy_token],
         )
     }
 
@@ -4027,13 +4038,17 @@ mod tests {
         );
 
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
-        assert_eq!(prepared.program().blocks()[0].nodes.len(), 19);
+        assert_eq!(prepared.program().blocks()[0].nodes.len(), 20);
         assert!(prepared.program().blocks()[0].nodes.iter().all(|node| {
-            matches!(
-                &node.work,
-                ProgramNodeWorkSpec::Tokens { value_id, axis: 0 }
-                    if node.inputs.iter().chain(&node.outputs).any(|value| value == value_id)
-            )
+            if node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID {
+                matches!(&node.work, ProgramNodeWorkSpec::Fixed)
+            } else {
+                matches!(
+                    &node.work,
+                    ProgramNodeWorkSpec::Tokens { value_id, axis: 0 }
+                        if node.inputs.iter().chain(&node.outputs).any(|value| value == value_id)
+                )
+            }
         }));
         let operation_ids = prepared.program().blocks()[0]
             .nodes
@@ -4060,6 +4075,45 @@ mod tests {
                 .filter(|operation| **operation == LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)
                 .count(),
             1
+        );
+        assert_eq!(
+            operation_ids
+                .iter()
+                .filter(|operation| **operation == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
+                .count(),
+            1
+        );
+        let greedy = prepared.program().blocks()[0]
+            .nodes
+            .iter()
+            .find(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
+            .unwrap();
+        assert_eq!(
+            greedy
+                .inputs
+                .iter()
+                .map(ProgramValueId::as_str)
+                .collect::<Vec<_>>(),
+            ["value.output.logits", "value.input.greedy_token_mask"]
+        );
+        assert_eq!(greedy.outputs[0].as_str(), "value.output.greedy_token");
+        assert_eq!(
+            prepared
+                .program()
+                .inputs()
+                .iter()
+                .map(ProgramValueId::as_str)
+                .collect::<Vec<_>>(),
+            ["value.input.token_ids", "value.input.greedy_token_mask"]
+        );
+        assert_eq!(
+            prepared
+                .program()
+                .outputs()
+                .iter()
+                .map(ProgramValueId::as_str)
+                .collect::<Vec<_>>(),
+            ["value.output.logits", "value.output.greedy_token"]
         );
         assert!(prepared.program().blocks()[0]
             .nodes

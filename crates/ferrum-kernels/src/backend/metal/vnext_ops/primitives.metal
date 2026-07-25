@@ -21,6 +21,10 @@ struct ResidualAddParams {
     uint elements;
 };
 
+struct LastTokenMaskedArgmaxParams {
+    uint vocabulary_size;
+};
+
 struct block_q6_K {
     uchar ql[QK_K / 2];
     uchar qh[QK_K / 4];
@@ -182,5 +186,59 @@ kernel void vnext_residual_add_f16(
     uint index [[thread_position_in_grid]]) {
     if (index < params.elements) {
         output[index] = half(float(left[index]) + float(right[index]));
+    }
+}
+
+kernel void vnext_last_token_masked_argmax_f16(
+    device const half * logits [[buffer(0)]],
+    device const uchar * valid_mask [[buffer(1)]],
+    device uint * output [[buffer(2)]],
+    constant LastTokenMaskedArgmaxParams & params [[buffer(3)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    float local_maximum = -INFINITY;
+    int local_index = -1;
+    for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
+        if (valid_mask[token] == 0) {
+            continue;
+        }
+        const float value = float(logits[token]);
+        if (!isfinite(value)) {
+            continue;
+        }
+        if (local_index < 0 || value > local_maximum ||
+            (value == local_maximum && int(token) < local_index)) {
+            local_maximum = value;
+            local_index = int(token);
+        }
+    }
+
+    const float simd_maximum = simd_max(local_maximum);
+    const int simd_index = simd_min(
+        local_index >= 0 && local_maximum == simd_maximum ? local_index : 0x7fffffff
+    );
+    threadgroup float partial_maximum[THREADS_PER_GROUP / 32];
+    threadgroup int partial_index[THREADS_PER_GROUP / 32];
+    if (simd_lane == 0) {
+        partial_maximum[simd_group] = simd_maximum;
+        partial_index[simd_group] = simd_index;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float maximum = -INFINITY;
+        int index = 0x7fffffff;
+        for (uint group = 0; group < THREADS_PER_GROUP / 32; ++group) {
+            const float candidate_maximum = partial_maximum[group];
+            const int candidate_index = partial_index[group];
+            if (candidate_index != 0x7fffffff &&
+                (index == 0x7fffffff || candidate_maximum > maximum ||
+                 (candidate_maximum == maximum && candidate_index < index))) {
+                maximum = candidate_maximum;
+                index = candidate_index;
+            }
+        }
+        output[0] = index == 0x7fffffff ? 0xffffffffu : uint(index);
     }
 }

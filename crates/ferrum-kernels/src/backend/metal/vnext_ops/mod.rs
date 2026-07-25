@@ -6,19 +6,20 @@ use std::sync::Arc;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
     gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
-    residual_add_contract, rms_norm_contract, routed_shared_swiglu_moe_contract,
-    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    EngineProviderDescriptor, ExecutionIdentityEnvelope, OperationContract, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationRuntimeRegistry, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
-    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
+    last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
+    routed_shared_swiglu_moe_contract, token_embedding_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    SemanticValue, VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    IDENTITY_WEIGHT_MATERIALIZER_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
     RMS_NORM_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_F16_CAPABILITY_ID,
 };
@@ -46,8 +47,8 @@ use linear::{
 };
 use moe::{MetalMoePipelines, MetalRoutedSharedSwiGluMoeProvider};
 use primitives::{
-    MetalPrimitivePipelines, MetalResidualAddProvider, MetalRmsNormProvider,
-    MetalTokenEmbeddingProvider,
+    MetalLastTokenMaskedArgmaxProvider, MetalPrimitivePipelines, MetalResidualAddProvider,
+    MetalRmsNormProvider, MetalTokenEmbeddingProvider,
 };
 
 const METAL_ENGINE_PROVIDER_ID: &str = "provider.engine.metal.vnext";
@@ -69,6 +70,7 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+        LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
         ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
@@ -132,6 +134,7 @@ pub fn metal_vnext_operation_registry(
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
+        Box::new(last_token_masked_argmax_contract().map_err(contract_error)?),
         Box::new(routed_shared_swiglu_moe_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
@@ -157,6 +160,10 @@ pub fn metal_vnext_operation_registry(
         Box::new(MetalLastTokenDenseLinearProvider::new(
             runtime,
             Arc::clone(&linear_pipelines),
+        )?),
+        Box::new(MetalLastTokenMaskedArgmaxProvider::new(
+            runtime,
+            Arc::clone(&pipelines),
         )?),
         Box::new(MetalRoutedSharedSwiGluMoeProvider::new(
             runtime,
@@ -723,16 +730,17 @@ mod tests {
     use ferrum_interfaces::vnext::{
         OperationId, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID,
         DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
-        ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+        RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+        TOKEN_EMBEDDING_OPERATION_ID,
     };
 
     #[test]
     fn partial_composition_advertises_only_installed_operation_capabilities() {
         let composition = MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
             .expect("create Metal primitive composition");
-        assert_eq!(composition.runtime().descriptor().capabilities.len(), 9);
-        assert_eq!(composition.catalog().device().capabilities.len(), 9);
+        assert_eq!(composition.runtime().descriptor().capabilities.len(), 10);
+        assert_eq!(composition.catalog().device().capabilities.len(), 10);
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             RMS_NORM_OPERATION_ID,
@@ -740,6 +748,7 @@ mod tests {
             DENSE_LINEAR_OPERATION_ID,
             DENSE_SWIGLU_OPERATION_ID,
             LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
             ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             CAUSAL_PAGED_ATTENTION_OPERATION_ID,
