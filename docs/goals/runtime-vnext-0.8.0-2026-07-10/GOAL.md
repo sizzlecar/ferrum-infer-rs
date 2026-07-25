@@ -53,6 +53,30 @@ GitHub credential/SSH key 不可用，archive 与 commit 暂留 retained stopped
 本机只有 stop/inventory metadata，未使用 SCP。实例已确认 `stopped/exited`，无
 paid/transitional sibling。
 
+后续 `e0a74fa0` 加入通用 native-work attribution gate，并通过临时 stdin credential
+先把旧 archive 完整推到 GitHub。`profile-detail=basic` 的首轮 closure 明确 REJECT：
+有 `3,240` 个 GDN node event，但没有 native-work event；源码确认 CUDA 只有 kernel
+attribution 或 reusable capture 才构造物理 command attribution。`profile-detail=full`
+随后产生 `22,906` 个 native-work event；其中 `2,520/2,520` 个多参与者 GDN compute
+event 全部满足 `batching_form=packed`、compute dispatch `10`、transfer `2`，参与者数
+覆盖 `3/4/13/19/32`，并打印：
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-packed-gdn-trace-affacd2c-20260725T161940Z/validation-full/native-work-attribution
+```
+
+因此 packed GDN 的“代码存在但产品未调用”风险已关闭，结论升级为
+`KEEP_PACKED_GDN_NATIVE_ATTRIBUTION`。这仍不是 G08B/G09 PASS：完整 CUDA matrix、
+三模型双后端、置信区间、legacy/external comparison 和 release gate 均未完成。compact
+evidence 在 GitHub branch
+`artifact/runtime-vnext-packed-gdn-trace-affacd2c-20260725` commit `fab7ac75`，
+archive SHA256 为
+`ea93671ead07eec23bafc921a24962a0140ee9c21c933ffc09f90ea8f77cb909`；原始
+`2,612,056,519` bytes profile/trace 由逐文件 SHA256 绑定并保留在 stopped instance。
+本次 paid window 为 `26m04s`、约 `$0.2039`，比 `$0.157` cap 超出约 `$0.0469`，
+失败分类为 full-profile overcollection；后续只采最小请求数并在 attribution 命中后立即
+停止。实例已确认 `stopped/exited`，无 paid/transitional sibling。
+
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
 为准。G00-G10 继续定义最终能力与验收维度；S0-S7 定义实际生产纵切顺序。修订不降低本文件的

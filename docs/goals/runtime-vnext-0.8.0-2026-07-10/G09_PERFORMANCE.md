@@ -1727,9 +1727,10 @@ CUDA VNEXT PACKED GDN CODE KEEP PENDING TRACE: affacd2c2a5fdc1274f5a77b014c2a2af
 ```
 
 No full sweep is authorized from this result. The next paid action is a short
-trace-closure diagnostic on the retained instance with `--profile-jsonl`,
-asserting packed attribution for a participant count greater than one; it does
-not need to repeat the full performance matrix. The closure validator is:
+trace-closure diagnostic on the retained instance with `--profile-jsonl` and
+`--profile-detail full`, asserting packed attribution for a participant count
+greater than one; it does not need to repeat the full performance matrix. The
+closure validator is:
 
 ```text
 python3 scripts/release/native_work_attribution_gate.py \
@@ -1762,6 +1763,51 @@ GitHub-authorized forwarded SSH key; SCP was not used. The paid window was
 paid lanes must preflight GitHub push authentication before the instance is
 started. The instance is verified `stopped/exited`, with no paid or
 transitional sibling.
+
+### 2026-07-25 Packed GDN Native Attribution Closure
+
+Commit `e0a74fa0` added a streaming, backend-neutral native-work attribution
+gate. The first closure run used `profile-detail=basic`; it completed `32/32`
+requests with zero request and quality errors but correctly REJECTed the
+attribution claim because the profile contained 3,240 GDN node events and zero
+`vnext.device_native_work` events. Source inspection identified the exact
+contract: CUDA creates command attribution when `DeviceTimingMode::Kernel` is
+enabled or a reusable execution capture exists. `basic` selects completion
+timing, while `full` selects kernel attribution.
+
+The bounded `profile-detail=full` follow-up was terminated after it had
+generated sufficient attribution rather than waiting for a throughput sample.
+It produced 22,906 native-work events. The gate found 2,520 eligible
+multi-participant GDN compute events and accepted all `2,520/2,520`:
+
+| participant count | event count | batching | compute dispatches | transfers |
+|---:|---:|---|---:|---:|
+| 3 | 30 | packed | 10 | 2 |
+| 4 | 1,290 | packed | 10 | 2 |
+| 13 | 60 | packed | 10 | 2 |
+| 19 | 30 | packed | 10 | 2 |
+| 32 | 1,110 | packed | 10 | 2 |
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-packed-gdn-trace-affacd2c-20260725T161940Z/validation-full/native-work-attribution
+```
+
+This closes the pending packed-path integration claim. It does not upgrade the
+single-repeat `155.138143 tok/s` result to formal G09 evidence, and the
+full-profile run is explicitly ineligible as a performance sample. The compact
+artifact is on GitHub branch
+`artifact/runtime-vnext-packed-gdn-trace-affacd2c-20260725` at
+`fab7ac7512ea61d7584d0f41e11caf321de79520`; archive SHA256 is
+`ea93671ead07eec23bafc921a24962a0140ee9c21c933ffc09f90ea8f77cb909`.
+Raw profile/trace files total `2,612,056,519` bytes, are bound by
+`raw-files.sha256`, and remain on retained instance `45319871`.
+
+The paid window was `26m04s`, approximately `$0.2039`, exceeding the stated
+`$0.157` cap by about `$0.0469`. The failure class is
+`full-profile-overcollection`: future topology closure must use the minimum
+request count and terminate as soon as the validator has eligible events.
+Instance `45319871` is verified `stopped/exited`, with zero paid or transitional
+sibling.
 
 ### M3 Qwen3-30B historical floors
 

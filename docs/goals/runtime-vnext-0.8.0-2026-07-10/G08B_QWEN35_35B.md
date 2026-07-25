@@ -1275,6 +1275,23 @@ tools/structured-output/concurrency coverage outside the selected scenarios,
 Metal, and legacy deletion remain open. The paid instance reached
 `stopped/exited`, with no paid or transitional sibling.
 
+The follow-up native attribution gate closed the product-path topology gap.
+With `profile-detail=full`, all `2,520/2,520` multi-participant compute events
+for `operation.gated_delta_recurrent_attention` used the packed native command,
+with exactly 10 physical compute dispatches and two transfer commands.
+Observed participant counts were 3, 4, 13, 19, and 32:
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-packed-gdn-trace-affacd2c-20260725T161940Z/validation-full/native-work-attribution
+```
+
+This proves that the packed implementation is reached by real CUDA product
+traffic; it does not replace the open 703-case matrix or Metal evidence.
+Compact evidence is on GitHub branch
+`artifact/runtime-vnext-packed-gdn-trace-affacd2c-20260725` at `fab7ac75`;
+archive SHA256 is
+`ea93671ead07eec23bafc921a24962a0140ee9c21c933ffc09f90ea8f77cb909`.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
