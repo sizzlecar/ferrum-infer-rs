@@ -338,6 +338,7 @@ fn launch_extent_validation_rejects_msl_uint_overflow() {
         value_features: VALUE_FEATURES as u64,
         qkvz_features: QKVZ_FEATURES as u64,
         ba_features: BA_FEATURES as u64,
+        qkvzba_features: (QKVZ_FEATURES + BA_FEATURES) as u64,
         conv_kernel: CONV_KERNEL as u64,
         conv_state_width: CONV_STATE_WIDTH as u64,
         epsilon: 1.0e-6,
@@ -351,17 +352,18 @@ fn launch_extent_validation_rejects_msl_uint_overflow() {
         .unwrap_err()
         .contains("QKV activation elements"));
 
-    let tokens = u64::from(u32::MAX) / shape.qkvz_features + 1;
+    let tokens = u64::from(u32::MAX) / shape.qkvzba_features + 1;
     assert!(shape
         .validate_launch_extents(tokens)
         .unwrap_err()
-        .contains("QKVZ activation elements"));
+        .contains("QKVZBA activation elements"));
 
     shape.ba_features = u64::from(u32::MAX);
+    shape.qkvzba_features = shape.qkvz_features + shape.ba_features;
     assert!(shape
         .validate_launch_extents(2)
         .unwrap_err()
-        .contains("BA activation elements"));
+        .contains("QKVZBA activation elements"));
 }
 
 #[test]
@@ -793,18 +795,18 @@ fn run_segment(
 ) -> Vec<f32> {
     let tokens = inputs.mixed_qkv.len() / QKV_FEATURES;
     let params = test_params(tokens, semantics);
-    let mut packed_qkvz = Vec::with_capacity(tokens * QKVZ_FEATURES);
-    let mut packed_ba = Vec::with_capacity(tokens * BA_FEATURES);
+    let mut packed_qkvzba = Vec::with_capacity(tokens * (QKVZ_FEATURES + BA_FEATURES));
     for token in 0..tokens {
-        packed_qkvz
+        packed_qkvzba
             .extend_from_slice(&inputs.mixed_qkv[token * QKV_FEATURES..(token + 1) * QKV_FEATURES]);
-        packed_qkvz
+        packed_qkvzba
             .extend_from_slice(&inputs.z[token * VALUE_FEATURES..(token + 1) * VALUE_FEATURES]);
-        packed_ba.extend_from_slice(&inputs.b_raw[token * VALUE_HEADS..(token + 1) * VALUE_HEADS]);
-        packed_ba.extend_from_slice(&inputs.a_raw[token * VALUE_HEADS..(token + 1) * VALUE_HEADS]);
+        packed_qkvzba
+            .extend_from_slice(&inputs.b_raw[token * VALUE_HEADS..(token + 1) * VALUE_HEADS]);
+        packed_qkvzba
+            .extend_from_slice(&inputs.a_raw[token * VALUE_HEADS..(token + 1) * VALUE_HEADS]);
     }
-    let mixed_qkvz = shared_buffer(device, &packed_qkvz);
-    let ba_raw = shared_buffer(device, &packed_ba);
+    let mixed_qkvzba = shared_buffer(device, &packed_qkvzba);
     let z = shared_buffer(device, inputs.z);
     let query = output_buffer::<f32>(device, tokens * QK_FEATURES);
     let key = output_buffer::<f32>(device, tokens * QK_FEATURES);
@@ -819,7 +821,7 @@ fn run_segment(
     let encoder = command.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipelines.prepare_conv);
     for (index, buffer) in [
-        &*mixed_qkvz,
+        &*mixed_qkvzba,
         weights.conv,
         conv_state,
         &*query,
@@ -837,7 +839,7 @@ fn run_segment(
 
     encoder.set_compute_pipeline_state(&pipelines.prepare_gates);
     for (index, buffer) in [
-        &*ba_raw,
+        &*mixed_qkvzba,
         weights.decay_parameter,
         weights.dt_bias,
         &*g,
@@ -852,7 +854,7 @@ fn run_segment(
     dispatch_elements(encoder, (tokens * VALUE_HEADS) as u64);
 
     encoder.set_compute_pipeline_state(&pipelines.collect_conv_state);
-    set_raw(encoder, 0, &mixed_qkvz);
+    set_raw(encoder, 0, &mixed_qkvzba);
     set_raw(encoder, 1, conv_state);
     set_raw(encoder, 2, &next_conv);
     set_params(encoder, 3, &params);

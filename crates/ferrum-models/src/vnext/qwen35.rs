@@ -52,8 +52,7 @@ pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGen
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
-const PACKED_LINEAR_ATTN_QKVZ_ROLE: &str = "linear_attn_qkvz";
-const PACKED_LINEAR_ATTN_BA_ROLE: &str = "linear_attn_ba";
+const PACKED_LINEAR_ATTN_QKVZBA_ROLE: &str = "linear_attn_qkvzba";
 const MOE_ROUTER_ROLE: &str = "moe_router";
 const MOE_ROUTED_GATE_UP_ROLE: &str = "moe_routed_gate_up";
 const MOE_ROUTED_DOWN_ROLE: &str = "moe_routed_down";
@@ -450,7 +449,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             }
             if matches!(
                 weight.role.as_str(),
-                "mlp_up" | "linear_attn_z" | "linear_attn_a"
+                "mlp_up" | "linear_attn_z" | "linear_attn_b" | "linear_attn_a"
             ) {
                 continue;
             }
@@ -467,24 +466,27 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         materialized_element_type(PACKED_GATE_UP_ROLE),
                     ),
                 });
-            } else if matches!(weight.role.as_str(), "linear_attn_qkv" | "linear_attn_b") {
+            } else if weight.role == "linear_attn_qkv" {
                 let layer_index = weight.layer_index.ok_or_else(|| {
                     invalid_config(
                         "weights.linear_attn",
                         "linear-attention projection has no layer",
                     )
                 })?;
-                let (second_role, packed_role) = if weight.role == "linear_attn_qkv" {
-                    ("linear_attn_z", PACKED_LINEAR_ATTN_QKVZ_ROLE)
-                } else {
-                    ("linear_attn_a", PACKED_LINEAR_ATTN_BA_ROLE)
-                };
-                let second = required_weight(config, Some(layer_index), second_role)?;
+                let z = required_weight(config, Some(layer_index), "linear_attn_z")?;
+                let b = required_weight(config, Some(layer_index), "linear_attn_b")?;
+                let a = required_weight(config, Some(layer_index), "linear_attn_a")?;
                 weight_refs.push(WeightReference {
-                    weight_id: packed_linear_attention_weight_id(layer_index, packed_role)?,
-                    value_id: packed_linear_attention_value_id(layer_index, packed_role)?,
+                    weight_id: packed_linear_attention_weight_id(
+                        layer_index,
+                        PACKED_LINEAR_ATTN_QKVZBA_ROLE,
+                    )?,
+                    value_id: packed_linear_attention_value_id(
+                        layer_index,
+                        PACKED_LINEAR_ATTN_QKVZBA_ROLE,
+                    )?,
                     tensor: tensor_spec(
-                        packed_linear_attention_dimensions(weight, second)?,
+                        packed_linear_attention_dimensions([weight, z, b, a])?,
                         DENSE_MATERIALIZED_ELEMENT_TYPE,
                     ),
                 });
@@ -549,14 +551,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         2,
                         packed_linear_attention_value_id(
                             layer_index as u32,
-                            PACKED_LINEAR_ATTN_BA_ROLE,
-                        )?,
-                    );
-                    attention_inputs.insert(
-                        2,
-                        packed_linear_attention_value_id(
-                            layer_index as u32,
-                            PACKED_LINEAR_ATTN_QKVZ_ROLE,
+                            PACKED_LINEAR_ATTN_QKVZBA_ROLE,
                         )?,
                     );
                     let conv_value = value_id(format!("value.state.layer.{layer_index}.conv"))?;
@@ -606,7 +601,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     };
                     (
                         GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-                        ContractVersion::new(5, 0),
+                        ContractVersion::new(6, 0),
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -630,6 +625,13 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                             attribute(
                                 "ba_features",
                                 (text.linear_attention.num_value_heads * 2) as u64,
+                            )?,
+                            attribute(
+                                "qkvzba_features",
+                                (text.linear_qk_total_dim() * 2
+                                    + text.linear_value_total_dim() * 2
+                                    + text.linear_attention.num_value_heads * 2)
+                                    as u64,
                             )?,
                             attribute("conv_kernel", text.linear_attention.conv_kernel_dim as u64)?,
                             attribute(
@@ -892,29 +894,33 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
     for weight in &config.weights {
         if matches!(
             weight.role.as_str(),
-            "mlp_up" | "linear_attn_z" | "linear_attn_a"
+            "mlp_up" | "linear_attn_z" | "linear_attn_b" | "linear_attn_a"
         ) {
             continue;
         }
-        if matches!(weight.role.as_str(), "linear_attn_qkv" | "linear_attn_b") {
+        if weight.role == "linear_attn_qkv" {
             let layer_index = weight.layer_index.ok_or_else(|| {
                 invalid_config(
                     "weights.linear_attn",
                     "linear-attention projection has no layer",
                 )
             })?;
-            let (second_role, packed_role) = if weight.role == "linear_attn_qkv" {
-                ("linear_attn_z", PACKED_LINEAR_ATTN_QKVZ_ROLE)
-            } else {
-                ("linear_attn_a", PACKED_LINEAR_ATTN_BA_ROLE)
-            };
-            let second = required_weight(config, Some(layer_index), second_role)?;
-            let dimensions = packed_linear_attention_dimensions(weight, second)?;
-            let component_id = packed_linear_attention_component_id(layer_index, packed_role)?;
+            let sources = [
+                weight,
+                required_weight(config, Some(layer_index), "linear_attn_z")?,
+                required_weight(config, Some(layer_index), "linear_attn_b")?,
+                required_weight(config, Some(layer_index), "linear_attn_a")?,
+            ];
+            let dimensions = packed_linear_attention_dimensions(sources)?;
+            let component_id =
+                packed_linear_attention_component_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)?;
             components.push(WeightComponentSpec {
                 id: component_id.clone(),
                 role: WeightComponentRole::Values,
-                external_names: vec![weight.external_name.clone(), second.external_name.clone()],
+                external_names: sources
+                    .iter()
+                    .map(|source| source.external_name.clone())
+                    .collect(),
                 dimensions: dimensions.clone(),
                 encoding: WeightEncoding::Dense {
                     element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
@@ -922,7 +928,7 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
                 required: true,
             });
             tensors.push(WeightTensorSpec {
-                id: packed_linear_attention_weight_id(layer_index, packed_role)?,
+                id: packed_linear_attention_weight_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)?,
                 dimensions,
                 logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
                 physical_layout: PhysicalWeightLayout::Dense { component_id },
@@ -986,9 +992,9 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
         layout_id: WeightLayoutId::new(
-            "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_inputs",
+            "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_qkvzba",
         )?,
-        version: ContractVersion::new(1, 3),
+        version: ContractVersion::new(1, 4),
         components,
         tensors,
     })
@@ -1011,39 +1017,42 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
         if is_moe_source_role(&weight.role)
             || matches!(
                 weight.role.as_str(),
-                "mlp_up" | "linear_attn_z" | "linear_attn_a"
+                "mlp_up" | "linear_attn_z" | "linear_attn_b" | "linear_attn_a"
             )
         {
             continue;
         }
-        if matches!(weight.role.as_str(), "linear_attn_qkv" | "linear_attn_b") {
+        if weight.role == "linear_attn_qkv" {
             let layer_index = weight.layer_index.ok_or_else(|| {
                 invalid_config(
                     "weights.linear_attn",
                     "linear-attention projection has no layer",
                 )
             })?;
-            let (second_role, packed_role) = if weight.role == "linear_attn_qkv" {
-                ("linear_attn_z", PACKED_LINEAR_ATTN_QKVZ_ROLE)
-            } else {
-                ("linear_attn_a", PACKED_LINEAR_ATTN_BA_ROLE)
-            };
-            let second = required_weight(config, Some(layer_index), second_role)?;
-            let logical_dimensions = packed_linear_attention_dimensions(weight, second)?;
-            let physical_layout = if [weight, second].into_iter().all(|source| {
+            let sources = [
+                weight,
+                required_weight(config, Some(layer_index), "linear_attn_z")?,
+                required_weight(config, Some(layer_index), "linear_attn_b")?,
+                required_weight(config, Some(layer_index), "linear_attn_a")?,
+            ];
+            let logical_dimensions = packed_linear_attention_dimensions(sources)?;
+            let physical_layout = if sources.iter().all(|source| {
                 matches!(
                     &source.source_encoding,
                     FamilyWeightSourceEncoding::Dense { .. }
                 )
             }) {
-                let component_id = packed_linear_attention_component_id(layer_index, packed_role)?;
+                let component_id = packed_linear_attention_component_id(
+                    layer_index,
+                    PACKED_LINEAR_ATTN_QKVZBA_ROLE,
+                )?;
                 components.push(WeightComponentSpec {
                     id: component_id.clone(),
                     role: WeightComponentRole::Values,
-                    external_names: vec![
-                        weight.external_name.clone(),
-                        second.external_name.clone(),
-                    ],
+                    external_names: sources
+                        .iter()
+                        .map(|source| source.external_name.clone())
+                        .collect(),
                     dimensions: logical_dimensions.clone(),
                     encoding: WeightEncoding::Dense {
                         element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
@@ -1053,8 +1062,8 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
                 PhysicalWeightLayout::Dense { component_id }
             } else {
                 let mut row_offset = 0_u64;
-                let mut parts = Vec::with_capacity(2);
-                for source in [weight, second] {
+                let mut parts = Vec::with_capacity(sources.len());
+                for source in sources {
                     let extents = logical_weight_dimensions(source)?;
                     let layout = append_safetensors_source_layout(
                         source,
@@ -1077,7 +1086,7 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
                 PhysicalWeightLayout::Composite { parts }
             };
             tensors.push(WeightTensorSpec {
-                id: packed_linear_attention_weight_id(layer_index, packed_role)?,
+                id: packed_linear_attention_weight_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)?,
                 dimensions: logical_dimensions,
                 logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
                 physical_layout,
@@ -1146,14 +1155,14 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.safetensors.gptq-marlin-int4")?,
         layout_id: WeightLayoutId::new(if text.is_moe() {
-            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_inputs"
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_qkvzba"
         } else {
-            "weight-layout.qwen3_5.dense_hybrid.gptq_marlin.packed_gdn_inputs"
+            "weight-layout.qwen3_5.dense_hybrid.gptq_marlin.packed_gdn_qkvzba"
         })?,
         version: if text.is_moe() {
-            ContractVersion::new(3, 1)
+            ContractVersion::new(3, 2)
         } else {
-            ContractVersion::new(2, 1)
+            ContractVersion::new(2, 2)
         },
         components,
         tensors,
@@ -1635,27 +1644,27 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
         }
         if matches!(
             weight.role.as_str(),
-            "mlp_up" | "linear_attn_z" | "linear_attn_a"
+            "mlp_up" | "linear_attn_z" | "linear_attn_b" | "linear_attn_a"
         ) {
             continue;
         }
-        if matches!(weight.role.as_str(), "linear_attn_qkv" | "linear_attn_b") {
+        if weight.role == "linear_attn_qkv" {
             let layer_index = weight.layer_index.ok_or_else(|| {
                 invalid_config(
                     "weights.linear_attn",
                     "linear-attention projection has no layer",
                 )
             })?;
-            let (second_role, packed_role) = if weight.role == "linear_attn_qkv" {
-                ("linear_attn_z", PACKED_LINEAR_ATTN_QKVZ_ROLE)
-            } else {
-                ("linear_attn_a", PACKED_LINEAR_ATTN_BA_ROLE)
-            };
-            let second = required_weight(config, Some(layer_index), second_role)?;
-            let logical_dimensions = packed_linear_attention_dimensions(weight, second)?;
+            let sources = [
+                weight,
+                required_weight(config, Some(layer_index), "linear_attn_z")?,
+                required_weight(config, Some(layer_index), "linear_attn_b")?,
+                required_weight(config, Some(layer_index), "linear_attn_a")?,
+            ];
+            let logical_dimensions = packed_linear_attention_dimensions(sources)?;
             let mut row_offset = 0_u64;
-            let mut parts = Vec::with_capacity(2);
-            for source in [weight, second] {
+            let mut parts = Vec::with_capacity(sources.len());
+            for source in sources {
                 let extents = logical_weight_dimensions(source)?;
                 let component = gguf_component_spec(source)?;
                 let layout = gguf_component_layout(source, component.id.clone(), &extents)?;
@@ -1673,7 +1682,7 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
                 components.push(component);
             }
             tensors.push(WeightTensorSpec {
-                id: packed_linear_attention_weight_id(layer_index, packed_role)?,
+                id: packed_linear_attention_weight_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)?,
                 dimensions: logical_dimensions,
                 logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
                 physical_layout: PhysicalWeightLayout::Composite { parts },
@@ -1741,14 +1750,14 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
     Ok(WeightSchema {
         format_id: WeightFormatId::new("weight-format.gguf.native-block")?,
         layout_id: WeightLayoutId::new(if text.is_moe() {
-            "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_inputs"
+            "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_qkvzba"
         } else {
-            "weight-layout.qwen3_5.dense_hybrid.gguf.native.packed_gdn_inputs"
+            "weight-layout.qwen3_5.dense_hybrid.gguf.native.packed_gdn_qkvzba"
         })?,
         version: if text.is_moe() {
-            ContractVersion::new(2, 1)
+            ContractVersion::new(2, 2)
         } else {
-            ContractVersion::new(1, 1)
+            ContractVersion::new(1, 2)
         },
         components,
         tensors,
@@ -3076,41 +3085,44 @@ fn packed_gate_up_value_id(layer_index: u32) -> Result<ProgramValueId, VNextErro
     ))
 }
 
-fn packed_linear_attention_dimensions(
-    first: &FamilyWeight,
-    second: &FamilyWeight,
-) -> Result<Vec<u64>, VNextError> {
-    let valid_pair = matches!(
-        (first.role.as_str(), second.role.as_str()),
-        ("linear_attn_qkv", "linear_attn_z") | ("linear_attn_b", "linear_attn_a")
-    );
-    let ([first_rows, first_hidden], [second_rows, second_hidden]) =
-        (first.dimensions.as_slice(), second.dimensions.as_slice())
-    else {
-        return Err(invalid_config(
-            "weights.linear_attn_projection",
-            "linear-attention projection sources must be matrices",
-        ));
-    };
-    if !valid_pair
-        || first.layer_index != second.layer_index
-        || first.expert_index.is_some()
-        || second.expert_index.is_some()
-        || first_hidden != second_hidden
-    {
-        return Err(invalid_config(
-            "weights.linear_attn_projection",
-            "linear-attention projection sources have incompatible roles, layers, or input widths",
-        ));
-    }
-    Ok(vec![
-        first_rows.checked_add(*second_rows).ok_or_else(|| {
+fn packed_linear_attention_dimensions(sources: [&FamilyWeight; 4]) -> Result<Vec<u64>, VNextError> {
+    let expected_roles = [
+        "linear_attn_qkv",
+        "linear_attn_z",
+        "linear_attn_b",
+        "linear_attn_a",
+    ];
+    let layer_index = sources[0].layer_index;
+    let mut hidden_size = None;
+    let mut output_features = 0_u64;
+    for (source, expected_role) in sources.into_iter().zip(expected_roles) {
+        let [rows, hidden] = source.dimensions.as_slice() else {
+            return Err(invalid_config(
+                "weights.linear_attn_projection",
+                "linear-attention projection sources must be matrices",
+            ));
+        };
+        if source.role != expected_role
+            || source.layer_index != layer_index
+            || source.expert_index.is_some()
+            || hidden_size.is_some_and(|expected| expected != *hidden)
+        {
+            return Err(invalid_config(
+                "weights.linear_attn_projection",
+                "linear-attention projection sources have incompatible roles, layers, or input widths",
+            ));
+        }
+        hidden_size = Some(*hidden);
+        output_features = output_features.checked_add(*rows).ok_or_else(|| {
             invalid_config(
                 "weights.linear_attn_projection",
                 "packed projection output width overflows",
             )
-        })?,
-        *first_hidden,
+        })?;
+    }
+    Ok(vec![
+        output_features,
+        hidden_size.expect("four validated projection sources have a hidden width"),
     ])
 }
 
@@ -3751,10 +3763,10 @@ mod tests {
             schema.quantization_formats(),
             BTreeSet::from([QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID).unwrap()])
         );
-        assert_eq!(schema.version, ContractVersion::new(3, 1));
+        assert_eq!(schema.version, ContractVersion::new(3, 2));
         assert_eq!(
             schema.layout_id.as_str(),
-            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_inputs"
+            "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_qkvzba"
         );
         let routed = schema
             .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
@@ -3979,9 +3991,9 @@ mod tests {
         ));
         assert_eq!(
             prepared.weight_schema().layout_id.as_str(),
-            "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_inputs"
+            "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_qkvzba"
         );
-        assert_eq!(prepared.weight_schema().version, ContractVersion::new(2, 1));
+        assert_eq!(prepared.weight_schema().version, ContractVersion::new(2, 2));
     }
 
     #[test]
@@ -4066,7 +4078,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(5, 0)
+            ContractVersion::new(6, 0)
         );
         assert_eq!(
             linear_attention
@@ -4088,8 +4100,7 @@ mod tests {
         );
         for (ordinal, role) in [
             "input_layernorm",
-            PACKED_LINEAR_ATTN_QKVZ_ROLE,
-            PACKED_LINEAR_ATTN_BA_ROLE,
+            PACKED_LINEAR_ATTN_QKVZBA_ROLE,
             "linear_attn_conv",
             "linear_attn_a_log",
             "linear_attn_dt_bias",
@@ -4101,7 +4112,7 @@ mod tests {
         {
             assert!(linear_inputs[ordinal + 1].ends_with(role));
         }
-        assert_eq!(linear_inputs.len(), 11);
+        assert_eq!(linear_inputs.len(), 10);
         let full_attention = prepared.program().blocks()[0]
             .nodes
             .iter()
@@ -4206,15 +4217,15 @@ mod tests {
                 .filter(|weight| {
                     !matches!(
                         weight.role.as_str(),
-                        "mlp_up" | "linear_attn_z" | "linear_attn_a"
+                        "mlp_up" | "linear_attn_z" | "linear_attn_b" | "linear_attn_a"
                     )
                 })
                 .count()
         );
-        assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 3));
+        assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 4));
         assert_eq!(
             prepared.weight_schema().layout_id.as_str(),
-            "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_inputs"
+            "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_qkvzba"
         );
         for component in prepared
             .weight_schema()
@@ -4274,20 +4285,17 @@ mod tests {
             .components
             .iter()
             .filter(|component| {
-                component.external_names.len() == 2
-                    && (component.external_names[0].contains("linear_attn.in_proj_qkv")
-                        || component.external_names[0].contains("linear_attn.in_proj_b"))
+                component.external_names.len() == 4
+                    && component.external_names[0].contains("linear_attn.in_proj_qkv")
             })
             .collect::<Vec<_>>();
-        assert_eq!(packed_gdn.len(), 6);
+        assert_eq!(packed_gdn.len(), 3);
         assert!(packed_gdn.iter().all(|component| {
-            let qkvz = component.external_names[0].contains("in_proj_qkv")
+            component.external_names[0].contains("in_proj_qkv")
                 && component.external_names[1].contains("in_proj_z")
-                && component.dimensions == [32, 16];
-            let ba = component.external_names[0].contains("in_proj_b")
-                && component.external_names[1].contains("in_proj_a")
-                && component.dimensions == [4, 16];
-            (qkvz || ba)
+                && component.external_names[2].contains("in_proj_b")
+                && component.external_names[3].contains("in_proj_a")
+                && component.dimensions == [36, 16]
                 && component.encoding
                     == WeightEncoding::Dense {
                         element_type: ElementType::F16,
@@ -4484,6 +4492,8 @@ mod tests {
         let tensors = [
             ("qkv.weight", vec![1.0_f32, 2.0, 3.0, 4.0], vec![2, 2]),
             ("z.weight", vec![5.0_f32, 6.0], vec![1, 2]),
+            ("b.weight", vec![7.0_f32, 8.0, 9.0, 10.0], vec![2, 2]),
+            ("a.weight", vec![11.0_f32, 12.0], vec![1, 2]),
         ];
         let views = tensors
             .iter()
@@ -4508,10 +4518,15 @@ mod tests {
         .unwrap();
         let source = SafetensorsArchive::open(directory.path()).unwrap();
         let component = WeightComponentSpec {
-            id: WeightId::new("component.layer.0.linear_attn_qkvz").unwrap(),
+            id: WeightId::new("component.layer.0.linear_attn_qkvzba").unwrap(),
             role: WeightComponentRole::Values,
-            external_names: vec!["qkv.weight".to_owned(), "z.weight".to_owned()],
-            dimensions: vec![3, 2],
+            external_names: vec![
+                "qkv.weight".to_owned(),
+                "z.weight".to_owned(),
+                "b.weight".to_owned(),
+                "a.weight".to_owned(),
+            ],
+            dimensions: vec![6, 2],
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::F16,
             },
@@ -4525,12 +4540,31 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             actual,
-            (1..=6).map(|value| value as f32).collect::<Vec<_>>()
+            (1..=12).map(|value| value as f32).collect::<Vec<_>>()
         );
-        assert_eq!(payload.dimensions(), [3, 2]);
+        let hidden = [2.0_f32, -1.0];
+        let fused_projection = actual
+            .chunks_exact(2)
+            .map(|row| row[0] * hidden[0] + row[1] * hidden[1])
+            .collect::<Vec<_>>();
+        let separate_projection = tensors
+            .iter()
+            .flat_map(|(_, values, _)| {
+                values
+                    .chunks_exact(2)
+                    .map(|row| row[0] * hidden[0] + row[1] * hidden[1])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fused_projection, separate_projection);
+        assert_eq!(payload.dimensions(), [6, 2]);
         assert_eq!(
             payload.external_names(),
-            ["qkv.weight".to_owned(), "z.weight".to_owned()]
+            [
+                "qkv.weight".to_owned(),
+                "z.weight".to_owned(),
+                "b.weight".to_owned(),
+                "a.weight".to_owned(),
+            ]
         );
     }
 
@@ -4624,7 +4658,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(5, 0)
+            ContractVersion::new(6, 0)
         );
         assert_eq!(
             linear_attention

@@ -404,7 +404,7 @@ const fn marlin_fp8_projection_shape_supported(n: usize, k: usize) -> bool {
 fn eligible_projection_use(operation_id: &str, ordinal: usize) -> bool {
     (operation_id == DENSE_LINEAR_OPERATION_ID && ordinal == 1)
         || (operation_id == GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID
-            && matches!(ordinal, 2 | 3 | 8))
+            && matches!(ordinal, 2 | 7))
 }
 
 #[derive(Clone, Copy)]
@@ -532,13 +532,17 @@ mod tests {
         ));
         assert!(eligible_projection_use(
             GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+            7
+        ));
+        assert!(!eligible_projection_use(DENSE_LINEAR_OPERATION_ID, 0));
+        assert!(!eligible_projection_use(
+            GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             3
         ));
-        assert!(eligible_projection_use(
+        assert!(!eligible_projection_use(
             GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             8
         ));
-        assert!(!eligible_projection_use(DENSE_LINEAR_OPERATION_ID, 0));
         assert!(!eligible_projection_use(
             GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             4
