@@ -1517,6 +1517,86 @@ Evidence is archived on branch
 `0f978393e4d3003051d9e3427bf5284f797e4307`; the package SHA256 is
 `1904faf443d071206d9dfe9be5fd1e78e1576e2b4f6f2bb49974b6664b0114d6`.
 
+### 2026-07-25 Implicit Requantization Rejection And Exact-F16 Reset
+
+The `0b72bab2` performance KEEP is invalid for the required exact product lane.
+The follow-up current-source focused matrix stopped at C17:
+
+- C03 passed;
+- C17 expected exact output `中文正确` but emitted only `正确`;
+- the candidate emitted token `97901` and lost token `99986`;
+- UTF-8 framing, process exit, memory, and transport were valid, so this was a
+  numerical-output regression rather than mojibake or a crash.
+
+The root cause was architectural. The CUDA composition treated availability of
+the Marlin FP8 W8A16 kernel as authorization to cold-materialize source F16 GDN
+weights into FP8. That conversion is numerically approximate and was selected
+without a user-visible precision policy. The model's GPTQ configuration
+explicitly excludes `.*attn.*`; current vLLM therefore also preserves the GDN
+projection precision instead of silently applying this conversion. The
+`77.069498 tok/s` row measures a different numerical contract and cannot satisfy
+the exact `76.1583 tok/s` floor or any vLLM ratio.
+
+Commit `5149bbfbc6b69bf0c55fdd483f290b75ea05057e` makes fidelity typed and
+fail-closed:
+
+- `WeightMaterializerDescriptor` declares `Exact` or `Approximate`;
+- the default compiler path selects only exact materializers;
+- Marlin F16 -> FP8 is retained as an approximate capability, not selected by
+  the CUDA default;
+- catalog mutation from exact to approximate invalidates the trusted witness;
+- a packed-weight numerical test proves the transform has nonzero error.
+
+Local focused contracts, the packed numerical test, formatting, and
+`cargo check --workspace --all-targets` passed. The clean official CUDA build
+used binary SHA256
+`330b50ab6397908acd3d77ad34c2bfcba46bd93d7c43bcd1fed7af6de96bc01a`.
+Focused C17 then passed with exact content `中文正确`, visible token IDs
+`99986,97901`, two output chunks, zero blocker match, and the line:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-fidelity-c17-cuda-5149bbfb-20260725T063955Z/correctness/m2-qwen35-35b-a3b/cuda/focused-c17-report.json
+```
+
+This proves the C17 causal repair, not G08B or G09 completion. The accepted
+exact-precision performance reference remains `58ea9761` at
+`73.385528 tok/s`, still `2.77277 tok/s` (`3.64%`) below the floor. The next
+candidate must retain exact F16 semantics. The `32c53a6b` pre-fusion profile
+recorded `11,250` F16 cuBLAS GEMV launches and `243.858703 ms`, or `26.0783%`
+of replay wall; that count was exactly `75 correlations x 30 recurrent layers x
+5 projections`. The landed QKVZ/BA fusion reduced the current topology to three
+projections per layer, so a same-scope current trace is predicted to contain
+`6,750`, not `11,250`, projection GEMVs.
+
+Source comparison against vLLM `33c4f355` shows that its exact CUDA path also
+executes QKVZ, BA, and output linear projections; compile/CUDA graph replay does
+not remove those three operations. The next bounded exact candidate is therefore
+one cold-path, byte-exact row concatenation of QKVZ+BA into QKVZBA, retaining the
+dependent output projection. Its predeclared c1 signals are:
+
+- projection GEMV launches `6,750 -> 4,500`;
+- GDN dispatches per correlation `330 -> 300`;
+- complete device span improves by at least `0.24 ms/correlation`, targeting
+  approximately `7.84 ms` from the prior `8.097945 ms`.
+
+Commit `883ee9e0ed73cd5ed0578410e19fad9840c39532` implements that exact QKVZBA
+candidate for CUDA and Metal under operation schema v6. It concatenates source
+F16 QKVZ and BA rows once during cold preparation; hot execution preserves F16
+input/output and the existing FP32 recurrent state. Focused Qwen/schema tests,
+nine CUDA replay contracts, workspace all-target checking, formatting, and the
+real Metal recurrent numerical test passed locally. The v6 tolerance catalog
+adds seven rows without widening the v5 bounds.
+
+This is source and local numerical evidence, not a CUDA performance result.
+The paid-run contract remains: first replay the affected correctness case and
+product paths; then require `4,500` projection GEMVs and `300` GDN dispatches
+per correlation; then require at least `0.24 ms/correlation` device-span
+reduction before running c1 throughput. Missing the launch topology or span
+reduction is REJECT and does not authorize throughput. For `P>1`,
+participant-packed projection remains a separate follow-up (`3P -> 3`
+launches/layer); it predicts no c1 gain and cannot be used to accept this
+candidate.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

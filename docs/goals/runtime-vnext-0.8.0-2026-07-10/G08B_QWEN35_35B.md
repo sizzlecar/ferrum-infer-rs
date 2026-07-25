@@ -1138,6 +1138,51 @@ contract tests or the actual product-path checkpoint. G08B remains Open: the
 current-HEAD tools, structured-output, concurrency, full CUDA matrix, Metal
 matrix, and legacy-deletion conditions are still outstanding.
 
+### 2026-07-25 Weight-Fidelity C17 Rejection And Repair
+
+The prior three-path smoke did not cover the deterministic multi-byte boundary.
+The next focused run on `7bc46122` passed C03 and stopped at C17: expected
+`中文正确`, observed `正确`. The process exited normally and emitted valid UTF-8,
+but token `99986` (`中文`) was missing before token `97901` (`正确`). This
+invalidates the implicit F16 -> FP8 candidate for G08B correctness regardless
+of its single-repeat performance result.
+
+Commit `5149bbfbc6b69bf0c55fdd483f290b75ea05057e` separates exact and
+approximate materialization in the trusted plan contract and restores identity
+F16 as the CUDA default. Its clean official-feature CUDA build took
+`315.909683 s`; binary SHA256 is
+`330b50ab6397908acd3d77ad34c2bfcba46bd93d7c43bcd1fed7af6de96bc01a`.
+The exact failed case was replayed first and passed:
+
+- content `中文正确`;
+- visible token IDs `99986,97901`;
+- `chunk_count=2`;
+- process return code `0`;
+- focused report status `pass`, decision `KEEP`.
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-fidelity-c17-cuda-5149bbfb-20260725T063955Z/correctness/m2-qwen35-35b-a3b/cuda/focused-c17-report.json
+```
+
+This is `1/1` focused evidence, not a formal matrix PASS. All earlier complete
+matrices are stale for `5149bbfb`; current-HEAD tools, structured output,
+`serve`, concurrency, and the full 703-case CUDA matrix remain open. Vast
+instance `45319871` was stopped and polled to `stopped/exited`, with zero active
+or transitional sibling.
+
+Commit `883ee9e0ed73cd5ed0578410e19fad9840c39532` then introduced schema v6
+without changing precision: source F16 QKVZ and BA rows are concatenated once
+on the cold path and consumed by one exact QKVZBA projection on both CUDA and
+Metal. Focused model/schema tests, nine CUDA replay contracts, workspace
+all-target checking, and the real Metal recurrent numerical test passed. The
+real Metal v6 operation maxima were `0.000244140625` for log-rate/grouped and
+`0.00006103515625` for negative-rate/interleaved; convolution state was exact
+and delta-state max error was at most `1.3504177331924438e-8`.
+
+This local evidence only closes the source/numerical precondition for the next
+paid run. CUDA C17, product `run`/`serve`, dispatch topology, and c1 performance
+have not yet been measured on `883ee9e0`; the G08B status remains Open.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

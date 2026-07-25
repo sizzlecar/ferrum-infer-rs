@@ -93,9 +93,14 @@ adapter inventory；数量从此只能单调下降。每个模型在 G08 子阶�
 | `cc4f8130` | build PASS，plan compile REJECT | 修复两个 CUDA 编译错误；暴露 channelwise grouping 错把矩阵 K 编进稳定 quantization ABI |
 | `bfdbf5db` | build PASS，static initialization REJECT | 用 `WholeAxis`/fixed grouping 表达 shape-relative quantization；暴露 mixed schema 中 unchanged component 未由 materializer 返回 |
 | `0c9a2c31` | build PASS，首个 `ferrum run` REJECT | materializer 显式保留 unchanged payload；暴露 provider 把 enclosing schema format 错当 component ABI |
-| `0b72bab2` | CUDA build、`run`/`serve` correctness 和 dispatch profile PASS | enclosing `schema_format_id` 降为 crate-private planning key；CUDA/Metal provider 只按 component physical layout/encoding 校验，并保留错误 quantization ABI negative tests |
+| `0b72bab2` | 窄 CUDA smoke/profile/c1 KEEP，后续 correctness REJECT | enclosing `schema_format_id` 降为 crate-private planning key；CUDA/Metal provider 只按 component physical layout/encoding 校验，但默认选择仍把 kernel capability 错当作 F16 -> FP8 数值授权 |
+| `7bc46122` | C03 PASS，C17 REJECT | deterministic Unicode 期望 `中文正确`，实际只生成 `正确`；transport UTF-8、进程和资源均正常，失败属于数值语义回归 |
+| `5149bbfb` | source gate PASS，focused C17 KEEP | materializer descriptor 增加 `Exact`/`Approximate`；compiler 默认只选 exact，Marlin FP8 被标记 approximate；C17 恢复 token `99986,97901` |
+| `883ee9e0` | source/replay/real-Metal numerics PASS，CUDA 待测 | schema v6 把 source F16 QKVZ+BA byte-exact 冷打包为 QKVZBA；CUDA/Metal 各执行一个精确 projection，不改变 source/compute/accumulation dtype |
 
-该 checkpoint 只证明 G03 的 schema/container 与 component ABI 边界已在源码层收敛；
+该 checkpoint 只证明 G03 的 schema/container、component ABI 和 materializer fidelity
+边界已在源码层收敛；v6 数值目录保留 v4/v5 历史并新增 2 个 operation、4 个 state
+和 1 个真实 layer contract，阈值未放宽；
 它没有产生 `vnext-g03` canonical PASS。完整 CUDA/Metal conformance、numerical catalog
 和 dispatch-overhead 仍未完成，G03 状态保持 Open。
 

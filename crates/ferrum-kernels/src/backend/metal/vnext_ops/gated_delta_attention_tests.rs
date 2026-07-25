@@ -266,15 +266,15 @@ fn cpu_output_tolerance(semantics: TestSemantics) -> (&'static str, &'static str
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v5.operation.fp16.none.log-rate-grouped",
-            "04ff1b536cf92e28b75828530037a28f3263e05337afbff2c7212212a4e92120",
+            "runtime-vnext.metal.gated-delta.v6.operation.fp16.none.log-rate-grouped",
+            "02d799e122b85d751adf50f3197e7db1d490b526ce1b8bd63c6830ad24a02824",
         ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v5.operation.fp16.none.negative-rate-interleaved",
-            "99bd1257837b73e11152351115a9fac1994c14e36093ba59f6f0bc05d1577530",
+            "runtime-vnext.metal.gated-delta.v6.operation.fp16.none.negative-rate-interleaved",
+            "b2af28130218cac84386890360735c14b02cb6715d33e84b95878a25775bf226",
         ),
         _ => panic!("unreviewed gated-delta output tolerance selector"),
     }
@@ -289,15 +289,15 @@ fn cpu_conv_state_tolerance(semantics: TestSemantics) -> (&'static str, &'static
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.log-rate-grouped",
-            "38763b499cf1b17f7213273e8c46b7ea56010b58f6e4e95ecd4f78f2e4ac2070",
+            "runtime-vnext.metal.gated-delta.v6.state.conv.fp16.none.log-rate-grouped",
+            "98bef7ddf965310196cd08d11a37f691f31758b188b526e9af4b7b2dc0550520",
         ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.negative-rate-interleaved",
-            "02c8fa5aa3e1415ec1f5cc2c4b07d97b68f131c8d391cce11417ac4d623130a0",
+            "runtime-vnext.metal.gated-delta.v6.state.conv.fp16.none.negative-rate-interleaved",
+            "d0cdac400fd40472e284360d5db59d14d405f221e779d8c18031e6df4ef36a53",
         ),
         _ => panic!("unreviewed gated-delta conv-state tolerance selector"),
     }
@@ -312,15 +312,15 @@ fn cpu_delta_state_tolerance(semantics: TestSemantics) -> (&'static str, &'stati
             GatedDeltaDecayParameterization::LogRate,
             GatedDeltaValueHeadMapping::GroupedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v5.state.delta.fp32.none.log-rate-grouped",
-            "2a6d8a74c8f8932da969c600e716a130326bafcec4b4905ecf45a363d7e64c8d",
+            "runtime-vnext.metal.gated-delta.v6.state.delta.fp32.none.log-rate-grouped",
+            "0cbe79578998a12f95ef680abe2d6dc1a9d9f790594eb0cde9241ee32c326227",
         ),
         (
             GatedDeltaDecayParameterization::NegativeRate,
             GatedDeltaValueHeadMapping::InterleavedByKeyHead,
         ) => (
-            "runtime-vnext.metal.gated-delta.v5.state.delta.fp32.none.negative-rate-interleaved",
-            "cf8e2efbb669c6bf4c3a1f1d742a351e831795f1b1432f7df8a6cc166a79ebd7",
+            "runtime-vnext.metal.gated-delta.v6.state.delta.fp32.none.negative-rate-interleaved",
+            "7ee2098f35ec9fb2bacd15acdf61c262e4bb512517ed0061ff1af27016172fe5",
         ),
         _ => panic!("unreviewed gated-delta delta-state tolerance selector"),
     }

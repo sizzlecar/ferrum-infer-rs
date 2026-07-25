@@ -6,10 +6,14 @@ Open。创建于 2026-07-10。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
-`G03 physical weight ABI -> G08B M2 CUDA current-HEAD correctness -> G09 Marlin FP8
-candidate`。`0b72bab2` 已取得 current-HEAD Qwen3.5-35B CUDA `run`/`serve`
-correctness PASS、Marlin dispatch profile PASS 和单次 c1 bounded KEEP；这些是开发
-checkpoint，不是 G03、G08B 或 G09 canonical PASS。
+`G03 weight ABI/fidelity contract -> G08B M2 CUDA current-HEAD correctness -> G09
+exact-precision performance`。`0b72bab2` 的隐式 F16 -> FP8 candidate 虽曾取得窄
+`run`/`serve` smoke、Marlin dispatch profile 和单次 c1 bounded KEEP，随后在 `7bc46122`
+的 C17 deterministic Unicode case 中丢失首 token，已判定 correctness REJECT。`5149bbfb`
+禁止默认近似重量化并恢复 exact-F16 C17 输出；`883ee9e0` 进一步把 exact QKVZ+BA
+冷打包为单个 QKVZBA projection，并在 CUDA/Metal 共用 schema v6。源码、replay contract
+和真实 Metal 数值用例已通过，CUDA current-HEAD correctness/profile/c1 尚待实机验证。
+这些仍只是 focused development evidence，不是 G03、G08B 或 G09 canonical PASS。
 
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
@@ -189,6 +193,20 @@ contract。每个 operation 必须具备：
 `ExecutionPlanner` 在模型加载阶段把 `ModelProgram + BackendCapabilities + RuntimePolicy`
 解析为不可变 `ExecutionPlan`。计划必须可序列化、可 snapshot、可 diff，并包含每个选择、
 fallback 和拒绝原因。capability 判断不得留在 token hot loop。
+
+权重物化的数值保真度是计划契约，不是 kernel registry 的附带属性：
+
+- 每个 materializer descriptor 必须声明 `Exact` 或 `Approximate`，计划证据同时记录 source
+  dtype/quantization、selected materializer、目标 physical format 和 fidelity；
+- 默认配置、正式正确性矩阵、legacy no-regression 和 release gate 只能选择 `Exact`；
+  layout/repack 只有在数值无损时才属于 `Exact`；
+- backend 存在更快 kernel 只证明 capability，不能授权改变 checkpoint 精度。`Approximate`
+  必须由用户可见的 typed CLI/config policy 显式选择，并有独立精度预算、正确性矩阵和性能
+  artifact；hidden env、backend feature 或自动 preset 不得授权；
+- approximate lane 不能替代同模型原始格式的 required correctness/performance cell，也不能把
+  不同数值合同的吞吐提升计入 exact no-regression；
+- compiler、static initialization 和 trusted catalog 都必须 fail closed：exact policy 遇到
+  approximate descriptor 时在分配设备权重前拒绝。
 
 ### 5.5 执行与资源层
 
