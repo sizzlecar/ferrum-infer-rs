@@ -53,6 +53,7 @@ const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const MASKED_ARGMAX_FUNCTION_NAME: &str = "argmax_rows_f16_masked";
+const SPARSE_REPETITION_FUNCTION_NAME: &str = "apply_repetition_penalties_sparse_f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
 const THREADS_PER_BLOCK: u32 = 256;
 const MAXIMUM_TOKENS_PER_LAUNCH: u64 = u16::MAX as u64;
@@ -466,7 +467,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
 
 pub struct CudaLastTokenMaskedArgmaxProvider {
     descriptor: OperationProviderDescriptor,
-    function: CudaFunction,
+    argmax_function: CudaFunction,
+    repetition_function: CudaFunction,
 }
 
 impl CudaLastTokenMaskedArgmaxProvider {
@@ -478,25 +480,33 @@ impl CudaLastTokenMaskedArgmaxProvider {
             LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID,
             LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
             LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID,
-            transformer::contiguous_bindings(2),
+            transformer::contiguous_bindings(5),
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
                 crate::ptx::ARGMAX_ROWS.as_bytes(),
                 MASKED_ARGMAX_FUNCTION_NAME.as_bytes(),
+                SPARSE_REPETITION_FUNCTION_NAME.as_bytes(),
             ]),
         )?;
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::ARGMAX_ROWS.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("masked argmax module load", error))?;
-        let function = module
-            .load_function(MASKED_ARGMAX_FUNCTION_NAME)
+        let argmax_function =
+            module
+                .load_function(MASKED_ARGMAX_FUNCTION_NAME)
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("masked argmax function load", error)
+                })?;
+        let repetition_function = module
+            .load_function(SPARSE_REPETITION_FUNCTION_NAME)
             .map_err(|error| {
-                CudaDeviceRuntimeError::driver("masked argmax function load", error)
+                CudaDeviceRuntimeError::driver("sparse repetition function load", error)
             })?;
         Ok(Self {
             descriptor,
-            function,
+            argmax_function,
+            repetition_function,
         })
     }
 }
@@ -530,7 +540,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_last_token_masked_argmax(
-            &self.function,
+            &self.argmax_function,
+            &self.repetition_function,
             self.descriptor.provider_implementation_fingerprint(),
             invocation,
         )
@@ -545,10 +556,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
 struct MaskedArgmaxLaunch {
     first_region: usize,
     vocabulary_size: i32,
+    repetition_capacity: i32,
 }
 
 fn encode_last_token_masked_argmax(
-    function: &CudaFunction,
+    argmax_function: &CudaFunction,
+    repetition_function: &CudaFunction,
     provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
@@ -558,23 +571,50 @@ fn encode_last_token_masked_argmax(
         return Err("CUDA masked argmax received another or empty operation".to_owned());
     }
 
-    let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
+    let mut regions = Vec::with_capacity(invocation.participants().len() * 6);
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for participant in invocation.participants() {
         let logits = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let valid_mask = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
+        let repetition_token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 2)?;
+        let repetition_offsets = binding(participant.bindings(), ResolvedValueRole::Input, 3)?;
+        let repetition_penalty = binding(participant.bindings(), ResolvedValueRole::Input, 4)?;
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        validate_masked_argmax_signature(logits, valid_mask, output, vocabulary_size)?;
+        let repetition_capacity = validate_masked_argmax_signature(
+            logits,
+            valid_mask,
+            repetition_token_ids,
+            repetition_offsets,
+            repetition_penalty,
+            output,
+            vocabulary_size,
+        )?;
 
         let first_region = regions.len();
         regions.push(contiguous_region(participant, logits, ElementType::F16)?);
         regions.push(contiguous_region(participant, valid_mask, ElementType::U8)?);
+        regions.push(contiguous_region(
+            participant,
+            repetition_token_ids,
+            ElementType::U32,
+        )?);
+        regions.push(contiguous_region(
+            participant,
+            repetition_offsets,
+            ElementType::U32,
+        )?);
+        regions.push(contiguous_region(
+            participant,
+            repetition_penalty,
+            ElementType::F32,
+        )?);
         regions.push(contiguous_region(participant, output, ElementType::U32)?);
         launches.push(MaskedArgmaxLaunch {
             first_region,
             vocabulary_size: i32::try_from(vocabulary_size)
                 .map_err(|_| "masked argmax vocabulary exceeds i32".to_owned())?,
+            repetition_capacity,
         });
     }
 
@@ -586,9 +626,11 @@ fn encode_last_token_masked_argmax(
     for launch in &launches {
         replay_key = replay_key
             .u64(launch.first_region as u64)
-            .i32(launch.vocabulary_size);
+            .i32(launch.vocabulary_size)
+            .i32(launch.repetition_capacity);
     }
-    let function = function.clone();
+    let argmax_function = argmax_function.clone();
+    let repetition_function = repetition_function.clone();
     CudaDeviceCommand::replayable_operation(
         "vnext_last_token_masked_argmax",
         regions,
@@ -597,8 +639,28 @@ fn encode_last_token_masked_argmax(
             for launch in &launches {
                 let logits = regions[launch.first_region].device_ptr();
                 let valid_mask = regions[launch.first_region + 1].device_ptr();
-                let output = regions[launch.first_region + 2].device_ptr();
-                let mut builder = stream.launch_builder(&function);
+                let repetition_token_ids = regions[launch.first_region + 2].device_ptr();
+                let repetition_offsets = regions[launch.first_region + 3].device_ptr();
+                let repetition_penalty = regions[launch.first_region + 4].device_ptr();
+                let output = regions[launch.first_region + 5].device_ptr();
+                let mut repetition_builder = stream.launch_builder(&repetition_function);
+                repetition_builder.arg(&logits);
+                repetition_builder.arg(&launch.vocabulary_size);
+                repetition_builder.arg(&repetition_offsets);
+                repetition_builder.arg(&repetition_token_ids);
+                repetition_builder.arg(&repetition_penalty);
+                repetition_builder.arg(&launch.repetition_capacity);
+                unsafe {
+                    repetition_builder.launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("vNext sparse repetition penalty launch", error)
+                })?;
+                let mut builder = stream.launch_builder(&argmax_function);
                 builder.arg(&logits);
                 builder.arg(&launch.vocabulary_size);
                 builder.arg(&valid_mask);
@@ -627,7 +689,7 @@ fn encode_last_token_masked_argmax(
             },
             participant_count,
             u64::from(participant_count),
-            u64::from(participant_count),
+            u64::from(participant_count).saturating_mul(2),
             0,
         )
     })
@@ -637,25 +699,39 @@ fn encode_last_token_masked_argmax(
 fn validate_masked_argmax_signature(
     logits: &ResolvedValueBinding,
     valid_mask: &ResolvedValueBinding,
+    repetition_token_ids: &ResolvedValueBinding,
+    repetition_offsets: &ResolvedValueBinding,
+    repetition_penalty: &ResolvedValueBinding,
     output: &ResolvedValueBinding,
     vocabulary_size: u64,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let contiguous = |binding: &ResolvedValueBinding| {
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
     if logits.tensor().element_type() != ElementType::F16
         || valid_mask.tensor().element_type() != ElementType::U8
+        || repetition_token_ids.tensor().element_type() != ElementType::U32
+        || repetition_offsets.tensor().element_type() != ElementType::U32
+        || repetition_penalty.tensor().element_type() != ElementType::F32
         || output.tensor().element_type() != ElementType::U32
         || logits.tensor().dimensions() != [1, vocabulary_size]
         || valid_mask.tensor().dimensions() != [vocabulary_size]
+        || repetition_token_ids.tensor().dimensions().len() != 1
+        || repetition_token_ids.tensor().dimensions()[0] == 0
+        || repetition_offsets.tensor().dimensions() != [2]
+        || repetition_penalty.tensor().dimensions() != [1]
         || output.tensor().dimensions() != [1]
         || !contiguous(logits)
         || !contiguous(valid_mask)
+        || !contiguous(repetition_token_ids)
+        || !contiguous(repetition_offsets)
+        || !contiguous(repetition_penalty)
         || !contiguous(output)
     {
         return Err("CUDA masked argmax invocation differs from its resolved signature".to_owned());
     }
-    Ok(())
+    i32::try_from(repetition_token_ids.tensor().dimensions()[0])
+        .map_err(|_| "CUDA masked argmax repetition capacity exceeds i32".to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]

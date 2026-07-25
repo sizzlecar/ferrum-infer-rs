@@ -23,6 +23,7 @@ struct ResidualAddParams {
 
 struct LastTokenMaskedArgmaxParams {
     uint vocabulary_size;
+    uint repetition_capacity;
 };
 
 struct block_q6_K {
@@ -190,13 +191,36 @@ kernel void vnext_residual_add_f16(
 }
 
 kernel void vnext_last_token_masked_argmax_f16(
-    device const half * logits [[buffer(0)]],
+    device half * logits [[buffer(0)]],
     device const uchar * valid_mask [[buffer(1)]],
-    device uint * output [[buffer(2)]],
-    constant LastTokenMaskedArgmaxParams & params [[buffer(3)]],
+    device const uint * repetition_token_ids [[buffer(2)]],
+    device const uint * repetition_offsets [[buffer(3)]],
+    device const float * repetition_penalty [[buffer(4)]],
+    device uint * output [[buffer(5)]],
+    constant LastTokenMaskedArgmaxParams & params [[buffer(6)]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const float penalty = repetition_penalty[0];
+    const uint repetition_start = min(repetition_offsets[0], params.repetition_capacity);
+    const uint repetition_end = min(repetition_offsets[1], params.repetition_capacity);
+    if (penalty != 1.0f && repetition_start < repetition_end) {
+        for (uint entry = repetition_start + lane;
+             entry < repetition_end;
+             entry += THREADS_PER_GROUP) {
+            const uint token = repetition_token_ids[entry];
+            if (token >= params.vocabulary_size) {
+                continue;
+            }
+            const float value = float(logits[token]);
+            if (!isfinite(value)) {
+                continue;
+            }
+            logits[token] = half(value > 0.0f ? value / penalty : value * penalty);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
     float local_maximum = -INFINITY;
     int local_index = -1;
     for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {

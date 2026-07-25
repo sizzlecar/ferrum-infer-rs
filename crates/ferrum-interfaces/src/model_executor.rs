@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use ferrum_types::{FerrumError, ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     future::Future,
     hash::{Hash, Hasher},
     num::NonZeroU64,
@@ -137,20 +137,42 @@ impl LogitsReturnPolicy {
 /// common greedy chat path while preserving repeat avoidance.
 #[derive(Clone, Debug)]
 pub struct GreedyRepetitionPenalty {
-    pub penalty: f32,
-    pub token_ids: Arc<[u32]>,
+    penalty: f32,
+    token_ids: Arc<[u32]>,
 }
 
 impl GreedyRepetitionPenalty {
-    pub fn new(penalty: f32, token_ids: Vec<u32>) -> Self {
+    pub fn new(penalty: f32, mut token_ids: Vec<u32>) -> Self {
+        let mut seen = HashSet::with_capacity(token_ids.len());
+        token_ids.retain(|token| seen.insert(*token));
         Self {
             penalty,
             token_ids: Arc::from(token_ids),
         }
     }
 
+    pub const fn penalty(&self) -> f32 {
+        self.penalty
+    }
+
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+
     pub fn is_empty(&self) -> bool {
         self.token_ids.is_empty() || self.penalty == 1.0
+    }
+}
+
+#[cfg(test)]
+mod greedy_repetition_penalty_tests {
+    use super::GreedyRepetitionPenalty;
+
+    #[test]
+    fn constructor_preserves_first_seen_order_and_removes_duplicates() {
+        let repetition = GreedyRepetitionPenalty::new(1.1, vec![7, 3, 7, 9, 3]);
+        assert_eq!(repetition.penalty(), 1.1);
+        assert_eq!(repetition.token_ids(), [7, 3, 9]);
     }
 }
 

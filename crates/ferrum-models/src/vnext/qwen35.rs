@@ -858,20 +858,35 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             ]),
         });
         let greedy_mask = value_id("value.input.greedy_token_mask")?;
+        let greedy_repetition_token_ids = value_id("value.input.greedy_repetition_token_ids")?;
+        let greedy_repetition_offsets = value_id("value.input.greedy_repetition_offsets")?;
+        let greedy_repetition_penalty = value_id("value.input.greedy_repetition_penalty")?;
         let greedy_token = value_id("value.output.greedy_token")?;
         nodes.push(ProgramNode {
             id: node_id("node.greedy_token")?,
             operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-            required_version: ContractVersion::new(1, 0),
+            required_version: ContractVersion::new(2, 0),
             work: ProgramNodeWorkSpec::Fixed,
-            inputs: vec![logits.clone(), greedy_mask.clone()],
+            inputs: vec![
+                logits.clone(),
+                greedy_mask.clone(),
+                greedy_repetition_token_ids.clone(),
+                greedy_repetition_offsets.clone(),
+                greedy_repetition_penalty.clone(),
+            ],
             outputs: vec![greedy_token.clone()],
             attributes: BTreeMap::from([attribute("vocab_size", config.vocab_size)?]),
         });
 
         ModelProgram::new(
             self.family_id.clone(),
-            vec![value_id("value.input.token_ids")?, greedy_mask],
+            vec![
+                value_id("value.input.token_ids")?,
+                greedy_mask,
+                greedy_repetition_token_ids,
+                greedy_repetition_offsets,
+                greedy_repetition_penalty,
+            ],
             vec![ProgramBlock {
                 id: "block.decoder".to_owned(),
                 nodes,
@@ -4094,7 +4109,13 @@ mod tests {
                 .iter()
                 .map(ProgramValueId::as_str)
                 .collect::<Vec<_>>(),
-            ["value.output.logits", "value.input.greedy_token_mask"]
+            [
+                "value.output.logits",
+                "value.input.greedy_token_mask",
+                "value.input.greedy_repetition_token_ids",
+                "value.input.greedy_repetition_offsets",
+                "value.input.greedy_repetition_penalty",
+            ]
         );
         assert_eq!(greedy.outputs[0].as_str(), "value.output.greedy_token");
         assert_eq!(
@@ -4104,7 +4125,13 @@ mod tests {
                 .iter()
                 .map(ProgramValueId::as_str)
                 .collect::<Vec<_>>(),
-            ["value.input.token_ids", "value.input.greedy_token_mask"]
+            [
+                "value.input.token_ids",
+                "value.input.greedy_token_mask",
+                "value.input.greedy_repetition_token_ids",
+                "value.input.greedy_repetition_offsets",
+                "value.input.greedy_repetition_penalty",
+            ]
         );
         assert_eq!(
             prepared
