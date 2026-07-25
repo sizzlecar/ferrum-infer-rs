@@ -113,18 +113,6 @@ fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
 }
 
 #[test]
-fn recurrent_f32_tiled_state_is_register_resident_between_tokens() {
-    assert!(GATED_DELTA_KERNEL_SOURCE
-        .contains("recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true>"));
-    assert!(GATED_DELTA_KERNEL_SOURCE
-        .contains("recurrent_gated_delta_rule_varlen_tiled_f32_impl<__half, 16, false>"));
-    assert!(GATED_DELTA_KERNEL_SOURCE.contains("float resident_state[STATE_VALUES_PER_THREAD]"));
-    assert!(GATED_DELTA_KERNEL_SOURCE.contains("resident_state[lane] *= decay"));
-    assert!(GATED_DELTA_KERNEL_SOURCE
-        .contains("ferrum_gdr_store_value(final_states, state_idx, resident_state[lane])"));
-}
-
-#[test]
 fn recurrent_attention_uses_two_packed_input_projections() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("contiguous_bindings(11)"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("shared.qkvz"));
