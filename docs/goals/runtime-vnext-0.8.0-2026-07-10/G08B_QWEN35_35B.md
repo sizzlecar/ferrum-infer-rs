@@ -1073,6 +1073,71 @@ GitHub artifact branch
 `25cc00a2cf1df9b50bc516210d6bc7bb001b90f8`. Retained Vast instance
 `45319871` was verified `stopped/exited` after artifact capture.
 
+### 2026-07-25 Marlin FP8 Mixed-Schema Correctness REJECT Chain
+
+The generic Marlin FP8 W8A16 candidate then produced four bounded CUDA artifacts:
+
+- `runtime-vnext-marlin-fp8-cuda-61398b66-20260725T040040Z`: CUDA Rust
+  compile REJECT, exit `101`; no model load or performance.
+- `runtime-vnext-marlin-fp8-cuda-cc4f8130-20260725T041809Z`: build PASS;
+  typed weight-schema ABI conflict before model execution; performance not started.
+- `runtime-vnext-marlin-fp8-cuda-bfdbf5db-20260725T044616Z`: build PASS;
+  unchanged embedding component static-initialization REJECT; serve, profile, and
+  performance not started.
+- `runtime-vnext-marlin-fp8-cuda-0c9a2c31-20260725T045756Z`: build PASS;
+  `mixed_execution_schema_rejected_by_component_local_moe_resolver`,
+  `correctness-driver.exit=21`; performance not started.
+
+Commit `0b72bab2` is the shared ABI correction for the final root cause, not a
+model-specific workaround. It makes the enclosing schema format a planning-only
+key and requires providers to validate the selected component's physical
+layout and encoding.
+
+The source candidate authorizes only focused CUDA component tests followed by
+three-turn `ferrum run`, non-streaming `ferrum serve`, and streaming usage with
+exactly one `[DONE]`. Any failure is an immediate REJECT. Profile and performance
+remain prohibited until both product entrypoints and actual Marlin dispatch are
+proven. This chain does not produce G08B PASS.
+
+Clean source `0b72bab2a319b71bc110a578c14b90c2936c0a89` then passed the
+official CUDA release build. Its Qwen3.5-35B product checkpoint passed:
+
+- three-turn `ferrum run` with exact outputs `ACKNOWLEDGED`, `CONTINUE`, and
+  `G09-marlin-fp8-001-OK`;
+- non-streaming `ferrum serve` with exact `Paris` output and usage;
+- streaming `ferrum serve` with exact `Paris`, one usage object, and exactly
+  one `[DONE]`.
+
+```text
+CUDA MARLIN FP8 CORRECTNESS PASS: /workspace/ferrum-artifacts/runtime-vnext-component-abi-cuda-0b72bab2-20260725T052043Z/correctness
+```
+
+The Nsight dispatch probe reached `0.994550` projection coverage. Unlike the
+`32c53a6b` reference, it contained a non-MoE channelwise
+`marlin::Marlin<... group_size=-1>` kernel: `2,250` launches and `69.643 ms`.
+The bounded c1 random `64/32`, `25 + 5` warmup, seed `9271` diagnostic
+completed `25/25` with zero errors at `77.0695 tok/s`. That is `5.02%` above
+the accepted `58ea9761` checkpoint and `1.20%` above the `76.1583 tok/s`
+absolute floor, but it has one repeat and no CI, so it is only KEEP.
+
+```text
+CUDA MARLIN FP8 BOUNDED C1 DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-component-abi-cuda-0b72bab2-20260725T052043Z
+```
+
+The complete evidence package is on GitHub branch
+`artifact/runtime-vnext-component-abi-0b72bab2-20260725` at commit
+`0f978393e4d3003051d9e3427bf5284f797e4307`; package SHA256 is
+`1904faf443d071206d9dfe9be5fd1e78e1576e2b4f6f2bb49974b6664b0114d6`.
+Vast instance `45319871` was stopped and polled to `actual_status=exited`;
+active or transitional sibling count was `0`.
+
+Cargo's CUDA unit-test profile generated a distinct cold native build directory,
+so two remote focused test launches were deliberately cancelled and recorded as
+harness REJECTs. They are not source failures and do not replace the local
+contract tests or the actual product-path checkpoint. G08B remains Open: the
+current-HEAD tools, structured-output, concurrency, full CUDA matrix, Metal
+matrix, and legacy-deletion conditions are still outstanding.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

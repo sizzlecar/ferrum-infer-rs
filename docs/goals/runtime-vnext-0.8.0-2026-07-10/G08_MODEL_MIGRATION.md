@@ -114,6 +114,10 @@ Qwen3-Coder 与 DeepSeek-R1 补充 lane必须迁移，因为它们承担 agent/r
 M2/M3 如果修改 G01-G04 contract，必须 reopen 受影响 Goal，并自动 stale 之前 M1/M2 artifact。
 不允许以“另一个模型还能跑”为理由继续迁移。
 
+`0b72bab2` 修改了 G03 resolved-weight/provider ABI，因此 `6fa8e215` 的 M2 CUDA
+703-case PASS 只保留为 historical/intermediate evidence，对 current HEAD 已 stale。
+必须重新取得 current-HEAD CUDA correctness，并在 source freeze 后再执行完整矩阵。
+
 G08 的开发迁移 PASS 不能跨过 v0.8.0 release freeze 自动成为发布候选正确性证据。G10A 生成
 唯一 `release_candidate_sha` 后必须执行：
 

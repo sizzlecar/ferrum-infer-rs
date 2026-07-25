@@ -1471,6 +1471,52 @@ and typed product selection. Vast `45319871` remains `stopped/exited`; the paid
 lane remains closed until that source slice has local correctness evidence and
 a counter-level KEEP/REJECT prediction.
 
+### 2026-07-25 Marlin FP8 W8A16 Candidate Correctness Blocker
+
+Commit `61398b66` implemented the Marlin FP8 lever described above, but the
+`61398b66 -> cc4f8130 -> bfdbf5db -> 0c9a2c31` sequence REJECTed respectively
+at CUDA build, plan ABI, static initialization, and first inference. Every run
+stopped before correctness completed, and no performance command was started.
+There is therefore no new throughput or kernel-counter conclusion.
+
+The accepted CUDA reference remains
+`runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z` at
+`73.385528 tok/s`, `2.77277 tok/s` (`3.64%`) below the `76.1583 tok/s`
+formal floor.
+
+Commit `0b72bab2` corrects the mixed-schema resolver through component-local
+physical ABI validation. Only after current-HEAD `run`/`serve` correctness
+passes and the eligible GDN projection is proven to move from FP16 cuBLAS GEMV
+to a Marlin kernel may one bounded c1 diagnostic run. Missing the kernel signal
+or failing to exceed `73.385528 tok/s` stops the candidate without a full sweep.
+G09 remains Open.
+
+Those bounded conditions passed on clean
+`0b72bab2a319b71bc110a578c14b90c2936c0a89`:
+
+- `ferrum run`, non-streaming `serve`, and streaming `serve` correctness passed;
+- Nsight attribution passed at `0.994550` projection coverage;
+- the old `32c53a6b` profile had no non-MoE `marlin::Marlin` kernel, while the
+  candidate recorded the channelwise `group_size=-1` variant for `2,250`
+  launches and `69.643 ms`;
+- the only unprofiled c1 diagnostic completed `25/25`, zero errors, usage-derived
+  tokens, `30` prefill waves, `930` decode waves, zero failed waves, and zero
+  request deferrals at `77.069498 tok/s`;
+- versus `58ea9761`, throughput increased by `3.683970 tok/s` (`5.02%`), decode
+  device average fell from `7.2650 ms` to `6.4207 ms`, and prefill device total
+  remained effectively flat (`1.1342 s` to `1.1231 s`).
+
+The diagnostic exceeds the `76.1583 tok/s` absolute floor by
+`0.911198 tok/s` (`1.20%`) but has `n_repeats=1` and no confidence interval.
+It is a lever KEEP, not G09 PASS, and no full sweep was run. Formal G09 still
+requires the Goal's correctness prerequisites, repeat/CI protocol, required
+concurrency cells, same-hardware external comparison, and both backends.
+
+Evidence is archived on branch
+`artifact/runtime-vnext-component-abi-0b72bab2-20260725` at
+`0f978393e4d3003051d9e3427bf5284f797e4307`; the package SHA256 is
+`1904faf443d071206d9dfe9be5fd1e78e1576e2b4f6f2bb49974b6664b0114d6`.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

@@ -85,6 +85,20 @@ adapter inventory；数量从此只能单调下降。每个模型在 G08 子阶�
 同一子阶段删除它不再需要的 legacy method、default impl 和 `supports_*`。G03 不为满足零值
 而提前迁移 G08 的全部模型 call sites。
 
+## 2026-07-25 Mixed Execution-Weight ABI Checkpoint
+
+| SHA | 结果 | G03 事实 |
+|---|---|---|
+| `61398b66` | CUDA build REJECT | 引入 capability-driven Marlin FP8 materializer、严格 CUDA component resolver 和 eligible GDN projection wiring；没有模型名、GPU 名或环境变量分支 |
+| `cc4f8130` | build PASS，plan compile REJECT | 修复两个 CUDA 编译错误；暴露 channelwise grouping 错把矩阵 K 编进稳定 quantization ABI |
+| `bfdbf5db` | build PASS，static initialization REJECT | 用 `WholeAxis`/fixed grouping 表达 shape-relative quantization；暴露 mixed schema 中 unchanged component 未由 materializer 返回 |
+| `0c9a2c31` | build PASS，首个 `ferrum run` REJECT | materializer 显式保留 unchanged payload；暴露 provider 把 enclosing schema format 错当 component ABI |
+| `0b72bab2` | CUDA build、`run`/`serve` correctness 和 dispatch profile PASS | enclosing `schema_format_id` 降为 crate-private planning key；CUDA/Metal provider 只按 component physical layout/encoding 校验，并保留错误 quantization ABI negative tests |
+
+该 checkpoint 只证明 G03 的 schema/container 与 component ABI 边界已在源码层收敛；
+它没有产生 `vnext-g03` canonical PASS。完整 CUDA/Metal conformance、numerical catalog
+和 dispatch-overhead 仍未完成，G03 状态保持 Open。
+
 ## 产物与 PASS
 
 ```text
