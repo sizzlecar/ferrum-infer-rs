@@ -8,21 +8,23 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
     gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
-    residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion,
-    DeviceBatchingForm, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
-    EngineProviderDescriptor, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
-    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-    IDENTITY_WEIGHT_MATERIALIZER_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
+    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
+    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceId, DeviceRuntime,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
+    ElementType, EncodedDeviceOperation, EngineProviderDescriptor, OperationContract,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
+    WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    TOKEN_EMBEDDING_OPERATION_ID,
 };
 #[cfg(feature = "vllm-moe-marlin")]
 use ferrum_interfaces::vnext::{
@@ -44,9 +46,13 @@ const LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID: &str =
     "provider.cuda.last_token_dense_linear.f16.cublas";
 const LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID: &str =
     "resource-estimator.cuda.last_token_dense_linear.f16.cublas";
+const LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID: &str = "provider.cuda.last_token_masked_argmax.f16";
+const LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID: &str =
+    "resource-estimator.cuda.last_token_masked_argmax.f16";
 const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
+const MASKED_ARGMAX_FUNCTION_NAME: &str = "argmax_rows_f16_masked";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
 const THREADS_PER_BLOCK: u32 = 256;
 const MAXIMUM_TOKENS_PER_LAUNCH: u64 = u16::MAX as u64;
@@ -65,6 +71,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
         crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
+        crate::ptx::ARGMAX_ROWS.as_bytes(),
         crate::ptx::RMS_NORM.as_bytes(),
         crate::ptx::FUSED_SILU_MUL.as_bytes(),
         crate::ptx::RESIDUAL_ADD.as_bytes(),
@@ -119,6 +126,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     let capabilities = [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+        LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
@@ -156,6 +164,7 @@ pub fn cuda_vnext_operation_registry(
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
+        Box::new(last_token_masked_argmax_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
@@ -174,6 +183,7 @@ pub fn cuda_vnext_operation_registry(
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
+        Box::new(CudaLastTokenMaskedArgmaxProvider::new(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
         Box::new(transformer::CudaDenseLinearProvider::new(runtime)?),
         Box::new(transformer::CudaDenseSwiGluProvider::new(runtime)?),
@@ -452,6 +462,200 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
             provider_failure(identity, "cuda.last_token_dense_linear.encode", message)
         })
     }
+}
+
+pub struct CudaLastTokenMaskedArgmaxProvider {
+    descriptor: OperationProviderDescriptor,
+    function: CudaFunction,
+}
+
+impl CudaLastTokenMaskedArgmaxProvider {
+    pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = last_token_masked_argmax_contract().map_err(contract_error)?;
+        let descriptor = transformer::provider_descriptor(
+            runtime,
+            &contract,
+            LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID,
+            LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+            LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID,
+            transformer::contiguous_bindings(2),
+            implementation_fingerprint(&[
+                include_str!("vnext_ops.rs").as_bytes(),
+                crate::ptx::ARGMAX_ROWS.as_bytes(),
+                MASKED_ARGMAX_FUNCTION_NAME.as_bytes(),
+            ]),
+        )?;
+        let module = runtime
+            .context()
+            .load_module(Ptx::from_src(crate::ptx::ARGMAX_ROWS.to_owned()))
+            .map_err(|error| CudaDeviceRuntimeError::driver("masked argmax module load", error))?;
+        let function = module
+            .load_function(MASKED_ARGMAX_FUNCTION_NAME)
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("masked argmax function load", error)
+            })?;
+        Ok(Self {
+            descriptor,
+            function,
+        })
+    }
+}
+
+impl OperationResourceEstimator for CudaLastTokenMaskedArgmaxProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        transformer::ensure_estimator_request(
+            &self.descriptor,
+            &request,
+            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+        )?;
+        Ok(transformer::estimate(
+            &self.descriptor,
+            request.input_fingerprint(),
+            None,
+        ))
+    }
+}
+
+impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider {
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_last_token_masked_argmax(
+            &self.function,
+            self.descriptor.provider_implementation_fingerprint(),
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| {
+            provider_failure(identity, "cuda.last_token_masked_argmax.encode", message)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MaskedArgmaxLaunch {
+    first_region: usize,
+    vocabulary_size: i32,
+}
+
+fn encode_last_token_masked_argmax(
+    function: &CudaFunction,
+    provider_fingerprint: &str,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    if invocation.operation().id.as_str() != LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+        || invocation.participants().is_empty()
+    {
+        return Err("CUDA masked argmax received another or empty operation".to_owned());
+    }
+
+    let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
+    let mut launches = Vec::with_capacity(invocation.participants().len());
+    for participant in invocation.participants() {
+        let logits = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
+        let valid_mask = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
+        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+        let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
+        validate_masked_argmax_signature(logits, valid_mask, output, vocabulary_size)?;
+
+        let first_region = regions.len();
+        regions.push(contiguous_region(participant, logits, ElementType::F16)?);
+        regions.push(contiguous_region(participant, valid_mask, ElementType::U8)?);
+        regions.push(contiguous_region(participant, output, ElementType::U32)?);
+        launches.push(MaskedArgmaxLaunch {
+            first_region,
+            vocabulary_size: i32::try_from(vocabulary_size)
+                .map_err(|_| "masked argmax vocabulary exceeds i32".to_owned())?,
+        });
+    }
+
+    let participant_count = u32::try_from(invocation.participants().len())
+        .map_err(|_| "masked argmax participant count exceeds u32".to_owned())?;
+    let mut replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_masked_argmax")
+            .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.first_region as u64)
+            .i32(launch.vocabulary_size);
+    }
+    let function = function.clone();
+    CudaDeviceCommand::replayable_operation(
+        "vnext_last_token_masked_argmax",
+        regions,
+        replay_key.finish(),
+        move |stream, regions| {
+            for launch in &launches {
+                let logits = regions[launch.first_region].device_ptr();
+                let valid_mask = regions[launch.first_region + 1].device_ptr();
+                let output = regions[launch.first_region + 2].device_ptr();
+                let mut builder = stream.launch_builder(&function);
+                builder.arg(&logits);
+                builder.arg(&launch.vocabulary_size);
+                builder.arg(&valid_mask);
+                builder.arg(&launch.vocabulary_size);
+                builder.arg(&output);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (THREADS_PER_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("vNext masked argmax launch", error)
+                })?;
+            }
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(
+            if participant_count == 1 {
+                DeviceBatchingForm::Scalar
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
+            participant_count,
+            u64::from(participant_count),
+            u64::from(participant_count),
+            0,
+        )
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn validate_masked_argmax_signature(
+    logits: &ResolvedValueBinding,
+    valid_mask: &ResolvedValueBinding,
+    output: &ResolvedValueBinding,
+    vocabulary_size: u64,
+) -> Result<(), String> {
+    let contiguous = |binding: &ResolvedValueBinding| {
+        matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
+    };
+    if logits.tensor().element_type() != ElementType::F16
+        || valid_mask.tensor().element_type() != ElementType::U8
+        || output.tensor().element_type() != ElementType::U32
+        || logits.tensor().dimensions() != [1, vocabulary_size]
+        || valid_mask.tensor().dimensions() != [vocabulary_size]
+        || output.tensor().dimensions() != [1]
+        || !contiguous(logits)
+        || !contiguous(valid_mask)
+        || !contiguous(output)
+    {
+        return Err("CUDA masked argmax invocation differs from its resolved signature".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
