@@ -12,9 +12,9 @@ use ferrum_interfaces::vnext::{
     PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, QuantizationFormatId,
     QuantizationGrouping, QuantizationPacking, QuantizationSpec, VNextError,
     WeightComponentPayload, WeightComponentRole, WeightComponentSource, WeightComponentSpec,
-    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightMaterializer,
-    WeightMaterializerDescriptor, WeightMaterializerId, WeightSchema, DENSE_LINEAR_OPERATION_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightMaterializationFidelity,
+    WeightMaterializer, WeightMaterializerDescriptor, WeightMaterializerId, WeightSchema,
+    DENSE_LINEAR_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -28,7 +28,7 @@ pub const MARLIN_FP8_WEIGHT_FORMAT_ID: &str = "weight-format.execution.cuda.marl
 pub const MARLIN_FP8_WEIGHT_LAYOUT_ID: &str = "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed";
 pub const MARLIN_FP8_QUANTIZATION_FORMAT_ID: &str = "quantization.marlin.fp8-e4m3fn-channelwise";
 
-const MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
 const DERIVED_COMPONENT_PREFIX: &str = "component.execution.marlin-fp8";
 
 pub fn marlin_fp8_weight_materializer() -> Result<Box<dyn WeightMaterializer>, VNextError> {
@@ -51,6 +51,7 @@ impl MarlinFp8WeightMaterializer {
                 WeightMaterializerId::new(MARLIN_FP8_WEIGHT_MATERIALIZER_ID)?,
                 MATERIALIZER_VERSION,
                 fingerprint,
+                WeightMaterializationFidelity::Approximate,
                 BTreeSet::from([CapabilityId::new(MARLIN_FP8_CAPABILITY_ID)?]),
             )?,
         })

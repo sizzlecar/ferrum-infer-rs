@@ -168,7 +168,7 @@ impl ProgramPlanCompiler {
         options: &ProgramPlanCompileOptions,
     ) -> Result<ProgramPlanCompilation, VNextError> {
         let execution_weights =
-            materializers.select(family, catalog, options.weight_materializer_id())?;
+            materializers.select_exact(family, catalog, options.weight_materializer_id())?;
         Self::compile_with_execution_weights(
             family,
             catalog,

@@ -545,6 +545,53 @@ mod tests {
         output
     }
 
+    fn unpack_fp8_marlin_for_test(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
+        let mut logical = vec![0_u8; n * k];
+        for k_tile in 0..k / 16 {
+            for n_tile in 0..n / 64 {
+                let input_base = (k_tile * (n / 64) + n_tile) * 16 * 64;
+                for thread in 0..32 {
+                    let tensor_core_column = thread / 4;
+                    let tensor_core_row = (thread % 4) * 2;
+                    for warp in 0..4 {
+                        for half in 0..2 {
+                            let output = n_tile * 64 + warp * 16 + tensor_core_column + half * 8;
+                            let rows = [
+                                tensor_core_row,
+                                tensor_core_row + 8,
+                                tensor_core_row + 1,
+                                tensor_core_row + 9,
+                            ];
+                            let input_word = thread * 8 + warp * 2 + half;
+                            for (byte, row) in rows.into_iter().enumerate() {
+                                let input = k_tile * 16 + row;
+                                logical[output * k + input] =
+                                    packed[input_base + input_word * 4 + byte];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        logical
+    }
+
+    fn unpack_channel_scales_for_test(scales: &[half::f16]) -> Vec<f32> {
+        let permutation = (0..4)
+            .flat_map(|row| [0, 1, 8, 9, 16, 17, 24, 25].map(move |column| 2 * row + column))
+            .collect::<Vec<_>>();
+        let mut logical = vec![0.0_f32; scales.len()];
+        for (packed, unpacked) in scales
+            .chunks_exact(permutation.len())
+            .zip(logical.chunks_exact_mut(permutation.len()))
+        {
+            for (destination, source) in permutation.iter().copied().enumerate() {
+                unpacked[source] = packed[destination].to_f32() / FP8_F16_EXPONENT_BIAS_SCALE;
+            }
+        }
+        logical
+    }
+
     fn vllm_int4_repack_reference(qweight: &[i32], k: usize, n: usize) -> Vec<i32> {
         assert_eq!(k % 16, 0);
         assert_eq!(n % 64, 0);
@@ -664,6 +711,49 @@ mod tests {
             prepared.scales(),
             repack_scales_to_marlin(&expected_scales, k, n, k)
         );
+    }
+
+    #[test]
+    fn f16_to_fp8_marlin_materialization_is_numerically_approximate() {
+        let n = 64;
+        let k = 128;
+        let source = f16_bytes((0..n).flat_map(|output| {
+            (0..k).map(move |input| {
+                let centered = ((output * 131 + input * 17) % 2_003) as f32 - 1_001.0;
+                centered / 97.0
+            })
+        }));
+        let input = (0..k)
+            .map(|index| (((index * 29) % 41) as f32 - 20.0) / 19.0)
+            .collect::<Vec<_>>();
+        let prepared = prepare_f16_weight_for_fp8_marlin(&source, n, k).unwrap();
+        let quantized = unpack_fp8_marlin_for_test(prepared.packed_values(), n, k);
+        let scales = unpack_channel_scales_for_test(prepared.scales());
+
+        let mut exact_squared = 0.0_f64;
+        let mut error_squared = 0.0_f64;
+        let mut maximum_error = 0.0_f32;
+        for output in 0..n {
+            let mut exact = 0.0_f32;
+            let mut approximate = 0.0_f32;
+            for (input_index, input_value) in input.iter().copied().enumerate() {
+                let source_value = read_f16_le(&source, output * k + input_index);
+                let quantized_value =
+                    float8::F8E4M3::from_bits(quantized[output * k + input_index]).to_f32()
+                        * scales[output];
+                exact += input_value * source_value;
+                approximate += input_value * quantized_value;
+            }
+            let error = approximate - exact;
+            exact_squared += f64::from(exact) * f64::from(exact);
+            error_squared += f64::from(error) * f64::from(error);
+            maximum_error = maximum_error.max(error.abs());
+        }
+        let relative_l2 = (error_squared / exact_squared).sqrt();
+
+        assert!(relative_l2 > 1.0e-4, "relative_l2={relative_l2}");
+        assert!(relative_l2 < 0.1, "relative_l2={relative_l2}");
+        assert!(maximum_error > 1.0e-3, "maximum_error={maximum_error}");
     }
 
     #[test]
