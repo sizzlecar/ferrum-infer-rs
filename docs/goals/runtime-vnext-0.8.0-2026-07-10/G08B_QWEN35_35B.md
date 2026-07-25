@@ -1248,6 +1248,33 @@ deletion are still open. The artifact is on GitHub branch
 Vast instance `45319871` was stopped and polled to `stopped/exited`, with no
 paid or transitional sibling.
 
+### 2026-07-25 Packed GDN CUDA Checkpoint
+
+Commit `d995201e95e3bb09d6aa67ba4fc7363e0a233c8f` replaces the per-participant
+GDN execution loop with one packed wave when participants share physical token
+regions. The packed path keeps recurrent state sequence-local through a pointer
+table and retains the batch-1 loop only for non-shared physical layouts. Commit
+`affacd2c2a5fdc1274f5a77b014c2a2af00f2a6e` keeps the base CUDA feature
+compilable without changing the full-feature path.
+
+On a clean 1x RTX 4090 host, the official CUDA feature build completed in
+`5m05s`; binary SHA256 was
+`4123b86531951cb802693776ec93c798ac953a065d0d2ec570402fbb60ee2d2d`.
+The real CUDA gated-delta and linear-attention numerical suites passed `14/14`.
+The product runner command selected 110 cases across C03, C05, C06, and C17
+(not the initially expected nine) and passed all `110/110`:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-packed-gdn-cuda-affacd2c-20260725T153414Z/correctness/m2-qwen35-35b-a3b/cuda/focused-packed-gdn-report.json
+```
+
+This evidence covers `ferrum run`, `ferrum serve`, streaming usage/`[DONE]`,
+multi-turn, and Unicode paths represented by those scenarios. It remains a
+focused KEEP rather than G08B PASS: the complete 703-case CUDA matrix, required
+tools/structured-output/concurrency coverage outside the selected scenarios,
+Metal, and legacy deletion remain open. The paid instance reached
+`stopped/exited`, with no paid or transitional sibling.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

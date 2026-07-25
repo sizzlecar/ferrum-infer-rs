@@ -35,6 +35,24 @@ CUDA matrix，所以仍不是 G03、G08B 或 G09 canonical PASS，也不降低 s
 archive SHA256 `1cd3b1fc3e656ecce8cd9f71f23877404f208665ed4e1596b1304917983637d2`；
 付费实例已确认 `stopped/exited`，无 paid/transitional sibling。
 
+commit `d995201e` 随后把共享物理 token 区域的多请求 GDN wave 合并为一个 packed
+projection/prepare/conv/delta/output 链，并以每序列 state pointer table 保留独立 recurrent
+state；`affacd2c` 修复基础 CUDA feature 的 `c_void` 编译边界。clean `affacd2c` 的官方
+CUDA feature build 用时 `5m05s`，binary SHA256 为
+`4123b86531951cb802693776ec93c798ac953a065d0d2ec570402fbb60ee2d2d`；真实 CUDA
+GDN/linear-attention 数值测试 `14/14` 通过。focus-scenario 命令实际选择了 `110` 个
+C03/C05/C06/C17 产品用例而不是预期的 9 个，结果 `110/110` 通过；相同 4090、相同
+random `64/32` c32 workload 完成 `64/64`、零错误，得到 `155.1381 tok/s`，比
+`90057af1` 的 `121.0025 tok/s` 提升 `28.21%`。本轮性能命令漏传
+`--profile-jsonl`，scheduler trace 只能证明 GDN node 执行，不能直接证明 native
+`batching_form=packed` 和物理 dispatch 计数，因此结论是
+`KEEP_CODE_AND_PERFORMANCE_PENDING_PACKED_ATTRIBUTION_TRACE`，不是 G08B/G09 PASS。
+远端压缩 artifact SHA256 为
+`7116188660add41efa654d4256fc0c1d2f9b8d6ffef08e7230853125b2c65a49`；因远端
+GitHub credential/SSH key 不可用，archive 与 commit 暂留 retained stopped instance，
+本机只有 stop/inventory metadata，未使用 SCP。实例已确认 `stopped/exited`，无
+paid/transitional sibling。
+
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
 为准。G00-G10 继续定义最终能力与验收维度；S0-S7 定义实际生产纵切顺序。修订不降低本文件的

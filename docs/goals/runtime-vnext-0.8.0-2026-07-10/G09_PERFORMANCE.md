@@ -1696,6 +1696,52 @@ sweep. Evidence is on GitHub branch
 The paid instance was verified `stopped/exited`, with zero paid or transitional
 sibling.
 
+### 2026-07-25 Packed GDN c32 Checkpoint
+
+The next source-backed lever removed the per-participant GDN projection and
+recurrent-kernel loop for shared physical token regions. Clean
+`affacd2c2a5fdc1274f5a77b014c2a2af00f2a6e` passed the official-feature build,
+real CUDA numerical tests `14/14`, and product correctness `110/110` before
+measurement. The same retained RTX 4090 and the same random `64/32` c32
+workload produced:
+
+| metric | `90057af1` | `affacd2c` | delta |
+|---|---:|---:|---:|
+| c32 output throughput | `121.002505 tok/s` | `155.138143 tok/s` | `+28.2107%` |
+| completed requests | `64/64` | `64/64` | unchanged |
+| request errors | `0` | `0` | unchanged |
+
+The candidate had zero malformed-stream, missing/duplicate `[DONE]`,
+zero-output, HTTP 500, panic, or output-quality counters, and usage-sourced
+output token counts. It is a single-repeat diagnostic without CI, not formal
+G09 performance evidence.
+
+The performance server command saved `scheduler-trace.jsonl` but accidentally
+omitted `--profile-jsonl`. The scheduler trace contains `6,480`
+`gated_delta_recurrent_attention` node events, but cannot directly establish
+the native work-attribution tuple `batching_form=packed`, physical compute
+dispatch count `10`, and transfer count `2`. Therefore the accepted decision is:
+
+```text
+CUDA VNEXT PACKED GDN CODE KEEP PENDING TRACE: affacd2c2a5fdc1274f5a77b014c2a2af00f2a6e
+```
+
+No full sweep is authorized from this result. The next paid action is a short
+trace-closure diagnostic on the retained instance with `--profile-jsonl`,
+asserting packed attribution for a participant count greater than one; it does
+not need to repeat the full performance matrix. The remote artifact archive is
+`runtime-vnext-packed-gdn-cuda-affacd2c-20260725T153414Z.tar.gz`, SHA256
+`7116188660add41efa654d4256fc0c1d2f9b8d6ffef08e7230853125b2c65a49`.
+Its pending artifact commit is `a8bf6d6a` on
+`artifact/runtime-vnext-packed-gdn-affacd2c-20260725`. GitHub upload is blocked
+because the retained host has neither usable HTTPS credentials nor a
+GitHub-authorized forwarded SSH key; SCP was not used. The paid window was
+`47m53s`, approximately `$0.3747` at `$0.469444/h`, exceeding the stated
+`$0.313` cap by about `$0.0617` during artifact packaging/auth attempts. Future
+paid lanes must preflight GitHub push authentication before the instance is
+started. The instance is verified `stopped/exited`, with no paid or
+transitional sibling.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
