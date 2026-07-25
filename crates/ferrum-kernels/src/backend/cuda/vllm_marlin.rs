@@ -1,11 +1,9 @@
-//! Rust FFI binding for the vLLM gptq_marlin port.
+//! Rust FFI binding for the vendored vLLM Marlin port.
 //!
-//! See `crates/ferrum-kernels/vllm_marlin/` for the C++ source. The
-//! `extern "C"` entry point at the bottom of `vllm_marlin/marlin.cu`
-//! (`ferrum_marlin_mm_f16_u4b8`) is the only symbol we expose for now —
-//! it forwards to `marlin::marlin_mm()` with a/b/c/s types fixed to
-//! kFloat16 / kU4B8 / kFloat16 / kFloat16. That covers the FP16 +
-//! GPTQ-INT4 path used by Llama-3.x INT4 (our M2 bench).
+//! Marlin compiles one CUDA specialization per supported scalar combination,
+//! but all Rust callers share one versioned C launch ABI. Rust exposes a typed
+//! FP16-activation weight kind rather than one FFI symbol per quantization
+//! precision.
 //!
 //! Compile time: nvcc compiling `marlin.cu` + `gptq_marlin_repack.cu` +
 //! `sm80_kernel_float16_u4b8_float16.cu` is ~10-20 min on a fresh build
@@ -13,6 +11,67 @@
 
 use cudarc::driver::sys::CUstream;
 use std::os::raw::{c_int, c_void};
+
+const FERRUM_MARLIN_ABI_VERSION: u32 = 1;
+const FERRUM_MARLIN_SCALAR_F16: i32 = 1;
+const FERRUM_MARLIN_SCALAR_U4B8: i32 = 5;
+const FERRUM_MARLIN_SCALAR_FE4M3FN: i32 = 8;
+
+const FERRUM_MARLIN_HAS_ACT_ORDER: u32 = 1 << 1;
+const FERRUM_MARLIN_IS_K_FULL: u32 = 1 << 2;
+const FERRUM_MARLIN_USE_ATOMIC_ADD: u32 = 1 << 4;
+const FERRUM_MARLIN_USE_FP32_REDUCE: u32 = 1 << 5;
+
+#[repr(C)]
+struct FerrumMarlinLaunch {
+    abi_version: u32,
+    struct_size: u32,
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    c_tmp: *mut c_void,
+    b_bias: *mut c_void,
+    a_scales: *mut c_void,
+    b_scales: *mut c_void,
+    global_scale: *mut c_void,
+    zero_points: *mut c_void,
+    group_index: *mut c_void,
+    permutation: *mut c_void,
+    a_tmp: *mut c_void,
+    workspace: *mut c_void,
+    stream: *mut c_void,
+    prob_m: i32,
+    prob_n: i32,
+    prob_k: i32,
+    lda: i32,
+    a_type: i32,
+    b_type: i32,
+    c_type: i32,
+    scale_type: i32,
+    num_groups: i32,
+    group_size: i32,
+    device: i32,
+    thread_k_init: i32,
+    thread_n_init: i32,
+    sms: i32,
+    flags: u32,
+    reserved: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarlinF16WeightType {
+    U4B8,
+    E4M3Fn,
+}
+
+impl MarlinF16WeightType {
+    const fn ffi_scalar_type(self) -> i32 {
+        match self {
+            Self::U4B8 => FERRUM_MARLIN_SCALAR_U4B8,
+            Self::E4M3Fn => FERRUM_MARLIN_SCALAR_FE4M3FN,
+        }
+    }
+}
 
 extern "C" {
     /// GPTQ → vLLM-Marlin tile-format repack. Same total bytes as input
@@ -40,48 +99,10 @@ extern "C" {
         stream: CUstream,
     ) -> c_int;
 
-    /// Forwards to `marlin::marlin_mm` with fixed FP16+kU4B8+FP16+FP16
-    /// dtype combo. See `vllm_marlin/marlin.cu` end-of-file for the
-    /// wrapper. Caller ensures all device pointers are valid + on
-    /// `dev` + the workspace buffer is at least `sms` ints.
-    pub fn ferrum_marlin_mm_f16_u4b8(
-        // Buffers (device pointers, FP16 / INT4-packed / etc.)
-        a: *const c_void,
-        b: *const c_void,
-        c: *mut c_void,
-        c_tmp: *mut c_void,
-        a_s: *mut c_void,
-        b_s: *mut c_void,
-        g_idx: *mut c_void,
-        perm: *mut c_void,
-        a_tmp: *mut c_void,
-        // Shape
-        prob_m: c_int,
-        prob_n: c_int,
-        prob_k: c_int,
-        lda: c_int,
-        // Workspace
-        workspace: *mut c_void,
-        // Flags
-        has_act_order: bool,
-        is_k_full: bool,
-        num_groups: c_int,
-        group_size: c_int,
-        // Device + stream
-        dev: c_int,
-        stream: CUstream,
-        // Tile init hints (-1 = let the kernel choose)
-        thread_k_init: c_int,
-        thread_n_init: c_int,
-        sms: c_int,
-        use_atomic_add: bool,
-        use_fp32_reduce: bool,
-    );
+    fn ferrum_marlin_mm(launch: *const FerrumMarlinLaunch);
 }
 
-/// Safe-ish wrapper over `ferrum_marlin_mm_f16_u4b8`. Caller still has
-/// to guarantee the device pointers point at valid CUDA memory and live
-/// for the duration of the call.
+/// Launch an FP16-activation Marlin GEMM through the shared versioned FFI.
 ///
 /// # Safety
 /// - `a`, `b`, `c`, `c_tmp`, `a_s`, `b_s`, `g_idx`, `perm`, `a_tmp`,
@@ -90,6 +111,89 @@ extern "C" {
 /// - Caller must respect Marlin shape constraints (size_n divisible by
 ///   min_thread_n, size_k divisible by tile_k_size, etc.). The kernel
 ///   abort()s otherwise.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_marlin_mm_f16_weight(
+    weight_type: MarlinF16WeightType,
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    c_tmp: *mut c_void,
+    a_s: *mut c_void,
+    b_s: *mut c_void,
+    g_idx: *mut c_void,
+    perm: *mut c_void,
+    a_tmp: *mut c_void,
+    prob_m: i32,
+    prob_n: i32,
+    prob_k: i32,
+    lda: i32,
+    workspace: *mut c_void,
+    has_act_order: bool,
+    is_k_full: bool,
+    num_groups: i32,
+    group_size: i32,
+    dev: i32,
+    stream: CUstream,
+    sms: i32,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+) {
+    let mut flags = 0;
+    if has_act_order {
+        flags |= FERRUM_MARLIN_HAS_ACT_ORDER;
+    }
+    if is_k_full {
+        flags |= FERRUM_MARLIN_IS_K_FULL;
+    }
+    if use_atomic_add {
+        flags |= FERRUM_MARLIN_USE_ATOMIC_ADD;
+    }
+    if use_fp32_reduce {
+        flags |= FERRUM_MARLIN_USE_FP32_REDUCE;
+    }
+
+    let launch = FerrumMarlinLaunch {
+        abi_version: FERRUM_MARLIN_ABI_VERSION,
+        struct_size: std::mem::size_of::<FerrumMarlinLaunch>() as u32,
+        a,
+        b,
+        c,
+        c_tmp,
+        b_bias: std::ptr::null_mut(),
+        a_scales: a_s,
+        b_scales: b_s,
+        global_scale: std::ptr::null_mut(),
+        zero_points: std::ptr::null_mut(),
+        group_index: g_idx,
+        permutation: perm,
+        a_tmp,
+        workspace,
+        stream: stream.cast(),
+        prob_m,
+        prob_n,
+        prob_k,
+        lda,
+        a_type: FERRUM_MARLIN_SCALAR_F16,
+        b_type: weight_type.ffi_scalar_type(),
+        c_type: FERRUM_MARLIN_SCALAR_F16,
+        scale_type: FERRUM_MARLIN_SCALAR_F16,
+        num_groups,
+        group_size,
+        device: dev,
+        thread_k_init: -1,
+        thread_n_init: -1,
+        sms,
+        flags,
+        reserved: 0,
+    };
+    ferrum_marlin_mm(&launch);
+}
+
+/// Compatibility helper for the existing GPTQ U4B8 call sites.
+///
+/// # Safety
+/// The same pointer, stream, and shape requirements as
+/// [`launch_marlin_mm_f16_weight`] apply.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_marlin_mm_f16_u4b8(
     a: *const c_void,
@@ -116,7 +220,8 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
     use_atomic_add: bool,
     use_fp32_reduce: bool,
 ) {
-    ferrum_marlin_mm_f16_u4b8(
+    launch_marlin_mm_f16_weight(
+        MarlinF16WeightType::U4B8,
         a,
         b,
         c,
@@ -137,8 +242,6 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
         group_size,
         dev,
         stream,
-        -1, // thread_k_init: let kernel choose
-        -1, // thread_n_init: let kernel choose
         sms,
         use_atomic_add,
         use_fp32_reduce,
@@ -411,7 +514,24 @@ pub fn vllm_gptq_marlin_repack(
 
 #[cfg(test)]
 mod tests {
-    use super::{gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin};
+    use super::{
+        gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin, FerrumMarlinLaunch,
+        MarlinF16WeightType, FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4B8,
+    };
+
+    #[test]
+    fn marlin_launch_ffi_layout_and_weight_types_are_stable() {
+        assert_eq!(std::mem::size_of::<FerrumMarlinLaunch>(), 184);
+        assert_eq!(std::mem::align_of::<FerrumMarlinLaunch>(), 8);
+        assert_eq!(
+            MarlinF16WeightType::U4B8.ffi_scalar_type(),
+            FERRUM_MARLIN_SCALAR_U4B8
+        );
+        assert_eq!(
+            MarlinF16WeightType::E4M3Fn.ffi_scalar_type(),
+            FERRUM_MARLIN_SCALAR_FE4M3FN
+        );
+    }
 
     #[test]
     fn qzeros_code7_detects_symmetric_gptq() {

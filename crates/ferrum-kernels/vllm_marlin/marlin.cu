@@ -24,6 +24,7 @@
 #endif
 
 #include "kernel.h"
+#include "ferrum_marlin_ffi.h"
 // Removed for ferrum-infer-rs port: PyBind/Torch registration not needed.
 // #include "core/registration.h"
 
@@ -859,11 +860,81 @@ torch::Tensor marlin_gemm(
 #endif
 #endif  // closes #if false (disabled torch::Tensor marlin_gemm wrapper)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// extern "C" entry point used by the ferrum-kernels Rust FFI. Forwards to
-// marlin::marlin_mm with explicit args. Caller is responsible for resolving
-// vllm::ScalarType from passed type ids (e.g. vllm::kFloat16, vllm::kU4B8).
-// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+vllm::ScalarType ferrum_marlin_scalar_type(int32_t scalar_type) {
+  switch (scalar_type) {
+    case FERRUM_MARLIN_SCALAR_F16:
+      return vllm::kFloat16;
+    case FERRUM_MARLIN_SCALAR_BF16:
+      return vllm::kBFloat16;
+    case FERRUM_MARLIN_SCALAR_S8:
+      return vllm::kS8;
+    case FERRUM_MARLIN_SCALAR_U4:
+      return vllm::kU4;
+    case FERRUM_MARLIN_SCALAR_U4B8:
+      return vllm::kU4B8;
+    case FERRUM_MARLIN_SCALAR_U8B128:
+      return vllm::kU8B128;
+    case FERRUM_MARLIN_SCALAR_FE2M1F:
+      return vllm::kFE2M1f;
+    case FERRUM_MARLIN_SCALAR_FE4M3FN:
+      return vllm::kFE4M3fn;
+    default:
+      TORCH_CHECK(false, "Unsupported Ferrum Marlin scalar type ",
+                  scalar_type);
+      return vllm::kFloat16;
+  }
+}
+
+constexpr uint32_t kFerrumMarlinKnownFlags =
+    FERRUM_MARLIN_HAS_BIAS | FERRUM_MARLIN_HAS_ACT_ORDER |
+    FERRUM_MARLIN_IS_K_FULL | FERRUM_MARLIN_HAS_ZERO_POINTS |
+    FERRUM_MARLIN_USE_ATOMIC_ADD | FERRUM_MARLIN_USE_FP32_REDUCE |
+    FERRUM_MARLIN_ZERO_POINTS_ARE_FLOAT;
+
+bool ferrum_marlin_flag(const FerrumMarlinLaunch& launch, uint32_t flag) {
+  return (launch.flags & flag) != 0;
+}
+
+}  // namespace
+
+extern "C" void ferrum_marlin_mm(const FerrumMarlinLaunch* launch) {
+  TORCH_CHECK(launch != nullptr, "FerrumMarlinLaunch must not be null");
+  TORCH_CHECK(launch->abi_version == FERRUM_MARLIN_ABI_VERSION,
+              "Unsupported Ferrum Marlin ABI version ", launch->abi_version);
+  TORCH_CHECK(launch->struct_size == sizeof(FerrumMarlinLaunch),
+              "FerrumMarlinLaunch size mismatch: received ",
+              launch->struct_size, ", expected ", sizeof(FerrumMarlinLaunch));
+  TORCH_CHECK(launch->reserved == 0,
+              "FerrumMarlinLaunch reserved field must be zero");
+  TORCH_CHECK((launch->flags & ~kFerrumMarlinKnownFlags) == 0,
+              "FerrumMarlinLaunch has unknown flags ", launch->flags);
+
+  marlin::marlin_mm(
+      launch->a, launch->b, launch->c, launch->c_tmp, launch->b_bias,
+      launch->a_scales, launch->b_scales, launch->global_scale,
+      launch->zero_points, launch->group_index, launch->permutation,
+      launch->a_tmp, launch->prob_m, launch->prob_n, launch->prob_k,
+      launch->lda, launch->workspace,
+      ferrum_marlin_scalar_type(launch->a_type),
+      ferrum_marlin_scalar_type(launch->b_type),
+      ferrum_marlin_scalar_type(launch->c_type),
+      ferrum_marlin_scalar_type(launch->scale_type),
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_HAS_BIAS),
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_HAS_ACT_ORDER),
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_IS_K_FULL),
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_HAS_ZERO_POINTS),
+      launch->num_groups, launch->group_size, launch->device,
+      reinterpret_cast<cudaStream_t>(launch->stream), launch->thread_k_init,
+      launch->thread_n_init, launch->sms,
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_USE_ATOMIC_ADD),
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_USE_FP32_REDUCE),
+      ferrum_marlin_flag(*launch, FERRUM_MARLIN_ZERO_POINTS_ARE_FLOAT));
+}
+
+// Compatibility entry point for the original Ferrum U4B8 caller. New weight
+// formats use ferrum_marlin_mm directly through the versioned launch ABI.
 extern "C" void ferrum_marlin_mm_f16_u4b8(
     const void* A, const void* B, void* C, void* C_tmp,
     void* a_s, void* b_s, void* g_idx, void* perm, void* a_tmp,
@@ -871,23 +942,40 @@ extern "C" void ferrum_marlin_mm_f16_u4b8(
     bool has_act_order, bool is_k_full, int num_groups, int group_size,
     int dev, cudaStream_t stream, int thread_k_init, int thread_n_init, int sms,
     bool use_atomic_add, bool use_fp32_reduce) {
-  marlin::marlin_mm(A, B, C, C_tmp,
-                    /* b_bias */ nullptr,
-                    a_s, b_s,
-                    /* g_s    (global scale) */ nullptr,
-                    /* zp                    */ nullptr,
-                    g_idx, perm, a_tmp,
-                    prob_m, prob_n, prob_k, lda,
-                    workspace,
-                    vllm::kFloat16,   // a_type
-                    vllm::kU4B8,      // b_type
-                    vllm::kFloat16,   // c_type
-                    vllm::kFloat16,   // s_type
-                    /* has_bias */ false,
-                    has_act_order, is_k_full,
-                    /* has_zp */ false,
-                    num_groups, group_size, dev, stream,
-                    thread_k_init, thread_n_init, sms,
-                    use_atomic_add, use_fp32_reduce,
-                    /* is_zp_float */ false);
+  uint32_t flags = 0;
+  if (has_act_order) flags |= FERRUM_MARLIN_HAS_ACT_ORDER;
+  if (is_k_full) flags |= FERRUM_MARLIN_IS_K_FULL;
+  if (use_atomic_add) flags |= FERRUM_MARLIN_USE_ATOMIC_ADD;
+  if (use_fp32_reduce) flags |= FERRUM_MARLIN_USE_FP32_REDUCE;
+
+  FerrumMarlinLaunch launch{};
+  launch.abi_version = FERRUM_MARLIN_ABI_VERSION;
+  launch.struct_size = sizeof(FerrumMarlinLaunch);
+  launch.a = A;
+  launch.b = B;
+  launch.c = C;
+  launch.c_tmp = C_tmp;
+  launch.a_scales = a_s;
+  launch.b_scales = b_s;
+  launch.group_index = g_idx;
+  launch.permutation = perm;
+  launch.a_tmp = a_tmp;
+  launch.workspace = workspace;
+  launch.stream = reinterpret_cast<void*>(stream);
+  launch.prob_m = prob_m;
+  launch.prob_n = prob_n;
+  launch.prob_k = prob_k;
+  launch.lda = lda;
+  launch.a_type = FERRUM_MARLIN_SCALAR_F16;
+  launch.b_type = FERRUM_MARLIN_SCALAR_U4B8;
+  launch.c_type = FERRUM_MARLIN_SCALAR_F16;
+  launch.scale_type = FERRUM_MARLIN_SCALAR_F16;
+  launch.num_groups = num_groups;
+  launch.group_size = group_size;
+  launch.device = dev;
+  launch.thread_k_init = thread_k_init;
+  launch.thread_n_init = thread_n_init;
+  launch.sms = sms;
+  launch.flags = flags;
+  ferrum_marlin_mm(&launch);
 }
