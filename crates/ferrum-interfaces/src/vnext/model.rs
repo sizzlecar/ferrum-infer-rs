@@ -810,6 +810,14 @@ impl WeightSchema {
         Ok(())
     }
 
+    pub fn fingerprint(&self) -> Result<String, VNextError> {
+        let bytes = serde_json::to_vec(self).map_err(|error| VNextError::Serialization {
+            context: "fingerprint weight schema",
+            message: error.to_string(),
+        })?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
     pub fn quantization_formats(&self) -> BTreeSet<super::QuantizationFormatId> {
         self.components
             .iter()

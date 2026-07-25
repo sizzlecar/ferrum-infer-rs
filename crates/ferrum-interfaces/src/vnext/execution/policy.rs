@@ -1,7 +1,7 @@
 use super::{
     canonical_fingerprint, invalid_plan, CapabilityCatalog, CompletionRetentionSpec,
-    ContractVersion, DynamicStorageProfile, PlanNodeResolution, PreparedModelFamily,
-    ReusableExecutionPolicy, Serialize, VNextError,
+    ContractVersion, DynamicStorageProfile, ExecutionWeightPlan, PlanNodeResolution,
+    PreparedModelFamily, ReusableExecutionPolicy, Serialize, VNextError,
 };
 
 /// Typed policy selected before planning. Memory capacity is part of the
@@ -50,6 +50,7 @@ pub struct PlanBuildRequest<'a, P: RuntimePolicy> {
     pub(super) policy: &'a P,
     pub(super) node_resolutions: Vec<PlanNodeResolution>,
     pub(super) completion_retention: CompletionRetentionSpec,
+    pub(super) execution_weights: ExecutionWeightPlan,
 }
 
 impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
@@ -69,6 +70,7 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
             policy,
             node_resolutions,
             completion_retention: CompletionRetentionSpec::default(),
+            execution_weights: ExecutionWeightPlan::identity(family)?,
         })
     }
 
@@ -107,5 +109,9 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
 
     pub fn policy(&self) -> &P {
         self.policy
+    }
+
+    pub fn execution_weights(&self) -> &ExecutionWeightPlan {
+        &self.execution_weights
     }
 }

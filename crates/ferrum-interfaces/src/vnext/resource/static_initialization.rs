@@ -466,6 +466,7 @@ where
     let setup_started = Instant::now();
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
     let placements = weight_placements(family, plan).map_err(contract_failure)?;
+    let execution_weight_schema = plan.payload().execution_weights().schema();
     let runtime = Arc::clone(transaction.lease().runtime());
     let mut weight_import = if placements.is_empty() {
         None
@@ -530,7 +531,7 @@ where
         }
     }
 
-    for component in &family.weight_schema().components {
+    for component in &execution_weight_schema.components {
         let Some(placement) = placements.get(&component.id) else {
             continue;
         };
@@ -795,6 +796,9 @@ where
 {
     let payload = plan.payload();
     let admission = transaction.admission();
+    payload
+        .execution_weights()
+        .validate_against_family(family)?;
     if payload.family_id() != family.family_id()
         || payload.prepared_family_fingerprint() != family.fingerprint()?
         || admission.plan_id() != payload.plan_id()
@@ -817,8 +821,11 @@ fn weight_placements(
     family: &PreparedModelFamily,
     plan: &ExecutionPlan,
 ) -> Result<BTreeMap<WeightId, WeightPlacement>, VNextError> {
-    let schema = family
-        .weight_schema()
+    plan.payload()
+        .execution_weights()
+        .validate_against_family(family)?;
+    let execution_weight_schema = plan.payload().execution_weights().schema();
+    let schema = execution_weight_schema
         .components
         .iter()
         .map(|component| (&component.id, component))
@@ -885,7 +892,7 @@ fn weight_placements(
             }
         }
     }
-    for component in family.weight_schema().components.iter() {
+    for component in &execution_weight_schema.components {
         if component.required && !placements.contains_key(&component.id) {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: format!(

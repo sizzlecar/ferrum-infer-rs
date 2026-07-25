@@ -1316,6 +1316,55 @@ kernel launches, reductions, barriers, or provider work it removes and
 predict the corresponding saved counter or timing change. Missing that
 offline headroom proof keeps the paid lane closed.
 
+### 2026-07-25 Execution Weight Materialization Contract Checkpoint
+
+The replay attribution artifact
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-replay-kernel-attribution-v2-32c53a6b-20260724T060439Z/`
+assigned `26.0783%` of replay wall time to the dominant FP16 cuBLAS GEMV
+lineage (`11,250` launches), while paged attention accounted for about
+`1.226%`. The next source lever therefore targets generic execution-weight
+materialization rather than another GDN state-residency or paged-attention
+candidate.
+
+The first source-only slice separates the prepared checkpoint `WeightSchema`
+from the physical `ExecutionWeightPlan` consumed by provider selection,
+resource identity, static memory planning, weight initialization, and plan
+wire/hash validation. It admits only a canonical identity materializer.
+Forged materializer identities or execution schemas remain unable to
+self-authorize through serialized plan data. This slice intentionally makes
+no CUDA performance claim and has not started a paid instance.
+
+Focused validation:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces \
+  --test vnext_program_plan_compiler_contract_tests \
+  --test vnext_plan_wire_contract_tests \
+  --test vnext_static_initialization_contract_tests -- --test-threads=2
+
+vnext_plan_wire_contract_tests: 12 passed
+vnext_program_plan_compiler_contract_tests: 8 passed
+vnext_static_initialization_contract_tests: 5 passed
+```
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.52s
+```
+
+The accepted performance reference remains
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/`
+at `73.385528 tok/s`, `2.77277 tok/s` (`3.64%`) below the formal
+`76.1583 tok/s` floor. Vast instance `45319871` remains `stopped/exited`.
+
+The paid CUDA lane stays closed until a trusted materializer catalog,
+transformed-schema lineage validation, explicit derived-weight memory
+accounting, and focused source tests exist. The first candidate is the
+already-compiled Marlin FP8 W8A16 path for eligible dense FP16 GDN weights;
+selection must be typed and capability-driven, with no model-name, GPU-name,
+or hidden-environment branch. A later CUDA diagnostic must predict and verify
+movement in the attributed FP16 GEMV launch/time counters before it may run.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

@@ -3325,8 +3325,19 @@ impl ResolvedModelPlan {
             || family_fingerprint != parts.execution_plan.payload().prepared_family_fingerprint()
             || runtime_fingerprint != parts.execution_plan.payload().policy_fingerprint()
             || program_fingerprint != parts.execution_plan.payload().program_fingerprint()
-            || &family.weight_schema().format_id != parts.execution_plan.payload().weight_format()
-            || family.weight_schema().quantization_formats()
+            || &parts
+                .execution_plan
+                .payload()
+                .execution_weights()
+                .schema()
+                .format_id
+                != parts.execution_plan.payload().weight_format()
+            || parts
+                .execution_plan
+                .payload()
+                .execution_weights()
+                .schema()
+                .quantization_formats()
                 != *parts.execution_plan.payload().quantization_formats()
             || capability_fingerprint
                 != parts
