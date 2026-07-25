@@ -2407,14 +2407,14 @@ impl ExecutionPlan {
         &self.operation_registry_authority
     }
 
-    pub(crate) fn materialize_weight_component<'source>(
+    pub(crate) fn materialize_weight_components<'source>(
         &self,
         family: &PreparedModelFamily,
         source: &'source dyn WeightComponentSource,
-        component: &WeightComponentSpec,
-    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        components: &[&WeightComponentSpec],
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
         self.trusted_execution_weights
-            .materialize_component(family, source, component)
+            .materialize_components(family, source, components)
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>, VNextError> {
