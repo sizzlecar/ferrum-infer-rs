@@ -85,6 +85,7 @@ RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE = (
 RUNTIME_VNEXT_CUDA_REPLAY_KERNEL_ATTRIBUTION = (
     REPO_ROOT / "scripts/release/runtime_vnext_cuda_replay_kernel_attribution.py"
 )
+NATIVE_WORK_ATTRIBUTION_GATE = REPO_ROOT / "scripts/release/native_work_attribution_gate.py"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 OPENAI_TOOL_CALL_REGRESSION = REPO_ROOT / "scripts/release/openai_tool_call_regression.py"
@@ -714,6 +715,15 @@ def test_runtime_vnext_cuda_replay_kernel_attribution_selftest() -> None:
     )
 
 
+def test_native_work_attribution_gate_selftest() -> None:
+    ok = run([sys.executable, str(NATIVE_WORK_ATTRIBUTION_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM NATIVE WORK ATTRIBUTION SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_bounded_command_selftest() -> None:
     ok = run([sys.executable, str(BOUNDED_COMMAND), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -1009,6 +1019,7 @@ def main() -> int:
     test_runtime_vnext_g08b_metal_matrix_prepare_selftest()
     test_runtime_vnext_g08_performance_smoke_selftest()
     test_runtime_vnext_cuda_replay_kernel_attribution_selftest()
+    test_native_work_attribution_gate_selftest()
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
