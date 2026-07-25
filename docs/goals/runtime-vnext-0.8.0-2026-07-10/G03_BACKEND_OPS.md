@@ -96,12 +96,16 @@ adapter inventory；数量从此只能单调下降。每个模型在 G08 子阶�
 | `0b72bab2` | 窄 CUDA smoke/profile/c1 KEEP，后续 correctness REJECT | enclosing `schema_format_id` 降为 crate-private planning key；CUDA/Metal provider 只按 component physical layout/encoding 校验，但默认选择仍把 kernel capability 错当作 F16 -> FP8 数值授权 |
 | `7bc46122` | C03 PASS，C17 REJECT | deterministic Unicode 期望 `中文正确`，实际只生成 `正确`；transport UTF-8、进程和资源均正常，失败属于数值语义回归 |
 | `5149bbfb` | source gate PASS，focused C17 KEEP | materializer descriptor 增加 `Exact`/`Approximate`；compiler 默认只选 exact，Marlin FP8 被标记 approximate；C17 恢复 token `99986,97901` |
-| `883ee9e0` | source/replay/real-Metal numerics PASS，CUDA 待测 | schema v6 把 source F16 QKVZ+BA byte-exact 冷打包为 QKVZBA；CUDA/Metal 各执行一个精确 projection，不改变 source/compute/accumulation dtype |
+| `883ee9e0` | source/replay/real-Metal numerics PASS | schema v6 把 source F16 QKVZ+BA byte-exact 冷打包为 QKVZBA；CUDA/Metal 各执行一个精确 projection，不改变 source/compute/accumulation dtype |
+| `557cdcf5` | focused CUDA correctness/topology PASS，formal G09 REJECT | 9-case current-HEAD product correctness KEEP；GDN topology 为 `4,500` projection GEMV、`300` dispatch/correlation，decode device-duration sum `7.6973 ms`；c1 `73.3800 < 76.1583 tok/s`，不能形成 G03/G08B/G09 canonical PASS |
 
 该 checkpoint 只证明 G03 的 schema/container、component ABI 和 materializer fidelity
 边界已在源码层收敛；v6 数值目录保留 v4/v5 历史并新增 2 个 operation、4 个 state
 和 1 个真实 layer contract，阈值未放宽；
-它没有产生 `vnext-g03` canonical PASS。完整 CUDA/Metal conformance、numerical catalog
+CUDA topology 的 `9,000`-instance cuBLAS kernel-name aggregate 包含全模型多个 projection
+shape，不能当作 GDN-only 计数；typed operation trace 与持久 CUDA graph node shape 共同确认
+GDN 自身为 `2,250` QKVZBA 加 `2,250` output GEMV。它没有产生 `vnext-g03`
+canonical PASS。完整 CUDA/Metal conformance、numerical catalog
 和 dispatch-overhead 仍未完成，G03 状态保持 Open。
 
 ## 产物与 PASS
