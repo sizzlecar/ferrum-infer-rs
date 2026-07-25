@@ -58,6 +58,7 @@ const MAX_DEFINITELY_NOT_SUBMITTED_RETRIES: u32 = 1;
 const MAX_BACKING_MAINTENANCE_ATTEMPTS: u32 = 2;
 const MAX_EXTENSION_RECHECKS: u32 = 2;
 const MAX_PROFILED_REUSABLE_EXECUTABLES: usize = 256;
+const MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES: usize = 1_024;
 
 type VNextDriver<R> = RuntimeResourceDriver<R>;
 
@@ -545,6 +546,8 @@ struct VNextExecutorMetrics {
     full_logits_readback_waves: AtomicU64,
     greedy_token_readback_waves: AtomicU64,
     greedy_policy_fallback_waves: AtomicU64,
+    token_mask_upload_participants: AtomicU64,
+    token_mask_cache_hit_participants: AtomicU64,
     total_prefill_us: AtomicU64,
     total_decode_us: AtomicU64,
     wave_timing: VNextWaveTimingMetrics,
@@ -566,6 +569,12 @@ enum VNextExecutionWaveKind {
 enum VNextProductOutputMode {
     FullLogits,
     GreedyToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VNextProductTokenMaskKey {
+    AllValid,
+    Selection { fingerprint: u64, source_len: usize },
 }
 
 fn product_output_mode_for_policies<'a>(
@@ -593,6 +602,32 @@ fn product_output_mode_for_policies<'a>(
     } else {
         VNextProductOutputMode::FullLogits
     }
+}
+
+fn product_token_mask_key(
+    policy: Option<&LogitsReturnPolicy>,
+    output_mode: VNextProductOutputMode,
+) -> VNextProductTokenMaskKey {
+    if output_mode == VNextProductOutputMode::GreedyToken {
+        if let Some(LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(token_mask),
+            repetition_penalty: None,
+        }) = policy
+        {
+            return VNextProductTokenMaskKey::Selection {
+                fingerprint: token_mask.fingerprint,
+                source_len: token_mask.len(),
+            };
+        }
+    }
+    VNextProductTokenMaskKey::AllValid
+}
+
+fn token_mask_upload_required(
+    cached: Option<VNextProductTokenMaskKey>,
+    requested: VNextProductTokenMaskKey,
+) -> bool {
+    cached != Some(requested)
 }
 
 fn normalized_product_token_mask(
@@ -1374,6 +1409,8 @@ impl VNextExecutorMetrics {
             &self.full_logits_readback_waves,
             &self.greedy_token_readback_waves,
             &self.greedy_policy_fallback_waves,
+            &self.token_mask_upload_participants,
+            &self.token_mask_cache_hit_participants,
             &self.total_prefill_us,
             &self.total_decode_us,
         ] {
@@ -2753,6 +2790,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     reusable_execution_catalog: OnceLock<VNextReusableExecutionCatalog>,
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
+    product_token_mask_slots: Mutex<BTreeMap<(u64, u32), VNextProductTokenMaskKey>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
     metrics: VNextExecutorMetrics,
@@ -3156,6 +3194,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             reusable_execution_catalog: OnceLock::new(),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
+            product_token_mask_slots: Mutex::new(BTreeMap::new()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             metrics: VNextExecutorMetrics::default(),
@@ -4527,10 +4566,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         wave: PreparedStepSubmissionWave<R>,
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
+        token_mask_upload_required: &[bool],
     ) -> DispatchOutcome<R> {
-        if participants.is_empty() {
+        if participants.is_empty() || participants.len() != token_mask_upload_required.len() {
             return DispatchOutcome::QuiescentFailure(
-                "vNext submission wave requires at least one participant".to_owned(),
+                "vNext submission wave requires matching participants and token-mask decisions"
+                    .to_owned(),
             );
         }
         let active_bindings = || {
@@ -4619,8 +4660,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let token_mask_uploads = participants
             .iter()
+            .zip(token_mask_upload_required)
             .enumerate()
-            .map(|(participant_index, participant)| {
+            .map(|(participant_index, (participant, upload_required))| {
+                if !*upload_required {
+                    return Ok(None);
+                }
                 SubmissionWaveInputUpload::new(
                     self.io.token_mask_input_node_id.clone(),
                     u32::try_from(participant_index).map_err(|_| {
@@ -4633,11 +4678,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     token_mask_layout,
                     self.product_token_mask(participant, output_mode),
                 )
+                .map(Some)
                 .map_err(|error| FerrumError::backend(error.to_string()))
             })
             .collect::<Result<Vec<_>>>();
         match token_mask_uploads {
-            Ok(token_mask_uploads) => uploads.extend(token_mask_uploads),
+            Ok(token_mask_uploads) => uploads.extend(token_mask_uploads.into_iter().flatten()),
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         }
         let uploaded_bytes = uploads.iter().fold(0_u64, |total, upload| {
@@ -5056,12 +5102,49 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             None
         };
         let output_mode = Self::product_output_mode(participants, kind);
+        let token_mask_keys = participants
+            .iter()
+            .map(|participant| product_token_mask_key(participant.logits_policy, output_mode))
+            .collect::<Vec<_>>();
+        // Cache by physical lane slot, not sequence: continuous batching can
+        // move sequences between slots and reuse one slot for another request.
+        let token_mask_slot_id = wave
+            .claimed_backing()
+            .program_binding_lane_slot_identity()
+            .map(|identity| identity.slot_id());
+        let token_mask_targets = (0..participants.len())
+            .map(|participant_index| {
+                let participant_index = u32::try_from(participant_index).map_err(|_| {
+                    FerrumError::backend("vNext token-mask participant index exceeds u32")
+                })?;
+                Ok(token_mask_slot_id.map(|slot_id| (slot_id, participant_index)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let token_mask_uploads = {
+            let slots = self.product_token_mask_slots.lock();
+            token_mask_targets
+                .iter()
+                .zip(&token_mask_keys)
+                .map(|(target, requested)| {
+                    token_mask_upload_required(
+                        target.and_then(|target| slots.get(&target).copied()),
+                        *requested,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_index, output_mode)?;
         let dispatch = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
             let _phase_timing = phase_timing.host_encode_submit.start();
-            self.dispatch_participant_wave(participants, wave, kind, output_mode)
+            self.dispatch_participant_wave(
+                participants,
+                wave,
+                kind,
+                output_mode,
+                &token_mask_uploads,
+            )
         };
         let mut execution_event_error = None;
         let (completion, attribution) = match dispatch {
@@ -5339,6 +5422,33 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.metrics
             .readback_bytes
             .fetch_add(readback_bytes, Ordering::Relaxed);
+        {
+            let mut slots = self.product_token_mask_slots.lock();
+            if slots.len() >= MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES
+                && token_mask_targets
+                    .iter()
+                    .flatten()
+                    .any(|target| !slots.contains_key(target))
+            {
+                slots.clear();
+            }
+            for (target, key) in token_mask_targets.iter().zip(&token_mask_keys) {
+                if let Some(target) = target {
+                    slots.insert(*target, *key);
+                }
+            }
+        }
+        for uploaded in token_mask_uploads {
+            if uploaded {
+                self.metrics
+                    .token_mask_upload_participants
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .token_mask_cache_hit_participants
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         match output_mode {
             VNextProductOutputMode::FullLogits => {
                 self.metrics
@@ -6333,6 +6443,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "full_logits_waves": self.metrics.full_logits_readback_waves.load(Ordering::Relaxed),
             "greedy_token_waves": self.metrics.greedy_token_readback_waves.load(Ordering::Relaxed),
             "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
+            "token_mask_upload_participants": self.metrics.token_mask_upload_participants.load(Ordering::Relaxed),
+            "token_mask_cache_hit_participants": self.metrics.token_mask_cache_hit_participants.load(Ordering::Relaxed),
         });
         serde_json::json!({
             "schema": "ferrum.runtime-vnext.executor-trace.v1",
@@ -7006,18 +7118,18 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
 
     use super::{
         decode_output_width, decode_selected_token, normalized_product_token_mask,
-        product_output_mode_for_policies, reported_allocated_bytes,
+        product_output_mode_for_policies, product_token_mask_key, reported_allocated_bytes,
         resolve_reusable_execution_policy, resolved_sequence_fit_policy,
         reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
-        AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
-        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
-        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextReusableExecutionDescriptor,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
-        VNextWaveTimingSink,
+        token_mask_upload_required, AdmissionFitPolicy, DecodeFailureDisposition, FerrumError,
+        SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
+        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{LogitsReturnPolicy, TokenSelectionMask};
     use ferrum_interfaces::vnext::{
@@ -7457,6 +7569,55 @@ mod tests {
             normalized_product_token_mask(None, VNextProductOutputMode::GreedyToken, 3),
             [1, 1, 1]
         );
+    }
+
+    #[test]
+    fn product_token_mask_cache_key_changes_only_with_effective_policy_source() {
+        let first = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(TokenSelectionMask::new(vec![1, 0, 1])),
+            repetition_penalty: None,
+        };
+        let second = first.clone();
+        let changed = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(TokenSelectionMask::new(vec![1, 1, 1])),
+            repetition_penalty: None,
+        };
+        let first_key = product_token_mask_key(Some(&first), VNextProductOutputMode::GreedyToken);
+        assert!(matches!(
+            first_key,
+            VNextProductTokenMaskKey::Selection { source_len: 3, .. }
+        ));
+        assert_eq!(
+            first_key,
+            product_token_mask_key(Some(&second), VNextProductOutputMode::GreedyToken)
+        );
+        assert_ne!(
+            first_key,
+            product_token_mask_key(Some(&changed), VNextProductOutputMode::GreedyToken)
+        );
+        assert_eq!(
+            product_token_mask_key(Some(&first), VNextProductOutputMode::FullLogits),
+            VNextProductTokenMaskKey::AllValid
+        );
+        assert!(token_mask_upload_required(None, first_key));
+        assert!(!token_mask_upload_required(Some(first_key), first_key));
+        assert!(token_mask_upload_required(
+            Some(VNextProductTokenMaskKey::AllValid),
+            first_key
+        ));
+        let slot_cache = BTreeMap::from([((7_u64, 0_u32), first_key)]);
+        assert!(!token_mask_upload_required(
+            slot_cache.get(&(7, 0)).copied(),
+            first_key
+        ));
+        assert!(token_mask_upload_required(
+            slot_cache.get(&(8, 0)).copied(),
+            first_key
+        ));
+        assert!(token_mask_upload_required(
+            slot_cache.get(&(7, 1)).copied(),
+            first_key
+        ));
     }
 
     #[test]
