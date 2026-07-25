@@ -71,6 +71,13 @@ impl MarlinFp8WeightMaterializer {
                 "Marlin FP8 materialization requires exactly one F16 source component",
             ));
         };
+        if let [execution_component] = execution_components {
+            if *source_component == *execution_component {
+                return source
+                    .component(source_component)
+                    .map(|payload| vec![payload]);
+            }
+        }
         if execution_components.is_empty() || execution_components.len() > 2 {
             return Err(invalid_plan(
                 "Marlin FP8 materialization requires one or both derived components",
@@ -495,6 +502,26 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 mod tests {
     use super::*;
 
+    struct ZeroWeightSource;
+
+    impl WeightComponentSource for ZeroWeightSource {
+        fn component<'source>(
+            &'source self,
+            component: &WeightComponentSpec,
+        ) -> Result<WeightComponentPayload<'source>, VNextError> {
+            let byte_len = usize::try_from(component.physical_bytes()?)
+                .map_err(|_| invalid_plan("test component exceeds address space"))?;
+            WeightComponentPayload::from_ordered_sources(
+                component,
+                component.external_names.clone(),
+                vec!["model.safetensors".to_owned(); component.external_names.len()],
+                component.dimensions.clone(),
+                component.physical_element_type(),
+                vec![0_u8; byte_len],
+            )
+        }
+    }
+
     #[test]
     fn eligibility_is_operation_and_ordinal_driven() {
         assert!(eligible_projection_use(DENSE_LINEAR_OPERATION_ID, 1));
@@ -543,5 +570,27 @@ mod tests {
         assert_eq!(quantization.grouping.resolved_size(2_048), 2_048);
         assert_eq!(quantization.grouping.resolved_size(4_096), 4_096);
         quantization.validate().unwrap();
+    }
+
+    #[test]
+    fn unchanged_components_borrow_their_source_payload() {
+        let component = WeightComponentSpec {
+            id: WeightId::new("component.global.embed_tokens").unwrap(),
+            role: WeightComponentRole::Values,
+            external_names: vec!["model.embed_tokens.weight".to_owned()],
+            dimensions: vec![2, 4],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        };
+        let materializer = MarlinFp8WeightMaterializer::new().unwrap();
+        let payloads = materializer
+            .materialize_components(&ZeroWeightSource, &[&component], &[&component])
+            .unwrap();
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].component_id(), &component.id);
+        assert_eq!(payloads[0].bytes().len(), 16);
     }
 }
