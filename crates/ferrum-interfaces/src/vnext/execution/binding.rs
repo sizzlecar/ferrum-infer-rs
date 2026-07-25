@@ -4,7 +4,7 @@ use super::{
     OperationId, PreparedModelFamily, ProgramNode, ProgramTensorSpec, ProviderId,
     QuantizationFormatId, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
     ResolvedValueStorage, ResolvedWeightBinding, ResourceId, SemanticValue, Serialize, Sha256,
-    TensorAccess, VNextError, WeightFormatId, WeightId,
+    TensorAccess, VNextError, WeightFormatId, WeightId, WeightSchema,
 };
 
 #[derive(Serialize)]
@@ -99,6 +99,7 @@ pub(super) fn validate_program_bindings(
 
 pub(super) fn validate_semantic_binding(
     family: &PreparedModelFamily,
+    execution_weight_schema: &WeightSchema,
     binding: &ResolvedValueBinding,
 ) -> Result<(), VNextError> {
     if let Some(weight) = family
@@ -115,14 +116,18 @@ pub(super) fn validate_semantic_binding(
         }
         validate_program_tensor(&weight.tensor, binding.tensor(), "weight")?;
         let expected_weight =
-            ResolvedWeightBinding::from_schema(family.weight_schema(), &weight.weight_id)?;
+            ResolvedWeightBinding::from_schema(execution_weight_schema, &weight.weight_id)?;
         if binding.weight() != Some(&expected_weight) {
             return Err(invalid_plan(format!(
-                "weight value `{}` resolved layout differs from the prepared model family",
+                "weight value `{}` resolved layout differs from the execution weight plan",
                 binding.value_id()
             )));
         }
-        validate_weight_storage(family, &weight.weight_id, binding.storage())?;
+        validate_weight_storage(
+            execution_weight_schema,
+            &weight.weight_id,
+            binding.storage(),
+        )?;
         return Ok(());
     }
     if let Some(state) = family
@@ -166,12 +171,11 @@ pub(super) fn validate_program_tensor(
 }
 
 pub(super) fn validate_weight_storage(
-    family: &PreparedModelFamily,
+    execution_weight_schema: &WeightSchema,
     weight_id: &WeightId,
     storage: &ResolvedValueStorage,
 ) -> Result<(), VNextError> {
-    let expected = family
-        .weight_schema()
+    let expected = execution_weight_schema
         .physical_component_refs(weight_id)?
         .into_iter()
         .map(|component| (component.id.clone(), component))

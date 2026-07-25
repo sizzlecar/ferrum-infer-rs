@@ -16,6 +16,7 @@ use super::{
     ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding,
     ResourceId, SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime,
     StrideConstraint, TensorAccess, TensorContract, VNextError, WeightFormatId, WeightId,
+    WeightMaterializerId, WeightSchema,
 };
 
 mod foundation;
@@ -23,6 +24,9 @@ use foundation::*;
 
 mod binding;
 pub(crate) use binding::*;
+
+mod weight;
+pub use weight::*;
 
 mod work;
 pub use work::*;

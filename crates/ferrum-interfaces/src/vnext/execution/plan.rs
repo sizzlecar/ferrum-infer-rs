@@ -21,7 +21,8 @@ use super::{
     ReusableExecutionMemoryPlan, ReusableExecutionPolicy, RuntimePolicy, Serialize,
     StateCapacityDemand, StateDependencyTracker, StateInitialization, StateLifetime, TensorAccess,
     UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
-    ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
+    ValueResourceDemand, WeightFormatId, WeightSchema, EXECUTION_PLAN_SCHEMA,
+    MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 use crate::vnext::{CompletionReadbackRequest, HostTransferLayout, ResourceWorkShape};
@@ -92,6 +93,8 @@ impl ExecutionPlan {
         }
         let family = request.family;
         let program = family.program();
+        request.execution_weights.validate_against_family(family)?;
+        let execution_weight_schema = request.execution_weights.schema();
         let prepared_family_fingerprint = family.fingerprint()?;
         let program_fingerprint = program.fingerprint()?;
         let capability_catalog_fingerprint = request.capabilities.fingerprint()?;
@@ -101,8 +104,8 @@ impl ExecutionPlan {
             .runtime_implementation_fingerprint
             .clone();
         let policy_fingerprint = canonical_runtime_policy_fingerprint(request.policy)?;
-        let weight_format = family.weight_schema().format_id.clone();
-        let quantization_formats = family.weight_schema().quantization_formats();
+        let weight_format = execution_weight_schema.format_id.clone();
+        let quantization_formats = execution_weight_schema.quantization_formats();
 
         let mut resolutions = BTreeMap::new();
         for resolution in request.node_resolutions {
@@ -160,6 +163,7 @@ impl ExecutionPlan {
             let storage_rejection = storage_rejections.remove(&program_node.id);
             let node = Self::build_node(
                 family,
+                execution_weight_schema,
                 &prepared_family_fingerprint,
                 program_node,
                 resolution,
@@ -225,6 +229,7 @@ impl ExecutionPlan {
             policy_version: request.policy.version(),
             policy_fingerprint,
             maximum_scheduled_tokens,
+            execution_weights: request.execution_weights.clone(),
             weight_format,
             quantization_formats,
             retained_completion_values,
@@ -248,6 +253,7 @@ impl ExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_node(
         family: &PreparedModelFamily,
+        execution_weight_schema: &WeightSchema,
         prepared_family_fingerprint: &str,
         program_node: &ProgramNode,
         resolution: PlanNodeResolution,
@@ -289,7 +295,7 @@ impl ExecutionPlan {
         )?;
         let state_effects = Self::derive_state_effects(family, &resolution.values)?;
         for binding in &resolution.values {
-            validate_semantic_binding(family, binding)?;
+            validate_semantic_binding(family, execution_weight_schema, binding)?;
             Self::validate_cross_node_value(binding, canonical_values)?;
             bound_values.insert(binding.value_id().clone());
         }
@@ -1965,6 +1971,21 @@ impl ExecutionPlan {
             || self.payload.maximum_scheduled_tokens == 0
         {
             return Err(invalid_plan("plan provenance or node set is invalid"));
+        }
+        self.payload
+            .execution_weights
+            .validate_structure(&self.payload.family_id)?;
+        if self.payload.weight_format != self.payload.execution_weights.schema().format_id
+            || self.payload.quantization_formats
+                != self
+                    .payload
+                    .execution_weights
+                    .schema()
+                    .quantization_formats()
+        {
+            return Err(invalid_plan(
+                "execution weight summary differs from the execution weight plan",
+            ));
         }
         let retention_spec = CompletionRetentionSpec::new(
             self.payload

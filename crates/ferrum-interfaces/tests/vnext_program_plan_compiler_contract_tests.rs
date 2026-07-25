@@ -42,6 +42,23 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
     let plan = compilation.executable().execution_plan();
     assert_eq!(plan.payload().nodes().len(), 1);
     assert!(plan.payload().retained_completion_values().is_empty());
+    assert_eq!(
+        plan.payload().execution_weights().schema(),
+        family.weight_schema()
+    );
+    assert_eq!(
+        plan.payload()
+            .execution_weights()
+            .source_schema_fingerprint(),
+        family.weight_schema().fingerprint().unwrap()
+    );
+    assert_eq!(
+        plan.payload()
+            .execution_weights()
+            .materializer_id()
+            .as_str(),
+        "weight-materializer.identity"
+    );
     assert_eq!(compilation.node_resolutions().len(), 1);
     assert_eq!(
         compilation

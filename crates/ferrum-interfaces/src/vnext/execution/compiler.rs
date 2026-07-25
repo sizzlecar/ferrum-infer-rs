@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     invalid_plan, AliasPolicy, BlockedTensorPadding, BufferUsage, CapabilityCatalog, CapabilityId,
     CompletionRetentionSpec, DimensionConstraint, ElementType, ExecutablePlan, ExecutionPlan,
-    LayoutConstraint, NodeId, OperationPlanningHandle, PlanBuildRequest, PlanNodeResolution,
-    PreparedModelFamily, ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan,
-    ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
-    ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy,
-    StrideConstraint, TensorContract, VNextError, WeightId,
+    ExecutionWeightPlan, LayoutConstraint, NodeId, OperationPlanningHandle, PlanBuildRequest,
+    PlanNodeResolution, PreparedModelFamily, ProgramTensorSpec, ProgramValueId, ProviderId,
+    ProviderResourcePlan, ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec,
+    ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding,
+    ResourceId, RuntimePolicy, StrideConstraint, TensorContract, VNextError, WeightId,
+    WeightSchema,
 };
 
 /// Explicit semantic inputs, per-node selection preferences, and optional
@@ -139,10 +140,18 @@ impl ProgramPlanCompiler {
         validate_compile_options(family, options)?;
         let value_tensors = infer_value_tensors(family, catalog, options)?;
         let family_fingerprint = family.fingerprint()?;
+        let execution_weights = ExecutionWeightPlan::identity(family)?;
+        let execution_weight_fingerprint = execution_weights.fingerprint()?;
+        let execution_weight_schema = execution_weights.schema();
 
-        let probe_locations = dedicated_weight_locations(family, &family_fingerprint)?;
+        let probe_locations = dedicated_weight_locations(
+            family,
+            execution_weight_schema,
+            &execution_weight_fingerprint,
+        )?;
         let probe_storages = build_value_storages(
             family,
+            execution_weight_schema,
             catalog,
             &value_tensors,
             &probe_locations,
@@ -150,6 +159,7 @@ impl ProgramPlanCompiler {
         )?;
         let probe_resolutions = resolve_nodes(
             family,
+            execution_weight_schema,
             &family_fingerprint,
             catalog,
             policy,
@@ -167,10 +177,15 @@ impl ProgramPlanCompiler {
 
         let mut final_resolution = None;
         for _ in 0..=u64::BITS {
-            let arena_locations =
-                arena_weight_locations(family, &family_fingerprint, value_alignment_bytes)?;
+            let arena_locations = arena_weight_locations(
+                family,
+                execution_weight_schema,
+                &execution_weight_fingerprint,
+                value_alignment_bytes,
+            )?;
             let final_storages = build_value_storages(
                 family,
+                execution_weight_schema,
                 catalog,
                 &value_tensors,
                 &arena_locations,
@@ -178,6 +193,7 @@ impl ProgramPlanCompiler {
             )?;
             let node_resolutions = resolve_nodes(
                 family,
+                execution_weight_schema,
                 &family_fingerprint,
                 catalog,
                 policy,
@@ -646,9 +662,10 @@ fn layout_matches(
 
 fn dedicated_weight_locations(
     family: &PreparedModelFamily,
-    family_fingerprint: &str,
+    execution_weight_schema: &WeightSchema,
+    execution_weight_fingerprint: &str,
 ) -> Result<BTreeMap<WeightId, WeightComponentLocation>, VNextError> {
-    referenced_weight_components(family)?
+    referenced_weight_components(family, execution_weight_schema)?
         .into_iter()
         .map(|component| {
             let length_bytes = component.physical_bytes()?;
@@ -657,7 +674,7 @@ fn dedicated_weight_locations(
                 WeightComponentLocation {
                     resource_id: hashed_resource_id(
                         "weight-probe",
-                        family_fingerprint,
+                        execution_weight_fingerprint,
                         component.id.as_str(),
                     )?,
                     offset_bytes: 0,
@@ -671,10 +688,11 @@ fn dedicated_weight_locations(
 
 fn arena_weight_locations(
     family: &PreparedModelFamily,
-    family_fingerprint: &str,
+    execution_weight_schema: &WeightSchema,
+    execution_weight_fingerprint: &str,
     provider_alignment_bytes: u64,
 ) -> Result<BTreeMap<WeightId, WeightComponentLocation>, VNextError> {
-    let components = referenced_weight_components(family)?;
+    let components = referenced_weight_components(family, execution_weight_schema)?;
     let mut arena_ids = BTreeMap::<ElementType, ResourceId>::new();
     let mut next_offsets = BTreeMap::<ElementType, u64>::new();
     let mut locations = BTreeMap::new();
@@ -691,7 +709,7 @@ fn arena_weight_locations(
             .entry(element_type)
             .or_insert(hashed_resource_id(
                 "weight-arena",
-                family_fingerprint,
+                execution_weight_fingerprint,
                 &serde_json::to_string(&element_type).map_err(|error| {
                     VNextError::Serialization {
                         context: "serialize weight arena element type",
@@ -713,25 +731,21 @@ fn arena_weight_locations(
     Ok(locations)
 }
 
-fn referenced_weight_components(
+fn referenced_weight_components<'schema>(
     family: &PreparedModelFamily,
-) -> Result<Vec<&super::super::WeightComponentSpec>, VNextError> {
+    execution_weight_schema: &'schema WeightSchema,
+) -> Result<Vec<&'schema super::super::WeightComponentSpec>, VNextError> {
     let referenced = family
         .program()
         .weights()
         .iter()
-        .map(|weight| {
-            family
-                .weight_schema()
-                .physical_component_refs(&weight.weight_id)
-        })
+        .map(|weight| execution_weight_schema.physical_component_refs(&weight.weight_id))
         .collect::<Result<Vec<_>, VNextError>>()?
         .into_iter()
         .flatten()
         .map(|component| component.id.clone())
         .collect::<BTreeSet<_>>();
-    Ok(family
-        .weight_schema()
+    Ok(execution_weight_schema
         .components
         .iter()
         .filter(|component| referenced.contains(&component.id))
@@ -760,6 +774,7 @@ fn hashed_resource_id(
 
 fn build_value_storages(
     family: &PreparedModelFamily,
+    execution_weight_schema: &WeightSchema,
     catalog: &CapabilityCatalog,
     tensors: &BTreeMap<ProgramValueId, ResolvedTensorSpec>,
     weight_locations: &BTreeMap<WeightId, WeightComponentLocation>,
@@ -774,8 +789,7 @@ fn build_value_storages(
         );
     }
     for weight in program.weights() {
-        let components = family
-            .weight_schema()
+        let components = execution_weight_schema
             .physical_component_refs(&weight.weight_id)?
             .into_iter()
             .map(|component| {
@@ -862,6 +876,7 @@ fn activation_storage(
 #[allow(clippy::too_many_arguments)]
 fn resolve_nodes<P: RuntimePolicy>(
     family: &PreparedModelFamily,
+    execution_weight_schema: &WeightSchema,
     prepared_family_fingerprint: &str,
     catalog: &CapabilityCatalog,
     policy: &P,
@@ -885,6 +900,7 @@ fn resolve_nodes<P: RuntimePolicy>(
                 .map(|(ordinal, (value_id, contract))| {
                     resolved_binding(
                         family,
+                        execution_weight_schema,
                         value_id,
                         ResolvedValueRole::Input,
                         ordinal as u32,
@@ -897,6 +913,7 @@ fn resolve_nodes<P: RuntimePolicy>(
                     |(ordinal, (value_id, contract))| {
                         resolved_binding(
                             family,
+                            execution_weight_schema,
                             value_id,
                             ResolvedValueRole::Output,
                             ordinal as u32,
@@ -909,6 +926,7 @@ fn resolve_nodes<P: RuntimePolicy>(
                 .collect::<Result<Vec<_>, VNextError>>()?;
             PlanNodeResolution::resolve_with_family_fingerprint(
                 family,
+                execution_weight_schema,
                 prepared_family_fingerprint,
                 catalog,
                 policy,
@@ -928,6 +946,7 @@ fn resolve_nodes<P: RuntimePolicy>(
 
 fn resolved_binding(
     family: &PreparedModelFamily,
+    execution_weight_schema: &WeightSchema,
     value_id: &ProgramValueId,
     role: ResolvedValueRole,
     ordinal: u32,
@@ -969,7 +988,7 @@ fn resolved_binding(
         usage,
         program_weight
             .map(|weight| {
-                ResolvedWeightBinding::from_schema(family.weight_schema(), &weight.weight_id)
+                ResolvedWeightBinding::from_schema(execution_weight_schema, &weight.weight_id)
             })
             .transpose()?,
         storages

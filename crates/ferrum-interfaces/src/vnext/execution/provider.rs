@@ -1,10 +1,10 @@
 use super::{
     AttributeId, BTreeMap, BTreeSet, CapabilityId, ContractVersion, Deserialize, Deserializer,
-    MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId, OperationRegistryAuthority,
-    PlanExactAlias, PlanHash, PlanId, PlanNode, PlanProviderRejectReason, PlanSchemaVersion,
-    PlanStateEffect, ProviderId, ProviderResourcePlan, ProviderSelection,
-    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding, ResourceId,
-    RetainedCompletionValue, SemanticValue, Serialize, WeightFormatId,
+    ExecutionWeightPlan, MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId,
+    OperationRegistryAuthority, PlanExactAlias, PlanHash, PlanId, PlanNode,
+    PlanProviderRejectReason, PlanSchemaVersion, PlanStateEffect, ProviderId, ProviderResourcePlan,
+    ProviderSelection, ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding,
+    ResourceId, RetainedCompletionValue, SemanticValue, Serialize, WeightFormatId,
 };
 
 /// Per-node trusted physical resolution. It supplies physical bindings and a
@@ -35,6 +35,7 @@ pub struct ExecutionPlanPayload {
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
     pub(super) maximum_scheduled_tokens: u64,
+    pub(super) execution_weights: ExecutionWeightPlan,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
@@ -87,6 +88,10 @@ impl ExecutionPlanPayload {
         self.maximum_scheduled_tokens
     }
 
+    pub fn execution_weights(&self) -> &ExecutionWeightPlan {
+        &self.execution_weights
+    }
+
     pub fn weight_format(&self) -> &WeightFormatId {
         &self.weight_format
     }
@@ -120,6 +125,7 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: &'a str,
     pub(super) maximum_scheduled_tokens: u64,
+    pub(super) execution_weights: &'a ExecutionWeightPlan,
     pub(super) weight_format: &'a WeightFormatId,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: &'a [RetainedCompletionValue],
@@ -141,6 +147,7 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             policy_version: payload.policy_version,
             policy_fingerprint: &payload.policy_fingerprint,
             maximum_scheduled_tokens: payload.maximum_scheduled_tokens,
+            execution_weights: &payload.execution_weights,
             weight_format: &payload.weight_format,
             quantization_formats: &payload.quantization_formats,
             retained_completion_values: &payload.retained_completion_values,
@@ -204,6 +211,7 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
     pub(super) maximum_scheduled_tokens: u64,
+    pub(super) execution_weights: ExecutionWeightPlan,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
