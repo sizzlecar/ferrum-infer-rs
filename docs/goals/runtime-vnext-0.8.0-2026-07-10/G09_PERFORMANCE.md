@@ -1244,22 +1244,6 @@ memory for state residency. Before correctness it must pass the same cubin
 gate with `0` spill/local bytes, shared bytes `<=16,448`, and theoretical
 active blocks/SM `>=6`.
 
-That shared-state source candidate is now prepared but is not yet a KEEP. It
-uses two independent 128-thread reduction groups for the even and odd value
-rows, removes the zero half of the old `16 x 256` partial array, and assigns
-the reclaimed `16 x 128` F32 shared array to resident state. The F32 normal
-and indirect entrypoints share this implementation; F16 remains on the
-unchanged generic kernel.
-
-Only a baseline/candidate cubin comparison is authorized first. If it passes
-the resource gate, CUDA varlen `128 x 128` multi-token numerical parity and
-actual-model `run`/non-streaming `serve`/streaming `serve` must pass before one
-Basic c1 random `64/32`, `25 + 5`, seed `9271` diagnostic. The KEEP signal
-remains decode device total `<=6.5538 s`, throughput `>=73.3855 tok/s`,
-prefill device total `<=1.1909 s`, zero request/quality error, zero failed
-wave, and unchanged direct-path miss/fallback counters. Missing any condition
-produces a REJECT and source revert without a full sweep.
-
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
