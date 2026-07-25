@@ -20,6 +20,90 @@ fn compile_options() -> ProgramPlanCompileOptions {
     .unwrap()
 }
 
+struct PaddedDenseMaterializer {
+    descriptor: WeightMaterializerDescriptor,
+}
+
+impl PaddedDenseMaterializer {
+    fn new() -> Self {
+        Self::with_implementation_fingerprint('9')
+    }
+
+    fn with_implementation_fingerprint(fingerprint_byte: char) -> Self {
+        Self {
+            descriptor: WeightMaterializerDescriptor::new(
+                id("weight-materializer.test.padded-dense"),
+                ContractVersion::new(1, 0),
+                sha(fingerprint_byte),
+                BTreeSet::from([id("capability.compute")]),
+            )
+            .unwrap(),
+        }
+    }
+}
+
+impl WeightMaterializerPlanner for PaddedDenseMaterializer {
+    fn descriptor(&self) -> &WeightMaterializerDescriptor {
+        &self.descriptor
+    }
+
+    fn execution_schema(
+        &self,
+        family: &PreparedModelFamily,
+        _device: &DeviceDescriptor,
+    ) -> Result<WeightSchema, VNextError> {
+        let mut schema = family.weight_schema().clone();
+        schema.layout_id = id("weight-layout.test.padded-dense");
+        schema.components[0].dimensions = vec![8];
+        schema.tensors[0].physical_layout = PhysicalWeightLayout::Stored {
+            component: PhysicalWeightComponentBinding {
+                component_id: id("weight.component"),
+                storage: PhysicalStorageLayout::Contiguous {
+                    padding: PhysicalWeightPadding::ZeroFill {
+                        padded_dimensions: vec![8],
+                    },
+                },
+            },
+        };
+        Ok(schema)
+    }
+}
+
+struct LogicalMutationMaterializer {
+    descriptor: WeightMaterializerDescriptor,
+}
+
+impl LogicalMutationMaterializer {
+    fn new() -> Self {
+        Self {
+            descriptor: WeightMaterializerDescriptor::new(
+                id("weight-materializer.test.logical-mutation"),
+                ContractVersion::new(1, 0),
+                sha('7'),
+                BTreeSet::from([id("capability.compute")]),
+            )
+            .unwrap(),
+        }
+    }
+}
+
+impl WeightMaterializerPlanner for LogicalMutationMaterializer {
+    fn descriptor(&self) -> &WeightMaterializerDescriptor {
+        &self.descriptor
+    }
+
+    fn execution_schema(
+        &self,
+        family: &PreparedModelFamily,
+        _device: &DeviceDescriptor,
+    ) -> Result<WeightSchema, VNextError> {
+        let mut schema = family.weight_schema().clone();
+        schema.components[0].dimensions = vec![5];
+        schema.tensors[0].dimensions = vec![5];
+        Ok(schema)
+    }
+}
+
 #[test]
 fn semantic_program_compiles_through_the_registered_provider_authority() {
     let family = TestRegistry::new().prepare();
@@ -94,6 +178,143 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
         0
     );
     assert!(registry.estimator_calls.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn trusted_materializer_changes_physical_plan_memory_and_wire_requires_its_witness() {
+    let family = TestRegistry::new().prepare();
+    let materializers =
+        WeightMaterializerRegistry::new(vec![Box::new(PaddedDenseMaterializer::new())]).unwrap();
+    let catalog = materializers.augment_catalog(catalog()).unwrap();
+    let policy = policy(4096);
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+
+    let identity = ProgramPlanCompiler::compile(
+        &family,
+        &catalog,
+        &policy,
+        &registry.planning(),
+        &compile_options(),
+    )
+    .unwrap();
+    let mut options = compile_options();
+    let materializer_id: WeightMaterializerId = id("weight-materializer.test.padded-dense");
+    options.require_weight_materializer(materializer_id.clone());
+    let transformed = ProgramPlanCompiler::compile_with_weight_materializers(
+        &family,
+        &catalog,
+        &policy,
+        &registry.planning(),
+        &materializers,
+        &options,
+    )
+    .unwrap();
+    let plan = transformed.executable().execution_plan();
+    assert_eq!(
+        plan.payload().execution_weights().materializer_id(),
+        &materializer_id
+    );
+    assert_eq!(
+        plan.payload().execution_weights().schema().layout_id,
+        id("weight-layout.test.padded-dense")
+    );
+    assert_eq!(
+        plan.payload().memory().static_bytes(),
+        identity
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .static_bytes()
+            + 16
+    );
+    plan.validate_against(&family, &catalog, &policy, transformed.node_resolutions())
+        .unwrap();
+
+    let wire = plan.to_json().unwrap();
+    assert!(ExecutionPlan::from_json_validated(
+        &wire,
+        &family,
+        &catalog,
+        &policy,
+        transformed.node_resolutions().to_vec(),
+    )
+    .is_err());
+    let trusted_weights = materializers
+        .select(&family, &catalog, &materializer_id)
+        .unwrap();
+    let mismatched_materializers = WeightMaterializerRegistry::new(vec![Box::new(
+        PaddedDenseMaterializer::with_implementation_fingerprint('6'),
+    )])
+    .unwrap();
+    let mismatched_catalog = mismatched_materializers
+        .augment_catalog(vnext_core_contract::catalog())
+        .unwrap();
+    assert!(PlanBuildRequest::new(
+        &family,
+        &mismatched_catalog,
+        &policy,
+        transformed.node_resolutions().to_vec(),
+    )
+    .unwrap()
+    .with_execution_weights(trusted_weights.clone())
+    .is_err());
+    let capability_mutated_materializers =
+        WeightMaterializerRegistry::new(vec![Box::new(PaddedDenseMaterializer {
+            descriptor: WeightMaterializerDescriptor::new(
+                materializer_id.clone(),
+                ContractVersion::new(1, 0),
+                sha('9'),
+                BTreeSet::new(),
+            )
+            .unwrap(),
+        })])
+        .unwrap();
+    let capability_mutated_catalog = capability_mutated_materializers
+        .augment_catalog(vnext_core_contract::catalog())
+        .unwrap();
+    assert!(PlanBuildRequest::new(
+        &family,
+        &capability_mutated_catalog,
+        &policy,
+        transformed.node_resolutions().to_vec(),
+    )
+    .unwrap()
+    .with_execution_weights(trusted_weights.clone())
+    .is_err());
+    let restored = ExecutionPlan::from_json_validated_with_execution_weights(
+        &wire,
+        &family,
+        &catalog,
+        &policy,
+        transformed.node_resolutions().to_vec(),
+        CompletionRetentionSpec::default(),
+        trusted_weights,
+    )
+    .unwrap();
+    assert_eq!(restored, *plan);
+}
+
+#[test]
+fn materializer_cannot_change_the_prepared_logical_weight_contract() {
+    let family = TestRegistry::new().prepare();
+    let materializers =
+        WeightMaterializerRegistry::new(vec![Box::new(LogicalMutationMaterializer::new())])
+            .unwrap();
+    let catalog = materializers.augment_catalog(catalog()).unwrap();
+    let error = materializers
+        .select(
+            &family,
+            &catalog,
+            &id("weight-materializer.test.logical-mutation"),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changes the prepared family's logical tensor contract"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -4,12 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     invalid_plan, AliasPolicy, BlockedTensorPadding, BufferUsage, CapabilityCatalog, CapabilityId,
     CompletionRetentionSpec, DimensionConstraint, ElementType, ExecutablePlan, ExecutionPlan,
-    ExecutionWeightPlan, LayoutConstraint, NodeId, OperationPlanningHandle, PlanBuildRequest,
-    PlanNodeResolution, PreparedModelFamily, ProgramTensorSpec, ProgramValueId, ProviderId,
-    ProviderResourcePlan, ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec,
-    ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding,
-    ResourceId, RuntimePolicy, StrideConstraint, TensorContract, VNextError, WeightId,
-    WeightSchema,
+    LayoutConstraint, NodeId, OperationPlanningHandle, PlanBuildRequest, PlanNodeResolution,
+    PreparedModelFamily, ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan,
+    ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
+    ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy,
+    StrideConstraint, TensorContract, TrustedExecutionWeightPlan, VNextError, WeightId,
+    WeightMaterializerId, WeightMaterializerRegistry, WeightSchema,
+    IDENTITY_WEIGHT_MATERIALIZER_ID,
 };
 
 /// Explicit semantic inputs, per-node selection preferences, and optional
@@ -22,6 +23,7 @@ pub struct ProgramPlanCompileOptions {
     required_capabilities: BTreeMap<NodeId, BTreeSet<CapabilityId>>,
     preferred_providers: BTreeMap<NodeId, ProviderId>,
     completion_retention: CompletionRetentionSpec,
+    weight_materializer_id: WeightMaterializerId,
 }
 
 impl ProgramPlanCompileOptions {
@@ -36,6 +38,7 @@ impl ProgramPlanCompileOptions {
             required_capabilities: BTreeMap::new(),
             preferred_providers: BTreeMap::new(),
             completion_retention: CompletionRetentionSpec::default(),
+            weight_materializer_id: WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
         })
     }
 
@@ -74,6 +77,14 @@ impl ProgramPlanCompileOptions {
 
     pub fn tensor_specs(&self) -> &BTreeMap<ProgramValueId, ProgramTensorSpec> {
         &self.tensor_specs
+    }
+
+    pub fn require_weight_materializer(&mut self, materializer_id: WeightMaterializerId) {
+        self.weight_materializer_id = materializer_id;
+    }
+
+    pub fn weight_materializer_id(&self) -> &WeightMaterializerId {
+        &self.weight_materializer_id
     }
 }
 
@@ -137,12 +148,50 @@ impl ProgramPlanCompiler {
         planning: &OperationPlanningHandle<'_>,
         options: &ProgramPlanCompileOptions,
     ) -> Result<ProgramPlanCompilation, VNextError> {
+        let materializers = WeightMaterializerRegistry::identity_only()?;
+        Self::compile_with_weight_materializers(
+            family,
+            catalog,
+            policy,
+            planning,
+            &materializers,
+            options,
+        )
+    }
+
+    pub fn compile_with_weight_materializers<P: RuntimePolicy>(
+        family: &PreparedModelFamily,
+        catalog: &CapabilityCatalog,
+        policy: &P,
+        planning: &OperationPlanningHandle<'_>,
+        materializers: &WeightMaterializerRegistry,
+        options: &ProgramPlanCompileOptions,
+    ) -> Result<ProgramPlanCompilation, VNextError> {
+        let execution_weights =
+            materializers.select(family, catalog, options.weight_materializer_id())?;
+        Self::compile_with_execution_weights(
+            family,
+            catalog,
+            policy,
+            planning,
+            options,
+            execution_weights,
+        )
+    }
+
+    fn compile_with_execution_weights<P: RuntimePolicy>(
+        family: &PreparedModelFamily,
+        catalog: &CapabilityCatalog,
+        policy: &P,
+        planning: &OperationPlanningHandle<'_>,
+        options: &ProgramPlanCompileOptions,
+        execution_weights: TrustedExecutionWeightPlan,
+    ) -> Result<ProgramPlanCompilation, VNextError> {
         validate_compile_options(family, options)?;
         let value_tensors = infer_value_tensors(family, catalog, options)?;
         let family_fingerprint = family.fingerprint()?;
-        let execution_weights = ExecutionWeightPlan::identity(family)?;
-        let execution_weight_fingerprint = execution_weights.fingerprint()?;
-        let execution_weight_schema = execution_weights.schema();
+        let execution_weight_fingerprint = execution_weights.plan().fingerprint()?;
+        let execution_weight_schema = execution_weights.plan().schema();
 
         let probe_locations = dedicated_weight_locations(
             family,
@@ -214,6 +263,7 @@ impl ProgramPlanCompiler {
         })?;
         let plan = ExecutionPlan::build(
             PlanBuildRequest::new(family, catalog, policy, node_resolutions.clone())?
+                .with_execution_weights(execution_weights)?
                 .with_completion_retention(options.completion_retention.clone())?,
         )?;
         let executable = ExecutablePlan::new(plan, catalog.clone())?;

@@ -29,7 +29,8 @@ use super::{
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
     StepParticipantFrameAssignment, StepResourceLease, TransactionId, TrustedActiveSequenceBinding,
     TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId, EXECUTION_IDENTITY_VERSION,
+    WeightId, WeightMaterializerDescriptor, WeightMaterializerId, EXECUTION_IDENTITY_VERSION,
+    MAX_WEIGHT_MATERIALIZERS,
 };
 
 mod compiled_submission_wave;
@@ -7493,6 +7494,7 @@ pub struct CapabilityCatalog {
     operations: BTreeMap<OperationId, OperationDescriptor>,
     providers: BTreeMap<OperationId, Vec<OperationProviderDescriptor>>,
     engine_providers: BTreeMap<ProviderId, EngineProviderDescriptor>,
+    weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
 }
 
 #[derive(Deserialize)]
@@ -7502,6 +7504,8 @@ struct CapabilityCatalogWire {
     operations: BTreeMap<OperationId, OperationDescriptor>,
     providers: BTreeMap<OperationId, Vec<OperationProviderDescriptor>>,
     engine_providers: BTreeMap<ProviderId, EngineProviderDescriptor>,
+    #[serde(default = "identity_weight_materializer_descriptors")]
+    weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
 }
 
 impl<'de> Deserialize<'de> for CapabilityCatalog {
@@ -7515,6 +7519,7 @@ impl<'de> Deserialize<'de> for CapabilityCatalog {
             wire.operations,
             wire.providers,
             wire.engine_providers,
+            wire.weight_materializers,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -7548,7 +7553,14 @@ impl CapabilityCatalog {
                 )));
             }
         }
-        Self::from_maps(device, operation_map, providers, engine_map)
+        let weight_materializers = identity_weight_materializer_descriptors();
+        Self::from_maps(
+            device,
+            operation_map,
+            providers,
+            engine_map,
+            weight_materializers,
+        )
     }
 
     fn from_maps(
@@ -7556,8 +7568,10 @@ impl CapabilityCatalog {
         operations: BTreeMap<OperationId, OperationDescriptor>,
         mut providers: BTreeMap<OperationId, Vec<OperationProviderDescriptor>>,
         engine_providers: BTreeMap<ProviderId, EngineProviderDescriptor>,
+        weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
     ) -> Result<Self, VNextError> {
         device.validate()?;
+        validate_weight_materializer_descriptors(&device, &weight_materializers)?;
         let provider_row_count = providers.values().try_fold(0_usize, |total, entries| {
             total.checked_add(entries.len()).ok_or_else(|| {
                 invalid_operation("capability catalog provider row count overflows usize")
@@ -7709,7 +7723,17 @@ impl CapabilityCatalog {
             operations,
             providers,
             engine_providers,
+            weight_materializers,
         })
+    }
+
+    pub(crate) fn with_weight_materializer_descriptors(
+        mut self,
+        weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
+    ) -> Result<Self, VNextError> {
+        validate_weight_materializer_descriptors(&self.device, &weight_materializers)?;
+        self.weight_materializers = weight_materializers;
+        Ok(self)
     }
 
     pub fn device(&self) -> &super::DeviceDescriptor {
@@ -7855,6 +7879,25 @@ impl CapabilityCatalog {
         &self.engine_providers
     }
 
+    pub fn weight_materializers(
+        &self,
+    ) -> &BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor> {
+        &self.weight_materializers
+    }
+
+    pub fn weight_materializer(
+        &self,
+        materializer_id: &WeightMaterializerId,
+    ) -> Result<&WeightMaterializerDescriptor, VNextError> {
+        self.weight_materializers
+            .get(materializer_id)
+            .ok_or_else(|| {
+                invalid_operation(format!(
+                    "weight materializer `{materializer_id}` is absent from the capability catalog"
+                ))
+            })
+    }
+
     pub fn engine_provider(
         &self,
         provider_id: &ProviderId,
@@ -7879,6 +7922,40 @@ impl CapabilityCatalog {
         })?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
+}
+
+fn validate_weight_materializer_descriptors(
+    device: &super::DeviceDescriptor,
+    descriptors: &BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
+) -> Result<(), VNextError> {
+    if descriptors.is_empty() || descriptors.len() > MAX_WEIGHT_MATERIALIZERS {
+        return Err(invalid_operation(
+            "capability catalog weight materializers are empty or exceed their row budget",
+        ));
+    }
+    for (id, descriptor) in descriptors {
+        if id != descriptor.id() {
+            return Err(invalid_operation(format!(
+                "weight materializer `{}` is stored under `{id}`",
+                descriptor.id()
+            )));
+        }
+        descriptor.validate_for_device(device)?;
+    }
+    let identity = WeightMaterializerDescriptor::identity()?;
+    if descriptors.get(identity.id()) != Some(&identity) {
+        return Err(invalid_operation(
+            "capability catalog lacks the canonical identity weight materializer",
+        ));
+    }
+    Ok(())
+}
+
+fn identity_weight_materializer_descriptors(
+) -> BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor> {
+    let identity = WeightMaterializerDescriptor::identity()
+        .expect("the built-in identity weight materializer descriptor is valid");
+    BTreeMap::from([(identity.id().clone(), identity)])
 }
 
 fn validate_reference_oracle_graph(

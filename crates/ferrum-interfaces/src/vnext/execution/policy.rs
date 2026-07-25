@@ -1,7 +1,8 @@
 use super::{
     canonical_fingerprint, invalid_plan, CapabilityCatalog, CompletionRetentionSpec,
     ContractVersion, DynamicStorageProfile, ExecutionWeightPlan, PlanNodeResolution,
-    PreparedModelFamily, ReusableExecutionPolicy, Serialize, VNextError,
+    PreparedModelFamily, ReusableExecutionPolicy, Serialize, TrustedExecutionWeightPlan,
+    VNextError,
 };
 
 /// Typed policy selected before planning. Memory capacity is part of the
@@ -50,7 +51,7 @@ pub struct PlanBuildRequest<'a, P: RuntimePolicy> {
     pub(super) policy: &'a P,
     pub(super) node_resolutions: Vec<PlanNodeResolution>,
     pub(super) completion_retention: CompletionRetentionSpec,
-    pub(super) execution_weights: ExecutionWeightPlan,
+    pub(super) execution_weights: TrustedExecutionWeightPlan,
 }
 
 impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
@@ -70,7 +71,7 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
             policy,
             node_resolutions,
             completion_retention: CompletionRetentionSpec::default(),
-            execution_weights: ExecutionWeightPlan::identity(family)?,
+            execution_weights: TrustedExecutionWeightPlan::identity(family)?,
         })
     }
 
@@ -99,6 +100,15 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
         Ok(self)
     }
 
+    pub fn with_execution_weights(
+        mut self,
+        execution_weights: TrustedExecutionWeightPlan,
+    ) -> Result<Self, VNextError> {
+        execution_weights.validate_against_catalog(self.family, self.capabilities)?;
+        self.execution_weights = execution_weights;
+        Ok(self)
+    }
+
     pub fn family(&self) -> &PreparedModelFamily {
         self.family
     }
@@ -112,6 +122,6 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
     }
 
     pub fn execution_weights(&self) -> &ExecutionWeightPlan {
-        &self.execution_weights
+        self.execution_weights.plan()
     }
 }

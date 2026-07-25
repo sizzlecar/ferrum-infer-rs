@@ -1,7 +1,7 @@
 use super::{
     invalid_plan, CapabilityCatalog, CompletionRetentionSpec, ExecutionPlan, PlanBuildRequest,
     PlanNodeResolution, PlanSchemaVersion, PreparedModelFamily, RuntimePolicy,
-    UnvalidatedExecutionPlan, VNextError, EXECUTION_PLAN_SCHEMA,
+    TrustedExecutionWeightPlan, UnvalidatedExecutionPlan, VNextError, EXECUTION_PLAN_SCHEMA,
 };
 
 impl UnvalidatedExecutionPlan {
@@ -33,6 +33,26 @@ impl UnvalidatedExecutionPlan {
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
     ) -> Result<ExecutionPlan, VNextError> {
+        let execution_weights = TrustedExecutionWeightPlan::identity(family)?;
+        self.revalidate_with_execution_weights(
+            family,
+            capabilities,
+            policy,
+            node_resolutions,
+            completion_retention,
+            execution_weights,
+        )
+    }
+
+    pub fn revalidate_with_execution_weights<P: RuntimePolicy>(
+        self,
+        family: &PreparedModelFamily,
+        capabilities: &CapabilityCatalog,
+        policy: &P,
+        node_resolutions: Vec<PlanNodeResolution>,
+        completion_retention: CompletionRetentionSpec,
+        execution_weights: TrustedExecutionWeightPlan,
+    ) -> Result<ExecutionPlan, VNextError> {
         if self.payload.schema != EXECUTION_PLAN_SCHEMA {
             return Err(VNextError::UnsupportedPlanSchema {
                 expected_major: EXECUTION_PLAN_SCHEMA.major,
@@ -43,6 +63,7 @@ impl UnvalidatedExecutionPlan {
         }
         let rebuilt = ExecutionPlan::build(
             PlanBuildRequest::new(family, capabilities, policy, node_resolutions)?
+                .with_execution_weights(execution_weights)?
                 .with_completion_retention(completion_retention)?,
         )?;
         let untrusted_payload =
