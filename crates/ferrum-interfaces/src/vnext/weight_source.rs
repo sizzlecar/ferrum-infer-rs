@@ -223,8 +223,10 @@ impl<'source> WeightComponentPayload<'source> {
 }
 
 /// Backend-neutral source of schema-addressed physical weight components.
-/// Implementations own file-format discovery, validation, and optional
-/// repacking; resource initialization owns placement and device submission.
+/// Implementations own checkpoint file-format discovery and source-payload
+/// validation. The execution plan's trusted [`super::WeightMaterializer`] owns
+/// any repacking or quantization before resource initialization performs
+/// placement and device submission.
 pub trait WeightComponentSource: Send + Sync {
     fn component<'source>(
         &'source self,

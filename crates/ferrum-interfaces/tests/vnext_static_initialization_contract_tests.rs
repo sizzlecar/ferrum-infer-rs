@@ -32,6 +32,134 @@ impl WeightComponentSource for ZeroWeightSource {
     }
 }
 
+struct StrictSourceWeightSource {
+    requested: Arc<Mutex<Vec<WeightId>>>,
+}
+
+impl WeightComponentSource for StrictSourceWeightSource {
+    fn component<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        if !matches!(
+            component.id.as_str(),
+            "weight.component.left" | "weight.component.right"
+        ) {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "strict source rejects derived execution component `{}`",
+                    component.id
+                ),
+            });
+        }
+        self.requested.lock().unwrap().push(component.id.clone());
+        ZeroWeightSource.component(component)
+    }
+}
+
+struct DerivedComponentMaterializer {
+    descriptor: WeightMaterializerDescriptor,
+}
+
+impl DerivedComponentMaterializer {
+    fn new() -> Self {
+        Self {
+            descriptor: WeightMaterializerDescriptor::new(
+                id("weight-materializer.test.derived-components"),
+                ContractVersion::new(1, 0),
+                sha('8'),
+                BTreeSet::from([id("capability.compute")]),
+            )
+            .unwrap(),
+        }
+    }
+}
+
+impl WeightMaterializer for DerivedComponentMaterializer {
+    fn descriptor(&self) -> &WeightMaterializerDescriptor {
+        &self.descriptor
+    }
+
+    fn execution_schema(
+        &self,
+        family: &PreparedModelFamily,
+        _device: &DeviceDescriptor,
+    ) -> Result<WeightSchema, VNextError> {
+        let mut schema = family.weight_schema().clone();
+        schema.layout_id = id("weight-layout.device-operation-derived");
+        schema.components[0].id = id("weight.execution.left");
+        schema.components[0].external_names = vec!["derived.left.bin".to_owned()];
+        schema.components[1].id = id("weight.execution.right");
+        schema.components[1].external_names = vec!["derived.right.bin".to_owned()];
+        let PhysicalWeightLayout::Composite { parts } = &mut schema.tensors[0].physical_layout
+        else {
+            panic!("fixture weight must remain composite");
+        };
+        let PhysicalWeightLayout::Dense { component_id } = parts[0].layout.as_mut() else {
+            panic!("fixture left weight must remain dense");
+        };
+        *component_id = id("weight.execution.left");
+        let PhysicalWeightLayout::Dense { component_id } = parts[1].layout.as_mut() else {
+            panic!("fixture right weight must remain dense");
+        };
+        *component_id = id("weight.execution.right");
+        Ok(schema)
+    }
+
+    fn component_sources(
+        &self,
+        _family: &PreparedModelFamily,
+        _execution_schema: &WeightSchema,
+    ) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
+        Ok(BTreeMap::from([
+            (
+                id("weight.execution.left"),
+                vec![id("weight.component.left")],
+            ),
+            (
+                id("weight.execution.right"),
+                vec![id("weight.component.right")],
+            ),
+        ]))
+    }
+
+    fn materialize_component<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        let [source_component] = source_components else {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "derived test materializer requires one source component".to_owned(),
+            });
+        };
+        let source_payload = source.component(source_component)?;
+        let fill = match execution_component.id.as_str() {
+            "weight.execution.left" => 0xa1,
+            "weight.execution.right" => 0xb2,
+            other => {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: format!("unexpected derived execution component `{other}`"),
+                })
+            }
+        };
+        let byte_len = usize::try_from(execution_component.physical_bytes()?).map_err(|_| {
+            VNextError::InvalidExecutionPlan {
+                reason: "derived test component exceeds host address space".to_owned(),
+            }
+        })?;
+        WeightComponentPayload::from_ordered_sources(
+            execution_component,
+            execution_component.external_names.clone(),
+            source_payload.source_files().to_vec(),
+            execution_component.dimensions.clone(),
+            execution_component.physical_element_type(),
+            vec![fill; byte_len],
+        )
+    }
+}
+
 fn committed_transaction(
     plan: &ExecutionPlan,
     runtime: Arc<TestRuntime>,
@@ -87,10 +215,71 @@ fn test_plan() -> (
     (resolved, plan, runtime, trace)
 }
 
+fn derived_component_test_plan() -> (
+    PreparedModelFamily,
+    ExecutionPlan,
+    Arc<TestRuntime>,
+    Arc<Mutex<RuntimeTrace>>,
+) {
+    let materializers =
+        WeightMaterializerRegistry::new(vec![Box::new(DerivedComponentMaterializer::new())])
+            .unwrap();
+    let catalog = materializers.augment_catalog(catalog()).unwrap();
+    let registry = operation_registry(
+        &catalog,
+        Arc::new(Mutex::new(ProviderBehavior::Success)),
+        Arc::new(Mutex::new(ProviderTrace::default())),
+    );
+    let family = TestModelRegistry::new()
+        .registration
+        .prepare(&json!({"width": 4}))
+        .unwrap();
+    let runtime_policy = policy();
+    let materializer_id = id("weight-materializer.test.derived-components");
+    let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+        id("value.input"),
+        ProgramTensorSpec {
+            dimensions: vec![4],
+            element_type: ElementType::F32,
+            layout: ResolvedTensorLayout::Contiguous,
+        },
+    )]))
+    .unwrap();
+    options.require_weight_materializer(materializer_id);
+    let plan = ProgramPlanCompiler::compile_with_weight_materializers(
+        &family,
+        &catalog,
+        &runtime_policy,
+        &registry.planning(),
+        &materializers,
+        &options,
+    )
+    .unwrap()
+    .executable()
+    .execution_plan()
+    .clone();
+    let (runtime, trace) = runtime(&catalog);
+    (family, plan, runtime, trace)
+}
+
 fn close(resources: Arc<PlanRuntimeResources<TestRuntime>>) {
-    let mut passed = 0;
-    close_plan_runtime(resources, &mut passed);
-    assert_eq!(passed, 1);
+    close_with_expected_static_resources(resources, 2);
+}
+
+fn close_with_expected_static_resources(
+    resources: Arc<PlanRuntimeResources<TestRuntime>>,
+    expected_static_resources: usize,
+) {
+    match PlanRuntimeResources::close(resources) {
+        Ok(PlanRuntimeCloseOutcome::Closed(receipt)) => assert_eq!(
+            receipt.released_static_resources(),
+            expected_static_resources
+        ),
+        Ok(PlanRuntimeCloseOutcome::Referenced { strong_count, .. }) => {
+            panic!("plan runtime close retained {strong_count} references")
+        }
+        Err(failure) => panic!("plan runtime close failed: {:?}", failure.failure()),
+    }
 }
 
 fn handoff(
@@ -168,6 +357,46 @@ fn static_initialization_uploads_schema_components_before_handoff() {
         assert_eq!(trace.synchronize_calls, 0);
     }
     close(handoff(initialized));
+}
+
+#[test]
+fn static_initialization_materializes_derived_components_through_trusted_plan_authority() {
+    let (family, plan, runtime, trace) = derived_component_test_plan();
+    assert_eq!(
+        plan.payload().execution_weights().component_sources(),
+        &BTreeMap::from([
+            (
+                id("weight.execution.left"),
+                vec![id("weight.component.left")],
+            ),
+            (
+                id("weight.execution.right"),
+                vec![id("weight.component.right")],
+            ),
+        ])
+    );
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let source = StrictSourceWeightSource {
+        requested: Arc::clone(&requested),
+    };
+    let initialized = committed_transaction(&plan, Arc::clone(&runtime), "derived-materializer")
+        .initialize_static(
+            &family,
+            &plan,
+            &source,
+            StaticInitializationPolicy::new(64, 8).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        *requested.lock().unwrap(),
+        vec![id("weight.component.left"), id("weight.component.right")]
+    );
+    assert_eq!(
+        trace.lock().unwrap().uploaded_payloads,
+        vec![vec![0xa1; 8], vec![0xb2; 8]]
+    );
+    let expected_static_resources = plan.payload().memory().static_allocations().len();
+    close_with_expected_static_resources(handoff(initialized), expected_static_resources);
 }
 
 #[test]

@@ -540,7 +540,8 @@ where
         // converted component until the final submit would duplicate the
         // entire model in host memory.
         let materialization_started = Instant::now();
-        let upload = prepare_upload(source, component, placement).map_err(contract_failure)?;
+        let upload =
+            prepare_upload(family, plan, source, component, placement).map_err(contract_failure)?;
         let materialization_duration = materialization_started.elapsed();
         source_materialization_duration += materialization_duration;
         if slowest_component_id.is_none()
@@ -955,11 +956,13 @@ fn weight_placements(
 }
 
 fn prepare_upload<'source>(
+    family: &PreparedModelFamily,
+    plan: &ExecutionPlan,
     source: &'source dyn WeightComponentSource,
     component: &WeightComponentSpec,
     placement: &WeightPlacement,
 ) -> Result<WeightComponentPayload<'source>, VNextError> {
-    let payload = source.component(component)?;
+    let payload = plan.materialize_weight_component(family, source, component)?;
     if payload.component_id() != &placement.component_id
         || payload.element_type() != placement.element_type
         || payload.bytes().len() as u64 != placement.length_bytes

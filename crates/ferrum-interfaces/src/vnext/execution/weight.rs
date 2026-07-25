@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
+
+use crate::vnext::{WeightComponentPayload, WeightComponentSource, WeightComponentSpec};
 
 use super::{
     canonical_fingerprint, invalid_plan, is_canonical_sha256, CapabilityCatalog, CapabilityId,
     ContractVersion, Deserialize, DeviceDescriptor, ModelFamilyId, PreparedModelFamily, Serialize,
-    VNextError, WeightMaterializerId, WeightSchema,
+    VNextError, WeightId, WeightMaterializerId, WeightSchema,
 };
 
 pub const IDENTITY_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.identity";
@@ -111,13 +114,15 @@ impl WeightMaterializerDescriptor {
     }
 }
 
-/// Planning half of a physical weight transformation.
+/// Trusted authority for one physical weight transformation.
 ///
 /// Implementations are invoked once while compiling an immutable plan. They
 /// must derive the complete execution schema from the prepared family and
 /// device descriptor without allocating device memory or reading request
-/// state.
-pub trait WeightMaterializerPlanner: Send + Sync {
+/// state. During static initialization the same retained implementation turns
+/// source components into the exact execution components recorded in that
+/// plan; no provider or weight source may bypass this authority.
+pub trait WeightMaterializer: Send + Sync {
     fn descriptor(&self) -> &WeightMaterializerDescriptor;
 
     fn execution_schema(
@@ -125,6 +130,31 @@ pub trait WeightMaterializerPlanner: Send + Sync {
         family: &PreparedModelFamily,
         device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError>;
+
+    /// Ordered source-component identities for every execution component.
+    ///
+    /// The default only permits a same-id mapping. Materializers that create
+    /// derived component identities or combine multiple source components must
+    /// declare that provenance explicitly.
+    fn component_sources(
+        &self,
+        family: &PreparedModelFamily,
+        execution_schema: &WeightSchema,
+    ) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
+        identity_component_sources(family, execution_schema)
+    }
+
+    /// Materialize one execution component on the cold initialization path.
+    ///
+    /// `source_components` is resolved from the immutable plan's ordered source
+    /// map. Implementations may borrow source bytes for identity layouts or
+    /// return owned bytes for repacked/quantized layouts.
+    fn materialize_component<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError>;
 }
 
 struct IdentityWeightMaterializer {
@@ -139,7 +169,7 @@ impl IdentityWeightMaterializer {
     }
 }
 
-impl WeightMaterializerPlanner for IdentityWeightMaterializer {
+impl WeightMaterializer for IdentityWeightMaterializer {
     fn descriptor(&self) -> &WeightMaterializerDescriptor {
         &self.descriptor
     }
@@ -151,25 +181,69 @@ impl WeightMaterializerPlanner for IdentityWeightMaterializer {
     ) -> Result<WeightSchema, VNextError> {
         Ok(family.weight_schema().clone())
     }
+
+    fn materialize_component<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        let [source_component] = source_components else {
+            return Err(invalid_plan(
+                "identity weight materializer requires exactly one source component",
+            ));
+        };
+        if *source_component != execution_component {
+            return Err(invalid_plan(format!(
+                "identity weight materializer cannot transform component `{}`",
+                execution_component.id
+            )));
+        }
+        source.component(source_component)
+    }
+}
+
+fn identity_component_sources(
+    family: &PreparedModelFamily,
+    execution_schema: &WeightSchema,
+) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
+    let source_ids = family
+        .weight_schema()
+        .components
+        .iter()
+        .map(|component| component.id.clone())
+        .collect::<BTreeSet<_>>();
+    execution_schema
+        .components
+        .iter()
+        .map(|component| {
+            if !source_ids.contains(&component.id) {
+                return Err(invalid_plan(format!(
+                    "weight materializer must declare sources for derived component `{}`",
+                    component.id
+                )));
+            }
+            Ok((component.id.clone(), vec![component.id.clone()]))
+        })
+        .collect()
 }
 
 /// Process-local registry retaining the exact implementations authorized to
 /// transform checkpoint schemas. It is deliberately neither serializable nor
 /// reconstructible from a capability catalog.
 pub struct WeightMaterializerRegistry {
-    materializers: BTreeMap<WeightMaterializerId, Arc<dyn WeightMaterializerPlanner>>,
+    materializers: BTreeMap<WeightMaterializerId, Arc<dyn WeightMaterializer>>,
 }
 
 impl WeightMaterializerRegistry {
-    pub fn new(materializers: Vec<Box<dyn WeightMaterializerPlanner>>) -> Result<Self, VNextError> {
+    pub fn new(materializers: Vec<Box<dyn WeightMaterializer>>) -> Result<Self, VNextError> {
         if materializers.len() >= MAX_WEIGHT_MATERIALIZERS {
             return Err(invalid_plan(format!(
                 "weight materializer registry exceeds {} non-identity entries",
                 MAX_WEIGHT_MATERIALIZERS - 1
             )));
         }
-        let identity: Arc<dyn WeightMaterializerPlanner> =
-            Arc::new(IdentityWeightMaterializer::new()?);
+        let identity: Arc<dyn WeightMaterializer> = Arc::new(IdentityWeightMaterializer::new()?);
         let mut entries = BTreeMap::from([(identity.descriptor().id().clone(), identity)]);
         for materializer in materializers {
             materializer.descriptor().validate_structure()?;
@@ -224,10 +298,13 @@ impl WeightMaterializerRegistry {
         descriptor.validate_for_device(catalog.device())?;
         let mut schema = materializer.execution_schema(family, catalog.device())?;
         schema.normalize();
-        let plan = ExecutionWeightPlan::from_materializer(family, descriptor, schema)?;
+        let component_sources = materializer.component_sources(family, &schema)?;
+        let plan =
+            ExecutionWeightPlan::from_materializer(family, descriptor, schema, component_sources)?;
         Ok(TrustedExecutionWeightPlan {
             plan,
             descriptor: descriptor.clone(),
+            materializer: Arc::clone(materializer),
         })
     }
 
@@ -241,22 +318,47 @@ impl WeightMaterializerRegistry {
 
 /// Non-serializable proof that a process-local registry implementation
 /// produced and validated this physical execution schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct TrustedExecutionWeightPlan {
     plan: ExecutionWeightPlan,
     descriptor: WeightMaterializerDescriptor,
+    materializer: Arc<dyn WeightMaterializer>,
 }
+
+impl fmt::Debug for TrustedExecutionWeightPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedExecutionWeightPlan")
+            .field("plan", &self.plan)
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TrustedExecutionWeightPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.plan == other.plan && self.descriptor == other.descriptor
+    }
+}
+
+impl Eq for TrustedExecutionWeightPlan {}
 
 impl TrustedExecutionWeightPlan {
     pub(crate) fn identity(family: &PreparedModelFamily) -> Result<Self, VNextError> {
-        let descriptor = WeightMaterializerDescriptor::identity()?;
+        let materializer: Arc<dyn WeightMaterializer> =
+            Arc::new(IdentityWeightMaterializer::new()?);
+        let descriptor = materializer.descriptor().clone();
+        let schema = family.weight_schema().clone();
+        let component_sources = materializer.component_sources(family, &schema)?;
         Ok(Self {
             plan: ExecutionWeightPlan::from_materializer(
                 family,
                 &descriptor,
-                family.weight_schema().clone(),
+                schema,
+                component_sources,
             )?,
             descriptor,
+            materializer,
         })
     }
 
@@ -269,6 +371,7 @@ impl TrustedExecutionWeightPlan {
         family: &PreparedModelFamily,
         catalog: &CapabilityCatalog,
     ) -> Result<(), VNextError> {
+        self.validate_runtime_authority()?;
         let catalog_descriptor = catalog.weight_materializer(self.descriptor.id())?;
         if &self.descriptor != catalog_descriptor {
             return Err(invalid_plan(format!(
@@ -278,6 +381,87 @@ impl TrustedExecutionWeightPlan {
         }
         self.plan
             .validate_against_materializer(family, &self.descriptor)
+    }
+
+    pub(crate) fn materialize_component<'source>(
+        &self,
+        family: &PreparedModelFamily,
+        source: &'source dyn WeightComponentSource,
+        execution_component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        self.validate_runtime_authority()?;
+        let planned_component_index = self
+            .plan
+            .schema
+            .components
+            .binary_search_by(|component| component.id.cmp(&execution_component.id))
+            .map_err(|_| {
+                invalid_plan(format!(
+                    "execution component `{}` is absent from the trusted weight plan",
+                    execution_component.id
+                ))
+            })?;
+        let planned_component = &self.plan.schema.components[planned_component_index];
+        if planned_component != execution_component {
+            return Err(invalid_plan(format!(
+                "execution component `{}` differs from the trusted weight plan",
+                execution_component.id
+            )));
+        }
+        let source_ids = self
+            .plan
+            .component_sources
+            .get(&execution_component.id)
+            .ok_or_else(|| {
+                invalid_plan(format!(
+                    "execution component `{}` has no source mapping",
+                    execution_component.id
+                ))
+            })?;
+        let source_components = source_ids
+            .iter()
+            .map(|source_id| {
+                let source_component_index = family
+                    .weight_schema()
+                    .components
+                    .binary_search_by(|component| component.id.cmp(source_id))
+                    .map_err(|_| {
+                        invalid_plan(format!(
+                            "execution component `{}` references unknown source component `{source_id}`",
+                            execution_component.id
+                        ))
+                    })?;
+                Ok(&family.weight_schema().components[source_component_index])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload = self.materializer.materialize_component(
+            source,
+            &source_components,
+            execution_component,
+        )?;
+        if payload.component_id() != &execution_component.id
+            || payload.external_names() != execution_component.external_names.as_slice()
+            || payload.dimensions() != execution_component.dimensions.as_slice()
+            || payload.element_type() != execution_component.physical_element_type()
+            || u64::try_from(payload.bytes().len()).ok()
+                != Some(execution_component.physical_bytes()?)
+        {
+            return Err(invalid_plan(format!(
+                "weight materializer `{}` returned invalid payload for execution component `{}`",
+                self.descriptor.id, execution_component.id
+            )));
+        }
+        Ok(payload)
+    }
+
+    fn validate_runtime_authority(&self) -> Result<(), VNextError> {
+        if self.materializer.descriptor() != &self.descriptor {
+            return Err(invalid_plan(format!(
+                "weight materializer `{}` runtime authority differs from its trusted descriptor",
+                self.descriptor.id
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -295,22 +479,23 @@ pub struct ExecutionWeightPlan {
     materializer_id: WeightMaterializerId,
     materializer_version: ContractVersion,
     materializer_implementation_fingerprint: String,
+    component_sources: BTreeMap<WeightId, Vec<WeightId>>,
     schema: WeightSchema,
 }
 
 impl ExecutionWeightPlan {
     pub fn identity(family: &PreparedModelFamily) -> Result<Self, VNextError> {
-        Self::from_materializer(
-            family,
-            &WeightMaterializerDescriptor::identity()?,
-            family.weight_schema().clone(),
-        )
+        let descriptor = WeightMaterializerDescriptor::identity()?;
+        let schema = family.weight_schema().clone();
+        let component_sources = identity_component_sources(family, &schema)?;
+        Self::from_materializer(family, &descriptor, schema, component_sources)
     }
 
     fn from_materializer(
         family: &PreparedModelFamily,
         descriptor: &WeightMaterializerDescriptor,
         schema: WeightSchema,
+        component_sources: BTreeMap<WeightId, Vec<WeightId>>,
     ) -> Result<Self, VNextError> {
         let plan = Self {
             source_schema_fingerprint: family.weight_schema().fingerprint()?,
@@ -319,6 +504,7 @@ impl ExecutionWeightPlan {
             materializer_implementation_fingerprint: descriptor
                 .implementation_fingerprint()
                 .to_owned(),
+            component_sources,
             schema,
         };
         plan.validate_against_materializer(family, descriptor)?;
@@ -345,6 +531,10 @@ impl ExecutionWeightPlan {
         &self.schema
     }
 
+    pub fn component_sources(&self) -> &BTreeMap<WeightId, Vec<WeightId>> {
+        &self.component_sources
+    }
+
     pub fn fingerprint(&self) -> Result<String, VNextError> {
         canonical_fingerprint(self, "fingerprint execution weight plan")
     }
@@ -358,7 +548,29 @@ impl ExecutionWeightPlan {
                 reason: "execution weight plan provenance is invalid".to_owned(),
             });
         }
-        self.schema.validate(family_id)
+        self.schema.validate(family_id)?;
+        let execution_component_ids = self
+            .schema
+            .components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mapped_component_ids = self
+            .component_sources
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if execution_component_ids != mapped_component_ids
+            || self.component_sources.values().any(|source_ids| {
+                source_ids.is_empty()
+                    || source_ids.iter().collect::<BTreeSet<_>>().len() != source_ids.len()
+            })
+        {
+            return Err(invalid_plan(
+                "execution weight component source map is incomplete or contains duplicate sources",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_against_family(
@@ -370,6 +582,31 @@ impl ExecutionWeightPlan {
             return Err(invalid_plan(
                 "execution weight plan source schema differs from its prepared family",
             ));
+        }
+        let source_components = family
+            .weight_schema()
+            .components
+            .iter()
+            .map(|component| (&component.id, component))
+            .collect::<BTreeMap<_, _>>();
+        let mut referenced_source_components = BTreeSet::new();
+        for (execution_component_id, source_ids) in &self.component_sources {
+            for source_id in source_ids {
+                if !source_components.contains_key(source_id) {
+                    return Err(invalid_plan(format!(
+                        "execution component `{execution_component_id}` references unknown source component `{source_id}`"
+                    )));
+                }
+                referenced_source_components.insert(source_id.clone());
+            }
+        }
+        if let Some(component) = source_components.values().find(|component| {
+            component.required && !referenced_source_components.contains(&component.id)
+        }) {
+            return Err(invalid_plan(format!(
+                "required source component `{}` is not represented in the execution weight plan",
+                component.id
+            )));
         }
         let source_tensors = family
             .weight_schema()

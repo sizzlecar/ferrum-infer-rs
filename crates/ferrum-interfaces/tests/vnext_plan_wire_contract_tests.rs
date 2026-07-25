@@ -106,7 +106,7 @@ fn breaking_schema_versions_are_rejected_100_of_100() {
 }
 
 #[test]
-fn legacy_schema_is_rejected_before_v6_nested_binding_validation() {
+fn legacy_schema_is_rejected_before_v7_weight_source_validation() {
     let fixture = plan_fixture(0);
     let mut value = serde_json::to_value(&fixture.plan).unwrap();
     value["payload"]["schema"] = json!({"major": 3, "minor": 0});
@@ -122,7 +122,7 @@ fn legacy_schema_is_rejected_before_v6_nested_binding_validation() {
     assert!(matches!(
         error,
         VNextError::UnsupportedPlanSchema {
-            expected_major: 6,
+            expected_major: 7,
             expected_minor: 0,
             actual_major: 3,
             actual_minor: 0,
@@ -133,7 +133,7 @@ fn legacy_schema_is_rejected_before_v6_nested_binding_validation() {
 #[test]
 fn execution_weight_materializer_and_schema_cannot_authorize_themselves_from_wire() {
     let fixture = plan_fixture(0);
-    for mutation in ["materializer", "schema"] {
+    for mutation in ["materializer", "schema", "component_sources"] {
         let mut value = serde_json::to_value(&fixture.plan).unwrap();
         match mutation {
             "materializer" => {
@@ -143,6 +143,10 @@ fn execution_weight_materializer_and_schema_cannot_authorize_themselves_from_wir
             "schema" => {
                 value["payload"]["execution_weights"]["schema"]["layout_id"] =
                     json!("weight-layout.forged");
+            }
+            "component_sources" => {
+                value["payload"]["execution_weights"]["component_sources"]["weight.component"] =
+                    json!(["weight.component.forged"]);
             }
             _ => unreachable!(),
         }
