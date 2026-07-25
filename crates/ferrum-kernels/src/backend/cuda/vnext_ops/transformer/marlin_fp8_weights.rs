@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
     ElementType, OperationInvocation, PhysicalStorageLayout, PhysicalWeightLayout,
-    PhysicalWeightPadding, QuantizationPacking, ResolvedStorageComponent, ResolvedValueBinding,
-    ResolvedWeightBinding, ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,
-    WeightId,
+    PhysicalWeightPadding, QuantizationGrouping, QuantizationPacking, ResolvedStorageComponent,
+    ResolvedValueBinding, ResolvedWeightBinding, ResolvedWeightComponentLayout,
+    WeightComponentRole, WeightEncoding, WeightId,
 };
 
 use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
@@ -15,13 +15,13 @@ use crate::marlin_fp8_materializer::{
 };
 
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
+pub(super) const MARLIN_FP8_CHANNELWISE_GROUP_SIZE: i32 = -1;
 
 pub(super) struct CudaMarlinFp8Weight {
     packed_region: CudaBufferRegion,
     scales_region: CudaBufferRegion,
     output_features: u64,
     input_features: u64,
-    group_size: u32,
 }
 
 impl CudaMarlinFp8Weight {
@@ -41,10 +41,6 @@ impl CudaMarlinFp8Weight {
         self.input_features
     }
 
-    pub(super) const fn group_size(&self) -> u32 {
-        self.group_size
-    }
-
     pub(super) fn into_regions(self) -> [CudaBufferRegion; 2] {
         [self.packed_region, self.scales_region]
     }
@@ -57,7 +53,6 @@ struct MarlinFp8Metadata {
     input_features: u64,
     packed_bytes: u64,
     scales_bytes: u64,
-    group_size: u32,
 }
 
 pub(super) fn resolve_marlin_fp8_weight(
@@ -130,7 +125,6 @@ pub(super) fn resolve_marlin_fp8_weight(
         scales_region,
         output_features: metadata.output_features,
         input_features: metadata.input_features,
-        group_size: metadata.group_size,
     })
 }
 
@@ -238,7 +232,7 @@ fn validate_marlin_fp8_contract(
         .map_err(|error| format!("CUDA Marlin FP8 quantization ABI is invalid: {error}"))?;
     if quantization.format_id.as_str() != MARLIN_FP8_QUANTIZATION_FORMAT_ID
         || quantization.bits_per_weight != 8
-        || u64::from(quantization.group_size) != *input_features
+        || quantization.grouping != QuantizationGrouping::WholeAxis
         || quantization.packing != QuantizationPacking::Tiled
         || quantization.scale_type != ElementType::F16
         || quantization.zero_point_type.is_some()
@@ -297,7 +291,6 @@ fn validate_marlin_fp8_contract(
         input_features: *input_features,
         packed_bytes,
         scales_bytes,
-        group_size: quantization.group_size,
     })
 }
 

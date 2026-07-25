@@ -30,7 +30,7 @@ fn grouped_quantized_axis_index_schema() -> WeightSchema {
     let quantization = QuantizationSpec {
         format_id: id("quantization.grouped"),
         bits_per_weight: 4,
-        group_size: 4,
+        grouping: QuantizationGrouping::fixed(4),
         packing: QuantizationPacking::Linear,
         scale_type: ElementType::F16,
         zero_point_type: Some(ElementType::U8),
@@ -162,6 +162,105 @@ fn physical_weight_layout_tree_accepts_grouped_quantized_axis_index_fixture() {
             .len(),
         5
     );
+}
+
+#[test]
+fn whole_axis_quantization_keeps_one_abi_across_matrix_shapes() {
+    let quantization = QuantizationSpec {
+        format_id: id("quantization.channelwise"),
+        bits_per_weight: 8,
+        grouping: QuantizationGrouping::WholeAxis,
+        packing: QuantizationPacking::Tiled,
+        scale_type: ElementType::F16,
+        zero_point_type: None,
+    };
+    let first_packed: WeightId = id("component.first.packed");
+    let first_scales: WeightId = id("component.first.scales");
+    let second_packed: WeightId = id("component.second.packed");
+    let second_scales: WeightId = id("component.second.scales");
+    let schema = WeightSchema {
+        format_id: id("weight-format.channelwise"),
+        layout_id: id("weight-layout.channelwise"),
+        version: ContractVersion::new(1, 0),
+        components: vec![
+            WeightComponentSpec {
+                id: first_packed.clone(),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["first.packed".to_owned()],
+                dimensions: vec![2, 4],
+                encoding: WeightEncoding::Quantized(quantization.clone()),
+                required: true,
+            },
+            WeightComponentSpec {
+                id: first_scales.clone(),
+                role: WeightComponentRole::Scales,
+                external_names: vec!["first.scales".to_owned()],
+                dimensions: vec![2, 1],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+                required: true,
+            },
+            WeightComponentSpec {
+                id: second_packed.clone(),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["second.packed".to_owned()],
+                dimensions: vec![3, 8],
+                encoding: WeightEncoding::Quantized(quantization),
+                required: true,
+            },
+            WeightComponentSpec {
+                id: second_scales.clone(),
+                role: WeightComponentRole::Scales,
+                external_names: vec!["second.scales".to_owned()],
+                dimensions: vec![3, 1],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+                required: true,
+            },
+        ],
+        tensors: vec![
+            WeightTensorSpec {
+                id: id("weight.first"),
+                dimensions: vec![2, 4],
+                logical_element_type: ElementType::F16,
+                physical_layout: PhysicalWeightLayout::Quantized {
+                    packed_values: PhysicalWeightComponentBinding::exact_contiguous(first_packed),
+                    packed_dimensions: vec![2, 4],
+                    scales: PhysicalWeightComponentBinding::exact_contiguous(first_scales),
+                    zero_points: None,
+                    axis_indices: None,
+                    permutation: None,
+                    codebook: None,
+                    group_axis: 1,
+                    group_padding: PhysicalWeightPadding::Exact,
+                },
+                required: true,
+            },
+            WeightTensorSpec {
+                id: id("weight.second"),
+                dimensions: vec![3, 8],
+                logical_element_type: ElementType::F16,
+                physical_layout: PhysicalWeightLayout::Quantized {
+                    packed_values: PhysicalWeightComponentBinding::exact_contiguous(second_packed),
+                    packed_dimensions: vec![3, 8],
+                    scales: PhysicalWeightComponentBinding::exact_contiguous(second_scales),
+                    zero_points: None,
+                    axis_indices: None,
+                    permutation: None,
+                    codebook: None,
+                    group_axis: 1,
+                    group_padding: PhysicalWeightPadding::Exact,
+                },
+                required: true,
+            },
+        ],
+    };
+
+    schema
+        .validate(&id("family.channelwise-two-shapes"))
+        .unwrap();
 }
 
 fn block_quantization(format_id: &str, bytes_per_block: u32) -> BlockQuantizationSpec {
@@ -480,7 +579,7 @@ fn block_quantized_layout_rejects_implicit_geometry_and_invalid_encodings() {
     separate_scale_encoding.components[0].encoding = WeightEncoding::Quantized(QuantizationSpec {
         format_id: id("quantization.separate-scale"),
         bits_per_weight: 4,
-        group_size: 256,
+        grouping: QuantizationGrouping::fixed(256),
         packing: QuantizationPacking::Linear,
         scale_type: ElementType::F16,
         zero_point_type: None,
@@ -518,7 +617,7 @@ fn recursive_quantized_expert_schema() -> WeightSchema {
     let quantization = QuantizationSpec {
         format_id: id("quantization.expert-grouped"),
         bits_per_weight: 4,
-        group_size: 4,
+        grouping: QuantizationGrouping::fixed(4),
         packing: QuantizationPacking::Tiled,
         scale_type: ElementType::F16,
         zero_point_type: Some(ElementType::U8),

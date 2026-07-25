@@ -7,6 +7,8 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+#[cfg(test)]
+use ferrum_interfaces::vnext::QuantizationGrouping;
 use ferrum_interfaces::vnext::{
     ElementType, QuantizationSpec, VNextError, WeightComponentPayload, WeightComponentRole,
     WeightComponentSource, WeightComponentSpec, WeightEncoding,
@@ -46,7 +48,8 @@ impl GptqMarlinSafetensorsSource {
         component: &WeightComponentSpec,
         quantization: &QuantizationSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
-        validate_marlin_quantization(component, quantization)?;
+        let group_size = usize::try_from(validate_marlin_quantization(component, quantization)?)
+            .map_err(|_| invalid_component(component, "GPTQ group size exceeds address space"))?;
         let groups = packed_source_groups(component)?;
         let first_qweight = self.tensor(component, groups[0].qweight)?;
         let (k, n) = validate_qweight_shape(component, &first_qweight)?;
@@ -89,23 +92,12 @@ impl GptqMarlinSafetensorsSource {
                     ));
                 }
                 let qzeros = self.tensor(component, group.qzeros)?;
-                validate_symmetric_qzeros_shape(
-                    component,
-                    &qzeros,
-                    k,
-                    n,
-                    quantization.group_size as usize,
-                )?;
+                validate_symmetric_qzeros_shape(component, &qzeros, k, n, group_size)?;
                 source_files.push(qweight.source_file().to_owned());
                 source_files.push(qzeros.source_file().to_owned());
                 if let Some(g_idx_name) = group.g_idx {
                     let g_idx = self.tensor(component, g_idx_name)?;
-                    validate_canonical_g_idx(
-                        component,
-                        &g_idx,
-                        k,
-                        quantization.group_size as usize,
-                    )?;
+                    validate_canonical_g_idx(component, &g_idx, k, group_size)?;
                     source_files.push(g_idx.source_file().to_owned());
                 }
                 projections.push(decode_i32(qweight.bytes(), component, "qweight")?);
@@ -476,11 +468,16 @@ fn concatenate_equal_width_rows<T: Copy>(
 fn validate_marlin_quantization(
     component: &WeightComponentSpec,
     quantization: &QuantizationSpec,
-) -> std::result::Result<(), VNextError> {
+) -> std::result::Result<u32, VNextError> {
     quantization.validate()?;
+    let Some(group_size) = quantization.grouping.fixed_size() else {
+        return Err(invalid_component(
+            component,
+            "typed GPTQ source requires fixed-size quantization groups",
+        ));
+    };
     if quantization.format_id.as_str() != GPTQ_MARLIN_INT4_FORMAT_ID
         || quantization.bits_per_weight != 4
-        || quantization.group_size == 0
         || quantization.scale_type != ElementType::F16
         || quantization.zero_point_type.is_some()
     {
@@ -489,7 +486,7 @@ fn validate_marlin_quantization(
             "typed GPTQ source requires symmetric INT4 Marlin packing with F16 scales",
         ));
     }
-    Ok(())
+    Ok(group_size)
 }
 
 fn validate_symmetric_qzeros_shape(
@@ -753,7 +750,7 @@ mod tests {
         QuantizationSpec {
             format_id: QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID).unwrap(),
             bits_per_weight: 4,
-            group_size: 128,
+            grouping: QuantizationGrouping::fixed(128),
             packing: QuantizationPacking::Tiled,
             scale_type: ElementType::F16,
             zero_point_type: None,

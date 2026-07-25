@@ -17,11 +17,50 @@ pub enum QuantizationPacking {
     Tiled,
 }
 
+/// How values are partitioned along a quantized layout's `group_axis`.
+///
+/// `WholeAxis` is shape-relative by design: all values on the group axis
+/// share one scale. This represents channelwise quantization without making a
+/// matrix dimension part of the otherwise stable quantization-format ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuantizationGrouping {
+    Fixed { size: u32 },
+    WholeAxis,
+}
+
+impl QuantizationGrouping {
+    pub const fn fixed(size: u32) -> Self {
+        Self::Fixed { size }
+    }
+
+    pub const fn fixed_size(self) -> Option<u32> {
+        match self {
+            Self::Fixed { size } => Some(size),
+            Self::WholeAxis => None,
+        }
+    }
+
+    pub const fn resolved_size(self, axis_extent: u64) -> u64 {
+        match self {
+            Self::Fixed { size } => size as u64,
+            Self::WholeAxis => axis_extent,
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        match self {
+            Self::Fixed { size } => size != 0 && size.is_power_of_two(),
+            Self::WholeAxis => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationSpec {
     pub format_id: super::QuantizationFormatId,
     pub bits_per_weight: u8,
-    pub group_size: u32,
+    pub grouping: QuantizationGrouping,
     pub packing: QuantizationPacking,
     pub scale_type: ElementType,
     pub zero_point_type: Option<ElementType>,
@@ -30,8 +69,7 @@ pub struct QuantizationSpec {
 impl QuantizationSpec {
     pub fn validate(&self) -> Result<(), VNextError> {
         if !(1..=8).contains(&self.bits_per_weight)
-            || self.group_size == 0
-            || !self.group_size.is_power_of_two()
+            || !self.grouping.is_valid()
             || !matches!(
                 self.scale_type,
                 ElementType::F16 | ElementType::Bf16 | ElementType::F32
@@ -1535,12 +1573,11 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                     };
                     spec.clone()
                 };
-                let grouped_dimensions = self.grouped_dimensions(
-                    semantic_dimensions,
-                    group_padding,
-                    axis,
-                    u64::from(quantization.group_size),
-                )?;
+                let group_size = quantization
+                    .grouping
+                    .resolved_size(semantic_dimensions[axis]);
+                let grouped_dimensions =
+                    self.grouped_dimensions(semantic_dimensions, group_padding, axis, group_size)?;
                 let packed_bytes = checked_elements(&grouped_dimensions)
                     .and_then(|elements| {
                         elements.checked_mul(u64::from(quantization.bits_per_weight))
@@ -1568,7 +1605,7 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                 }
 
                 let mut group_shape = grouped_dimensions;
-                group_shape[axis] /= u64::from(quantization.group_size);
+                group_shape[axis] /= group_size;
                 let scales_component =
                     self.bind_component(scales, &group_shape, WeightComponentRole::Scales, depth)?;
                 if scales_component.dense_element_type() != Some(quantization.scale_type) {

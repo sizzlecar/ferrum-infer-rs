@@ -15,8 +15,8 @@ use ferrum_interfaces::vnext::{
     ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightComponentBinding,
     PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode,
     ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
-    QuantizationPacking, QuantizationSpec, ResolvedTensorLayout, SemanticValue,
-    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedTensorLayout,
+    SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
     WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
@@ -1610,12 +1610,14 @@ fn gptq_marlin_quantization_spec(
     Ok(QuantizationSpec {
         format_id: QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID)?,
         bits_per_weight: 4,
-        group_size: u32::try_from(quantization.group_size).map_err(|_| {
-            invalid_config(
-                "hf_config.quantization_config.group_size",
-                "GPTQ group size exceeds u32",
-            )
-        })?,
+        grouping: QuantizationGrouping::fixed(u32::try_from(quantization.group_size).map_err(
+            |_| {
+                invalid_config(
+                    "hf_config.quantization_config.group_size",
+                    "GPTQ group size exceeds u32",
+                )
+            },
+        )?),
         packing: QuantizationPacking::Tiled,
         scale_type: ElementType::F16,
         zero_point_type: None,
