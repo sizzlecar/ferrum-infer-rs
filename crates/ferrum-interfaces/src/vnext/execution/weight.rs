@@ -155,6 +155,24 @@ pub trait WeightMaterializer: Send + Sync {
         source_components: &[&WeightComponentSpec],
         execution_component: &WeightComponentSpec,
     ) -> Result<WeightComponentPayload<'source>, VNextError>;
+
+    /// Materialize execution components that share one exact ordered source set.
+    ///
+    /// The default preserves existing one-component implementations. Expensive
+    /// transforms may override this method to decode, quantize, or repack their
+    /// common source once and return one payload per requested component in the
+    /// same order.
+    fn materialize_components<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_components: &[&WeightComponentSpec],
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        execution_components
+            .iter()
+            .map(|component| self.materialize_component(source, source_components, component))
+            .collect()
+    }
 }
 
 struct IdentityWeightMaterializer {
@@ -383,41 +401,59 @@ impl TrustedExecutionWeightPlan {
             .validate_against_materializer(family, &self.descriptor)
     }
 
-    pub(crate) fn materialize_component<'source>(
+    pub(crate) fn materialize_components<'source>(
         &self,
         family: &PreparedModelFamily,
         source: &'source dyn WeightComponentSource,
-        execution_component: &WeightComponentSpec,
-    ) -> Result<WeightComponentPayload<'source>, VNextError> {
+        execution_components: &[&WeightComponentSpec],
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
         self.validate_runtime_authority()?;
-        let planned_component_index = self
-            .plan
-            .schema
-            .components
-            .binary_search_by(|component| component.id.cmp(&execution_component.id))
-            .map_err(|_| {
-                invalid_plan(format!(
-                    "execution component `{}` is absent from the trusted weight plan",
+        let Some(first_execution_component) = execution_components.first() else {
+            return Err(invalid_plan(
+                "weight materializer received an empty execution component group",
+            ));
+        };
+        let mut planned_components = Vec::with_capacity(execution_components.len());
+        for execution_component in execution_components {
+            let planned_component_index = self
+                .plan
+                .schema
+                .components
+                .binary_search_by(|component| component.id.cmp(&execution_component.id))
+                .map_err(|_| {
+                    invalid_plan(format!(
+                        "execution component `{}` is absent from the trusted weight plan",
+                        execution_component.id
+                    ))
+                })?;
+            let planned_component = &self.plan.schema.components[planned_component_index];
+            if planned_component != *execution_component {
+                return Err(invalid_plan(format!(
+                    "execution component `{}` differs from the trusted weight plan",
                     execution_component.id
-                ))
-            })?;
-        let planned_component = &self.plan.schema.components[planned_component_index];
-        if planned_component != execution_component {
-            return Err(invalid_plan(format!(
-                "execution component `{}` differs from the trusted weight plan",
-                execution_component.id
-            )));
+                )));
+            }
+            planned_components.push(planned_component);
         }
         let source_ids = self
             .plan
             .component_sources
-            .get(&execution_component.id)
+            .get(&first_execution_component.id)
             .ok_or_else(|| {
                 invalid_plan(format!(
                     "execution component `{}` has no source mapping",
-                    execution_component.id
+                    first_execution_component.id
                 ))
             })?;
+        if execution_components
+            .iter()
+            .skip(1)
+            .any(|component| self.plan.component_sources.get(&component.id) != Some(source_ids))
+        {
+            return Err(invalid_plan(
+                "grouped execution components do not share one ordered source mapping",
+            ));
+        }
         let source_components = source_ids
             .iter()
             .map(|source_id| {
@@ -428,30 +464,40 @@ impl TrustedExecutionWeightPlan {
                     .map_err(|_| {
                         invalid_plan(format!(
                             "execution component `{}` references unknown source component `{source_id}`",
-                            execution_component.id
+                            first_execution_component.id
                         ))
                     })?;
                 Ok(&family.weight_schema().components[source_component_index])
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let payload = self.materializer.materialize_component(
+        let payloads = self.materializer.materialize_components(
             source,
             &source_components,
-            execution_component,
+            &planned_components,
         )?;
-        if payload.component_id() != &execution_component.id
-            || payload.external_names() != execution_component.external_names.as_slice()
-            || payload.dimensions() != execution_component.dimensions.as_slice()
-            || payload.element_type() != execution_component.physical_element_type()
-            || u64::try_from(payload.bytes().len()).ok()
-                != Some(execution_component.physical_bytes()?)
-        {
+        if payloads.len() != planned_components.len() {
             return Err(invalid_plan(format!(
-                "weight materializer `{}` returned invalid payload for execution component `{}`",
-                self.descriptor.id, execution_component.id
+                "weight materializer `{}` returned {} payloads for {} execution components",
+                self.descriptor.id,
+                payloads.len(),
+                planned_components.len()
             )));
         }
-        Ok(payload)
+        for (payload, execution_component) in payloads.iter().zip(&planned_components) {
+            if payload.component_id() != &execution_component.id
+                || payload.external_names() != execution_component.external_names.as_slice()
+                || payload.dimensions() != execution_component.dimensions.as_slice()
+                || payload.element_type() != execution_component.physical_element_type()
+                || u64::try_from(payload.bytes().len()).ok()
+                    != Some(execution_component.physical_bytes()?)
+            {
+                return Err(invalid_plan(format!(
+                    "weight materializer `{}` returned invalid or reordered payload for execution component `{}`",
+                    self.descriptor.id, execution_component.id
+                )));
+            }
+        }
+        Ok(payloads)
     }
 
     fn validate_runtime_authority(&self) -> Result<(), VNextError> {

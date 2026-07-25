@@ -88,9 +88,15 @@ impl WeightMaterializer for DerivedComponentMaterializer {
         let mut schema = family.weight_schema().clone();
         schema.layout_id = id("weight-layout.device-operation-derived");
         schema.components[0].id = id("weight.execution.left");
-        schema.components[0].external_names = vec!["derived.left.bin".to_owned()];
+        schema.components[0].external_names = vec![
+            "derived.left.primary.bin".to_owned(),
+            "derived.left.secondary.bin".to_owned(),
+        ];
         schema.components[1].id = id("weight.execution.right");
-        schema.components[1].external_names = vec!["derived.right.bin".to_owned()];
+        schema.components[1].external_names = vec![
+            "derived.right.primary.bin".to_owned(),
+            "derived.right.secondary.bin".to_owned(),
+        ];
         let PhysicalWeightLayout::Composite { parts } = &mut schema.tensors[0].physical_layout
         else {
             panic!("fixture weight must remain composite");
@@ -114,11 +120,11 @@ impl WeightMaterializer for DerivedComponentMaterializer {
         Ok(BTreeMap::from([
             (
                 id("weight.execution.left"),
-                vec![id("weight.component.left")],
+                vec![id("weight.component.left"), id("weight.component.right")],
             ),
             (
                 id("weight.execution.right"),
-                vec![id("weight.component.right")],
+                vec![id("weight.component.left"), id("weight.component.right")],
             ),
         ]))
     }
@@ -129,12 +135,15 @@ impl WeightMaterializer for DerivedComponentMaterializer {
         source_components: &[&WeightComponentSpec],
         execution_component: &WeightComponentSpec,
     ) -> Result<WeightComponentPayload<'source>, VNextError> {
-        let [source_component] = source_components else {
+        if source_components.is_empty() {
             return Err(VNextError::InvalidExecutionPlan {
-                reason: "derived test materializer requires one source component".to_owned(),
+                reason: "derived test materializer requires source components".to_owned(),
             });
-        };
-        let source_payload = source.component(source_component)?;
+        }
+        let source_payloads = source_components
+            .iter()
+            .map(|source_component| source.component(source_component))
+            .collect::<Result<Vec<_>, _>>()?;
         let fill = match execution_component.id.as_str() {
             "weight.execution.left" => 0xa1,
             "weight.execution.right" => 0xb2,
@@ -152,11 +161,63 @@ impl WeightMaterializer for DerivedComponentMaterializer {
         WeightComponentPayload::from_ordered_sources(
             execution_component,
             execution_component.external_names.clone(),
-            source_payload.source_files().to_vec(),
+            source_payloads
+                .iter()
+                .flat_map(|payload| payload.source_files().iter().cloned())
+                .collect(),
             execution_component.dimensions.clone(),
             execution_component.physical_element_type(),
             vec![fill; byte_len],
         )
+    }
+
+    fn materialize_components<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_components: &[&WeightComponentSpec],
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        if source_components.is_empty() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "derived test materializer requires shared source components".to_owned(),
+            });
+        }
+        let source_payloads = source_components
+            .iter()
+            .map(|source_component| source.component(source_component))
+            .collect::<Result<Vec<_>, _>>()?;
+        let source_files = source_payloads
+            .iter()
+            .flat_map(|payload| payload.source_files().iter().cloned())
+            .collect::<Vec<_>>();
+        execution_components
+            .iter()
+            .map(|execution_component| {
+                let fill = match execution_component.id.as_str() {
+                    "weight.execution.left" => 0xa1,
+                    "weight.execution.right" => 0xb2,
+                    other => {
+                        return Err(VNextError::InvalidExecutionPlan {
+                            reason: format!("unexpected derived execution component `{other}`"),
+                        })
+                    }
+                };
+                let byte_len =
+                    usize::try_from(execution_component.physical_bytes()?).map_err(|_| {
+                        VNextError::InvalidExecutionPlan {
+                            reason: "derived test component exceeds host address space".to_owned(),
+                        }
+                    })?;
+                WeightComponentPayload::from_ordered_sources(
+                    execution_component,
+                    execution_component.external_names.clone(),
+                    source_files.clone(),
+                    execution_component.dimensions.clone(),
+                    execution_component.physical_element_type(),
+                    vec![fill; byte_len],
+                )
+            })
+            .collect()
     }
 }
 
@@ -367,11 +428,11 @@ fn static_initialization_materializes_derived_components_through_trusted_plan_au
         &BTreeMap::from([
             (
                 id("weight.execution.left"),
-                vec![id("weight.component.left")],
+                vec![id("weight.component.left"), id("weight.component.right")],
             ),
             (
                 id("weight.execution.right"),
-                vec![id("weight.component.right")],
+                vec![id("weight.component.left"), id("weight.component.right")],
             ),
         ])
     );
