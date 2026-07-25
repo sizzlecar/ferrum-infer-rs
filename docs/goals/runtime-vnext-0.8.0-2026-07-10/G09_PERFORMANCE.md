@@ -1244,6 +1244,78 @@ memory for state residency. Before correctness it must pass the same cubin
 gate with `0` spill/local bytes, shared bytes `<=16,448`, and theoretical
 active blocks/SM `>=6`.
 
+#### Shared-memory state residency product rejection
+
+Commit `add5241e` implemented that bounded follow-up. Two 128-thread groups
+owned disjoint even/odd value rows, compacted the reduction scratch to
+`16 x 128`, and reused the reclaimed shared memory for the complete
+`16 x 128` F32 recurrent-state tile. The indirect product path loaded state
+once before the token loop and wrote it once after the loop; the F16 path kept
+its previous per-token quantization semantics.
+
+The source audit found no mapping, race, barrier, reduction-tree, or indirect
+`state,state` alias blocker. The SM89 cubin gate then improved the target
+indirect kernel from `42` to `40` registers/thread while retaining `0` stack
+bytes, `0` local bytes, `16,448` shared bytes/block, and six theoretical
+active blocks/SM:
+
+```text
+CUDA GDN SHARED STATE CUBIN PASS: /workspace/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z
+```
+
+The exact CUDA numerical parity test passed `1/1`. The release build completed
+in `5m11s`; binary SHA256 was
+`9feca6789f5c29ecb9e8bc069cc84842126fc9ccf256997a5f3230de67a1324c`.
+Actual Qwen3.5-35B-A3B-GPTQ correctness then passed resident three-turn
+`ferrum run`, non-streaming `ferrum serve`, and streaming `ferrum serve` with
+exactly one `[DONE]`, usage, and no invalid-output marker:
+
+```text
+CUDA GDN SHARED STATE CORRECTNESS PASS: /workspace/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z/correctness
+```
+
+The one authorized Basic c1 random `64/32`, `25 + 5` warmup, seed `9271`
+diagnostic nevertheless missed its predeclared decode stop condition:
+
+| metric | `58ea9761` accepted baseline | `add5241e` candidate | delta / gate |
+|---|---:|---:|---:|
+| throughput | `73.3855 tok/s` | `73.6792 tok/s` | `+0.40%` |
+| prefill device total | `1.1342 s` | `0.7815 s` | `-31.10%` |
+| decode device total | `6.7565 s` | `6.6315 s` | `-1.85%`; required `<=6.5538 s` |
+| prefill/decode/submitted waves | `30 / 930 / 960` | `30 / 930 / 960` | unchanged |
+| failed waves | `0` | `0` | PASS |
+| request errors | `0` | `0` | PASS |
+| direct fallback/catalog/epoch miss | `0 / 0 / 0` | `0 / 0 / 0` | PASS |
+
+The candidate missed the decode threshold by `77,767,168 ns` and remained
+`2.4791 tok/s` (`3.26%`) below the formal `76.1583 tok/s` floor. Its failure
+class is `shared-state-gdn-decode-gain-below-three-percent`; correctness and a
+large prefill improvement do not override the decode-dominant KEEP contract:
+
+```text
+CUDA GDN SHARED STATE BOUNDED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z
+```
+
+The SHA256-verified local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z/`.
+Its archive SHA256 is
+`3b862a8db2fa823d4bef1fffa60a856d3a09ee2ad8a814fd477ad88b5b50b1ba`;
+GitHub artifact branch
+`artifact/runtime-vnext-gdn-shared-state-add5241e-20260725` is at
+`e2badb69f77c9053f90b7f5fc2777c2786d67ad3`. The retained-instance start
+through confirmed stop window was about `21m13s`, approximately `$0.166`.
+Vast `45319871` is verified `stopped/exited`.
+
+Commit `954288bc` reverted the shared-state source candidate. This closes the
+state-residency-only lineage: no new paid run may merely move the same state
+between global memory, registers, or shared memory. Before another CUDA
+candidate, the saved replay/profile evidence must attribute enough
+decode-wave time to a specific GDN or non-GDN component to clear at least the
+remaining `3%` device-time requirement. The source proposal must name the
+kernel launches, reductions, barriers, or provider work it removes and
+predict the corresponding saved counter or timing change. Missing that
+offline headroom proof keeps the paid lane closed.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
