@@ -1179,9 +1179,26 @@ real Metal v6 operation maxima were `0.000244140625` for log-rate/grouped and
 `0.00006103515625` for negative-rate/interleaved; convolution state was exact
 and delta-state max error was at most `1.3504177331924438e-8`.
 
-This local evidence only closes the source/numerical precondition for the next
-paid run. CUDA C17, product `run`/`serve`, dispatch topology, and c1 performance
-have not yet been measured on `883ee9e0`; the G08B status remains Open.
+Clean current HEAD `557cdcf5f3c90fd5ab097d83bf265cf60ee8ad1f` then completed the
+bounded 1x RTX 4090 lane with binary SHA256
+`a09caa066dda43883562d8a81491d40949b83182eff2c850dafed7d800e22784`.
+The focused runner selected 9 cases across C03, C05, C06, and C17, covering
+`ferrum run`, non-streaming `serve`, streaming usage/`[DONE]`, multi-turn, and
+the exact Unicode regression. All 9 passed:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/gate/correctness/m2-qwen35-35b-a3b/cuda/focused-qkvzba-report.json
+```
+
+This is focused current-HEAD correctness evidence, not the 703-case G08B CUDA
+matrix. Tools, structured output, the required concurrency cells, full CUDA,
+and Metal remain open, so G08B remains Open. The complete evidence package is
+on GitHub branch
+`artifact/runtime-vnext-exact-qkvzba-557cdcf5-20260725` at commit
+`b161d69e592ec8593ca35384e586b83dbabfef16`; archive SHA256 is
+`ecd3fc9c503a436a2159f08012691b5acb7720bf0f04b8efc420795e9007965a`.
+Vast instance `45319871` reached `stopped/exited`, with no paid or transitional
+sibling instance.
 
 ## Metal Matrix Workflow
 

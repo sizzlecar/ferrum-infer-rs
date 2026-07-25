@@ -1597,6 +1597,44 @@ participant-packed projection remains a separate follow-up (`3P -> 3`
 launches/layer); it predicts no c1 gain and cannot be used to accept this
 candidate.
 
+The bounded run then completed on clean current HEAD
+`557cdcf5f3c90fd5ab097d83bf265cf60ee8ad1f`, binary SHA256
+`a09caa066dda43883562d8a81491d40949b83182eff2c850dafed7d800e22784`,
+and one RTX 4090:
+
+- all 9 selected C03/C05/C06/C17 correctness cases passed before profiling;
+- typed GDN trace reported exactly `300` compute dispatches per correlation;
+- persistent CUDA graph nodes and GEMV shapes identified 30 QKVZBA plus 30
+  GDN output projections across 75 decode correlations, exactly `4,500` GEMVs;
+- the raw `9,000` cuBLAS kernel-name aggregate also included non-GDN projection
+  shapes and is not a valid GDN-only topology metric;
+- replay mean fell from `6.888088` to `6.483529 ms`; replay plus same-step eager
+  device duration was `7.697259 ms`, below the predeclared `7.857945 ms` target;
+- bounded random `64/32` c1, 25 requests plus 5 warmups, seed `9271`, completed
+  `25/25`, zero errors/quality issues, usage token counts, at
+  `73.380002 tok/s`.
+
+The c1 result is effectively equal to the exact `73.385528 tok/s` reference
+(`-0.0075%`) but misses the `76.1583 tok/s` floor by `2.778298 tok/s`
+(`3.6481%`). It has one repeat and no confidence interval. The exact source
+structure is retained because it removes dispatches and improves device time
+without changing precision, but this is a formal G09 performance REJECT and no
+full sweep was run:
+
+```text
+CUDA EXACT QKVZBA TOPOLOGY PASS: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/topology-summary.json
+CUDA EXACT QKVZBA STRUCTURAL CHECKPOINT KEEP: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/diagnostic-summary.json
+CUDA EXACT QKVZBA G09 PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/diagnostic-summary.json
+```
+
+The next lever must optimize exact dtype/shape execution or graph coverage.
+Implicit requantization is prohibited. The complete package is on GitHub branch
+`artifact/runtime-vnext-exact-qkvzba-557cdcf5-20260725` at
+`b161d69e592ec8593ca35384e586b83dbabfef16`; archive SHA256 is
+`ecd3fc9c503a436a2159f08012691b5acb7720bf0f04b8efc420795e9007965a`.
+The paid instance was verified `stopped/exited`, with zero paid or transitional
+sibling instance.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

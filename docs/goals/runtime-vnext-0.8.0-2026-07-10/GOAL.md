@@ -12,8 +12,14 @@ exact-precision performance`。`0b72bab2` 的隐式 F16 -> FP8 candidate 虽曾�
 的 C17 deterministic Unicode case 中丢失首 token，已判定 correctness REJECT。`5149bbfb`
 禁止默认近似重量化并恢复 exact-F16 C17 输出；`883ee9e0` 进一步把 exact QKVZ+BA
 冷打包为单个 QKVZBA projection，并在 CUDA/Metal 共用 schema v6。源码、replay contract
-和真实 Metal 数值用例已通过，CUDA current-HEAD correctness/profile/c1 尚待实机验证。
-这些仍只是 focused development evidence，不是 G03、G08B 或 G09 canonical PASS。
+和真实 Metal 数值用例已通过。clean `557cdcf5` 的 1x RTX 4090 focused CUDA lane 随后通过
+9 个 C03/C05/C06/C17 用例、`4,500` 个 GDN projection GEMV、每 correlation `300`
+dispatch 和 `7.6973 ms` device-duration target；bounded c1 为 `73.3800 tok/s`，与
+`73.3855 tok/s` exact reference 持平，但仍比 `76.1583 tok/s` floor 低 `3.65%`。
+因此只保留 exact structural checkpoint，G09 performance REJECT；这些仍不是 G03、
+G08B 或 G09 canonical PASS。完整证据在 GitHub branch
+`artifact/runtime-vnext-exact-qkvzba-557cdcf5-20260725` commit `b161d69e`，
+付费实例已确认 `stopped/exited`。
 
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
