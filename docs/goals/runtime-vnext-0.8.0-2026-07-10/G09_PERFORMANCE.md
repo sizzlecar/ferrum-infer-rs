@@ -98,6 +98,19 @@ slot 保存 scheduler active timeline、eligible interval 和 duty-cycle；瞬�
   serve-c1 decode median `>=0.95`；G00 legacy PASS lane 的 run 另以匹配的完整
   `engine.infer` E2E 边界满足 legacy no-regression。
 
+### 2026-07-25 M2 CUDA c1 窄范围容差修订
+
+Owner 接受 exact-precision M2 CUDA c1 与固定 legacy floor 之间不超过 `5%` 的差距，
+避免为低收益单并发尾差继续消耗 paid GPU 和开发时间。该修订只覆盖 M2 CUDA c1 的 legacy
+throughput non-regression：正式 G09 fresh ABBA 仍须满足 candidate median
+`>=0.95x legacy` 且 ratio 95% CI LCB `>=0.95`。其他模型、c=4/16/32、延迟、显存、
+correctness、same-host vLLM 逐 cell `>=0.90` 和主矩阵几何平均 `>=0.95` 的门槛全部不变。
+
+`557cdcf5` 的 bounded c1 为 `73.380002 / 76.1583 = 0.963519`，因此记为
+`ACCEPTED_DEVELOPMENT_CHECKPOINT`，禁止继续 c1-only paid optimization，除非后续 fresh
+correctness 失败或同一产品路径跌破 `0.95x`。该 artifact 只有一次 repeat 且没有 CI，不能
+追认、改写或伪造为 canonical G09 PASS；正式矩阵仍须由 gate 重采并打印规定 PASS line。
+
 ### M2 Qwen3.5-35B 历史审计向量
 
 历史 vLLM ShareGPT artifact 的均值和当时计算的 80% LCB 为：
