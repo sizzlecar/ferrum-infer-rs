@@ -90,7 +90,7 @@ pub fn cuda_vnext_runtime_config(
     #[cfg(feature = "vllm-marlin")]
     let fingerprint_parts = {
         let mut fingerprint_parts = fingerprint_parts;
-        fingerprint_parts.push(include_str!("../../../marlin_fp8_materializer.rs").as_bytes());
+        fingerprint_parts.push(include_str!("../../marlin_fp8_materializer.rs").as_bytes());
         fingerprint_parts
     };
     Ok(CudaDeviceRuntimeConfig {

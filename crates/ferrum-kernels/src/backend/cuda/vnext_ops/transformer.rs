@@ -1096,9 +1096,7 @@ impl MarlinFp8ProjectionRuntime {
                 stream.cu_stream(),
             )
         }
-        .map_err(|error| {
-            CudaDeviceRuntimeError::driver(format!("{operation} workspace zero"), error)
-        })?;
+        .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))?;
         unsafe {
             launch_marlin_mm_f16_weight(
                 MarlinF16WeightType::E4M3Fn,
