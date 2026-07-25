@@ -113,6 +113,21 @@ fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
 }
 
 #[test]
+fn recurrent_f32_tiled_state_reuses_compacted_reduction_shared_memory() {
+    assert!(GATED_DELTA_KERNEL_SOURCE
+        .contains("recurrent_gated_delta_rule_varlen_tiled16_shared_state_f32_impl"));
+    assert!(
+        GATED_DELTA_KERNEL_SOURCE.contains("__shared__ float partial[BV_TILE][REDUCTION_THREADS]")
+    );
+    assert!(GATED_DELTA_KERNEL_SOURCE
+        .contains("__shared__ float resident_state[BV_TILE][REDUCTION_THREADS]"));
+    assert!(GATED_DELTA_KERNEL_SOURCE.contains("resident_state[local_v][key_lane] = state"));
+    assert!(GATED_DELTA_KERNEL_SOURCE.contains("resident_state[local_v][key_lane]"));
+    assert!(GATED_DELTA_KERNEL_SOURCE
+        .contains("recurrent_gated_delta_rule_varlen_tiled_f32_impl<__half, 16>"));
+}
+
+#[test]
 fn recurrent_attention_uses_two_packed_input_projections() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("contiguous_bindings(11)"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("shared.qkvz"));
