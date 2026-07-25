@@ -1491,6 +1491,7 @@ dependencies = [
  "ferrum-interfaces",
  "ferrum-native-ops",
  "ferrum-types",
+ "float8 0.7.0",
  "half",
  "libc",
  "metal 0.31.0",

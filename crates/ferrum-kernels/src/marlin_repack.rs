@@ -7,6 +7,205 @@
 //! `gptq_marlin_repack` 16-by-64 tile ABI.
 
 use rayon::prelude::*;
+use std::error::Error;
+use std::fmt;
+
+const FP8_E4M3_MAX: f32 = 448.0;
+const FP8_F16_EXPONENT_BIAS_SCALE: f32 = 256.0;
+
+/// Host-prepared Marlin W8A16 storage for one logical `[N, K]` F16 matrix.
+///
+/// `packed_values` is the 16-by-64 Marlin tile ABI, stored as little-endian
+/// words but exposed as bytes. `scales` is one permuted FP16 scale per output
+/// channel with the E4M3-to-F16 exponent-bias correction already folded in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fp8MarlinWeight {
+    packed_values: Vec<u8>,
+    scales: Vec<half::f16>,
+}
+
+impl Fp8MarlinWeight {
+    pub fn packed_values(&self) -> &[u8] {
+        &self.packed_values
+    }
+
+    pub fn scales(&self) -> &[half::f16] {
+        &self.scales
+    }
+
+    pub fn into_parts(self) -> (Vec<u8>, Vec<half::f16>) {
+        (self.packed_values, self.scales)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fp8MarlinPrepareError {
+    UnsupportedShape { n: usize, k: usize },
+    SourceLength { actual: usize, expected: usize },
+    NonFiniteWeight { output: usize, input: usize },
+}
+
+impl fmt::Display for Fp8MarlinPrepareError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedShape { n, k } => write!(
+                formatter,
+                "Marlin W8A16 shape [N={n}, K={k}] does not fit a supported thread-tile family"
+            ),
+            Self::SourceLength { actual, expected } => write!(
+                formatter,
+                "F16 source has {actual} bytes, expected {expected}"
+            ),
+            Self::NonFiniteWeight { output, input } => write!(
+                formatter,
+                "F16 source contains a non-finite value at [N={output}, K={input}]"
+            ),
+        }
+    }
+}
+
+impl Error for Fp8MarlinPrepareError {}
+
+/// Whether `[N, K]` can be dispatched by an unpadded Marlin W8A16 kernel.
+pub const fn fp8_marlin_shape_supported(n: usize, k: usize) -> bool {
+    n != 0
+        && k != 0
+        && ((n.is_multiple_of(64) && k.is_multiple_of(128))
+            || (n.is_multiple_of(128) && k.is_multiple_of(64)))
+}
+
+/// Quantize a row-major logical `[N, K]` F16 matrix into the vLLM/Marlin
+/// FP16-x-E4M3 W8A16 ABI.
+///
+/// Quantization is symmetric and channel-wise along `N`. The input is explicit
+/// little-endian bytes so mmap-backed checkpoint payloads need no aligned
+/// intermediate `Vec<f16>`. Preparation is cold-path CPU work and does not
+/// allocate device memory.
+pub fn prepare_f16_weight_for_fp8_marlin(
+    source_f16_le: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Fp8MarlinWeight, Fp8MarlinPrepareError> {
+    if !fp8_marlin_shape_supported(n, k) {
+        return Err(Fp8MarlinPrepareError::UnsupportedShape { n, k });
+    }
+    let expected = n
+        .checked_mul(k)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<half::f16>()))
+        .ok_or(Fp8MarlinPrepareError::SourceLength {
+            actual: source_f16_le.len(),
+            expected: usize::MAX,
+        })?;
+    if source_f16_le.len() != expected {
+        return Err(Fp8MarlinPrepareError::SourceLength {
+            actual: source_f16_le.len(),
+            expected,
+        });
+    }
+
+    let raw_scales = (0..n)
+        .into_par_iter()
+        .map(|output| {
+            let mut maximum = 0.0_f32;
+            for input in 0..k {
+                let value = read_f16_le(source_f16_le, output * k + input);
+                if !value.is_finite() {
+                    return Err(Fp8MarlinPrepareError::NonFiniteWeight { output, input });
+                }
+                maximum = maximum.max(value.abs());
+            }
+            Ok(maximum / FP8_E4M3_MAX)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let n_tiles = n / 64;
+    let mut packed_values = vec![0_u8; n * k];
+    packed_values
+        .par_chunks_mut(16 * 64)
+        .enumerate()
+        .for_each(|(tile_index, tile)| {
+            let k_tile = tile_index / n_tiles;
+            let n_tile = tile_index % n_tiles;
+            for thread in 0..32 {
+                let tensor_core_column = thread / 4;
+                let tensor_core_row = (thread % 4) * 2;
+                for warp in 0..4 {
+                    let column = n_tile * 64 + warp * 16 + tensor_core_column;
+                    let first = fp8_marlin_word(
+                        source_f16_le,
+                        &raw_scales,
+                        k,
+                        k_tile,
+                        tensor_core_row,
+                        column,
+                    );
+                    let second = fp8_marlin_word(
+                        source_f16_le,
+                        &raw_scales,
+                        k,
+                        k_tile,
+                        tensor_core_row,
+                        column + 8,
+                    );
+                    let output_word = thread * 8 + warp * 2;
+                    tile[output_word * 4..output_word * 4 + 4]
+                        .copy_from_slice(&first.to_le_bytes());
+                    tile[(output_word + 1) * 4..(output_word + 1) * 4 + 4]
+                        .copy_from_slice(&second.to_le_bytes());
+                }
+            }
+        });
+
+    let scales = raw_scales
+        .into_iter()
+        .map(|scale| half::f16::from_f32(scale * FP8_F16_EXPONENT_BIAS_SCALE))
+        .collect::<Vec<_>>();
+    let scales = repack_scales_to_marlin(&scales, k, n, k);
+    Ok(Fp8MarlinWeight {
+        packed_values,
+        scales,
+    })
+}
+
+#[inline]
+fn read_f16_le(bytes: &[u8], element: usize) -> f32 {
+    let offset = element * 2;
+    half::f16::from_le_bytes([bytes[offset], bytes[offset + 1]]).to_f32()
+}
+
+#[inline]
+fn quantized_fp8_bits(value: f32, scale: f32) -> u8 {
+    if scale == 0.0 {
+        0
+    } else {
+        float8::F8E4M3::from_f32(value / scale).to_bits()
+    }
+}
+
+#[inline]
+fn fp8_marlin_word(
+    source_f16_le: &[u8],
+    scales: &[f32],
+    k: usize,
+    k_tile: usize,
+    tensor_core_row: usize,
+    column: usize,
+) -> u32 {
+    let rows = [
+        tensor_core_row,
+        tensor_core_row + 8,
+        tensor_core_row + 1,
+        tensor_core_row + 9,
+    ];
+    rows.into_iter()
+        .enumerate()
+        .fold(0_u32, |word, (byte, row)| {
+            let output = column;
+            let input = k_tile * 16 + row;
+            let value = read_f16_le(source_f16_le, output * k + input);
+            word | (u32::from(quantized_fp8_bits(value, scales[output])) << (byte * 8))
+        })
+}
 
 /// Permute GPTQ INT4 rows before Marlin repacking for activation-order models.
 pub fn permute_gptq_qweight_rows(
@@ -294,6 +493,58 @@ fn marlin_weight_permutation() -> Vec<usize> {
 mod tests {
     use super::*;
 
+    fn f16_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
+        values
+            .into_iter()
+            .flat_map(|value| half::f16::from_f32(value).to_le_bytes())
+            .collect()
+    }
+
+    fn vllm_fp8_repack_reference(
+        source_f16_le: &[u8],
+        n: usize,
+        k: usize,
+        scales: &[f32],
+    ) -> Vec<u8> {
+        assert_eq!(k % 16, 0);
+        assert_eq!(n % 64, 0);
+        let mut gptq = vec![0_u8; k * n];
+        for input in 0..k {
+            for output in 0..n {
+                let value = read_f16_le(source_f16_le, output * k + input);
+                gptq[input * n + output] = quantized_fp8_bits(value, scales[output]);
+            }
+        }
+
+        let mut output = vec![0_u8; k * n];
+        for k_tile in 0..k / 16 {
+            for n_tile in 0..n / 64 {
+                let output_base = (k_tile * (n / 64) + n_tile) * 16 * 64;
+                for thread in 0..32 {
+                    let tensor_core_column = thread / 4;
+                    let tensor_core_row = (thread % 4) * 2;
+                    for warp in 0..4 {
+                        for half in 0..2 {
+                            let column = n_tile * 64 + warp * 16 + tensor_core_column + half * 8;
+                            let rows = [
+                                tensor_core_row,
+                                tensor_core_row + 8,
+                                tensor_core_row + 1,
+                                tensor_core_row + 9,
+                            ];
+                            let output_word = thread * 8 + warp * 2 + half;
+                            for (byte, row) in rows.into_iter().enumerate() {
+                                output[output_base + output_word * 4 + byte] =
+                                    gptq[(k_tile * 16 + row) * n + column];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        output
+    }
+
     fn vllm_int4_repack_reference(qweight: &[i32], k: usize, n: usize) -> Vec<i32> {
         assert_eq!(k % 16, 0);
         assert_eq!(n % 64, 0);
@@ -373,6 +624,85 @@ mod tests {
                 .into_iter()
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fp8_marlin_prepare_matches_vllm_w8a16_tile_abi() {
+        let n = 64_usize;
+        let k = 128_usize;
+        let source = f16_bytes((0..n).flat_map(|output| {
+            let scale = ((output % 8) + 1) as f32 / 8.0;
+            (0..k).map(move |input| {
+                if input == k - 1 {
+                    FP8_E4M3_MAX * scale
+                } else {
+                    let magnitude = ((output * 11 + input * 7) % 31 + 1) as f32;
+                    if (output + input).is_multiple_of(2) {
+                        magnitude * scale
+                    } else {
+                        -magnitude * scale
+                    }
+                }
+            })
+        }));
+        let raw_scales = (0..n)
+            .map(|output| ((output % 8) + 1) as f32 / 8.0)
+            .collect::<Vec<_>>();
+
+        let prepared = prepare_f16_weight_for_fp8_marlin(&source, n, k).unwrap();
+        assert_eq!(
+            prepared.packed_values(),
+            vllm_fp8_repack_reference(&source, n, k, &raw_scales)
+        );
+
+        let expected_scales = raw_scales
+            .iter()
+            .map(|scale| half::f16::from_f32(scale * FP8_F16_EXPONENT_BIAS_SCALE))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepared.scales(),
+            repack_scales_to_marlin(&expected_scales, k, n, k)
+        );
+    }
+
+    #[test]
+    fn fp8_marlin_prepare_keeps_zero_channels_finite() {
+        let n = 64;
+        let k = 128;
+        let prepared = prepare_f16_weight_for_fp8_marlin(&vec![0_u8; n * k * 2], n, k).unwrap();
+
+        assert!(prepared.packed_values().iter().all(|byte| *byte == 0));
+        assert!(prepared
+            .scales()
+            .iter()
+            .all(|scale| *scale == half::f16::ZERO));
+    }
+
+    #[test]
+    fn fp8_marlin_prepare_rejects_invalid_source_contracts() {
+        assert_eq!(
+            prepare_f16_weight_for_fp8_marlin(&[], 63, 128),
+            Err(Fp8MarlinPrepareError::UnsupportedShape { n: 63, k: 128 })
+        );
+        assert_eq!(
+            prepare_f16_weight_for_fp8_marlin(&[], 64, 128),
+            Err(Fp8MarlinPrepareError::SourceLength {
+                actual: 0,
+                expected: 64 * 128 * 2,
+            })
+        );
+
+        let n = 64;
+        let k = 128;
+        let mut source = vec![0_u8; n * k * 2];
+        source[..2].copy_from_slice(&half::f16::NAN.to_le_bytes());
+        assert_eq!(
+            prepare_f16_weight_for_fp8_marlin(&source, n, k),
+            Err(Fp8MarlinPrepareError::NonFiniteWeight {
+                output: 0,
+                input: 0,
+            })
         );
     }
 }
