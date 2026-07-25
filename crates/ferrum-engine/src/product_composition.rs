@@ -13,7 +13,8 @@ use ferrum_interfaces::vnext::{
     ResolutionSourceEvidence, ResolutionSourceProvenance, ResolvedModelPlan,
     ResolvedModelPlanInputs, ResolvedPlanValidationContext, ResolvedRuntimePolicy, SamplingPolicy,
     SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy, StructuredOutputPolicy,
-    TokenizerDescriptor, TokenizerId, TriStatePolicy, JSON_RESOLUTION_SOURCE_PARSER,
+    TokenizerDescriptor, TokenizerId, TriStatePolicy, WeightMaterializerId,
+    WeightMaterializerRegistry, JSON_RESOLUTION_SOURCE_PARSER,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
 use ferrum_models::VNextModelExecutor;
@@ -31,6 +32,8 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
     model_info: ModelInfo,
     runtime: Arc<R>,
     operation_registry: OperationRuntimeRegistry<R>,
+    weight_materializers: WeightMaterializerRegistry,
+    weight_materializer_id: WeightMaterializerId,
     catalog: CapabilityCatalog,
 ) -> Result<VNextModelExecutor<R>> {
     VNextModelExecutor::from_runtime_composition(
@@ -39,6 +42,8 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         engine,
         runtime,
         operation_registry,
+        weight_materializers,
+        weight_materializer_id,
         catalog,
         |prepared, runtime, catalog, compilation| {
             resolve_model_plan(engine, prepared, catalog, runtime, compilation)

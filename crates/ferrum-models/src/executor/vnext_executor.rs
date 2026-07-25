@@ -2735,6 +2735,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         engine_config: &EngineConfig,
         runtime: Arc<R>,
         registry: OperationRuntimeRegistry<R>,
+        weight_materializers: WeightMaterializerRegistry,
+        weight_materializer_id: WeightMaterializerId,
         catalog: CapabilityCatalog,
         resolve_plan: F,
     ) -> Result<Self>
@@ -2786,12 +2788,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut compile_options);
         }
+        compile_options.require_weight_materializer(weight_materializer_id);
         let compile_phase = StartupPhaseTimer::start("plan_compile");
-        let compilation = ProgramPlanCompiler::compile(
+        let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             family,
             &catalog,
             &config.runtime_policy,
             &registry.planning(),
+            &weight_materializers,
             &compile_options,
         )
         .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;

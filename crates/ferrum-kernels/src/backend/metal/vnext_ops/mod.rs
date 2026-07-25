@@ -15,8 +15,9 @@ use ferrum_interfaces::vnext::{
     OperationResourceEstimateRequest, OperationRuntimeRegistry, ProfilePhase, ProviderId,
     ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
     RMS_NORM_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_F16_CAPABILITY_ID,
@@ -184,6 +185,8 @@ pub fn metal_vnext_operation_registry(
 pub struct MetalVNextComposition {
     runtime: Arc<MetalDeviceRuntime>,
     registry: OperationRuntimeRegistry<MetalDeviceRuntime>,
+    weight_materializers: WeightMaterializerRegistry,
+    weight_materializer_id: WeightMaterializerId,
     catalog: CapabilityCatalog,
 }
 
@@ -192,6 +195,10 @@ impl MetalVNextComposition {
         let config = metal_vnext_runtime_config(device_id).map_err(contract_error)?;
         let runtime = Arc::new(MetalDeviceRuntime::new(config)?);
         let registry = metal_vnext_operation_registry(&runtime)?;
+        let weight_materializers =
+            WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
+        let weight_materializer_id =
+            WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID).map_err(contract_error)?;
         let engine = EngineProviderDescriptor::new(
             ProviderId::new(METAL_ENGINE_PROVIDER_ID).map_err(contract_error)?,
             ContractVersion::new(1, 0),
@@ -207,9 +214,14 @@ impl MetalVNextComposition {
         let catalog = registry
             .capability_catalog(runtime.descriptor().clone(), vec![engine])
             .map_err(contract_error)?;
+        let catalog = weight_materializers
+            .augment_catalog(catalog)
+            .map_err(contract_error)?;
         Ok(Self {
             runtime,
             registry,
+            weight_materializers,
+            weight_materializer_id,
             catalog,
         })
     }
@@ -231,9 +243,17 @@ impl MetalVNextComposition {
     ) -> (
         Arc<MetalDeviceRuntime>,
         OperationRuntimeRegistry<MetalDeviceRuntime>,
+        WeightMaterializerRegistry,
+        WeightMaterializerId,
         CapabilityCatalog,
     ) {
-        (self.runtime, self.registry, self.catalog)
+        (
+            self.runtime,
+            self.registry,
+            self.weight_materializers,
+            self.weight_materializer_id,
+            self.catalog,
+        )
     }
 }
 

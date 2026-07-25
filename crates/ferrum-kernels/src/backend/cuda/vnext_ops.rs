@@ -17,9 +17,10 @@ use ferrum_interfaces::vnext::{
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
     ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    IDENTITY_WEIGHT_MATERIALIZER_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
     RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
@@ -86,6 +87,12 @@ pub fn cuda_vnext_runtime_config(
         ]);
         fingerprint_parts
     };
+    #[cfg(feature = "vllm-marlin")]
+    let fingerprint_parts = {
+        let mut fingerprint_parts = fingerprint_parts;
+        fingerprint_parts.push(include_str!("../../../marlin_fp8_materializer.rs").as_bytes());
+        fingerprint_parts
+    };
     Ok(CudaDeviceRuntimeConfig {
         ordinal,
         device_id,
@@ -131,6 +138,14 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         )?);
         capabilities
     };
+    #[cfg(feature = "vllm-marlin")]
+    let capabilities = {
+        let mut capabilities = capabilities;
+        capabilities.insert(CapabilityId::new(
+            crate::marlin_fp8_materializer::MARLIN_FP8_CAPABILITY_ID,
+        )?);
+        capabilities
+    };
     Ok(capabilities)
 }
 
@@ -168,6 +183,14 @@ pub fn cuda_vnext_operation_registry(
         )?),
         Box::new(transformer::CudaCausalPagedAttentionProvider::new(runtime)?),
     ];
+    #[cfg(feature = "vllm-marlin")]
+    let providers = {
+        let mut providers = providers;
+        providers.push(Box::new(
+            transformer::CudaMarlinFp8DenseLinearProvider::new(runtime)?,
+        ));
+        providers
+    };
     #[cfg(feature = "vllm-moe-marlin")]
     let providers = {
         let mut providers = providers;
@@ -185,6 +208,8 @@ pub fn cuda_vnext_operation_registry(
 pub struct CudaVNextComposition {
     runtime: Arc<CudaDeviceRuntime>,
     registry: OperationRuntimeRegistry<CudaDeviceRuntime>,
+    weight_materializers: WeightMaterializerRegistry,
+    weight_materializer_id: WeightMaterializerId,
     catalog: CapabilityCatalog,
 }
 
@@ -193,6 +218,23 @@ impl CudaVNextComposition {
         let config = cuda_vnext_runtime_config(ordinal, device_id).map_err(contract_error)?;
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
         let registry = cuda_vnext_operation_registry(&runtime)?;
+        #[cfg(feature = "vllm-marlin")]
+        let (weight_materializers, weight_materializer_id) = (
+            WeightMaterializerRegistry::new(vec![
+                crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
+                    .map_err(contract_error)?,
+            ])
+            .map_err(contract_error)?,
+            WeightMaterializerId::new(
+                crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
+            )
+            .map_err(contract_error)?,
+        );
+        #[cfg(not(feature = "vllm-marlin"))]
+        let (weight_materializers, weight_materializer_id) = (
+            WeightMaterializerRegistry::identity_only().map_err(contract_error)?,
+            WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID).map_err(contract_error)?,
+        );
         let engine = EngineProviderDescriptor::new(
             ProviderId::new(CUDA_ENGINE_PROVIDER_ID).map_err(contract_error)?,
             ContractVersion::new(1, 0),
@@ -208,9 +250,14 @@ impl CudaVNextComposition {
         let catalog = registry
             .capability_catalog(runtime.descriptor().clone(), vec![engine])
             .map_err(contract_error)?;
+        let catalog = weight_materializers
+            .augment_catalog(catalog)
+            .map_err(contract_error)?;
         Ok(Self {
             runtime,
             registry,
+            weight_materializers,
+            weight_materializer_id,
             catalog,
         })
     }
@@ -232,9 +279,17 @@ impl CudaVNextComposition {
     ) -> (
         Arc<CudaDeviceRuntime>,
         OperationRuntimeRegistry<CudaDeviceRuntime>,
+        WeightMaterializerRegistry,
+        WeightMaterializerId,
         CapabilityCatalog,
     ) {
-        (self.runtime, self.registry, self.catalog)
+        (
+            self.runtime,
+            self.registry,
+            self.weight_materializers,
+            self.weight_materializer_id,
+            self.catalog,
+        )
     }
 }
 
