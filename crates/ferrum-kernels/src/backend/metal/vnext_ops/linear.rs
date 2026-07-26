@@ -9,8 +9,8 @@ use ferrum_interfaces::vnext::{
     BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
     EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
     OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole,
+    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole,
     ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
@@ -256,6 +256,7 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
             ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(OperationResourceEstimate::new(
@@ -347,6 +348,7 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
             )?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(OperationResourceEstimate::new(

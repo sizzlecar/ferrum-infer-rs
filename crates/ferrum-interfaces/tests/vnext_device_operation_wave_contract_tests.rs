@@ -1455,6 +1455,236 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
 }
 
 #[test]
+fn provider_scratch_is_zeroed_before_every_reused_lane_invocation() {
+    let (fixture, sequence, session, batch, first_step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ScratchZeroed),
+    );
+    let lane = Arc::clone(first_step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+
+    let first_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &first_step);
+    let first_active_bindings = wave_active_bindings(&first_wave, &session);
+    let first_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        first_active_bindings.iter(),
+        &first_wave,
+        &lane,
+    )
+    .unwrap();
+    let first_completion = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &first_identity,
+        first_active_bindings.iter(),
+        DeviceTimingMode::Off,
+        first_wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        first_completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    drop(first_completion);
+    drop(first_active_bindings);
+    first_step.try_retire_normal().unwrap();
+
+    let second_step = begin_single_participant_step_on_lane(&batch, &lane);
+    let second_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &second_step);
+    let second_active_bindings = wave_active_bindings(&second_wave, &session);
+    let second_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        second_active_bindings.iter(),
+        &second_wave,
+        &lane,
+    )
+    .unwrap();
+    let second_completion = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &second_identity,
+        second_active_bindings.iter(),
+        DeviceTimingMode::Off,
+        second_wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        second_completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_commands,
+            vec![
+                vec![
+                    TestCommand::Zero,
+                    TestCommand::Zero,
+                    TestCommand::ScratchProvider,
+                    TestCommand::ScratchProvider,
+                ],
+                vec![
+                    TestCommand::Zero,
+                    TestCommand::Zero,
+                    TestCommand::ScratchProvider,
+                    TestCommand::ScratchProvider,
+                ],
+            ]
+        );
+        assert_eq!(
+            trace.submitted_command_phases,
+            vec![
+                vec![
+                    DeviceCommandPhase::Initialization,
+                    DeviceCommandPhase::Initialization,
+                    DeviceCommandPhase::Compute,
+                    DeviceCommandPhase::Compute,
+                ],
+                vec![
+                    DeviceCommandPhase::Initialization,
+                    DeviceCommandPhase::Initialization,
+                    DeviceCommandPhase::Compute,
+                    DeviceCommandPhase::Compute,
+                ],
+            ]
+        );
+        assert_eq!(
+            trace.submitted_command_node_indices,
+            vec![
+                vec![Some(0), Some(1), Some(0), Some(1)],
+                vec![Some(0), Some(1), Some(0), Some(1)],
+            ]
+        );
+        assert_eq!(
+            trace.scratch_observations,
+            vec![(0, 0), (1, 0), (0, 0), (1, 0)]
+        );
+    }
+
+    drop(second_completion);
+    drop(second_active_bindings);
+    drop(providers);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, second_step);
+}
+
+#[test]
+fn verification_zeroes_overwrite_scratch_without_changing_the_default_path() {
+    let (fixture, sequence, session, batch, first_step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
+    );
+    let lane = Arc::clone(first_step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+
+    let first_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &first_step);
+    let first_active_bindings = wave_active_bindings(&first_wave, &session);
+    let first_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        first_active_bindings.iter(),
+        &first_wave,
+        &lane,
+    )
+    .unwrap();
+    let first_completion = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &first_identity,
+        first_active_bindings.iter(),
+        DeviceTimingMode::Off,
+        first_wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        first_completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    drop(first_completion);
+    drop(first_active_bindings);
+    first_step.try_retire_normal().unwrap();
+
+    let second_step = begin_single_participant_step_on_lane(&batch, &lane);
+    let second_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &second_step);
+    let second_active_bindings = wave_active_bindings(&second_wave, &session);
+    let second_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        second_active_bindings.iter(),
+        &second_wave,
+        &lane,
+    )
+    .unwrap();
+    let second_completion = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &second_identity,
+        second_active_bindings.iter(),
+        DeviceTimingMode::Verification,
+        second_wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        second_completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_commands,
+            vec![
+                vec![TestCommand::ScratchProvider, TestCommand::ScratchProvider],
+                vec![
+                    TestCommand::Zero,
+                    TestCommand::Zero,
+                    TestCommand::ScratchProvider,
+                    TestCommand::ScratchProvider,
+                ],
+            ]
+        );
+        assert_eq!(
+            trace.submitted_command_node_indices,
+            vec![
+                vec![Some(0), Some(1)],
+                vec![Some(0), Some(1), Some(0), Some(1)],
+            ]
+        );
+        assert_eq!(
+            trace.scratch_observations,
+            vec![(0, 0xa5), (1, 0xa5), (0, 0), (1, 0)]
+        );
+    }
+
+    drop(second_completion);
+    drop(second_active_bindings);
+    drop(providers);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, second_step);
+}
+
+#[test]
 fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success() {
     let (fixture, sequence, session, batch, first_step) =
         setup_with_fixture(fixture_with_zero_state(true));

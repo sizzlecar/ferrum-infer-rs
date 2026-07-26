@@ -659,9 +659,11 @@ pub enum StreamState {
 /// additionally attributes backend-observed physical work to immutable-plan
 /// node indices. `Verification` retains full logical/kernel attribution while
 /// requiring eager command execution so a profiler can compare reusable
-/// execution against the same compiled bindings and resource layout. Replay
-/// and verification timing are diagnostic instrumentation and may add backend
-/// measurement events or encoder boundaries.
+/// execution against the same compiled bindings and resource layout. It also
+/// zeroes provider scratch before every invocation, making stale-workspace
+/// dependence a directly falsifiable diagnostic. Replay and verification
+/// timing are diagnostic instrumentation and may add backend measurement
+/// events, initialization commands, or encoder boundaries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
@@ -2435,6 +2437,14 @@ impl<C> DeviceCommandBatch<C> {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Initialization,
             node_index: None,
+            command,
+        });
+    }
+
+    pub(crate) fn push_node_initialization(&mut self, node_index: u32, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Initialization,
+            node_index: Some(node_index),
             command,
         });
     }

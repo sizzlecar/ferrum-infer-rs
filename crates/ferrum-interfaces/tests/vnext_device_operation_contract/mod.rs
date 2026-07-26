@@ -301,6 +301,13 @@ pub(crate) fn operation() -> OperationDescriptor {
 }
 
 pub(crate) fn operation_with_zero_state(zero_state: bool) -> OperationDescriptor {
+    operation_with_resource_options(zero_state, ResourcePresenceRequirement::Forbidden)
+}
+
+fn operation_with_resource_options(
+    zero_state: bool,
+    scratch: ResourcePresenceRequirement,
+) -> OperationDescriptor {
     let mut inputs = vec![
         tensor_contract(TensorAccess::Read),
         tensor_contract(TensorAccess::Read),
@@ -316,7 +323,7 @@ pub(crate) fn operation_with_zero_state(zero_state: bool) -> OperationDescriptor
         attributes: AttributeSchema::empty(),
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
-            scratch: ResourcePresenceRequirement::Forbidden,
+            scratch,
             binding: ResourcePresenceRequirement::Optional,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
@@ -334,7 +341,14 @@ pub(crate) fn catalog() -> CapabilityCatalog {
 }
 
 pub(crate) fn catalog_with_zero_state(zero_state: bool) -> CapabilityCatalog {
-    let operation = operation_with_zero_state(zero_state);
+    catalog_with_resource_options(zero_state, ResourcePresenceRequirement::Forbidden)
+}
+
+fn catalog_with_resource_options(
+    zero_state: bool,
+    scratch: ResourcePresenceRequirement,
+) -> CapabilityCatalog {
+    let operation = operation_with_resource_options(zero_state, scratch);
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
@@ -406,6 +420,8 @@ pub(crate) enum ProviderBehavior {
     SplitPhases,
     ProgramBinding,
     ProgramBindingIneligible,
+    ScratchOverwrite,
+    ScratchZeroed,
     WrongIdentity,
     WrongPhase,
 }
@@ -446,6 +462,25 @@ impl OperationResourceEstimator for TestProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
+        let behavior = *self.behavior.lock().unwrap();
+        let scratch_policy = match behavior {
+            ProviderBehavior::ScratchOverwrite => {
+                Some(ProviderWorkspaceReusePolicy::OverwriteBeforeRead)
+            }
+            ProviderBehavior::ScratchZeroed => Some(ProviderWorkspaceReusePolicy::ZeroBeforeUse),
+            _ => None,
+        };
+        let scratch = scratch_policy
+            .map(|reuse_policy| {
+                ProviderWorkspaceRequirement::from_formula(
+                    ProviderWorkspaceSizeFormula::tokens(16)?,
+                    16,
+                    ProviderWorkspaceScope::Invocation,
+                    reuse_policy,
+                    DynamicStorageRequirement::contiguous(),
+                )
+            })
+            .transpose()?;
         let estimate = OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
@@ -453,15 +488,16 @@ impl OperationResourceEstimator for TestProvider {
                 .resource_estimator_implementation_fingerprint(),
             request.input_fingerprint(),
             16,
-            None,
+            scratch,
             None,
         );
-        if self.behavior.lock().unwrap().uses_program_binding() {
+        if behavior.uses_program_binding() {
             Ok(
                 estimate.with_binding(ProviderWorkspaceRequirement::from_formula(
                     ProviderWorkspaceSizeFormula::actual_sequences(16)?,
                     16,
                     ProviderWorkspaceScope::Invocation,
+                    ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
                     DynamicStorageRequirement::contiguous(),
                 )?),
             )
@@ -571,6 +607,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
                 Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
                     .with_program_binding(TestCommand::ProgramBinding))
             }
+            ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed => Ok(
+                EncodedDeviceOperation::compute(TestCommand::ScratchProvider),
+            ),
             ProviderBehavior::WrongIdentity => {
                 let mut parts = participant.identity().parts().clone();
                 parts.request_id = id("request.provider.wrong");
@@ -819,6 +858,7 @@ pub(crate) struct TestStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCommand {
     Provider,
+    ScratchProvider,
     ReusableExecution,
     ProgramBinding,
     CoalescedProgramBinding,
@@ -924,9 +964,12 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
     pub(crate) submitted_command_phases: Vec<Vec<DeviceCommandPhase>>,
+    pub(crate) submitted_command_node_indices: Vec<Vec<Option<u32>>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
     pub(crate) uploaded_payloads: Vec<Vec<u8>>,
     pub(crate) submitted_reusable_captures: Vec<Option<DeviceReusableExecutionCapture>>,
+    pub(crate) scratch_bytes: BTreeMap<u32, u8>,
+    pub(crate) scratch_observations: Vec<(u32, u8)>,
     pub(crate) program_binding_coalesce_calls: u64,
     pub(crate) program_binding_input_counts: Vec<usize>,
     pub(crate) readback_calls: u64,
@@ -1147,6 +1190,7 @@ impl DeviceRuntime for TestRuntime {
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands.into_entries();
         let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
+        let command_node_indices = entries.iter().map(DeviceCommandEntry::node_index).collect();
         let attribution = timing_mode.kernel_attribution_enabled().then(|| {
             entries
                 .iter()
@@ -1155,6 +1199,7 @@ impl DeviceRuntime for TestRuntime {
                     let (native_op_id, compute_dispatch_count, transfer_command_count) =
                         match entry.command() {
                             TestCommand::Provider => ("test_provider", 1, 0),
+                            TestCommand::ScratchProvider => ("test_scratch_provider", 1, 0),
                             TestCommand::ReusableExecution => ("test_reusable_execution", 1, 0),
                             TestCommand::ProgramBinding => ("test_program_binding", 0, 1),
                             TestCommand::CoalescedProgramBinding => {
@@ -1183,6 +1228,17 @@ impl DeviceRuntime for TestRuntime {
                 .collect()
         });
         let attribution = attribution.and_then(DeviceSubmissionAttribution::new);
+        let scratch_events = entries
+            .iter()
+            .filter_map(|entry| {
+                let node_index = entry.node_index()?;
+                match entry.command() {
+                    TestCommand::Zero => Some((node_index, None)),
+                    TestCommand::ScratchProvider => Some((node_index, Some(0xa5))),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
         let commands = entries
             .into_iter()
             .map(DeviceCommandEntry::into_parts)
@@ -1194,7 +1250,19 @@ impl DeviceRuntime for TestRuntime {
             trace.submit_calls += 1;
             trace.submitted_command_counts.push(command_count);
             trace.submitted_command_phases.push(command_phases);
+            trace
+                .submitted_command_node_indices
+                .push(command_node_indices);
             trace.submitted_commands.push(commands);
+            for (node_index, provider_write) in scratch_events {
+                if let Some(provider_write) = provider_write {
+                    let observed = *trace.scratch_bytes.get(&node_index).unwrap_or(&0xa5);
+                    trace.scratch_observations.push((node_index, observed));
+                    trace.scratch_bytes.insert(node_index, provider_write);
+                } else {
+                    trace.scratch_bytes.insert(node_index, 0);
+                }
+            }
             trace
                 .submitted_reusable_captures
                 .push(reusable_execution_capture);
@@ -1688,13 +1756,15 @@ pub(crate) fn resolved_model_plan_with_zero_state(
     zero_state: bool,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let runtime_policy = policy();
-    resolved_model_plan_with_zero_state_and_policy(registry, zero_state, &runtime_policy)
+    let catalog = catalog_with_zero_state(zero_state);
+    resolved_model_plan_with_zero_state_and_policy(registry, zero_state, &runtime_policy, &catalog)
 }
 
 fn resolved_model_plan_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
     runtime_policy: &ResolvedRuntimePolicy,
+    catalog: &CapabilityCatalog,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
     let raw_config = if zero_state {
@@ -1703,19 +1773,18 @@ fn resolved_model_plan_with_zero_state_and_policy(
         json!({"width": 4})
     };
     let family = model_registry.registration.prepare(&raw_config).unwrap();
-    let catalog = catalog_with_zero_state(zero_state);
     let resolutions = vec![
-        node_resolution_with_zero_state(&family, &catalog, runtime_policy, registry, zero_state),
+        node_resolution_with_zero_state(&family, catalog, runtime_policy, registry, zero_state),
         tail_node_resolution_with_zero_state(
             &family,
-            &catalog,
+            catalog,
             runtime_policy,
             registry,
             zero_state,
         ),
     ];
     let plan = ExecutionPlan::build(
-        PlanBuildRequest::new(&family, &catalog, runtime_policy, resolutions.clone()).unwrap(),
+        PlanBuildRequest::new(&family, catalog, runtime_policy, resolutions.clone()).unwrap(),
     )
     .unwrap();
     let config_fingerprint = family.config_fingerprint().to_owned();
@@ -1855,13 +1924,15 @@ pub(crate) fn plan_for_registry_with_zero_state(
     zero_state: bool,
 ) -> ExecutionPlan {
     let runtime_policy = policy();
-    plan_for_registry_with_zero_state_and_policy(registry, zero_state, &runtime_policy)
+    let catalog = catalog_with_zero_state(zero_state);
+    plan_for_registry_with_zero_state_and_policy(registry, zero_state, &runtime_policy, &catalog)
 }
 
 fn plan_for_registry_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
     runtime_policy: &ResolvedRuntimePolicy,
+    catalog: &CapabilityCatalog,
 ) -> ExecutionPlan {
     let raw_config = if zero_state {
         json!({"width": 4, "zero_state": true})
@@ -1871,23 +1942,22 @@ fn plan_for_registry_with_zero_state_and_policy(
     let family = TypedFamilyRegistration::new(TestFamily)
         .prepare(&raw_config)
         .unwrap();
-    let catalog = catalog_with_zero_state(zero_state);
     ExecutionPlan::build(
         PlanBuildRequest::new(
             &family,
-            &catalog,
+            catalog,
             runtime_policy,
             vec![
                 node_resolution_with_zero_state(
                     &family,
-                    &catalog,
+                    catalog,
                     runtime_policy,
                     registry,
                     zero_state,
                 ),
                 tail_node_resolution_with_zero_state(
                     &family,
-                    &catalog,
+                    catalog,
                     runtime_policy,
                     registry,
                     zero_state,
@@ -2190,7 +2260,15 @@ pub(crate) fn fixture_with_provider_behavior(
     zero_state: bool,
     behavior: ProviderBehavior,
 ) -> Fixture {
-    let catalog = catalog_with_zero_state(zero_state);
+    let scratch = if matches!(
+        behavior,
+        ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed
+    ) {
+        ResourcePresenceRequirement::Optional
+    } else {
+        ResourcePresenceRequirement::Forbidden
+    };
+    let catalog = catalog_with_resource_options(zero_state, scratch);
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
         let (policy, bucket) = reusable_policy();
         (policy, Some(bucket))
@@ -2211,8 +2289,19 @@ pub(crate) fn fixture_with_provider_behavior(
         )
         .unwrap();
     assert_eq!(derived_catalog, catalog);
-    let (resolved, plan) =
-        resolved_model_plan_with_zero_state_and_policy(&registry, zero_state, &runtime_policy);
+    let planning = registry.planning();
+    let registered_contracts = planning.contracts_for(&id("operation.main"));
+    assert_eq!(registered_contracts.len(), 1);
+    assert_eq!(
+        registered_contracts[0].descriptor(),
+        catalog.operation(&id("operation.main")).unwrap()
+    );
+    let (resolved, plan) = resolved_model_plan_with_zero_state_and_policy(
+        &registry,
+        zero_state,
+        &runtime_policy,
+        &catalog,
+    );
     let impostor_registry = operation_registry(
         &catalog,
         Arc::new(Mutex::new(ProviderBehavior::WrongPhase)),
@@ -2222,6 +2311,7 @@ pub(crate) fn fixture_with_provider_behavior(
         &impostor_registry,
         zero_state,
         &runtime_policy,
+        &catalog,
     )
     .plan_hash()
     .clone();
