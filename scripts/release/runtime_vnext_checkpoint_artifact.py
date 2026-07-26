@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -17,7 +18,12 @@ from typing import Any
 
 
 PASS_PREFIX = "RUNTIME VNEXT CHECKPOINT ARTIFACT PASS"
+COMPARISON_PASS_PREFIX = "RUNTIME VNEXT CHECKPOINT COMPARISON"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+LAYER_VALUE_RE = re.compile(
+    r"value\.layer\.(?P<layer>[0-9]+)\."
+    r"(?P<stage>attention|post_attention_norm|mlp|output)"
+)
 ELEMENT_FORMATS = {"f16": ("<e", 2), "f32": ("<f", 4), "u32": ("<I", 4)}
 
 PLAN_FIELDS_V1 = frozenset(
@@ -430,6 +436,7 @@ def validate_artifact(
                     "value_id": value_id,
                     "participant_index": participant_index,
                     "request_id": record["request_id"],
+                    "token_span_fingerprint": token_span["fingerprint"],
                     "raw_file": raw_name,
                     "raw_bytes": raw_bytes,
                     "raw_sha256": digest,
@@ -466,6 +473,155 @@ def validate_artifact(
         "prefill_wave_count": len(prefill_wave_paths),
         "decode_wave_count": len(decode_wave_paths),
         "waves": summaries,
+    }
+
+
+def semantic_value_order(value_id: str) -> tuple[int, int, int, str]:
+    layer_match = LAYER_VALUE_RE.fullmatch(value_id)
+    if layer_match is not None:
+        stage_order = {
+            "attention": 0,
+            "post_attention_norm": 1,
+            "mlp": 2,
+            "output": 3,
+        }
+        return (
+            0,
+            int(layer_match.group("layer")),
+            stage_order[layer_match.group("stage")],
+            value_id,
+        )
+    output_order = {
+        "value.output.final_hidden": 0,
+        "value.output.logits": 1,
+        "value.output.greedy_token": 2,
+    }
+    return (1, output_order.get(value_id, 3), 0, value_id)
+
+
+def compare_artifacts(
+    baseline_dir: Path,
+    candidate_dir: Path,
+    expected_model_id: str | None,
+    expected_values: list[str],
+    expected_relation: str,
+) -> dict[str, Any]:
+    baseline = validate_artifact(baseline_dir, expected_model_id, expected_values)
+    candidate = validate_artifact(candidate_dir, expected_model_id, expected_values)
+    for field in (
+        "model_id",
+        "plan_id",
+        "plan_hash",
+        "family_fingerprint",
+        "program_fingerprint",
+        "checkpoint_values",
+        "maximum_prefill_waves",
+        "maximum_decode_waves",
+    ):
+        require(
+            baseline[field] == candidate[field],
+            f"comparison {field} differs across captures",
+        )
+
+    baseline_waves = {
+        (wave["wave_kind"], wave["capture_index"]): wave for wave in baseline["waves"]
+    }
+    candidate_waves = {
+        (wave["wave_kind"], wave["capture_index"]): wave for wave in candidate["waves"]
+    }
+    require(
+        baseline_waves.keys() == candidate_waves.keys(),
+        "comparison wave topology differs across captures",
+    )
+
+    first_difference: dict[str, Any] | None = None
+    wave_order = {"prefill": 0, "decode": 1}
+    for wave_key in sorted(
+        baseline_waves,
+        key=lambda item: (wave_order[item[0]], item[1]),
+    ):
+        baseline_wave = baseline_waves[wave_key]
+        candidate_wave = candidate_waves[wave_key]
+        require(
+            baseline_wave["participant_count"] == candidate_wave["participant_count"],
+            f"comparison participant count differs at {wave_key}",
+        )
+        baseline_records = {
+            (record["value_id"], record["participant_index"]): record
+            for record in baseline_wave["records"]
+        }
+        candidate_records = {
+            (record["value_id"], record["participant_index"]): record
+            for record in candidate_wave["records"]
+        }
+        require(
+            baseline_records.keys() == candidate_records.keys(),
+            f"comparison checkpoint topology differs at {wave_key}",
+        )
+        for record_key in sorted(
+            baseline_records,
+            key=lambda item: (semantic_value_order(item[0]), item[1]),
+        ):
+            baseline_record = baseline_records[record_key]
+            candidate_record = candidate_records[record_key]
+            for field in ("raw_bytes", "element_type"):
+                require(
+                    baseline_record[field] == candidate_record[field],
+                    f"comparison {field} differs at {wave_key}/{record_key}",
+                )
+            if (
+                baseline_record["token_span_fingerprint"]
+                != candidate_record["token_span_fingerprint"]
+            ):
+                first_difference = {
+                    "difference_kind": "input-token-span",
+                    "wave_kind": wave_key[0],
+                    "capture_index": wave_key[1],
+                    "value_id": record_key[0],
+                    "participant_index": record_key[1],
+                    "baseline_token_span_fingerprint": baseline_record[
+                        "token_span_fingerprint"
+                    ],
+                    "candidate_token_span_fingerprint": candidate_record[
+                        "token_span_fingerprint"
+                    ],
+                }
+                break
+            if baseline_record["raw_sha256"] != candidate_record["raw_sha256"]:
+                first_difference = {
+                    "difference_kind": "semantic-value",
+                    "wave_kind": wave_key[0],
+                    "capture_index": wave_key[1],
+                    "value_id": record_key[0],
+                    "participant_index": record_key[1],
+                    "baseline_raw_sha256": baseline_record["raw_sha256"],
+                    "candidate_raw_sha256": candidate_record["raw_sha256"],
+                    "baseline_raw_file": baseline_record["raw_file"],
+                    "candidate_raw_file": candidate_record["raw_file"],
+                }
+                break
+        if first_difference is not None:
+            break
+
+    actual_relation = "different" if first_difference is not None else "equal"
+    require(
+        actual_relation == expected_relation,
+        f"checkpoint relation is {actual_relation}, expected {expected_relation}; "
+        f"first_difference={first_difference}",
+    )
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "expected_relation": expected_relation,
+        "actual_relation": actual_relation,
+        "baseline_capture_dir": baseline["capture_dir"],
+        "candidate_capture_dir": candidate["capture_dir"],
+        "model_id": baseline["model_id"],
+        "plan_id": baseline["plan_id"],
+        "program_fingerprint": baseline["program_fingerprint"],
+        "baseline_run_id": baseline["run_id"],
+        "candidate_run_id": candidate["run_id"],
+        "first_difference": first_difference,
     }
 
 
@@ -559,6 +715,44 @@ def self_test() -> None:
             json.dumps(decode_wave), encoding="utf-8"
         )
         validate_artifact(capture, "model.test", ["value.test"])
+
+        candidate = Path(temporary) / "candidate"
+        shutil.copytree(capture, candidate)
+        candidate_raw = struct.pack("<ee", 0.5, -2.0)
+        (candidate / decode_raw_name).write_bytes(candidate_raw)
+        candidate_decode_wave = load_json(candidate / "decode-wave-0000.json")
+        candidate_decode_wave["records"][0]["raw_sha256"] = hashlib.sha256(
+            candidate_raw
+        ).hexdigest()
+        (candidate / "decode-wave-0000.json").write_text(
+            json.dumps(candidate_decode_wave), encoding="utf-8"
+        )
+        different = compare_artifacts(
+            capture,
+            candidate,
+            "model.test",
+            ["value.test"],
+            "different",
+        )
+        require(
+            different["first_difference"]["difference_kind"] == "semantic-value"
+            and different["first_difference"]["wave_kind"] == "decode"
+            and different["first_difference"]["capture_index"] == 0
+            and different["first_difference"]["value_id"] == "value.test",
+            "comparison did not identify the first decode semantic-value difference",
+        )
+        equal = compare_artifacts(
+            capture,
+            capture,
+            "model.test",
+            ["value.test"],
+            "equal",
+        )
+        require(
+            equal["first_difference"] is None,
+            "equal comparison reported a difference",
+        )
+
         (capture / raw_name).write_bytes(raw + b"bad")
         try:
             validate_artifact(capture, "model.test", ["value.test"])
@@ -585,6 +779,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-model-id")
     parser.add_argument("--expected-value", action="append", default=[])
     parser.add_argument("--summary", type=Path)
+    parser.add_argument("--compare-capture", type=Path)
+    parser.add_argument("--expected-relation", choices=("equal", "different"))
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -596,14 +792,37 @@ def main() -> int:
             self_test()
             return 0
         require(args.capture_dir is not None, "capture_dir is required")
-        summary = validate_artifact(
-            args.capture_dir,
-            args.expected_model_id,
-            args.expected_value,
-        )
+        if args.compare_capture is not None:
+            require(
+                args.expected_relation is not None,
+                "--expected-relation is required with --compare-capture",
+            )
+            summary = compare_artifacts(
+                args.capture_dir,
+                args.compare_capture,
+                args.expected_model_id,
+                args.expected_value,
+                args.expected_relation,
+            )
+        else:
+            require(
+                args.expected_relation is None,
+                "--expected-relation requires --compare-capture",
+            )
+            summary = validate_artifact(
+                args.capture_dir,
+                args.expected_model_id,
+                args.expected_value,
+            )
         if args.summary is not None:
             write_summary(args.summary, summary)
-        print(f"{PASS_PREFIX}: {args.capture_dir}")
+        if args.compare_capture is not None:
+            print(
+                f"{COMPARISON_PASS_PREFIX} {args.expected_relation.upper()} PASS: "
+                f"{args.capture_dir} <> {args.compare_capture}"
+            )
+        else:
+            print(f"{PASS_PREFIX}: {args.capture_dir}")
         return 0
     except (ArtifactError, OSError) as error:
         print(f"RUNTIME VNEXT CHECKPOINT ARTIFACT REJECT: {error}", file=sys.stderr)
