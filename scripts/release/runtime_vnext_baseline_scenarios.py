@@ -5215,6 +5215,24 @@ def c09_terminal_outcome(
     abort_exchange: dict[str, Any],
     recovery_exchange: dict[str, Any],
 ) -> dict[str, Any]:
+    abort_response = require_object(
+        abort_exchange.get("response"), "C09 abort.response"
+    )
+    admission_observed = abort_response.get("admission_observed")
+    require(
+        isinstance(admission_observed, bool),
+        "C09 abort admission_observed must be boolean",
+    )
+    admitted_request_id = abort_response.get("admission_request_id")
+    if admission_observed:
+        admitted_request_id = require_string(
+            admitted_request_id, "C09 abort.admission_request_id"
+        )
+    else:
+        require(
+            admitted_request_id is None,
+            "C09 non-admitted abort must not claim an admission request id",
+        )
     abort_start_ns = require_count(
         abort_exchange.get("started_monotonic_ns"),
         "C09 abort.started_monotonic_ns",
@@ -5351,13 +5369,23 @@ def c09_terminal_outcome(
 
     abort_lifecycles, abort_resource_ids = lifecycle_rows("abort_window")
     recovery_lifecycles, recovery_resource_ids = lifecycle_rows("recovery_window")
+    abort_opened_ids = {
+        request_id
+        for request_id, lifecycle in abort_lifecycles.items()
+        if phase_rows(lifecycle, "engine_request_open")
+    }
+    recovery_opened_ids = {
+        request_id
+        for request_id, lifecycle in recovery_lifecycles.items()
+        if phase_rows(lifecycle, "engine_request_open")
+    }
     require(
-        len(recovery_lifecycles) == 1 and len(recovery_resource_ids) == 1,
+        len(recovery_opened_ids) == 1,
         "C09 recovery trace must contain exactly one request lifecycle",
     )
-    recovery_request_id = next(iter(recovery_lifecycles))
+    recovery_request_id = next(iter(recovery_opened_ids))
     require(
-        recovery_resource_ids == {recovery_request_id},
+        recovery_request_id in recovery_resource_ids,
         "C09 recovery resource events are not bound to its request lifecycle",
     )
     recovery_resource_balance = require_clean_close(
@@ -5367,7 +5395,11 @@ def c09_terminal_outcome(
         "C09 recovery",
     )
 
-    if not abort_lifecycles and not abort_resource_ids:
+    if admitted_request_id is None:
+        require(
+            not abort_opened_ids,
+            "C09 trace observed an admission missing from the transport binding",
+        )
         return {
             "cancel_resource_outcome": C09_NOT_ADMITTED_SAFE,
             "cancel_safety": "safe",
@@ -5382,14 +5414,12 @@ def c09_terminal_outcome(
         }
 
     require(
-        len(abort_lifecycles) == 1 and len(abort_resource_ids) == 1,
-        "C09 abort trace must contain zero or one request lifecycle",
+        abort_opened_ids == {admitted_request_id}
+        and admitted_request_id in abort_lifecycles
+        and admitted_request_id in abort_resource_ids,
+        "C09 admitted request lifecycle is missing from the abort trace",
     )
-    cancel_request_id = next(iter(abort_lifecycles))
-    require(
-        abort_resource_ids == {cancel_request_id},
-        "C09 abort resource events are not bound to its request lifecycle",
-    )
+    cancel_request_id = admitted_request_id
     lifecycle = abort_lifecycles[cancel_request_id]
     require(
         cancel_request_id != recovery_request_id,
@@ -10681,6 +10711,10 @@ def self_test() -> int:
     abort_exchange = {
         "started_monotonic_ns": 9_998_000_000,
         "finished_monotonic_ns": 9_999_000_000,
+        "response": {
+            "admission_observed": True,
+            "admission_request_id": "c09-cancel",
+        },
     }
     recovery_exchange = {
         "started_monotonic_ns": 10_050_000_000,
@@ -10702,11 +10736,44 @@ def self_test() -> int:
         and admitted_outcome["cancel_coverage"] == "exercised",
         "C09 admitted cancellation fixture did not reach released terminal state",
     )
+    stale_abort_rows = [
+        row
+        for row in c09_fixture_request_rows(
+            "c09-prior-request",
+            "abort_window",
+            9_999_000_000,
+            disconnected=False,
+        )
+        if row["raw"].get("phase")
+        in {
+            "plan_runtime_workspace_release",
+            "engine_request_slot_release",
+            "engine_request_close",
+        }
+    ]
+    contaminated_outcome = c09_terminal_outcome(
+        [*stale_abort_rows, *admitted_rows],
+        abort_exchange,
+        recovery_exchange,
+    )
+    require(
+        contaminated_outcome["cancel_request_id"] == "c09-cancel"
+        and contaminated_outcome["cancel_resource_outcome"]
+        == C09_ADMITTED_RELEASED,
+        "C09 admitted cancellation was obscured by a prior request tail",
+    )
+    pre_admission_exchange = {
+        **abort_exchange,
+        "response": {
+            "admission_observed": False,
+            "admission_request_id": None,
+        },
+    }
     pre_admission_outcome = c09_terminal_outcome(
         c09_fixture_request_rows(
             "c09-recovery", "recovery_window", 10_060_000_000, disconnected=False
         ),
-        abort_exchange,
+        pre_admission_exchange,
         recovery_exchange,
     )
     require(
