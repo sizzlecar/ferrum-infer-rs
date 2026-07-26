@@ -9,8 +9,8 @@ use ferrum_interfaces::vnext::{
     EncodedDeviceOperation, OperationContract, OperationFailure, OperationProvider,
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProfilePhase, ProviderId, ProviderWorkspaceRequirement,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    QuantizationFormatId, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
@@ -256,6 +256,7 @@ impl OperationResourceEstimator for CudaRoutedSharedSwiGluMoeProvider {
             ProviderWorkspaceSizeFormula::affine(fixed_bytes, 0, bytes_per_token)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(estimate(

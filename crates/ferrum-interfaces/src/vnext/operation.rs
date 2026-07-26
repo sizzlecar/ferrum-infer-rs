@@ -26,12 +26,13 @@ use super::{
     LogicalBackingSegmentBinding, LogicalBackingSliceAuthority, MemoryPlan, NodeId,
     NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
     PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
-    RequestIdentity, ResolvedWeightBinding, ResourceId, ResourcePoolId, RunId, SemanticValue,
-    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
-    StepParticipantFrameAssignment, StepResourceLease, TransactionId, TrustedActiveSequenceBinding,
-    TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId, WeightMaterializerDescriptor, WeightMaterializerId, EXECUTION_IDENTITY_VERSION,
+    ProgramValueId, ProviderId, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    QuantizationFormatId, RequestIdentity, ResolvedWeightBinding, ResourceId, ResourcePoolId,
+    ResourceWorkShape, RunId, SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch,
+    SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment, StepResourceLease,
+    TransactionId, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence,
+    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
+    WeightMaterializerDescriptor, WeightMaterializerId, EXECUTION_IDENTITY_VERSION,
     MAX_WEIGHT_MATERIALIZERS,
 };
 
@@ -4948,6 +4949,193 @@ fn validate_workspace<B>(
     }
 }
 
+fn encode_provider_workspace_initialization<R, Retry>(
+    runtime: &R,
+    node_index: u32,
+    node_identity: &BatchOperationNodeIdentity,
+    requirement: &ProviderWorkspaceRequirement,
+    work: &ResourceWorkShape,
+    view: &OperationBufferView<'_, R::Buffer>,
+    force_zero: bool,
+    commands: &mut DeviceCommandBatch<R::Command>,
+) -> Result<usize, OperationDispatchError<R, Retry>>
+where
+    R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
+{
+    if requirement.reuse_policy() == ProviderWorkspaceReusePolicy::Preserve {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace cannot preserve bytes across invocations",
+        )));
+    }
+    if !force_zero && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse {
+        return Ok(0);
+    }
+
+    let required_bytes = requirement
+        .evaluate_bytes(work)
+        .map_err(OperationDispatchError::Contract)?;
+    let descriptor = view.descriptor();
+    if descriptor.usage != BufferUsage::Scratch
+        || descriptor.element_type != super::ElementType::U8
+        || descriptor.size_bytes != required_bytes
+        || descriptor.alignment_bytes < requirement.alignment_bytes()
+        || descriptor.alignment_bytes % requirement.alignment_bytes() != 0
+    {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace zero range differs from its provider requirement",
+        )));
+    }
+    let regions = view
+        .translate(0, required_bytes)
+        .map_err(OperationDispatchError::Contract)?;
+    let participant = node_identity.participants().first().ok_or_else(|| {
+        OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace initialization has no participant identity",
+        ))
+    })?;
+    let identity = participant.identity().clone();
+    let mut encoded_bytes = 0_u64;
+    let mut command_count = 0_usize;
+    for region in regions.iter() {
+        let (buffer, physical_range, _retention) = region.buffer_and_physical_range();
+        let actual = runtime.buffer_descriptor(buffer);
+        if actual.usage != BufferUsage::Scratch
+            || actual.element_type != super::ElementType::U8
+            || physical_range.end > actual.size_bytes
+            || physical_range.start >= physical_range.end
+        {
+            return Err(OperationDispatchError::Contract(invalid_operation(
+                "scratch workspace physical zero range drifted",
+            )));
+        }
+        let length_bytes = physical_range.end - physical_range.start;
+        let command = runtime
+            .encode_zero(buffer, physical_range.start, length_bytes)
+            .map_err(|error| {
+                classify_device_error(runtime, identity.clone(), &error)
+                    .map(OperationDispatchError::Initialization)
+                    .unwrap_or_else(OperationDispatchError::Contract)
+            })?;
+        commands.push_node_initialization(node_index, command);
+        encoded_bytes = encoded_bytes.checked_add(length_bytes).ok_or_else(|| {
+            OperationDispatchError::Contract(invalid_operation(
+                "scratch workspace zero byte count overflows u64",
+            ))
+        })?;
+        command_count = command_count.checked_add(1).ok_or_else(|| {
+            OperationDispatchError::Contract(invalid_operation(
+                "scratch workspace zero command count overflows usize",
+            ))
+        })?;
+    }
+    if encoded_bytes != required_bytes {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace zero commands do not cover the logical workspace",
+        )));
+    }
+    Ok(command_count)
+}
+
+fn encode_submission_wave_workspace_initializations<R>(
+    runtime: &R,
+    resolved: &dyn ExecutablePlanView,
+    batch_identity: &BatchOperationIdentity,
+    timing_mode: DeviceTimingMode,
+    completion: &super::CompletionReservation<R>,
+    commands: &mut DeviceCommandBatch<R::Command>,
+) -> Result<usize, SubmissionWaveDispatchError<R>>
+where
+    R: DeviceRuntime,
+{
+    let plan_nodes = resolved.execution_plan().payload().nodes();
+    if batch_identity.node_count() != completion.wave().nodes().len() {
+        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+            "workspace initialization topology differs from the prepared wave",
+        )));
+    }
+    let force_zero = matches!(timing_mode, DeviceTimingMode::Verification);
+    let mut command_count = 0_usize;
+    for (node_index, prepared_node) in completion.wave().nodes().iter().enumerate() {
+        let plan_node = plan_nodes
+            .iter()
+            .find(|node| node.id() == prepared_node.node_id())
+            .ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "workspace initialization node is absent from the immutable plan",
+                ))
+            })?;
+        let node_identity = batch_identity.nodes().get(node_index).ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization node has no batch identity",
+            ))
+        })?;
+        if plan_node.id() != prepared_node.node_id()
+            || node_identity.node_id() != prepared_node.node_id()
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization node differs from the prepared wave",
+            )));
+        }
+        let Some(requirement) = plan_node.provider_resources().scratch() else {
+            continue;
+        };
+        if !force_zero && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse
+        {
+            continue;
+        }
+        let resource_id = plan_node.scratch_resource().ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "scratch workspace initialization has no base resource",
+            ))
+        })?;
+        let backing = completion
+            .wave()
+            .backing_view(node_index, resource_id)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        let coverage = if backing.capacity_size_bytes() > backing.size_bytes() {
+            OperationBufferCoverage::BackingPrefix
+        } else {
+            OperationBufferCoverage::Exact
+        };
+        let view = OperationBufferView {
+            descriptor: BufferDescriptor {
+                resource_id: resource_id.clone(),
+                size_bytes: backing.size_bytes(),
+                alignment_bytes: backing.alignment_bytes(),
+                usage: backing.usage(),
+                element_type: backing.element_type(),
+            },
+            source: OperationBufferSource::Backing(backing),
+            coverage,
+        };
+        let node_index = u32::try_from(node_index).map_err(|_| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization node index exceeds u32",
+            ))
+        })?;
+        let encoded = encode_provider_workspace_initialization::<
+            R,
+            DefinitelyNotSubmittedWaveRetryAuthority<R>,
+        >(
+            runtime,
+            node_index,
+            node_identity,
+            requirement,
+            prepared_node.work_shape().resource_work(),
+            &view,
+            force_zero,
+            commands,
+        )?;
+        command_count = command_count.checked_add(encoded).ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization command count overflows usize",
+            ))
+        })?;
+    }
+    Ok(command_count)
+}
+
 pub trait DispatchRetryAuthority: fmt::Debug {
     fn prior_attempt(&self) -> BatchInvocationId;
 }
@@ -5937,6 +6125,10 @@ impl OperationDispatch {
                 "operation encode runtime differs from its execution lane snapshot",
             )));
         }
+        let mut commands = DeviceCommandBatch::with_capacity(3);
+        completion
+            .encode_backing_initializations(runtime, &mut commands)
+            .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
         let invocation = BatchedOperationInvocation::from_resolved(
             runtime,
             resolved,
@@ -5946,6 +6138,38 @@ impl OperationDispatch {
             active_bindings,
         )
         .map_err(OperationDispatchError::Contract)?;
+        let plan_node = resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == node_identity.node_id())
+            .ok_or_else(|| {
+                OperationDispatchError::Contract(invalid_operation(
+                    "operation workspace node is absent from the immutable plan",
+                ))
+            })?;
+        if let Some(requirement) = plan_node.provider_resources().scratch() {
+            let scratch_view = invocation
+                .participants()
+                .first()
+                .and_then(OperationInvocation::scratch_view)
+                .ok_or_else(|| {
+                    OperationDispatchError::Contract(invalid_operation(
+                        "operation scratch requirement has no invocation view",
+                    ))
+                })?;
+            encode_provider_workspace_initialization::<R, DefinitelyNotSubmittedRetryAuthority<R>>(
+                runtime,
+                0,
+                node_identity,
+                requirement,
+                invocation.work_shape().resource_work(),
+                scratch_view,
+                false,
+                &mut commands,
+            )?;
+        }
         let expected_phase = invocation.operation().profile_phase;
         let operation = match provider.provider().encode_selected(invocation) {
             Ok(operation) => operation,
@@ -5966,10 +6190,6 @@ impl OperationDispatch {
                 "operation encode completion runtime drifted",
             )));
         }
-        let mut commands = DeviceCommandBatch::with_capacity(2);
-        completion
-            .encode_backing_initializations(runtime, &mut commands)
-            .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
         commands.push_operation(0, operation);
         let timing_mode = commands.timing_mode();
         let mut lane_reservation = lane
@@ -6303,10 +6523,22 @@ impl OperationDispatch {
             providers.len().saturating_add(input_uploads.len()),
             timing_mode,
         );
-        let initialization_command_count = completion
+        let backing_initialization_command_count = completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
-        if commands.len() != initialization_command_count {
+        let workspace_initialization_command_count =
+            encode_submission_wave_workspace_initializations(
+                runtime,
+                resolved,
+                batch_identity,
+                timing_mode,
+                &completion,
+                &mut commands,
+            )?;
+        if commands.len()
+            != backing_initialization_command_count
+                .saturating_add(workspace_initialization_command_count)
+        {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
                 "backing initialization command accounting differs from encoded commands",
             )));

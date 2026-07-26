@@ -304,12 +304,30 @@ pub enum ProviderWorkspaceScope {
     Invocation,
 }
 
+/// Content contract applied whenever an existing physical workspace is reused.
+///
+/// The policy is deliberately independent from allocation lifetime. A lane may
+/// retain the same invocation-scoped physical extent across many submissions,
+/// so allocation-time initialization alone cannot define what a provider may
+/// observe on entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderWorkspaceReusePolicy {
+    /// The provider writes every byte it may read during the invocation.
+    OverwriteBeforeRead,
+    /// Core zeroes the complete logical workspace before provider commands.
+    ZeroBeforeUse,
+    /// Existing bytes remain meaningful for the declared workspace scope.
+    Preserve,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderWorkspaceRequirement {
     pub(super) size_formula: ProviderWorkspaceSizeFormula,
     pub(super) alignment_bytes: u64,
     pub(super) scope: ProviderWorkspaceScope,
+    pub(super) reuse_policy: ProviderWorkspaceReusePolicy,
     pub(super) storage: DynamicStorageRequirement,
 }
 
@@ -320,12 +338,14 @@ impl ProviderWorkspaceRequirement {
         fixed_bytes: u64,
         alignment_bytes: u64,
         scope: ProviderWorkspaceScope,
+        reuse_policy: ProviderWorkspaceReusePolicy,
         storage: DynamicStorageRequirement,
     ) -> Result<Self, VNextError> {
         Self::from_formula(
             ProviderWorkspaceSizeFormula::fixed(fixed_bytes)?,
             alignment_bytes,
             scope,
+            reuse_policy,
             storage,
         )
     }
@@ -334,6 +354,7 @@ impl ProviderWorkspaceRequirement {
         size_formula: ProviderWorkspaceSizeFormula,
         alignment_bytes: u64,
         scope: ProviderWorkspaceScope,
+        reuse_policy: ProviderWorkspaceReusePolicy,
         storage: DynamicStorageRequirement,
     ) -> Result<Self, VNextError> {
         size_formula.validate()?;
@@ -351,6 +372,7 @@ impl ProviderWorkspaceRequirement {
             size_formula,
             alignment_bytes,
             scope,
+            reuse_policy,
             storage,
         };
         requirement.minimum_bytes()?;
@@ -398,6 +420,10 @@ impl ProviderWorkspaceRequirement {
         self.scope
     }
 
+    pub const fn reuse_policy(&self) -> ProviderWorkspaceReusePolicy {
+        self.reuse_policy
+    }
+
     pub fn storage(&self) -> &DynamicStorageRequirement {
         &self.storage
     }
@@ -409,6 +435,7 @@ pub(super) struct ProviderWorkspaceRequirementWire {
     pub(super) size_formula: ProviderWorkspaceSizeFormula,
     pub(super) alignment_bytes: u64,
     pub(super) scope: ProviderWorkspaceScope,
+    pub(super) reuse_policy: ProviderWorkspaceReusePolicy,
     pub(super) storage: DynamicStorageRequirement,
 }
 
@@ -422,6 +449,7 @@ impl<'de> Deserialize<'de> for ProviderWorkspaceRequirement {
             wire.size_formula,
             wire.alignment_bytes,
             wire.scope,
+            wire.reuse_policy,
             wire.storage,
         )
         .map_err(serde::de::Error::custom)

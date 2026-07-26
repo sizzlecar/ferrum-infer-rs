@@ -672,14 +672,28 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         ProviderWorkspaceSizeFormula::actual_sequences(7).unwrap(),
         16,
         ProviderWorkspaceScope::Invocation,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
         contiguous_storage_requirement(),
     )
     .unwrap();
     assert_eq!(aligned.evaluate_bytes(&shape).unwrap(), 32);
+    let aligned_wire = serde_json::to_value(&aligned).unwrap();
+    assert_eq!(aligned_wire["reuse_policy"], "overwrite_before_read");
+    assert_eq!(
+        serde_json::from_value::<ProviderWorkspaceRequirement>(aligned_wire.clone()).unwrap(),
+        aligned
+    );
+    let mut missing_reuse_policy = aligned_wire;
+    missing_reuse_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("reuse_policy");
+    assert!(serde_json::from_value::<ProviderWorkspaceRequirement>(missing_reuse_policy).is_err());
     let affine = ProviderWorkspaceRequirement::from_formula(
         ProviderWorkspaceSizeFormula::affine(5, 7, 3).unwrap(),
         16,
         ProviderWorkspaceScope::Invocation,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
         contiguous_storage_requirement(),
     )
     .unwrap();
@@ -688,6 +702,7 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         ProviderWorkspaceSizeFormula::tokens(4).unwrap(),
         16,
         ProviderWorkspaceScope::Plan,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
         contiguous_storage_requirement(),
     )
     .is_err());
@@ -695,6 +710,7 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         ProviderWorkspaceSizeFormula::actual_sequences(4).unwrap(),
         16,
         ProviderWorkspaceScope::Sequence,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
         contiguous_storage_requirement(),
     )
     .is_err());
@@ -702,6 +718,7 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         ProviderWorkspaceSizeFormula::fixed(u64::MAX).unwrap(),
         16,
         ProviderWorkspaceScope::Invocation,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
         contiguous_storage_requirement(),
     )
     .is_err());
@@ -714,6 +731,7 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         ProviderWorkspaceSizeFormula::affine(1, 1, 1).unwrap(),
         16,
         ProviderWorkspaceScope::Sequence,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
         contiguous_storage_requirement(),
     )
     .is_err());

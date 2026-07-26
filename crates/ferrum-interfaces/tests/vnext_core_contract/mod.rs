@@ -942,6 +942,7 @@ impl OperationResourceEstimator for TestEstimator {
                     ProviderWorkspaceSizeFormula::tokens(self.scratch_bytes).unwrap(),
                     16,
                     ProviderWorkspaceScope::Invocation,
+                    ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
                     contiguous_storage_requirement(),
                 )
                 .unwrap()
@@ -950,6 +951,7 @@ impl OperationResourceEstimator for TestEstimator {
                     self.scratch_bytes,
                     16,
                     ProviderWorkspaceScope::Invocation,
+                    ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
                     contiguous_storage_requirement(),
                 )
                 .unwrap()
@@ -984,6 +986,7 @@ impl OperationResourceEstimator for TestEstimator {
                     self.persistent_bytes,
                     16,
                     ProviderWorkspaceScope::Plan,
+                    ProviderWorkspaceReusePolicy::Preserve,
                     contiguous_storage_requirement(),
                 )
                 .unwrap(),
@@ -1041,12 +1044,14 @@ impl OperationResourceEstimator for SequentialScratchEstimator {
                 scratch_bytes,
                 16,
                 ProviderWorkspaceScope::Invocation,
+                ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
                 contiguous_storage_requirement(),
             )?),
             Some(ProviderWorkspaceRequirement::new(
                 32,
                 16,
                 ProviderWorkspaceScope::Plan,
+                ProviderWorkspaceReusePolicy::Preserve,
                 contiguous_storage_requirement(),
             )?),
         ))

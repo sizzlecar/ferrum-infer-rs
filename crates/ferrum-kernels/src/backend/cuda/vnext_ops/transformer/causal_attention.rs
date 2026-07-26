@@ -14,10 +14,11 @@ use ferrum_interfaces::vnext::{
     OperationBufferStorageKind, OperationContract, OperationFailure, OperationInvocation,
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
-    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -283,6 +284,7 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         let binding = ProviderWorkspaceRequirement::from_formula(
@@ -291,6 +293,7 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(

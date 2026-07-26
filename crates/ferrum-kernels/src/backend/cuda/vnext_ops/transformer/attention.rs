@@ -15,10 +15,10 @@ use ferrum_interfaces::vnext::{
     GatedDeltaValueHeadMapping, OperationContract, OperationFailure, OperationInvocation,
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
-    WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
+    VNextError, WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
     GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
@@ -267,12 +267,14 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
             )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         let binding = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::actual_sequences(STATE_BINDING_SLOT_BYTES)?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(

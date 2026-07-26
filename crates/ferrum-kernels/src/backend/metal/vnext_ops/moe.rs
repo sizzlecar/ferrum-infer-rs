@@ -9,10 +9,11 @@ use ferrum_interfaces::vnext::{
     DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightEncoding,
-    ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    WeightEncoding, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
+    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -147,6 +148,7 @@ impl OperationResourceEstimator for MetalRoutedSharedSwiGluMoeProvider {
             ProviderWorkspaceSizeFormula::affine(fixed_bytes, 0, bytes_per_token)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(OperationResourceEstimate::new(

@@ -19,10 +19,10 @@ use ferrum_interfaces::vnext::{
     OperationContract, OperationFailure, OperationInvocation, OperationProvider,
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
-    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
+    VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
 };
@@ -315,6 +315,7 @@ impl OperationResourceEstimator for CudaMarlinFp8DenseLinearProvider {
             ProviderWorkspaceSizeFormula::fixed(self.workspace_bytes()?)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(estimate(
@@ -406,6 +407,7 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
             ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
         Ok(estimate(

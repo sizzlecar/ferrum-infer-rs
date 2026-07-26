@@ -1,7 +1,8 @@
 use super::{
     canonical_fingerprint, invalid_plan, is_canonical_sha256, ContractVersion,
     OperationProviderDescriptor, OperationResourceEstimate, ProviderId,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, Serialize, VNextError,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, Serialize,
+    VNextError,
 };
 
 /// Trusted output from the selected provider's shape/attribute-specific
@@ -72,37 +73,43 @@ impl ProviderResourcePlan {
             || !self.value_alignment_bytes.is_power_of_two()
             || self.scratch.as_ref().is_some_and(|workspace| {
                 workspace.scope != ProviderWorkspaceScope::Invocation
+                    || workspace.reuse_policy == ProviderWorkspaceReusePolicy::Preserve
                     || ProviderWorkspaceRequirement::from_formula(
                         workspace.size_formula.clone(),
                         workspace.alignment_bytes,
                         workspace.scope,
+                        workspace.reuse_policy,
                         workspace.storage.clone(),
                     )
                     .is_err()
             })
             || self.binding.as_ref().is_some_and(|workspace| {
                 workspace.scope != ProviderWorkspaceScope::Invocation
+                    || workspace.reuse_policy != ProviderWorkspaceReusePolicy::OverwriteBeforeRead
                     || ProviderWorkspaceRequirement::from_formula(
                         workspace.size_formula.clone(),
                         workspace.alignment_bytes,
                         workspace.scope,
+                        workspace.reuse_policy,
                         workspace.storage.clone(),
                     )
                     .is_err()
             })
             || self.persistent.as_ref().is_some_and(|workspace| {
                 workspace.scope == ProviderWorkspaceScope::Invocation
+                    || workspace.reuse_policy != ProviderWorkspaceReusePolicy::Preserve
                     || ProviderWorkspaceRequirement::from_formula(
                         workspace.size_formula.clone(),
                         workspace.alignment_bytes,
                         workspace.scope,
+                        workspace.reuse_policy,
                         workspace.storage.clone(),
                     )
                     .is_err()
             })
         {
             return Err(invalid_plan(
-                "provider resource estimate identity, alignment, or scope is invalid",
+                "provider resource estimate identity, alignment, scope, or reuse policy is invalid",
             ));
         }
         Ok(())

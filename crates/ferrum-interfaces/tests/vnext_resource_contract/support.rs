@@ -365,12 +365,14 @@ impl OperationResourceEstimator for TestEstimator {
                 64,
                 16,
                 ProviderWorkspaceScope::Invocation,
+                ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
                 DynamicStorageRequirement::contiguous(),
             )?),
             Some(ProviderWorkspaceRequirement::new(
                 32,
                 16,
                 ProviderWorkspaceScope::Plan,
+                ProviderWorkspaceReusePolicy::Preserve,
                 DynamicStorageRequirement::contiguous(),
             )?),
         ))
