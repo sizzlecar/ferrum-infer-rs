@@ -3902,7 +3902,9 @@ impl VNextProfileExecutionEventSink {
                 profile_detail: config.runtime.profile_detail,
                 capture_policy: if matches!(
                     config.runtime.profile_detail,
-                    ObservabilityProfileDetail::Replay | ObservabilityProfileDetail::Full
+                    ObservabilityProfileDetail::Replay
+                        | ObservabilityProfileDetail::Verify
+                        | ObservabilityProfileDetail::Full
                 ) {
                     ExecutionEventCapturePolicy::AllFrames
                 } else {
@@ -4282,6 +4284,14 @@ impl VNextProfileEventContext {
             (
                 "production_reusable_execution_selection_preserved".to_string(),
                 serde_json::json!(self.profile_detail == ObservabilityProfileDetail::Replay),
+            ),
+            (
+                "execution_path_policy".to_string(),
+                serde_json::json!(match self.profile_detail {
+                    ObservabilityProfileDetail::Verify => "compiled_bindings_eager_commands",
+                    ObservabilityProfileDetail::Full => "logical_commands_reusable_segments",
+                    _ => "production_selection",
+                }),
             ),
             (
                 "measurement_instrumentation_present".to_string(),
@@ -4873,6 +4883,9 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
             }
             ObservabilityProfileDetail::Replay => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Replay
+            }
+            ObservabilityProfileDetail::Verify => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Verification
             }
             ObservabilityProfileDetail::Full => ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
         }

@@ -950,13 +950,19 @@ impl CompletionFenceTiming {
         let device_execution = match (timing_mode, device_execution) {
             (DeviceTimingMode::Off, _) => DeviceTimingMeasurement::NotRequested,
             (
-                DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel,
+                DeviceTimingMode::Completion
+                | DeviceTimingMode::Replay
+                | DeviceTimingMode::Kernel
+                | DeviceTimingMode::Verification,
                 DeviceTimingMeasurement::NotRequested,
             ) => DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendUnsupported,
             ),
             (
-                DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel,
+                DeviceTimingMode::Completion
+                | DeviceTimingMode::Replay
+                | DeviceTimingMode::Kernel
+                | DeviceTimingMode::Verification,
                 measurement,
             ) => measurement,
         };
@@ -2382,12 +2388,15 @@ fn terminal_observation<R: DeviceRuntime>(
             DeviceTimingMeasurement::NotRequested
         }
         (
-            DeviceTimingMode::Replay | DeviceTimingMode::Kernel,
+            DeviceTimingMode::Replay | DeviceTimingMode::Kernel | DeviceTimingMode::Verification,
             DeviceTimingMeasurement::NotRequested,
         ) => {
             DeviceTimingMeasurement::Unavailable(DeviceTimingUnavailableReason::BackendUnsupported)
         }
-        (DeviceTimingMode::Replay | DeviceTimingMode::Kernel, measurement) => measurement,
+        (
+            DeviceTimingMode::Replay | DeviceTimingMode::Kernel | DeviceTimingMode::Verification,
+            measurement,
+        ) => measurement,
     };
     let descriptor_is_stable = catch_unwind(AssertUnwindSafe(|| {
         lane.current_descriptor_matches_snapshot()

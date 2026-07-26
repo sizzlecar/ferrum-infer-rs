@@ -845,7 +845,9 @@ impl TestFence {
                     1_000_000,
                 )),
             ),
-            DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
+            DeviceTimingMode::Replay
+            | DeviceTimingMode::Kernel
+            | DeviceTimingMode::Verification => {
                 let submission_timing = self
                     .2
                     .as_ref()

@@ -2548,6 +2548,26 @@ mod tests {
     }
 
     #[test]
+    fn run_verify_profile_detail_reaches_typed_engine_config() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Verify;
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+
+        engine
+            .apply_runtime_config_snapshot(&effective)
+            .expect("verify profile detail should apply");
+
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Verify
+        );
+    }
+
+    #[test]
     fn run_effective_runtime_config_records_layer_split_pipeline_mode() {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();

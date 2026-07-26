@@ -1014,6 +1014,21 @@ mod tests {
     }
 
     #[test]
+    fn engine_config_applies_typed_verification_profile_detail_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "verify")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Verify
+        );
+    }
+
+    #[test]
     fn engine_config_applies_typed_profile_jsonl_runtime_key() {
         let mut config = EngineConfig::default();
         let snapshot =

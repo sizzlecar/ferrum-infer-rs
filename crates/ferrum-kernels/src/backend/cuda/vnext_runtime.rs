@@ -2110,9 +2110,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
             }
         }
-        let executable_candidates = match cuda_executable_candidates(&command_phases, &commands) {
-            Ok(candidates) => candidates,
-            Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+        let executable_candidates = if timing_mode.executable_replay_allowed() {
+            match cuda_executable_candidates(&command_phases, &commands) {
+                Ok(candidates) => candidates,
+                Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+            }
+        } else {
+            Vec::new()
         };
         let capture_allowed = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {
@@ -2193,7 +2197,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
-            DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
+            DeviceTimingMode::Completion
+            | DeviceTimingMode::Replay
+            | DeviceTimingMode::Kernel
+            | DeviceTimingMode::Verification => {
                 match stream
                     .stream
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -2447,7 +2454,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             DeviceTimingMode::Off | DeviceTimingMode::Completion => {
                 CudaFenceCommandTiming::NotRequested
             }
-            DeviceTimingMode::Replay | DeviceTimingMode::Kernel => command_spans.map_or(
+            DeviceTimingMode::Replay
+            | DeviceTimingMode::Kernel
+            | DeviceTimingMode::Verification => command_spans.map_or(
                 CudaFenceCommandTiming::Unavailable(
                     DeviceTimingUnavailableReason::BackendMeasurementFailed,
                 ),
@@ -2464,7 +2473,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
         );
         let fence_flags = match timing_mode {
             DeviceTimingMode::Off => None,
-            DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
+            DeviceTimingMode::Completion
+            | DeviceTimingMode::Replay
+            | DeviceTimingMode::Kernel
+            | DeviceTimingMode::Verification => {
                 Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)
             }
         };

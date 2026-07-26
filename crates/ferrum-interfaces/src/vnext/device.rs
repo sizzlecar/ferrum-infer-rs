@@ -657,8 +657,11 @@ pub enum StreamState {
 /// readback boundaries; `Replay` preserves normal reusable-versus-eager path
 /// selection while measuring physical executable/eager spans; `Kernel`
 /// additionally attributes backend-observed physical work to immutable-plan
-/// node indices. Replay timing is diagnostic instrumentation and may add
-/// backend measurement events or encoder boundaries.
+/// node indices. `Verification` retains full logical/kernel attribution while
+/// requiring eager command execution so a profiler can compare reusable
+/// execution against the same compiled bindings and resource layout. Replay
+/// and verification timing are diagnostic instrumentation and may add backend
+/// measurement events or encoder boundaries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
@@ -668,6 +671,7 @@ pub enum DeviceTimingMode {
     Completion = 1,
     Replay = 2,
     Kernel = 3,
+    Verification = 4,
 }
 
 impl DeviceTimingMode {
@@ -676,11 +680,19 @@ impl DeviceTimingMode {
     }
 
     pub const fn physical_span_attribution_enabled(self) -> bool {
-        matches!(self, Self::Replay | Self::Kernel)
+        matches!(self, Self::Replay | Self::Kernel | Self::Verification)
     }
 
     pub const fn kernel_attribution_enabled(self) -> bool {
-        matches!(self, Self::Kernel)
+        matches!(self, Self::Kernel | Self::Verification)
+    }
+
+    pub const fn direct_reusable_execution_allowed(self) -> bool {
+        !matches!(self, Self::Kernel | Self::Verification)
+    }
+
+    pub const fn executable_replay_allowed(self) -> bool {
+        !matches!(self, Self::Verification)
     }
 }
 
@@ -2073,7 +2085,7 @@ pub enum DeviceCommandPhase {
 
 /// Backend-observed physical work for one core-owned command entry.
 ///
-/// Rows are created only in `DeviceTimingMode::Kernel`. The node index is
+/// Rows are created only when kernel attribution is enabled. The node index is
 /// issued by core and binds backend work back to the immutable plan; backend
 /// labels and counters carry observation only and grant no execution authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2702,7 +2714,7 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     }
 
     /// Returns backend-observed native work for an already submitted fence.
-    /// Only `DeviceTimingMode::Kernel` fences may carry attribution. The
+    /// Only modes with kernel attribution enabled may carry attribution. The
     /// returned rows are diagnostic evidence and never grant completion or
     /// resource-release authority.
     fn submission_attribution(&self, _fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
@@ -2772,6 +2784,13 @@ mod execution_timing_tests {
         assert!(!DeviceTimingMode::Replay.kernel_attribution_enabled());
         assert!(DeviceTimingMode::Kernel.physical_span_attribution_enabled());
         assert!(DeviceTimingMode::Kernel.kernel_attribution_enabled());
+        assert!(DeviceTimingMode::Kernel.executable_replay_allowed());
+        assert!(!DeviceTimingMode::Kernel.direct_reusable_execution_allowed());
+        assert!(DeviceTimingMode::Verification.completion_enabled());
+        assert!(DeviceTimingMode::Verification.physical_span_attribution_enabled());
+        assert!(DeviceTimingMode::Verification.kernel_attribution_enabled());
+        assert!(!DeviceTimingMode::Verification.executable_replay_allowed());
+        assert!(!DeviceTimingMode::Verification.direct_reusable_execution_allowed());
         assert!(!DeviceTimingMode::Completion.physical_span_attribution_enabled());
         assert!(!DeviceTimingMode::Off.completion_enabled());
     }
