@@ -6260,9 +6260,9 @@ impl OperationDispatch {
             Self::reusable_execution_program_id_for_wave(providers, resolved, &wave, lane)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
         if let Some(reusable_program) = reusable_program {
-            if timing_mode == DeviceTimingMode::Kernel {
+            if !timing_mode.direct_reusable_execution_allowed() {
                 return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "kernel attribution requires full logical provider encoding",
+                    "kernel attribution or verification requires full logical provider encoding",
                 )));
             }
             let actual_program_id = reusable_execution_program_id.as_ref().ok_or_else(|| {

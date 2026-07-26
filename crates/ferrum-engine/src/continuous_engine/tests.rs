@@ -5854,6 +5854,35 @@ fn replay_vnext_profile_preserves_physical_timing_without_kernel_attribution() {
 }
 
 #[test]
+fn verification_vnext_profile_requires_eager_kernel_attribution() {
+    let trace_path = resource_trace_temp_path("vnext-verification-profile");
+    let _ = std::fs::remove_file(&trace_path);
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Verify;
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+
+    assert_eq!(
+        sink.capture_policy(),
+        ExecutionEventCapturePolicy::AllFrames
+    );
+    assert_eq!(
+        sink.device_timing_mode(),
+        ferrum_interfaces::vnext::DeviceTimingMode::Verification
+    );
+    assert!(sink.device_timing_mode().kernel_attribution_enabled());
+    assert!(!sink.device_timing_mode().executable_replay_allowed());
+    assert!(!sink
+        .device_timing_mode()
+        .direct_reusable_execution_allowed());
+
+    drop(sink);
+    journal.close().unwrap();
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
 fn replay_device_timing_is_owned_once_by_its_physical_span() {
     use ferrum_interfaces::vnext::{DeviceExecutionInterval, DeviceExecutionIntervalKind};
 

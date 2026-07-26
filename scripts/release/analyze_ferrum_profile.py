@@ -250,7 +250,7 @@ def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None
         profile_detail = attrs.get("profile_detail")
         diagnostic_only = attrs.get("diagnostic_only")
         if attrs.get("performance_claim") is True and (
-            profile_detail in {"debug", "full"} or diagnostic_only is True
+            profile_detail in {"debug", "replay", "verify", "full"} or diagnostic_only is True
         ):
             raise ValidationError(f"{context} uses diagnostic profile as performance claim")
         profile_count = attrs.get("profile_completed_requests")

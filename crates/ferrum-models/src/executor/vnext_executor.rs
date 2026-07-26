@@ -3756,6 +3756,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn device_timing_mode(&self) -> DeviceTimingMode {
         match self.device_timing_mode.load(Ordering::Acquire) {
+            value if value == DeviceTimingMode::Verification as u8 => {
+                DeviceTimingMode::Verification
+            }
             value if value == DeviceTimingMode::Kernel as u8 => DeviceTimingMode::Kernel,
             value if value == DeviceTimingMode::Replay as u8 => DeviceTimingMode::Replay,
             value if value == DeviceTimingMode::Completion as u8 => DeviceTimingMode::Completion,
@@ -4984,7 +4987,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let device_timing_mode = self.device_timing_mode();
             let mut reusable_catalog_miss = false;
             let mut reusable_catalog_epoch_miss = false;
-            let reusable_program = if device_timing_mode == DeviceTimingMode::Kernel
+            let reusable_program = if !device_timing_mode.direct_reusable_execution_allowed()
                 || reusable_direct_attempted
             {
                 None

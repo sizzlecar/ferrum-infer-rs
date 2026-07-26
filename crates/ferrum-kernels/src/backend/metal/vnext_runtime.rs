@@ -1736,9 +1736,10 @@ impl MetalDeviceRuntime {
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => MetalFenceTiming::NotRequested,
-            DeviceTimingMode::Completion | DeviceTimingMode::Replay | DeviceTimingMode::Kernel => {
-                MetalFenceTiming::CommandBuffer
-            }
+            DeviceTimingMode::Completion
+            | DeviceTimingMode::Replay
+            | DeviceTimingMode::Kernel
+            | DeviceTimingMode::Verification => MetalFenceTiming::CommandBuffer,
         };
         drop(begin_timing_stage);
 

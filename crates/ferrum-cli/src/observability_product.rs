@@ -26,6 +26,7 @@ pub enum ProfileDetailArg {
     Basic,
     Debug,
     Replay,
+    Verify,
     Full,
 }
 
@@ -36,6 +37,7 @@ impl ProfileDetailArg {
             Self::Basic => "basic",
             Self::Debug => "debug",
             Self::Replay => "replay",
+            Self::Verify => "verify",
             Self::Full => "full",
         }
     }
@@ -48,6 +50,7 @@ impl From<ProfileDetailArg> for ObservabilityProfileDetail {
             ProfileDetailArg::Basic => Self::Basic,
             ProfileDetailArg::Debug => Self::Debug,
             ProfileDetailArg::Replay => Self::Replay,
+            ProfileDetailArg::Verify => Self::Verify,
             ProfileDetailArg::Full => Self::Full,
         }
     }

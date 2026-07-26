@@ -70,6 +70,7 @@ pub enum ObservabilityProfileDetail {
     Basic,
     Debug,
     Replay,
+    Verify,
     Full,
 }
 
@@ -80,6 +81,7 @@ impl ObservabilityProfileDetail {
             "basic" => Some(Self::Basic),
             "debug" => Some(Self::Debug),
             "replay" => Some(Self::Replay),
+            "verify" => Some(Self::Verify),
             "full" => Some(Self::Full),
             _ => None,
         }
@@ -91,12 +93,13 @@ impl ObservabilityProfileDetail {
             Self::Basic => "basic",
             Self::Debug => "debug",
             Self::Replay => "replay",
+            Self::Verify => "verify",
             Self::Full => "full",
         }
     }
 
     pub fn diagnostic_only(self) -> bool {
-        matches!(self, Self::Debug | Self::Replay | Self::Full)
+        matches!(self, Self::Debug | Self::Replay | Self::Verify | Self::Full)
     }
 }
 
@@ -411,6 +414,16 @@ mod tests {
         assert_eq!(ObservabilityProfileDetail::Replay.as_str(), "replay");
         assert!(ObservabilityProfileDetail::Replay.diagnostic_only());
         assert!(!ObservabilityProfileDetail::Basic.diagnostic_only());
+    }
+
+    #[test]
+    fn verification_profile_detail_is_typed_and_diagnostic_only() {
+        assert_eq!(
+            ObservabilityProfileDetail::parse(" verify "),
+            Some(ObservabilityProfileDetail::Verify)
+        );
+        assert_eq!(ObservabilityProfileDetail::Verify.as_str(), "verify");
+        assert!(ObservabilityProfileDetail::Verify.diagnostic_only());
     }
 
     #[test]
