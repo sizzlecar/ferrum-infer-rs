@@ -1385,6 +1385,55 @@ Both Vast instances `45319871` and `45897840` were then confirmed
 formal C12 or 703-case CUDA PASS, which still requires validation on the
 current clean source.
 
+### 2026-07-26 Current-SHA C12 PASS and C09 Trace-Scope Rejection
+
+Clean source `4ca173deb0ab2a5a941eca6998276b266907f917` bound the unchanged CUDA
+binary SHA256
+`5c73d6b0952f91265e31483dc8e1bc7f9c05e46fee850d6b8916348d7756d39b`;
+the cached build completed in `1.207625s`. The current-SHA affected-contract
+run passed all C12 cases, including the former `c12-023` blocker:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-c12-contract-4ca173de-20260726T1247Z/correctness/focused-c12-report.json
+```
+
+The canonical 703-case runner then completed `203` cases successfully and
+stopped at the first failure, `c09-001`, rather than restarting the matrix:
+
+```text
+FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS FAIL: /workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-matrix-4ca173de-20260726T1256Z/correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json: case c09-001 unexpected status: expected pass, observed known-fail; failure class drift: expected None, observed c09-contract-violation; checker: case c09-001 did not exercise an admitted cancellation with terminal release
+```
+
+The request-scoped trace proves the opposite product result. Target request
+`f53dd466-1bc3-416f-87ab-9d3181556a8d` reached admission, emitted exactly one
+disconnect detection and release pair, closed with zero outstanding resources,
+and reached `terminal_state=released` in `0` scheduler ticks and
+`0.000655372s`. The recovery request returned HTTP 200 and also closed with
+zero outstanding resources. The abort collection window additionally contained
+the preceding request's late completion/close rows. The checker incorrectly
+required the entire window to contain at most one lifecycle instead of binding
+derivation to the `admission_request_id` already captured by the transport
+probe.
+
+The checker now preserves every raw trace row but derives cancel ownership only
+from that authoritative request id. A regression fixture injects a prior
+request tail and still requires the target cancel to release; missing target
+release, scheduler-tick overrun, duplicate release, and missing recovery close
+remain negative cases. Revalidation of the saved real transcript prints:
+
+```text
+C09-001 SAVED ARTIFACT REQUEST-SCOPED REVALIDATION PASS
+```
+
+The GitHub-transferred failure bundle contains 442 evidence files:
+[`runtime-vnext-g08b-cuda-matrix-4ca173de-20260726T1256Z.failure-bundle.tar.zst`](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-g08b-cuda-matrix-4ca173de-20260726T1256Z.failure-bundle.tar.zst),
+SHA256
+`ea000542d3a3b1db6cf598fb2a37c13c3fcb3f56e9bb83b6d2c204919ca02205`.
+The full 394 MiB root and 85 MiB archive remain on retained instance
+`45897840`; both Vast instances are confirmed `stopped/exited`, with no
+billable sibling. G08B CUDA remains open until the corrected clean SHA passes
+focused C09 and a canonical 703-case gate.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
