@@ -103,6 +103,13 @@ C01/C20 不生成模型输出的 negative case 不应用 sampling；C20 的纯�
 case 使用 `P_DETERMINISTIC`。M3 的 soft `/think`、`/no_think` 只改变 C19 和明确标记的 tool
 子组，不得改变其他 preset 的 hard `enable_thinking` 值。
 
+C11/C12 是上述 preset 的确定性 parity 子协议：保留 `P_NO_THINKING`/`P_THINKING` 的
+template kwargs、thinking mode 和 output budget，但把实际 request 的 sampling 字段显式替换为
+同模型 `P_DETERMINISTIC` 的 sampling vector，并在 request metadata 记录
+`g00_sampling_contract=deterministic-stream-parity`。C10/C13-C15 仍使用各自 preset 的官方
+sampling；C21 继续覆盖官方默认随机采样路径。不得用 fixed seed 下的随机采样逐 token 相等代替
+C11/C12 的确定性 stream parity，也不得因 parity 子协议而跳过 C21。
+
 下表是 vNext 在 G08/G10 的最终硬合同。G00 仍逐项运行可执行的 legacy case，但必须按
 `runtime_vnext_legacy_correctness_expectations.json` 冻结为 `pass`、`known-fail` 或
 `blocked`；未知事实先进入不产生 PASS 的 discovery 阶段。不得因为下表是最终标准，就把 G05
