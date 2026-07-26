@@ -1345,6 +1345,46 @@ Vast instance `45319871` was stopped and polled to
 `cur_state=stopped,actual_status=exited`. G08B remains Open; this REJECT does
 not satisfy the 703-case CUDA matrix or any Metal requirement.
 
+### 2026-07-26 C12-023 Reusable-Execution A/B
+
+Commit `080ee3ba38435c89653acd258e5fdce397bc3f6b` restored the request-side
+deterministic sampling vector. Its clean CUDA binary SHA256 was
+`5c73d6b0952f91265e31483dc8e1bc7f9c05e46fee850d6b8916348d7756d39b`.
+The resulting focused C12 run again accepted the first 22 cases and rejected
+`c12-023`: non-stream used 88 completion tokens and stream used 91, while both
+returned HTTP 200, `finish_reason=tool_calls`, exactly one valid
+`lookup_weather({"city":"Paris"})` call, and valid stream termination/usage.
+
+A bounded same-binary, same-model A/B then ran the request sequence
+`N,N,S,N,S,S,N,S` with reusable execution enabled and explicitly disabled.
+All 16 requests returned the same correct tool call. Reusable-on produced
+completion counts `[85,88,89,94]` and five distinct full
+reasoning/output records; reusable-off produced `[88,94,95,102]` and six.
+The exact diagnostic result was:
+
+```text
+CUDA C12-023 REUSABLE A/B KEEP: /workspace/ferrum-artifacts/c12-023-reuse-ab-080ee3ba-20260726T122334Z (reusable-independent-numerical-or-kernel-nondeterminism)
+```
+
+This falsifies both a stream-only state leak and reusable-execution replay as
+the cause: even consecutive non-stream requests vary with reusable execution
+disabled. It also exposes an incorrect validator boundary. The C12 goal row
+requires deep-equal reconstructed tool calls and valid per-response usage, not
+cross-request equality of hidden reasoning or completion token counts in the
+absence of a typed batch-invariant mode. The validator now keeps C12 tool/SSE,
+usage arithmetic, equal prompt-token count, schema, finish, and empty-content
+checks hard while retaining hidden reasoning and completion-token differences
+as diagnostic evidence. C06/C17 exact parity remains unchanged, and C21
+official sampling no longer inherits an accidental exact-output requirement.
+
+The compact A/B artifact was transferred GPU-to-GitHub without SCP:
+`c12-023-reuse-ab-080ee3ba-20260726T122334Z.tar.zst`, SHA256
+`cfbd03b28917d469e84b82fe1d5df778b0dacfa2c9c236f3e91a9bc04752fa56`.
+Both Vast instances `45319871` and `45897840` were then confirmed
+`stopped/exited`. This diagnostic corrects the gate hypothesis; it is not the
+formal C12 or 703-case CUDA PASS, which still requires validation on the
+current clean source.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
