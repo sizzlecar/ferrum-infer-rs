@@ -1434,6 +1434,58 @@ The full 394 MiB root and 85 MiB archive remain on retained instance
 billable sibling. G08B CUDA remains open until the corrected clean SHA passes
 focused C09 and a canonical 703-case gate.
 
+### 2026-07-26 C13 Attribution Fix and Verify-Scope Rejection
+
+Commit `f7b37f083b043fdf04b6bebecb4719a7538eb4a3` made executor startup
+events observable. Its first focused C13 run then failed before the request
+could execute because core-created workspace-zero commands carried physical
+transfer work but no node-bound logical participant/token shape. Commit
+`47d9438418bf05857b1add0271da212843e4284b` added typed core logical work
+to the command boundary and bound it in both CUDA and Metal without replacing
+provider-owned attribution. The focused interface, scratch-reuse, CUDA, and
+Metal tests passed, as did `cargo check --workspace --all-targets`.
+
+The clean CUDA build took `443.10178s`; its binary SHA256 is
+`94cfdb45ffb55243562bb69e5a3d727ac1be64baec3a07b239861cdf4c1108ae`.
+The real-model request passed the former submission blocker. Its trace contains
+`20,640` valid node-scoped workspace-zero rows; the first prefill row binds
+`node_index=1`, `batching_form=packed`, `participant_count=1`,
+`token_count=61`, and one physical transfer. No runtime log contains the former
+`invalid native work metadata` error, panic, crash, OOM, or KV overflow.
+
+The same diagnostic is nevertheless REJECT:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-g08b-c13-verify-47d94384-20260726T193741Z/focused-report.json: case c13-021 unexpected status: expected pass, observed known-fail; failure class drift: expected None, observed c13-contract-violation; checker: case c13-021 expected HTTP 200
+```
+
+The manually amended command used `profile-detail=verify` and sample rate `1`
+for the entire unbounded C13 response. Verification mode intentionally forces
+eager command timing, disables direct reusable execution, and captures every
+frame. In `900.078722s` it completed only `258` decode frames while producing
+`191,549` profile rows, approximately `742.44` rows per frame. The non-streaming
+client then returned `TimeoutError`; the server was still live and no request
+terminal event had been emitted. Because no partial content is available, this
+artifact cannot distinguish a later model EOS from verify-mode host overhead
+and is not a C13 output-correctness result.
+
+The complete artifact is available as
+[`runtime-vnext-g08b-c13-verify-47d94384-20260726T193741Z.tar.zst`](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-g08b-c13-verify-47d94384-20260726T193741Z.tar.zst),
+75,220,637 bytes, SHA256
+`3c192339f32ca77bd6fb9208d718f67129260e77424cee03bb41dd383d8a4625`.
+The GitHub-downloaded local copy matches that hash. Vast instance `45897840`
+was then stopped and polled to `cur_state=stopped,actual_status=exited`; no
+other paid or scheduling instance exists.
+
+The next bounded CUDA action reuses this exact binary and cached instance but
+uses the unmodified product-default manifest with no manual profile flags. It
+runs only `c13-021`; KEEP requires HTTP 200 and response content incorporating
+the tool result `21`. Any timeout or content miss is a new correctness REJECT.
+The existing verify artifact remains the attribution proof, while the
+product-default run decides C13 correctness. No performance claim is attached
+to either focused diagnostic, and no full matrix may restart before this case
+is classified.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
