@@ -9,7 +9,7 @@
 //! - Validation before engine creation
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
-use ferrum_interfaces::engine::LlmInferenceEngine;
+use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
     TensorFactory, Tokenizer,
@@ -448,14 +448,8 @@ impl EngineBuilder {
             _ => (None, None),
         };
 
-        // This is the single product readiness boundary shared by `run` and
-        // `serve`. Executor-owned compilation and warmup must finish here so
-        // it cannot leak into the first request or diverge by entrypoint.
-        executor.prepare_startup().await?;
-        if let Some(draft) = draft_executor.as_ref() {
-            draft.prepare_startup().await?;
-        }
-
+        // Construct the unpublished engine shell first so its typed profile
+        // sink is attached before executor startup emits warmup/capture events.
         let engine = match execution_resource_authority {
             ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime => {
                 crate::ContinuousBatchEngine::new_plan_runtime(
@@ -463,7 +457,7 @@ impl EngineBuilder {
                     cb_scheduler,
                     tokenizer,
                     sampler,
-                    executor,
+                    Arc::clone(&executor),
                     tensor_factory,
                 )?
             }
@@ -477,14 +471,34 @@ impl EngineBuilder {
                     tokenizer,
                     sampler,
                     kv_cache,
-                    executor,
+                    Arc::clone(&executor),
                     tensor_factory,
-                    draft_executor,
+                    draft_executor.clone(),
                     spec_config,
                     recurrent_state_manager,
                 )?
             }
         };
+
+        // This is the single product readiness boundary shared by `run` and
+        // `serve`. The engine is not exposed until executor-owned compilation
+        // and warmup complete, but those events now share the product trace.
+        let startup_result = async {
+            executor.prepare_startup().await?;
+            if let Some(draft) = draft_executor.as_ref() {
+                draft.prepare_startup().await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(startup_error) = startup_result {
+            if let Err(shutdown_error) = engine.shutdown().await {
+                tracing::warn!(
+                    "Failed to close engine resources after startup rejection: {shutdown_error}"
+                );
+            }
+            return Err(startup_error);
+        }
         Ok(Box::new(engine))
     }
 }
@@ -595,11 +609,15 @@ mod tests {
             DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
             ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
         },
+        vnext::ExecutionEventSink,
         RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats,
         RecurrentStateSpec, RecurrentStateTensorSpec,
     };
     use ferrum_types::{DataType, Device, RequestId};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    };
 
     #[derive(Debug)]
     struct NoopRecurrentStateManager;
@@ -612,6 +630,12 @@ mod tests {
         inner: ferrum_testkit::MockModelExecutor,
         calls: Arc<AtomicUsize>,
         fail: bool,
+    }
+
+    struct ProfileStartupProbeExecutor {
+        inner: ferrum_testkit::MockModelExecutor,
+        event_sink: Mutex<Option<Arc<dyn ExecutionEventSink>>>,
+        saw_sink_during_startup: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -643,6 +667,118 @@ mod tests {
         fn status(&self) -> ExecutorStatus {
             self.inner.status()
         }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelExecutor for ProfileStartupProbeExecutor {
+        fn info(&self) -> &ferrum_types::ModelInfo {
+            self.inner.info()
+        }
+
+        async fn prepare_startup(&self) -> Result<()> {
+            use ferrum_interfaces::vnext::{ExecutionEventEmitter, TrustedExecutionEventContext};
+
+            let sink = self
+                .event_sink
+                .lock()
+                .expect("profile startup probe sink lock")
+                .clone();
+            self.saw_sink_during_startup
+                .store(sink.is_some(), Ordering::Release);
+            let Some(sink) = sink else {
+                return Ok(());
+            };
+            let (run_id, request_id, event) = startup_profile_test_event();
+            ExecutionEventEmitter::from_shared(sink, run_id.clone(), request_id.clone())
+                .emit(
+                    event,
+                    &TrustedExecutionEventContext::pre_plan(&run_id, &request_id),
+                )
+                .map_err(|error| {
+                    FerrumError::internal(format!("emit startup profile probe: {error}"))
+                })
+        }
+
+        fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+            *self
+                .event_sink
+                .lock()
+                .expect("profile startup probe sink lock") = Some(sink);
+        }
+
+        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+            self.inner.prefill(input).await
+        }
+
+        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+            self.inner.decode(input).await
+        }
+
+        fn capabilities(&self) -> ExecutorCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn status(&self) -> ExecutorStatus {
+            self.inner.status()
+        }
+    }
+
+    fn startup_profile_test_event() -> (
+        ferrum_interfaces::vnext::RunId,
+        ferrum_interfaces::vnext::RequestIdentity,
+        ferrum_interfaces::vnext::ExecutionEvent,
+    ) {
+        use ferrum_interfaces::vnext::{
+            ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
+            ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp, RequestIdentity, RunId,
+            SpanId, EXECUTION_IDENTITY_VERSION,
+        };
+
+        let run_id = RunId::new("run.vnext.builder-startup-profile").unwrap();
+        let request_id = RequestIdentity::new("request.vnext.builder-startup-profile").unwrap();
+        let event = ExecutionEvent::new(
+            MonotonicTimestamp {
+                nanos_since_run_start: 1,
+            },
+            ExecutionPhase::Resolution,
+            ExecutionEventKind::RequestAccepted,
+            ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+                version: EXECUTION_IDENTITY_VERSION,
+                run_id: run_id.clone(),
+                request_id: request_id.clone(),
+                sequence: 1,
+                plan_id: None,
+                plan_hash: None,
+                frame_id: None,
+                node_invocation_id: None,
+                node_id: None,
+                operation_id: None,
+                provider_id: None,
+                device_id: None,
+                resource_pool_id: None,
+                resource_pool_identity_fingerprint: None,
+                provisioning_run_id: None,
+                provisioning_request_id: None,
+                transaction_id: None,
+                active_sequence_slot: None,
+                admission_generation: None,
+                activation_epoch: None,
+                runtime_implementation_fingerprint: None,
+                active_sequence_fingerprint: None,
+                completed_sequence_fingerprint: None,
+                aborted_sequence_fingerprint: None,
+                resource_id: None,
+                resource_generation: None,
+                resource_batch_fingerprint: None,
+                span_id: SpanId::new("vnext/request/builder-startup-profile").unwrap(),
+                parent_span_id: None,
+                async_links: Vec::new(),
+            })
+            .unwrap(),
+            ExecutionEventDetail::None,
+        )
+        .unwrap();
+        (run_id, request_id, event)
     }
 
     #[async_trait::async_trait]
@@ -986,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_preparation_runs_once_and_blocks_engine_construction_on_failure() {
+    async fn startup_preparation_runs_once_and_blocks_engine_publication_on_failure() {
         let success_calls = Arc::new(AtomicUsize::new(0));
         let success: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
@@ -1014,6 +1150,46 @@ mod tests {
             .expect("failed startup preparation must stop engine construction");
         assert!(error.to_string().contains("startup preparation rejected"));
         assert_eq!(failure_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn product_profile_captures_startup_events_before_engine_readiness() {
+        let trace_path = std::env::temp_dir().join(format!(
+            "ferrum-builder-startup-profile-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&trace_path);
+        let saw_sink_during_startup = Arc::new(AtomicBool::new(false));
+        let executor: Arc<dyn ModelExecutor + Send + Sync> =
+            Arc::new(ProfileStartupProbeExecutor {
+                inner: ferrum_testkit::MockModelExecutor::instant(128),
+                event_sink: Mutex::new(None),
+                saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
+            });
+        let mut config = EngineConfig::default();
+        config.runtime.profile_jsonl = Some(trace_path.clone());
+        config.runtime.profile_entrypoint = Some(ferrum_types::ProfileEntrypoint::Run);
+
+        let engine = EngineBuilder::new(config)
+            .with_custom_executor(executor)
+            .build()
+            .await
+            .expect("profile-enabled startup builds the engine");
+        assert!(saw_sink_during_startup.load(Ordering::Acquire));
+        engine.shutdown().await.unwrap();
+
+        let startup_events = std::fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["phase"] == "vnext.request_accepted")
+            .count();
+        assert_eq!(startup_events, 1);
+        let _ = std::fs::remove_file(trace_path);
     }
 
     #[tokio::test]
