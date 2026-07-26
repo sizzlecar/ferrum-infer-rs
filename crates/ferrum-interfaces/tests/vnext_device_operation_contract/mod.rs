@@ -1211,15 +1211,21 @@ impl DeviceRuntime for TestRuntime {
                             TestCommand::Upload => ("test_upload", 0, 1),
                             TestCommand::Zero => ("test_zero", 0, 1),
                         };
+                    let logical_work = entry.logical_work();
                     DeviceNativeWorkAttribution::new(
                         u32::try_from(command_index).ok()?,
                         entry.node_index(),
                         entry.phase(),
                         native_op_id,
                         DeviceExecutionPath::Eager,
-                        DeviceBatchingForm::Scalar,
-                        u32::from(entry.node_index().is_some()),
-                        u64::from(entry.node_index().is_some()),
+                        logical_work
+                            .map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
+                        logical_work.map_or(u32::from(entry.node_index().is_some()), |work| {
+                            work.participant_count()
+                        }),
+                        logical_work.map_or(u64::from(entry.node_index().is_some()), |work| {
+                            work.token_count()
+                        }),
                         compute_dispatch_count,
                         transfer_command_count,
                         None,
@@ -1242,7 +1248,7 @@ impl DeviceRuntime for TestRuntime {
         let commands = entries
             .into_iter()
             .map(DeviceCommandEntry::into_parts)
-            .map(|(_, _, command)| command)
+            .map(|(_, _, _, command)| command)
             .collect::<Vec<_>>();
         let command_count = commands.len();
         let (drift, behavior, fence) = {

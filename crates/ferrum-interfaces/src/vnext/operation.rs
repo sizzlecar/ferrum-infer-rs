@@ -13,8 +13,9 @@ use super::{
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
     CanonicalRational, CapabilityId, ClaimedSubmissionWaveBacking, CompletionHandle,
     CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority,
-    DefinitelyNotSubmittedWaveRetryAuthority, DeviceBufferRetention, DeviceCommandBatch, DeviceId,
-    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm, DeviceBufferRetention,
+    DeviceCommandBatch, DeviceCommandLogicalWork, DeviceId, DeviceReusableAddressScope,
+    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceSubmissionAttribution,
     DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
@@ -4994,6 +4995,22 @@ where
             "scratch workspace initialization has no participant identity",
         ))
     })?;
+    let participant_count = u32::try_from(node_identity.participants().len()).map_err(|_| {
+        OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace participant count exceeds u32",
+        ))
+    })?;
+    if participant_count != work.immediate_sequences() {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace logical participants differ from its resource work",
+        )));
+    }
+    let logical_work = DeviceCommandLogicalWork::new(
+        DeviceBatchingForm::Packed,
+        participant_count,
+        work.immediate_tokens(),
+    )
+    .map_err(OperationDispatchError::Contract)?;
     let identity = participant.identity().clone();
     let mut encoded_bytes = 0_u64;
     let mut command_count = 0_usize;
@@ -5017,7 +5034,7 @@ where
                     .map(OperationDispatchError::Initialization)
                     .unwrap_or_else(OperationDispatchError::Contract)
             })?;
-        commands.push_node_initialization(node_index, command);
+        commands.push_node_initialization(node_index, logical_work, command);
         encoded_bytes = encoded_bytes.checked_add(length_bytes).ok_or_else(|| {
             OperationDispatchError::Contract(invalid_operation(
                 "scratch workspace zero byte count overflows u64",
