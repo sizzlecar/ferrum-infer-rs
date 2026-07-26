@@ -9,11 +9,11 @@
   "goal_documents": [
     {
       "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
-      "sha256": "0fb764f0f905754a5f40a5a7ec70bacb648fad5d497ccce6debe5ed487018f58"
+      "sha256": "e51fd26b9620a61e828587df6a22f35e8528a1d707e6ba5e50c42cf941519d33"
     },
     {
       "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",
-      "sha256": "0e5b3cbd0b51c59cfa8b73ac9b454ec7cd64351d1beb5fabb9313d88da5c006c"
+      "sha256": "86e1aa790ce5d7ef4da1e5c34e44884f6590c23f7c1f51a909d86677a7c9f33d"
     }
   ],
   "expected_family_ids": [

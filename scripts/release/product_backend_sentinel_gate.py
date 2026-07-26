@@ -326,7 +326,7 @@ def write_blocker_profile_fixture(
                 "backend": "synthetic",
                 "runtime_preset_hash": SYNTHETIC_RUNTIME_PRESET_HASH,
                 "phase": "admission",
-                "event_kind": "instant",
+                "event_kind": "resource",
                 "timestamp": "2026-07-02T00:00:00Z",
                 "status": "ok",
                 "model": "synthetic/no-weight",
@@ -1180,6 +1180,8 @@ def actual_smoke_profile_event(
     memory: dict[str, Any] | None = None,
     replay_bundle_dir: Path | None = None,
 ) -> dict[str, Any]:
+    if resource is not None:
+        event_kind = "resource"
     event: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "ts_unix_nanos": 1782950400000000000,
