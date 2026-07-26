@@ -1459,6 +1459,26 @@ def response_message(response: dict[str, Any], label: str) -> tuple[dict[str, An
     return message, content or ""
 
 
+def validate_completion_usage(raw: Any, label: str) -> dict[str, Any]:
+    usage = require_object(raw, label)
+    prompt_tokens = require_count(
+        usage.get("prompt_tokens"), f"{label}.prompt_tokens", minimum=1
+    )
+    completion_tokens = require_count(
+        usage.get("completion_tokens"),
+        f"{label}.completion_tokens",
+        minimum=1,
+    )
+    total_tokens = require_count(
+        usage.get("total_tokens"), f"{label}.total_tokens", minimum=2
+    )
+    require(
+        total_tokens == prompt_tokens + completion_tokens,
+        f"{label}.total_tokens is not prompt_tokens + completion_tokens",
+    )
+    return usage
+
+
 def history_response_message(exchange: dict[str, Any], label: str, errors: list[dict[str, Any]]) -> dict[str, Any] | None:
     raw_response = exchange.get("response")
     try:
@@ -1729,20 +1749,76 @@ def validate_case_output(
         reference_response = require_object(exchanges[0].get("response"), f"{label}.reference.response")
         reference_message, reference_content = response_message(reference_response, f"{label}.reference")
         reference_choice = require_object(require_list(reference_response.get("choices"), f"{label}.reference.choices")[0], f"{label}.reference.choice")
-        require(reconstruction.get("finish_reason") == reference_choice.get("finish_reason"), f"{label} stream finish_reason differs from non-stream")
-        require(reconstruction.get("usage") == reference_response.get("usage"), f"{label} stream usage differs from non-stream")
+        reference_usage = validate_completion_usage(
+            reference_response.get("usage"), f"{label}.reference.usage"
+        )
+        stream_usage = validate_completion_usage(
+            reconstruction.get("usage"), f"{label}.stream.usage"
+        )
         reference_reasoning = reference_message.get("reasoning", reference_message.get("reasoning_content")) or ""
-        require(reconstruction.get("reasoning", "") == reference_reasoning, f"{label} stream reasoning differs from non-stream")
-        if scenario_id in {"C06", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
+        streamed_reasoning = reconstruction.get("reasoning", "")
+        require(
+            isinstance(reference_reasoning, str)
+            and isinstance(streamed_reasoning, str),
+            f"{label} reasoning fields must be strings",
+        )
+        if scenario_id in {"C06", "C17"}:
+            require(reconstruction.get("finish_reason") == reference_choice.get("finish_reason"), f"{label} stream finish_reason differs from non-stream")
+            require(stream_usage == reference_usage, f"{label} stream usage differs from non-stream")
+            require(streamed_reasoning == reference_reasoning, f"{label} stream reasoning differs from non-stream")
             require(reconstruction.get("content") == reference_content, f"{label} stream content differs from non-stream")
             require(reference_content == observed.get("expected_marker"), f"{label} paired reference returned unexpected content")
         if scenario_id == "C12":
+            require(
+                reference_choice.get("finish_reason") == "tool_calls"
+                and reconstruction.get("finish_reason") == "tool_calls",
+                f"{label} C11/C12 pair must finish with tool_calls",
+            )
+            require(
+                reference_usage.get("prompt_tokens")
+                == stream_usage.get("prompt_tokens"),
+                f"{label} C11/C12 prompt token counts differ",
+            )
+            require(
+                reference_content == "" and reconstruction.get("content") == "",
+                f"{label} C11/C12 tool response fabricated content",
+            )
             reference_calls = require_list(reference_message.get("tool_calls"), f"{label}.reference.tool_calls")
             streamed_calls = require_list(reconstruction.get("tool_calls"), f"{label}.stream.tool_calls")
+            require(
+                len(reference_calls) == len(streamed_calls) == 1,
+                f"{label} C11/C12 pair must contain exactly one tool call",
+            )
             require(streamed_calls == reference_calls, f"{label} streamed tool call differs from matching C11 non-stream call")
             function = require_object(require_object(streamed_calls[0], f"{label}.stream.tool_calls[0]").get("function"), f"{label}.stream.function")
             arguments = json.loads(require_string(function.get("arguments"), f"{label}.stream.arguments"))
             require(arguments == {"city": "Paris"}, f"{label} reconstructed tool arguments are invalid")
+        if scenario_id == "C21" and variant == "serve-stream":
+            marker = require_string(
+                observed.get("expected_marker"),
+                f"{label}.observed.expected_marker",
+            )
+            require(
+                reference_choice.get("finish_reason") in {"stop", "eos"}
+                and reconstruction.get("finish_reason") in {"stop", "eos"},
+                f"{label} official sampling stream did not terminate naturally",
+            )
+            require(
+                reference_usage.get("prompt_tokens")
+                == stream_usage.get("prompt_tokens"),
+                f"{label} official sampling prompt token counts differ",
+            )
+            streamed_content = reconstruction.get("content")
+            require(
+                isinstance(streamed_content, str)
+                and reference_content.strip()
+                and streamed_content.strip(),
+                f"{label} official sampling stream returned empty content",
+            )
+            require(
+                marker in reference_content and marker in streamed_content,
+                f"{label} official sampling stream lost its expected marker",
+            )
         if scenario_id == "C17":
             wire = require_object(transcript.get("utf8_wire_evidence"), f"{label}.utf8_wire_evidence")
             chunks = [base64.b64decode(require_string(value, f"{label}.wire_chunk"), validate=True) for value in require_list(wire.get("chunks_base64"), f"{label}.chunks_base64")]
@@ -10178,8 +10254,243 @@ def self_test_c18_trace_scope() -> int:
     return 0
 
 
+def self_test_stream_pair_contracts() -> None:
+    def usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+    def transcript(
+        *,
+        case_id: str,
+        reference_request: dict[str, Any],
+        reference_message: dict[str, Any],
+        reference_finish: str,
+        reference_usage: dict[str, int],
+        stream_content: str,
+        stream_reasoning: str,
+        stream_finish: str,
+        stream_usage: dict[str, int],
+        stream_tool_calls: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        stream_request = copy.deepcopy(reference_request)
+        stream_request.update(
+            {"stream": True, "stream_options": {"include_usage": True}}
+        )
+        return {
+            "case_id": case_id,
+            "exchanges": [
+                {
+                    "request": reference_request,
+                    "status": 200,
+                    "response": {
+                        "choices": [
+                            {
+                                "message": reference_message,
+                                "finish_reason": reference_finish,
+                            }
+                        ],
+                        "usage": reference_usage,
+                    },
+                },
+                {"request": stream_request, "status": 200, "response": {}},
+            ],
+            "done_count": 1,
+            "usage_count": 1,
+            "delta_count": 2,
+            "stream_reconstruction": {
+                "malformed_count": 0,
+                "content": stream_content,
+                "reasoning": stream_reasoning,
+                "finish_reason": stream_finish,
+                "usage": stream_usage,
+                "tool_calls": stream_tool_calls,
+            },
+        }
+
+    with tempfile.TemporaryDirectory(
+        prefix="runtime-vnext-stream-contract-"
+    ) as tmp:
+        stdout_path = Path(tmp) / "stdout.log"
+        stdout_path.write_text("{}\n", encoding="utf-8")
+        tool_calls = [
+            {
+                "id": "call-c12-023",
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+            }
+        ]
+        c12_request = {
+            "model": "m2-qwen35-35b-a3b",
+            "messages": [{"role": "user", "content": "Use lookup_weather for Paris."}],
+            "metadata": {
+                "g00_ordinal": 23,
+                "g00_reference_contract": "C11",
+                "g00_reference_case_id": "c11-023",
+            },
+        }
+        c12 = transcript(
+            case_id="c12-023",
+            reference_request=c12_request,
+            reference_message={
+                "content": None,
+                "reasoning_content": "reference numerical branch",
+                "tool_calls": tool_calls,
+            },
+            reference_finish="tool_calls",
+            reference_usage=usage(284, 88),
+            stream_content="",
+            stream_reasoning="different valid numerical branch",
+            stream_finish="tool_calls",
+            stream_usage=usage(284, 91),
+            stream_tool_calls=copy.deepcopy(tool_calls),
+        )
+        validate_case_output(
+            "C12",
+            "streamed-tool",
+            "serve",
+            stdout_path,
+            c12,
+            {"case_id": "c12-023"},
+            "C12 numerical-branch fixture",
+        )
+        c12_prompt_mismatch = copy.deepcopy(c12)
+        c12_prompt_mismatch["stream_reconstruction"]["usage"] = usage(285, 91)
+        prompt_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C12",
+                "streamed-tool",
+                "serve",
+                stdout_path,
+                c12_prompt_mismatch,
+                {"case_id": "c12-023"},
+                "C12 prompt mismatch fixture",
+            )
+        )
+        require(
+            isinstance(prompt_failure, ScenarioError)
+            and "prompt token counts differ" in str(prompt_failure),
+            "C12 accepted mismatched prompt usage",
+        )
+        c12_tool_mismatch = copy.deepcopy(c12)
+        c12_tool_mismatch["stream_reconstruction"]["tool_calls"][0]["function"][
+            "arguments"
+        ] = '{"city":"London"}'
+        tool_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C12",
+                "streamed-tool",
+                "serve",
+                stdout_path,
+                c12_tool_mismatch,
+                {"case_id": "c12-023"},
+                "C12 tool mismatch fixture",
+            )
+        )
+        require(
+            isinstance(tool_failure, ScenarioError)
+            and "streamed tool call differs" in str(tool_failure),
+            "C12 accepted a semantically different streamed tool call",
+        )
+
+        c06_request = {
+            "model": "m2-qwen35-35b-a3b",
+            "messages": [{"role": "user", "content": "Return C06-MARKER."}],
+            "metadata": {
+                "g00_ordinal": 1,
+                "g00_reference_contract": "C05",
+                "g00_reference_case_id": "c05-001",
+            },
+        }
+        c06 = transcript(
+            case_id="c06-001",
+            reference_request=c06_request,
+            reference_message={
+                "content": "C06-MARKER",
+                "reasoning_content": "reference reasoning",
+            },
+            reference_finish="stop",
+            reference_usage=usage(8, 4),
+            stream_content="C06-MARKER",
+            stream_reasoning="different reasoning",
+            stream_finish="stop",
+            stream_usage=usage(8, 4),
+            stream_tool_calls=[],
+        )
+        c06_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C06",
+                "stream",
+                "serve",
+                stdout_path,
+                c06,
+                {"case_id": "c06-001", "expected_marker": "C06-MARKER"},
+                "C06 exact parity fixture",
+            )
+        )
+        require(
+            isinstance(c06_failure, ScenarioError)
+            and "reasoning differs" in str(c06_failure),
+            "C06 lost its exact stream parity contract",
+        )
+
+        c21_request = {
+            "model": "m2-qwen35-35b-a3b",
+            "messages": [{"role": "user", "content": "Discuss C21-MARKER."}],
+            "metadata": {"g00_ordinal": 1},
+        }
+        c21 = transcript(
+            case_id="c21-005",
+            reference_request=c21_request,
+            reference_message={
+                "content": "C21-MARKER reference answer",
+                "reasoning_content": "reference sampled reasoning",
+            },
+            reference_finish="stop",
+            reference_usage=usage(12, 6),
+            stream_content="C21-MARKER streamed answer",
+            stream_reasoning="different sampled reasoning",
+            stream_finish="eos",
+            stream_usage=usage(12, 8),
+            stream_tool_calls=[],
+        )
+        validate_case_output(
+            "C21",
+            "serve-stream",
+            "serve",
+            stdout_path,
+            c21,
+            {"case_id": "c21-005", "expected_marker": "C21-MARKER"},
+            "C21 stochastic stream fixture",
+        )
+        c21_missing_marker = copy.deepcopy(c21)
+        c21_missing_marker["stream_reconstruction"]["content"] = "unrelated output"
+        marker_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C21",
+                "serve-stream",
+                "serve",
+                stdout_path,
+                c21_missing_marker,
+                {"case_id": "c21-005", "expected_marker": "C21-MARKER"},
+                "C21 missing marker fixture",
+            )
+        )
+        require(
+            isinstance(marker_failure, ScenarioError)
+            and "lost its expected marker" in str(marker_failure),
+            "C21 accepted a sampled response that lost the requested marker",
+        )
+
+
 def self_test() -> int:
     self_test_c18_trace_scope()
+    self_test_stream_pair_contracts()
     validate_c17_markers()
     focus_fixture_rows = [
         {"case_id": "c01-001", "scenario_id": "C01"},
