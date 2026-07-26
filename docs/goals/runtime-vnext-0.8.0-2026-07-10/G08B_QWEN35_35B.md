@@ -1292,6 +1292,59 @@ Compact evidence is on GitHub branch
 archive SHA256 is
 `ea93671ead07eec23bafc921a24962a0140ee9c21c933ffc09f90ea8f77cb909`.
 
+### 2026-07-26 C12 Sampling-Contract Rejection
+
+Commit `836c54deb25c5d8b43ce643a024ed4c226e37aec` replaced the ambiguous
+optional reusable-topology fingerprint with typed `Static`, `Dynamic`, and
+`Ineligible` eligibility. Local wave contracts passed `18/18`, the new focused
+eligibility contract passed `1/1`, and the affected interface/model/kernel
+checks passed. This was structural evidence only, not a CUDA correctness PASS.
+
+The clean official-feature CUDA build completed in `317.11553 s`; binary
+SHA256 was
+`b7d9e84996d8b2ab4a16c05197f571c1353b0cff75014d1d7eee0d8c8618c7d5`.
+The bounded C12 run passed the first 22 cases and stopped at `c12-023`:
+
+```text
+CUDA TOPOLOGY C12 REJECT: /workspace/ferrum-artifacts/runtime-vnext-topology-eligibility-c12-836c54de-20260726T0932Z exit=1
+```
+
+Both `c12-023` requests returned HTTP 200, `finish_reason=tool_calls`, and the
+correct `lookup_weather({"city":"Paris"})` call. The non-stream request used 98
+completion tokens; the stream request used 99. Their reasoning took two
+semantically valid branches, so the validator reported `stream usage differs
+from non-stream`.
+
+The persisted input proves that C12 ran with
+`temperature=1.0,top_p=0.95,top_k=20,presence_penalty=1.5,seed=9271`.
+That contradicts `MODEL_MATRIX.md` section 7.3, which requires
+`temperature=0` for exact stream/non-stream parity. Source history identifies
+the regression at `7e48888c`: pinned generation controls were applied uniformly
+to all scenarios without retaining the pre-existing deterministic parity
+override. Request completion ordering was also audited: the plan-runtime cache
+is completed, sequence resources reach a terminal session state, and scheduler
+completion runs before the final response is sent. Each request owns a freshly
+seeded RNG. The artifact therefore does not establish cross-request resource
+leakage.
+
+The C11/C12 contract now preserves the selected
+`P_NO_THINKING`/`P_THINKING` template mode and output budget while explicitly
+using the model's `P_DETERMINISTIC` sampling vector. C10/C13-C15 retain their
+official preset sampling, and C21 remains the official stochastic product-path
+smoke. Validator self-tests bind these distinctions and the C11/C12 canonical
+pair payload. This is a gate correction, not a waiver: C12 must still pass all
+40 cases on the corrected current binary before the affected-contract stage can
+advance.
+
+The complete 224 MiB directory was archived and transferred through GitHub.
+The archive is
+`runtime-vnext-topology-eligibility-c12-836c54de-20260726T0932Z.tar.zst`,
+62,038,525 bytes, SHA256
+`eddbd29c963eb4f23a471849ee02778ad946a5783ed75fc223fffbe4a07992ca`.
+Vast instance `45319871` was stopped and polled to
+`cur_state=stopped,actual_status=exited`. G08B remains Open; this REJECT does
+not satisfy the 703-case CUDA matrix or any Metal requirement.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

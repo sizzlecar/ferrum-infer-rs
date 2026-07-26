@@ -3484,6 +3484,31 @@ def preset_values(model_key: str, preset: str | None) -> dict[str, Any]:
     return copy.deepcopy(require_object(presets.get(preset), f"generation preset {model_key}.{preset}"))
 
 
+DETERMINISTIC_PARITY_SAMPLING_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "seed",
+    "stop",
+)
+
+
+def apply_deterministic_parity_sampling(
+    payload: dict[str, Any],
+    model_key: str,
+) -> None:
+    deterministic = preset_values(model_key, "P_DETERMINISTIC")
+    for key in DETERMINISTIC_PARITY_SAMPLING_KEYS:
+        if key in deterministic:
+            payload[key] = copy.deepcopy(deterministic[key])
+        else:
+            payload.pop(key, None)
+
+
 def case_marker(case_id: str) -> str:
     return f"G00-{case_id}-OK"
 
@@ -4128,6 +4153,12 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
             payload[key] = values[key]
     if isinstance(values.get("template_kwargs"), dict) and values["template_kwargs"]:
         payload["chat_template_kwargs"] = values["template_kwargs"]
+    if scenario_id in {"C11", "C12"}:
+        # C11/C12 retain the selected thinking mode and output budget, while
+        # their exact stream-parity comparison uses the goal's deterministic
+        # sampling vector. Official stochastic sampling remains covered by C21.
+        apply_deterministic_parity_sampling(payload, model_key)
+        payload["metadata"]["g00_sampling_contract"] = "deterministic-stream-parity"
     if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
         payload.update({"stream": True, "stream_options": {"include_usage": True}})
     if scenario_id == "C06":
@@ -11157,6 +11188,69 @@ def self_test() -> int:
             require(
                 "max_tokens" not in case_http_payload(c21_serve, model_key),
                 f"{model_key} C21 serve serialized the official auto ceiling as an explicit limit",
+            )
+            planned_rows = planned_case_rows(
+                model_key,
+                "cuda",
+                internal_expectations_catalog(),
+            )
+            for preset_name, thinking_enabled in (
+                ("P_NO_THINKING", False),
+                ("P_THINKING", True),
+            ):
+                paired_payloads = []
+                for scenario_id in ("C11", "C12"):
+                    pair_case = {
+                        **next(
+                            row
+                            for row in planned_rows
+                            if row["scenario_id"] == scenario_id
+                            and row["preset"] == preset_name
+                        ),
+                        "model_key": model_key,
+                    }
+                    pair_payload = case_http_payload(pair_case, model_key)
+                    deterministic = preset_values(model_key, "P_DETERMINISTIC")
+                    require(
+                        all(
+                            pair_payload.get(key) == deterministic.get(key)
+                            for key in DETERMINISTIC_PARITY_SAMPLING_KEYS
+                        ),
+                        f"{model_key} {scenario_id}/{preset_name} lost deterministic parity sampling",
+                    )
+                    require(
+                        pair_payload.get("chat_template_kwargs")
+                        == {"enable_thinking": thinking_enabled},
+                        f"{model_key} {scenario_id}/{preset_name} lost its thinking mode",
+                    )
+                    require(
+                        pair_payload["metadata"].get("g00_sampling_contract")
+                        == "deterministic-stream-parity",
+                        f"{model_key} {scenario_id}/{preset_name} lost its sampling contract",
+                    )
+                    paired_payloads.append(
+                        canonical_pair_payload(
+                            pair_payload,
+                            f"{model_key} {scenario_id}/{preset_name}",
+                        )
+                    )
+                require(
+                    paired_payloads[0] == paired_payloads[1],
+                    f"{model_key} C11/C12 {preset_name} parity payloads differ",
+                )
+            official_tool_case = {
+                **next(
+                    row
+                    for row in planned_rows
+                    if row["scenario_id"] == "C10"
+                    and row["preset"] == "P_THINKING"
+                ),
+                "model_key": model_key,
+            }
+            require(
+                case_http_payload(official_tool_case, model_key).get("temperature")
+                == preset_values(model_key, "P_THINKING")["temperature"],
+                f"{model_key} C10 official thinking sampling was overwritten",
             )
         for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
             require(
