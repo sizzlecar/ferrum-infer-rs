@@ -4984,35 +4984,38 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let device_timing_mode = self.device_timing_mode();
             let mut reusable_catalog_miss = false;
             let mut reusable_catalog_epoch_miss = false;
-            let reusable_program =
-                if device_timing_mode == DeviceTimingMode::Kernel || reusable_direct_attempted {
-                    None
-                } else {
-                    let program_id = match wave.claimed_backing().reusable_execution_program_id(
-                        &self.runtime.descriptor().runtime_implementation_fingerprint,
-                        self.lane.id(),
-                    ) {
-                        Ok(program_id) => program_id,
-                        Err(error) => {
-                            return DispatchOutcome::QuiescentFailure(error.to_string());
-                        }
-                    };
-                    match (program_id, self.reusable_execution_catalog.get()) {
-                        (Some(_), Some(catalog))
-                            if !catalog.programs.is_empty()
-                                && catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
-                        {
-                            reusable_catalog_epoch_miss = true;
-                            None
-                        }
-                        (Some(program_id), Some(catalog)) if !catalog.programs.is_empty() => {
-                            let program = catalog.programs.get(&program_id);
-                            reusable_catalog_miss = program.is_none();
-                            program
-                        }
-                        _ => None,
+            let reusable_program = if device_timing_mode == DeviceTimingMode::Kernel
+                || reusable_direct_attempted
+            {
+                None
+            } else {
+                let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
+                    self.providers.providers(),
+                    &self.resolved_plan,
+                    &wave,
+                    &self.lane,
+                ) {
+                    Ok(program_id) => program_id,
+                    Err(error) => {
+                        return DispatchOutcome::QuiescentFailure(error.to_string());
                     }
                 };
+                match (program_id, self.reusable_execution_catalog.get()) {
+                    (Some(_), Some(catalog))
+                        if !catalog.programs.is_empty()
+                            && catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
+                    {
+                        reusable_catalog_epoch_miss = true;
+                        None
+                    }
+                    (Some(program_id), Some(catalog)) if !catalog.programs.is_empty() => {
+                        let program = catalog.programs.get(&program_id);
+                        reusable_catalog_miss = program.is_none();
+                        program
+                    }
+                    _ => None,
+                }
+            };
             reusable_direct_attempted |= reusable_program.is_some();
             let reusable_program_stats = reusable_program.map(|program| {
                 (

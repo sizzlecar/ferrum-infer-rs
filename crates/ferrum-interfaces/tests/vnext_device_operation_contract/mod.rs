@@ -465,6 +465,48 @@ impl OperationResourceEstimator for TestProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        if *self.behavior.lock().unwrap() != ProviderBehavior::ProgramBinding {
+            return Ok(None);
+        }
+        let mut fingerprint = [0_u8; 32];
+        fingerprint[..8].copy_from_slice(&request.work_shape().immediate_tokens().to_le_bytes());
+        let source_frontier = request
+            .work_shape()
+            .participant_token_ranges()
+            .iter()
+            .map(|range| range.source_token_range().end)
+            .max()
+            .unwrap_or_default();
+        fingerprint[8..16].copy_from_slice(&source_frontier.to_le_bytes());
+        let activation_role = if request.node_id().as_str() == "node.main" {
+            ResolvedValueRole::Output
+        } else {
+            ResolvedValueRole::Input
+        };
+        let activation_scope = request
+            .binding_reusable_address_scope(activation_role, 0)?
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "program-binding test activation lacks reusable address authority"
+                    .to_owned(),
+            })?;
+        fingerprint[16] = match activation_scope {
+            DeviceReusableAddressScope::ExecutionLane(_) => 2,
+            DeviceReusableAddressScope::Plan => {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: "program-binding test activation unexpectedly used plan scope"
+                        .to_owned(),
+                });
+            }
+        };
+        Ok(Some(
+            DeviceReusableExecutionTopologyFingerprint::from_sha256(fingerprint),
+        ))
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, TestBuffer>,

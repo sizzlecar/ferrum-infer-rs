@@ -255,6 +255,13 @@ impl OperationResourceEstimator for TestExecutionProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestExecutionProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         _invocation: BatchedOperationInvocation<'_, TestBuffer>,

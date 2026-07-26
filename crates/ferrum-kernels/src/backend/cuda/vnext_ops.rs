@@ -10,14 +10,15 @@ use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
     last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
     token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceId, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, EngineProviderDescriptor, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
+    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceId,
+    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
+    EncodedDeviceOperation, EngineProviderDescriptor, OperationContract, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
+    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopologyRequest, SemanticValue,
+    VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
@@ -388,6 +389,17 @@ impl OperationResourceEstimator for CudaTokenEmbeddingProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        reusable_token_topology(
+            &request,
+            b"ferrum.cuda.token-embedding.reusable-topology.v1\0",
+            true,
+        )
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -449,6 +461,17 @@ impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        reusable_token_topology(
+            &request,
+            b"ferrum.cuda.last-token-linear.reusable-topology.v1\0",
+            false,
+        )
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -534,6 +557,13 @@ impl OperationResourceEstimator for CudaLastTokenMaskedArgmaxProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -1114,6 +1144,45 @@ fn unsigned_attribute(
         Some(SemanticValue::Unsigned(value)) => Ok(*value),
         _ => Err(format!("CUDA operation lacks unsigned attribute {name:?}")),
     }
+}
+
+fn reusable_token_topology(
+    request: &ReusableExecutionTopologyRequest<'_>,
+    domain: &'static [u8],
+    bind_source_ranges: bool,
+) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+    for (role, ordinal) in [
+        (ResolvedValueRole::Input, 0),
+        (ResolvedValueRole::Input, 1),
+        (ResolvedValueRole::Output, 0),
+    ] {
+        if request
+            .binding_reusable_address_scope(role, ordinal)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+    }
+
+    let ranges = request.work_shape().participant_token_ranges();
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update((ranges.len() as u64).to_le_bytes());
+    digest.update(request.work_shape().immediate_tokens().to_le_bytes());
+    for range in ranges {
+        let source = range.source_token_range();
+        let packed = range.immediate_token_range();
+        digest.update(range.immediate_tokens().to_le_bytes());
+        if bind_source_ranges {
+            digest.update(source.start.to_le_bytes());
+            digest.update(source.end.to_le_bytes());
+        }
+        digest.update(packed.start.to_le_bytes());
+        digest.update(packed.end.to_le_bytes());
+    }
+    Ok(Some(
+        DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
+    ))
 }
 
 fn contiguous_region(

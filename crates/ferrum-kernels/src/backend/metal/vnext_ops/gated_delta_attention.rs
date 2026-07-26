@@ -6,13 +6,14 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    DeviceBatchingForm, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
-    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
-    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderWorkspaceRequirement,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
+    DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DynamicStorageRequirement,
+    ElementType, EncodedDeviceOperation, GatedDeltaDecayParameterization,
+    GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm, GatedDeltaExecutionPreference,
+    GatedDeltaValueHeadMapping, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
@@ -20,6 +21,7 @@ use metal::{
     CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, FunctionConstantValues,
     MTLDataType, MTLSize,
 };
+use sha2::{Digest, Sha256};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -300,6 +302,19 @@ impl OperationResourceEstimator for MetalGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttentionProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        reusable_attention_topology(
+            &request,
+            self.execution_capabilities,
+            self.execution_cost_model,
+        )
+        .map(Some)
+        .map_err(invalid_plan)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -322,6 +337,54 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
             )
         })
     }
+}
+
+fn reusable_attention_topology(
+    request: &ReusableExecutionTopologyRequest<'_>,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
+    execution_cost_model: MetalGatedDeltaExecutionCostModel,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+    if request.operation_id().as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID {
+        return Err("Metal gated-delta topology received another operation".to_owned());
+    }
+    let shape = AttentionShape::from_attributes(request.attributes())?;
+    let ranges = request.work_shape().participant_token_ranges();
+    if ranges.is_empty() {
+        return Err("Metal gated-delta topology has no participant token ranges".to_owned());
+    }
+
+    const DOMAIN: &[u8] = b"ferrum.metal.gated-delta.reusable-topology.v1\0";
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update((ranges.len() as u64).to_le_bytes());
+    digest.update(request.work_shape().immediate_tokens().to_le_bytes());
+    for range in ranges {
+        let tokens = range.immediate_tokens();
+        shape.validate_launch_extents(tokens)?;
+        let participant_capabilities = if shape.supports_chunked_scan_c64()? {
+            execution_capabilities
+        } else {
+            GatedDeltaExecutionCapabilities::recurrent_only()
+        };
+        let execution_form = participant_capabilities
+            .select(tokens, execution_cost_model.preference(tokens))
+            .map_err(|error| error.to_string())?;
+        if matches!(execution_form, GatedDeltaExecutionForm::ChunkedScan(_)) {
+            shape.validate_chunked_launch_extents(tokens)?;
+        }
+        digest.update(tokens.to_le_bytes());
+        digest.update(range.source_token_range().start.to_le_bytes());
+        digest.update((execution_form.as_str().len() as u64).to_le_bytes());
+        digest.update(execution_form.as_str().as_bytes());
+        if let GatedDeltaExecutionForm::ChunkedScan(plan) = execution_form {
+            digest.update(plan.chunk_size().to_le_bytes());
+            digest.update(plan.chunk_count().to_le_bytes());
+            digest.update(plan.final_chunk_tokens().to_le_bytes());
+        }
+    }
+    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
+        digest.finalize().into(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -15,8 +15,8 @@ use super::{
     VNextError, Weak,
 };
 use crate::vnext::{
-    DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
-    ReusableExecutionMemoryPlan,
+    DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolResidentPressure,
+    ReusableExecutionBucketId, ReusableExecutionMemoryPlan,
 };
 use sha2::{Digest, Sha256};
 
@@ -2201,6 +2201,13 @@ impl LogicalBackingSliceAuthority {
             evidence: self.evidence.clone(),
             segment_lease: Arc::clone(&self.segment_lease),
             reusable_lane: Some(lane_id),
+        }
+    }
+
+    pub(crate) const fn reusable_address_scope(&self) -> Option<DeviceReusableAddressScope> {
+        match self.reusable_lane {
+            Some(lane_id) => Some(DeviceReusableAddressScope::ExecutionLane(lane_id)),
+            None => None,
         }
     }
 
