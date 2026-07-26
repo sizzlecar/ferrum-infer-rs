@@ -13,7 +13,7 @@ use ferrum_interfaces::vnext::{
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
@@ -305,13 +305,22 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        if request
+            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
+            .is_none()
+            || request
+                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+                .is_none()
+        {
+            return Ok(ReusableExecutionTopology::Ineligible);
+        }
         reusable_attention_topology(
             &request,
             self.execution_capabilities,
             self.execution_cost_model,
         )
-        .map(Some)
+        .map(ReusableExecutionTopology::Dynamic)
         .map_err(invalid_plan)
     }
 

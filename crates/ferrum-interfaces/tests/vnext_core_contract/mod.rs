@@ -996,8 +996,8 @@ impl OperationProvider<PlanningTestRuntime> for TestEstimator {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -1057,8 +1057,8 @@ impl OperationProvider<PlanningTestRuntime> for SequentialScratchEstimator {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(

@@ -16,8 +16,8 @@ use ferrum_interfaces::vnext::{
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -304,7 +304,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+    ) -> Result<ReusableExecutionTopology, VNextError> {
         if request
             .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
             .is_none()
@@ -312,10 +312,10 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
                 .is_none()
         {
-            return Ok(None);
+            return Ok(ReusableExecutionTopology::Ineligible);
         }
         reusable_attention_topology(&request)
-            .map(Some)
+            .map(ReusableExecutionTopology::Dynamic)
             .map_err(invalid_plan)
     }
 

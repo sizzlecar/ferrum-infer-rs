@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, ElementType, EncodedDeviceOperation,
-    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
+    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm, ElementType,
+    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    PhysicalWeightPadding, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
     RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
@@ -141,8 +140,8 @@ impl OperationProvider<MetalDeviceRuntime> for MetalTokenEmbeddingProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -206,8 +205,8 @@ impl OperationProvider<MetalDeviceRuntime> for MetalRmsNormProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -271,8 +270,8 @@ impl OperationProvider<MetalDeviceRuntime> for MetalResidualAddProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -340,8 +339,8 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenMaskedArgmaxProvide
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(

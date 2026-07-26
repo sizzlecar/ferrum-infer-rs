@@ -12,7 +12,7 @@ use ferrum_interfaces::vnext::{
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use metal::{
@@ -274,9 +274,18 @@ impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        if request
+            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
+            .is_none()
+            || request
+                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+                .is_none()
+        {
+            return Ok(ReusableExecutionTopology::Ineligible);
+        }
         reusable_attention_topology(&request)
-            .map(Some)
+            .map(ReusableExecutionTopology::Dynamic)
             .map_err(invalid_plan)
     }
 
