@@ -510,8 +510,6 @@ def compare_artifacts(
     candidate = validate_artifact(candidate_dir, expected_model_id, expected_values)
     for field in (
         "model_id",
-        "plan_id",
-        "plan_hash",
         "family_fingerprint",
         "program_fingerprint",
         "checkpoint_values",
@@ -617,7 +615,8 @@ def compare_artifacts(
         "baseline_capture_dir": baseline["capture_dir"],
         "candidate_capture_dir": candidate["capture_dir"],
         "model_id": baseline["model_id"],
-        "plan_id": baseline["plan_id"],
+        "baseline_plan_id": baseline["plan_id"],
+        "candidate_plan_id": candidate["plan_id"],
         "program_fingerprint": baseline["program_fingerprint"],
         "baseline_run_id": baseline["run_id"],
         "candidate_run_id": candidate["run_id"],
@@ -718,6 +717,22 @@ def self_test() -> None:
 
         candidate = Path(temporary) / "candidate"
         shutil.copytree(capture, candidate)
+        candidate_plan = load_json(candidate / "plan.json")
+        candidate_plan["plan_hash"] = "7" * 64
+        candidate_plan["plan_id"] = f"plan/sha256/{'7' * 64}"
+        (candidate / "plan.json").write_text(
+            json.dumps(candidate_plan), encoding="utf-8"
+        )
+        for candidate_wave_path in (
+            candidate / "wave-0000.json",
+            candidate / "decode-wave-0000.json",
+        ):
+            candidate_wave = load_json(candidate_wave_path)
+            candidate_wave["plan_hash"] = "7" * 64
+            candidate_wave["plan_id"] = f"plan/sha256/{'7' * 64}"
+            candidate_wave_path.write_text(
+                json.dumps(candidate_wave), encoding="utf-8"
+            )
         candidate_raw = struct.pack("<ee", 0.5, -2.0)
         (candidate / decode_raw_name).write_bytes(candidate_raw)
         candidate_decode_wave = load_json(candidate / "decode-wave-0000.json")
