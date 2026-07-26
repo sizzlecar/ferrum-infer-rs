@@ -405,8 +405,15 @@ pub(crate) enum ProviderBehavior {
     Success,
     SplitPhases,
     ProgramBinding,
+    ProgramBindingIneligible,
     WrongIdentity,
     WrongPhase,
+}
+
+impl ProviderBehavior {
+    fn uses_program_binding(self) -> bool {
+        matches!(self, Self::ProgramBinding | Self::ProgramBindingIneligible)
+    }
 }
 
 #[derive(Default)]
@@ -449,7 +456,7 @@ impl OperationResourceEstimator for TestProvider {
             None,
             None,
         );
-        if *self.behavior.lock().unwrap() == ProviderBehavior::ProgramBinding {
+        if self.behavior.lock().unwrap().uses_program_binding() {
             Ok(
                 estimate.with_binding(ProviderWorkspaceRequirement::from_formula(
                     ProviderWorkspaceSizeFormula::actual_sequences(16)?,
@@ -468,9 +475,13 @@ impl OperationProvider<TestRuntime> for TestProvider {
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        if *self.behavior.lock().unwrap() != ProviderBehavior::ProgramBinding {
-            return Ok(None);
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        match *self.behavior.lock().unwrap() {
+            ProviderBehavior::ProgramBinding => {}
+            ProviderBehavior::ProgramBindingIneligible => {
+                return Ok(ReusableExecutionTopology::Ineligible);
+            }
+            _ => return Ok(ReusableExecutionTopology::Static),
         }
         let mut fingerprint = [0_u8; 32];
         fingerprint[..8].copy_from_slice(&request.work_shape().immediate_tokens().to_le_bytes());
@@ -502,7 +513,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
                 });
             }
         };
-        Ok(Some(
+        Ok(ReusableExecutionTopology::Dynamic(
             DeviceReusableExecutionTopologyFingerprint::from_sha256(fingerprint),
         ))
     }
@@ -556,7 +567,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
                     .with_dynamic_binding(TestCommand::DynamicBinding)
                     .with_result_binding(TestCommand::ResultBinding))
             }
-            ProviderBehavior::ProgramBinding => {
+            ProviderBehavior::ProgramBinding | ProviderBehavior::ProgramBindingIneligible => {
                 Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
                     .with_program_binding(TestCommand::ProgramBinding))
             }
@@ -588,7 +599,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
         &self,
         invocation: BatchedOperationInvocation<'_, TestBuffer>,
     ) -> Result<EncodedReusableExecutionBindings<TestCommand>, OperationFailure> {
-        if *self.behavior.lock().unwrap() != ProviderBehavior::ProgramBinding {
+        if !self.behavior.lock().unwrap().uses_program_binding() {
             return self
                 .encode_selected(invocation)
                 .map(EncodedReusableExecutionBindings::from_operation);
@@ -2178,13 +2189,12 @@ pub(crate) fn fixture_with_provider_behavior(
     behavior: ProviderBehavior,
 ) -> Fixture {
     let catalog = catalog_with_zero_state(zero_state);
-    let (runtime_policy, reusable_execution_bucket) =
-        if behavior == ProviderBehavior::ProgramBinding {
-            let (policy, bucket) = reusable_policy();
-            (policy, Some(bucket))
-        } else {
-            (policy(), None)
-        };
+    let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
+        let (policy, bucket) = reusable_policy();
+        (policy, Some(bucket))
+    } else {
+        (policy(), None)
+    };
     let provider_behavior = Arc::new(Mutex::new(behavior));
     let provider_trace = Arc::new(Mutex::new(ProviderTrace::default()));
     let registry = operation_registry(

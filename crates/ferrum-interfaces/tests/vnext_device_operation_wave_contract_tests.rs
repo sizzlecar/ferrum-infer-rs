@@ -1227,6 +1227,60 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
 }
 
 #[test]
+fn reusable_topology_states_cannot_alias_resident_program_authority() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let lane = Arc::clone(step.execution_lane());
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+
+    let dynamic_program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("dynamic topology must produce a reusable program identity");
+
+    *fixture.provider_behavior.lock().unwrap() = ProviderBehavior::Success;
+    let static_program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("static topology must retain the base reusable program identity");
+    assert_ne!(dynamic_program_id, static_program_id);
+
+    *fixture.provider_behavior.lock().unwrap() = ProviderBehavior::ProgramBindingIneligible;
+    assert!(
+        OperationDispatch::reusable_execution_program_id_for_wave(
+            &providers,
+            &fixture.resolved,
+            &wave,
+            &lane,
+        )
+        .unwrap()
+        .is_none(),
+        "one ineligible provider must veto resident reuse for the complete wave"
+    );
+
+    drop(providers);
+    drop(wave);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn stale_reusable_topology_is_rejected_before_dispatch_or_encoding() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),

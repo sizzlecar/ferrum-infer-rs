@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightEncoding,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
@@ -166,8 +166,8 @@ impl OperationProvider<MetalDeviceRuntime> for MetalRoutedSharedSwiGluMoeProvide
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(

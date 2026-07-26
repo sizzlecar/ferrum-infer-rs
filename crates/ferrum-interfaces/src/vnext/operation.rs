@@ -5802,7 +5802,8 @@ impl OperationDispatch {
     ///
     /// Provider topology remains opaque. Core binds each dynamic row to its
     /// immutable node/provider position before aggregating it, so two providers
-    /// cannot accidentally alias the same program variant.
+    /// cannot accidentally alias the same program variant. One ineligible
+    /// provider vetoes resident reuse for the complete wave.
     pub fn reusable_execution_program_id_for_wave<R>(
         providers: &[BoundOperationProvider<'_, R>],
         resolved: &dyn ExecutablePlanView,
@@ -5832,7 +5833,7 @@ impl OperationDispatch {
             return Ok(None);
         };
 
-        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v1\0";
+        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v2\0";
         let mut digest = Sha256::new();
         digest.update(DOMAIN);
         let mut dynamic_rows = 0_u32;
@@ -5861,8 +5862,10 @@ impl OperationDispatch {
                 wave.claimed_backing(),
                 wave.step_resources().backing_slices(),
             )?;
-            let Some(topology) = provider.provider().reusable_execution_topology(request)? else {
-                continue;
+            let topology = match provider.provider().reusable_execution_topology(request)? {
+                ReusableExecutionTopology::Static => continue,
+                ReusableExecutionTopology::Dynamic(topology) => topology,
+                ReusableExecutionTopology::Ineligible => return Ok(None),
             };
             let node_index = u32::try_from(node_index)
                 .map_err(|_| invalid_operation("reusable topology node index exceeds u32"))?;
@@ -7368,14 +7371,28 @@ impl OperationPlanningRegistry for OperationPlanningHandle<'_> {
     }
 }
 
+/// A provider declaration for the compute topology captured by a resident
+/// reusable program.
+///
+/// `Static` means every captured choice and address is already bound by the
+/// immutable plan and lane identity. `Dynamic` contributes an opaque
+/// provider-owned fingerprint. `Ineligible` means at least one captured
+/// boundary lacks reusable address authority, so core must use normal encoding
+/// for the complete wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusableExecutionTopology {
+    Static,
+    Dynamic(DeviceReusableExecutionTopologyFingerprint),
+    Ineligible,
+}
+
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
     /// Publishes the provider-private compute topology that must match a
-    /// resident reusable program. `None` means this provider contributes no
-    /// dynamic captured topology for the current plan and address authority:
-    /// either its topology is static or its submission-scoped regions make the
-    /// command ineligible for resident capture.
+    /// resident reusable program. Static topology and capture ineligibility are
+    /// intentionally distinct states: a provider may never silently turn a
+    /// submission-scoped address into resident state.
     ///
     /// This declaration is intentionally required. A new provider cannot
     /// silently inherit a static topology after adding shape-dependent kernel
@@ -7383,7 +7400,7 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError>;
+    ) -> Result<ReusableExecutionTopology, VNextError>;
 
     fn encode_selected(
         &self,

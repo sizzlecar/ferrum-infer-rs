@@ -15,16 +15,16 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
     AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DynamicStorageRequirement,
-    ElementType, EncodedDeviceOperation, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID,
-    RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
+    DeviceRuntime, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -147,8 +147,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -206,8 +206,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -330,8 +330,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaMarlinFp8DenseLinearProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -420,8 +420,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -491,8 +491,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(

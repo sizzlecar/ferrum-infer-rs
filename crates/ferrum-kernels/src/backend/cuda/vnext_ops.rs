@@ -17,15 +17,15 @@ use ferrum_interfaces::vnext::{
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
     ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopologyRequest, SemanticValue,
-    VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
-    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
-    RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
-    TOKEN_EMBEDDING_OPERATION_ID,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
+    WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    IDENTITY_WEIGHT_MATERIALIZER_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
+    RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 #[cfg(feature = "vllm-moe-marlin")]
 use ferrum_interfaces::vnext::{
@@ -392,7 +392,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+    ) -> Result<ReusableExecutionTopology, VNextError> {
         reusable_token_topology(
             &request,
             b"ferrum.cuda.token-embedding.reusable-topology.v1\0",
@@ -464,7 +464,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+    ) -> Result<ReusableExecutionTopology, VNextError> {
         reusable_token_topology(
             &request,
             b"ferrum.cuda.last-token-linear.reusable-topology.v1\0",
@@ -560,8 +560,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
-    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
-        Ok(None)
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        Ok(ReusableExecutionTopology::Static)
     }
 
     fn encode_selected(
@@ -1150,7 +1150,7 @@ fn reusable_token_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     domain: &'static [u8],
     bind_source_ranges: bool,
-) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+) -> Result<ReusableExecutionTopology, VNextError> {
     for (role, ordinal) in [
         (ResolvedValueRole::Input, 0),
         (ResolvedValueRole::Input, 1),
@@ -1160,7 +1160,7 @@ fn reusable_token_topology(
             .binding_reusable_address_scope(role, ordinal)?
             .is_none()
         {
-            return Ok(None);
+            return Ok(ReusableExecutionTopology::Ineligible);
         }
     }
 
@@ -1180,7 +1180,7 @@ fn reusable_token_topology(
         digest.update(packed.start.to_le_bytes());
         digest.update(packed.end.to_le_bytes());
     }
-    Ok(Some(
+    Ok(ReusableExecutionTopology::Dynamic(
         DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
     ))
 }
