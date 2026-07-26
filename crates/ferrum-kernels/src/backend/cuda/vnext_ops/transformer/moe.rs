@@ -5,12 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationContract, OperationFailure, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderWorkspaceRequirement,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationContract,
+    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    QuantizationFormatId, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 
@@ -266,6 +267,13 @@ impl OperationResourceEstimator for CudaRoutedSharedSwiGluMoeProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaRoutedSharedSwiGluMoeProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,

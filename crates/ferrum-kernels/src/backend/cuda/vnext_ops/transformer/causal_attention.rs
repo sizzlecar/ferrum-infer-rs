@@ -8,16 +8,18 @@ use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    EncodedDeviceOperation, EncodedReusableExecutionBindings, OperationBufferStorageKind,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
+    ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
+    OperationBufferStorageKind, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
+    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
+use sha2::{Digest, Sha256};
 
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 #[cfg(feature = "vllm-paged-attn-v2")]
@@ -299,6 +301,24 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        if request
+            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
+            .is_none()
+            || request
+                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        reusable_attention_topology(&request)
+            .map(Some)
+            .map_err(invalid_plan)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -532,6 +552,87 @@ impl CausalAttentionReplayTopology {
     const fn is_partition_stable(self) -> bool {
         matches!(self, Self::PartitionStableDecode(_))
     }
+}
+
+fn reusable_attention_topology(
+    request: &ReusableExecutionTopologyRequest<'_>,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+    if request.operation_id().as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID {
+        return Err("CUDA causal topology received another operation".to_owned());
+    }
+    let shape = CausalAttentionShape::from_attributes(request.attributes())?;
+    let ranges = request.work_shape().participant_token_ranges();
+    if ranges.is_empty() {
+        return Err("CUDA causal topology has no participant token ranges".to_owned());
+    }
+
+    reusable_attention_topology_from_rows(
+        shape,
+        ranges.len(),
+        ranges.iter().map(|range| {
+            let source = range.source_token_range();
+            if source.end > range.full_input_tokens()
+                || range.full_input_tokens() > shape.maximum_context_tokens
+            {
+                return Err("causal topology token range exceeds its admitted context".to_owned());
+            }
+            Ok(CausalAttentionTopologyRow {
+                active_tokens: range.immediate_tokens(),
+                sequence_tokens: source.end,
+            })
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CausalAttentionTopologyRow {
+    active_tokens: u64,
+    sequence_tokens: u64,
+}
+
+fn reusable_attention_topology_from_rows<I>(
+    shape: CausalAttentionShape,
+    row_count: usize,
+    rows: I,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String>
+where
+    I: IntoIterator<Item = Result<CausalAttentionTopologyRow, String>>,
+{
+    if row_count == 0 {
+        return Err("CUDA causal topology has no participants".to_owned());
+    }
+
+    const DOMAIN: &[u8] = b"ferrum.cuda.causal-attention.reusable-topology.v1\0";
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update((row_count as u64).to_le_bytes());
+    let mut observed_rows = 0_usize;
+    let mut total_tokens = 0_u64;
+    for row in rows {
+        let row = row?;
+        observed_rows = observed_rows
+            .checked_add(1)
+            .ok_or_else(|| "CUDA causal topology participant count overflows".to_owned())?;
+        total_tokens = total_tokens
+            .checked_add(row.active_tokens)
+            .ok_or_else(|| "CUDA causal topology token count overflows".to_owned())?;
+        let path =
+            CausalAttentionKernelPath::select(shape, row.active_tokens, row.sequence_tokens)?;
+        let topology = CausalAttentionReplayTopology::new(shape, path, row.sequence_tokens)?;
+        let envelope = topology.envelope();
+        digest.update(row.active_tokens.to_le_bytes());
+        digest.update(path.replay_id().to_le_bytes());
+        digest.update(envelope.sequence_capacity_tokens.to_le_bytes());
+        digest.update(envelope.table_capacity_entries.to_le_bytes());
+        digest.update([u8::from(topology.is_partition_stable())]);
+    }
+    if observed_rows != row_count {
+        return Err("CUDA causal topology participant count changed while hashing".to_owned());
+    }
+    digest.update(total_tokens.to_le_bytes());
+    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
+        digest.finalize().into(),
+    ))
 }
 
 impl CausalAttentionShape {
@@ -2568,6 +2669,28 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[test]
+    fn reusable_topology_changes_only_at_native_decode_partitions() {
+        let shape = goal_shape(16, 2, 256, 4_096);
+        let topology = |sequence_tokens| {
+            reusable_attention_topology_from_rows(
+                shape,
+                1,
+                std::iter::once(Ok(CausalAttentionTopologyRow {
+                    active_tokens: 1,
+                    sequence_tokens,
+                })),
+            )
+            .unwrap()
+        };
+
+        assert_ne!(topology(512), topology(513));
+        assert_eq!(topology(784), topology(785));
+        assert_eq!(topology(513), topology(1_024));
+        assert_ne!(topology(1_024), topology(1_025));
     }
 
     #[test]

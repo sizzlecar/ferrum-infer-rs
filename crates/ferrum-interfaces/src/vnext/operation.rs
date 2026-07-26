@@ -11,19 +11,21 @@ use super::{
     classify_device_error, AdmittedSequenceResources, AllocationLifetime,
     BackingInitializationEncodeError, BatchInvocationId, BatchParticipantAuthority,
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
-    CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
-    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceReusableExecutionCapture,
-    DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand,
-    DynamicResourceShape, EncodedDeviceOperation, EncodedReusableExecutionBindings,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
-    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
-    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
-    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
+    CanonicalRational, CapabilityId, ClaimedSubmissionWaveBacking, CompletionHandle,
+    CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority,
+    DefinitelyNotSubmittedWaveRetryAuthority, DeviceBufferRetention, DeviceCommandBatch, DeviceId,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
+    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape,
+    EncodedDeviceOperation, EncodedReusableExecutionBindings, ExecutablePlanView,
+    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, ExecutionLaneId,
+    HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
+    LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, LogicalBackingSliceAuthority, MemoryPlan, NodeId,
+    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
     ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
     RequestIdentity, ResolvedWeightBinding, ResourceId, ResourcePoolId, RunId, SemanticValue,
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
@@ -5795,6 +5797,95 @@ impl OperationDispatch {
         )
     }
 
+    /// Derives the exact reusable-program identity for the current wave without
+    /// materializing device buffers or entering dispatch.
+    ///
+    /// Provider topology remains opaque. Core binds each dynamic row to its
+    /// immutable node/provider position before aggregating it, so two providers
+    /// cannot accidentally alias the same program variant.
+    pub fn reusable_execution_program_id_for_wave<R>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        wave: &PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+    ) -> Result<Option<DeviceReusableExecutionProgramId>, VNextError>
+    where
+        R: DeviceRuntime,
+    {
+        let plan = resolved.execution_plan();
+        let plan_nodes = plan.payload().nodes();
+        if providers.is_empty()
+            || providers.len() != plan_nodes.len()
+            || providers.len() != wave.nodes().len()
+            || wave.execution_lane_id() != lane.id()
+            || lane.descriptor() != resolved.device()
+        {
+            return Err(invalid_operation(
+                "reusable execution topology requires one exact provider per wave node and lane",
+            ));
+        }
+        let Some(program_id) = wave.claimed_backing().reusable_execution_program_id(
+            &lane.descriptor().runtime_implementation_fingerprint,
+            lane.id(),
+        )?
+        else {
+            return Ok(None);
+        };
+
+        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v1\0";
+        let mut digest = Sha256::new();
+        digest.update(DOMAIN);
+        let mut dynamic_rows = 0_u32;
+        for (node_index, ((provider, prepared_node), node)) in providers
+            .iter()
+            .zip(wave.nodes())
+            .zip(plan_nodes)
+            .enumerate()
+        {
+            if provider.plan_id != *plan.payload().plan_id()
+                || provider.plan_hash != *plan.plan_hash()
+                || provider.node_id != *node.id()
+                || prepared_node.node_id() != node.id()
+            {
+                return Err(invalid_operation(
+                    "reusable execution topology provider or node differs from the immutable plan",
+                ));
+            }
+            let request = ReusableExecutionTopologyRequest::new(
+                node.id(),
+                node.operation_id(),
+                node.attributes(),
+                node.values(),
+                plan.payload().memory(),
+                prepared_node.work_shape(),
+                wave.claimed_backing(),
+                wave.step_resources().backing_slices(),
+            )?;
+            let Some(topology) = provider.provider().reusable_execution_topology(request)? else {
+                continue;
+            };
+            let node_index = u32::try_from(node_index)
+                .map_err(|_| invalid_operation("reusable topology node index exceeds u32"))?;
+            let provider_id = provider.descriptor().provider_id().as_str().as_bytes();
+            let provider_id_len = u64::try_from(provider_id.len())
+                .map_err(|_| invalid_operation("reusable topology provider id exceeds u64"))?;
+            digest.update(node_index.to_le_bytes());
+            digest.update(provider_id_len.to_le_bytes());
+            digest.update(provider_id);
+            digest.update(topology.as_bytes());
+            dynamic_rows = dynamic_rows
+                .checked_add(1)
+                .ok_or_else(|| invalid_operation("reusable topology row count exceeds u32"))?;
+        }
+        if dynamic_rows == 0 {
+            return Ok(Some(program_id));
+        }
+        digest.update(dynamic_rows.to_le_bytes());
+        Ok(Some(program_id.with_topology_fingerprint(
+            DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn encode_and_submit<R>(
         provider: &BoundOperationProvider<'_, R>,
@@ -6162,6 +6253,32 @@ impl OperationDispatch {
                 )));
             }
         }
+        let reusable_execution_program_id =
+            Self::reusable_execution_program_id_for_wave(providers, resolved, &wave, lane)
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+        if let Some(reusable_program) = reusable_program {
+            if timing_mode == DeviceTimingMode::Kernel {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "kernel attribution requires full logical provider encoding",
+                )));
+            }
+            let actual_program_id = reusable_execution_program_id.as_ref().ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "reusable execution program has no live program binding authority",
+                ))
+            })?;
+            if actual_program_id != reusable_program.program_id()
+                || reusable_program.segments().iter().any(|segment| {
+                    segment.end_node_index() as usize > providers.len()
+                        || segment.logical_command_count()
+                            != segment.end_node_index() - segment.start_node_index()
+                })
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "reusable execution program differs from the exact wave topology",
+                )));
+            }
+        }
         wave.begin_dispatch()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         let mut completion =
@@ -6212,36 +6329,6 @@ impl OperationDispatch {
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
         if let Some(reusable_program) = reusable_program {
-            if timing_mode == DeviceTimingMode::Kernel {
-                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "kernel attribution requires full logical provider encoding",
-                )));
-            }
-            let actual_program_id = completion
-                .wave()
-                .claimed_backing()
-                .reusable_execution_program_id(
-                    &lane.descriptor().runtime_implementation_fingerprint,
-                    lane.id(),
-                )
-                .map_err(SubmissionWaveDispatchError::Contract)?
-                .ok_or_else(|| {
-                    SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "reusable execution program has no live program binding authority",
-                    ))
-                })?;
-            if &actual_program_id != reusable_program.program_id()
-                || reusable_program.segments().iter().any(|segment| {
-                    segment.end_node_index() as usize > providers.len()
-                        || segment.logical_command_count()
-                            != segment.end_node_index() - segment.start_node_index()
-                })
-            {
-                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "reusable execution program differs from the exact wave topology",
-                )));
-            }
-
             let mut node_index = 0_usize;
             let mut segment_index = 0_usize;
             while node_index < providers.len() {
@@ -6317,7 +6404,7 @@ impl OperationDispatch {
                         segment_result_bindings.append(&mut result_bindings);
                     }
                     let invocation = DeviceReusableExecutionInvocation::new(
-                        actual_program_id.clone(),
+                        reusable_program.program_id().clone(),
                         segment.clone(),
                         u32::try_from(active_participant_count).map_err(|_| {
                             SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -6575,15 +6662,7 @@ impl OperationDispatch {
             commands.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
         }
         if reusable_program.is_none() {
-            if let Some(program_id) = completion
-                .wave()
-                .claimed_backing()
-                .reusable_execution_program_id(
-                    &lane.descriptor().runtime_implementation_fingerprint,
-                    lane.id(),
-                )
-                .map_err(SubmissionWaveDispatchError::Contract)?
-            {
+            if let Some(program_id) = reusable_execution_program_id {
                 commands
                     .set_reusable_execution_capture(DeviceReusableExecutionCapture::new(
                         program_id,
@@ -6950,6 +7029,160 @@ pub struct OperationResourceEstimateRequest<'a> {
     input_fingerprint: &'a str,
 }
 
+/// Lightweight provider view used to bind dynamic compute topology into a
+/// reusable program identity before catalog lookup.
+///
+/// It deliberately exposes no buffers, request identity, or submission
+/// authority. Providers may derive only an opaque fixed-size topology
+/// fingerprint from immutable plan semantics, typed reusable-address
+/// authority, and the current batch work shape.
+pub struct ReusableExecutionTopologyRequest<'a> {
+    node_id: &'a NodeId,
+    operation_id: &'a OperationId,
+    attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+    bindings: &'a [ResolvedValueBinding],
+    memory: &'a MemoryPlan,
+    work_shape: &'a BatchWorkShape,
+    claimed_backing: &'a ClaimedSubmissionWaveBacking,
+    step_backing: &'a [LogicalBackingSliceAuthority],
+}
+
+impl<'a> ReusableExecutionTopologyRequest<'a> {
+    fn new(
+        node_id: &'a NodeId,
+        operation_id: &'a OperationId,
+        attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+        bindings: &'a [ResolvedValueBinding],
+        memory: &'a MemoryPlan,
+        work_shape: &'a BatchWorkShape,
+        claimed_backing: &'a ClaimedSubmissionWaveBacking,
+        step_backing: &'a [LogicalBackingSliceAuthority],
+    ) -> Result<Self, VNextError> {
+        if work_shape.participants().is_empty() {
+            return Err(invalid_operation(
+                "reusable execution topology request has no participants",
+            ));
+        }
+        Ok(Self {
+            node_id,
+            operation_id,
+            attributes,
+            bindings,
+            memory,
+            work_shape,
+            claimed_backing,
+            step_backing,
+        })
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        self.node_id
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        self.operation_id
+    }
+
+    pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
+        self.attributes
+    }
+
+    pub fn bindings(&self) -> &[ResolvedValueBinding] {
+        self.bindings
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.work_shape
+    }
+
+    /// Returns the reusable address authority shared by every physical
+    /// component of one resolved value. `None` means at least one component is
+    /// submission-scoped and the backend must exclude commands that capture it
+    /// from resident reusable segments.
+    pub fn binding_reusable_address_scope(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.role() == role && binding.ordinal() == ordinal)
+            .ok_or_else(|| {
+                invalid_operation("reusable topology requested an unknown value binding")
+            })?;
+        let mut aggregate = DeviceReusableAddressScope::Plan;
+        for component in binding.storage().components() {
+            let resource_id = component.resource_id();
+            let component_scope = if self
+                .memory
+                .static_allocations()
+                .binary_search_by(|allocation| allocation.resource_id().cmp(resource_id))
+                .is_ok()
+            {
+                Some(DeviceReusableAddressScope::Plan)
+            } else {
+                let mut component_scope = None;
+                for backing_slices in [self.claimed_backing.backing_slices(), self.step_backing] {
+                    let authority_start = backing_slices
+                        .partition_point(|authority| authority.resource_id() < resource_id);
+                    let authority_end = authority_start
+                        + backing_slices[authority_start..]
+                            .partition_point(|authority| authority.resource_id() == resource_id);
+                    for authority in &backing_slices[authority_start..authority_end] {
+                        let Some(authority_scope) = authority.reusable_address_scope() else {
+                            return Ok(None);
+                        };
+                        component_scope = Some(merge_reusable_address_scope(
+                            component_scope.unwrap_or(DeviceReusableAddressScope::Plan),
+                            authority_scope,
+                        )?);
+                    }
+                }
+                if component_scope.is_none() {
+                    if self
+                        .memory
+                        .dynamic_descriptors()
+                        .binary_search_by(|descriptor| {
+                            descriptor.base_resource_id().cmp(resource_id)
+                        })
+                        .is_ok()
+                    {
+                        return Ok(None);
+                    }
+                    return Err(invalid_operation(
+                        "reusable topology value references an unknown memory resource",
+                    ));
+                }
+                component_scope
+            };
+            aggregate = merge_reusable_address_scope(
+                aggregate,
+                component_scope.expect("component scope is present after early return"),
+            )?;
+        }
+        Ok(Some(aggregate))
+    }
+}
+
+fn merge_reusable_address_scope(
+    left: DeviceReusableAddressScope,
+    right: DeviceReusableAddressScope,
+) -> Result<DeviceReusableAddressScope, VNextError> {
+    match (left, right) {
+        (DeviceReusableAddressScope::Plan, scope) | (scope, DeviceReusableAddressScope::Plan) => {
+            Ok(scope)
+        }
+        (
+            DeviceReusableAddressScope::ExecutionLane(left),
+            DeviceReusableAddressScope::ExecutionLane(right),
+        ) if left == right => Ok(DeviceReusableAddressScope::ExecutionLane(left)),
+        _ => Err(invalid_operation(
+            "reusable topology value spans different execution lanes",
+        )),
+    }
+}
+
 impl<'a> OperationResourceEstimateRequest<'a> {
     pub(crate) fn new(
         node_id: &'a NodeId,
@@ -7138,6 +7371,20 @@ impl OperationPlanningRegistry for OperationPlanningHandle<'_> {
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    /// Publishes the provider-private compute topology that must match a
+    /// resident reusable program. `None` means this provider contributes no
+    /// dynamic captured topology for the current plan and address authority:
+    /// either its topology is static or its submission-scoped regions make the
+    /// command ineligible for resident capture.
+    ///
+    /// This declaration is intentionally required. A new provider cannot
+    /// silently inherit a static topology after adding shape-dependent kernel
+    /// selection.
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError>;
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, R::Buffer>,

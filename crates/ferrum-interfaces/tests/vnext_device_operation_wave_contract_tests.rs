@@ -1034,17 +1034,14 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
         &lane,
     )
     .unwrap();
-    let expected_program_id = wave
-        .claimed_backing()
-        .reusable_execution_program_id(
-            &fixture
-                .runtime
-                .descriptor()
-                .runtime_implementation_fingerprint,
-            lane.id(),
-        )
-        .unwrap()
-        .expect("program-binding wave must expose reusable capture identity");
+    let expected_program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("program-binding wave must expose reusable capture identity");
 
     let handle = OperationDispatch::encode_and_submit_wave(
         &providers,
@@ -1156,17 +1153,14 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
     assert!(!batch_identity
         .materialization_snapshot()
         .full_participant_projection());
-    let program_id = wave
-        .claimed_backing()
-        .reusable_execution_program_id(
-            &fixture
-                .runtime
-                .descriptor()
-                .runtime_implementation_fingerprint,
-            lane.id(),
-        )
-        .unwrap()
-        .expect("program-binding wave must have a reusable program identity");
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("program-binding wave must have a reusable program identity");
     let node_count = u32::try_from(providers.len()).unwrap();
     let segment = DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap();
     let program =
@@ -1224,6 +1218,92 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         .full_participant_projection());
 
     drop(handle);
+    drop(topology);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn stale_reusable_topology_is_rejected_before_dispatch_or_encoding() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let topology =
+        OperationDispatch::compile_submission_wave_identity(&fixture.resolved, &lane).unwrap();
+    let batch_identity = OperationDispatch::bind_compiled_submission_wave_identity(
+        &topology,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let live_program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("program-binding wave must have a reusable program identity");
+    let stale_program_id = live_program_id.with_topology_fingerprint(
+        DeviceReusableExecutionTopologyFingerprint::from_sha256([0xff; 32]),
+    );
+    let node_count = u32::try_from(providers.len()).unwrap();
+    let stale_program = DeviceReusableExecutionProgram::new(
+        stale_program_id,
+        vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
+        (0..node_count).collect(),
+    )
+    .unwrap();
+
+    let error = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        &stale_program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SubmissionWaveDispatchError::Contract(ref error)
+            if error.to_string().contains(
+                "reusable execution program differs from the exact wave topology"
+            )
+    ));
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(trace.submit_calls, 0);
+        assert!(trace.submitted_commands.is_empty());
+    }
+    {
+        let trace = fixture.provider_trace.lock().unwrap();
+        assert_eq!(trace.encode_calls, 0);
+        assert_eq!(trace.reusable_binding_encode_calls, 0);
+    }
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+
+    drop(stale_program);
     drop(topology);
     drop(providers);
     drop(active_bindings);

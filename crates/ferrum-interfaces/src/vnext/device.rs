@@ -891,6 +891,29 @@ impl DeviceReusableExecutionPlan {
     }
 }
 
+/// Opaque provider-owned topology identity for one reusable compute program.
+///
+/// The core aggregates these fixed-size values with node and provider identity.
+/// Backends keep kernel-selection details private while the program catalog can
+/// still reject a stale executable before any command is encoded or submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DeviceReusableExecutionTopologyFingerprint([u8; 32]);
+
+impl DeviceReusableExecutionTopologyFingerprint {
+    pub const fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn static_program() -> Self {
+        Self([0; 32])
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Runtime-local identity for one immutable reusable program.
 ///
 /// The bucket binds execution topology and capacity, while the plan and lane
@@ -909,6 +932,7 @@ pub struct DeviceReusableExecutionProgramId {
     immediate_sequences: u32,
     immediate_tokens: u64,
     immediate_pages: u64,
+    topology_fingerprint: DeviceReusableExecutionTopologyFingerprint,
 }
 
 impl DeviceReusableExecutionProgramId {
@@ -953,7 +977,16 @@ impl DeviceReusableExecutionProgramId {
             immediate_sequences,
             immediate_tokens,
             immediate_pages,
+            topology_fingerprint: DeviceReusableExecutionTopologyFingerprint::static_program(),
         })
+    }
+
+    pub fn with_topology_fingerprint(
+        mut self,
+        topology_fingerprint: DeviceReusableExecutionTopologyFingerprint,
+    ) -> Self {
+        self.topology_fingerprint = topology_fingerprint;
+        self
     }
 
     pub fn plan_hash(&self) -> &PlanHash {
@@ -994,6 +1027,10 @@ impl DeviceReusableExecutionProgramId {
 
     pub const fn immediate_pages(&self) -> u64 {
         self.immediate_pages
+    }
+
+    pub const fn topology_fingerprint(&self) -> DeviceReusableExecutionTopologyFingerprint {
+        self.topology_fingerprint
     }
 }
 

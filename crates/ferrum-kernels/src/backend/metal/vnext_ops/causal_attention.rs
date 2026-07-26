@@ -6,18 +6,20 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole, SemanticValue,
-    VNextError, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
+    OperationBufferStorageKind, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use metal::{
     ArgumentEncoder, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
     Function, MTLArgumentBuffersTier, MTLResourceUsage, MTLSize,
 };
+use sha2::{Digest, Sha256};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -269,6 +271,15 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        reusable_attention_topology(&request)
+            .map(Some)
+            .map_err(invalid_plan)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -284,6 +295,39 @@ impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider
             provider_failure(identity, "metal.causal_paged_attention.encode", message)
         })
     }
+}
+
+fn reusable_attention_topology(
+    request: &ReusableExecutionTopologyRequest<'_>,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+    if request.operation_id().as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID {
+        return Err("Metal causal topology received another operation".to_owned());
+    }
+    let shape = CausalAttentionShape::from_attributes(request.attributes())?;
+    let ranges = request.work_shape().participant_token_ranges();
+    if ranges.is_empty() {
+        return Err("Metal causal topology has no participant token ranges".to_owned());
+    }
+
+    const DOMAIN: &[u8] = b"ferrum.metal.causal-attention.reusable-topology.v1\0";
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update((ranges.len() as u64).to_le_bytes());
+    digest.update(request.work_shape().immediate_tokens().to_le_bytes());
+    for range in ranges {
+        let source = range.source_token_range();
+        if source.end > range.full_input_tokens()
+            || range.full_input_tokens() > shape.maximum_context_tokens
+        {
+            return Err("Metal causal topology exceeds its admitted context".to_owned());
+        }
+        digest.update(range.immediate_tokens().to_le_bytes());
+        digest.update(source.start.to_le_bytes());
+        digest.update(source.end.to_le_bytes());
+    }
+    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
+        digest.finalize().into(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

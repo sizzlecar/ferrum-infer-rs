@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm, ElementType,
-    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    VNextError, WeightEncoding, LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
-    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
-    TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm,
+    DeviceReusableExecutionTopologyFingerprint, ElementType, EncodedDeviceOperation,
+    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
+    RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -137,6 +138,13 @@ impl OperationResourceEstimator for MetalTokenEmbeddingProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalTokenEmbeddingProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -195,6 +203,13 @@ impl OperationResourceEstimator for MetalRmsNormProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalRmsNormProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -253,6 +268,13 @@ impl OperationResourceEstimator for MetalResidualAddProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalResidualAddProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -315,6 +337,13 @@ impl OperationResourceEstimator for MetalLastTokenMaskedArgmaxProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenMaskedArgmaxProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,

@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
-    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole, VNextError,
+    BatchedOperationInvocation, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
+    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedTensorLayout, ResolvedValueRole, ReusableExecutionTopologyRequest, VNextError,
     WeightEncoding, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
@@ -184,6 +185,13 @@ impl OperationResourceEstimator for MetalDenseLinearProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalDenseLinearProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -264,6 +272,13 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalDenseSwiGluProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -348,6 +363,13 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        Ok(None)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,

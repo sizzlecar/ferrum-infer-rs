@@ -8,18 +8,20 @@ use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement,
-    ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
-    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
-    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationContract, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
+    DeviceRuntime, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    EncodedReusableExecutionBindings, GatedDeltaDecayParameterization,
+    GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm, GatedDeltaExecutionPreference,
+    GatedDeltaValueHeadMapping, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
     QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    SemanticValue, VNextError, WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
+    GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
+use sha2::{Digest, Sha256};
 
 use super::{
     attach_invocation_binding, contiguous_bindings, ensure_estimator_request, estimate,
@@ -280,6 +282,24 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<Option<DeviceReusableExecutionTopologyFingerprint>, VNextError> {
+        if request
+            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
+            .is_none()
+            || request
+                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        reusable_attention_topology(&request, self.execution_capabilities)
+            .map(Some)
+            .map_err(invalid_plan)
+    }
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -321,6 +341,73 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             .expect("core-issued CUDA attention identity must be valid")
         })
     }
+}
+
+fn reusable_attention_topology(
+    request: &ReusableExecutionTopologyRequest<'_>,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+    if request.operation_id().as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID {
+        return Err("CUDA recurrent topology received another operation".to_owned());
+    }
+    let shape = AttentionShape::from_attributes(request.attributes())?;
+    let ranges = request.work_shape().participant_token_ranges();
+    reusable_attention_topology_for_tokens(
+        shape,
+        execution_capabilities,
+        ranges.len(),
+        ranges.iter().map(|range| range.immediate_tokens()),
+    )
+}
+
+fn reusable_attention_topology_for_tokens<I>(
+    shape: AttentionShape,
+    execution_capabilities: GatedDeltaExecutionCapabilities,
+    participant_count: usize,
+    token_counts: I,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String>
+where
+    I: IntoIterator<Item = u64>,
+{
+    if participant_count == 0 {
+        return Err("CUDA recurrent topology has no participants".to_owned());
+    }
+
+    const DOMAIN: &[u8] = b"ferrum.cuda.gated-delta.reusable-topology.v1\0";
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update((participant_count as u64).to_le_bytes());
+    let mut observed_participants = 0_usize;
+    let mut total_tokens = 0_u64;
+    for tokens in token_counts {
+        observed_participants = observed_participants
+            .checked_add(1)
+            .ok_or_else(|| "CUDA recurrent topology participant count overflows".to_owned())?;
+        shape.validate_launch_extents(tokens)?;
+        total_tokens = total_tokens
+            .checked_add(tokens)
+            .ok_or_else(|| "CUDA recurrent topology token count overflows".to_owned())?;
+        let execution_form = execution_capabilities
+            .select(tokens, GatedDeltaExecutionPreference::RecurrentScan)
+            .map_err(|error| error.to_string())?;
+        if let GatedDeltaExecutionForm::ChunkedScan(plan) = execution_form {
+            return Err(format!(
+                "CUDA gated-delta provider selected an uninstalled {} form for {} tokens",
+                execution_form.as_str(),
+                plan.token_count()
+            ));
+        }
+        digest.update(tokens.to_le_bytes());
+        digest.update((execution_form.as_str().len() as u64).to_le_bytes());
+        digest.update(execution_form.as_str().as_bytes());
+    }
+    if observed_participants != participant_count {
+        return Err("CUDA recurrent topology participant count changed while hashing".to_owned());
+    }
+    digest.update(total_tokens.to_le_bytes());
+    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
+        digest.finalize().into(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2463,9 +2550,8 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn launch_extent_validation_covers_packed_projection_strides() {
-        let mut shape = AttentionShape {
+    fn test_shape() -> AttentionShape {
+        AttentionShape {
             hidden_size: 16,
             key_heads: 2,
             value_heads: 8,
@@ -2482,7 +2568,12 @@ mod tests {
             layer_index: 0,
             decay_parameterization: GatedDeltaDecayParameterization::LogRate,
             value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
-        };
+        }
+    }
+
+    #[test]
+    fn launch_extent_validation_covers_packed_projection_strides() {
+        let mut shape = test_shape();
 
         let tokens = i32::MAX as u64 / shape.qkvzba_features + 1;
         assert!(shape
@@ -2496,5 +2587,19 @@ mod tests {
             .validate_launch_extents(2)
             .unwrap_err()
             .contains("QKVZBA activation elements"));
+    }
+
+    #[test]
+    fn reusable_topology_binds_participant_token_distribution() {
+        let capabilities = GatedDeltaExecutionCapabilities::recurrent_only();
+        let one_three =
+            reusable_attention_topology_for_tokens(test_shape(), capabilities, 2, [1, 3]).unwrap();
+        let two_two =
+            reusable_attention_topology_for_tokens(test_shape(), capabilities, 2, [2, 2]).unwrap();
+        let same_one_three =
+            reusable_attention_topology_for_tokens(test_shape(), capabilities, 2, [1, 3]).unwrap();
+
+        assert_ne!(one_three, two_two);
+        assert_eq!(one_three, same_one_three);
     }
 }
