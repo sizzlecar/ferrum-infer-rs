@@ -236,8 +236,11 @@ def load_ferrum_checkpoint(
     wave = load_json(wave_paths[0])
     require(isinstance(plan, dict) and isinstance(wave, dict),
             "Ferrum plan and wave must be JSON objects")
-    require(plan.get("schema_version") == 1, "unsupported Ferrum plan schema")
-    require(wave.get("schema_version") == 1, "unsupported Ferrum wave schema")
+    require(plan.get("schema_version") in (1, 2), "unsupported Ferrum plan schema")
+    require(
+        wave.get("schema_version") == plan.get("schema_version"),
+        "unsupported Ferrum wave schema",
+    )
     require(wave.get("wave_kind") == "prefill", "Ferrum checkpoint must be prefill")
     require(wave.get("participant_count") == 1,
             "Ferrum checkpoint must contain exactly one participant")

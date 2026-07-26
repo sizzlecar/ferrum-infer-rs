@@ -20,7 +20,7 @@ PASS_PREFIX = "RUNTIME VNEXT CHECKPOINT ARTIFACT PASS"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 ELEMENT_FORMATS = {"f16": ("<e", 2), "f32": ("<f", 4), "u32": ("<I", 4)}
 
-PLAN_FIELDS = frozenset(
+PLAN_FIELDS_V1 = frozenset(
     {
         "schema_version",
         "plan_id",
@@ -33,6 +33,7 @@ PLAN_FIELDS = frozenset(
         "checkpoints",
     }
 )
+PLAN_FIELDS_V2 = PLAN_FIELDS_V1 | {"maximum_decode_waves"}
 WAVE_FIELDS = frozenset(
     {
         "schema_version",
@@ -239,8 +240,15 @@ def validate_artifact(
             "capture directory must be a real directory")
     plan_path = capture_dir / "plan.json"
     require(plan_path.is_file() and not plan_path.is_symlink(), "plan.json must be a real file")
-    plan = exact_object(load_json(plan_path), PLAN_FIELDS, "plan")
-    require(plan["schema_version"] == 1, "plan.schema_version must be 1")
+    raw_plan = load_json(plan_path)
+    require(isinstance(raw_plan, dict), "plan must be an object")
+    schema_version = integer(raw_plan.get("schema_version"), "plan.schema_version", minimum=1)
+    require(schema_version in (1, 2), "plan.schema_version must be 1 or 2")
+    plan = exact_object(
+        raw_plan,
+        PLAN_FIELDS_V1 if schema_version == 1 else PLAN_FIELDS_V2,
+        "plan",
+    )
     plan_hash = sha256(plan["plan_hash"], "plan.plan_hash")
     require(
         plan["plan_id"] == f"plan/sha256/{plan_hash}",
@@ -254,6 +262,15 @@ def validate_artifact(
         require(model_id == expected_model_id, "plan.model_id differs from --expected-model-id")
     maximum_waves = integer(plan["maximum_prefill_waves"], "plan.maximum_prefill_waves", minimum=1)
     require(maximum_waves <= 16, "plan.maximum_prefill_waves exceeds the product limit")
+    maximum_decode_waves = (
+        integer(plan["maximum_decode_waves"], "plan.maximum_decode_waves")
+        if schema_version >= 2
+        else 0
+    )
+    require(
+        maximum_decode_waves <= 512,
+        "plan.maximum_decode_waves exceeds the product limit",
+    )
     checkpoints_raw = plan["checkpoints"]
     require(
         isinstance(checkpoints_raw, list) and checkpoints_raw,
@@ -271,25 +288,48 @@ def validate_artifact(
                 "plan checkpoint values differ from --expected-value")
     checkpoint_by_id = {item["value_id"]: item for item in checkpoints}
 
-    wave_paths = sorted(capture_dir.glob("wave-*.json"))
-    require(len(wave_paths) == maximum_waves, "captured wave count differs from plan maximum")
+    prefill_wave_paths = sorted(capture_dir.glob("wave-*.json"))
+    decode_wave_paths = sorted(capture_dir.glob("decode-wave-*.json"))
+    require(
+        len(prefill_wave_paths) == maximum_waves,
+        "captured prefill wave count differs from plan maximum",
+    )
+    require(
+        len(decode_wave_paths) == maximum_decode_waves,
+        "captured decode wave count differs from plan maximum",
+    )
+    wave_groups = (
+        ("prefill", "wave-", prefill_wave_paths),
+        ("decode", "decode-wave-", decode_wave_paths),
+    )
+    wave_entries = [
+        (kind, filename_prefix, index, path)
+        for kind, filename_prefix, paths in wave_groups
+        for index, path in enumerate(paths)
+    ]
     summaries: list[dict[str, Any]] = []
     referenced_raw: set[str] = set()
-    for expected_index, wave_path in enumerate(wave_paths):
+    for expected_kind, filename_prefix, expected_index, wave_path in wave_entries:
         require(
             wave_path.is_file() and not wave_path.is_symlink(),
             "wave manifest must be a real file",
         )
         wave = exact_object(load_json(wave_path), WAVE_FIELDS, f"wave[{expected_index}]")
-        require(wave["schema_version"] == 1, "wave.schema_version must be 1")
+        require(
+            wave["schema_version"] == schema_version,
+            "wave.schema_version must match plan.schema_version",
+        )
         require(wave["capture_index"] == expected_index, "wave.capture_index is not contiguous")
         require(
-            wave_path.name == f"wave-{expected_index:04}.json",
+            wave_path.name == f"{filename_prefix}{expected_index:04}.json",
             "wave filename is not canonical",
         )
         for field in IDENTITY_FIELDS:
             require(wave[field] == plan[field], f"wave.{field} differs from plan")
-        require(wave["wave_kind"] == "prefill", "wave.wave_kind must be prefill")
+        require(
+            wave["wave_kind"] == expected_kind,
+            f"wave.wave_kind must be {expected_kind}",
+        )
         participant_count = integer(wave["participant_count"], "wave.participant_count", minimum=1)
         sha256(wave["completion_fingerprint"], "wave.completion_fingerprint")
         sha256(wave["receipt_fingerprint"], "wave.receipt_fingerprint")
@@ -400,6 +440,7 @@ def validate_artifact(
         require(record_keys == sorted(set(record_keys)), "wave records must be unique and sorted")
         summaries.append(
             {
+                "wave_kind": expected_kind,
                 "capture_index": expected_index,
                 "participant_count": participant_count,
                 "records": records_summary,
@@ -409,7 +450,7 @@ def validate_artifact(
     actual_raw = {path.name for path in capture_dir.glob("*.bin")}
     require(actual_raw == referenced_raw, "raw file set differs from manifest references")
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "status": "pass",
         "capture_dir": str(capture_dir.resolve()),
         "model_id": model_id,
@@ -419,7 +460,11 @@ def validate_artifact(
         "program_fingerprint": plan["program_fingerprint"],
         "run_id": plan["run_id"],
         "checkpoint_values": value_ids,
+        "maximum_prefill_waves": maximum_waves,
+        "maximum_decode_waves": maximum_decode_waves,
         "wave_count": len(summaries),
+        "prefill_wave_count": len(prefill_wave_paths),
+        "decode_wave_count": len(decode_wave_paths),
         "waves": summaries,
     }
 
@@ -441,6 +486,10 @@ def self_test() -> None:
         raw_name = "capture-0000-participant-0000-value_test-000000000000.bin"
         (capture / raw_name).write_bytes(raw)
         digest = hashlib.sha256(raw).hexdigest()
+        decode_raw = struct.pack("<ee", 0.25, -2.0)
+        decode_raw_name = "decode-capture-0000-participant-0000-value_test-000000000000.bin"
+        (capture / decode_raw_name).write_bytes(decode_raw)
+        decode_digest = hashlib.sha256(decode_raw).hexdigest()
         checkpoint = {
             "value_id": "value.test",
             "producer_node_id": "node.test",
@@ -458,13 +507,14 @@ def self_test() -> None:
             "run_id": "run.test",
         }
         plan = {
-            "schema_version": 1,
+            "schema_version": 2,
             **identity,
             "maximum_prefill_waves": 1,
+            "maximum_decode_waves": 1,
             "checkpoints": [checkpoint],
         }
         wave = {
-            "schema_version": 1,
+            "schema_version": 2,
             "capture_index": 0,
             **identity,
             "wave_kind": "prefill",
@@ -491,8 +541,23 @@ def self_test() -> None:
                 }
             ],
         }
+        decode_wave = {
+            **wave,
+            "wave_kind": "decode",
+            "records": [
+                {
+                    **wave["records"][0],
+                    "raw_file": decode_raw_name,
+                    "raw_bytes": len(decode_raw),
+                    "raw_sha256": decode_digest,
+                }
+            ],
+        }
         (capture / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
         (capture / "wave-0000.json").write_text(json.dumps(wave), encoding="utf-8")
+        (capture / "decode-wave-0000.json").write_text(
+            json.dumps(decode_wave), encoding="utf-8"
+        )
         validate_artifact(capture, "model.test", ["value.test"])
         (capture / raw_name).write_bytes(raw + b"bad")
         try:
@@ -501,6 +566,16 @@ def self_test() -> None:
             require("raw_bytes differs" in str(error), "self-test rejected the wrong mutation")
         else:
             raise ArtifactError("self-test accepted a mutated raw tensor")
+
+        (capture / raw_name).write_bytes(raw)
+        (capture / decode_raw_name).unlink()
+        (capture / "decode-wave-0000.json").unlink()
+        plan["schema_version"] = 1
+        plan.pop("maximum_decode_waves")
+        wave["schema_version"] = 1
+        (capture / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (capture / "wave-0000.json").write_text(json.dumps(wave), encoding="utf-8")
+        validate_artifact(capture, "model.test", ["value.test"])
     print("RUNTIME VNEXT CHECKPOINT ARTIFACT SELF-TEST PASS")
 
 
