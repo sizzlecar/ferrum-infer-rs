@@ -85,6 +85,27 @@ CASES = {
             {"role": "user", "content": "Q2"},
         ]
     },
+    "tool_result_history": {
+        "messages": [
+            {"role": "user", "content": "Use the calculator."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": {"expression": "7*3"},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "21"},
+        ],
+        "render_kwargs": {"enable_thinking": True},
+    },
     "tools": {
         "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
         "tools": [WEATHER_TOOL],
@@ -215,12 +236,13 @@ def main() -> None:
                 # tests instead.
                 continue
             try:
+                case_kwargs = {**kwargs, **case.get("render_kwargs", {})}
                 rendered = tok.apply_chat_template(
                     case["messages"],
                     tools=tools,
                     tokenize=False,
                     add_generation_prompt=True,
-                    **kwargs,
+                    **case_kwargs,
                 )
             except Exception as e:  # noqa: BLE001 - record and continue
                 print(f"   !! case {name} failed: {e}")
