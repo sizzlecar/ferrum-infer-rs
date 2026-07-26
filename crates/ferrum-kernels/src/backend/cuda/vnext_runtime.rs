@@ -17,18 +17,18 @@ use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
-    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
-    DeviceReusableAddressScope, DeviceReusableExecutionInvocation,
-    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
-    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ProgramBindingNodeBinding, StreamState, VNextError,
+    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
+    DeviceCommandLogicalWork, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
+    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionSpanKind,
+    DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceReusableAddressScope,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionTrim, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
+    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
+    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
+    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, StreamState, VNextError,
 };
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
@@ -726,6 +726,21 @@ impl CudaDeviceCommand {
         self.token_count = token_count;
         self.compute_dispatch_count = compute_dispatch_count;
         self.transfer_command_count = transfer_command_count;
+        Ok(self)
+    }
+
+    fn bind_core_logical_work(
+        mut self,
+        logical_work: DeviceCommandLogicalWork,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if self.participant_count != 0 || self.token_count != 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA core logical work cannot replace provider command attribution",
+            ));
+        }
+        self.batching_form = logical_work.batching_form();
+        self.participant_count = logical_work.participant_count();
+        self.token_count = logical_work.token_count();
         Ok(self)
     }
 
@@ -2013,8 +2028,16 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let entries = commands
             .into_entries()
             .into_iter()
-            .map(DeviceCommandEntry::into_parts)
-            .collect::<Vec<_>>();
+            .map(|entry| {
+                let (phase, node_index, logical_work, command) = entry.into_parts();
+                let command = match logical_work {
+                    Some(logical_work) => command.bind_core_logical_work(logical_work)?,
+                    None => command,
+                };
+                Ok((phase, node_index, command))
+            })
+            .collect::<Result<Vec<_>, CudaDeviceRuntimeError>>()
+            .map_err(DefinitelyNotSubmitted::new)?;
         let command_count = u32::try_from(entries.len()).map_err(|_| {
             DefinitelyNotSubmitted::new(CudaDeviceRuntimeError::contract(
                 "CUDA command count exceeds u32",
@@ -2718,6 +2741,50 @@ mod tests {
         assert_eq!(binding.reusable_graph_node_count(), Some(2));
         assert_eq!(binding.compute_dispatch_count(), 0);
         assert_eq!(binding.transfer_command_count(), 2);
+    }
+
+    #[test]
+    fn core_logical_work_binds_node_workspace_zero_attribution() {
+        let zero = || {
+            CudaDeviceCommand::transfer(
+                1,
+                "device zero",
+                Vec::new(),
+                Vec::new(),
+                Box::new(|_, _, _, _| Ok(())),
+            )
+        };
+        let error = cuda_submission_attribution(
+            &[DeviceCommandPhase::Initialization],
+            &[Some(0)],
+            &[zero()],
+            &[DeviceExecutionPath::Eager],
+            Some(&[None]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid native work metadata"));
+
+        let logical_work =
+            DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 1, 164).unwrap();
+        let bound = zero().bind_core_logical_work(logical_work).unwrap();
+        let attribution = cuda_submission_attribution(
+            &[DeviceCommandPhase::Initialization],
+            &[Some(0)],
+            &[bound],
+            &[DeviceExecutionPath::Eager],
+            Some(&[None]),
+        )
+        .unwrap();
+        let [command] = attribution.commands() else {
+            panic!("expected one node workspace initialization row")
+        };
+        assert_eq!(command.node_index(), Some(0));
+        assert_eq!(command.command_phase(), DeviceCommandPhase::Initialization);
+        assert_eq!(command.batching_form(), DeviceBatchingForm::Packed);
+        assert_eq!(command.participant_count(), 1);
+        assert_eq!(command.token_count(), 164);
+        assert_eq!(command.compute_dispatch_count(), 0);
+        assert_eq!(command.transfer_command_count(), 1);
     }
 
     #[test]

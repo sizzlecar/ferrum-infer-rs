@@ -17,8 +17,8 @@ use std::time::Instant;
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
-    DeviceCommandExecutionTiming, DeviceCommandPhase, DeviceDescriptor, DeviceErrorReport,
-    DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
+    DeviceCommandExecutionTiming, DeviceCommandLogicalWork, DeviceCommandPhase, DeviceDescriptor,
+    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceRuntime,
     DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
     DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
@@ -1229,6 +1229,21 @@ impl MetalDeviceCommand {
         Ok(self)
     }
 
+    fn bind_core_logical_work(
+        mut self,
+        logical_work: DeviceCommandLogicalWork,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        if self.participant_count != 0 || self.token_count != 0 {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal core logical work cannot replace provider command attribution",
+            ));
+        }
+        self.batching_form = logical_work.batching_form();
+        self.participant_count = logical_work.participant_count();
+        self.token_count = logical_work.token_count();
+        Ok(self)
+    }
+
     fn transfer(
         runtime_instance: u64,
         operation: &'static str,
@@ -2102,8 +2117,16 @@ impl DeviceRuntime for MetalDeviceRuntime {
         let entries = commands
             .into_entries()
             .into_iter()
-            .map(DeviceCommandEntry::into_parts)
-            .collect();
+            .map(|entry| {
+                let (phase, node_index, logical_work, command) = entry.into_parts();
+                let command = match logical_work {
+                    Some(logical_work) => command.bind_core_logical_work(logical_work)?,
+                    None => command,
+                };
+                Ok((phase, node_index, command))
+            })
+            .collect::<Result<Vec<_>, MetalDeviceRuntimeError>>()
+            .map_err(DefinitelyNotSubmitted::new)?;
         self.submit_commands(stream, entries, timing_mode, timing_sink)
     }
 
@@ -2627,8 +2650,11 @@ mod tests {
         let command = runtime
             .encode_zero(&destination, 0, 8)
             .expect("zero command")
-            .with_work_shape(DeviceBatchingForm::Packed, 2, 8)
-            .expect("work shape");
+            .bind_core_logical_work(
+                DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 2, 8)
+                    .expect("logical work"),
+            )
+            .expect("core logical work");
         let mut stream = runtime.create_stream().expect("stream");
 
         let fence = runtime

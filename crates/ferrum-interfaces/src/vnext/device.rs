@@ -732,6 +732,50 @@ impl DeviceBatchingForm {
     }
 }
 
+/// Core-owned logical work bound to a node-scoped device command.
+///
+/// Providers describe their own command work directly. Core-created commands,
+/// such as scratch initialization, use this value so backend-native
+/// attribution remains bound to the exact batch node instead of inventing a
+/// participant or token count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceCommandLogicalWork {
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+}
+
+impl DeviceCommandLogicalWork {
+    pub fn new(
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, super::VNextError> {
+        if participant_count == 0 {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "node-scoped device command has zero logical participants".to_owned(),
+            });
+        }
+        Ok(Self {
+            batching_form,
+            participant_count,
+            token_count,
+        })
+    }
+
+    pub const fn batching_form(self) -> DeviceBatchingForm {
+        self.batching_form
+    }
+
+    pub const fn participant_count(self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(self) -> u64 {
+        self.token_count
+    }
+}
+
 /// Typed host boundaries inside one backend submission. These intervals use
 /// the host monotonic clock and must not be combined with device-event time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2352,6 +2396,7 @@ impl<C> EncodedReusableExecutionBindings<C> {
 pub struct DeviceCommandEntry<C> {
     phase: DeviceCommandPhase,
     node_index: Option<u32>,
+    logical_work: Option<DeviceCommandLogicalWork>,
     command: C,
 }
 
@@ -2364,12 +2409,23 @@ impl<C> DeviceCommandEntry<C> {
         self.node_index
     }
 
+    pub const fn logical_work(&self) -> Option<DeviceCommandLogicalWork> {
+        self.logical_work
+    }
+
     pub const fn command(&self) -> &C {
         &self.command
     }
 
-    pub fn into_parts(self) -> (DeviceCommandPhase, Option<u32>, C) {
-        (self.phase, self.node_index, self.command)
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeviceCommandPhase,
+        Option<u32>,
+        Option<DeviceCommandLogicalWork>,
+        C,
+    ) {
+        (self.phase, self.node_index, self.logical_work, self.command)
     }
 }
 
@@ -2392,6 +2448,7 @@ impl<C> DeviceCommandBatch<C> {
             commands: vec![DeviceCommandEntry {
                 phase: DeviceCommandPhase::Compute,
                 node_index: None,
+                logical_work: None,
                 command,
             }],
             timing_mode: DeviceTimingMode::Off,
@@ -2437,14 +2494,21 @@ impl<C> DeviceCommandBatch<C> {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Initialization,
             node_index: None,
+            logical_work: None,
             command,
         });
     }
 
-    pub(crate) fn push_node_initialization(&mut self, node_index: u32, command: C) {
+    pub(crate) fn push_node_initialization(
+        &mut self,
+        node_index: u32,
+        logical_work: DeviceCommandLogicalWork,
+        command: C,
+    ) {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Initialization,
             node_index: Some(node_index),
+            logical_work: Some(logical_work),
             command,
         });
     }
@@ -2453,6 +2517,7 @@ impl<C> DeviceCommandBatch<C> {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::DynamicBinding,
             node_index: None,
+            logical_work: None,
             command,
         });
     }
@@ -2461,6 +2526,7 @@ impl<C> DeviceCommandBatch<C> {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Compute,
             node_index: None,
+            logical_work: None,
             command,
         });
     }
@@ -2469,6 +2535,7 @@ impl<C> DeviceCommandBatch<C> {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::ResultBinding,
             node_index: None,
+            logical_work: None,
             command,
         });
     }
@@ -2479,6 +2546,7 @@ impl<C> DeviceCommandBatch<C> {
             self.commands.push(DeviceCommandEntry {
                 phase: DeviceCommandPhase::DynamicBinding,
                 node_index: Some(node_index),
+                logical_work: None,
                 command,
             });
         }
@@ -2496,18 +2564,21 @@ impl<C> DeviceCommandBatch<C> {
             self.commands.push(DeviceCommandEntry {
                 phase: DeviceCommandPhase::DynamicBinding,
                 node_index: Some(node_index),
+                logical_work: None,
                 command,
             });
         }
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Compute,
             node_index: Some(node_index),
+            logical_work: None,
             command: compute,
         });
         for command in result_bindings {
             self.commands.push(DeviceCommandEntry {
                 phase: DeviceCommandPhase::ResultBinding,
                 node_index: Some(node_index),
+                logical_work: None,
                 command,
             });
         }
@@ -3119,10 +3190,27 @@ mod deferred_cleanup_tests {
             entries
                 .into_iter()
                 .map(DeviceCommandEntry::into_parts)
-                .map(|(_, _, command)| command)
+                .map(|(_, _, _, command)| command)
                 .collect::<Vec<_>>(),
             vec!["program-bind", "bind-a", "bind-b", "compute", "writeback",]
         );
+    }
+
+    #[test]
+    fn node_initialization_carries_core_owned_logical_work() {
+        let logical_work =
+            DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 4, 17).unwrap();
+        let mut batch = DeviceCommandBatch::with_capacity(1);
+        batch.push_node_initialization(7, logical_work, "workspace-zero");
+
+        let mut entries = batch.into_entries();
+        assert_eq!(entries.len(), 1);
+        let entry = entries.pop().unwrap();
+        assert_eq!(entry.phase(), DeviceCommandPhase::Initialization);
+        assert_eq!(entry.node_index(), Some(7));
+        assert_eq!(entry.logical_work(), Some(logical_work));
+        assert_eq!(entry.command(), &"workspace-zero");
+        assert!(DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 0, 17).is_err());
     }
 
     #[test]
