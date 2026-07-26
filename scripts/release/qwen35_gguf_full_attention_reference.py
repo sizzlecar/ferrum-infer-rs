@@ -55,7 +55,8 @@ def load_capture(
     wave = common.load_json(wave_paths[0])
     common.require(isinstance(plan, dict) and isinstance(wave, dict),
                    "Ferrum plan and wave must be objects")
-    common.require(plan.get("schema_version") == 1 and wave.get("schema_version") == 1,
+    common.require(plan.get("schema_version") in (1, 2)
+                   and wave.get("schema_version") == plan.get("schema_version"),
                    "unsupported Ferrum capture schema")
     common.require(wave.get("wave_kind") == "prefill"
                    and wave.get("participant_count") == 1,

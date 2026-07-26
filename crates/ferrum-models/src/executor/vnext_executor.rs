@@ -41,7 +41,8 @@ use crate::vnext::PreparedProductionModel;
 use super::{
     common,
     vnext_checkpoint::{
-        VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointSelection,
+        VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointClaim,
+        VNextCheckpointSelection,
     },
     vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
     vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
@@ -5363,12 +5364,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
         let PreparedVNextPrefill { step, wave } = prepared;
-        let capture_index = if kind == VNextExecutionWaveKind::Prefill {
-            self.checkpoint_capture
+        let capture_claim = match kind {
+            VNextExecutionWaveKind::Prefill => self
+                .checkpoint_capture
                 .as_ref()
-                .and_then(VNextCheckpointCapture::claim_prefill_wave)
-        } else {
-            None
+                .and_then(VNextCheckpointCapture::claim_prefill_wave),
+            VNextExecutionWaveKind::Decode => self
+                .checkpoint_capture
+                .as_ref()
+                .and_then(VNextCheckpointCapture::claim_decode_wave),
         };
         let output_mode = Self::product_output_mode(participants, kind);
         let token_mask_keys = participants
@@ -5415,7 +5419,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
         let readbacks =
-            self.prepare_terminal_readbacks(participants, capture_index, output_mode)?;
+            self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
         let dispatch = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
             let _phase_timing = phase_timing.host_encode_submit.start();
@@ -5612,7 +5616,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             && request.output_layout() == self.io.greedy_token_output_layout
                     }
                 };
-                let checkpoint = capture_index
+                let checkpoint = capture_claim
                     .and_then(|_| self.checkpoint_capture.as_ref())
                     .and_then(|capture| capture.checkpoint_for_output(output));
                 if !is_product_output && checkpoint.is_none() {
@@ -5641,8 +5645,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     }
                     *slot = Some(self.decode_product_output(output.bytes(), output_mode)?);
                 }
-                if let (Some(capture_index), Some(capture), Some(checkpoint)) =
-                    (capture_index, self.checkpoint_capture.as_ref(), checkpoint)
+                if let (Some(capture_claim), Some(capture), Some(checkpoint)) =
+                    (capture_claim, self.checkpoint_capture.as_ref(), checkpoint)
                 {
                     let participant_index =
                         usize::try_from(request.participant_index()).map_err(|_| {
@@ -5656,7 +5660,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )
                     })?;
                     checkpoint_records.push(capture.write_output(
-                        capture_index,
+                        capture_claim,
                         &participant.sequence.request_id,
                         participant.span,
                         checkpoint,
@@ -5684,11 +5688,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(self.abort_step(step, error.to_string()).await);
             }
         };
-        if let (Some(capture_index), Some(capture)) =
-            (capture_index, self.checkpoint_capture.as_ref())
+        if let (Some(capture_claim), Some(capture)) =
+            (capture_claim, self.checkpoint_capture.as_ref())
         {
             if let Err(error) = capture.finish_wave(
-                capture_index,
+                capture_claim,
                 participants.len(),
                 receipt.completion().fingerprint(),
                 receipt.fingerprint(),
@@ -5796,7 +5800,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn prepare_terminal_readbacks(
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
-        capture_index: Option<usize>,
+        capture_claim: Option<VNextCheckpointClaim>,
         output_mode: VNextProductOutputMode,
     ) -> Result<VNextTerminalReadbacks> {
         let (output_node_id, output_resource_id, output_offset_bytes, output_layout) =
@@ -5833,7 +5837,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let product_readbacks = CompletionReadbackBatchRequest::new(product_readbacks)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         let mut readback_batches = vec![product_readbacks.clone()];
-        if capture_index.is_some() {
+        if capture_claim.is_some() {
             let capture = self.checkpoint_capture.as_ref().ok_or_else(|| {
                 FerrumError::internal("vNext checkpoint capture index has no capture owner")
             })?;

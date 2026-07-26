@@ -2079,6 +2079,7 @@ mod tests {
                 output_dir,
                 value_ids: vec!["value.output.logits".to_owned()],
                 maximum_prefill_waves: 1,
+                maximum_decode_waves: 0,
             });
     }
 

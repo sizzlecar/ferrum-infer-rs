@@ -51,6 +51,8 @@ pub struct VNextCheckpointCaptureConfig {
     pub output_dir: PathBuf,
     pub value_ids: Vec<String>,
     pub maximum_prefill_waves: usize,
+    #[serde(default)]
+    pub maximum_decode_waves: usize,
 }
 
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
@@ -892,6 +894,18 @@ mod tests {
             scheduler.sequence_fit_policy,
             SequenceFitPolicy::ImmediateOnly
         );
+    }
+
+    #[test]
+    fn checkpoint_capture_deserialization_keeps_decode_capture_disabled_by_default() {
+        let capture: VNextCheckpointCaptureConfig = serde_json::from_value(serde_json::json!({
+            "output_dir": "capture",
+            "value_ids": ["value.output.logits"],
+            "maximum_prefill_waves": 1
+        }))
+        .unwrap();
+
+        assert_eq!(capture.maximum_decode_waves, 0);
     }
 
     #[test]

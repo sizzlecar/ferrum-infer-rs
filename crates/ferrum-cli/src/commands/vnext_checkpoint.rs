@@ -9,8 +9,8 @@ pub struct VNextCheckpointArgs {
     #[arg(long = "vnext-checkpoint-dir", value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
 
-    /// Semantic ProgramValueId retained and captured after prefill. Repeat for
-    /// multiple layer or logits checkpoints.
+    /// Semantic ProgramValueId retained and captured after a selected execution
+    /// wave. Repeat for multiple layer or logits checkpoints.
     #[arg(
         long = "vnext-checkpoint-value",
         value_name = "VALUE_ID",
@@ -22,13 +22,19 @@ pub struct VNextCheckpointArgs {
     /// excluded. Defaults to one when capture is configured.
     #[arg(long = "vnext-checkpoint-prefill-waves", value_name = "N")]
     pub maximum_prefill_waves: Option<usize>,
+
+    /// Maximum number of real decode waves to capture. Startup warmup is
+    /// excluded. Defaults to zero when capture is configured.
+    #[arg(long = "vnext-checkpoint-decode-waves", value_name = "N")]
+    pub maximum_decode_waves: Option<usize>,
 }
 
 impl VNextCheckpointArgs {
     pub fn to_config(&self) -> Result<Option<VNextCheckpointCaptureConfig>> {
         let configured = self.output_dir.is_some()
             || !self.value_ids.is_empty()
-            || self.maximum_prefill_waves.is_some();
+            || self.maximum_prefill_waves.is_some()
+            || self.maximum_decode_waves.is_some();
         if !configured {
             return Ok(None);
         }
@@ -46,6 +52,7 @@ impl VNextCheckpointArgs {
             output_dir,
             value_ids: self.value_ids.clone(),
             maximum_prefill_waves: self.maximum_prefill_waves.unwrap_or(1),
+            maximum_decode_waves: self.maximum_decode_waves.unwrap_or(0),
         }))
     }
 }
@@ -83,10 +90,28 @@ mod tests {
             output_dir: Some(PathBuf::from("capture")),
             value_ids: vec!["value.output.logits".to_owned()],
             maximum_prefill_waves: None,
+            maximum_decode_waves: None,
         }
         .to_config()
         .unwrap()
         .unwrap();
         assert_eq!(config.maximum_prefill_waves, 1);
+        assert_eq!(config.maximum_decode_waves, 0);
+    }
+
+    #[test]
+    fn decode_capture_is_an_explicit_shared_product_option() {
+        let config = VNextCheckpointArgs {
+            output_dir: Some(PathBuf::from("capture")),
+            value_ids: vec!["value.output.greedy_token".to_owned()],
+            maximum_prefill_waves: Some(1),
+            maximum_decode_waves: Some(64),
+        }
+        .to_config()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.maximum_prefill_waves, 1);
+        assert_eq!(config.maximum_decode_waves, 64);
     }
 }

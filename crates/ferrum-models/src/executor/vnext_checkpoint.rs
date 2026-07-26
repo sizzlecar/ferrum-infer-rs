@@ -15,11 +15,14 @@ use sha2::{Digest, Sha256};
 
 const MAX_CHECKPOINT_VALUES: usize = 63;
 const MAX_PREFILL_WAVES: usize = 16;
+const MAX_DECODE_WAVES: usize = 512;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 pub(super) struct VNextCheckpointSelection {
     output_dir: PathBuf,
     value_ids: Vec<ProgramValueId>,
     maximum_prefill_waves: usize,
+    maximum_decode_waves: usize,
 }
 
 impl VNextCheckpointSelection {
@@ -44,6 +47,11 @@ impl VNextCheckpointSelection {
                 "vNext checkpoint prefill wave count must be in 1..={MAX_PREFILL_WAVES}"
             )));
         }
+        if config.maximum_decode_waves > MAX_DECODE_WAVES {
+            return Err(FerrumError::config(format!(
+                "vNext checkpoint decode wave count must be in 0..={MAX_DECODE_WAVES}"
+            )));
+        }
         let value_ids = config
             .value_ids
             .iter()
@@ -66,6 +74,7 @@ impl VNextCheckpointSelection {
             output_dir: config.output_dir.clone(),
             value_ids,
             maximum_prefill_waves: config.maximum_prefill_waves,
+            maximum_decode_waves: config.maximum_decode_waves,
         }))
     }
 
@@ -94,7 +103,9 @@ impl VNextCheckpointSelection {
             output_dir: self.output_dir,
             checkpoints,
             maximum_prefill_waves: self.maximum_prefill_waves,
+            maximum_decode_waves: self.maximum_decode_waves,
             next_prefill_wave: AtomicUsize::new(0),
+            next_decode_wave: AtomicUsize::new(0),
             armed: AtomicBool::new(false),
             plan_id: plan.payload().plan_id().to_string(),
             plan_hash: plan.plan_hash().to_string(),
@@ -112,7 +123,9 @@ pub(super) struct VNextCheckpointCapture {
     output_dir: PathBuf,
     checkpoints: Vec<RetainedCompletionValue>,
     maximum_prefill_waves: usize,
+    maximum_decode_waves: usize,
     next_prefill_wave: AtomicUsize,
+    next_decode_wave: AtomicUsize,
     armed: AtomicBool,
     plan_id: String,
     plan_hash: String,
@@ -122,20 +135,76 @@ pub(super) struct VNextCheckpointCapture {
     run_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VNextCheckpointWaveKind {
+    Prefill,
+    Decode,
+}
+
+impl VNextCheckpointWaveKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VNextCheckpointClaim {
+    kind: VNextCheckpointWaveKind,
+    capture_index: usize,
+}
+
+impl VNextCheckpointClaim {
+    const fn new(kind: VNextCheckpointWaveKind, capture_index: usize) -> Self {
+        Self {
+            kind,
+            capture_index,
+        }
+    }
+
+    fn manifest_file_name(self) -> String {
+        match self.kind {
+            VNextCheckpointWaveKind::Prefill => {
+                format!("wave-{:04}.json", self.capture_index)
+            }
+            VNextCheckpointWaveKind::Decode => {
+                format!("decode-wave-{:04}.json", self.capture_index)
+            }
+        }
+    }
+}
+
 impl VNextCheckpointCapture {
     pub(super) fn arm(&self) {
         self.armed.store(true, Ordering::Release);
     }
 
-    pub(super) fn claim_prefill_wave(&self) -> Option<usize> {
+    pub(super) fn claim_prefill_wave(&self) -> Option<VNextCheckpointClaim> {
+        self.claim_wave(VNextCheckpointWaveKind::Prefill)
+    }
+
+    pub(super) fn claim_decode_wave(&self) -> Option<VNextCheckpointClaim> {
+        self.claim_wave(VNextCheckpointWaveKind::Decode)
+    }
+
+    fn claim_wave(&self, kind: VNextCheckpointWaveKind) -> Option<VNextCheckpointClaim> {
         if !self.armed.load(Ordering::Acquire) {
             return None;
         }
-        self.next_prefill_wave
+        let (next_wave, maximum_waves) = match kind {
+            VNextCheckpointWaveKind::Prefill => {
+                (&self.next_prefill_wave, self.maximum_prefill_waves)
+            }
+            VNextCheckpointWaveKind::Decode => (&self.next_decode_wave, self.maximum_decode_waves),
+        };
+        next_wave
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.maximum_prefill_waves).then_some(current + 1)
+                (current < maximum_waves).then_some(current + 1)
             })
             .ok()
+            .map(|capture_index| VNextCheckpointClaim::new(kind, capture_index))
     }
 
     pub(super) fn checkpoints(&self) -> &[RetainedCompletionValue] {
@@ -185,7 +254,7 @@ impl VNextCheckpointCapture {
 
     pub(super) fn write_output(
         &self,
-        capture_index: usize,
+        claim: VNextCheckpointClaim,
         request_id: &RequestId,
         token_span: &TokenSpanWork,
         checkpoint: &RetainedCompletionValue,
@@ -201,7 +270,7 @@ impl VNextCheckpointCapture {
             ));
         }
         let stem = checkpoint_file_stem(
-            capture_index,
+            claim,
             output.request().participant_index(),
             checkpoint.value_id(),
         );
@@ -221,7 +290,7 @@ impl VNextCheckpointCapture {
 
     pub(super) fn finish_wave(
         &self,
-        capture_index: usize,
+        claim: VNextCheckpointClaim,
         participant_count: usize,
         completion_fingerprint: &str,
         receipt_fingerprint: &str,
@@ -256,15 +325,15 @@ impl VNextCheckpointCapture {
                 .then_with(|| left.participant_index.cmp(&right.participant_index))
         });
         let manifest = VNextCheckpointWaveManifest {
-            schema_version: 1,
-            capture_index,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            capture_index: claim.capture_index,
             plan_id: &self.plan_id,
             plan_hash: &self.plan_hash,
             model_id: &self.model_id,
             family_fingerprint: &self.family_fingerprint,
             program_fingerprint: &self.program_fingerprint,
             run_id: &self.run_id,
-            wave_kind: "prefill",
+            wave_kind: claim.kind.as_str(),
             participant_count,
             completion_fingerprint,
             receipt_fingerprint,
@@ -273,17 +342,12 @@ impl VNextCheckpointCapture {
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
             FerrumError::internal(format!("serialize vNext checkpoint wave: {error}"))
         })?;
-        write_new_file(
-            &self
-                .output_dir
-                .join(format!("wave-{capture_index:04}.json")),
-            &bytes,
-        )
+        write_new_file(&self.output_dir.join(claim.manifest_file_name()), &bytes)
     }
 
     fn write_plan_manifest(&self) -> Result<()> {
         let manifest = VNextCheckpointPlanManifest {
-            schema_version: 1,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
             plan_id: &self.plan_id,
             plan_hash: &self.plan_hash,
             model_id: &self.model_id,
@@ -291,6 +355,7 @@ impl VNextCheckpointCapture {
             program_fingerprint: &self.program_fingerprint,
             run_id: &self.run_id,
             maximum_prefill_waves: self.maximum_prefill_waves,
+            maximum_decode_waves: self.maximum_decode_waves,
             checkpoints: &self.checkpoints,
         };
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
@@ -322,6 +387,7 @@ struct VNextCheckpointPlanManifest<'a> {
     program_fingerprint: &'a str,
     run_id: &'a str,
     maximum_prefill_waves: usize,
+    maximum_decode_waves: usize,
     checkpoints: &'a [RetainedCompletionValue],
 }
 
@@ -370,7 +436,7 @@ fn prepare_empty_output_directory(path: &Path) -> Result<()> {
 }
 
 fn checkpoint_file_stem(
-    capture_index: usize,
+    claim: VNextCheckpointClaim,
     participant_index: u32,
     value_id: &ProgramValueId,
 ) -> String {
@@ -386,8 +452,13 @@ fn checkpoint_file_stem(
         })
         .collect::<String>();
     let digest = format!("{:x}", Sha256::digest(value_id.as_str().as_bytes()));
+    let kind_prefix = match claim.kind {
+        VNextCheckpointWaveKind::Prefill => "",
+        VNextCheckpointWaveKind::Decode => "decode-",
+    };
     format!(
-        "capture-{capture_index:04}-participant-{participant_index:04}-{slug}-{}",
+        "{kind_prefix}capture-{:04}-participant-{participant_index:04}-{slug}-{}",
+        claim.capture_index,
         &digest[..12]
     )
 }
@@ -411,12 +482,17 @@ fn checkpoint_io_error(context: &'static str, error: std::io::Error) -> FerrumEr
 mod tests {
     use super::*;
 
-    fn capture(maximum_prefill_waves: usize) -> VNextCheckpointCapture {
+    fn capture(
+        maximum_prefill_waves: usize,
+        maximum_decode_waves: usize,
+    ) -> VNextCheckpointCapture {
         VNextCheckpointCapture {
             output_dir: PathBuf::new(),
             checkpoints: Vec::new(),
             maximum_prefill_waves,
+            maximum_decode_waves,
             next_prefill_wave: AtomicUsize::new(0),
+            next_decode_wave: AtomicUsize::new(0),
             armed: AtomicBool::new(false),
             plan_id: "plan.test".to_owned(),
             plan_hash: "plan-hash".to_owned(),
@@ -441,6 +517,7 @@ mod tests {
             output_dir: directory.path().join("capture"),
             value_ids: vec!["value.z".to_owned(), "value.a".to_owned()],
             maximum_prefill_waves: 2,
+            maximum_decode_waves: 64,
         };
         let selection = VNextCheckpointSelection::from_config(Some(&config))
             .unwrap()
@@ -464,16 +541,57 @@ mod tests {
             ..config
         };
         assert!(VNextCheckpointSelection::from_config(Some(&zero_waves)).is_err());
+        let excessive_decode_waves = VNextCheckpointCaptureConfig {
+            maximum_prefill_waves: 1,
+            maximum_decode_waves: MAX_DECODE_WAVES + 1,
+            ..zero_waves
+        };
+        assert!(VNextCheckpointSelection::from_config(Some(&excessive_decode_waves)).is_err());
     }
 
     #[test]
-    fn capture_only_claims_bounded_waves_after_startup_arm() {
-        let capture = capture(2);
+    fn capture_only_claims_bounded_prefill_and_decode_waves_after_startup_arm() {
+        let capture = capture(2, 1);
         assert_eq!(capture.claim_prefill_wave(), None);
+        assert_eq!(capture.claim_decode_wave(), None);
         capture.arm();
-        assert_eq!(capture.claim_prefill_wave(), Some(0));
-        assert_eq!(capture.claim_prefill_wave(), Some(1));
+        assert_eq!(
+            capture.claim_prefill_wave(),
+            Some(VNextCheckpointClaim::new(
+                VNextCheckpointWaveKind::Prefill,
+                0
+            ))
+        );
+        assert_eq!(
+            capture.claim_prefill_wave(),
+            Some(VNextCheckpointClaim::new(
+                VNextCheckpointWaveKind::Prefill,
+                1
+            ))
+        );
         assert_eq!(capture.claim_prefill_wave(), None);
+        assert_eq!(
+            capture.claim_decode_wave(),
+            Some(VNextCheckpointClaim::new(
+                VNextCheckpointWaveKind::Decode,
+                0
+            ))
+        );
+        assert_eq!(capture.claim_decode_wave(), None);
+    }
+
+    #[test]
+    fn decode_artifact_names_do_not_collide_with_legacy_prefill_names() {
+        let prefill = VNextCheckpointClaim::new(VNextCheckpointWaveKind::Prefill, 0);
+        let decode = VNextCheckpointClaim::new(VNextCheckpointWaveKind::Decode, 0);
+        let value_id = ProgramValueId::new("value.output.logits").unwrap();
+
+        assert_eq!(prefill.manifest_file_name(), "wave-0000.json");
+        assert_eq!(decode.manifest_file_name(), "decode-wave-0000.json");
+        assert_ne!(
+            checkpoint_file_stem(prefill, 0, &value_id),
+            checkpoint_file_stem(decode, 0, &value_id)
+        );
     }
 
     #[test]
