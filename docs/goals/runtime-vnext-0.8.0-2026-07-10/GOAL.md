@@ -4,6 +4,27 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-07-26 的当前 clean HEAD 为
+`277309dda27f8b2f83f630695637017d5dad8390`。正式 G00-G10 PASS 仍为
+`0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前 M2 CUDA
+correctness artifact
+`/workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-matrix-277309dd-20260726T1410Z`
+在 canonical 703-case runner 中完成 `404` 个 PASS 后，于第 `405` 个 case
+`c13-022` 以 `c13-contract-violation` 停止：请求携带 calculator tool call 和 tool
+result `21`，产品响应却要求用户提供算式。该结果是当前产品正确性 blocker，不是正式
+PASS，也不能由 2026-07-23 的 stale `6fa8e215` 703/703 artifact 替代。相同当前 SHA
+已经在独立 focused lane 和 canonical lane 中分别证明 C09 `60/60`，canonical C12
+也为 `40/40`；C09/C12 不再是当前 blocker。
+
+两台 retained RTX 4090 实例 `45319871`、`45897840` 均已确认
+`cur_state=stopped`、`actual_status=exited`，当前没有 paid/transitional sibling。
+在下一次 paid CUDA work 之前只允许完成 C13 的 source/artifact 证据链：比较旧/新
+rendered prompt identity 和首个分叉 logit/token，先以本地 prompt contract 证伪
+history/template 丢失，再决定 product composition 或数值执行修复。禁止输出过滤、模型名
+特判、降低 C13 oracle 或直接重跑完整 703。修复后的执行顺序固定为 exact replay
+`c13-022`、C13 affected-contract、尚未执行的 C13-C16/C18/C20 suffix scenarios，
+最后只运行一次 canonical 703 和 `vnext-g08b-cuda` validator。
+
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
 `G03 weight ABI/fidelity contract -> G08B M2 CUDA current-HEAD correctness -> G09
