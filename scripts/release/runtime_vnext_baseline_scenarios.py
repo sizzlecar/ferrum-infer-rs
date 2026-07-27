@@ -4006,6 +4006,10 @@ def validate_c01_negative_probe(
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="strict").lower()
     combined = stdout_text + "\n" + stderr_text
     require("unsupported" in combined and ("architecture" in combined or "layout" in combined), f"{label} negative probe lacks exact unsupported architecture/layout evidence")
+    require(
+        "implicit architecture fallback is forbidden" in combined,
+        f"{label} negative probe lacks the registry fail-closed error",
+    )
     forbidden = (
         "missing weight",
         "no such file",
@@ -4015,7 +4019,9 @@ def validate_c01_negative_probe(
         "kernel launch",
         "out of memory",
         "llama",
-        "fallback",
+        "falling back",
+        "fallback selected",
+        "using fallback",
     )
     require(not any(value in combined for value in forbidden), f"{label} negative probe failed after fallback, weight, or kernel work")
     validate_process_receipt(
@@ -8499,7 +8505,15 @@ def make_case_fixture(
                 negative_weight_sha = file_sha256(negative_named_weight)
                 negative_weight_stat = negative_named_weight.stat()
                 negative_stdout.write_text("negative fixture rejected before inference\n", encoding="utf-8")
-                negative_stderr.write_text(f"unsupported architecture/layout: G00UnsupportedArchitecture{ordinal:03d}\n", encoding="utf-8")
+                negative_stderr.write_text(
+                    (
+                        "Unsupported operation: model metadata "
+                        f"hf.architecture.G00UnsupportedArchitecture{ordinal:03d} "
+                        "is absent from both the vNext and explicit legacy registries; "
+                        "implicit architecture fallback is forbidden\n"
+                    ),
+                    encoding="utf-8",
+                )
                 negative_env = {"NO_COLOR": "1", "PYTHONUNBUFFERED": "1"}
                 negative_argv = [binary_argv0, "run", negative_invocation_model_ref, "--backend", base["backend"]]
                 started = iso_now()
@@ -9381,7 +9395,13 @@ def run_mode(argv):
         target = config_document.get("text_config") if isinstance(config_document.get("text_config"), dict) else config_document
         architectures = target.get("architectures", [])
         if architectures and str(architectures[0]).startswith("G00UnsupportedArchitecture"):
-            print(f"unsupported architecture/layout: {architectures[0]}", file=sys.stderr)
+            print(
+                "Unsupported operation: model metadata "
+                f"hf.architecture.{architectures[0]} "
+                "is absent from both the vNext and explicit legacy registries; "
+                "implicit architecture fallback is forbidden",
+                file=sys.stderr,
+            )
             return 65
     write_config(argv, "run")
     config = value_after(argv, "--effective-config-json", "")
@@ -11864,6 +11884,23 @@ def self_test() -> int:
             expect_execution_report_reject(mutation_root, candidate, "negative tokenizer differs from the locked source")
             rejected_mutations.add("c01-negative-tokenizer-drift")
 
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-fallback-action") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0, case_index=15)
+            envelope = read_json(envelope_path)
+            input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
+            negative = require_object(input_document.get("negative_probe"), "C01 mutation negative probe")
+            negative_stderr = mutation_root / negative["artifacts"]["stderr"]["path"]
+            negative_stderr.write_text(
+                negative_stderr.read_text(encoding="utf-8")
+                + "falling back to an implicit legacy implementation\n",
+                encoding="utf-8",
+            )
+            update_ref_sha(negative["artifacts"]["stderr"], mutation_root)
+            negative["fixture_manifest_sha256"] = canonical_json_sha256(negative["artifacts"])
+            persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
+            expect_execution_report_reject(mutation_root, candidate, "failed after fallback, weight, or kernel work")
+            rejected_mutations.add("c01-fallback-action")
+
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-pass-architecture") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0)
             envelope = read_json(envelope_path)
@@ -12344,6 +12381,7 @@ def self_test() -> int:
             "resident-wire-cross-command-binding",
             "post-c09-case-old-process-binding",
             "c01-missing-resolution-probe",
+            "c01-fallback-action",
             "c01-negative-tokenizer-drift",
             "c01-pass-architecture-mismatch",
             "c01-wrong-negative-failure-class",
