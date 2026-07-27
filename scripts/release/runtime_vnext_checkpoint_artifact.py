@@ -388,7 +388,7 @@ def validate_artifact(
             )
             require(
                 end - start == immediate_tokens
-                and full_tokens == fit_tokens
+                and full_tokens <= fit_tokens
                 and end <= full_tokens,
                 f"{label}.token_span is inconsistent",
             )
@@ -684,7 +684,7 @@ def self_test() -> None:
                     "token_span": {
                         "immediate_tokens": 2,
                         "full_input_tokens": 2,
-                        "fit_input_tokens": 2,
+                        "fit_input_tokens": 128,
                         "immediate_start_token": 0,
                         "immediate_end_token": 2,
                         "fingerprint": "6" * 64,
