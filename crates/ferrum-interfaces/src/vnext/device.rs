@@ -2137,9 +2137,10 @@ pub enum DeviceCommandPhase {
 
 /// Backend-observed physical work for one core-owned command entry.
 ///
-/// Rows are created only when kernel attribution is enabled. The node index is
-/// issued by core and binds backend work back to the immutable plan; backend
-/// labels and counters carry observation only and grant no execution authority.
+/// Rows are created only when core explicitly requests attribution. The node
+/// index is issued by core and binds backend work back to the immutable plan;
+/// backend labels and counters carry observation only and grant no execution
+/// authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceNativeWorkAttribution {
     command_index: u32,
@@ -2242,27 +2243,236 @@ impl DeviceNativeWorkAttribution {
     }
 }
 
+/// One logical plan-node command sealed inside a physical reusable executable.
+///
+/// A CUDA graph segment launches as one physical command, but release
+/// determinism must still prove which immutable-plan nodes were replayed and
+/// how much native graph work each logical command contributed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DeviceSubmissionAttribution {
-    commands: Box<[DeviceNativeWorkAttribution]>,
+pub struct DeviceReplayedLogicalCommandAttribution {
+    logical_command_ordinal: u32,
+    node_index: u32,
+    native_op_id: &'static str,
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
+    reusable_graph_node_count: u64,
 }
 
-impl DeviceSubmissionAttribution {
-    pub fn new(commands: Vec<DeviceNativeWorkAttribution>) -> Option<Self> {
-        if commands.is_empty()
-            || commands
-                .windows(2)
-                .any(|pair| pair[0].command_index() >= pair[1].command_index())
+impl DeviceReplayedLogicalCommandAttribution {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        logical_command_ordinal: u32,
+        node_index: u32,
+        native_op_id: &'static str,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+        reusable_graph_node_count: u64,
+    ) -> Option<Self> {
+        if native_op_id.is_empty()
+            || participant_count == 0
+            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+            || reusable_graph_node_count == 0
         {
             return None;
         }
         Some(Self {
+            logical_command_ordinal,
+            node_index,
+            native_op_id,
+            batching_form,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+            reusable_graph_node_count,
+        })
+    }
+
+    pub const fn logical_command_ordinal(&self) -> u32 {
+        self.logical_command_ordinal
+    }
+
+    pub const fn node_index(&self) -> u32 {
+        self.node_index
+    }
+
+    pub const fn native_op_id(&self) -> &'static str {
+        self.native_op_id
+    }
+
+    pub const fn batching_form(&self) -> DeviceBatchingForm {
+        self.batching_form
+    }
+
+    pub const fn participant_count(&self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+
+    pub const fn compute_dispatch_count(&self) -> u64 {
+        self.compute_dispatch_count
+    }
+
+    pub const fn transfer_command_count(&self) -> u64 {
+        self.transfer_command_count
+    }
+
+    pub const fn reusable_graph_node_count(&self) -> u64 {
+        self.reusable_graph_node_count
+    }
+}
+
+/// Logical-node attribution for one physical reusable executable launch.
+///
+/// Physical timing remains indexed by `physical_command_index`; the ordered
+/// logical rows bind that launch back to every plan node captured in the
+/// sealed program segment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReplayedSegmentAttribution {
+    physical_command_index: u32,
+    program_id: DeviceReusableExecutionProgramId,
+    segment: DeviceReusableExecutionSegment,
+    reusable_executable_fingerprint: String,
+    logical_commands: Box<[DeviceReplayedLogicalCommandAttribution]>,
+}
+
+impl DeviceReplayedSegmentAttribution {
+    pub fn new(
+        physical_command_index: u32,
+        program_id: DeviceReusableExecutionProgramId,
+        segment: DeviceReusableExecutionSegment,
+        reusable_executable_fingerprint: String,
+        logical_commands: Vec<DeviceReplayedLogicalCommandAttribution>,
+    ) -> Option<Self> {
+        let canonical_sha256 = reusable_executable_fingerprint.len() == 64
+            && reusable_executable_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !canonical_sha256
+            || segment
+                .start_node_index()
+                .checked_add(segment.logical_command_count())
+                != Some(segment.end_node_index())
+            || logical_commands.len() != segment.logical_command_count() as usize
+            || logical_commands
+                .iter()
+                .enumerate()
+                .any(|(ordinal, command)| {
+                    u32::try_from(ordinal).ok() != Some(command.logical_command_ordinal())
+                        || segment
+                            .start_node_index()
+                            .checked_add(command.logical_command_ordinal())
+                            != Some(command.node_index())
+                })
+        {
+            return None;
+        }
+        Some(Self {
+            physical_command_index,
+            program_id,
+            segment,
+            reusable_executable_fingerprint,
+            logical_commands: logical_commands.into_boxed_slice(),
+        })
+    }
+
+    pub const fn physical_command_index(&self) -> u32 {
+        self.physical_command_index
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub const fn segment(&self) -> &DeviceReusableExecutionSegment {
+        &self.segment
+    }
+
+    pub fn reusable_executable_fingerprint(&self) -> &str {
+        &self.reusable_executable_fingerprint
+    }
+
+    pub fn logical_commands(&self) -> &[DeviceReplayedLogicalCommandAttribution] {
+        &self.logical_commands
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionAttribution {
+    commands: Box<[DeviceNativeWorkAttribution]>,
+    replayed_segments: Box<[DeviceReplayedSegmentAttribution]>,
+}
+
+impl DeviceSubmissionAttribution {
+    pub fn new(commands: Vec<DeviceNativeWorkAttribution>) -> Option<Self> {
+        Self::with_replayed_segments(commands, Vec::new())
+    }
+
+    pub fn with_replayed_segments(
+        commands: Vec<DeviceNativeWorkAttribution>,
+        replayed_segments: Vec<DeviceReplayedSegmentAttribution>,
+    ) -> Option<Self> {
+        if commands.is_empty()
+            || commands
+                .windows(2)
+                .any(|pair| pair[0].command_index() >= pair[1].command_index())
+            || replayed_segments.windows(2).any(|pair| {
+                pair[0].physical_command_index() >= pair[1].physical_command_index()
+                    || pair[0].segment().end_node_index() > pair[1].segment().start_node_index()
+            })
+        {
+            return None;
+        }
+        for segment in &replayed_segments {
+            let physical_index = commands
+                .binary_search_by_key(&segment.physical_command_index(), |command| {
+                    command.command_index()
+                })
+                .ok()?;
+            let physical = commands.get(physical_index)?;
+            let first_logical = segment.logical_commands().first()?;
+            let logical_graph_node_count = segment
+                .logical_commands()
+                .iter()
+                .try_fold(0_u64, |total, logical| {
+                    total.checked_add(logical.reusable_graph_node_count())
+                })?;
+            if physical.command_index() != segment.physical_command_index()
+                || physical.command_phase() != DeviceCommandPhase::Compute
+                || physical.execution_path() != DeviceExecutionPath::Replayed
+                || physical.reusable_graph_node_count() != Some(logical_graph_node_count)
+                || physical.node_index() != Some(segment.segment().start_node_index())
+                || physical.participant_count() != first_logical.participant_count()
+                || physical.token_count() != first_logical.token_count()
+                || segment.logical_commands().iter().any(|logical| {
+                    logical.participant_count() != physical.participant_count()
+                        || logical.token_count() != physical.token_count()
+                })
+            {
+                return None;
+            }
+        }
+        Some(Self {
             commands: commands.into_boxed_slice(),
+            replayed_segments: replayed_segments.into_boxed_slice(),
         })
     }
 
     pub fn commands(&self) -> &[DeviceNativeWorkAttribution] {
         &self.commands
+    }
+
+    pub fn replayed_segments(&self) -> &[DeviceReplayedSegmentAttribution] {
+        &self.replayed_segments
     }
 }
 
@@ -2884,6 +3094,9 @@ pub fn classify_device_error<R: DeviceRuntime + ?Sized>(
 #[cfg(test)]
 mod execution_timing_tests {
     use super::*;
+    use crate::vnext::{
+        ReusableExecutionBucketSpec, ReusableExecutionCapacity, ReusableExecutionClassId,
+    };
 
     #[test]
     fn timing_capabilities_are_independent_from_compute_path_requirement() {
@@ -3121,6 +3334,158 @@ mod execution_timing_tests {
             serde_json::to_value(replayed).unwrap()["reusable_graph_node_count"],
             serde_json::json!(2)
         );
+    }
+
+    fn replay_test_program_id() -> DeviceReusableExecutionProgramId {
+        let plan_hash: PlanHash =
+            serde_json::from_value(serde_json::json!("a".repeat(64))).unwrap();
+        let bucket = ReusableExecutionBucketSpec::new(
+            ReusableExecutionClassId::new("device-attribution-test").unwrap(),
+            ReusableExecutionCapacity::new(2, 3, 1).unwrap(),
+        )
+        .unwrap();
+        DeviceReusableExecutionProgramId::new(
+            plan_hash,
+            "b".repeat(64),
+            ExecutionLaneId::mint().unwrap(),
+            bucket.bucket_id().clone(),
+            "c".repeat(64),
+            "d".repeat(64),
+            7,
+            2,
+            3,
+            1,
+        )
+        .unwrap()
+    }
+
+    fn replay_test_physical(
+        execution_path: DeviceExecutionPath,
+        node_index: u32,
+        graph_node_count: Option<u64>,
+    ) -> DeviceNativeWorkAttribution {
+        DeviceNativeWorkAttribution::new(
+            0,
+            Some(node_index),
+            DeviceCommandPhase::Compute,
+            "vnext_reusable_execution",
+            execution_path,
+            DeviceBatchingForm::ParticipantLoop,
+            2,
+            3,
+            1,
+            0,
+            graph_node_count,
+        )
+        .unwrap()
+    }
+
+    fn replay_test_logical(
+        ordinal: u32,
+        node_index: u32,
+        graph_node_count: u64,
+    ) -> DeviceReplayedLogicalCommandAttribution {
+        DeviceReplayedLogicalCommandAttribution::new(
+            ordinal,
+            node_index,
+            "test.logical.compute",
+            DeviceBatchingForm::ParticipantLoop,
+            2,
+            3,
+            1,
+            0,
+            graph_node_count,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replayed_segment_separates_one_physical_launch_from_logical_plan_nodes() {
+        let segment = DeviceReusableExecutionSegment::new(0, 4, 6, 2).unwrap();
+        let replayed = DeviceReplayedSegmentAttribution::new(
+            0,
+            replay_test_program_id(),
+            segment,
+            "e".repeat(64),
+            vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 5, 3)],
+        )
+        .unwrap();
+        let attribution = DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(
+                DeviceExecutionPath::Replayed,
+                4,
+                Some(5),
+            )],
+            vec![replayed],
+        )
+        .unwrap();
+
+        assert_eq!(attribution.commands().len(), 1);
+        assert_eq!(attribution.replayed_segments().len(), 1);
+        assert_eq!(
+            attribution.replayed_segments()[0].logical_commands().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn replayed_segment_rejects_incomplete_or_mismatched_logical_attribution() {
+        assert!(DeviceReplayedLogicalCommandAttribution::new(
+            0,
+            4,
+            "test.logical.compute",
+            DeviceBatchingForm::ParticipantLoop,
+            2,
+            3,
+            1,
+            0,
+            0,
+        )
+        .is_none());
+
+        let segment = DeviceReusableExecutionSegment::new(0, 4, 6, 2).unwrap();
+        assert!(DeviceReplayedSegmentAttribution::new(
+            0,
+            replay_test_program_id(),
+            segment.clone(),
+            "e".repeat(64),
+            vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 6, 3)],
+        )
+        .is_none());
+
+        let replayed = || {
+            DeviceReplayedSegmentAttribution::new(
+                0,
+                replay_test_program_id(),
+                segment.clone(),
+                "e".repeat(64),
+                vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 5, 3)],
+            )
+            .unwrap()
+        };
+        assert!(DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(
+                DeviceExecutionPath::Replayed,
+                4,
+                Some(4),
+            )],
+            vec![replayed()],
+        )
+        .is_none());
+        assert!(DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(DeviceExecutionPath::Eager, 4, None)],
+            vec![replayed()],
+        )
+        .is_none());
+        assert!(DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(
+                DeviceExecutionPath::Replayed,
+                5,
+                Some(5),
+            )],
+            vec![replayed()],
+        )
+        .is_none());
     }
 }
 
