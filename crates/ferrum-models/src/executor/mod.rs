@@ -22,5 +22,9 @@ pub use clip_executor::ClipModelExecutor;
 pub use llm_executor::LlmExecutor;
 pub use stub_executor::StubModelExecutor;
 pub use tts_executor::TtsModelExecutor;
-pub use vnext_executor::{VNextExecutorConfig, VNextModelExecutor};
+pub use vnext_executor::{
+    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
+    VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
+    VNextExecutorConfig, VNextModelExecutor, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+};
 pub use whisper_executor::WhisperModelExecutor;

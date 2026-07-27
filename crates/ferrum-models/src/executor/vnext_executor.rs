@@ -49,6 +49,13 @@ use super::{
     vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
 };
 
+mod determinism;
+pub use determinism::{
+    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
+    VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
+    MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+};
+
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(2, 0);
 const UNIFORM_QUERY_REUSABLE_CLASS: &str = "execution.uniform-query-token";
