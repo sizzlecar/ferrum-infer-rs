@@ -103,16 +103,33 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
             raise GateError(f"{path}:{line_no} must be a JSON object")
         if "resource" in event:
+            event_kind = event.get("event_kind")
+            if event_kind not in {None, "resource"}:
+                raise GateError(
+                    f"{path}:{line_no}.event_kind must be resource when a resource object is present"
+                )
             resource = event["resource"]
             if not isinstance(resource, dict):
                 raise GateError(f"{path}:{line_no}.resource must be an object")
             merged = dict(resource)
             merged.setdefault("scenario", event.get("scenario"))
             events.append(merged)
+        elif "action" in event:
+            # Checked-in fixtures use the original flat ResourceTraceEvent shape.
+            events.append(event)
+        elif "event_kind" in event:
+            event_kind = event["event_kind"]
+            if not isinstance(event_kind, str) or not event_kind.strip():
+                raise GateError(f"{path}:{line_no}.event_kind must be a non-empty string")
+            if event_kind == "resource":
+                raise GateError(f"{path}:{line_no}.resource must be present for a resource event")
+            # Scheduler traces intentionally multiplex admission, execution, and resource events.
+            # Only resource events participate in this gate's lifecycle accounting.
+            continue
         else:
             events.append(event)
     if not events:
-        raise GateError(f"{path} must contain at least one event")
+        raise GateError(f"{path} must contain at least one resource event")
     return events
 
 

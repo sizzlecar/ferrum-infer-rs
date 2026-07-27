@@ -40,6 +40,7 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
                     next_frame: Some(frame(next_frame)),
                     active_frame: None,
                     participant_flights: BTreeMap::new(),
+                    submission_wave_flight: None,
                     retired_frames: next_frame - 1,
                 },
             )),
@@ -51,12 +52,21 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
 
 fn retire(holds: &mut [SessionFrameHold]) -> Vec<StepParticipantRetirementDisposition> {
     let mut references = holds.iter_mut().collect::<Vec<_>>();
-    finalize_session_frames(&mut references, false).expect("test frame retires")
+    finalize_session_frames(&mut references, StepFrameFinalization::Commit)
+        .expect("test frame retires")
 }
 
 fn flight_candidate(
     candidate: &SequenceFrameCandidate,
     hold: &SessionFrameHold,
+) -> ParticipantFlightCandidate {
+    flight_candidate_for(candidate, hold, 1)
+}
+
+fn flight_candidate_for(
+    candidate: &SequenceFrameCandidate,
+    hold: &SessionFrameHold,
+    participant: u32,
 ) -> ParticipantFlightCandidate {
     ParticipantFlightCandidate {
         slot: Arc::clone(&candidate.slot),
@@ -67,8 +77,8 @@ fn flight_candidate(
             batch_step_id: hold.batch_step_id,
         },
         participant: BatchParticipantAuthority::new(
-            SequenceAuthorityId::test_only(1, 1),
-            RequestAuthorityId::test_only(1, 1),
+            SequenceAuthorityId::test_only(participant, 1),
+            RequestAuthorityId::test_only(participant, 1),
         ),
     }
 }
@@ -173,7 +183,7 @@ fn explicit_frame_abort_clears_the_hold_but_keeps_the_session_fail_closed() {
     let mut holds = acquire_session_frames(std::slice::from_ref(&candidate), step(1)).unwrap();
     let mut references = holds.iter_mut().collect::<Vec<_>>();
     assert_eq!(
-        finalize_session_frames(&mut references, true).unwrap(),
+        finalize_session_frames(&mut references, StepFrameFinalization::Abort).unwrap(),
         vec![StepParticipantRetirementDisposition::Aborted]
     );
     drop(references);
@@ -191,13 +201,78 @@ fn explicit_frame_abort_clears_the_hold_but_keeps_the_session_fail_closed() {
 }
 
 #[test]
+fn unsubmitted_frame_rollback_restores_the_unexecuted_frame_for_retry() {
+    let candidate = active_candidate(1, "session-capacity-retry");
+    let mut first = acquire_session_frames(std::slice::from_ref(&candidate), step(1)).unwrap();
+    let mut references = first.iter_mut().collect::<Vec<_>>();
+    assert_eq!(
+        finalize_session_frames(&mut references, StepFrameFinalization::RollbackUnsubmitted,)
+            .unwrap(),
+        vec![StepParticipantRetirementDisposition::RolledBackUnsubmitted]
+    );
+    drop(references);
+    drop(first);
+
+    {
+        let state = candidate.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert_eq!(active.phase, SequenceSessionPhase::Open);
+        assert_eq!(active.active_frame, None);
+        assert_eq!(active.retired_frames, 0);
+        assert_eq!(active.next_frame, Some(frame(1)));
+    }
+
+    let mut retry = acquire_session_frames(std::slice::from_ref(&candidate), step(2)).unwrap();
+    assert_eq!(retry[0].frame_id, frame(1));
+    assert_eq!(
+        retire(&mut retry),
+        vec![StepParticipantRetirementDisposition::Committed]
+    );
+}
+
+#[test]
+fn batch_unsubmitted_rollback_restores_each_participants_local_frame() {
+    let candidates = vec![
+        active_candidate(7, "session-retry-7"),
+        active_candidate(2, "session-retry-2"),
+        active_candidate(19, "session-retry-19"),
+    ];
+    let expected = vec![frame(7), frame(2), frame(19)];
+    let mut first = acquire_session_frames(&candidates, step(41)).unwrap();
+    assert_eq!(
+        first.iter().map(|hold| hold.frame_id).collect::<Vec<_>>(),
+        expected
+    );
+    let mut references = first.iter_mut().collect::<Vec<_>>();
+    assert_eq!(
+        finalize_session_frames(&mut references, StepFrameFinalization::RollbackUnsubmitted)
+            .unwrap(),
+        vec![StepParticipantRetirementDisposition::RolledBackUnsubmitted; 3]
+    );
+    drop(references);
+    drop(first);
+
+    let mut retry = acquire_session_frames(&candidates, step(42)).unwrap();
+    assert_eq!(
+        retry.iter().map(|hold| hold.frame_id).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        retire(&mut retry),
+        vec![StepParticipantRetirementDisposition::Committed; 3]
+    );
+}
+
+#[test]
 fn cancel_after_step_rejects_new_invocation_with_zero_partial_flights() {
     let first = active_candidate(1, "flight-first");
     let cancelled = active_candidate(1, "flight-cancelled");
     let mut frames = acquire_session_frames(&[first.clone(), cancelled.clone()], step(1)).unwrap();
     let candidates = vec![
-        flight_candidate(&first, &frames[0]),
-        flight_candidate(&cancelled, &frames[1]),
+        flight_candidate_for(&first, &frames[0], 1),
+        flight_candidate_for(&cancelled, &frames[1], 2),
     ];
     {
         let mut state = cancelled.slot.state.lock().unwrap();
@@ -230,8 +305,8 @@ fn cancel_before_dispatch_rejects_all_participants_without_partial_transition() 
     let cancelled = active_candidate(1, "dispatch-cancelled");
     let mut frames = acquire_session_frames(&[first.clone(), cancelled.clone()], step(1)).unwrap();
     let candidates = vec![
-        flight_candidate(&first, &frames[0]),
-        flight_candidate(&cancelled, &frames[1]),
+        flight_candidate_for(&first, &frames[0], 1),
+        flight_candidate_for(&cancelled, &frames[1], 2),
     ];
     let mut prepared = prepare_participant_flights(&candidates, &node("main")).unwrap();
     {
@@ -514,6 +589,63 @@ fn physical_invocation_retry_requires_not_submitted_and_a_fresh_attempt() {
 }
 
 #[test]
+fn full_plan_wave_ledger_is_one_entry_and_preserves_all_node_tombstones() {
+    let registry = Arc::new(InvocationRegistry::default());
+    let key = participant_node_key(1, 7, "main");
+    let fingerprint = "e".repeat(64);
+    let mut guard = registry
+        .enter_submission_wave(262, invocation(21), &fingerprint)
+        .unwrap();
+
+    assert_eq!(guard.physical_entry_count(), 1);
+    {
+        let state = registry.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        let wave = state.submission_wave.as_ref().unwrap();
+        assert_eq!(wave.covered_participant_nodes, 262);
+        assert_eq!(wave.ledger.work_fingerprint, fingerprint);
+        assert_eq!(wave.ledger.phase, PhysicalInvocationPhase::Prepared);
+    }
+    assert!(registry
+        .enter(vec![key.clone()], invocation(22), &"f".repeat(64))
+        .is_err());
+    assert!(registry
+        .enter_submission_wave(262, invocation(23), &fingerprint)
+        .is_err());
+
+    guard.mark_not_submitted().unwrap();
+    guard.prepare_retry(invocation(24)).unwrap();
+    guard.mark_in_flight().unwrap();
+    drop(guard);
+    {
+        let state = registry.state.lock().unwrap();
+        assert_eq!(
+            state.submission_wave.as_ref().unwrap().ledger.phase,
+            PhysicalInvocationPhase::Retired
+        );
+    }
+    assert!(registry
+        .enter(vec![key], invocation(25), &"f".repeat(64))
+        .is_err());
+
+    let node_first = Arc::new(InvocationRegistry::default());
+    let node_guard = node_first
+        .enter(
+            vec![participant_node_key(2, 2, "first")],
+            invocation(26),
+            &"a".repeat(64),
+        )
+        .unwrap();
+    assert!(node_first
+        .enter_submission_wave(262, invocation(27), &fingerprint)
+        .is_err());
+    drop(node_guard);
+    assert!(node_first
+        .enter_submission_wave(262, invocation(28), &fingerprint)
+        .is_err());
+}
+
+#[test]
 fn definitely_not_submitted_participant_flights_reset_for_exact_retry() {
     let session = active_candidate(1, "dispatch-retry");
     let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
@@ -542,6 +674,186 @@ fn definitely_not_submitted_participant_flights_reset_for_exact_retry() {
         assert!(active.participant_flights.is_empty());
     }
     retire(&mut frames);
+}
+
+#[test]
+fn submission_wave_transitions_one_session_once_and_retries_atomically() {
+    let session = active_candidate(1, "multi-node-wave");
+    let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
+    let candidate = flight_candidate(&session, &frames[0]);
+    let mut prepared =
+        prepare_submission_wave_participant_flights(std::slice::from_ref(&candidate)).unwrap();
+    assert_eq!(prepared.len(), 1);
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert!(active.participant_flights.is_empty());
+        assert_eq!(
+            active.submission_wave_flight,
+            Some(ParticipantFlightPhase::Prepared)
+        );
+    }
+
+    begin_submission_wave_participant_flights_dispatch(&mut prepared).unwrap();
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert_eq!(
+            active.submission_wave_flight,
+            Some(ParticipantFlightPhase::InFlight)
+        );
+    }
+    reset_submission_wave_participant_flights_after_definitely_not_submitted(&mut prepared)
+        .unwrap();
+    drop(prepared);
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert!(active.participant_flights.is_empty());
+        assert!(active.submission_wave_flight.is_none());
+    }
+    retire(&mut frames);
+}
+
+#[test]
+fn duplicate_participant_in_wave_rejects_without_partial_participant_flight() {
+    let session = active_candidate(1, "duplicate-wave-participant");
+    let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
+    let candidate = flight_candidate(&session, &frames[0]);
+    assert!(prepare_submission_wave_participant_flights(&[candidate.clone(), candidate]).is_err());
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert!(active.participant_flights.is_empty());
+        assert!(active.submission_wave_flight.is_none());
+    }
+    retire(&mut frames);
+}
+
+#[test]
+fn submission_wave_owns_one_flight_per_participant() {
+    let first = active_candidate(7, "wave-first");
+    let second = active_candidate(2, "wave-second");
+    let mut frames = acquire_session_frames(&[first.clone(), second.clone()], step(1)).unwrap();
+    let candidates = vec![
+        flight_candidate_for(&first, &frames[0], 1),
+        flight_candidate_for(&second, &frames[1], 2),
+    ];
+
+    let prepared = prepare_submission_wave_participant_flights(&candidates).unwrap();
+    assert_eq!(prepared.len(), 2);
+    for session in [&first, &second] {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert!(active.participant_flights.is_empty());
+        assert_eq!(active.participant_flight_count(), 1);
+    }
+
+    drop(prepared);
+    for session in [&first, &second] {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert_eq!(active.participant_flight_count(), 0);
+    }
+    retire(&mut frames);
+}
+
+#[test]
+fn submission_wave_and_standalone_node_flights_are_mutually_exclusive() {
+    let node_first = active_candidate(1, "node-before-wave");
+    let mut node_first_frames =
+        acquire_session_frames(std::slice::from_ref(&node_first), step(1)).unwrap();
+    let node_first_candidate = flight_candidate(&node_first, &node_first_frames[0]);
+    let node_flight = prepare_participant_flights(
+        std::slice::from_ref(&node_first_candidate),
+        &node("standalone"),
+    )
+    .unwrap();
+    assert!(
+        prepare_submission_wave_participant_flights(std::slice::from_ref(&node_first_candidate))
+            .is_err()
+    );
+    {
+        let state = node_first.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert_eq!(active.participant_flights.len(), 1);
+        assert!(active.submission_wave_flight.is_none());
+    }
+    drop(node_flight);
+    retire(&mut node_first_frames);
+
+    let wave_first = active_candidate(1, "wave-before-node");
+    let mut wave_first_frames =
+        acquire_session_frames(std::slice::from_ref(&wave_first), step(2)).unwrap();
+    let wave_first_candidate = flight_candidate(&wave_first, &wave_first_frames[0]);
+    let wave_flight =
+        prepare_submission_wave_participant_flights(std::slice::from_ref(&wave_first_candidate))
+            .unwrap();
+    assert!(prepare_participant_flights(
+        std::slice::from_ref(&wave_first_candidate),
+        &node("standalone")
+    )
+    .is_err());
+    {
+        let state = wave_first.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert!(active.participant_flights.is_empty());
+        assert_eq!(
+            active.submission_wave_flight,
+            Some(ParticipantFlightPhase::Prepared)
+        );
+    }
+    drop(wave_flight);
+    retire(&mut wave_first_frames);
+}
+
+#[test]
+fn cancel_before_submission_wave_dispatch_preserves_atomic_prepared_state() {
+    let session = active_candidate(1, "cancel-wave-before-dispatch");
+    let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
+    let candidate = flight_candidate(&session, &frames[0]);
+    let mut prepared =
+        prepare_submission_wave_participant_flights(std::slice::from_ref(&candidate)).unwrap();
+    {
+        let mut state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &mut *state else {
+            unreachable!();
+        };
+        active.phase = SequenceSessionPhase::CancelRequested;
+    }
+
+    assert!(begin_submission_wave_participant_flights_dispatch(&mut prepared).is_err());
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert_eq!(
+            active.submission_wave_flight,
+            Some(ParticipantFlightPhase::Prepared)
+        );
+    }
+    drop(prepared);
+    assert_eq!(
+        retire(&mut frames),
+        vec![StepParticipantRetirementDisposition::DiscardedCancelled]
+    );
 }
 
 #[test]

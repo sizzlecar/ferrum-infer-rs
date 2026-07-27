@@ -187,6 +187,7 @@ fn ferrum_device_to_candle(d: &ferrum_types::Device) -> candle_core::Device {
 pub struct LlmExecutor {
     model: Mutex<Box<dyn DecoderOnlyLLM>>,
     info: ModelInfo,
+    vnext_model: Option<Arc<crate::vnext::PreparedProductionModel>>,
     next_cache_id: AtomicU64,
     total_model_lock_wait_us: AtomicU64,
     model_lock_wait_samples: AtomicU64,
@@ -194,13 +195,38 @@ pub struct LlmExecutor {
 
 impl LlmExecutor {
     pub fn new(model: Box<dyn DecoderOnlyLLM>, info: ModelInfo) -> Self {
+        Self::new_with_optional_vnext_model(model, info, None)
+    }
+
+    pub fn new_with_vnext_model(
+        model: Box<dyn DecoderOnlyLLM>,
+        info: ModelInfo,
+        vnext_model: Arc<crate::vnext::PreparedProductionModel>,
+    ) -> Self {
+        Self::new_with_optional_vnext_model(model, info, Some(vnext_model))
+    }
+
+    fn new_with_optional_vnext_model(
+        model: Box<dyn DecoderOnlyLLM>,
+        info: ModelInfo,
+        vnext_model: Option<Arc<crate::vnext::PreparedProductionModel>>,
+    ) -> Self {
         Self {
             model: Mutex::new(model),
             info,
+            vnext_model,
             next_cache_id: AtomicU64::new(0),
             total_model_lock_wait_us: AtomicU64::new(0),
             model_lock_wait_samples: AtomicU64::new(0),
         }
+    }
+
+    pub fn vnext_model(&self) -> Option<&Arc<crate::vnext::PreparedProductionModel>> {
+        self.vnext_model.as_ref()
+    }
+
+    pub fn vnext_family(&self) -> Option<&ferrum_interfaces::vnext::PreparedModelFamily> {
+        self.vnext_model.as_deref().map(|model| model.family())
     }
 
     fn lock_model(&self) -> MutexGuard<'_, Box<dyn DecoderOnlyLLM>> {
@@ -1358,8 +1384,8 @@ mod tests {
                 0,
                 "delta_state",
                 vec![1, 2, 3],
+                DataType::FP32,
             )],
-            dtype: DataType::FP32,
             device: Device::CPU,
             max_batch_slots: 1,
         };
@@ -1378,7 +1404,6 @@ mod tests {
 
         assert_eq!(actual.request_id, request_id);
         assert_eq!(actual.device, Device::CUDA(0));
-        assert_eq!(actual.dtype, spec.dtype);
         assert_eq!(actual.max_batch_slots, spec.max_batch_slots);
         assert_eq!(actual.tensors, spec.tensors);
     }

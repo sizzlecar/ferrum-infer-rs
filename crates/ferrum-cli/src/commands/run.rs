@@ -8,12 +8,15 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
+    has_unclosed_thinking_block, parse_reasoning_response_for_prompt, FerrumConfigBuilder,
+    FerrumError, FinishReason, InferenceRequest, InferenceResponse, ModelCapabilities, Priority,
     RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, SamplingParams, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY,
+    RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage, WorkloadProfile,
+    DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG, THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
@@ -21,11 +24,14 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::source_resolver::tokenizer_sibling_repo;
+
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
-const THINK_START_TAG: &str = "<think>";
-const THINK_END_TAG: &str = "</think>";
+const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
 
 /// Output format for `ferrum run`. JSONL mode emits one record per event
 /// (assistant generation result, user input, exit) on stdout — used by
@@ -50,50 +56,177 @@ fn finish_reason_str(r: FinishReason) -> &'static str {
     }
 }
 
-fn emit_jsonl_ready(model: &str, backend: &str) {
+fn emit_jsonl_ready(session_id: &str, requested_model: &str, resolved_model: &str, backend: &str) {
     let record = serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "ready",
-        "model": model,
+        "session_id": session_id,
+        "history_epoch": 0,
+        "model": resolved_model,
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
         "backend": backend,
     });
-    println!("{record}");
+    emit_jsonl_record(&record);
 }
 
-fn emit_jsonl_user(turn: usize, content: &str) {
+fn emit_jsonl_user(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    content: &str,
+    history: &[(String, String)],
+) {
     let record = serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "user",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
+        "request_id": request_id,
         "turn": turn,
         "content": content,
+        "history_before": history_evidence(history),
     });
-    println!("{record}");
+    emit_jsonl_record(&record);
+}
+
+fn emit_jsonl_assistant_delta(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    index: usize,
+    raw_text_delta: &str,
+    token_id: Option<u32>,
+) {
+    emit_jsonl_record(&jsonl_assistant_delta_record(
+        session_id,
+        history_epoch,
+        request_id,
+        turn,
+        index,
+        raw_text_delta,
+        token_id,
+    ));
+}
+
+fn jsonl_assistant_delta_record(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    index: usize,
+    raw_text_delta: &str,
+    token_id: Option<u32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
+        "event": "assistant_delta",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
+        "request_id": request_id,
+        "turn": turn,
+        "index": index,
+        "raw_text_delta": raw_text_delta,
+        "utf8_bytes": raw_text_delta.len(),
+        "token_id": token_id,
+    })
 }
 
 fn emit_jsonl_assistant(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
     turn: usize,
     content: &str,
+    reasoning: Option<&str>,
+    history: &[(String, String)],
     finish_reason: Option<FinishReason>,
+    usage: Option<&TokenUsage>,
     n_tokens: usize,
     chunk_count: usize,
+    raw_text: &str,
     ms: f64,
 ) {
-    let record = serde_json::json!({
-        "event": "assistant",
-        "turn": turn,
-        "content": content,
-        "finish_reason": finish_reason.map(finish_reason_str),
-        "n_tokens": n_tokens,
-        "chunk_count": chunk_count,
-        "ms": ms,
-    });
-    println!("{record}");
+    emit_jsonl_record(&jsonl_assistant_record(
+        session_id,
+        history_epoch,
+        request_id,
+        turn,
+        content,
+        reasoning,
+        history,
+        finish_reason,
+        usage,
+        n_tokens,
+        chunk_count,
+        raw_text,
+        ms,
+    ));
 }
 
-fn emit_jsonl_exit(reason: &str) {
+fn jsonl_assistant_record(
+    session_id: &str,
+    history_epoch: usize,
+    request_id: &str,
+    turn: usize,
+    content: &str,
+    reasoning: Option<&str>,
+    history: &[(String, String)],
+    finish_reason: Option<FinishReason>,
+    usage: Option<&TokenUsage>,
+    n_tokens: usize,
+    chunk_count: usize,
+    raw_text: &str,
+    ms: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
+        "event": "assistant",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
+        "request_id": request_id,
+        "turn": turn,
+        "content": content,
+        "reasoning": reasoning,
+        "history_before": history_evidence(history),
+        "finish_reason": finish_reason.map(finish_reason_str),
+        "usage": usage,
+        "n_tokens": n_tokens,
+        "chunk_count": chunk_count,
+        "raw_text_sha256": sha256_text(raw_text),
+        "ms": ms,
+    })
+}
+
+fn emit_jsonl_exit(session_id: &str, history_epoch: usize, reason: &str) {
     let record = serde_json::json!({
+        "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "exit",
+        "session_id": session_id,
+        "history_epoch": history_epoch,
         "reason": reason,
     });
+    emit_jsonl_record(&record);
+}
+
+fn emit_jsonl_record(record: &serde_json::Value) {
     println!("{record}");
+    io::stdout().flush().ok();
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn history_evidence(history: &[(String, String)]) -> serde_json::Value {
+    let encoded = serde_json::to_vec(history).expect("run history serialization cannot fail");
+    serde_json::json!({
+        "message_count": history.len(),
+        "turn_count": history.iter().filter(|(role, _)| role == "user").count(),
+        "sha256": format!("{:x}", Sha256::digest(encoded)),
+    })
 }
 
 fn run_request_metadata(
@@ -112,14 +245,6 @@ fn run_request_metadata(
         );
     }
     metadata
-}
-
-fn has_unclosed_thinking_block(prompt: &str) -> bool {
-    match (prompt.rfind(THINK_START_TAG), prompt.rfind(THINK_END_TAG)) {
-        (Some(start), Some(end)) => start > end,
-        (Some(_), None) => true,
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,21 +275,44 @@ struct RunBudget {
 }
 
 impl RunBudget {
-    fn from_source(source_path: &Path, snapshot: &RuntimeConfigSnapshot) -> Self {
-        let tokenizer = discover_run_tokenizer_path(source_path)
-            .and_then(|path| tokenizers::Tokenizer::from_file(path).ok());
+    fn from_product_sources(
+        explicit_tokenizer: Option<&Path>,
+        product_sources: Option<&ferrum_models::vnext::ProductionModelSourceBundle>,
+        legacy_source_path: &Path,
+        snapshot: &RuntimeConfigSnapshot,
+    ) -> Result<Self> {
+        let tokenizer = if let Some(path) = explicit_tokenizer {
+            Some(tokenizers::Tokenizer::from_file(path).map_err(|error| {
+                FerrumError::model(format!(
+                    "failed to load explicit tokenizer {}: {error}",
+                    path.display()
+                ))
+            })?)
+        } else if let Some(sources) = product_sources {
+            Some(
+                tokenizers::Tokenizer::from_bytes(sources.tokenizer_json()).map_err(|error| {
+                    FerrumError::model(format!(
+                        "failed to parse tokenizer from product source {}: {error}",
+                        sources.tokenizer_file().display()
+                    ))
+                })?,
+            )
+        } else {
+            discover_run_tokenizer_path(legacy_source_path)
+                .and_then(|path| tokenizers::Tokenizer::from_file(path).ok())
+        };
         let kv_capacity =
             crate::runtime_env::runtime_snapshot_value(snapshot, "FERRUM_KV_CAPACITY")
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|&value| value > 0);
-        Self {
+        Ok(Self {
             tokenizer,
             kv_capacity,
             #[cfg(test)]
             prompt_token_id_mapper: None,
             #[cfg(test)]
             prompt_token_counter: None,
-        }
+        })
     }
 
     fn prompt_tokenization(&self, prompt: &str) -> RunPromptTokenization {
@@ -205,6 +353,103 @@ fn display_response_text(text: &str) -> String {
     text.trim().to_string()
 }
 
+struct CollectedRunGeneration {
+    request_id: String,
+    raw_text: String,
+    finish_reason: Option<FinishReason>,
+    usage: Option<TokenUsage>,
+    token_count: usize,
+    token_ids: Vec<u32>,
+    chunk_count: usize,
+}
+
+impl CollectedRunGeneration {
+    fn from_response(response: InferenceResponse) -> Self {
+        Self {
+            request_id: response.request_id.to_string(),
+            raw_text: response.text,
+            finish_reason: Some(response.finish_reason),
+            usage: Some(response.usage),
+            token_count: response.tokens.len(),
+            token_ids: response
+                .tokens
+                .into_iter()
+                .map(|token| token.get())
+                .collect(),
+            chunk_count: 1,
+        }
+    }
+}
+
+type RunResponseStream = Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + 'static>>;
+
+async fn collect_run_stream(
+    mut stream: RunResponseStream,
+    trace_tokens: bool,
+    turn: usize,
+    session_id: &str,
+    history_epoch: usize,
+    expected_request_id: &str,
+) -> Result<CollectedRunGeneration> {
+    let mut request_id = None;
+    let mut raw_text = String::new();
+    let mut finish_reason = None;
+    let mut latest_usage = None;
+    let mut token_count = 0usize;
+    let mut token_ids = Vec::new();
+    let mut chunk_count = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let chunk_request_id = chunk.request_id.to_string();
+        if chunk_request_id != expected_request_id {
+            return Err(FerrumError::internal(format!(
+                "run stream request id drift: expected {expected_request_id}, got {chunk_request_id}"
+            )));
+        }
+        request_id.get_or_insert_with(|| chunk_request_id.clone());
+        let token_id = chunk.token.map(|token| token.get());
+        if !chunk.text.is_empty() {
+            raw_text.push_str(&chunk.text);
+            emit_jsonl_assistant_delta(
+                session_id,
+                history_epoch,
+                expected_request_id,
+                turn,
+                chunk_count,
+                &chunk.text,
+                token_id,
+            );
+            chunk_count += 1;
+        }
+        if let Some(token_id) = token_id {
+            if trace_tokens {
+                eprintln!(
+                    "[run-token-trace] turn={turn} token={} text={:?}",
+                    token_id, chunk.text
+                );
+            }
+            token_ids.push(token_id);
+            token_count += 1;
+        }
+        if let Some(usage) = chunk.usage.as_ref() {
+            token_count = usage.completion_tokens;
+            latest_usage = Some(usage.clone());
+        }
+        if chunk.finish_reason.is_some() {
+            finish_reason = chunk.finish_reason;
+        }
+    }
+    Ok(CollectedRunGeneration {
+        request_id: request_id.unwrap_or_else(|| expected_request_id.to_string()),
+        raw_text,
+        finish_reason,
+        usage: latest_usage,
+        token_count,
+        token_ids,
+        chunk_count,
+    })
+}
+
 #[derive(Args)]
 pub struct RunCommand {
     /// Model name (alias like `qwen3:8b`, HF repo id, or path to a `.gguf` file).
@@ -213,12 +458,16 @@ pub struct RunCommand {
     #[arg(default_value = "tinyllama")]
     pub model: String,
 
+    #[command(flatten)]
+    pub product_sources: crate::source_resolver::ProductSourceArgs,
+
     /// System prompt (interactive chat mode only).
     #[arg(long)]
     pub system: Option<String>,
 
-    /// Maximum tokens to generate
-    #[arg(long, default_value = "1024")]
+    /// Maximum output-token ceiling. Context planning shrinks it to the
+    /// remaining KV capacity before dropping any complete history turn.
+    #[arg(long, default_value = "4096")]
     pub max_tokens: u32,
 
     /// Stop generation when this text appears. Can be provided multiple times.
@@ -234,9 +483,9 @@ pub struct RunCommand {
     pub disable_thinking: bool,
 
     /// Disable CLI context shift. By default, `ferrum run` keeps the REPL
-    /// alive by dropping the oldest history before shrinking this turn's output
-    /// budget, then clamps only when the current turn itself leaves too little
-    /// room in KV.
+    /// alive by shrinking this turn's output budget before dropping history.
+    /// Oldest complete turns are removed only when the rendered prompt itself
+    /// no longer fits in KV.
     #[arg(long)]
     pub no_context_shift: bool,
 
@@ -249,11 +498,6 @@ pub struct RunCommand {
     /// Backend: auto, cpu, metal, cuda (default: auto)
     #[arg(long, default_value = "auto")]
     pub backend: String,
-
-    /// Enable the explicit CPU/FP32 Qwen3.5/Qwen3.6 reference executor for W3
-    /// correctness bring-up. This is not a release-performance path.
-    #[arg(long)]
-    pub qwen35_reference: bool,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
@@ -294,6 +538,16 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.95")]
     pub top_p: f32,
 
+    /// Minimum probability cutoff relative to the most likely token.
+    /// A value of 0 disables min-p filtering.
+    #[arg(long, default_value = "0.0")]
+    pub min_p: f32,
+
+    /// Presence penalty applied to tokens that already occurred in the
+    /// request. Qwen3.5 recommends 1.5 for general thinking workloads.
+    #[arg(long, default_value = "0.0")]
+    pub presence_penalty: f32,
+
     /// Repetition penalty applied to logits before sampling. >1 discourages
     /// repeats, <1 encourages, 1.0 disables. Defaults to 1.1 (OpenAI/llama.cpp
     /// standard) because the chat default is greedy (temperature 0): greedy
@@ -320,6 +574,12 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// Exact device-wide memory budget available to runtime weights and
+    /// dynamic resources. This is a typed capacity ceiling shared by `run`
+    /// and `serve`; omit it to use the normal pressure-threshold policy.
+    #[arg(long, value_name = "BYTES")]
+    pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -332,6 +592,10 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
 
+    /// Sequence fit gate used before prefill admission.
+    #[arg(long, value_enum)]
+    pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
+
     /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_batched_graph")]
     pub batched_graph: bool,
@@ -339,6 +603,14 @@ pub struct RunCommand {
     /// Disable legacy Llama/Gemma batched decode CUDA graph replay.
     #[arg(long, conflicts_with = "batched_graph")]
     pub disable_batched_graph: bool,
+
+    /// Enable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "disable_reusable_execution")]
+    pub reusable_execution: bool,
+
+    /// Disable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "reusable_execution")]
+    pub disable_reusable_execution: bool,
 
     /// Enable Llama/Gemma unified decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_unified_graph")]
@@ -390,6 +662,9 @@ pub struct RunCommand {
     /// Generate a synthetic/no-weight observability vertical-slice artifact and exit.
     #[arg(long, value_name = "DIR")]
     pub observability_vertical_slice_out: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
 
     /// Write product observability profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
@@ -511,21 +786,41 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // either the safetensors path (via NativeSafetensorsLoader) or the
     // GGUF path (via gguf_engine_loader, routed by
     // `WeightFormat::detect()` inside `LlmExecutorFactory`).
-    let cache_dir = get_hf_cache_dir(&config);
-    let resolved = crate::source_resolver::resolve_model_source(
+    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
+    let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
         &cmd.model,
         &cache_dir,
         crate::source_resolver::DownloadPolicy::AutoDownload,
         autosize,
+        &cmd.product_sources,
     )
     .await?;
-    let source = resolved.source;
-    let model_id = source.original.clone();
-    let model_definition_for_config = load_run_model_definition(&source).await?;
-    if let (Some(selection), Some(definition)) =
-        (gpu_selection.as_mut(), model_definition_for_config.as_ref())
-    {
-        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+    let product_input = resolved.into_product_engine_input();
+    let requested_model = product_input.requested_model.clone();
+    let model_id = product_input.public_model_id.clone();
+    let source = product_input.source;
+    let mut engine_config = product_input.engine_config;
+    let model_sources = product_input.model_sources;
+    let prepared_model = model_sources
+        .as_ref()
+        .map(crate::source_resolver::prepare_registered_product_model)
+        .transpose()?
+        .flatten();
+    let model_definition_for_config = if prepared_model.is_none() {
+        load_run_model_definition(&source, model_sources.as_deref()).await?
+    } else {
+        None
+    };
+    let model_layer_count = prepared_model
+        .as_ref()
+        .map(|prepared| prepared.descriptor().layer_count())
+        .or_else(|| {
+            model_definition_for_config
+                .as_ref()
+                .map(|definition| definition.num_hidden_layers)
+        });
+    if let (Some(selection), Some(layer_count)) = (gpu_selection.as_mut(), model_layer_count) {
+        if selection.apply_model_layer_count(layer_count)? {
             if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
                 eprintln!("{}", format!("CUDA layer split plan: {plan}").dimmed());
             }
@@ -534,7 +829,26 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
         }
     }
-    let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
+    let model_chat_template = match prepared_model.as_deref() {
+        Some(prepared) => Some(crate::source_resolver::load_prepared_product_chat_template(
+            prepared,
+        )?),
+        None => match model_sources.as_deref() {
+            Some(sources) => crate::source_resolver::load_product_chat_template(sources),
+            None => crate::source_resolver::load_model_chat_template(&source.local_path),
+        },
+    };
+    let product_source_identity = prepared_model
+        .as_deref()
+        .map(|prepared| {
+            crate::source_resolver::prepared_product_source_identity(
+                prepared,
+                &requested_model,
+                &model_id,
+                model_chat_template.as_ref(),
+            )
+        })
+        .transpose()?;
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
@@ -559,21 +873,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "Loading weights to GPU... (30s+ for >10 GB models)".dimmed()
     );
     let load_start = std::time::Instant::now();
-    let mut engine_config = ferrum_types::EngineConfig::default();
-    engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+    engine_config.sampling.default_params = build_sampling_params(&cmd);
     engine_config.backend.device = device.clone();
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.backend.backend_options.insert(
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
-    if cmd.qwen35_reference {
-        engine_config.backend.backend_options.insert(
-            "qwen35_reference".to_string(),
-            serde_json::Value::Bool(true),
-        );
-    }
-    let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let runtime_config = run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
     }
@@ -583,8 +890,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     )?;
     let effective_runtime_config =
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
+    let typed_model_capabilities = prepared_model
+        .as_ref()
+        .map(|prepared| prepared.model_capabilities())
+        .transpose()?;
     let startup_auto_config = run_startup_auto_config(
         &device,
+        typed_model_capabilities,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -596,13 +908,20 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     crate::commands::serve::write_startup_config_artifacts(
         &startup_auto_config,
+        product_source_identity.as_ref(),
         cmd.effective_config_json.as_deref(),
         cmd.decision_trace_jsonl.as_deref(),
     )?;
-    let run_budget = RunBudget::from_source(&source.local_path, &runtime_config);
+    let run_budget = RunBudget::from_product_sources(
+        cmd.tokenizer.as_deref(),
+        model_sources.as_deref(),
+        &source.local_path,
+        &runtime_config,
+    )?;
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
+    engine_config.runtime.vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
     if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
         .or_else(|| {
             runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
@@ -616,7 +935,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = ferrum_engine::create_default_engine(engine_config).await?;
+    let engine = match (prepared_model, model_sources) {
+        (Some(prepared), _) => {
+            ferrum_engine::create_prepared_product_engine(engine_config, prepared).await?
+        }
+        (None, Some(sources)) => {
+            ferrum_engine::create_product_engine(engine_config, sources).await?
+        }
+        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+    };
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -660,6 +987,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         )
         .dimmed()
     );
+    let run_session_id = Uuid::new_v4().to_string();
 
     // One-shot mode: --prompt supplied → run a single request and exit.
     // Matches the GGUF run_gguf_one_shot UX. Previously cmd.prompt was
@@ -679,14 +1007,29 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             &run_budget,
         )?;
         maybe_warn_context_shift(&plan, format);
+        let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
         let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
         let prompt_chars = plan.prompt.chars().count();
+        let request_id = RequestId(Uuid::new_v4());
+        let request_id_text = request_id.to_string();
+        let one_shot_history = Vec::new();
+        if format == OutputFormat::Jsonl {
+            emit_jsonl_ready(&run_session_id, &requested_model, &model_id, &device_label);
+            emit_jsonl_user(
+                &run_session_id,
+                0,
+                &request_id_text,
+                0,
+                &one_shot,
+                &one_shot_history,
+            );
+        }
         let request = InferenceRequest {
-            id: RequestId(Uuid::new_v4()),
+            id: request_id,
             model_id: ferrum_types::ModelId(model_id.clone()),
             prompt: plan.prompt,
             sampling_params: plan.sampling_params.clone(),
-            stream: false,
+            stream: format == OutputFormat::Jsonl,
             priority: Priority::Normal,
             client_id: None,
             session_id: None,
@@ -700,8 +1043,31 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let start = std::time::Instant::now();
-        let response = match engine.infer(request).await {
-            Ok(response) => response,
+        let trace_tokens =
+            crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_RUN_TRACE_TOKENS")
+                .is_some();
+        let generation_result = match format {
+            OutputFormat::Text => engine
+                .infer(request)
+                .await
+                .map(CollectedRunGeneration::from_response),
+            OutputFormat::Jsonl => match engine.infer_stream(request).await {
+                Ok(stream) => {
+                    collect_run_stream(
+                        stream,
+                        trace_tokens,
+                        0,
+                        &run_session_id,
+                        0,
+                        &request_id_text,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        let generation = match generation_result {
+            Ok(generation) => generation,
             Err(err) => {
                 let memory_after = product_memory_enabled
                     .then(|| memory_sampler.sample())
@@ -745,18 +1111,31 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let memory = process_memory_observation_between(memory_before, memory_after.clone());
-        let tokens = response.tokens.len();
-        let output_token_ids = response
-            .tokens
-            .iter()
-            .map(|token| token.get())
-            .collect::<Vec<_>>();
-        let content = display_response_text(&response.text);
-        let chunk_count = usize::from(!content.is_empty());
-        let finish_reason = Some(response.finish_reason);
+        let CollectedRunGeneration {
+            request_id: response_request_id,
+            raw_text,
+            finish_reason,
+            usage,
+            token_count: tokens,
+            token_ids: output_token_ids,
+            chunk_count,
+        } = generation;
+        if response_request_id != request_id_text {
+            return Err(FerrumError::internal(format!(
+                "run response request id drift: expected {request_id_text}, got {response_request_id}"
+            )));
+        }
+        let raw_response = display_response_text(&raw_text);
+        let parsed = parse_reasoning_response_for_prompt(&raw_response, prompt_opened_thinking);
+        let content = display_response_text(&parsed.content);
+        let reasoning = parsed
+            .reasoning
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let bench = cmd.bench_mode;
         if format == OutputFormat::Text && !bench {
-            print!("{}", content);
+            print!("{}", raw_response);
             io::stdout().flush().ok();
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -777,11 +1156,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             }
             OutputFormat::Jsonl => {
                 emit_jsonl_assistant(
+                    &run_session_id,
+                    0,
+                    &request_id_text,
                     0,
                     &content,
+                    reasoning,
+                    &one_shot_history,
                     finish_reason,
+                    usage.as_ref(),
                     tokens,
                     chunk_count,
+                    &raw_response,
                     elapsed * 1000.0,
                 );
             }
@@ -811,8 +1197,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 chunk_count,
                 finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
                 prompt_chars,
-                response_chars: content.chars().count(),
-                response_text: content.clone(),
+                response_chars: raw_response.chars().count(),
+                response_text: raw_response,
                 memory,
                 memory_stages: actual_run_memory_stages(
                     product_memory_enabled,
@@ -828,8 +1214,16 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             },
         )?;
         shutdown_result?;
+        if format == OutputFormat::Jsonl {
+            emit_jsonl_exit(&run_session_id, 0, "one_shot_complete");
+        }
         return Ok(());
     }
+
+    let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
+    let mut history_epoch = 0usize;
+    let mut turn = 0usize;
+    let mut exit_reason: &str = "eof";
 
     // Print ready message
     let format = cmd.output_format;
@@ -844,14 +1238,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             eprintln!();
         }
         OutputFormat::Jsonl => {
-            emit_jsonl_ready(&model_id, &device_label);
+            emit_jsonl_ready(&run_session_id, &requested_model, &model_id, &device_label);
         }
     }
-
-    // Interactive loop
-    let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
-    let mut turn = 0usize;
-    let mut exit_reason: &str = "eof";
 
     // If stdin is not a TTY (piped input), don't print prompts and just consume lines.
     // This enables: `printf "hi\n/bye\n" | ferrum run ...` for automation/profiling.
@@ -886,24 +1275,28 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     break;
                 }
                 if input == "/clear" {
+                    let before = history_evidence(&history);
                     history.clear();
+                    history_epoch += 1;
+                    turn = 0;
                     match format {
                         OutputFormat::Text => {
                             eprintln!("{}", "History cleared.".dimmed());
                         }
                         OutputFormat::Jsonl => {
                             let record = serde_json::json!({
-                                "event": "clear",
+                                "schema_version": RUN_JSONL_SCHEMA_VERSION,
+                                "event": "history_reset",
+                                "session_id": run_session_id,
+                                "history_epoch": history_epoch,
                                 "turn": turn,
+                                "history_before": before,
+                                "history_after": history_evidence(&history),
                             });
-                            println!("{record}");
+                            emit_jsonl_record(&record);
                         }
                     }
                     continue;
-                }
-
-                if format == OutputFormat::Jsonl {
-                    emit_jsonl_user(turn, input);
                 }
 
                 let plan = build_run_prompt_plan(
@@ -917,14 +1310,27 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     &run_budget,
                 )?;
                 maybe_warn_context_shift(&plan, format);
+                let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
                 let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
+                let request_id = RequestId(Uuid::new_v4());
+                let request_id_text = request_id.to_string();
+                if format == OutputFormat::Jsonl {
+                    emit_jsonl_user(
+                        &run_session_id,
+                        history_epoch,
+                        &request_id_text,
+                        turn,
+                        input,
+                        &history,
+                    );
+                }
                 // Create request
                 let request = InferenceRequest {
-                    id: RequestId(Uuid::new_v4()),
+                    id: request_id,
                     model_id: ferrum_types::ModelId(model_id.clone()),
                     prompt: plan.prompt,
                     sampling_params: plan.sampling_params,
-                    stream: format == OutputFormat::Text,
+                    stream: true,
                     priority: Priority::Normal,
                     client_id: None,
                     session_id: None,
@@ -939,7 +1345,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     "FERRUM_RUN_TRACE_TOKENS",
                 )
                 .is_some();
-                let (clean_response, finish_reason, token_count, chunk_count) = match format {
+                let (
+                    raw_response,
+                    clean_response,
+                    reasoning,
+                    finish_reason,
+                    usage,
+                    token_count,
+                    chunk_count,
+                ) = match format {
                     OutputFormat::Text => {
                         let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
                         let mut stream = match engine.infer_stream(request).await {
@@ -951,6 +1365,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                         };
                         let mut raw_response_text = String::new();
                         let mut finish_reason = None;
+                        let mut latest_usage = None;
                         let mut token_count = 0usize;
                         let mut chunk_count = 0usize;
                         while let Some(chunk) = stream.next().await {
@@ -988,36 +1403,51 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             }
                             if let Some(usage) = chunk.usage.as_ref() {
                                 token_count = usage.completion_tokens;
+                                latest_usage = Some(usage.clone());
                             }
                             if chunk.finish_reason.is_some() {
                                 finish_reason = chunk.finish_reason;
                             }
                         }
                         clear_first_token_indicator(&mut first_token_indicator);
+                        let raw_response = display_response_text(&raw_response_text);
                         (
-                            display_response_text(&raw_response_text),
+                            raw_response.clone(),
+                            raw_response,
+                            None,
                             finish_reason,
+                            latest_usage,
                             token_count,
                             chunk_count,
                         )
                     }
                     OutputFormat::Jsonl => {
-                        let response = engine.infer(request).await?;
-                        if trace_tokens {
-                            let tokens = response
-                                .tokens
-                                .iter()
-                                .map(|token| token.get())
-                                .collect::<Vec<_>>();
-                            eprintln!("[run-token-trace] turn={turn} tokens={tokens:?}");
-                        }
-                        let content = display_response_text(&response.text);
-                        let chunk_count = usize::from(!content.is_empty());
+                        let stream = engine.infer_stream(request).await?;
+                        let generation = collect_run_stream(
+                            stream,
+                            trace_tokens,
+                            turn,
+                            &run_session_id,
+                            history_epoch,
+                            &request_id_text,
+                        )
+                        .await?;
+                        let raw_response = display_response_text(&generation.raw_text);
+                        let parsed = parse_reasoning_response_for_prompt(
+                            &raw_response,
+                            prompt_opened_thinking,
+                        );
                         (
-                            content,
-                            Some(response.finish_reason),
-                            response.tokens.len(),
-                            chunk_count,
+                            raw_response,
+                            display_response_text(&parsed.content),
+                            parsed
+                                .reasoning
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty()),
+                            generation.finish_reason,
+                            generation.usage,
+                            generation.token_count,
+                            generation.chunk_count,
                         )
                     }
                 };
@@ -1042,11 +1472,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     }
                     OutputFormat::Jsonl => {
                         emit_jsonl_assistant(
+                            &run_session_id,
+                            history_epoch,
+                            &request_id_text,
                             turn,
                             &clean_response,
+                            reasoning.as_deref(),
+                            &history,
                             finish_reason,
+                            usage.as_ref(),
                             token_count,
                             chunk_count,
+                            &raw_response,
                             elapsed_s * 1000.0,
                         );
                     }
@@ -1060,8 +1497,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 // Add to history
                 history.push(("user".to_string(), input.to_string()));
-                if !clean_response.is_empty() {
-                    history.push(("assistant".to_string(), clean_response));
+                if !raw_response.is_empty() {
+                    history.push(("assistant".to_string(), raw_response));
                 }
 
                 // Limit history
@@ -1087,7 +1524,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             eprintln!("{}", "Goodbye!".bright_yellow());
         }
         OutputFormat::Jsonl => {
-            emit_jsonl_exit(exit_reason);
+            emit_jsonl_exit(&run_session_id, history_epoch, exit_reason);
         }
     }
     engine.shutdown().await?;
@@ -1375,6 +1812,8 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
         } else {
             Some(cmd.top_k)
         },
+        min_p: (cmd.min_p != 0.0).then_some(cmd.min_p),
+        presence_penalty: cmd.presence_penalty,
         repetition_penalty: cmd.repeat_penalty,
         stop_sequences,
         seed: cmd.seed,
@@ -1479,10 +1918,6 @@ fn build_run_prompt_plan(
 
         if prompt_tokens < kv_capacity {
             let remaining = kv_capacity - prompt_tokens;
-            if base_sampling.max_tokens > remaining && history_start < history.len() {
-                history_start = next_context_shift_history_start(history, history_start);
-                continue;
-            }
             let mut sampling_params = base_sampling.clone();
             let max_tokens_clamped_from = if sampling_params.max_tokens > remaining {
                 let old = sampling_params.max_tokens;
@@ -1593,360 +2028,6 @@ fn discover_run_tokenizer_path(source_path: &Path) -> Option<PathBuf> {
     tokenizer.is_file().then_some(tokenizer)
 }
 
-pub fn resolve_model_alias(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "tinyllama" | "tiny" => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
-        "qwen2.5:0.5b" | "qwen:0.5b" => "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
-        "qwen2.5:1.5b" | "qwen:1.5b" => "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
-        "qwen2.5:3b" | "qwen:3b" => "Qwen/Qwen2.5-3B-Instruct".to_string(),
-        "qwen2.5:7b" | "qwen:7b" => "Qwen/Qwen2.5-7B-Instruct".to_string(),
-        "qwen3:0.6b" => "Qwen/Qwen3-0.6B".to_string(),
-        "qwen3:1.7b" => "Qwen/Qwen3-1.7B".to_string(),
-        "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
-        "qwen3:14b" => "Qwen/Qwen3-14B".to_string(),
-        "qwen3:32b" => "Qwen/Qwen3-32B".to_string(),
-        // 2026-06 model-coverage W1 (docs/goals/model-coverage-2026-06-12/).
-        // GPTQ repos are the Marlin-clean picks verified in that goal doc.
-        "qwen3-coder:30b" | "qwen3-coder:30b-a3b" => {
-            "Qwen/Qwen3-Coder-30B-A3B-Instruct".to_string()
-        }
-        "qwen3-coder:30b-gptq" => "jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq".to_string(),
-        "qwen3:14b-gptq" => "JunHowie/Qwen3-14B-GPTQ-Int4".to_string(),
-        "qwen3:32b-gptq" => "JunHowie/Qwen3-32B-GPTQ-Int4".to_string(),
-        "deepseek-r1:8b" | "r1:8b" => "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B".to_string(),
-        "deepseek-r1:14b" | "r1:14b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B".to_string(),
-        "deepseek-r1:32b" | "r1:32b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B".to_string(),
-        "deepseek-r1:32b-gptq" => "OPEA/DeepSeek-R1-Distill-Qwen-32B-int4-gptq-sym-inc".to_string(),
-        "qwen2.5-coder:32b" => "Qwen/Qwen2.5-Coder-32B-Instruct".to_string(),
-        "qwen2.5-coder:32b-gptq" => "Qwen/Qwen2.5-Coder-32B-Instruct-GPTQ-Int4".to_string(),
-        "qwen2.5-coder:14b" => "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
-        // Gemma 3 text family (W2). unsloth mirrors are ungated rehosts of
-        // the license-gated google/ repos (same weights, HF-API-verified
-        // 2026-06-13); 1B is the L1 code-path representative. The GPTQ
-        // pick is the only classic-format (qweight/qzeros/scales/g_idx)
-        // text-only 27B export on the Hub — ISTA-DASLab ships
-        // compressed-tensors, which ferrum does not load.
-        "gemma3:1b" => "unsloth/gemma-3-1b-it".to_string(),
-        "gemma3:4b" => "unsloth/gemma-3-4b-it".to_string(),
-        "gemma3:27b" => "unsloth/gemma-3-27b-it".to_string(),
-        "gemma3:27b-gptq" => "circulus/gemma-3-27b-it-gptq".to_string(),
-        "mistral-small:24b" | "mistral-small:3.2" => {
-            "mistralai/Mistral-Small-3.2-24B-Instruct-2506".to_string()
-        }
-        "devstral:24b" | "devstral:2" => "mistralai/Devstral-Small-2-24B-Instruct-2512".to_string(),
-        "magistral:24b" => "mistralai/Magistral-Small-2509".to_string(),
-        "qwen2.5:3b-gptq" | "qwen2.5-3b-instruct-gptq-int4" => {
-            "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4".to_string()
-        }
-        "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
-        "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
-        "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),
-        "whisper-base" | "whisper:base" => "openai/whisper-base".to_string(),
-        "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
-        "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
-        "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
-        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
-            "openai/whisper-large-v3-turbo".to_string()
-        }
-        "qwen3-tts" | "tts" | "tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
-        "tts:1.7b" | "qwen3-tts:1.7b" => "Qwen/Qwen3-TTS-12Hz-1.7B-Base".to_string(),
-        _ => name.to_string(),
-    }
-}
-
-pub fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
-    // Check environment variable first
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        return PathBuf::from(hf_home);
-    }
-
-    // Use config value
-    let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
-    PathBuf::from(configured)
-}
-
-pub fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedModelSource> {
-    let repo_dir = cache_dir
-        .join("hub")
-        .join(format!("models--{}", model_id.replace('/', "--")));
-    let snapshots_dir = repo_dir.join("snapshots");
-
-    // Try refs/main first
-    let ref_main = repo_dir.join("refs").join("main");
-    if let Ok(rev) = std::fs::read_to_string(&ref_main) {
-        let rev = rev.trim();
-        if !rev.is_empty() {
-            let snapshot = snapshots_dir.join(rev);
-            if snapshot.exists() {
-                let format = detect_format(&snapshot);
-                if format != ModelFormat::Unknown {
-                    return Some(ResolvedModelSource {
-                        original: model_id.to_string(),
-                        local_path: snapshot,
-                        format,
-                        from_cache: true,
-                    });
-                }
-            }
-        }
-    }
-
-    // Fallback: first snapshot directory
-    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let format = detect_format(&path);
-                if format != ModelFormat::Unknown {
-                    return Some(ResolvedModelSource {
-                        original: model_id.to_string(),
-                        local_path: path,
-                        format,
-                        from_cache: true,
-                    });
-                }
-            }
-        }
-    }
-
-    None
-}
-
-pub fn detect_format(path: &PathBuf) -> ModelFormat {
-    if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
-    {
-        ModelFormat::SafeTensors
-    } else if path.join("pytorch_model.bin").exists() {
-        ModelFormat::PyTorchBin
-    } else {
-        ModelFormat::Unknown
-    }
-}
-
-/// Treat the model argument as a `.gguf` file path if it ends in `.gguf`
-/// (case-insensitive) and the file actually exists. Anything else falls
-/// through to the alias / HF repo path.
-pub fn looks_like_gguf_path(model: &str) -> bool {
-    let p = PathBuf::from(model);
-    p.extension()
-        .map(|e| e.eq_ignore_ascii_case("gguf"))
-        .unwrap_or(false)
-        && p.is_file()
-}
-
-/// One curated GGUF model: alias keys, source repo, pinned quantization
-/// file, and — when the strip-`-GGUF` convention can't find one — the
-/// repo hosting its HF-format tokenizer.json.
-///
-/// All facts per model live in this one row so an alias can't be added
-/// without deciding its tokenizer source. None of this is derivable at
-/// runtime: GGUF repos don't host tokenizer.json (all 9 W1 repos
-/// checked), bartowski/* has no safetensors mirrors, mistralai/*
-/// upstream ships tekken-format tokenizers only, meta-llama/* is gated.
-/// Long-term fix is reading the tokenizer embedded in the GGUF itself
-/// (llama.cpp-style); until then this table is the bridge.
-struct GgufAliasEntry {
-    aliases: &'static [&'static str],
-    repo: &'static str,
-    filename: &'static str,
-    /// Overrides the strip-`-GGUF` sibling convention for tokenizer
-    /// sidecar downloads. Verified to host tokenizer.json via the HF
-    /// API on 2026-06-12.
-    tokenizer_repo: Option<&'static str>,
-}
-
-// Aliases verified by probing the HF API on 2026-05-01 (group A) and
-// 2026-06-12 (model-coverage W1, docs/goals/model-coverage-2026-06-12/).
-// Quantization availability differs per repo — Qwen/Qwen3-{0.6B,1.7B}-GGUF
-// only host Q8_0; 4B / 8B / 30B-A3B host Q4_K_M.
-const GGUF_ALIASES: &[GgufAliasEntry] = &[
-    // Group A bench targets — same models the bench scripts use for
-    // single-request PP/TG comparison vs llama.cpp / mistral.rs.
-    GgufAliasEntry {
-        aliases: &["qwen3:8b-q4_k_m"],
-        repo: "Qwen/Qwen3-8B-GGUF",
-        filename: "Qwen3-8B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen3:4b-q4_k_m"],
-        repo: "Qwen/Qwen3-4B-GGUF",
-        filename: "Qwen3-4B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen3:1.7b", "qwen3:1.7b-q8_0"],
-        repo: "Qwen/Qwen3-1.7B-GGUF",
-        filename: "Qwen3-1.7B-Q8_0.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen3:0.6b-gguf", "qwen3:0.6b-q8_0"],
-        repo: "Qwen/Qwen3-0.6B-GGUF",
-        filename: "Qwen3-0.6B-Q8_0.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen3-moe:30b-a3b-q4_k_m", "qwen3:30b-a3b-q4_k_m"],
-        repo: "Qwen/Qwen3-30B-A3B-GGUF",
-        filename: "Qwen3-30B-A3B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    // 2026-06 model-coverage W2 aliases (Gemma 3; tokenizer from the
-    // unsloth safetensors mirrors).
-    GgufAliasEntry {
-        aliases: &["gemma3:1b-q4_k_m"],
-        repo: "unsloth/gemma-3-1b-it-GGUF",
-        filename: "gemma-3-1b-it-Q4_K_M.gguf",
-        tokenizer_repo: Some("unsloth/gemma-3-1b-it"),
-    },
-    GgufAliasEntry {
-        aliases: &["gemma3:27b-q4_k_m"],
-        repo: "unsloth/gemma-3-27b-it-GGUF",
-        filename: "gemma-3-27b-it-Q4_K_M.gguf",
-        tokenizer_repo: Some("unsloth/gemma-3-27b-it"),
-    },
-    // 2026-06 model-coverage W1 aliases.
-    GgufAliasEntry {
-        aliases: &["qwen3:14b-q4_k_m"],
-        repo: "Qwen/Qwen3-14B-GGUF",
-        filename: "Qwen3-14B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen3:32b-q4_k_m"],
-        repo: "Qwen/Qwen3-32B-GGUF",
-        filename: "Qwen3-32B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen3-coder:30b-q4_k_m", "qwen3-coder:30b-a3b-q4_k_m"],
-        repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-        filename: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["deepseek-r1:8b-q4_k_m", "r1:8b-q4_k_m"],
-        repo: "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
-        filename: "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["deepseek-r1:32b-q4_k_m", "r1:32b-q4_k_m"],
-        repo: "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
-        filename: "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf",
-        tokenizer_repo: None,
-    },
-    GgufAliasEntry {
-        aliases: &["qwen2.5-coder:32b-q4_k_m"],
-        repo: "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF",
-        filename: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
-        tokenizer_repo: Some("Qwen/Qwen2.5-Coder-32B-Instruct"),
-    },
-    GgufAliasEntry {
-        aliases: &["mistral-small:24b-q4_k_m"],
-        repo: "bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF",
-        filename: "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
-        // mistralai upstream ships tekken-format tokenizers only.
-        tokenizer_repo: Some("unsloth/Mistral-Small-3.2-24B-Instruct-2506"),
-    },
-    GgufAliasEntry {
-        aliases: &["devstral:24b-q4_k_m"],
-        repo: "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
-        filename: "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
-        tokenizer_repo: Some("mistralai/Devstral-Small-2-24B-Instruct-2512"),
-    },
-    GgufAliasEntry {
-        aliases: &["magistral:24b-q4_k_m"],
-        repo: "bartowski/mistralai_Magistral-Small-2509-GGUF",
-        filename: "mistralai_Magistral-Small-2509-Q4_K_M.gguf",
-        tokenizer_repo: Some("unsloth/Magistral-Small-2509"),
-    },
-    // meta-llama/* upstream is gated; unsloth mirrors are not.
-    GgufAliasEntry {
-        aliases: &["llama3.1:8b-q4_k_m"],
-        repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        tokenizer_repo: Some("unsloth/Meta-Llama-3.1-8B-Instruct"),
-    },
-    GgufAliasEntry {
-        aliases: &["llama3.2:3b-q4_k_m"],
-        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
-        filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        tokenizer_repo: Some("unsloth/Llama-3.2-3B-Instruct"),
-    },
-    GgufAliasEntry {
-        aliases: &["llama3.2:1b-q4_k_m"],
-        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
-        filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-        tokenizer_repo: Some("unsloth/Llama-3.2-1B-Instruct"),
-    },
-];
-
-/// Resolve a GGUF alias to a `(repo, filename)` pair if recognised. Returns
-/// `None` for non-GGUF aliases — callers fall through to
-/// [`resolve_model_alias`].
-///
-/// These map ergonomic aliases to the `<org>/<name>-GGUF` repos the
-/// community publishes Q4_K_M quantizations under. The filename component
-/// pins a specific quantization; users wanting other quants pass the path
-/// directly or extend [`GGUF_ALIASES`].
-pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
-    let name = name.to_lowercase();
-    GGUF_ALIASES
-        .iter()
-        .find(|e| e.aliases.contains(&name.as_str()))
-        .map(|e| (e.repo.to_string(), e.filename.to_string()))
-}
-
-/// For GGUF aliases whose repo lacks a tokenizer.json, return the sibling
-/// safetensors repo where the tokenizer should be pulled from: the
-/// per-entry `tokenizer_repo` override when set, else the strip-`-GGUF`
-/// convention.
-pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
-    if let Some(entry) = GGUF_ALIASES.iter().find(|e| e.repo == gguf_repo) {
-        if let Some(repo) = entry.tokenizer_repo {
-            return Some(repo.to_string());
-        }
-    }
-    gguf_repo.strip_suffix("-GGUF").map(|s| s.to_string())
-}
-
-/// Locate a previously-pulled GGUF file in the HF cache.
-///
-/// Mirrors `find_cached_model` but returns the path to the specific
-/// `.gguf` file (not a directory). Looks up `refs/main` to find the
-/// active snapshot, falls back to the first snapshot containing the
-/// requested file. Returns `None` if neither finds it.
-pub fn find_cached_gguf(cache_dir: &PathBuf, repo: &str, filename: &str) -> Option<PathBuf> {
-    let repo_dir = cache_dir
-        .join("hub")
-        .join(format!("models--{}", repo.replace('/', "--")));
-    let snapshots_dir = repo_dir.join("snapshots");
-
-    let ref_main = repo_dir.join("refs").join("main");
-    if let Ok(rev) = std::fs::read_to_string(&ref_main) {
-        let rev = rev.trim();
-        if !rev.is_empty() {
-            let candidate = snapshots_dir.join(rev).join(filename);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join(filename);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
 pub fn select_device(backend: &str) -> Result<ferrum_types::Device> {
     match backend.trim().to_lowercase().as_str() {
         "cpu" => Ok(ferrum_types::Device::CPU),
@@ -2018,7 +2099,14 @@ fn build_chat_prompt(
 
 async fn load_run_model_definition(
     source: &ResolvedModelSource,
+    product_sources: Option<&ferrum_models::vnext::ProductionModelSourceBundle>,
 ) -> Result<Option<ferrum_models::ModelDefinition>> {
+    if let Some(sources) = product_sources {
+        let mut config_manager = ferrum_models::ConfigManager::new();
+        return config_manager
+            .load_from_bytes(sources.config_json())
+            .map(Some);
+    }
     if source.format != ModelFormat::SafeTensors {
         return Ok(None);
     }
@@ -2039,11 +2127,27 @@ fn run_effective_runtime_config(
     snapshot
 }
 
+fn run_base_runtime_config(
+    config: &CliConfig,
+    env_snapshot: RuntimeConfigSnapshot,
+) -> RuntimeConfigSnapshot {
+    crate::commands::serve::merge_runtime_config_sources(
+        config.runtime.runtime_config_entries(),
+        env_snapshot,
+        Vec::new(),
+    )
+}
+
 fn run_startup_cli_runtime_entries(
     cmd: &RunCommand,
     gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
+    entries.push(RuntimeConfigEntry::new(
+        "FERRUM_PROFILE_DETAIL",
+        cmd.profile_detail.as_str(),
+        RuntimeConfigSource::Cli,
+    ));
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
         "FERRUM_KV_DTYPE",
@@ -2070,9 +2174,29 @@ fn run_startup_cli_runtime_entries(
         "FERRUM_MAX_BATCHED_TOKENS",
         cmd.max_num_batched_tokens,
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_SEQUENCE_FIT_POLICY",
+        cmd.sequence_fit_policy
+            .map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+        cmd.runtime_memory_budget_bytes
+            .map(std::num::NonZeroUsize::get),
+    );
     if let Some(enabled) = bool_cli_override(cmd.batched_graph, cmd.disable_batched_graph) {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = bool_cli_override(cmd.reusable_execution, cmd.disable_reusable_execution)
+    {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));
@@ -2156,19 +2280,20 @@ fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
 
 fn run_startup_auto_config(
     device: &ferrum_types::Device,
+    typed_model_capabilities: Option<ModelCapabilities>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
     let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
-    let model = model_definition
-        .map(|definition| {
+    let model = typed_model_capabilities
+        .or_else(|| model_definition.map(|definition| {
             crate::commands::serve::model_capabilities_from_definition_with_weight_bytes_for_hardware(
                 definition,
                 model_weight_bytes,
                 &hardware,
             )
-        })
+        }))
         .unwrap_or_else(ModelCapabilities::unknown);
     let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
     FerrumConfigBuilder::new(runtime_config)
@@ -2223,7 +2348,7 @@ pub fn apply_kv_dtype_override(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_types::RuntimeConfigSource;
+    use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy};
 
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
@@ -2235,15 +2360,15 @@ mod tests {
     fn test_run_cmd() -> RunCommand {
         RunCommand {
             model: "tinyllama".to_string(),
+            product_sources: crate::source_resolver::ProductSourceArgs::default(),
             system: None,
-            max_tokens: 1024,
+            max_tokens: 4096,
             stop: Vec::new(),
             no_context_shift: false,
             enable_thinking: false,
             disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
-            qwen35_reference: false,
             gpu_devices: None,
             layer_split_pipeline_mode: None,
             prompt: None,
@@ -2251,15 +2376,21 @@ mod tests {
             bench_mode: false,
             top_k: 50,
             top_p: 0.95,
+            min_p: 0.0,
+            presence_penalty: 0.0,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
             seed: None,
             gpu_memory_utilization: 0.9,
+            runtime_memory_budget_bytes: None,
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
+            sequence_fit_policy: None,
             batched_graph: false,
             disable_batched_graph: false,
+            reusable_execution: false,
+            disable_reusable_execution: false,
             unified_graph: false,
             disable_unified_graph: false,
             unified_graph_layers_only: false,
@@ -2272,6 +2403,7 @@ mod tests {
             effective_config_json: None,
             decision_trace_jsonl: None,
             observability_vertical_slice_out: None,
+            vnext_checkpoint: Default::default(),
             profile_jsonl: None,
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
             memory_profile_jsonl: None,
@@ -2327,6 +2459,24 @@ mod tests {
     }
 
     #[test]
+    fn run_effective_runtime_config_records_memory_budget() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.runtime_memory_budget_bytes = std::num::NonZeroUsize::new(12_345);
+
+        let effective =
+            run_effective_runtime_config(&snapshot, &run_startup_cli_runtime_entries(&cmd, None));
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES")
+            .expect("missing runtime memory budget entry");
+
+        assert_eq!(entry.effective_value, "12345");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
     fn run_effective_runtime_config_records_observability_paths() {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();
@@ -2358,6 +2508,66 @@ mod tests {
     }
 
     #[test]
+    fn run_full_profile_detail_reaches_typed_engine_config() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Full;
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+
+        engine
+            .apply_runtime_config_snapshot(&effective)
+            .expect("full profile detail should apply");
+
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Full
+        );
+    }
+
+    #[test]
+    fn run_replay_profile_detail_reaches_typed_engine_config() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Replay;
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+
+        engine
+            .apply_runtime_config_snapshot(&effective)
+            .expect("replay profile detail should apply");
+
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Replay
+        );
+    }
+
+    #[test]
+    fn run_verify_profile_detail_reaches_typed_engine_config() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Verify;
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+
+        engine
+            .apply_runtime_config_snapshot(&effective)
+            .expect("verify profile detail should apply");
+
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Verify
+        );
+    }
+
+    #[test]
     fn run_effective_runtime_config_records_layer_split_pipeline_mode() {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();
@@ -2379,6 +2589,7 @@ mod tests {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();
         cmd.batched_graph = true;
+        cmd.disable_reusable_execution = true;
         cmd.unified_graph = true;
         cmd.unified_graph_layers_only = true;
         cmd.unified_graph_lm_head_eager = true;
@@ -2394,6 +2605,11 @@ mod tests {
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_BATCHED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION").source,
             RuntimeConfigSource::Cli
         );
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
@@ -2459,6 +2675,7 @@ mod tests {
         cmd.max_model_len = Some(8192);
         cmd.max_num_seqs = Some(8);
         cmd.max_num_batched_tokens = Some(1024);
+        cmd.sequence_fit_policy = Some(crate::commands::SequenceFitPolicyArg::FullInputMustFit);
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
         let effective = run_effective_runtime_config(&snapshot, &cli_entries);
@@ -2476,9 +2693,57 @@ mod tests {
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1024");
         assert_eq!(
+            entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
+            "full-input-must-fit"
+        );
+        assert_eq!(
             entry("FERRUM_MAX_MODEL_LEN").source,
             RuntimeConfigSource::Cli
         );
+    }
+
+    #[test]
+    fn run_runtime_config_precedence_is_config_then_env_then_cli() {
+        let mut config = CliConfig::default();
+        config.runtime.sequence_fit_policy = Some(SequenceFitPolicy::FullInputMustFit);
+
+        let config_only =
+            run_base_runtime_config(&config, RuntimeConfigSnapshot::from_entries(Vec::new()));
+        let config_entry = config_only
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .expect("config sequence fit policy is missing");
+        assert_eq!(config_entry.effective_value, "full-input-must-fit");
+        assert_eq!(config_entry.source, RuntimeConfigSource::ConfigFile);
+
+        let env_wins = run_base_runtime_config(
+            &config,
+            RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_SEQUENCE_FIT_POLICY",
+                "immediate-only",
+                RuntimeConfigSource::Env,
+            )]),
+        );
+        let env_entry = env_wins
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .expect("env sequence fit policy is missing");
+        assert_eq!(env_entry.effective_value, "immediate-only");
+        assert_eq!(env_entry.source, RuntimeConfigSource::Env);
+
+        let mut cmd = test_run_cmd();
+        cmd.sequence_fit_policy = Some(crate::commands::SequenceFitPolicyArg::FullInputMustFit);
+        let effective =
+            run_effective_runtime_config(&env_wins, &run_startup_cli_runtime_entries(&cmd, None));
+        let cli_entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .expect("CLI sequence fit policy is missing");
+        assert_eq!(cli_entry.effective_value, "full-input-must-fit");
+        assert_eq!(cli_entry.source, RuntimeConfigSource::Cli);
     }
 
     #[test]
@@ -2504,6 +2769,7 @@ mod tests {
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
+            None,
             None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),
@@ -2564,6 +2830,33 @@ mod tests {
     }
 
     #[test]
+    fn run_thinking_options_preserve_model_default_and_explicit_overrides() {
+        let template = ModelChatTemplate::new(
+            "{% if enable_thinking is defined %}{{ enable_thinking }}{% endif %}",
+            "thinking-template",
+        );
+        let mut cmd = test_run_cmd();
+
+        assert_eq!(
+            build_chat_template_options(&cmd, Some(&template)).enable_thinking,
+            None
+        );
+
+        cmd.enable_thinking = true;
+        assert_eq!(
+            build_chat_template_options(&cmd, Some(&template)).enable_thinking,
+            Some(true)
+        );
+
+        cmd.enable_thinking = false;
+        cmd.disable_thinking = true;
+        assert_eq!(
+            build_chat_template_options(&cmd, Some(&template)).enable_thinking,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn run_metadata_forbids_initial_thinking_start_when_template_disables_thinking() {
         let metadata = run_request_metadata(
             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -2595,6 +2888,76 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_v2_assistant_binds_reasoning_usage_and_history() {
+        let history = vec![
+            ("user".to_string(), "first".to_string()),
+            (
+                "assistant".to_string(),
+                "<think>why</think>answer".to_string(),
+            ),
+        ];
+        let usage = TokenUsage::new(7, 3);
+        let record = jsonl_assistant_record(
+            "session-1",
+            2,
+            "request-1",
+            1,
+            "answer",
+            Some("why"),
+            &history,
+            Some(FinishReason::EOS),
+            Some(&usage),
+            3,
+            2,
+            "<think>why</think>answer",
+            12.5,
+        );
+        assert_eq!(record["schema_version"], RUN_JSONL_SCHEMA_VERSION);
+        assert_eq!(record["session_id"], "session-1");
+        assert_eq!(record["history_epoch"], 2);
+        assert_eq!(record["request_id"], "request-1");
+        assert_eq!(record["content"], "answer");
+        assert_eq!(record["reasoning"], "why");
+        assert_eq!(record["usage"]["prompt_tokens"], 7);
+        assert_eq!(record["usage"]["completion_tokens"], 3);
+        assert_eq!(record["usage"]["total_tokens"], 10);
+        assert_eq!(record["history_before"]["message_count"], 2);
+        assert_eq!(record["history_before"]["turn_count"], 1);
+        assert_eq!(
+            record["raw_text_sha256"],
+            sha256_text("<think>why</think>answer")
+        );
+    }
+
+    #[test]
+    fn history_evidence_changes_when_reasoning_history_changes() {
+        let first = vec![("assistant".to_string(), "answer".to_string())];
+        let second = vec![(
+            "assistant".to_string(),
+            "<think>why</think>answer".to_string(),
+        )];
+        assert_ne!(
+            history_evidence(&first)["sha256"],
+            history_evidence(&second)["sha256"]
+        );
+    }
+
+    #[test]
+    fn jsonl_v2_delta_preserves_utf8_bytes_and_request_binding() {
+        let record =
+            jsonl_assistant_delta_record("session-1", 3, "request-1", 4, 2, "🙂", Some(9271));
+        assert_eq!(record["event"], "assistant_delta");
+        assert_eq!(record["session_id"], "session-1");
+        assert_eq!(record["history_epoch"], 3);
+        assert_eq!(record["request_id"], "request-1");
+        assert_eq!(record["turn"], 4);
+        assert_eq!(record["index"], 2);
+        assert_eq!(record["raw_text_delta"], "🙂");
+        assert_eq!(record["utf8_bytes"], 4);
+        assert_eq!(record["token_id"], 9271);
+    }
+
+    #[test]
     fn cli_display_preserves_thinking_markers() {
         assert_eq!(
             display_response_text("<think>\nreasoning\n</think>\n\n最终答案"),
@@ -2614,7 +2977,38 @@ mod tests {
     fn default_run_temperature_is_greedy() {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
-        assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+        assert_eq!(build_sampling_params(&cmd).max_tokens, 4096);
+    }
+
+    #[test]
+    fn run_propagates_min_p_and_presence_penalty() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+
+        let parsed = TestCli::parse_from([
+            "ferrum",
+            "qwen3.5",
+            "--temperature",
+            "1.0",
+            "--min-p",
+            "0.05",
+            "--presence-penalty",
+            "1.5",
+        ]);
+        let params = build_sampling_params(&parsed.run);
+        assert_eq!(params.min_p, Some(0.05));
+        assert_eq!(params.presence_penalty, 1.5);
+        params
+            .validate()
+            .expect("official sampling controls must validate");
+
+        let disabled = TestCli::parse_from(["ferrum", "qwen3.5", "--min-p", "0.0"]);
+        assert_eq!(build_sampling_params(&disabled.run).min_p, None);
     }
 
     #[test]
@@ -2644,7 +3038,7 @@ mod tests {
     }
 
     #[test]
-    fn run_parses_explicit_qwen35_reference_flag() {
+    fn run_rejects_removed_qwen35_flag() {
         use clap::Parser;
 
         #[derive(Parser)]
@@ -2653,9 +3047,12 @@ mod tests {
             run: RunCommand,
         }
 
-        let parsed = TestCli::parse_from(["ferrum", "qwen3.5", "--qwen35-reference"]);
+        let error = match TestCli::try_parse_from(["ferrum", "qwen3.5", "--qwen35-reference"]) {
+            Ok(_) => panic!("product CLI exposed the legacy Qwen3.5 reference adapter"),
+            Err(error) => error,
+        };
 
-        assert!(parsed.run.qwen35_reference);
+        assert!(error.to_string().contains("--qwen35-reference"));
     }
 
     #[test]
@@ -2707,7 +3104,7 @@ mod tests {
 
         let prompt_tokens = plan.prompt_tokens.unwrap();
         assert!(prompt_tokens < 64);
-        assert_eq!(plan.max_tokens_clamped_from, Some(1024));
+        assert_eq!(plan.max_tokens_clamped_from, Some(4096));
         assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
     }
 
@@ -2764,19 +3161,21 @@ mod tests {
     }
 
     #[test]
-    fn context_shift_drops_history_before_clamping_output_budget() {
+    fn context_shift_clamps_output_before_dropping_history() {
         let mut cmd = test_run_cmd();
-        cmd.max_tokens = 32;
+        cmd.max_tokens = 1024;
         let budget = whitespace_budget(64);
-        let medium = std::iter::repeat_n("old", 12).collect::<Vec<_>>().join(" ");
         let history = vec![
-            ("user".to_string(), medium.clone()),
-            ("assistant".to_string(), medium),
+            (
+                "user".to_string(),
+                "Remember the identifier G00-c03-001-OK.".to_string(),
+            ),
+            ("assistant".to_string(), "ACKNOWLEDGED".to_string()),
         ];
         let options = default_template_options();
         let plan = build_run_prompt_plan(
             &history,
-            "demo",
+            "What identifier did I ask you to remember?",
             None,
             "tinyllama",
             None,
@@ -2786,10 +3185,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.dropped_history_messages, 2);
-        assert_eq!(plan.dropped_history_turns, 1);
-        assert_eq!(plan.max_tokens_clamped_from, None);
-        assert_eq!(plan.sampling_params.max_tokens, 32);
+        let prompt_tokens = plan.prompt_tokens.unwrap();
+        assert!(prompt_tokens < 64);
+        assert!(plan.prompt.contains("G00-c03-001-OK"));
+        assert_eq!(plan.dropped_history_messages, 0);
+        assert_eq!(plan.dropped_history_turns, 0);
+        assert_eq!(plan.max_tokens_clamped_from, Some(1024));
+        assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
     }
 
     #[test]

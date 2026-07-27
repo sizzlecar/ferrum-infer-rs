@@ -32,6 +32,7 @@ fn parses_official_qwen35_dense_min_config() {
     assert_eq!(cfg.linear_attention.key_head_dim, 128);
     assert_eq!(cfg.linear_attention.value_head_dim, 128);
     assert_eq!(cfg.linear_attention.conv_kernel_dim, 4);
+    assert_eq!(cfg.mamba_ssm_dtype, DataType::FP32);
     assert!(cfg.attn_output_gate);
     assert_eq!(cfg.rope_parameters.rope_theta, 10_000_000.0);
     assert_eq!(cfg.rope_parameters.partial_rotary_factor, 0.25);
@@ -82,7 +83,7 @@ fn parses_official_qwen35_dense_min_config() {
         vec![16, 128, 128]
     );
     assert_eq!(cfg.recurrent_conv_state_shape().unwrap(), vec![6144, 3]);
-    let specs = cfg.recurrent_state_tensor_specs().unwrap();
+    let specs = cfg.recurrent_state_tensor_specs(DataType::BF16).unwrap();
     assert_eq!(specs.len(), 36);
     assert_eq!(specs[0].layer_index, 0);
     assert_eq!(specs[1].layer_index, 0);
@@ -91,8 +92,10 @@ fn parses_official_qwen35_dense_min_config() {
     assert_eq!(specs[6].layer_index, 4);
     assert_eq!(specs[0].name, QWEN35_CONV_STATE_NAME);
     assert_eq!(specs[0].shape, vec![6144, 3]);
+    assert_eq!(specs[0].dtype, DataType::BF16);
     assert_eq!(specs[1].name, QWEN35_DELTA_STATE_NAME);
     assert_eq!(specs[1].shape, vec![16, 128, 128]);
+    assert_eq!(specs[1].dtype, DataType::FP32);
     assert_eq!(
         cfg.recurrent_state_elements_per_slot().unwrap(),
         18 * (6144 * 3 + 16 * 128 * 128)
@@ -106,12 +109,36 @@ fn parses_official_qwen35_dense_min_config() {
     assert_eq!(spec.tensors.len(), 36);
     assert_eq!(spec.tensors[0].shape, vec![6144, 3]);
     assert_eq!(spec.tensors[1].shape, vec![16, 128, 128]);
-    assert_eq!(spec.dtype, DataType::BF16);
     assert_eq!(spec.device, Device::CPU);
     assert_eq!(spec.max_batch_slots, 1);
     assert_eq!(
         spec.estimated_memory_bytes(),
-        18 * (6144 * 3 + 16 * 128 * 128) * 2
+        18 * (6144 * 3 * 2 + 16 * 128 * 128 * 4)
+    );
+}
+
+#[test]
+fn rejects_missing_or_unsupported_mamba_ssm_dtype() {
+    let raw = read_artifact("dense_min_reference.config.json");
+    let mut missing: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    missing["text_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mamba_ssm_dtype");
+    let error = Qwen35TextConfig::from_hf_config_value(&missing)
+        .expect_err("missing temporal state dtype must fail closed");
+    assert!(
+        error.contains("mamba_ssm_dtype must be a string"),
+        "{error}"
+    );
+
+    let mut unsupported: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    unsupported["text_config"]["mamba_ssm_dtype"] = serde_json::json!("float8");
+    let error = Qwen35TextConfig::from_hf_config_value(&unsupported)
+        .expect_err("unsupported temporal state dtype must fail closed");
+    assert!(
+        error.contains("unsupported Qwen3.5 mamba_ssm_dtype"),
+        "{error}"
     );
 }
 
@@ -130,6 +157,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(cfg.layer_types[3], Qwen35LayerType::FullAttention);
     assert_eq!(cfg.linear_attention.num_key_heads, 16);
     assert_eq!(cfg.linear_attention.num_value_heads, 32);
+    assert_eq!(cfg.mamba_ssm_dtype, DataType::FP32);
     assert!(cfg.attn_output_gate);
     assert_eq!(cfg.rope_parameters.rope_theta, 10_000_000.0);
     assert_eq!(cfg.rope_parameters.partial_rotary_factor, 0.25);
@@ -190,7 +218,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
         vec![32, 128, 128]
     );
     assert_eq!(cfg.recurrent_conv_state_shape().unwrap(), vec![8192, 3]);
-    let specs = cfg.recurrent_state_tensor_specs().unwrap();
+    let specs = cfg.recurrent_state_tensor_specs(DataType::FP16).unwrap();
     assert_eq!(specs.len(), 60);
     assert_eq!(specs[0].layer_index, 0);
     assert_eq!(specs[1].layer_index, 0);
@@ -199,8 +227,10 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(specs[6].layer_index, 4);
     assert_eq!(specs[0].name, QWEN35_CONV_STATE_NAME);
     assert_eq!(specs[0].shape, vec![8192, 3]);
+    assert_eq!(specs[0].dtype, DataType::FP16);
     assert_eq!(specs[1].name, QWEN35_DELTA_STATE_NAME);
     assert_eq!(specs[1].shape, vec![32, 128, 128]);
+    assert_eq!(specs[1].dtype, DataType::FP32);
     assert_eq!(
         cfg.recurrent_state_elements_per_slot().unwrap(),
         30 * (8192 * 3 + 32 * 128 * 128)
@@ -214,7 +244,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(spec.tensors[1].shape, vec![32, 128, 128]);
     assert_eq!(
         spec.estimated_memory_bytes(),
-        30 * (8192 * 3 + 32 * 128 * 128) * 2
+        30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4)
     );
 }
 
@@ -239,6 +269,7 @@ fn parses_qwen35_moe_gptq_quantization_config() {
         "linear_key_head_dim": 128,
         "linear_value_head_dim": 128,
         "linear_conv_kernel_dim": 4,
+        "mamba_ssm_dtype": "float32",
         "head_dim": 256,
         "num_attention_heads": 16,
         "num_key_value_heads": 2,
@@ -287,6 +318,7 @@ fn rejects_unknown_qwen35_quantization_method() {
         "linear_key_head_dim": 4,
         "linear_value_head_dim": 4,
         "linear_conv_kernel_dim": 4,
+        "mamba_ssm_dtype": "float32",
         "head_dim": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
@@ -316,6 +348,7 @@ fn rejects_dense_config_with_moe_fields() {
         "linear_key_head_dim": 4,
         "linear_value_head_dim": 4,
         "linear_conv_kernel_dim": 4,
+        "mamba_ssm_dtype": "float32",
         "head_dim": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
@@ -342,6 +375,7 @@ fn rejects_moe_config_without_shared_expert() {
         "linear_key_head_dim": 4,
         "linear_value_head_dim": 4,
         "linear_conv_kernel_dim": 4,
+        "mamba_ssm_dtype": "float32",
         "head_dim": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
@@ -363,6 +397,19 @@ fn rejects_zero_recurrent_state_batch_slots() {
         .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 0)
         .expect_err("zero batch slots should fail");
     assert!(err.contains("max_batch_slots"), "{err}");
+}
+
+#[test]
+fn rejects_recurrent_state_dimension_overflow_before_spec_creation() {
+    let raw = read_artifact("dense_min_reference.config.json");
+    let mut cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
+    cfg.linear_attention.num_key_heads = usize::MAX;
+
+    let err = cfg
+        .recurrent_state_tensor_specs(DataType::FP16)
+        .expect_err("overflowing state dimensions must fail before allocation");
+
+    assert!(err.contains("QK width overflows"), "{err}");
 }
 
 #[test]

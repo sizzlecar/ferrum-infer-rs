@@ -2,31 +2,59 @@
 //!
 //! Iteration-level continuous batching: each step processes a mixed batch of
 //! prefill and decode requests selected by the scheduler.  Multiple callers
-//! can submit requests concurrently — an `iteration_lock` serializes the
-//! actual engine steps so each batch is processed exactly once.
+//! can submit requests concurrently. An `iteration_lock` makes publication
+//! atomic with planning, while the single background driver owns device-wave
+//! execution.
 
 use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
 };
 use async_trait::async_trait;
-use ferrum_bench_core::{global_profile, profile_fields_from_json};
+use ferrum_bench_core::{
+    global_profile, profile_fields_from_json, JsonlJournal, JsonlJournalError,
+};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
-        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
+        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
+        ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
+        ExecutorExecutionCapacityPreemption, ExecutorPrefillAdmission,
+        ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
+        ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
+        TokenSelectionMask,
+    },
+    sampler::SamplingConfig as TokenSamplingPlan,
+    vnext::{
+        AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
+        CapacityAvailabilityEpoch, DeferredAction, DeviceCapacityPressureScope,
+        DeviceExecutionSpanKind, DeviceExecutionSpanMeasurement, DeviceSubmissionExecutionSpan,
+        DeviceSubmissionExecutionTiming, DeviceTimingMeasurement, DeviceTimingUnavailableReason,
+        EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy,
+        ExecutionEventDetail, ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink,
+        ExecutionEventSinkError, OperationCompletionReceipt,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
-use ferrum_sampler::json_mode::JsonModeProcessor;
-use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
+use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
+use ferrum_scheduler::implementations::{
+    ContinuousBatchScheduler, ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot,
+    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, PressureYieldTransaction,
+    RequestPhase,
+};
+#[cfg(test)]
+use ferrum_scheduler::implementations::{PressureTransitionKind, PressureYieldKind};
+use ferrum_scheduler::vnext::{
+    AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
+};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
-    InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileError,
-    ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result,
-    SamplingParams, StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    InferenceRequest, InferenceResponse, ObservabilityProfileDetail, Priority, ProfileEntrypoint,
+    ProfileError, ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent,
+    Result, SamplingParams, StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
     ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
     PROMPT_TOKENS_METADATA_KEY,
 };
@@ -41,6 +69,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
@@ -91,6 +120,7 @@ struct ContinuousEngineRuntimeConfig {
     max_model_len: Option<usize>,
     next_batch_prof: bool,
     profile_entrypoint: Option<ProfileEntrypoint>,
+    profile_jsonl: Option<PathBuf>,
     prefix_cache_enabled: bool,
     rbd_prof: bool,
     scheduler_trace_jsonl: Option<PathBuf>,
@@ -113,6 +143,7 @@ impl ContinuousEngineRuntimeConfig {
             max_model_len: r.max_model_len,
             next_batch_prof: r.next_batch_prof,
             profile_entrypoint: r.profile_entrypoint,
+            profile_jsonl: r.profile_jsonl.clone(),
             prefix_cache_enabled: r.prefix_cache_enabled,
             rbd_prof: r.rbd_prof,
             scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
@@ -143,6 +174,9 @@ impl ContinuousEngineRuntimeConfig {
             profile_entrypoint: vars
                 .get("FERRUM_PROFILE_ENTRYPOINT")
                 .and_then(|value| ProfileEntrypoint::parse(value)),
+            profile_jsonl: vars
+                .get("FERRUM_PROFILE_JSONL")
+                .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             prefix_cache_enabled: vars
                 .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
                 .is_some_and(|v| v == "1"),
@@ -309,6 +343,7 @@ fn resolve_stop_conditions(
 fn resolve_sampling_token_constraints(
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     stop_token_ids: &HashSet<u32>,
+    request_generated_control_token_texts: &[&str],
 ) -> (HashSet<u32>, Option<usize>, HashSet<u32>) {
     let mut allowed_extended = stop_token_ids.clone();
     let Some(tok) = tokenizer else {
@@ -322,6 +357,11 @@ fn resolve_sampling_token_constraints(
         allowed_extended.insert(extra.get());
     }
     for text in GENERATED_CONTROL_TOKEN_TEXTS {
+        if let Some(token) = tok.token_id(text) {
+            allowed_extended.insert(token.get());
+        }
+    }
+    for text in request_generated_control_token_texts {
         if let Some(token) = tok.token_id(text) {
             allowed_extended.insert(token.get());
         }
@@ -443,7 +483,7 @@ fn cached_forbidden_generation_tokens(
         let raw_text_forbidden = raw_text.is_some_and(is_forbidden_generation_token_text);
         let decoded_text_forbidden = tok
             .decode(&[token], true)
-            .map(|text| is_forbidden_generation_token_text(&text))
+            .map(|text| decoded_token_is_statically_forbidden(tok, token, &text))
             .unwrap_or(true);
         if missing_token_text || raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
@@ -539,6 +579,89 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
         || lower.contains("unused")
 }
 
+fn decoded_token_is_statically_forbidden(
+    tokenizer: &(dyn Tokenizer + Send + Sync),
+    token: TokenId,
+    decoded: &str,
+) -> bool {
+    if !decoded.contains('\u{FFFD}') {
+        return is_forbidden_generation_token_text(decoded);
+    }
+    if contains_replacement_char_mojibake(decoded) {
+        return true;
+    }
+
+    let Some(bytes) = tokenizer.token_bytes(token) else {
+        return true;
+    };
+    if bytes.is_empty() || std::str::from_utf8(&bytes).is_ok() {
+        return true;
+    }
+
+    // Byte-level vocabularies can split one UTF-8 scalar across tokens. A
+    // one-token string decode must render such a fragment as U+FFFD, but the
+    // raw bytes remain legal in context and are owned by candidate decoding.
+    !is_potential_utf8_fragment(&bytes)
+}
+
+fn is_potential_utf8_fragment(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while offset < bytes.len() && is_utf8_continuation(bytes[offset]) {
+        offset += 1;
+    }
+    if offset > 3 {
+        return false;
+    }
+
+    while offset < bytes.len() {
+        let lead = bytes[offset];
+        if lead.is_ascii() {
+            offset += 1;
+            continue;
+        }
+
+        let continuation_count = match lead {
+            0xC2..=0xDF => 1,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF4 => 3,
+            _ => return false,
+        };
+        let available = bytes.len() - offset - 1;
+        let present = available.min(continuation_count);
+        for index in 0..present {
+            let byte = bytes[offset + index + 1];
+            if !is_utf8_continuation(byte) {
+                return false;
+            }
+            if index == 0
+                && matches!(
+                    (lead, byte),
+                    (0xE0, 0x80..=0x9F)
+                        | (0xED, 0xA0..=0xBF)
+                        | (0xF0, 0x80..=0x8F)
+                        | (0xF4, 0x90..=0xBF)
+                )
+            {
+                return false;
+            }
+        }
+        if present < continuation_count {
+            return true;
+        }
+        offset += continuation_count + 1;
+    }
+
+    true
+}
+
+fn is_utf8_continuation(byte: u8) -> bool {
+    matches!(byte, 0x80..=0xBF)
+}
+
 fn decoded_delta_has_forbidden_quality(
     full_text: &str,
     previous_text_len: usize,
@@ -596,7 +719,9 @@ pub struct SequenceState {
     pub generated_tokens: Vec<TokenId>,
     model_kv: Option<SequenceModelKvState>,
     recurrent_state: Option<SequenceRecurrentState>,
-    pub sampling_params: SamplingParams,
+    sampling_params: SamplingParams,
+    /// Immutable logits-processing and sampler plan prepared once per request.
+    sampling_plan: TokenSamplingPlan,
     pub phase: RequestPhase,
     pub rng: StdRng,
     pub prefill_complete: bool,
@@ -604,7 +729,7 @@ pub struct SequenceState {
     /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
     pub prefill_tokens_processed: usize,
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
-    pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
+    pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
     /// Wall-clock `Instant` at which the first SSE chunk was actually
@@ -625,12 +750,10 @@ pub struct SequenceState {
     pub tokens_this_iteration: usize,
     /// Number of times this request has been preempted.
     pub preemption_count: usize,
-    /// JSON mode logits processor (active when response_format is JsonObject).
-    pub json_processor: Option<Arc<JsonModeProcessor>>,
-    /// Regex-guided hard-mask processor (active when response_format is Regex).
-    pub regex_processor: Option<Arc<ferrum_sampler::guided::RegexGuidedProcessor>>,
+    /// Tokenizer-aware hard grammar for `json_object` and strict schema.
+    pub structured_output_processor: Option<StructuredOutputProcessor>,
     draft_kv: Option<SequenceDraftKvState>,
-    /// Token frequency counts for repetition penalty.
+    /// Generated-token counts shared by repetition, presence, and frequency penalties.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
     /// exactly one token. Checked against the last generated token each step
@@ -667,40 +790,52 @@ pub struct SequenceState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SequenceKvAllocation {
     request_id: RequestId,
-    blocks: Option<usize>,
+    blocks: usize,
 }
 
 impl SequenceKvAllocation {
-    fn new(request_id: RequestId, blocks: Option<usize>) -> Self {
+    fn new(request_id: RequestId, blocks: usize) -> Self {
         Self {
             request_id,
-            blocks: blocks.map(|blocks| blocks.max(1)),
+            blocks: blocks.max(1),
         }
     }
 }
 
 #[derive(Debug, Clone)]
+enum SequenceKvRelease {
+    /// The model runtime is the only release authority. This covers vNext
+    /// plan-runtime leases and cloned prefix-cache references; neither has a
+    /// second allocation in the legacy engine KV manager.
+    RuntimeManaged,
+    /// Transitional legacy composition: release the model cache reference and
+    /// the exact engine KV-manager allocation together.
+    LegacyAllocated(SequenceKvAllocation),
+}
+
+#[derive(Debug, Clone)]
 struct SequenceModelKvState {
     cache: Arc<dyn KvCacheHandle>,
-    resource_blocks: Option<usize>,
     model_cache_id: String,
+    release: SequenceKvRelease,
 }
 
 impl SequenceModelKvState {
-    fn new(cache: Arc<dyn KvCacheHandle>, resource_blocks: Option<usize>) -> Self {
+    fn runtime_managed(cache: Arc<dyn KvCacheHandle>) -> Self {
         let model_cache_id = cache.cache_id();
-        Self::new_with_model_cache_id(cache, resource_blocks, model_cache_id)
-    }
-
-    fn new_with_model_cache_id(
-        cache: Arc<dyn KvCacheHandle>,
-        resource_blocks: Option<usize>,
-        model_cache_id: String,
-    ) -> Self {
         Self {
             cache,
-            resource_blocks: resource_blocks.map(|blocks| blocks.max(1)),
             model_cache_id,
+            release: SequenceKvRelease::RuntimeManaged,
+        }
+    }
+
+    fn legacy_allocated(cache: Arc<dyn KvCacheHandle>, allocation: SequenceKvAllocation) -> Self {
+        let model_cache_id = cache.cache_id();
+        Self {
+            cache,
+            model_cache_id,
+            release: SequenceKvRelease::LegacyAllocated(allocation),
         }
     }
 
@@ -708,19 +843,41 @@ impl SequenceModelKvState {
         self.cache.clone()
     }
 
-    fn resource_blocks(&self) -> Option<usize> {
-        self.resource_blocks
+    fn legacy_allocation(&self) -> Option<&SequenceKvAllocation> {
+        match &self.release {
+            SequenceKvRelease::RuntimeManaged => None,
+            SequenceKvRelease::LegacyAllocated(allocation) => Some(allocation),
+        }
     }
 
     fn model_cache_id(&self) -> &str {
         &self.model_cache_id
     }
 
-    fn into_physical_resources(self, request_id: RequestId) -> (SequenceKvAllocation, String) {
-        (
-            SequenceKvAllocation::new(request_id, self.resource_blocks),
-            self.model_cache_id,
-        )
+    fn validate_replacement_cache(&self, cache: &Arc<dyn KvCacheHandle>) -> Result<()> {
+        let replacement_cache_id = cache.cache_id();
+        if replacement_cache_id != self.model_cache_id() {
+            return Err(FerrumError::internal(format!(
+                "decode replaced model cache authority {} with {}",
+                self.model_cache_id(),
+                replacement_cache_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn replace_cache_handle(&mut self, cache: Arc<dyn KvCacheHandle>) -> Result<()> {
+        self.validate_replacement_cache(&cache)?;
+        self.cache = cache;
+        Ok(())
+    }
+
+    fn into_physical_resources(self) -> (Option<SequenceKvAllocation>, String) {
+        let legacy_allocation = match self.release {
+            SequenceKvRelease::RuntimeManaged => None,
+            SequenceKvRelease::LegacyAllocated(allocation) => Some(allocation),
+        };
+        (legacy_allocation, self.model_cache_id)
     }
 }
 
@@ -777,14 +934,14 @@ impl SequenceDraftKvState {
     }
 
     fn allocation(self) -> SequenceKvAllocation {
-        SequenceKvAllocation::new(self.request_id, Some(self.resource_blocks))
+        SequenceKvAllocation::new(self.request_id, self.resource_blocks)
     }
 }
 
 #[derive(Debug, Default)]
 struct SequencePhysicalResources {
-    kv_allocation: Option<SequenceKvAllocation>,
-    draft_kv_allocation: Option<SequenceKvAllocation>,
+    legacy_kv_allocation: Option<SequenceKvAllocation>,
+    legacy_draft_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
     model_cache_id: Option<String>,
 }
@@ -805,13 +962,13 @@ struct SequenceCompletionResources {
 #[derive(Debug, Default)]
 #[must_use = "unified prefill owned resources must be released or committed"]
 struct UnifiedPrefillOwnedResources {
-    kv_allocation: Option<SequenceKvAllocation>,
+    legacy_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
 }
 
 impl UnifiedPrefillOwnedResources {
-    fn with_fresh_kv(mut self, request_id: RequestId, blocks: usize) -> Self {
-        self.kv_allocation = Some(SequenceKvAllocation::new(request_id, Some(blocks)));
+    fn with_fresh_kv(mut self, allocation: SequenceKvAllocation) -> Self {
+        self.legacy_kv_allocation = Some(allocation);
         self
     }
 
@@ -821,16 +978,16 @@ impl UnifiedPrefillOwnedResources {
     }
 
     fn commit(mut self) {
-        self.kv_allocation = None;
+        self.legacy_kv_allocation = None;
         self.recurrent_state_allocation = None;
     }
 
     fn is_empty(&self) -> bool {
-        self.kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
+        self.legacy_kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
     }
 
     async fn release(mut self, engine: &EngineInner, owner_request_id: &RequestId) {
-        if let Some(kv_allocation) = self.kv_allocation.take() {
+        if let Some(kv_allocation) = self.legacy_kv_allocation.take() {
             engine
                 .release_kv_allocation(
                     owner_request_id,
@@ -870,7 +1027,7 @@ impl Drop for UnifiedPrefillOwnedResources {
         }
         let message = "unified prefill resources dropped without explicit release or commit";
         warn!(
-            kv_allocation = ?self.kv_allocation,
+            legacy_kv_allocation = ?self.legacy_kv_allocation,
             recurrent_state_allocation = ?self.recurrent_state_allocation,
             "{message}"
         );
@@ -893,7 +1050,7 @@ struct SequenceDecodeResources {
 #[derive(Debug, Clone)]
 struct SequencePrefillResources {
     kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    kv_resource_blocks: Option<usize>,
+    legacy_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     prefill_tokens_processed: usize,
 }
@@ -905,7 +1062,9 @@ impl SequencePrefillResources {
     }
 
     fn kv_resource_blocks(&self) -> Option<usize> {
-        self.kv_resource_blocks
+        self.legacy_kv_allocation
+            .as_ref()
+            .map(|allocation| allocation.blocks)
     }
 }
 
@@ -920,10 +1079,9 @@ impl SequenceState {
         Self::new_with_tokenizer(request, input_tokens, None)
     }
 
-    /// Build sequence state, optionally wiring a tokenizer for guided-decoding
-    /// processors (`ResponseFormat::Regex` needs vocab access to compile a
-    /// token-level mask). Falling back to `None` preserves the old behaviour
-    /// for call sites that don't have a tokenizer to hand (smoke tests).
+    /// Build sequence state, optionally wiring a tokenizer for constrained
+    /// decoding. Test-only direct constructors build a local grammar factory;
+    /// product entrypoints use the fallible shared-factory constructor below.
     pub fn new_with_tokenizer(
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
@@ -938,7 +1096,34 @@ impl SequenceState {
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
         model_vocab_size: Option<usize>,
     ) -> Self {
+        Self::try_new_with_tokenizer_model_vocab_and_structured_factory(
+            request,
+            input_tokens,
+            tokenizer,
+            model_vocab_size,
+            None,
+        )
+        .expect("direct SequenceState construction requires supported sampling and structured-output contracts")
+    }
+
+    pub fn try_new_with_tokenizer_model_vocab_and_structured_factory(
+        request: InferenceRequest,
+        input_tokens: Vec<TokenId>,
+        tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+        model_vocab_size: Option<usize>,
+        shared_structured_factory: Option<&StructuredOutputFactory>,
+    ) -> Result<Self> {
         use ferrum_types::ResponseFormat;
+        request.sampling_params.validate()?;
+        if request.sampling_params.tfs.is_some()
+            || request.sampling_params.typical_p.is_some()
+            || request.sampling_params.mirostat.is_some()
+        {
+            return Err(FerrumError::unsupported(
+                "tfs, typical_p, and mirostat are not supported by the token sampling plan",
+            ));
+        }
+        let sampling_plan = TokenSamplingPlan::from_params(&request.sampling_params);
         let rng = request
             .sampling_params
             .seed
@@ -947,38 +1132,25 @@ impl SequenceState {
                 let mut rng = rand::rng();
                 StdRng::from_rng(&mut rng)
             });
-        let json_processor = match &request.sampling_params.response_format {
-            ResponseFormat::JsonObject => Some(Arc::new(JsonModeProcessor::new())),
-            _ => None,
-        };
-        let regex_processor = match (&request.sampling_params.response_format, &tokenizer) {
-            (ResponseFormat::JsonSchema(schema), Some(tok)) => {
-                // OpenAI-style structured output: compile the JSON Schema
-                // to a regex then drive the DFA-guided processor with it.
-                match ferrum_sampler::schema_to_regex::schema_to_regex(schema) {
-                    Ok(pattern) => {
-                        let eos = tok.special_tokens().eos_token;
-                        match ferrum_sampler::guided::RegexGuidedProcessor::new(
-                            &pattern,
-                            tok.clone(),
-                            eos,
-                        ) {
-                            Ok(p) => Some(Arc::new(p)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "json_schema guided decode disabled (regex build): {e}"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "json_schema guided decode disabled (schema translation): {e}"
-                        );
-                        None
-                    }
-                }
+        let needs_structured_output = !matches!(
+            request.sampling_params.response_format,
+            ResponseFormat::Text
+        );
+        let local_structured_factory = match (
+            needs_structured_output,
+            shared_structured_factory,
+            tokenizer.as_ref(),
+        ) {
+            (true, None, Some(tokenizer)) => {
+                Some(StructuredOutputFactory::new_with_model_vocab_size(
+                    Arc::clone(tokenizer),
+                    model_vocab_size,
+                )?)
+            }
+            (true, None, None) => {
+                return Err(FerrumError::config(
+                    "structured output requires a tokenizer-aware grammar factory",
+                ));
             }
             _ => None,
         };
@@ -989,8 +1161,30 @@ impl SequenceState {
             .unwrap_or(false);
         let (stop_token_ids, stop_text_seqs) =
             resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
+        let structured_output_processor = shared_structured_factory
+            .or(local_structured_factory.as_ref())
+            .map(|factory| {
+                factory.create_processor(
+                    &request.sampling_params.response_format,
+                    &request.sampling_params.structured_output_start,
+                    request.sampling_params.max_tokens,
+                    &stop_token_ids,
+                    &stop_text_seqs,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let request_generated_control_token_texts = request
+            .api_request
+            .as_ref()
+            .map(ferrum_types::ApiRequest::generated_control_token_texts)
+            .unwrap_or_default();
         let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
-            resolve_sampling_token_constraints(tokenizer.as_deref(), &stop_token_ids);
+            resolve_sampling_token_constraints(
+                tokenizer.as_deref(),
+                &stop_token_ids,
+                request_generated_control_token_texts,
+            );
         let mut initial_forbidden_token_ids = HashSet::new();
         let initial_forbidden_token_texts = request
             .metadata
@@ -1028,7 +1222,7 @@ impl SequenceState {
                 )
             })
         };
-        Self {
+        Ok(Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
             input_tokens,
@@ -1036,6 +1230,7 @@ impl SequenceState {
             model_kv: None,
             recurrent_state: None,
             sampling_params: request.sampling_params,
+            sampling_plan,
             phase: RequestPhase::Waiting,
             rng,
             prefill_complete: false,
@@ -1049,8 +1244,7 @@ impl SequenceState {
             emitted_chunks: 0,
             tokens_this_iteration: 0,
             preemption_count: 0,
-            json_processor,
-            regex_processor,
+            structured_output_processor,
             draft_kv: None,
             token_frequencies: HashMap::new(),
             stop_token_ids,
@@ -1062,11 +1256,16 @@ impl SequenceState {
             argmax_token_mask,
             initial_argmax_token_mask,
             streamed_text_len: 0,
-        }
+        })
     }
 
     pub fn total_tokens(&self) -> usize {
         self.input_tokens.len() + self.generated_tokens.len()
+    }
+
+    /// Original immutable sampling parameters used to prepare this request.
+    pub fn sampling_params(&self) -> &SamplingParams {
+        &self.sampling_params
     }
 
     pub fn prefill_context_tokens(&self) -> Vec<TokenId> {
@@ -1104,20 +1303,27 @@ impl SequenceState {
         metadata
     }
 
+    fn model_maximum_sequence_tokens(&self) -> usize {
+        self.prefill_context_len().max(
+            self.input_tokens
+                .len()
+                .saturating_add(self.sampling_params.max_tokens.saturating_sub(1)),
+        )
+    }
+
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
-        let (kv_allocation, model_cache_id) = self
+        let (legacy_kv_allocation, model_cache_id) = self
             .model_kv
             .take()
             .map(|state| {
-                let (kv_allocation, model_cache_id) =
-                    state.into_physical_resources(self.request_id.clone());
-                (Some(kv_allocation), Some(model_cache_id))
+                let (legacy_kv_allocation, model_cache_id) = state.into_physical_resources();
+                (legacy_kv_allocation, Some(model_cache_id))
             })
             .unwrap_or((None, None));
-        let draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
+        let legacy_draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
         let resources = SequencePhysicalResources {
-            kv_allocation,
-            draft_kv_allocation,
+            legacy_kv_allocation,
+            legacy_draft_kv_allocation,
             recurrent_state_allocation: self
                 .recurrent_state
                 .take()
@@ -1161,26 +1367,26 @@ impl SequenceState {
         }
     }
 
-    fn install_model_kv(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        kv_resource_blocks: Option<usize>,
-    ) -> ModelCacheRefUpdate {
-        let model_cache_id = kv_cache.cache_id();
+    fn install_model_kv_state(&mut self, state: SequenceModelKvState) -> ModelCacheRefUpdate {
+        let model_cache_id = state.model_cache_id().to_string();
         let model_cache_update = self.model_cache_ref_update_for(&model_cache_id);
-        self.model_kv = Some(SequenceModelKvState::new_with_model_cache_id(
-            kv_cache,
-            kv_resource_blocks,
-            model_cache_id,
-        ));
+        self.model_kv = Some(state);
         model_cache_update
     }
 
-    fn install_model_kv_without_owned_blocks(
+    fn install_runtime_managed_model_kv(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
     ) -> ModelCacheRefUpdate {
-        self.install_model_kv(kv_cache, None)
+        self.install_model_kv_state(SequenceModelKvState::runtime_managed(kv_cache))
+    }
+
+    fn install_legacy_allocated_model_kv(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        allocation: SequenceKvAllocation,
+    ) -> ModelCacheRefUpdate {
+        self.install_model_kv_state(SequenceModelKvState::legacy_allocated(kv_cache, allocation))
     }
 
     fn commit_cached_prefill_physical_resources(
@@ -1188,7 +1394,7 @@ impl SequenceState {
         kv_cache: Arc<dyn KvCacheHandle>,
         prefill_tokens_processed: usize,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv_without_owned_blocks(kv_cache);
+        let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
         self.prefill_tokens_processed = prefill_tokens_processed;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
@@ -1202,7 +1408,8 @@ impl SequenceState {
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         recurrent_state_slots: Option<usize>,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv(kv_cache, Some(kv_resource_blocks));
+        let allocation = SequenceKvAllocation::new(self.request_id.clone(), kv_resource_blocks);
+        let model_cache_update = self.install_legacy_allocated_model_kv(kv_cache, allocation);
         self.recurrent_state =
             recurrent_state.map(|state| SequenceRecurrentState::new(state, recurrent_state_slots));
         self.prefill_complete = true;
@@ -1210,15 +1417,34 @@ impl SequenceState {
         model_cache_update
     }
 
+    fn commit_plan_runtime_prefill_chunk_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        prefill_tokens_processed: usize,
+        is_final_chunk: bool,
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
+        self.recurrent_state = None;
+        self.prefill_tokens_processed = prefill_tokens_processed;
+        self.prefill_complete = is_final_chunk;
+        self.phase = if is_final_chunk {
+            RequestPhase::Decoding
+        } else {
+            RequestPhase::Prefilling
+        };
+        model_cache_update
+    }
+
     fn commit_prefill_chunk_physical_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
-        kv_resource_blocks: Option<usize>,
+        legacy_kv_allocation: SequenceKvAllocation,
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         prefill_tokens_processed: usize,
         is_final_chunk: bool,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv(kv_cache, kv_resource_blocks);
+        let model_cache_update =
+            self.install_legacy_allocated_model_kv(kv_cache, legacy_kv_allocation);
         let existing_slots = self.recurrent_state.as_ref().and_then(|state| state.slots);
         self.recurrent_state =
             recurrent_state.map(|state| SequenceRecurrentState::new(state, existing_slots));
@@ -1276,10 +1502,11 @@ impl SequenceState {
     fn prefill_resources(&self) -> SequencePrefillResources {
         SequencePrefillResources {
             kv_cache: self.model_kv.as_ref().map(SequenceModelKvState::handle),
-            kv_resource_blocks: self
+            legacy_kv_allocation: self
                 .model_kv
                 .as_ref()
-                .and_then(SequenceModelKvState::resource_blocks),
+                .and_then(SequenceModelKvState::legacy_allocation)
+                .cloned(),
             recurrent_state: self
                 .recurrent_state
                 .as_ref()
@@ -1309,7 +1536,8 @@ impl SequenceState {
     fn kv_resource_blocks(&self) -> Option<usize> {
         self.model_kv
             .as_ref()
-            .and_then(SequenceModelKvState::resource_blocks)
+            .and_then(SequenceModelKvState::legacy_allocation)
+            .map(|allocation| allocation.blocks)
     }
 
     fn model_cache_id(&self) -> Option<&str> {
@@ -1323,10 +1551,18 @@ impl SequenceState {
         self.model_kv = None;
     }
 
-    fn commit_decode_step_physical_resources(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
-        let existing_blocks = self.kv_resource_blocks();
-        self.model_kv = Some(SequenceModelKvState::new(kv_cache, existing_blocks));
+    fn commit_decode_step_physical_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> Result<()> {
+        self.model_kv
+            .as_mut()
+            .ok_or_else(|| {
+                FerrumError::internal("decode completed without an active model KV lease")
+            })?
+            .replace_cache_handle(kv_cache)?;
         self.tokens_this_iteration += 1;
+        Ok(())
     }
 
     fn commit_decode_recurrent_state(
@@ -1354,19 +1590,38 @@ impl SequenceState {
         &mut self,
         target_kv_cache: Arc<dyn KvCacheHandle>,
         draft_kv_cache: Arc<dyn KvCacheHandle>,
-    ) {
-        let existing_blocks = self.kv_resource_blocks();
-        self.model_kv = Some(SequenceModelKvState::new(target_kv_cache, existing_blocks));
-        if let Some(draft) = &mut self.draft_kv {
-            draft.cache = draft_kv_cache;
-        } else {
-            let message = "draft KV cache updated without owned allocation metadata";
-            warn!(request_id = %self.request_id, "{message}");
-            #[cfg(test)]
-            if !std::thread::panicking() {
-                panic!("{message}");
+    ) -> Result<()> {
+        self.model_kv
+            .as_ref()
+            .ok_or_else(|| {
+                FerrumError::internal(
+                    "speculative decode completed without an active target KV lease",
+                )
+            })?
+            .validate_replacement_cache(&target_kv_cache)?;
+        if let Some(draft) = &self.draft_kv {
+            let replacement_cache_id = draft_kv_cache.cache_id();
+            if replacement_cache_id != draft.cache.cache_id() {
+                return Err(FerrumError::internal(format!(
+                    "speculative decode replaced draft cache authority {} with {}",
+                    draft.cache.cache_id(),
+                    replacement_cache_id
+                )));
             }
+        } else {
+            return Err(FerrumError::internal(
+                "draft KV cache updated without owned allocation metadata",
+            ));
         }
+        self.model_kv
+            .as_mut()
+            .expect("validated target KV lease remains installed")
+            .replace_cache_handle(target_kv_cache)?;
+        self.draft_kv
+            .as_mut()
+            .expect("validated draft KV lease remains installed")
+            .cache = draft_kv_cache;
+        Ok(())
     }
 
     fn commit_draft_kv_allocation(
@@ -1412,9 +1667,17 @@ impl SequenceState {
             && params.tfs.is_none()
             && params.typical_p.is_none()
             && params.mirostat.is_none()
-            && self.json_processor.is_none()
-            && self.regex_processor.is_none()
+            && self.structured_output_processor.is_none()
             && matches!(params.response_format, ResponseFormat::Text)
+    }
+
+    fn supports_raw_speculative_decode(&self) -> bool {
+        self.structured_output_processor.is_none()
+            && self.sampling_plan.supports_raw_greedy_speculation()
+            && self
+                .argmax_token_mask
+                .as_ref()
+                .is_none_or(|mask| mask.valid_token_mask.iter().all(|&value| value != 0))
     }
 
     fn model_decode_repetition_penalty(&self) -> Option<GreedyRepetitionPenalty> {
@@ -1422,13 +1685,11 @@ impl SequenceState {
         if penalty == 1.0 || self.generated_tokens.is_empty() {
             return None;
         }
-        let mut seen = HashSet::new();
-        let mut token_ids = Vec::new();
-        for token in &self.generated_tokens {
-            if seen.insert(token.get()) {
-                token_ids.push(token.get());
-            }
-        }
+        let token_ids: Vec<u32> = self
+            .generated_tokens
+            .iter()
+            .map(|token| token.get())
+            .collect();
         if token_ids.is_empty() {
             None
         } else {
@@ -1477,6 +1738,7 @@ impl SequenceState {
             tokenizer,
             self.streamed_text_len,
             token,
+            None,
         ) {
             return Err(FerrumError::model(format!(
                 "model greedy argmax token decoded to forbidden output ({})",
@@ -1543,12 +1805,15 @@ impl SequenceState {
     pub fn requires_engine_full_logits_for_sampling(&self) -> bool {
         use ferrum_types::ResponseFormat;
 
-        self.json_processor.is_some()
-            || self.regex_processor.is_some()
+        self.structured_output_processor.is_some()
             || matches!(
                 self.sampling_params.response_format,
                 ResponseFormat::JsonSchema(_)
             )
+    }
+
+    pub fn has_structured_output_constraint(&self) -> bool {
+        self.structured_output_processor.is_some()
     }
 
     pub fn requires_full_logits_for_sampling(&self) -> bool {
@@ -1558,11 +1823,8 @@ impl SequenceState {
     }
 
     pub fn reset_guided_processors(&self) -> Result<()> {
-        if let Some(ref jp) = self.json_processor {
-            jp.reset();
-        }
-        if let Some(ref rp) = self.regex_processor {
-            rp.reset()?;
+        if let Some(processor) = &self.structured_output_processor {
+            processor.reset()?;
         }
         Ok(())
     }
@@ -1609,7 +1871,7 @@ impl SequenceState {
     }
 
     /// Sample next token with full processor chain (temperature, top-k/p,
-    /// repetition penalty, JSON mode, regex-guided mask).
+    /// repetition penalty and tokenizer-aware structured-output mask).
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
         self.sample_with_processors_with_tokenizer(logits, None)
     }
@@ -1619,55 +1881,38 @@ impl SequenceState {
         logits: &mut [f32],
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     ) -> Result<TokenId> {
-        use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
+        use ferrum_interfaces::sampler::SamplingContext;
 
-        // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
-        // tokens to -inf). Subsequent temperature / top-k / top-p stay
-        // correct because -inf tokens can't make it through any softmax.
-        if let Some(ref rp) = self.regex_processor {
-            let best_non_control =
-                best_finite_excluding_tokens(logits, &self.allowed_extended_token_ids);
-            rp.advance_with_tokens_public(&self.generated_tokens);
-            rp.mask_logits(logits);
-            mask_non_stop_control_token_logits(
+        // The grammar mask runs first. There is deliberately no invalid-token
+        // fallback: a dead grammar state is a request error, not permission to
+        // return malformed JSON.
+        let mut required_structured_delimiter_token_id = None;
+        if let Some(processor) = &self.structured_output_processor {
+            let constraint = processor.mask_logits_with_terminals(
                 logits,
-                &self.allowed_extended_token_ids,
+                &self.generated_tokens,
                 &self.stop_token_ids,
-            );
-            if !rp.can_accept() {
+                &self.allowed_extended_token_ids,
+            )?;
+            required_structured_delimiter_token_id = constraint.required_delimiter_token_id;
+            if !constraint.accepting {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
-                if !logits.iter().any(|logit| logit.is_finite()) {
-                    if let Some(token) = best_non_control {
-                        force_only_token(logits, token);
-                    }
-                }
             }
         }
 
-        // Apply JSON mode biases before the standard processor chain
-        if let Some(ref jp) = self.json_processor {
-            let generated: String = self
-                .generated_tokens
-                .iter()
-                .filter_map(|t| {
-                    let v = t.get();
-                    if v < 128 {
-                        Some(v as u8 as char)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            jp.apply_biases(logits, &generated);
-        }
-
         for &token_id in &self.forbidden_token_ids {
+            if required_structured_delimiter_token_id == Some(token_id) {
+                continue;
+            }
             if let Some(logit) = logits.get_mut(token_id as usize) {
                 *logit = f32::NEG_INFINITY;
             }
         }
         if self.generated_tokens.is_empty() {
             for &token_id in &self.initial_forbidden_token_ids {
+                if required_structured_delimiter_token_id == Some(token_id) {
+                    continue;
+                }
                 if let Some(logit) = logits.get_mut(token_id as usize) {
                     *logit = f32::NEG_INFINITY;
                 }
@@ -1676,15 +1921,15 @@ impl SequenceState {
         if let Some(base_vocab_size) = self.tokenizer_base_vocab_size {
             if logits.len() > base_vocab_size {
                 for (token_id, logit) in logits.iter_mut().enumerate().skip(base_vocab_size) {
-                    if !self.allowed_extended_token_ids.contains(&(token_id as u32)) {
+                    if required_structured_delimiter_token_id != Some(token_id as u32)
+                        && !self.allowed_extended_token_ids.contains(&(token_id as u32))
+                    {
                         *logit = f32::NEG_INFINITY;
                     }
                 }
             }
         }
 
-        // Build SamplingConfig from this request's params (includes temperature, top-k/p, repetition penalty)
-        let config = SamplingConfig::from_params(&self.sampling_params);
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
         let previous_streamed_text_len = self.streamed_text_len;
@@ -1697,15 +1942,27 @@ impl SequenceState {
                 &self.token_frequencies,
                 vocab_size,
             );
-            config.processor_chain.process(&mut ctx)?;
+            self.sampling_plan.processor_chain.process(&mut ctx)?;
+            if !ctx.logits.iter().any(|logit| logit.is_finite()) {
+                let message = if self.structured_output_processor.is_some() {
+                    "structured-output constraints and engine sampling policies have no finite token"
+                } else {
+                    "engine sampling policies have no finite token"
+                };
+                return Err(FerrumError::model(message));
+            }
             let mut attempts = 0usize;
             let mut rejected_tokens = Vec::new();
             loop {
-                let token = config.sampler.sample_with_context(&ctx, &mut self.rng)?;
+                let token = self
+                    .sampling_plan
+                    .sampler
+                    .sample_with_context(&ctx, &mut self.rng)?;
                 if !self.sample_candidate_decodes_to_forbidden_output(
                     tokenizer,
                     previous_streamed_text_len,
                     token,
+                    required_structured_delimiter_token_id,
                 ) {
                     break token;
                 }
@@ -1740,7 +1997,11 @@ impl SequenceState {
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         previous_streamed_text_len: usize,
         token: TokenId,
+        required_structured_delimiter_token_id: Option<u32>,
     ) -> bool {
+        if required_structured_delimiter_token_id == Some(token.get()) {
+            return false;
+        }
         let Some(tokenizer) = tokenizer else {
             return false;
         };
@@ -1835,39 +2096,6 @@ fn mask_stop_token_logits(logits: &mut [f32], stop_token_ids: &HashSet<u32>) {
         if let Some(logit) = logits.get_mut(token_id as usize) {
             *logit = f32::NEG_INFINITY;
         }
-    }
-}
-
-fn mask_non_stop_control_token_logits(
-    logits: &mut [f32],
-    control_token_ids: &HashSet<u32>,
-    stop_token_ids: &HashSet<u32>,
-) {
-    for &token_id in control_token_ids {
-        if stop_token_ids.contains(&token_id) {
-            continue;
-        }
-        if let Some(logit) = logits.get_mut(token_id as usize) {
-            *logit = f32::NEG_INFINITY;
-        }
-    }
-}
-
-fn best_finite_excluding_tokens(
-    logits: &[f32],
-    excluded_token_ids: &HashSet<u32>,
-) -> Option<usize> {
-    logits
-        .iter()
-        .enumerate()
-        .filter(|(idx, logit)| logit.is_finite() && !excluded_token_ids.contains(&(*idx as u32)))
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(idx, _)| idx)
-}
-
-fn force_only_token(logits: &mut [f32], token: usize) {
-    for (idx, logit) in logits.iter_mut().enumerate() {
-        *logit = if idx == token { 0.0 } else { f32::NEG_INFINITY };
     }
 }
 
@@ -1970,7 +2198,7 @@ impl KvAllocationLease {
             .release_kv_allocation(
                 &self.owner_request_id,
                 self.allocation_request_id.clone(),
-                Some(self.blocks),
+                self.blocks,
             )
             .await;
         self.armed = false;
@@ -2212,15 +2440,57 @@ impl PendingBatchPrefill {
     }
 }
 
+enum EngineIterationOutcome {
+    Progressed,
+    Idle,
+    CapacityBlocked(ExecutorCapacityWaitRegistration),
+}
+
+enum EngineResourceComposition {
+    LegacyEngine {
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+    },
+    PlanRuntime,
+}
+
+impl EngineResourceComposition {
+    const fn authority(&self) -> ExecutionResourceAuthority {
+        match self {
+            Self::LegacyEngine { .. } => ExecutionResourceAuthority::LegacyEngine,
+            Self::PlanRuntime => ExecutionResourceAuthority::PlanRuntime,
+        }
+    }
+
+    fn kv_cache(&self) -> Option<&Arc<dyn KvCacheManager + Send + Sync>> {
+        match self {
+            Self::LegacyEngine { kv_cache, .. } => Some(kv_cache),
+            Self::PlanRuntime => None,
+        }
+    }
+
+    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
+        match self {
+            Self::LegacyEngine {
+                recurrent_state_manager,
+                ..
+            } => recurrent_state_manager.as_ref(),
+            Self::PlanRuntime => None,
+        }
+    }
+}
+
 struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    /// Lazily built once because most requests are plain text. Structured
+    /// requests reuse its tokenizer trie and compiled grammar templates.
+    structured_output_factory: OnceLock<std::result::Result<Arc<StructuredOutputFactory>, String>>,
     #[allow(dead_code)]
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
-    kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-    recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+    resource_composition: EngineResourceComposition,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     /// Optional draft executor for speculative decoding. When set alongside
     /// `spec_config`, `run_single_decode` routes through `SpeculativeRunner`.
@@ -2231,18 +2501,22 @@ struct EngineInner {
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
     is_running: AtomicBool,
     shutdown_notify: Arc<Notify>,
-    /// Ensures only one iteration step runs at a time.
+    /// Serializes request publication with cancellation and BatchPlan
+    /// construction. Device execution deliberately runs after this guard is
+    /// released so new user requests can enter while a wave is in flight.
     iteration_lock: tokio::sync::Mutex<()>,
     /// Wakes callers or a background loop when new work is submitted.
-    work_notify: Notify,
+    work_notify: Arc<Notify>,
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
-    scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
-    legacy_scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
+    profile_trace_jsonl: Option<SchedulerTraceJournal>,
+    scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
+    legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
+    dynamic_admission_availability: Mutex<Vec<CapacityAvailabilityEpoch>>,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -2260,9 +2534,97 @@ struct EngineInner {
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
+    shutdown_started: AtomicBool,
+    shutdown_lock: tokio::sync::Mutex<()>,
+    background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+struct ClientReceiverDropWake {
+    work_notify: Arc<Notify>,
+    armed: bool,
 }
 
 impl EngineInner {
+    fn signal_shutdown(&self) {
+        self.shutdown_started.store(true, Ordering::Release);
+        self.is_running.store(false, Ordering::SeqCst);
+
+        // The background loop can be between its state check and registering
+        // the async wait. `notify_one` retains a permit across that window;
+        // `notify_waiters` would lose the shutdown signal when no waiter is
+        // registered yet.
+        self.shutdown_notify.notify_one();
+        self.work_notify.notify_one();
+    }
+
+    fn structured_output_factory(&self) -> Result<Arc<StructuredOutputFactory>> {
+        match self.structured_output_factory.get_or_init(|| {
+            StructuredOutputFactory::new_with_model_vocab_size(
+                Arc::clone(&self.tokenizer),
+                Some(self.model_executor.info().vocab_size),
+            )
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+        }) {
+            Ok(factory) => Ok(Arc::clone(factory)),
+            Err(message) => Err(FerrumError::config(format!(
+                "structured-output runtime unavailable: {message}"
+            ))),
+        }
+    }
+}
+
+impl ClientReceiverDropWake {
+    fn new(work_notify: Arc<Notify>) -> Self {
+        Self {
+            work_notify,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClientReceiverDropWake {
+    fn drop(&mut self) {
+        if self.armed {
+            self.work_notify.notify_one();
+        }
+    }
+}
+
+struct CancellationAwareResponseStream {
+    receiver: tokio_stream::wrappers::ReceiverStream<Result<StreamChunk>>,
+    receiver_drop_wake: ClientReceiverDropWake,
+}
+
+impl Stream for CancellationAwareResponseStream {
+    type Item = Result<StreamChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = Pin::new(&mut self.receiver).poll_next(cx);
+        if matches!(&result, Poll::Ready(None)) {
+            self.receiver_drop_wake.disarm();
+        }
+        result
+    }
+}
+
+impl EngineInner {
+    fn engine_managed_kv_cache(&self) -> Result<&Arc<dyn KvCacheManager + Send + Sync>> {
+        self.resource_composition.kv_cache().ok_or_else(|| {
+            FerrumError::internal(
+                "plan runtime attempted to use the legacy engine KV-cache manager",
+            )
+        })
+    }
+
+    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
+        self.resource_composition.recurrent_state_manager()
+    }
+
     fn record_iteration_lock_wait(&self, duration: Duration) {
         self.total_iteration_lock_wait_us
             .fetch_add(duration_to_us(duration), Ordering::Relaxed);
@@ -2287,6 +2649,27 @@ impl EngineInner {
         self.runtime_config
             .profile_entrypoint
             .unwrap_or(ProfileEntrypoint::Synthetic)
+    }
+
+    fn extend_scheduler_timeline_attributes(
+        &self,
+        attributes: &mut BTreeMap<String, serde_json::Value>,
+    ) {
+        let snapshot = self.scheduler.trace_snapshot();
+        attributes.extend([
+            (
+                "active_sequence_count".to_string(),
+                serde_json::json!(snapshot.active_len),
+            ),
+            (
+                "monotonic_nanos".to_string(),
+                serde_json::json!(inner::scheduler_trace_monotonic_nanos()),
+            ),
+            (
+                "scheduler_snapshot".to_string(),
+                serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null),
+            ),
+        ]);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2327,9 +2710,15 @@ impl EngineInner {
                 "backend_type".to_string(),
                 serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
             ),
-            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            (
+                "diagnostic_only".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.diagnostic_only()),
+            ),
             ("l0_only".to_string(), serde_json::json!(false)),
-            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.as_str()),
+            ),
             (
                 "resource_trace_source".to_string(),
                 serde_json::json!("engine"),
@@ -2352,12 +2741,14 @@ impl EngineInner {
                 serde_json::json!(underflow_amount),
             );
         }
-        if matches!(action, ResourceAction::Defer) {
-            attributes.insert(
-                "scheduler_snapshot".to_string(),
-                serde_json::to_value(self.scheduler.trace_snapshot())
-                    .unwrap_or(serde_json::Value::Null),
-            );
+        if matches!(
+            action,
+            ResourceAction::RequestOpen
+                | ResourceAction::RequestClose
+                | ResourceAction::Defer
+                | ResourceAction::Reject
+        ) {
+            self.extend_scheduler_timeline_attributes(&mut attributes);
         }
         let timestamp = chrono::Utc::now();
         let mut shape =
@@ -2417,18 +2808,8 @@ impl EngineInner {
             warn!("Skipping invalid engine resource trace event: {}", error);
             return;
         }
-        let mut line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!("Failed to serialize engine resource trace event: {}", error);
-                return;
-            }
-        };
-        line.push('\n');
-        let mut file = sink.lock();
-        if let Err(error) = file.write_all(line.as_bytes()) {
-            warn!("Failed to write engine resource trace event: {}", error);
-            return;
+        if let Err(error) = sink.enqueue(event) {
+            warn!("Failed to enqueue engine resource trace event: {}", error);
         }
     }
 
@@ -2491,9 +2872,15 @@ impl EngineInner {
                 "backend_type".to_string(),
                 serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
             ),
-            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            (
+                "diagnostic_only".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.diagnostic_only()),
+            ),
             ("l0_only".to_string(), serde_json::json!(false)),
-            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.config.runtime.profile_detail.as_str()),
+            ),
             (
                 "resource_owner_close_summary".to_string(),
                 serde_json::Value::Array(close_summary_json),
@@ -2517,6 +2904,7 @@ impl EngineInner {
                 serde_json::json!(message),
             );
         }
+        self.extend_scheduler_timeline_attributes(&mut attributes);
         let timestamp = chrono::Utc::now();
         let error = message.as_ref().map(|message| ProfileError {
             kind: "resource_owner_close_outstanding".to_string(),
@@ -2584,21 +2972,9 @@ impl EngineInner {
             );
             return;
         }
-        let mut line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!(
-                    "Failed to serialize engine resource close trace event: {}",
-                    error
-                );
-                return;
-            }
-        };
-        line.push('\n');
-        let mut file = sink.lock();
-        if let Err(error) = file.write_all(line.as_bytes()) {
+        if let Err(error) = sink.enqueue(event) {
             warn!(
-                "Failed to write engine resource close trace event: {}",
+                "Failed to enqueue engine resource close trace event: {}",
                 error
             );
         }
@@ -2909,7 +3285,7 @@ impl EngineInner {
         tokens: usize,
     ) -> Result<KvAllocationLease> {
         debug_assert_eq!(allocation_request_id, request.request_id);
-        let handle = self.kv_cache.allocate(request).await?;
+        let handle = self.engine_managed_kv_cache()?.allocate(request).await?;
         let blocks = self.kv_resource_blocks_for_tokens(tokens);
         self.trace_kv_allocate(owner_request_id, blocks);
         Ok(KvAllocationLease::new(
@@ -3024,17 +3400,23 @@ impl EngineInner {
         &self,
         owner_request_id: &RequestId,
         allocation_request_id: RequestId,
-        blocks: Option<usize>,
+        blocks: usize,
     ) {
-        match self
-            .kv_cache
-            .deallocate(allocation_request_id.clone())
-            .await
-        {
+        let kv_cache = match self.engine_managed_kv_cache() {
+            Ok(kv_cache) => kv_cache,
+            Err(error) => {
+                warn!(
+                    owner_request_id = %owner_request_id,
+                    allocation_request_id = %allocation_request_id,
+                    error = %error,
+                    "Legacy engine KV allocation reached a plan-runtime composition"
+                );
+                return;
+            }
+        };
+        match kv_cache.deallocate(allocation_request_id.clone()).await {
             Ok(()) => {
-                if let Some(blocks) = blocks {
-                    self.trace_kv_release(owner_request_id, blocks);
-                }
+                self.trace_kv_release(owner_request_id, blocks);
             }
             Err(error) => {
                 warn!(
@@ -3043,15 +3425,13 @@ impl EngineInner {
                     error = %error,
                     "KV allocation release failed"
                 );
-                if blocks.is_some() {
-                    self.trace_resource_release_failure(
-                        owner_request_id,
-                        "kv_block",
-                        "engine_kv_block_release_failed",
-                        Some(self.config.kv_cache.max_blocks),
-                        format!("kv release failed for {allocation_request_id}: {error}"),
-                    );
-                }
+                self.trace_resource_release_failure(
+                    owner_request_id,
+                    "kv_block",
+                    "engine_kv_block_release_failed",
+                    Some(self.config.kv_cache.max_blocks),
+                    format!("kv release failed for {allocation_request_id}: {error}"),
+                );
             }
         }
     }
@@ -3064,11 +3444,11 @@ impl EngineInner {
         if let Some(cache_id) = resources.model_cache_id {
             self.release_model_cache_ref(request_id, &cache_id);
         }
-        if let Some(kv_allocation) = resources.kv_allocation {
+        if let Some(kv_allocation) = resources.legacy_kv_allocation {
             self.release_kv_allocation(request_id, kv_allocation.request_id, kv_allocation.blocks)
                 .await;
         }
-        if let Some(draft_kv_allocation) = resources.draft_kv_allocation {
+        if let Some(draft_kv_allocation) = resources.legacy_draft_kv_allocation {
             self.release_kv_allocation(
                 request_id,
                 draft_kv_allocation.request_id,
@@ -3080,6 +3460,37 @@ impl EngineInner {
             self.release_recurrent_allocation(request_id, recurrent_allocation.slots)
                 .await;
         }
+    }
+
+    async fn complete_sequence_physical_resources(
+        &self,
+        request_id: &RequestId,
+        mut resources: SequencePhysicalResources,
+        usage: &TokenUsage,
+    ) -> Result<()> {
+        let completion_result = if let Some(cache_id) = resources.model_cache_id.take() {
+            let completion = ExecutorSequenceCompletion::new(
+                request_id.clone(),
+                cache_id.clone(),
+                usage.prompt_tokens,
+                usage.completion_tokens,
+            );
+            let result = match completion {
+                Ok(completion) => self.model_executor.complete_cache(completion),
+                Err(error) => {
+                    self.model_executor.release_cache(&cache_id);
+                    Err(error)
+                }
+            };
+            self.trace_model_cache_ref_release(request_id);
+            result
+        } else {
+            Ok(())
+        };
+
+        self.release_sequence_physical_resources(request_id, resources)
+            .await;
+        completion_result
     }
 
     fn trace_recurrent_allocate(
@@ -3117,7 +3528,7 @@ impl EngineInner {
     }
 
     async fn release_recurrent_allocation(&self, request_id: &RequestId, slots: Option<usize>) {
-        if let Some(manager) = &self.recurrent_state_manager {
+        if let Some(manager) = self.recurrent_state_manager() {
             let capacity = manager.stats().total_batch_slots;
             match manager.deallocate(request_id.clone()).await {
                 Ok(()) => {
@@ -3164,7 +3575,7 @@ impl EngineInner {
         };
 
         debug_assert_eq!(&spec.request_id, request_id);
-        let Some(manager) = &self.recurrent_state_manager else {
+        let Some(manager) = self.recurrent_state_manager() else {
             return Err(FerrumError::config(format!(
                 "model '{}' requires recurrent state for request {}, but no recurrent-state manager is configured",
                 self.model_executor.info().model_id, request_id
@@ -3268,13 +3679,1307 @@ fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
     }
 }
 
-fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::File>> {
+fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
+    match kind {
+        VNextExecutionEventKind::RequestAccepted => "request_accepted",
+        VNextExecutionEventKind::PlanBuilt => "plan_built",
+        VNextExecutionEventKind::FrameStarted => "frame_started",
+        VNextExecutionEventKind::NodeStarted => "node_started",
+        VNextExecutionEventKind::OperationSubmitted => "operation_submitted",
+        VNextExecutionEventKind::NodeRetired => "node_retired",
+        VNextExecutionEventKind::FrameCompleted => "frame_completed",
+        VNextExecutionEventKind::FailureObserved => "failure_observed",
+        VNextExecutionEventKind::SequenceCompleted => "sequence_completed",
+        VNextExecutionEventKind::SequenceAborted => "sequence_aborted",
+        VNextExecutionEventKind::RequestCompleted => "request_completed",
+        VNextExecutionEventKind::RequestFailed => "request_failed",
+    }
+}
+
+struct VNextProfileEventContext {
+    entrypoint: ProfileEntrypoint,
+    model: String,
+    backend_device: String,
+    backend_type: String,
+    profile_detail: ObservabilityProfileDetail,
+    capture_policy: ExecutionEventCapturePolicy,
+}
+
+#[derive(Clone)]
+struct DeferredVNextProfileEvent {
+    event: ExecutionEvent,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    context: Arc<VNextProfileEventContext>,
+}
+
+enum SchedulerTraceRecord {
+    Profile(FerrumProfileEvent),
+    DeferredVNext(DeferredVNextProfileEvent),
+}
+
+impl serde::Serialize for SchedulerTraceRecord {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Profile(event) => serde::Serialize::serialize(event, serializer),
+            Self::DeferredVNext(record) => {
+                let event = record
+                    .context
+                    .profile_event(&record.event, record.timestamp.to_owned())
+                    .map_err(serde::ser::Error::custom)?;
+                serde::Serialize::serialize(&event, serializer)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SchedulerTraceJournal {
+    inner: JsonlJournal<SchedulerTraceRecord>,
+}
+
+impl SchedulerTraceJournal {
+    fn create(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        JsonlJournal::create(path).map(|inner| Self { inner })
+    }
+
+    fn enqueue(&self, event: FerrumProfileEvent) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.enqueue(SchedulerTraceRecord::Profile(event))
+    }
+
+    fn enqueue_batch(
+        &self,
+        events: Vec<FerrumProfileEvent>,
+    ) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.enqueue_batch(
+            events
+                .into_iter()
+                .map(SchedulerTraceRecord::Profile)
+                .collect(),
+        )
+    }
+
+    fn enqueue_deferred_vnext(
+        &self,
+        event: DeferredVNextProfileEvent,
+    ) -> std::result::Result<(), JsonlJournalError> {
+        self.inner
+            .enqueue(SchedulerTraceRecord::DeferredVNext(event))
+    }
+
+    fn enqueue_deferred_vnext_batch(
+        &self,
+        events: Vec<DeferredVNextProfileEvent>,
+    ) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.enqueue_batch(
+            events
+                .into_iter()
+                .map(SchedulerTraceRecord::DeferredVNext)
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    fn flush(&self) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.flush()
+    }
+
+    fn close(&self) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.close()
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+}
+
+struct VNextProfileExecutionEventSink {
+    journals: Box<[SchedulerTraceJournal]>,
+    context: Arc<VNextProfileEventContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceCommandTimingUnavailable {
+    Backend(DeviceTimingUnavailableReason),
+    MissingSpan,
+}
+
+impl DeviceCommandTimingUnavailable {
+    fn label(self) -> String {
+        match self {
+            Self::Backend(reason) => format!("{reason:?}").to_ascii_lowercase(),
+            Self::MissingSpan => "missing_span".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeviceCommandTimingProjection<'a> {
+    physical_span: Option<&'a DeviceSubmissionExecutionSpan>,
+    command_measurement: Option<&'a DeviceExecutionSpanMeasurement>,
+    status: &'static str,
+    unavailable: Option<DeviceCommandTimingUnavailable>,
+}
+
+fn project_device_command_timing<'a>(
+    terminal_timing: &'a DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    command_index: u32,
+) -> DeviceCommandTimingProjection<'a> {
+    match terminal_timing {
+        DeviceTimingMeasurement::NotRequested => DeviceCommandTimingProjection {
+            physical_span: None,
+            command_measurement: None,
+            status: "not_requested",
+            unavailable: None,
+        },
+        DeviceTimingMeasurement::Unavailable(reason) => DeviceCommandTimingProjection {
+            physical_span: None,
+            command_measurement: None,
+            status: "unavailable",
+            unavailable: Some(DeviceCommandTimingUnavailable::Backend(*reason)),
+        },
+        DeviceTimingMeasurement::Measured(timing) => {
+            let physical_span = timing.span_for_command(command_index);
+            let Some(physical_span) = physical_span else {
+                return DeviceCommandTimingProjection {
+                    physical_span: None,
+                    command_measurement: None,
+                    status: "unavailable",
+                    unavailable: Some(DeviceCommandTimingUnavailable::MissingSpan),
+                };
+            };
+            let measured = physical_span.measurement().elapsed_ns().is_some();
+            let replayed = physical_span.kind() == DeviceExecutionSpanKind::ReusableExecutable;
+            DeviceCommandTimingProjection {
+                physical_span: Some(physical_span),
+                command_measurement: (!replayed).then(|| physical_span.measurement()),
+                status: if measured {
+                    if replayed {
+                        "covered_by_physical_span"
+                    } else {
+                        "measured"
+                    }
+                } else {
+                    "unavailable"
+                },
+                unavailable: physical_span
+                    .measurement()
+                    .unavailable_reason()
+                    .map(DeviceCommandTimingUnavailable::Backend),
+            }
+        }
+    }
+}
+
+impl VNextProfileExecutionEventSink {
+    #[cfg(test)]
+    fn new(
+        journal: SchedulerTraceJournal,
+        entrypoint: ProfileEntrypoint,
+        config: &EngineConfig,
+    ) -> Self {
+        Self::with_journals(vec![journal], entrypoint, config)
+    }
+
+    fn with_journals(
+        journals: Vec<SchedulerTraceJournal>,
+        entrypoint: ProfileEntrypoint,
+        config: &EngineConfig,
+    ) -> Self {
+        assert!(
+            !journals.is_empty(),
+            "vNext profile sink requires at least one JSONL journal"
+        );
+        Self {
+            journals: journals.into_boxed_slice(),
+            context: Arc::new(VNextProfileEventContext {
+                entrypoint,
+                model: config.model.model_id.to_string(),
+                backend_device: format!("{:?}", config.backend.device),
+                backend_type: format!("{:?}", config.backend.backend_type),
+                profile_detail: config.runtime.profile_detail,
+                capture_policy: if matches!(
+                    config.runtime.profile_detail,
+                    ObservabilityProfileDetail::Replay
+                        | ObservabilityProfileDetail::Verify
+                        | ObservabilityProfileDetail::Full
+                ) {
+                    ExecutionEventCapturePolicy::AllFrames
+                } else {
+                    ExecutionEventCapturePolicy::FirstFramePerRequest
+                },
+            }),
+        }
+    }
+
+    fn enqueue_profile_batch(
+        &self,
+        events: Vec<FerrumProfileEvent>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        for journal in &self.journals {
+            journal.enqueue_batch(events.clone()).map_err(|error| {
+                ExecutionEventSinkError::new(format!(
+                    "enqueue vNext profile events to {}: {error}",
+                    journal.path().display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_deferred_event(
+        &self,
+        event: DeferredVNextProfileEvent,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        for journal in &self.journals {
+            journal
+                .enqueue_deferred_vnext(event.clone())
+                .map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "enqueue deferred vNext profile event to {}: {error}",
+                        journal.path().display()
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_deferred_batch(
+        &self,
+        events: Vec<DeferredVNextProfileEvent>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        for journal in &self.journals {
+            journal
+                .enqueue_deferred_vnext_batch(events.clone())
+                .map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "enqueue deferred vNext profile batch to {}: {error}",
+                        journal.path().display()
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl VNextProfileEventContext {
+    fn profile_event(
+        &self,
+        event: &ExecutionEvent,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
+        let identity = event.identity().parts();
+        let event_name = vnext_execution_event_name(event.kind());
+        let failure = match event.detail() {
+            ExecutionEventDetail::Failure(failure) => Some(ProfileError {
+                kind: failure.failure().code().to_string(),
+                message: failure.failure().message().to_string(),
+                blocking: true,
+            }),
+            ExecutionEventDetail::FailureTerminal {
+                first_failure_fingerprint,
+            } => Some(ProfileError {
+                kind: "vnext_request_failed".to_string(),
+                message: format!("request terminated after failure {first_failure_fingerprint}"),
+                blocking: true,
+            }),
+            _ => None,
+        };
+        let status = if failure.is_some() {
+            ProfileStatus::Failure
+        } else {
+            ProfileStatus::Ok
+        };
+        let mut shape = BTreeMap::from([(
+            "execution_sequence".to_string(),
+            serde_json::json!(identity.sequence),
+        )]);
+        if let Some(frame_id) = identity.frame_id {
+            shape.insert("frame_id".to_string(), serde_json::json!(frame_id.get()));
+        }
+        if let Some(invocation_id) = identity.node_invocation_id {
+            shape.insert(
+                "node_invocation_id".to_string(),
+                serde_json::json!(invocation_id.get()),
+            );
+        }
+        if let ExecutionEventDetail::Counters { input, output } = event.detail() {
+            shape.insert("event_input_count".to_string(), serde_json::json!(input));
+            shape.insert("event_output_count".to_string(), serde_json::json!(output));
+        }
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    self.entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(self.backend_device),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(self.backend_type),
+            ),
+            (
+                "diagnostic_only".to_string(),
+                serde_json::json!(self.profile_detail.diagnostic_only()),
+            ),
+            ("l0_only".to_string(), serde_json::json!(false)),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.profile_detail.as_str()),
+            ),
+            (
+                "execution_capture_policy".to_string(),
+                serde_json::json!(self.capture_policy.as_str()),
+            ),
+            (
+                "execution_event_kind".to_string(),
+                serde_json::json!(event_name),
+            ),
+            (
+                "execution_phase".to_string(),
+                serde_json::json!(format!("{:?}", event.phase()).to_ascii_lowercase()),
+            ),
+            (
+                "execution_trace_source".to_string(),
+                serde_json::json!("vnext"),
+            ),
+            (
+                "monotonic_nanos_since_run_start".to_string(),
+                serde_json::json!(event.timestamp().nanos_since_run_start),
+            ),
+            (
+                "run_id".to_string(),
+                serde_json::json!(identity.run_id.to_string()),
+            ),
+            (
+                "span_id".to_string(),
+                serde_json::json!(identity.span_id.to_string()),
+            ),
+        ]);
+        for (key, value) in [
+            (
+                "plan_id",
+                identity.plan_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "plan_hash",
+                identity.plan_hash.as_ref().map(ToString::to_string),
+            ),
+            (
+                "node_id",
+                identity.node_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "operation_id",
+                identity.operation_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "provider_id",
+                identity.provider_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "device_id",
+                identity.device_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "parent_span_id",
+                identity.parent_span_id.as_ref().map(ToString::to_string),
+            ),
+        ] {
+            if let Some(value) = value {
+                attributes.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        let profile = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+            event_id: format!(
+                "evt-vnext-{}-{}-{}",
+                identity.run_id, identity.request_id, identity.sequence
+            ),
+            request_id: identity.request_id.to_string(),
+            correlation_id: Some(identity.request_id.to_string()),
+            entrypoint: self.entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: format!("vnext.{event_name}"),
+            event_kind: if failure.is_some() {
+                ProfileEventKind::Error
+            } else {
+                ProfileEventKind::Instant
+            },
+            timestamp,
+            status,
+            model: Some(self.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: failure,
+            replay: None,
+            shape,
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+            ])),
+            attributes,
+        };
+        profile.validate().map_err(|error| {
+            ExecutionEventSinkError::new(format!("invalid vNext profile event: {error}"))
+        })?;
+        Ok(profile)
+    }
+
+    fn physical_device_submission_timing_event(
+        &self,
+        completion: &OperationCompletionReceipt,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<Option<FerrumProfileEvent>, ExecutionEventSinkError> {
+        let submission = completion.submission();
+        let batch = submission.batch_identity();
+        let first = batch
+            .nodes()
+            .first()
+            .and_then(|node| node.participants().first())
+            .ok_or_else(|| {
+                ExecutionEventSinkError::new(
+                    "physical device submission timing has no batch participant",
+                )
+            })?;
+        let first_identity = first.identity().parts();
+        let mut participant_request_ids = batch
+            .nodes()
+            .iter()
+            .flat_map(|node| node.participants())
+            .map(|participant| participant.identity().parts().request_id.to_string())
+            .collect::<Vec<_>>();
+        participant_request_ids.sort();
+        participant_request_ids.dedup();
+
+        let (command_count, spans, timing_status, unavailable_reason) =
+            match completion.submission_timing() {
+                DeviceTimingMeasurement::NotRequested => return Ok(None),
+                DeviceTimingMeasurement::Unavailable(reason) => (
+                    0_u32,
+                    None,
+                    "unavailable",
+                    Some(format!("{reason:?}").to_ascii_lowercase()),
+                ),
+                DeviceTimingMeasurement::Measured(timing) => (
+                    timing.command_count(),
+                    Some(timing.spans()),
+                    "measured",
+                    None,
+                ),
+            };
+        let eager_span_count = spans.map_or(0, |spans| {
+            spans
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::EagerCommand)
+                .count()
+        });
+        let reusable_span_count = spans.map_or(0, |spans| {
+            spans
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::ReusableExecutable)
+                .count()
+        });
+        let shape = BTreeMap::from([
+            (
+                "command_count".to_string(),
+                serde_json::json!(command_count),
+            ),
+            (
+                "eager_span_count".to_string(),
+                serde_json::json!(eager_span_count),
+            ),
+            (
+                "participant_count".to_string(),
+                serde_json::json!(participant_request_ids.len()),
+            ),
+            (
+                "reusable_span_count".to_string(),
+                serde_json::json!(reusable_span_count),
+            ),
+            (
+                "span_count".to_string(),
+                serde_json::json!(spans.map_or(0, |spans| spans.len())),
+            ),
+        ]);
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    self.entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "attribution_scope".to_string(),
+                serde_json::json!("physical_submission"),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(self.backend_device),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(self.backend_type),
+            ),
+            (
+                "device_id".to_string(),
+                serde_json::json!(batch.device_id().to_string()),
+            ),
+            ("diagnostic_only".to_string(), serde_json::json!(true)),
+            (
+                "device_timing_semantics".to_string(),
+                serde_json::json!("submission_relative_duration_only"),
+            ),
+            (
+                "device_timing_status".to_string(),
+                serde_json::json!(timing_status),
+            ),
+            (
+                "formal_device_busy_time_eligible".to_string(),
+                serde_json::json!(false),
+            ),
+            (
+                "participant_request_ids".to_string(),
+                serde_json::json!(participant_request_ids),
+            ),
+            (
+                "physical_submission_fingerprint".to_string(),
+                serde_json::json!(submission.fingerprint()),
+            ),
+            (
+                "plan_hash".to_string(),
+                serde_json::json!(batch.plan_hash().to_string()),
+            ),
+            (
+                "plan_id".to_string(),
+                serde_json::json!(batch.plan_id().to_string()),
+            ),
+            (
+                "profile_detail".to_string(),
+                serde_json::json!(self.profile_detail.as_str()),
+            ),
+            (
+                "runtime_implementation_fingerprint".to_string(),
+                serde_json::json!(batch.runtime_implementation_fingerprint()),
+            ),
+            (
+                "production_reusable_execution_selection_preserved".to_string(),
+                serde_json::json!(self.profile_detail == ObservabilityProfileDetail::Replay),
+            ),
+            (
+                "execution_path_policy".to_string(),
+                serde_json::json!(match self.profile_detail {
+                    ObservabilityProfileDetail::Verify => "compiled_bindings_eager_commands",
+                    ObservabilityProfileDetail::Full => "logical_commands_reusable_segments",
+                    _ => "production_selection",
+                }),
+            ),
+            (
+                "measurement_instrumentation_present".to_string(),
+                serde_json::json!(true),
+            ),
+        ]);
+        if let Some(reason) = unavailable_reason {
+            attributes.insert(
+                "device_timing_unavailable_reason".to_string(),
+                serde_json::json!(reason),
+            );
+        }
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+            event_id: format!("evt-vnext-physical-{}", submission.fingerprint()),
+            request_id: first_identity.request_id.to_string(),
+            correlation_id: Some(submission.fingerprint().to_owned()),
+            entrypoint: self.entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: "vnext.device_physical_submission".to_string(),
+            event_kind: ProfileEventKind::Instant,
+            timestamp,
+            status: ProfileStatus::DiagnosticOnly,
+            model: Some(self.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: None,
+            replay: None,
+            shape,
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+                ("physical_spans".to_string(), serde_json::json!(spans)),
+            ])),
+            attributes,
+        };
+        event.validate().map_err(|error| {
+            ExecutionEventSinkError::new(format!(
+                "invalid vNext physical submission timing event: {error}"
+            ))
+        })?;
+        Ok(Some(event))
+    }
+
+    fn device_submission_attribution_events(
+        &self,
+        attribution: &BoundDeviceSubmissionAttribution,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<Vec<FerrumProfileEvent>, ExecutionEventSinkError> {
+        let batch = attribution.batch_identity();
+        let measured_timings = match attribution.terminal_timing() {
+            DeviceTimingMeasurement::Measured(timing) => Some(timing),
+            DeviceTimingMeasurement::NotRequested | DeviceTimingMeasurement::Unavailable(_) => None,
+        };
+        let reusable_span_count = measured_timings.map_or(0, |timing| {
+            timing
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::ReusableExecutable)
+                .count()
+        });
+        let mut events =
+            Vec::with_capacity(attribution.device().commands().len() + reusable_span_count);
+        for command in attribution.device().commands() {
+            let timing = project_device_command_timing(
+                attribution.terminal_timing(),
+                command.command_index(),
+            );
+            let physical_span = timing.physical_span;
+            let command_measurement = timing.command_measurement;
+            let device_elapsed_ns =
+                command_measurement.and_then(DeviceExecutionSpanMeasurement::elapsed_ns);
+            let device_intervals = command_measurement
+                .and_then(DeviceExecutionSpanMeasurement::intervals)
+                .map(|intervals| {
+                    intervals
+                        .iter()
+                        .map(|interval| {
+                            serde_json::json!({
+                                "kind": interval.kind().as_str(),
+                                "start_offset_ns": interval.start_offset_ns(),
+                                "end_offset_ns": interval.end_offset_ns(),
+                                "subwork_id": interval.subwork_id(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+            let (node_index, node, first, participant_request_ids) = if let Some(node_index) =
+                command.node_index()
+            {
+                let node_index_usize = usize::try_from(node_index).map_err(|_| {
+                    ExecutionEventSinkError::new(
+                        "device attribution node index exceeds the host index range",
+                    )
+                })?;
+                let node = batch.nodes().get(node_index_usize).ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "device attribution node index is absent from its batch identity",
+                    )
+                })?;
+                let first = node.participants().first().ok_or_else(|| {
+                    ExecutionEventSinkError::new("device attribution node has no participants")
+                })?;
+                let participant_request_ids = node
+                    .participants()
+                    .iter()
+                    .map(|participant| participant.identity().parts().request_id.to_string())
+                    .collect::<Vec<_>>();
+                (Some(node_index), Some(node), first, participant_request_ids)
+            } else {
+                let first_node = batch.nodes().first().ok_or_else(|| {
+                    ExecutionEventSinkError::new("wave-level device attribution has no batch nodes")
+                })?;
+                let first = first_node.participants().first().ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "wave-level device attribution has no participants",
+                    )
+                })?;
+                let mut participant_request_ids = batch
+                    .nodes()
+                    .iter()
+                    .flat_map(|node| node.participants())
+                    .map(|participant| participant.identity().parts().request_id.to_string())
+                    .collect::<Vec<_>>();
+                participant_request_ids.sort();
+                participant_request_ids.dedup();
+                (None, None, first, participant_request_ids)
+            };
+            let first_identity = first.identity().parts();
+            let shape = BTreeMap::from([
+                (
+                    "command_index".to_string(),
+                    serde_json::json!(command.command_index()),
+                ),
+                ("node_index".to_string(), serde_json::json!(node_index)),
+                (
+                    "participant_count".to_string(),
+                    serde_json::json!(command.participant_count()),
+                ),
+                (
+                    "token_count".to_string(),
+                    serde_json::json!(command.token_count()),
+                ),
+                (
+                    "physical_compute_dispatch_count".to_string(),
+                    serde_json::json!(command.compute_dispatch_count()),
+                ),
+                (
+                    "physical_transfer_command_count".to_string(),
+                    serde_json::json!(command.transfer_command_count()),
+                ),
+                (
+                    "reusable_graph_node_count".to_string(),
+                    serde_json::json!(command.reusable_graph_node_count()),
+                ),
+                (
+                    "device_interval_count".to_string(),
+                    serde_json::json!(command_measurement
+                        .and_then(DeviceExecutionSpanMeasurement::intervals)
+                        .map_or(0, |intervals| intervals.len())),
+                ),
+                (
+                    "device_elapsed_ns".to_string(),
+                    serde_json::json!(device_elapsed_ns),
+                ),
+                (
+                    "device_span_start_command_index".to_string(),
+                    serde_json::json!(physical_span.map(|span| span.start_command_index())),
+                ),
+                (
+                    "device_span_end_command_index".to_string(),
+                    serde_json::json!(physical_span.map(|span| span.end_command_index())),
+                ),
+            ]);
+            let mut attributes = BTreeMap::from([
+                (
+                    "actual_model_smoke".to_string(),
+                    serde_json::json!(matches!(
+                        self.entrypoint,
+                        ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                    )),
+                ),
+                (
+                    "attribution_scope".to_string(),
+                    serde_json::json!(if node.is_some() { "node" } else { "wave" }),
+                ),
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+                (
+                    "batching_form".to_string(),
+                    serde_json::json!(command.batching_form().as_str()),
+                ),
+                (
+                    "command_phase".to_string(),
+                    serde_json::json!(format!("{:?}", command.command_phase()).to_ascii_lowercase()),
+                ),
+                (
+                    "device_id".to_string(),
+                    serde_json::json!(batch.device_id().to_string()),
+                ),
+                ("diagnostic_only".to_string(), serde_json::json!(true)),
+                (
+                    "execution_path".to_string(),
+                    serde_json::json!(command.execution_path().as_str()),
+                ),
+                (
+                    "native_op_id".to_string(),
+                    serde_json::json!(command.native_op_id()),
+                ),
+                (
+                    "participant_request_ids".to_string(),
+                    serde_json::json!(participant_request_ids),
+                ),
+                (
+                    "plan_hash".to_string(),
+                    serde_json::json!(batch.plan_hash().to_string()),
+                ),
+                (
+                    "plan_id".to_string(),
+                    serde_json::json!(batch.plan_id().to_string()),
+                ),
+                (
+                    "profile_detail".to_string(),
+                    serde_json::json!(self.profile_detail.as_str()),
+                ),
+                (
+                    "physical_submission_fingerprint".to_string(),
+                    serde_json::json!(attribution.submission_fingerprint()),
+                ),
+                (
+                    "runtime_implementation_fingerprint".to_string(),
+                    serde_json::json!(batch.runtime_implementation_fingerprint()),
+                ),
+            ]);
+            if let Some(node) = node {
+                attributes.insert(
+                    "node_id".to_string(),
+                    serde_json::json!(node.node_id().to_string()),
+                );
+                attributes.insert(
+                    "operation_id".to_string(),
+                    serde_json::json!(node.operation_id().to_string()),
+                );
+                attributes.insert(
+                    "provider_id".to_string(),
+                    serde_json::json!(node.provider_id().to_string()),
+                );
+                let semantics = node.provider_execution_semantics();
+                attributes.insert(
+                    "provider_execution_contract_version".to_string(),
+                    serde_json::json!(semantics.contract_version().to_string()),
+                );
+                attributes.insert(
+                    "provider_execution_contract_fingerprint".to_string(),
+                    serde_json::json!(semantics.contract_fingerprint().to_string()),
+                );
+                attributes.insert(
+                    "provider_execution_repeatability".to_string(),
+                    serde_json::json!(semantics.repeatability().as_str()),
+                );
+                attributes.insert(
+                    "provider_replay_equivalence".to_string(),
+                    serde_json::json!(semantics.replay_equivalence().as_str()),
+                );
+            }
+            attributes.insert(
+                "device_timing_status".to_string(),
+                serde_json::json!(timing.status),
+            );
+            attributes.insert(
+                "device_timing_semantics".to_string(),
+                serde_json::json!("submission_relative_duration_only"),
+            );
+            attributes.insert(
+                "formal_device_busy_time_eligible".to_string(),
+                serde_json::json!(false),
+            );
+            if let Some(span) = physical_span {
+                attributes.insert(
+                    "device_timing_span_kind".to_string(),
+                    serde_json::json!(span.kind().as_str()),
+                );
+                if let Some(fingerprint) = span.reusable_executable_fingerprint() {
+                    attributes.insert(
+                        "reusable_executable_fingerprint".to_string(),
+                        serde_json::json!(fingerprint),
+                    );
+                }
+            }
+            if let Some(reason) = timing.unavailable {
+                attributes.insert(
+                    "device_timing_unavailable_reason".to_string(),
+                    serde_json::json!(reason.label()),
+                );
+            }
+            let event = FerrumProfileEvent {
+                schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                ts_unix_nanos: timestamp
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+                event_id: format!(
+                    "evt-vnext-native-{}-{}-{}",
+                    attribution.submission_fingerprint(),
+                    node_index.map_or_else(|| "wave".to_owned(), |index| index.to_string()),
+                    command.command_index()
+                ),
+                request_id: first_identity.request_id.to_string(),
+                correlation_id: Some(attribution.submission_fingerprint().to_owned()),
+                entrypoint: self.entrypoint,
+                backend: "actual".to_string(),
+                runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+                phase: "vnext.device_native_work".to_string(),
+                event_kind: ProfileEventKind::Instant,
+                timestamp,
+                status: ProfileStatus::DiagnosticOnly,
+                model: Some(self.model.clone()),
+                duration_us: None,
+                memory: None,
+                resource: None,
+                error: None,
+                replay: None,
+                shape,
+                backend_detail: Some(BTreeMap::from([
+                    (
+                        "backend_device".to_string(),
+                        serde_json::json!(self.backend_device),
+                    ),
+                    (
+                        "backend_type".to_string(),
+                        serde_json::json!(self.backend_type),
+                    ),
+                    (
+                        "device_intervals".to_string(),
+                        serde_json::json!(device_intervals),
+                    ),
+                ])),
+                attributes,
+            };
+            event.validate().map_err(|error| {
+                ExecutionEventSinkError::new(format!(
+                    "invalid vNext device attribution profile event: {error}"
+                ))
+            })?;
+            events.push(event);
+        }
+        if let Some(timing) = measured_timings {
+            let first_node = batch.nodes().first().ok_or_else(|| {
+                ExecutionEventSinkError::new("physical device timing span has no batch nodes")
+            })?;
+            let first = first_node.participants().first().ok_or_else(|| {
+                ExecutionEventSinkError::new("physical device timing span has no participants")
+            })?;
+            let first_identity = first.identity().parts();
+            let mut participant_request_ids = batch
+                .nodes()
+                .iter()
+                .flat_map(|node| node.participants())
+                .map(|participant| participant.identity().parts().request_id.to_string())
+                .collect::<Vec<_>>();
+            participant_request_ids.sort();
+            participant_request_ids.dedup();
+            for span in timing
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == DeviceExecutionSpanKind::ReusableExecutable)
+            {
+                let device_intervals = span.measurement().intervals().map(|intervals| {
+                    intervals
+                        .iter()
+                        .map(|interval| {
+                            serde_json::json!({
+                                "kind": interval.kind().as_str(),
+                                "start_offset_ns": interval.start_offset_ns(),
+                                "end_offset_ns": interval.end_offset_ns(),
+                                "subwork_id": interval.subwork_id(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let shape = BTreeMap::from([
+                    (
+                        "start_command_index".to_string(),
+                        serde_json::json!(span.start_command_index()),
+                    ),
+                    (
+                        "end_command_index".to_string(),
+                        serde_json::json!(span.end_command_index()),
+                    ),
+                    (
+                        "command_count".to_string(),
+                        serde_json::json!(span.command_count()),
+                    ),
+                    (
+                        "participant_count".to_string(),
+                        serde_json::json!(participant_request_ids.len()),
+                    ),
+                    (
+                        "device_interval_count".to_string(),
+                        serde_json::json!(span
+                            .measurement()
+                            .intervals()
+                            .map_or(0, |intervals| intervals.len())),
+                    ),
+                    (
+                        "device_elapsed_ns".to_string(),
+                        serde_json::json!(span.measurement().elapsed_ns()),
+                    ),
+                ]);
+                let mut attributes = BTreeMap::from([
+                    (
+                        "actual_model_smoke".to_string(),
+                        serde_json::json!(matches!(
+                            self.entrypoint,
+                            ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                        )),
+                    ),
+                    (
+                        "attribution_scope".to_string(),
+                        serde_json::json!("physical_span"),
+                    ),
+                    (
+                        "backend_device".to_string(),
+                        serde_json::json!(self.backend_device),
+                    ),
+                    (
+                        "backend_type".to_string(),
+                        serde_json::json!(self.backend_type),
+                    ),
+                    (
+                        "device_id".to_string(),
+                        serde_json::json!(batch.device_id().to_string()),
+                    ),
+                    ("diagnostic_only".to_string(), serde_json::json!(true)),
+                    (
+                        "device_timing_semantics".to_string(),
+                        serde_json::json!("submission_relative_duration_only"),
+                    ),
+                    (
+                        "device_timing_span_kind".to_string(),
+                        serde_json::json!(span.kind().as_str()),
+                    ),
+                    (
+                        "device_timing_status".to_string(),
+                        serde_json::json!(if span.measurement().elapsed_ns().is_some() {
+                            "measured"
+                        } else {
+                            "unavailable"
+                        }),
+                    ),
+                    ("execution_path".to_string(), serde_json::json!("replayed")),
+                    (
+                        "formal_device_busy_time_eligible".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    (
+                        "participant_request_ids".to_string(),
+                        serde_json::json!(participant_request_ids),
+                    ),
+                    (
+                        "physical_submission_fingerprint".to_string(),
+                        serde_json::json!(attribution.submission_fingerprint()),
+                    ),
+                    (
+                        "plan_hash".to_string(),
+                        serde_json::json!(batch.plan_hash().to_string()),
+                    ),
+                    (
+                        "plan_id".to_string(),
+                        serde_json::json!(batch.plan_id().to_string()),
+                    ),
+                    (
+                        "profile_detail".to_string(),
+                        serde_json::json!(self.profile_detail.as_str()),
+                    ),
+                    (
+                        "runtime_implementation_fingerprint".to_string(),
+                        serde_json::json!(batch.runtime_implementation_fingerprint()),
+                    ),
+                ]);
+                if let Some(reason) = span.measurement().unavailable_reason() {
+                    attributes.insert(
+                        "device_timing_unavailable_reason".to_string(),
+                        serde_json::json!(format!("{reason:?}").to_ascii_lowercase()),
+                    );
+                }
+                if let Some(fingerprint) = span.reusable_executable_fingerprint() {
+                    attributes.insert(
+                        "reusable_executable_fingerprint".to_string(),
+                        serde_json::json!(fingerprint),
+                    );
+                }
+                let event = FerrumProfileEvent {
+                    schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                    ts_unix_nanos: timestamp
+                        .timestamp_nanos_opt()
+                        .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+                    event_id: format!(
+                        "evt-vnext-device-span-{}-{}-{}",
+                        attribution.submission_fingerprint(),
+                        span.start_command_index(),
+                        span.end_command_index()
+                    ),
+                    request_id: first_identity.request_id.to_string(),
+                    correlation_id: Some(attribution.submission_fingerprint().to_owned()),
+                    entrypoint: self.entrypoint,
+                    backend: "actual".to_string(),
+                    runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+                    phase: "vnext.device_execution_span".to_string(),
+                    event_kind: ProfileEventKind::Instant,
+                    timestamp,
+                    status: ProfileStatus::DiagnosticOnly,
+                    model: Some(self.model.clone()),
+                    duration_us: None,
+                    memory: None,
+                    resource: None,
+                    error: None,
+                    replay: None,
+                    shape,
+                    backend_detail: Some(BTreeMap::from([
+                        (
+                            "backend_device".to_string(),
+                            serde_json::json!(self.backend_device),
+                        ),
+                        (
+                            "backend_type".to_string(),
+                            serde_json::json!(self.backend_type),
+                        ),
+                        (
+                            "device_intervals".to_string(),
+                            serde_json::json!(device_intervals),
+                        ),
+                    ])),
+                    attributes,
+                };
+                event.validate().map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "invalid vNext physical device timing span event: {error}"
+                    ))
+                })?;
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+}
+
+impl VNextProfileExecutionEventSink {
+    #[cfg(test)]
+    fn profile_event(
+        &self,
+        event: &ExecutionEvent,
+    ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
+        self.context.profile_event(event, chrono::Utc::now())
+    }
+
+    fn enqueue_events(
+        &self,
+        events: Vec<ExecutionEvent>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let timestamp = chrono::Utc::now();
+        let mut deferred = Vec::new();
+        deferred.try_reserve(events.len()).map_err(|error| {
+            ExecutionEventSinkError::new(format!("reserve deferred vNext profile batch: {error}"))
+        })?;
+        for event in events {
+            deferred.push(DeferredVNextProfileEvent {
+                event,
+                timestamp,
+                context: Arc::clone(&self.context),
+            });
+        }
+        self.enqueue_deferred_batch(deferred)
+    }
+}
+
+impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
+        true
+    }
+
+    fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
+        match self.context.profile_detail {
+            ObservabilityProfileDetail::Off => ferrum_interfaces::vnext::DeviceTimingMode::Off,
+            ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Completion
+            }
+            ObservabilityProfileDetail::Replay => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Replay
+            }
+            ObservabilityProfileDetail::Verify => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Verification
+            }
+            ObservabilityProfileDetail::Full => ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
+        }
+    }
+
+    fn capture_policy(&self) -> ExecutionEventCapturePolicy {
+        self.context.capture_policy
+    }
+
+    fn record_device_submission_attribution(
+        &self,
+        attribution: &BoundDeviceSubmissionAttribution,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let events = self
+            .context
+            .device_submission_attribution_events(attribution, chrono::Utc::now())?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_profile_batch(events)
+    }
+
+    fn record_physical_device_submission_timing(
+        &self,
+        completion: &OperationCompletionReceipt,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let Some(event) = self
+            .context
+            .physical_device_submission_timing_event(completion, chrono::Utc::now())?
+        else {
+            return Ok(());
+        };
+        self.enqueue_profile_batch(vec![event])
+    }
+
+    fn record(
+        &self,
+        permit: EventEmissionPermit,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let event = DeferredVNextProfileEvent {
+            event: permit.into_event(),
+            timestamp: chrono::Utc::now(),
+            context: Arc::clone(&self.context),
+        };
+        self.enqueue_deferred_event(event)
+    }
+
+    fn record_batch(
+        &self,
+        permit: EventBatchEmissionPermit,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        self.enqueue_events(permit.into_events())
+    }
+}
+
+fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<SchedulerTraceJournal> {
+    let path = path?;
+    match SchedulerTraceJournal::create(path.to_path_buf()) {
+        Ok(journal) => Some(journal),
+        Err(error) => {
+            warn!(
+                "Failed to open scheduler trace JSONL {}: {}",
+                path.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
+fn create_legacy_scheduler_trace_sink(path: Option<&Path>) -> Option<Arc<Mutex<std::fs::File>>> {
     let path = path?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 warn!(
-                    "Failed to create scheduler trace directory {}: {}",
+                    "Failed to create legacy scheduler trace directory {}: {}",
                     parent.display(),
                     error
                 );
@@ -3285,7 +4990,7 @@ fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::Fil
     if let Err(error) = std::fs::remove_file(path) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!(
-                "Failed to clear scheduler trace JSONL {}: {}",
+                "Failed to clear legacy scheduler trace JSONL {}: {}",
                 path.display(),
                 error
             );
@@ -3297,10 +5002,10 @@ fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::Fil
         .append(true)
         .open(path)
     {
-        Ok(file) => Some(Mutex::new(file)),
+        Ok(file) => Some(Arc::new(Mutex::new(file))),
         Err(error) => {
             warn!(
-                "Failed to open scheduler trace JSONL {}: {}",
+                "Failed to open legacy scheduler trace JSONL {}: {}",
                 path.display(),
                 error
             );
@@ -3334,7 +5039,7 @@ impl ContinuousBatchEngine {
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_speculation(
             config,
             scheduler,
@@ -3361,7 +5066,7 @@ impl ContinuousBatchEngine {
         tensor_factory: Arc<dyn TensorFactory>,
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_speculation_and_recurrent_state_manager(
             config,
             scheduler,
@@ -3390,26 +5095,149 @@ impl ContinuousBatchEngine {
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-    ) -> Self {
+    ) -> Result<Self> {
+        Self::new_with_resource_composition(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            EngineResourceComposition::LegacyEngine {
+                kv_cache,
+                recurrent_state_manager,
+            },
+            model_executor,
+            tensor_factory,
+            draft_executor,
+            spec_config,
+        )
+    }
+
+    /// Build an engine bound to the shared plan runtime, which is the sole
+    /// owner of request-lifetime KV, recurrent state, and backing capacity.
+    /// The model executor adapts that runtime but does not own a second
+    /// resource manager; no legacy engine manager is created or retained.
+    pub fn new_plan_runtime(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+    ) -> Result<Self> {
+        Self::new_with_resource_composition(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            EngineResourceComposition::PlanRuntime,
+            model_executor,
+            tensor_factory,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_resource_composition(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        resource_composition: EngineResourceComposition,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
+    ) -> Result<Self> {
+        let executor_authority = model_executor.execution_resource_authority();
+        if draft_executor.is_some() != spec_config.is_some() {
+            return Err(FerrumError::config(
+                "speculative decoding requires both a draft executor and its configuration",
+            ));
+        }
+        if let Some(draft_executor) = draft_executor.as_ref() {
+            let draft_authority = draft_executor.execution_resource_authority();
+            if draft_authority != executor_authority {
+                return Err(FerrumError::config(format!(
+                    "draft executor authority {draft_authority:?} does not match target authority {executor_authority:?}"
+                )));
+            }
+        }
+        if resource_composition.authority() != executor_authority {
+            return Err(FerrumError::config(format!(
+                "engine resource composition {:?} does not match executor authority {:?}",
+                resource_composition.authority(),
+                executor_authority
+            )));
+        }
+        let recurrent_state_manager = resource_composition.recurrent_state_manager().is_some();
         info!(
+            ?executor_authority,
             "Creating ContinuousBatchEngine (speculative_decoding={}, recurrent_state_manager={})",
             draft_executor.is_some() && spec_config.is_some(),
-            recurrent_state_manager.is_some()
+            recurrent_state_manager
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
-        let scheduler_trace_jsonl =
-            create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
-        let legacy_scheduler_trace_jsonl =
-            create_scheduler_trace_sink(runtime_config.legacy_scheduler_trace_jsonl.as_deref());
+        let profile_trace_jsonl = runtime_config
+            .profile_jsonl
+            .as_ref()
+            .map(|path| {
+                SchedulerTraceJournal::create(path.clone()).map_err(|error| {
+                    FerrumError::io(format!(
+                        "open product profile JSONL {}: {error}",
+                        path.display()
+                    ))
+                })
+            })
+            .transpose()?;
+        let scheduler_trace_jsonl = match runtime_config.scheduler_trace_jsonl.as_deref() {
+            Some(path)
+                if profile_trace_jsonl
+                    .as_ref()
+                    .is_some_and(|journal| journal.path() == path) =>
+            {
+                profile_trace_jsonl.clone()
+            }
+            path => create_scheduler_trace_sink(path),
+        };
+        let legacy_scheduler_trace_jsonl = create_legacy_scheduler_trace_sink(
+            runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
+        );
+        let mut execution_profile_journals = Vec::with_capacity(2);
+        if let Some(journal) = profile_trace_jsonl.as_ref() {
+            execution_profile_journals.push(journal.clone());
+        }
+        if let Some(journal) = scheduler_trace_jsonl.as_ref() {
+            if execution_profile_journals
+                .iter()
+                .all(|existing| existing.path() != journal.path())
+            {
+                execution_profile_journals.push(journal.clone());
+            }
+        }
+        if !execution_profile_journals.is_empty() {
+            let sink: Arc<dyn ExecutionEventSink> =
+                Arc::new(VNextProfileExecutionEventSink::with_journals(
+                    execution_profile_journals,
+                    runtime_config
+                        .profile_entrypoint
+                        .unwrap_or(ProfileEntrypoint::Synthetic),
+                    &config,
+                ));
+            model_executor.attach_execution_event_sink(Arc::clone(&sink));
+            if let Some(draft_executor) = draft_executor.as_ref() {
+                draft_executor.attach_execution_event_sink(sink);
+            }
+        }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(EngineInner {
                 config,
                 scheduler,
                 tokenizer,
+                structured_output_factory: OnceLock::new(),
                 sampler,
-                kv_cache,
-                recurrent_state_manager,
+                resource_composition,
                 model_executor,
                 draft_executor,
                 spec_config,
@@ -3418,15 +5246,17 @@ impl ContinuousBatchEngine {
                 is_running: AtomicBool::new(false),
                 shutdown_notify: Arc::new(Notify::new()),
                 iteration_lock: tokio::sync::Mutex::new(()),
-                work_notify: Notify::new(),
+                work_notify: Arc::new(Notify::new()),
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
+                profile_trace_jsonl,
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
                 scheduler_trace_none_streak: AtomicU64::new(0),
                 resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
                 resource_trace_event_counter: AtomicU64::new(0),
+                dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -3438,8 +5268,11 @@ impl ContinuousBatchEngine {
                 total_model_execution_time_us: AtomicU64::new(0),
                 model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
+                shutdown_started: AtomicBool::new(false),
+                shutdown_lock: tokio::sync::Mutex::new(()),
+                background_loop: Mutex::new(None),
             }),
-        }
+        })
     }
 
     /// Spawn the background iteration loop on first request. Without this,
@@ -3449,8 +5282,15 @@ impl ContinuousBatchEngine {
     /// per-iter tokio scheduling overhead at c=16). With one bg loop +
     /// per-request tasks just consuming their channel, lock is uncontested.
     fn ensure_bg_loop(&self) {
-        if !self.inner.bg_loop_spawned.swap(true, Ordering::SeqCst) {
-            let _ = self.start_loop();
+        if self.inner.bg_loop_spawned.load(Ordering::Acquire) {
+            return;
+        }
+        let mut background_loop = self.inner.background_loop.lock();
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.inner.bg_loop_spawned.swap(true, Ordering::AcqRel) {
+            *background_loop = Some(self.start_loop());
         }
     }
 
@@ -3486,14 +5326,13 @@ impl ContinuousBatchEngine {
                 } else {
                     None
                 };
-                {
-                    let lock_wait_start = Instant::now();
-                    let _guard = inner.iteration_lock.lock().await;
-                    inner.record_iteration_lock_wait(lock_wait_start.elapsed());
-                    if let Err(e) = inner.run_iteration().await {
-                        warn!("Iteration error: {}", e);
+                let outcome = match inner.run_iteration().await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        warn!("Iteration error: {}", error);
+                        EngineIterationOutcome::Progressed
                     }
-                }
+                };
                 if prof {
                     let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n.is_multiple_of(8) {
@@ -3503,7 +5342,29 @@ impl ContinuousBatchEngine {
                     }
                 }
                 last_iter_end = Some(std::time::Instant::now());
-                tokio::task::yield_now().await;
+                if !inner.is_running.load(Ordering::SeqCst) {
+                    break;
+                }
+                match outcome {
+                    EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
+                    EngineIterationOutcome::Idle => {
+                        tokio::select! {
+                            _ = inner.shutdown_notify.notified() => {}
+                            _ = inner.work_notify.notified() => {}
+                        }
+                    }
+                    EngineIterationOutcome::CapacityBlocked(registration) => {
+                        tokio::select! {
+                            _ = inner.shutdown_notify.notified() => {}
+                            _ = inner.work_notify.notified() => {}
+                            result = registration.wait_for_change() => {
+                                if let Err(error) = result {
+                                    warn!("Executor capacity wait error: {}", error);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             info!("Background iteration loop stopped");
         })
@@ -3516,7 +5377,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let request_id = request.id.clone();
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
-        gauge!("ferrum.engine.active_requests").increment(1.0);
 
         maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
@@ -3539,28 +5399,70 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             serde_json::Value::from(input_tokens.len() as u64),
         );
 
-        // Submit to scheduler
-        let mut request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
-        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
-            request_slot.reject(&self.inner, error.to_string());
-            return Err(error);
-        }
-        request_slot.admit(&self.inner);
-
-        // Create sequence state with oneshot channel
+        // Publish the tokenized sequence and scheduler item atomically with
+        // respect to the iteration driver. Typed admission must never observe
+        // one without the other.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
-            input_tokens,
-            Some(self.inner.tokenizer.clone()),
-            Some(self.inner.model_executor.info().vocab_size),
-        );
+        let mut receiver_drop_wake =
+            ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
+        let structured_factory = if matches!(
+            &request.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text
+        ) {
+            None
+        } else {
+            Some(self.inner.structured_output_factory()?)
+        };
+        let mut seq_state =
+            SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+                request.clone(),
+                input_tokens,
+                Some(self.inner.tokenizer.clone()),
+                Some(self.inner.model_executor.info().vocab_size),
+                structured_factory.as_deref(),
+            )?;
+        gauge!("ferrum.engine.active_requests").increment(1.0);
+        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.response_sender = Some(resp_tx);
         seq_state.request_slot = Some(request_slot);
-        self.inner
-            .sequences
-            .write()
-            .insert(request_id.clone(), seq_state);
+        {
+            let _iteration = self.inner.iteration_lock.lock().await;
+            {
+                let mut sequences = self.inner.sequences.write();
+                if sequences.contains_key(&request_id) {
+                    let error = FerrumError::already_exists(format!(
+                        "request {} is already active",
+                        request_id
+                    ));
+                    if let Some(request_slot) = seq_state.request_slot.take() {
+                        request_slot.reject(&self.inner, error.to_string());
+                    }
+                    gauge!("ferrum.engine.active_requests").decrement(1.0);
+                    return Err(error);
+                }
+                sequences.insert(request_id.clone(), seq_state);
+            }
+            if let Err(error) = self.inner.scheduler.submit(request).await {
+                let mut sequence = self
+                    .inner
+                    .sequences
+                    .write()
+                    .remove(&request_id)
+                    .expect("just-published sequence remains present after submit failure");
+                if let Some(request_slot) = sequence.request_slot.take() {
+                    request_slot.reject(&self.inner, error.to_string());
+                }
+                gauge!("ferrum.engine.active_requests").decrement(1.0);
+                return Err(error);
+            }
+            self.inner
+                .sequences
+                .write()
+                .get_mut(&request_id)
+                .and_then(|sequence| sequence.request_slot.as_mut())
+                .expect("submitted sequence retains its request slot")
+                .admit(&self.inner);
+        }
 
         // Make sure the single shared bg loop is running, then just wait
         // for our oneshot to fire. Avoids per-request drive_to_completion
@@ -3568,9 +5470,12 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
 
-        let result = resp_rx
-            .await
-            .map_err(|_| FerrumError::internal("Response channel closed before response was sent"));
+        let result = resp_rx.await.unwrap_or_else(|_| {
+            Err(FerrumError::internal(
+                "Response channel closed before response was sent",
+            ))
+        });
+        receiver_drop_wake.disarm();
 
         gauge!("ferrum.engine.active_requests").decrement(1.0);
         let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
@@ -3595,6 +5500,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         mut request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let (tx, rx) = mpsc::channel(100);
+        let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
         let request_id = request.id.clone();
 
         maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
@@ -3618,27 +5524,63 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             serde_json::Value::from(input_tokens.len() as u64),
         );
 
-        // Submit to scheduler
-        let mut request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
-        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
-            request_slot.reject(&self.inner, error.to_string());
-            return Err(error);
-        }
-        request_slot.admit(&self.inner);
-
-        // Create sequence state with stream sender
-        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
-            input_tokens,
-            Some(self.inner.tokenizer.clone()),
-            Some(self.inner.model_executor.info().vocab_size),
-        );
+        // Publish tokenized state and the scheduler item under the same
+        // iteration boundary; see the non-streaming path above.
+        let structured_factory = if matches!(
+            &request.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text
+        ) {
+            None
+        } else {
+            Some(self.inner.structured_output_factory()?)
+        };
+        let mut seq_state =
+            SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+                request.clone(),
+                input_tokens,
+                Some(self.inner.tokenizer.clone()),
+                Some(self.inner.model_executor.info().vocab_size),
+                structured_factory.as_deref(),
+            )?;
+        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.stream_sender = Some(tx);
         seq_state.request_slot = Some(request_slot);
-        self.inner
-            .sequences
-            .write()
-            .insert(request_id.clone(), seq_state);
+        {
+            let _iteration = self.inner.iteration_lock.lock().await;
+            {
+                let mut sequences = self.inner.sequences.write();
+                if sequences.contains_key(&request_id) {
+                    let error = FerrumError::already_exists(format!(
+                        "request {} is already active",
+                        request_id
+                    ));
+                    if let Some(request_slot) = seq_state.request_slot.take() {
+                        request_slot.reject(&self.inner, error.to_string());
+                    }
+                    return Err(error);
+                }
+                sequences.insert(request_id.clone(), seq_state);
+            }
+            if let Err(error) = self.inner.scheduler.submit(request).await {
+                let mut sequence = self
+                    .inner
+                    .sequences
+                    .write()
+                    .remove(&request_id)
+                    .expect("just-published sequence remains present after submit failure");
+                if let Some(request_slot) = sequence.request_slot.take() {
+                    request_slot.reject(&self.inner, error.to_string());
+                }
+                return Err(error);
+            }
+            self.inner
+                .sequences
+                .write()
+                .get_mut(&request_id)
+                .and_then(|sequence| sequence.request_slot.as_mut())
+                .expect("submitted sequence retains its request slot")
+                .admit(&self.inner);
+        }
 
         // Single shared bg loop drives iters; per-request stream just
         // consumes from `rx`. Used to spawn a per-request drive_to_completion
@@ -3649,7 +5591,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
 
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Box::pin(CancellationAwareResponseStream {
+            receiver: tokio_stream::wrappers::ReceiverStream::new(rx),
+            receiver_drop_wake,
+        }))
     }
 }
 
@@ -3657,9 +5602,42 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 impl InferenceEngine for ContinuousBatchEngine {
     async fn status(&self) -> EngineStatus {
         let metrics = self.inner.scheduler.metrics();
-        let kv_stats = self.inner.kv_cache.stats();
-        let total_bytes = kv_stats.total_memory_bytes;
-        let used_bytes = kv_stats.used_memory_bytes;
+        let (total_bytes, used_bytes, cache_memory_bytes, resource_status_ready) =
+            match &self.inner.resource_composition {
+                EngineResourceComposition::LegacyEngine { kv_cache, .. } => {
+                    let kv_stats = kv_cache.stats();
+                    (
+                        kv_stats.total_memory_bytes,
+                        kv_stats.used_memory_bytes,
+                        kv_stats.used_memory_bytes,
+                        true,
+                    )
+                }
+                EngineResourceComposition::PlanRuntime => {
+                    match self.inner.model_executor.plan_runtime_resource_snapshot() {
+                        Ok(Some(snapshot)) => {
+                            let total_bytes = usize::try_from(snapshot.usable_capacity_bytes())
+                                .unwrap_or(usize::MAX);
+                            let used_bytes = snapshot
+                                .used_bytes()
+                                .ok()
+                                .and_then(|bytes| usize::try_from(bytes).ok())
+                                .unwrap_or(usize::MAX);
+                            let dynamic_used_bytes = usize::try_from(snapshot.dynamic_used_bytes())
+                                .unwrap_or(usize::MAX);
+                            (total_bytes, used_bytes, dynamic_used_bytes, true)
+                        }
+                        Ok(None) => {
+                            warn!("Plan runtime did not expose its required resource snapshot");
+                            (0, 0, 0, false)
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "Plan-runtime resource snapshot failed");
+                            (0, 0, 0, false)
+                        }
+                    }
+                }
+            };
         let free_bytes = total_bytes.saturating_sub(used_bytes);
         let mut memory_usage = ferrum_types::MemoryUsage {
             total_bytes,
@@ -3674,12 +5652,12 @@ impl InferenceEngine for ContinuousBatchEngine {
                 .then_some(used_bytes),
             cpu_memory_bytes: matches!(self.inner.config.backend.device, Device::CPU)
                 .then_some(used_bytes),
-            cache_memory_bytes: used_bytes,
+            cache_memory_bytes,
             utilization_percent: 0.0,
         };
         memory_usage.calculate_utilization();
         EngineStatus {
-            is_ready: self.inner.is_running.load(Ordering::SeqCst),
+            is_ready: resource_status_ready && self.inner.is_running.load(Ordering::SeqCst),
             loaded_models: vec![self.inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,
@@ -3691,10 +5669,53 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        let _shutdown_guard = self.inner.shutdown_lock.lock().await;
         info!("Shutting down continuous batch engine");
-        self.inner.is_running.store(false, Ordering::SeqCst);
-        self.inner.shutdown_notify.notify_waiters();
-        Ok(())
+        let background_loop = {
+            let mut background_loop = self.inner.background_loop.lock();
+            self.inner.signal_shutdown();
+            background_loop.take()
+        };
+
+        let loop_result = match background_loop {
+            Some(background_loop) => background_loop.await.map_err(|error| {
+                FerrumError::internal(format!("background iteration loop failed: {error}"))
+            }),
+            None => Ok(()),
+        };
+
+        let mut trace_journals = Vec::with_capacity(2);
+        if let Some(journal) = self.inner.profile_trace_jsonl.clone() {
+            trace_journals.push(journal);
+        }
+        if let Some(journal) = self.inner.scheduler_trace_jsonl.clone() {
+            if trace_journals
+                .iter()
+                .all(|existing| existing.path() != journal.path())
+            {
+                trace_journals.push(journal);
+            }
+        }
+        let trace_result = if trace_journals.is_empty() {
+            Ok(())
+        } else {
+            tokio::task::spawn_blocking(move || {
+                for journal in trace_journals {
+                    journal.close()?;
+                }
+                Ok::<(), JsonlJournalError>(())
+            })
+            .await
+            .map_err(|error| {
+                FerrumError::internal(format!("scheduler trace close task failed: {error}"))
+            })?
+            .map_err(|error| {
+                FerrumError::internal(format!("scheduler trace close failed: {error}"))
+            })
+        };
+
+        loop_result?;
+        trace_result
     }
 
     fn config(&self) -> &EngineConfig {

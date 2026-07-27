@@ -3,7 +3,7 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G00、G06、G07、G08
+- 依赖：G00P、G06、G07、G08；只在 S6 correctness/legacy-zero 后形成正式性能结论
 - 下游：G10
 
 ## 目标
@@ -98,6 +98,19 @@ slot 保存 scheduler active timeline、eligible interval 和 duty-cycle；瞬�
   serve-c1 decode median `>=0.95`；G00 legacy PASS lane 的 run 另以匹配的完整
   `engine.infer` E2E 边界满足 legacy no-regression。
 
+### 2026-07-25 M2 CUDA c1 窄范围容差修订
+
+Owner 接受 exact-precision M2 CUDA c1 与固定 legacy floor 之间不超过 `5%` 的差距，
+避免为低收益单并发尾差继续消耗 paid GPU 和开发时间。该修订只覆盖 M2 CUDA c1 的 legacy
+throughput non-regression：正式 G09 fresh ABBA 仍须满足 candidate median
+`>=0.95x legacy` 且 ratio 95% CI LCB `>=0.95`。其他模型、c=4/16/32、延迟、显存、
+correctness、same-host vLLM 逐 cell `>=0.90` 和主矩阵几何平均 `>=0.95` 的门槛全部不变。
+
+`557cdcf5` 的 bounded c1 为 `73.380002 / 76.1583 = 0.963519`，因此记为
+`ACCEPTED_DEVELOPMENT_CHECKPOINT`，禁止继续 c1-only paid optimization，除非后续 fresh
+correctness 失败或同一产品路径跌破 `0.95x`。该 artifact 只有一次 repeat 且没有 CI，不能
+追认、改写或伪造为 canonical G09 PASS；正式矩阵仍须由 gate 重采并打印规定 PASS line。
+
 ### M2 Qwen3.5-35B 历史审计向量
 
 历史 vLLM ShareGPT artifact 的均值和当时计算的 80% LCB 为：
@@ -112,6 +125,1689 @@ slot 保存 scheduler active timeline、eligible interval 和 duty-cycle；瞬�
 该历史 artifact 未可靠保存 vLLM active cap，且曾报告异常的 `49140 MiB` visible VRAM，所以上表
 只是审计线索，不进入 validator，也不能用 c32 值拒绝 Ferrum active-cap-16 的结果。G00 新鲜、
 same-host、相同 active-cap baseline 的 LCB 才是正式标准。
+
+2026-07-23 的 addressed vLLM paged-attention scoped diagnostic 绑定 clean source
+`6a596558` 和 binary SHA256 `e8d12cc...`，把 decode attention 从
+`5.826 ms/wave` 降到 `0.887 ms/wave`。随后 clean source `d0d2e4f5` 和 binary
+SHA256 `3b09cb93...` 消除部分 resource/identity 重建：profile-off c1 从
+`39.5687 +/- 2.0459 tok/s` 提升到 `46.0342 +/- 0.7937 tok/s`，
+`submitted_wave_total=12.888 ms` 达到 `<=13.5 ms`，但
+`resource_prepare_attempt=3.603 ms` 仍比 `<=3.5 ms` 硬线高 `0.103 ms`。
+因此 scoped diagnostic 仍为 REJECT，且正式 `76.158 tok/s` legacy 90% 线仍差
+`30.124 tok/s`。完整证据记录在
+[`G08B_QWEN35_35B.md`](G08B_QWEN35_35B.md)；下一次 paid M2 performance
+diagnostic 暂停。事后源码审计确认 `bench-serve` c1 的 outer batch 构造发生在
+`resource_prepare_attempt` 计时区间之外，因此 artifact 中“缓存 singleton batch 可把
+该指标降到 `<=3.45 ms`”的初始假设无效。先在现有 typed `wave_timing` 中把该指标拆为
+work-shape/request preparation、step admission 和 submission-wave preparation，
+再基于占比最高的实测阶段提出下一项源码预测；不得用另一轮 GPU sweep 代替该定位。
+
+2026-07-24 的本地真实 Qwen3.5 Metal 诊断完成了该拆分。step admission 中
+`backing_claim=4.174 ms`，占 `step_admission=4.591 ms` 的 `90.9%`；demand、
+logical claim 和 frame lease 均不是首要瓶颈。源码根因是 backend-neutral
+`ReusableExecutionPolicy` 被错误绑定到 CUDA graph/device executable capture 开关，导致
+graph-disabled CUDA 和 Metal 每个 wave 重复申请/释放 workspace backing。历史 CUDA
+703-case 和 `d0d2e4f5` artifact 均明确记录 `FERRUM_BATCHED_GRAPH=0`、startup
+preparation disabled、dynamic-pool `live_segments=0`，因此它们证明 vNext 正确性路径，
+不证明 workspace reuse 已启用。
+
+dirty candidate `89d3f66d + source.diff` 将 workspace bucket policy 与 device capture
+解耦后，同请求的 `backing_claim` 降至 `0.262 ms`，`step_admission` 降至
+`0.692 ms`，`resource_prepare_attempt` 从 `7.528 ms` 降至 `1.170 ms`；device capture
+仍为 disabled/unsupported，domains 1/4/5 则保留 lane-stable live segments。32/32 waves
+完成，failed wave 和 product-visible deferral 均为 `0`。该结果仅为
+`KEEP_DIAGNOSTIC`，不是正式性能或正确性 PASS；artifact 位于
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/workspace-reuse-metal-dirty-89d3f66d/`。
+
+clean source `e66ade7f0c0cd88ffc55c9a3c5a9ac902c68f58d` 已按上述合同完成一次
+1x RTX 4090 bounded smoke。`c03-001 run`、`c05-001 serve`、`c06-001 stream`
+正确性 `3/3 pass` 后，profile-off c1 `random 64/32`、`100 x 3` 完成
+`300/300` measured requests，error/quality issue 均为 `0`，token source 为 usage。
+`resource_prepare_attempt` 从 `3.6031 ms` 降至 `1.1426 ms`（`-68.29%`），
+graph capture 保持关闭且 lane-stable live segments 非零，命中预期 signal。
+吞吐从 `46.0342` 提升至 `55.5897 +/- 0.2898 tok/s`（`+20.76%`），但仍比
+`76.1583 tok/s` 正式 floor 低 `20.5685 tok/s`（`27.01%`），所以结论仅为
+`KEEP_DIAGNOSTIC`，不是 G09 PASS。三次 client event/usage mismatch 使 ITL comparison
+不具资格，不得从该 artifact 得出 ITL no-regression 结论。
+
+完整 artifact 通过 GitHub transfer 回传，SHA256 为
+`e25500b9da8ef546f5cb70b0785cd81a15f8b26b0d4a94fa1d2618a439363445`；详情见
+[`G08B_QWEN35_35B.md`](G08B_QWEN35_35B.md)。Vast `45319871` 已
+`stopped/exited`。在下一次 paid run 前，必须从现有 artifact 的
+`host_encode_submit=6.224 ms`、`completion_round_trip=5.629 ms` 和 device timing 中提出
+单一 source-level hypothesis；不得因本轮 KEEP 直接启动 full sweep。
+
+同一 clean source/binary 的后续 bounded full-profile 已完成该定位：4/4 请求正确，
+75 个 decode wave 中每 wave 均有 174 条 eager command、40/40 个 reusable candidate
+落在 startup preparation 之外，replay 为 0。`device_runtime_submit=5.682 ms/wave` 中
+`enqueue_commands=5.614 ms/wave`，而 completion-worker queued wait 仅
+`0.046 ms/wave`。因此失败类收敛为
+`stable-decode-command-program-outside-reusable-preparation`，不是 paged-attention
+或 scheduler/resource admission 重新设计问题。full-profile 的 `7.4649 tok/s` 仅用于
+归因，不可与 profile-off 性能比较。
+
+历史实现只证明 reusable executable 的产品路径真实存在，不能直接提供本轮性能目标。
+`beb3e63c` 的 `1.819 ms/wave` 来自真实 Qwen3.5-4B `serve`，但差分中的 36 个
+wave 混合 prefill/decode，且 measured 区间仍发生 6 次 capture。`b38e9645` 的
+`2432/2432` 也是 Qwen3.5-4B 真实请求，但它表示 76 个 decode wave 的 candidate
+segment 全命中，不是全部 command replay；同一 artifact 实际为 `7980` replay、
+`2660` eager（75% command replay），enqueue `3.27695 ms/wave`。模型、workload 和
+统计口径均与当前 M2 不同；此外 `a0038a0e` 使用 full kernel attribution，会在 eager
+command 前后记录 CUDA event，因此 owner 数可用而 enqueue 时长不能与历史 basic-profile
+直接比较。二者不得作为 `a0038a0e` 或下一候选的直接验收线。
+
+`a0038a0e` 的 `>=150` replay、`<=24` eager、`<=2.0 ms` enqueue 是该次 paid
+diagnostic 预先声明且已失败的假设，保留为 immutable REJECT 证据，不循环复用。
+该候选已证明 typed product policy integration 生效；后续问题不是再接一次开关，也不是
+新增 paged-attention 内核或第二套 command cache。
+
+诊断产物 SHA256 为
+`ebb2e401276fc5767ef96bfa66373967f6d242d9bbacd7ccf938dac27fbb59b6`，本机验证路径为
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/current-sha-full-profile-e66ade7f/`。
+该轮约 12 分钟、`$0.0939`；Vast `45319871` 已 `stopped/exited`，计费或过渡 sibling 为 0。
+
+clean candidate `a0038a0e` 已把 typed reusable program 从 legacy graph policy 中独立出来，
+且 `run/serve/config` 使用同一产品可见策略。受影响本地 gate 全部通过后，同一 RTX 4090 的
+`c03/c05/c06` 正确性通过 `3/3`。默认配置保持 `FERRUM_BATCHED_GRAPH=0`，
+同时 `FERRUM_REUSABLE_EXECUTION=1`；startup 在 `1.389 s` 内准备 240 个 executable，
+captured/uploaded/resident 均为 240，rejected/deferred 为 0，
+`eager_fallback_required=false`。
+
+该候选只命中部分 performance signal：40/40 candidate segment 每 wave 均 cache-hit/replay，
+outside-preparation 和 request-time capture/upload 均为 0；但只 replay
+`121 commands/wave`，仍有 `53 commands/wave` eager。enqueue 从 `5.614 ms` 降到
+`2.509 ms/wave`，没有达到 `<=2.0 ms`；profile-off 完成 `300/300` 且错误为 0，但
+`55.4898 +/- 2.1109 tok/s` 没有超过 `55.5897` 既有候选，正式
+`76.1583 tok/s` floor 仍差 `20.6685 tok/s`。因此 artifact 明确为
+`typed-reusable-program-partial-command-coverage` REJECT，不是 G09 progress PASS：
+
+```text
+CUDA REUSABLE PROGRAM INTEGRATION REJECT: /workspace/ferrum-artifacts/runtime-vnext-reusable-program-a0038a0e-20260724T0423/diagnostic-summary.json
+```
+
+完整 GitHub artifact SHA256 为
+`f7ab54160372956f39b868df20cc6ffedca6c06ce953cad43110953d13dbb80d`，本机已验证于
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/reusable-program-cuda-a0038a0e/`。
+该轮约 29 分钟、`$0.2269`，实例已 `stopped/exited`。下一轮 paid work 被 source
+analysis 阻塞：必须先按 typed command owner 分类 53 条 eager command，并预测哪一类进入
+prepared replay 后可把 enqueue 降到 `<=2.0 ms`；不得继续试跑发现 owner。
+
+保存的 scheduler trace 已完成该分类。每 wave 的 174 条命令由 `1` 条 token upload 和
+173 条 provider command 构成：
+
+| owner | commands/wave | 当前路径 |
+|---|---:|---|
+| RMSNorm（40 层 + final） | 41 | replay |
+| routed/shared MoE | 40 | replay |
+| residual add | 40 | replay |
+| gated-delta recurrent attention | 30 | eager compute |
+| causal paged attention compute | 10 | eager compute |
+| causal address binding | 10 | eager dynamic binding |
+| token embedding | 1 | eager compute |
+| last-token logits projection | 1 | eager compute |
+| token upload | 1 | eager input boundary |
+
+因此 `121 replay + 53 eager = 174` 已无未知 owner。源码同时证明当前抽象把两类责任混在
+同一个 `CudaDeviceCommand`：一类是 CUDA graph 真正读取的稳定 kernel/BLAS 参数，另一类是
+只为 fence 生命周期保留的动态 KV/state region。causal compute 虽然从 binding workspace
+读取 page address，仍把动态 page region 放入 compute payload，导致 reusable-address
+合同被剥离；recurrent attention、embedding 和 logits 则仍直接绑定 sequence/request 地址。
+把这些地址强行标记稳定或把 dynamic binding 捕获进 graph 都会破坏正确性。
+
+源码改造按 owner 精确分三步：先拆 captured launch region 与 fence-only dependency，
+使十个 causal compute 恢复 replay，预测 `131 replay / 43 eager`；再引入 lane-stable
+recurrent-state binding，预测 `161 / 13`；最后将 embedding/logits 移入 lane-stable
+I/O staging，预测 `163 / 11`。十个 causal address binding 与一个 upload 保持显式 eager
+边界；这些数字是下一 artifact 的可证伪预测，不是提前宣告 PASS。
+
+最终 source checkpoint 是 backend-neutral 的“plan-owned static command program +
+typed per-wave binding patch”合同及 CUDA 实现：cache hit 不再逐 node 重新
+`encode_selected`；动态 state/IO 只能通过 typed binding 或显式 eager boundary 更新；
+cached program 不得持有 request-owned resource；completion fence 必须继续覆盖所有 binding
+target。Metal 可以复用 program/binding 生命周期合同，但保留自己的 command-buffer/pipeline
+实现。完成本地 contract、生命周期和故障测试前禁止再开 paid GPU；下一轮必须重新声明将减少
+的具体 owner 数、`provider_node_encode`/`enqueue_commands` 预测和停止线。正式
+`76.1583 tok/s` floor 不变。
+
+clean source `3ac6b65a` 随后验证了第一阶段 owner 移动，但也暴露了 program segmentation
+的根缺陷。`c03 run`、`c05 serve`、`c06 streaming` 真实 CUDA 正确性 `3/3 pass`；
+75 个 decode wave 精确达到预言的 `131 replay / 43 eager`。但是同一 full-profile
+workload 中，exact-shape causal varlen prefill 进入 reusable segment 后，使相邻稳定
+RMSNorm/MoE/residual 的 prefill replay 分别丢失 `275/250/250` 条，只换回 `50` 条 causal
+prefill replay。整个 workload 的 replay 最终只增加 `25` 条，而不是 decode 局部看到的
+`750` 条。
+
+profile-off c1 `random 64/32`、`100 x 3` 完成 `300/300`，错误和质量问题均为 `0`，
+但吞吐为 `51.5331 +/- 4.3387 tok/s`，比 `a0038a0e` 的 `55.4898` 低 `7.13%`，
+距正式 floor 仍差 `24.6252 tok/s`（`32.33%`）。因此本轮按
+`mixed-topology-replay-segment-poisoning` REJECT：
+
+```text
+CUDA CAUSAL REPLAY ENVELOPE REJECT: /workspace/ferrum-artifacts/runtime-vnext-causal-envelope-3ac6b65a-20260724T0548/diagnostic-summary.json
+```
+
+下一步不是提高 executable cache 容量，也不是继续搬 recurrent owner。必须先让 replay
+eligibility 成为 typed launch-topology contract：decode V1/V2 可复用，尚无稳定 envelope
+的 varlen/fallback prefill 是显式 eager barrier，单个 dynamic-key miss 不能污染相邻 stable
+command。下一付费 artifact 的可证伪预测为：
+
+- decode 保持 `131 replay / 43 eager`；
+- prefill RMSNorm/MoE/residual replay 恢复为 `1230/1200/1200`；
+- causal prefill replay 为 `0`；
+- scoped workload 总计 `13455 replay / 5985 eager`；
+- 在这些结构数字命中前，不运行另一轮 `100 x 3` 性能。
+
+本轮压缩包 SHA256 为
+`1e0b9774ff7822ffe3336b39c7afb96b78171a40e5c0a17ba9f4f9863108b8d7`。
+后续已通过临时 GitHub branch 传回并在本机校验，路径为
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-20260724/causal-envelope-cuda-3ac6b65a/`。
+
+clean source `4df3d63a` 随后把 eligibility 固化为 typed launch-topology contract：
+decode V1/V2 继续 replay，exact-shape varlen/fallback prefill 成为带独立 fence
+dependency 的 eager barrier。CUDA candidate build 与 manifest READY，`c03 run`、
+`c05 serve`、`c06 streaming` 再次 `3/3 pass`。full-profile 精确命中全部预言：
+
+- scoped native replay `12730 -> 13455`，目标 `13455`；
+- prefill RMSNorm/MoE/residual replay 为 `1230/1200/1200`；
+- prefill causal replay 为 `0`；
+- 75 个 decode wave 均为 `131 replay + 42 eager provider + 1 upload`。
+
+因此 topology isolation 作为结构改造 KEEP；它没有改变 decode 主瓶颈。正式
+profile-off c1 `random 64/32`、`100 x 3`、seed `9271` 完成 `300/300`，
+usage token count、请求错误和质量问题均合格，但只有
+`48.3721 +/- 4.9645 tok/s`。相对 `3ac6b65a` 为 `-6.13%`，相对
+`a0038a0e` 稳定 checkpoint 为 `-12.83%`；两个近期候选的 CI 重叠，因此不把这段小差异
+另行归因。绝对 floor 仍差 `27.7862 tok/s`（`36.48%`），本轮按
+`formal-throughput-floor-miss-after-topology-isolation-hit` REJECT：
+
+```text
+CUDA TOPOLOGY REPLAY BARRIER REJECT: /workspace/ferrum-artifacts/runtime-vnext-topology-barrier-4df3d63a-20260723T231634Z/diagnostic-summary.json
+```
+
+archive 为 `35,174,029` bytes，SHA256
+`c433fffb9e77bfea543a66a6e5df5f4420f6cb58d80743e61f4dd2516084657d`。
+首次 GitHub upload 在远端连接超时，archive 暂留 retained instance `45319871`；
+实例已确认 `stopped/exited`。禁止为重复 benchmark 单独恢复实例。
+
+下一 source lever 不再调整 replay key 或 prefill segmentation，而是建立
+plan-owned immutable CUDA command program 与 typed per-wave binding patch。
+当前 decode 仍有 `43` 条 eager command，其中 `30` 条属于 recurrent attention；
+必须先用 lane-stable state indirection 证明 recurrent state 地址、RAII 和 fence
+生命周期，再降低 eager owner 数。下一 paid run 前必须有本地 command-program
+ownership、binding lifetime、recurrent address-scope 和无硬编码合同，并预言
+`decode eager <43`、`recurrent eager <30` 或可测的 host enqueue 下降；否则停止在
+source analysis。
+
+clean source `393a9a40` 随后完成 recurrent state indirection 和 wave-level
+program-binding prelude。真实 CUDA `c03 run`、`c05 serve`、`c06 streaming`
+正确性为 `3/3 pass`。75 个 decode wave 全部直接观测到
+`161 replay / 2 node-attributed eager`；补入唯一 coalesced binding prelude 和
+显式 input upload 后，完整结构精确命中预言的 `161/4`，相对 `131/43` 大幅减少
+eager command。
+
+结构命中后才运行 profile-off c1 `random 64/32`、`100 x 3`、十次 warmup、
+seed `9271`。`300/300` 请求完成，usage token、错误和质量门均通过，但性能只有
+`44.947749 +/- 3.671515 tok/s`：相对 `4df3d63a` 下降 `7.079%`，相对预声明
+KEEP 线 `55.5897` 仍差 `19.144%`，相对正式 `76.1583` floor 仍差
+`31.210551 tok/s`（`40.981%`）。因此本轮按
+`formal-throughput-floor-and-keep-threshold-miss-after-decode-structure-hit`
+REJECT：
+
+```text
+CUDA PROGRAM BINDING PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-program-binding-393a9a40-20260724T004652Z/diagnostic-summary.json
+```
+
+同机、同 workload 的 host-wall 边界给出可归因结果：
+
+| decode boundary | `4df3d63a` | `393a9a40` | delta |
+|---|---:|---:|---:|
+| resource prepare | `1.507994ms` | `1.894054ms` | `+25.601%` |
+| host encode/submit | `6.122343ms` | `5.066258ms` | `-17.250%` |
+| completion round trip | `6.689556ms` | `8.351333ms` | `+24.841%` |
+| submitted wave total | `13.626184ms` | `14.433627ms` | `+5.926%` |
+
+这证明 replay 和 host-submit 方向有效，但当前 coalescer 只合并 Rust command 外壳，
+没有合并 30 个 recurrent 加 10 个 causal provider binding 的 native transfer 与
+resource workspace。下一 source checkpoint 必须把 binding ownership 上移到 compiled
+plan：一个 typed `ProgramBindingLayout`、一个 lane-owned device arena、一个连续 host
+patch 和每 wave 最多一次 H2D upload；provider compute program 只编译一次并使用固定
+offset。不得继续在 per-node invocation binding workspace 上打补丁。
+
+另一 paid run 前，本地合同必须证明 aggregate workspace、单 upload、request-owned
+address 隔离、RAII/fence 和无硬编码。下一 artifact 必须保持 `161/4`，把 binding native
+transfer 降到 `<=1`，并把 decode resource prepare、completion round trip、total
+分别恢复到 `<=1.507994ms`、`<=6.689556ms`、`<=13.626184ms`；之后才允许以
+`>=55.5897 tok/s` 作为最小 KEEP 线。`393a9a40` 禁止原样复跑。
+
+完整 archive SHA256 为
+`38dba973258d622f40d550794b2b2d5b829fe4a85fe0ce075d913382aa2e4146`，
+暂留 stopped Vast instance `45319871`。实例已确认 `stopped/exited`，无 billable
+sibling；GitHub transfer 尚未完成，不能把远端留存写成已 copy-back。
+
+clean source `e5a6e6c1` 随后完成 compiled `ProgramBindingLayout`、lane-owned
+binding arena 和 typed aggregate host patch。真实 CUDA `c03 run`、`c05 serve`、
+`c06 streaming` 为 `3/3 pass`；75 个 decode wave 均有 40 个 recurrent/causal
+binding owner、恰好一个 aggregate prelude 和恰好一次 physical transfer，缺失、重复、
+非法 attribution 均为 `0`：
+
+```text
+CUDA PHASE B AGGREGATE BINDING TRACE PASS: /workspace/ferrum-artifacts/runtime-vnext-phase-b-trace-e5a6e6c1-20260724T030818Z/full-profile/trace-summary.json
+```
+
+结构命中不等于性能通过。profile-off c1 `random 64/32`、`100 x 3`、十次 warmup、
+seed `9271` 完成 `300/300`，错误和质量问题均为 `0`，但只有
+`45.931942 +/- 2.411397 tok/s`。距预声明 KEEP 线 `55.5897` 仍差
+`9.657758 tok/s`（`17.37%`），距正式 floor `76.1583` 仍差
+`30.226358 tok/s`（`39.69%`），因此只 KEEP 结构、REJECT 性能：
+
+```text
+CUDA PHASE B C1 THROUGHPUT REJECT: /workspace/ferrum-artifacts/runtime-vnext-phase-b-trace-e5a6e6c1-20260724T030818Z/perf-off/throughput-summary.json
+```
+
+同 workload 的 profile-off host wall 相对 `393a9a40` 显示 host encode/submit
+`5.066258 -> 4.710335 ms`（`-7.03%`），completion round trip 仅
+`8.351333 -> 8.264359 ms`（`-1.04%`），submitted wave total
+`14.433627 -> 13.908279 ms`（`-3.64%`）。full profile 的 exact submission
+counter 已把主区间缩到 device：decode device execution 平均 `8.206444 ms`，
+completion worker queued wait 仅 `55.987 us`，readback host 为 `348.865 us`；
+device execution 与 fence host wait 可能重叠，禁止相加。
+
+剩余阻塞不再需要另一轮吞吐排除法。当前 CUDA kernel profile 在任何 reusable
+executable replay 后直接把整批 command timing 置为 `BackendUnsupported`。本 artifact
+的 `18,450` 条 native event 只有 `825` 条 measured，`17,625` 条 unavailable；
+其中 `16,605` 条 replayed compute 全部 unavailable。因此 exact submission 能证明
+`8.206444 ms` 在 device program 内，却不能把它继续分解到 replay segment/op/kernel。
+下一 source checkpoint 是 typed physical timing span：eager command 使用
+`[command_index, command_index + 1)`，replay executable 使用真实
+`[start_command_index, end_command_index)`，consumer 按显式 span join，禁止把一个
+segment duration 复制到多个 logical command。完成本地 contract 和 CUDA feature compile
+前，不允许再开 paid GPU 或重跑 `100 x 3`。
+
+本轮 diagnostic 决策为
+`REJECT_PERFORMANCE_KEEP_STRUCTURE`，不计 G09 formal progress。archive 为
+`5,157,454` bytes，SHA256
+`b0624ac1c8281897a1d6e1f4db77a95cd5959b69a1edcd5858b98c955a51ba7d`，
+已通过 GitHub branch
+`artifact/runtime-vnext-phase-b-e5a6e6c1-20260724` 传回并在本机校验，路径为
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-phase-b-trace-e5a6e6c1-20260724T030818Z/`。
+retained instance `45319871` 已再次确认 `stopped/exited`，无 billable sibling。
+
+clean source `33fc6e46` 随后实现 typed physical execution span，并用同一 retained
+1x RTX 4090 完成一次 bounded diagnostic。CUDA binary SHA256 为
+`7e2b279eb8899c3dd3c7a0da938b00cbc11580dca679986347844ebb78101eb6`；`c03 run`、
+`c05 serve`、`c06 streaming` 均为 `KEEP`。本轮没有重跑 `100 x 3`，只用
+c1 `random 64/16`、4 requests、1 repeat 获取 full-profile shape。
+
+物理计时覆盖已经从 replay 全部 unavailable 收敛为 `405/405 measured`，logical replay
+command `16,605` 条的 duplicated elapsed 为 `0`，ownership/range error 为 `0`。decode
+device interval 平均 `8.203624ms`，精确拆为 replay `6.995859ms`（`85.3879%`）、
+eager `1.197175ms` 和 gap `6.527573us`。这把下一瓶颈从“device program”进一步收敛为
+“CUDA graph replay body”；program binding、scheduler gap 和 completion queue 不再是本轮
+第一假设。eager 的主要次级项是 last-token dense projection
+`1.069725ms/decode frame`。
+
+```text
+CUDA REPLAY EXECUTION SPAN TRACE PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-span-summary.json
+CUDA REPLAY EXECUTION BREAKDOWN PASS: /workspace/ferrum-artifacts/runtime-vnext-replay-span-33fc6e46-20260724T041818Z/full-profile/replay-breakdown-summary.json
+```
+
+该 artifact 的 decision 为 `KEEP_OBSERVABILITY_CHECKPOINT`，
+`formal_performance_goal_progress=false`，因此不改变 `76.1583 tok/s` floor 或 G09 Open
+状态。archive SHA256 为
+`74c0e665fd7e2830e12c681831deb7775b35b504d45811462e6a18155ab679d3`，已通过
+GitHub branch `artifact/runtime-vnext-replay-span-33fc6e46-20260724` 回传并在本机验证；
+branch 最新 lifecycle commit 为 `d3f70381`。Vast `45319871` 已
+`stopped/exited`，无 billable sibling。
+
+下一 paid performance work 仍被 source/profile hypothesis 阻塞。只允许先对 decode graph
+运行 kernel-activity scoped diagnostic，要求 `>=95%` replay duration 被 kernel/native-op
+分类；未命中则停止并修复 profiler，不运行吞吐。命中后只优化累计占比最高的一个 kernel
+family，并预先声明该 family 的 device-time 降幅及对 `8.203624ms` decode interval 的预测，
+再决定是否值得运行 profile-off performance smoke。
+
+该 scoped diagnostic 已在 clean source `36b1b3af` 上按停止规则执行并
+`REJECT_INSTRUMENTATION_LIFECYCLE`：12 个 fingerprint 全部 join，但 405 个 NVTX replay
+range 未正常闭合，kernel-duration sum / Ferrum replay wall-time=`1.170497`；原始 SQLite
+显示 405 个 start 共享同一个 profiler terminal end，v2 projection 重放把 405/405 标记为
+nested。它没有运行 throughput，也没有产生 G09 performance progress；受污染的 GEMV/Marlin/
+MoE-align 排名不得用于选择优化项。
+
+修复提交 `8f44dd8c` 改为显式成对标记，并把 analyzer coverage 口径切到 projected GPU
+wall-time。下一次 paid work 仍只允许复用同一 stopped 4090 做一次 bounded attribution：
+CUDA feature compile、`c03/c05/c06` 必须先 PASS；range count 必须逐 fingerprint 对齐、
+nesting/child=`0`、projection coverage=`0.95..1.10`。任一条件失败即保存 REJECT 并停机；
+全部命中后才接受 top kernel family，仍不直接运行 `100 x 3` 或 G09 full sweep。完整失败
+artifact、GitHub commit `804cb22a` 和 SHA256
+`b6f0558f98675ad043d31f5958aa45e60f1c0ed38b6fad7f0173d45d02d8a143`
+记录在 [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md)。
+
+后续 clean source `32c53a6b` 的同范围 bounded diagnostic 已命中全部 correlation stop
+condition，精确结果记录在 [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md)。
+这只关闭 profiler instrumentation blocker，不改变 G09 Open 状态或 `76.1583 tok/s` floor。
+dominant decode graph 的 owner kernel work 为 recurrent attention `46.0304%`、MoE
+`40.3663%`、causal attention `11.8639%`；paged-attention kernel 本体仅 `1.2260%`。
+
+recurrent attention 内部第一组可修改瓶颈是五个 F16 projection，其中 QKV GEMV 占全部
+kernel work `16.7828%`、Z GEMV `8.7463%`、output GEMV `8.8117%`，B/A 各约 `0.95%`。
+当前 vNext 每层分别提交 QKV、Z、B、A 四次 projection；当前 vLLM Qwen GDN 则把它们组织为
+QKVZ 和 BA 两个 merged projection。Ferrum 采用自己的 typed weight/program 合同：在模型
+prepare 时把现有 immutable source weight 物化为 QKVZ/BA composite，热路径只执行两次
+projection，不引入 model-name/GPU-name 分支，也不复制 Python runtime 设计。
+
+下一项 CUDA candidate 的必需信号为：30 个 recurrent layer 每层 projection kernel 从
+`4` 降到 `2`，dominant decode graph 总 kernel node 至少减少 `60`；`c03/c05/c06` 正确性
+必须先通过，replay wall 和 profile-off throughput 均不得回退。若 graph-node 信号未命中，
+立即 REJECT source contract；只有命中且窄 profile 显示绝对时间改善，才运行一次
+profile-off c1 smoke，不直接运行 G09 full sweep。
+
+### 2026-07-24 GDN Input Fusion Result
+
+Clean source `cefb4de25036a818fd3d0628a63b4fde3b74d81d` implements the typed
+QKVZ/BA input fusion and the reviewed v5 operation, weight-layout, numerical
+tolerance, and backend extent contracts. The bound one-RTX-4090 CUDA binary
+SHA256 is
+`fa76fc9af5cdef07d6a887cc821b4347d139263a6b1618b542af0f29cb947800`;
+the final incremental release build took `295.619278 s`.
+
+Correctness preceded every performance measurement:
+
+- the CUDA packed-extent, CUDA/CPU packed numerical parity, and production replay
+  symbol tests each passed `1/1`;
+- actual-model `c03-001 ferrum run`, `c05-001 ferrum serve`, and `c06-001`
+  streaming serve passed `3/3`;
+- the focused runner printed
+  `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`, with zero blocker-scan match.
+
+The predeclared structural signal was exact. The same Qwen3.5 program has 30
+recurrent layers; the `32c53a6b` trace reported `13` compute dispatches per layer
+and `390` per correlation, while `cefb4de2` reported `11` and `330`. This is an
+observed reduction of exactly `60` compute dispatches per correlation, not a
+source-count estimate.
+
+The same-hardware full-profile timing also moved in the predicted direction over
+75 decode correlations:
+
+| signal | `32c53a6b` | `cefb4de2` | delta |
+|---|---:|---:|---:|
+| replay elapsed | `7.362019 ms` | `6.888088 ms` | `-0.473931 ms` (`-6.44%`) |
+| complete device span | `8.608580 ms` | `8.097945 ms` | `-0.510635 ms` (`-5.93%`) |
+| GDN dispatches/correlation | `390` | `330` | `-60` |
+
+Profile-off c1 used the canonical diagnostic workload: random `64/32`, 100
+measured requests and 10 warmups per repeat, three repeats, seed `9271`,
+`--fail-on-error --require-ci`, and usage-derived token counts. It completed
+`300/300` with zero request, stream, output, or quality error. Repeat throughput
+was `48.2964 / 46.4895 / 55.4540 tok/s`, with mean
+`50.0800 +/- 11.7781 tok/s` and CV `9.4667%`.
+
+This is `4.1480 tok/s` (`9.03%`) above the latest available current-path
+profile-off checkpoint at `45.931942 tok/s`, so the optimization source is kept.
+It remains `5.5097 tok/s` (`9.91%`) below the higher `55.5897 tok/s` KEEP line
+and `26.0783 tok/s` (`34.24%`) below the unchanged `76.1583 tok/s` formal floor.
+The decision is therefore:
+
+```text
+CUDA GDN INPUT FUSION CHECKPOINT KEEP: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/diagnostic-summary.json
+CUDA GDN INPUT FUSION FORMAL PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/diagnostic-summary.json
+```
+
+The complete GitHub-transfer archive is
+[runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z.tar.zst),
+asset id `488205719`, size `30,043,998` bytes, SHA256
+`0521a5baa3b98398ce2e4683576b3e558500da74f6cf2479b369d53fef41e144`.
+It was downloaded and revalidated locally at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-fusion-cuda-cefb4de2-20260724T080613Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no running or
+scheduling sibling.
+
+No repeat of this candidate or G09 full sweep is authorized. The next work is
+offline source/profile analysis of the post-fusion graph. It must compare the
+remaining recurrent output projection against the MoE routing/alignment/Marlin
+family, select one predicted high-return lever, and name an absolute device-time
+change before another paid run. The retained `330` dispatch count, `6.888088 ms`
+replay time, product `3/3`, and zero-error profile-off result become no-regression
+requirements for that candidate.
+
+### 2026-07-24 Single-Token MoE Direct-Alignment Result
+
+Clean source `992153a4de14bee734c97f54d2b78b754d7737f7` replaces the
+single-token Qwen3.5 MoE route-plus-generic-align sequence with one typed
+`SingleTokenDirectMarlin` plan. The CUDA router writes the stable
+expert/token/block metadata required by Marlin directly; multi-token prefill
+continues to use the generic alignment path. The bound one-RTX-4090 binary
+SHA256 is
+`393f377659560db9c5df564bf544fbf7d435780059c2fb71fbfbe1e797d1ae1a`.
+
+Correctness ran before performance:
+
+- the focused replay source contract passed `8/8` and the kernel library tests
+  passed `17/17`;
+- actual Qwen3.5-35B `c03-001 ferrum run`, `c05-001 ferrum serve`, and
+  `c06-001` streaming serve passed `3/3`;
+- the focused runner printed
+  `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`;
+- positive blocker-log matches and structured request-quality issues were both
+  `0`.
+
+The full-profile structural result exactly matched the predeclared prediction.
+Across 75 decode correlations and 3,000 MoE node observations, the old
+`cefb4de2` candidate used `12` physical compute dispatches per single-token MoE
+node; `992153a4` uses `11`. Multi-token prefill remains at `12`, so the change
+did not broaden into the generic route. Mean replay device time moved from
+`6.888088 ms` to `6.233041 ms`, a reduction of `0.655048 ms` or `9.51%`.
+This agrees with the prior Nsight attribution of about `0.679 ms/token` to
+`moe_align_block_size_pair_ids_f32`.
+
+The canonical profile-off c1 workload remained random `64/32`, 100 measured
+requests plus ten warmups per repeat, three repeats, seed `9271`,
+`--fail-on-error --require-ci`, and usage-derived token counts. It completed
+`300/300` with zero request or quality error. Repeat throughput was
+`45.7588 / 46.4369 / 50.4481 tok/s`, with mean
+`47.5479 +/- 6.2963 tok/s`. This is `2.5320 tok/s` (`5.06%`) below the
+`cefb4de2` mean; the two three-repeat confidence intervals overlap, so this run
+does not prove an end-to-end regression or improvement. It remains
+`28.6104 tok/s` (`37.57%`) below the unchanged `76.1583 tok/s` formal floor.
+
+The decision therefore separates the deterministic structural evidence from
+the noisy product metric:
+
+```text
+CUDA MOE DIRECT ALIGN STRUCTURAL KEEP: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/diagnostic-summary.json
+CUDA MOE DIRECT ALIGN CANONICAL PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/diagnostic-summary.json
+```
+
+The complete GitHub-transfer archive is
+[runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z.tar.zst),
+asset id `488260567`, size `29,911,858` bytes, SHA256
+`0550e682170a20bed55a53627ac879c98cd2a522d1d1f8dc3f115cd02fc51eff`.
+It was range-resumed after an interrupted download and revalidated locally at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-moe-direct-align-cuda-992153a4-20260724T091507Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
+
+The workspace all-target test compiled and then encountered two existing
+network-sensitive CLI E2E failures: the inherited host proxy returned a
+Hugging Face `404 Repository not found` before the tests could observe their
+expected local missing-model message. Therefore this checkpoint does not claim
+the unit source-gate PASS line.
+
+No repeat of `992153a4` or G09 full sweep is authorized. Offline work must now
+rank the post-fusion projection/GEMV, recurrent kernel, Marlin, and
+shared-versus-routed scheduling costs against current source and the vLLM
+baseline. Another paid run requires one falsifiable lever, a named device-time
+or trace-shape delta, and a reject threshold; the current `11` MoE dispatches,
+`6.233041 ms` replay time, product `3/3`, and zero-error c1 result are the new
+structural no-regression requirements.
+
+### 2026-07-24 Typed Direct-Program And Binding-Only Results
+
+Clean source `f435bec9498d51e77c0e08b71ea29016f3eb74ed` moved cache hits onto
+the exact typed CUDA direct-program path. Qwen3.5-35B `c03/c05/c06` passed
+`3/3`; the canonical c1 run completed `300/300` requests at
+`59.887970 +/- 17.927647 tok/s`. Health evidence reported `12,210` direct
+waves, `32,010` direct segments, `468,600` binding-node applications, and zero
+direct fallback or catalog-epoch miss. This is the best current-path mean in
+the immediate sequence of CUDA direct-program candidates, but it remains
+`16.270330 tok/s` (`21.36%`) below the unchanged `76.1583 tok/s` floor and
+therefore does not satisfy G09.
+
+Clean follow-up `8c58e3ea0017c85865c5b5f56d0b02e94f36063a` installed specialized
+binding-only encoders for recurrent and causal attention. It retained the same
+direct counts and again passed `c03/c05/c06` `3/3`, but the same c1 command
+produced only `50.272873 +/- 3.385823 tok/s`. The predeclared
+`host_encode_submit <2.319187 ms` signal also missed at `3.076369 ms`.
+Resource preparation and host postprocess regressed by similar proportions,
+while completion changed only from `7.482255 ms` to `7.628776 ms`; the run is
+classified as
+`profile-off-host-wide-latency-regression-with-specialized-binding-coverage`.
+It cannot prove that the simpler binding source path caused or fixed the
+end-to-end delta.
+
+The immutable local evidence roots are:
+
+- `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-direct-program-cuda-f435bec9-20260724T115319Z-gated/`
+- `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-only-cuda-8c58e3ea-20260724T122544Z/`
+
+The latter contains `diagnostic-summary.json` with the paired stage metrics,
+binary SHA256, clean source SHA, correctness KEEP line, command evidence, and
+stopped-instance receipt. Both source checkpoints remain below the absolute
+floor, so no repeat c1 or full sweep is authorized. The next paid diagnostic
+requires existing full-profile or bounded same-process attribution to isolate
+`provider_node_encode` from host-wide variance, followed by one source-level
+hypothesis with a named stage delta.
+
+### 2026-07-24 Same-Session Direct-Binding Attribution
+
+The requested bounded attribution subsequently completed on the same retained
+RTX 4090 with both binaries, one model cache, and `A-B-B-A` ordering. Each slot
+used `profile-detail=basic`, random `64/32`, c1, 25 measured requests plus five
+warmups, and seed `9271`. All `100/100` measured requests passed with usage
+token counts, and all 4,440 direct waves completed with zero direct fallback
+or catalog-epoch miss.
+
+The reversal followed the binary in both halves:
+
+| direct-path metric | A `f435bec9` | B `8c58e3ea` | B vs A |
+|---|---:|---:|---:|
+| provider-node encode | `1498.316 us` | `860.026 us` | `-42.60%` |
+| host encode/submit | `3598.252 us` | `2534.590 us` | `-29.56%` |
+| completion round trip | `7565.833 us` | `7495.563 us` | `-0.93%` |
+| diagnostic throughput | `47.0844 tok/s` | `54.8719 tok/s` | `+16.54%` |
+
+This resolves the earlier unpaired profile-off ambiguity in favor of retaining
+the specialized binding-only source. It does not satisfy the formal
+`76.1583 tok/s` floor and is not a G09 performance PASS. The immutable result
+is:
+
+```text
+CUDA DIRECT BINDING AB ATTRIBUTION KEEP: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-binding-ab-attribution-20260724T130106Z/diagnostic-summary.json
+```
+
+### 2026-07-24 Rejected Single-Token Packed-Decode Candidate
+
+Clean candidate `67921b1c55a093c43e5e6a4ea5f60c7916a962df`, binary SHA256
+`1a6c582c6af39bf22bfd9f9d6d9a138334ba1b397a6280d955bb376531b1d8d3`,
+implemented a typed single-token recurrent topology. The CUDA build completed
+in `295.411386 s`. Correctness ran before profiling or throughput:
+
+- actual-model `c03-001 ferrum run`, `c05-001 ferrum serve`, and `c06-001`
+  streaming serve passed `3/3`;
+- all three cases passed execution-envelope, expectation, model-binding, and
+  scenario-oracle checks;
+- the runner printed `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`.
+
+The full-profile structural prediction was exact. Across 75 decode
+correlations and 2,250 recurrent-layer observations, each recurrent layer
+moved from `11 compute + 2 transfer` commands to `9 compute + 0 transfer`.
+The recurrent contribution therefore moved from `330` to `270` compute
+dispatches per decode correlation. Mean physical replay span moved from
+`6.888088 ms` to `6.195692 ms`, an improvement of `0.692397 ms` or `10.05%`.
+The full-profile diagnostic throughput also moved from `7.454970` to
+`7.918762 tok/s`; profile-on throughput is not a product performance claim.
+
+The bounded profile-off check used random `64/32`, concurrency one, 25 measured
+requests plus five warmups per repeat, three repeats, seed `9271`,
+`--fail-on-error --require-ci`, and usage token counts. It completed `75/75`
+with zero request or quality error. Repeat throughput was
+`54.6932 / 58.6079 / 50.5373 tok/s`, mean
+`54.6128 +/- 10.0265 tok/s`. This missed the predeclared current-path
+`59.887970 tok/s` line by `5.275174 tok/s` and the unchanged
+`76.1583 tok/s` formal floor by `21.545504 tok/s` (`28.29%`). The smaller
+diagnostic request count does not prove a formal regression, but it cannot
+accept the candidate or authorize a full sweep.
+
+The result is therefore structural KEEP and candidate REJECT:
+
+```text
+CUDA PACKED DECODE STRUCTURAL KEEP: dispatch-diagnostic/dispatch-summary.json
+CUDA PACKED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commit `b0286270` explicitly reverted the two candidate commits after targeted
+verification: the CUDA replay source contracts passed `9/9`,
+`cargo check -p ferrum-kernels --all-targets` passed, and formatting passed.
+The rejected implementation remains in Git history for diagnosis but is not
+present in the active source tree.
+
+The sanitized GitHub evidence asset is
+[runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z-sanitized.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z-sanitized.tar.zst),
+asset id `488525573`, size `28,247,157` bytes, SHA256
+`152c6cb4257c7656ab7f3fd3722713da97f0e109b7216b9f2c7970969838cc07`.
+It was verified locally under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-cuda-67921b1c-20260724T140119Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
+
+This exact candidate must not be rerun. Source review found that its packed
+delta kernel normalizes Q/K inside each value-tile block. The initial successor
+hypothesis was to move normalization to a once-per-key-head stage while
+preserving the typed topology and indirect-state lifetime contract. That exact
+hypothesis has now been evaluated and rejected below; it must not be proposed
+again as an untested next step.
+
+### 2026-07-24 Rejected Separate-Normalization Packed Decode
+
+Clean source `a884f5d44e9bb68542e2dfe67d8310fb2071f227`, binary SHA256
+`64e137337df0f120d7a4d415198a2d9a7a0921df4c34f3d8b7808fd6992bf357`,
+implemented the once-per-key-head normalization hypothesis as a separate CUDA
+dispatch followed by a prenormalized packed-delta kernel. The release build
+completed in `296.234294 s`. Correctness preceded performance:
+
+- the actual RTX 4090 CUDA parity test
+  `normalized_packed_decode_matches_varlen_cuda_state_and_output` passed `1/1`;
+- actual-model `c03 run`, `c05 serve`, and `c06 streaming serve` passed `3/3`;
+- request errors, quality issues, and blocker-log matches were all `0`.
+
+The topology reached its exact prediction of `10 compute + 0 transfer` per
+recurrent layer, but the physical result missed its predeclared stop
+condition. Across 75 decode correlations and 2,250 recurrent observations,
+mean replay was `6.221576 ms`, which is `0.025885 ms` or `0.4178%` slower than
+the `67921b1c` packed candidate's `6.195692 ms`. The additional normalization
+dispatch cost more than the removed per-value-tile normalization saved.
+Profile-off was intentionally not run after the structural miss.
+
+The immutable decision is:
+
+```text
+CUDA NORMALIZED PACKED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+Commit `784d5bf2` reverted the candidate; the active source contains neither
+rejected packed-decode implementation. The GitHub-transfer artifact is
+[runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z-sanitized.tar.zst](https://github.com/sizzlecar/ferrum-infer-rs/releases/download/untagged-711d3e8abdfcbe0c8b41/runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z-sanitized.tar.zst),
+asset id `488576890`, size `27,926,534` bytes, SHA256
+`38e715a12017b0771f8da38b2c80b7b4fbdab358c23a67f61ccba3ad77e67080`.
+It was downloaded and revalidated locally under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-normalized-packed-decode-cuda-a884f5d4-20260724T153606Z/`.
+Vast instance `45319871` is confirmed `stopped/exited`, with no paid sibling.
+
+Neither `67921b1c` nor `a884f5d4` may repeat the old unpaired benchmark
+protocol. The one permitted bounded re-attribution of the already-built
+baseline and `67921b1c` binaries has run and stopped after its first Basic
+pair. Both A=`8c58e3ea` and B=`67921b1c` completed 25/25 requests with `1,110`
+direct waves, zero fallback, and zero catalog-epoch miss. B moved throughput
+from `53.239670` to `51.267727 tok/s` (`-3.70%`) and completion from
+`7,540.598` to `7,900.400 us` (`+4.77%`). Because the predeclared adjacent-pair
+direction test failed, B2/A2 and profile-off were not run. `67921b1c` is
+permanently rejected, with immutable evidence at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-packed-decode-paired-ab-20260724T163845Z/diagnostic-summary.json`.
+
+### 2026-07-24 vLLM Source Comparison And Measurement Amendment
+
+The current source comparison uses local vLLM commit
+`426d48bfa149582664d48f89df21ec9beae5c37b`. For Qwen3.5 non-speculative
+decode, vLLM runs `causal_conv1d_update` and then
+`fused_recurrent_gated_delta_rule_packed_decode`
+(`qwen_gdn_linear_attn.py:1206-1218,1564-1615`). Its Triton program uses grid
+`(NV, B * HV)` and reloads and normalizes Q/K inside every value tile
+(`third_party/flash_linear_attention/ops/fused_recurrent.py:282-315,448-475`).
+This deliberately accepts repeated normalization to avoid another launch.
+Accordingly, `67921b1c` was structurally closest to vLLM, while `a884f5d4`
+tested a Rust/CUDA-specific alternative and proved that a separate launch is
+worse. Ferrum must use this evidence to improve the trade-off, not copy either
+implementation blindly.
+
+The same review also corrected a profiling assumption. Current Ferrum maps
+`off -> DeviceTimingMode::Off`, `basic/debug -> Completion`, and
+`full -> Kernel`. The typed direct-program path is selected only outside
+`Kernel`; full kernel attribution explicitly falls back to complete logical
+provider encoding. Therefore:
+
+- `full` is authoritative for topology, graph-node composition, and device
+  replay deltas only when its reusable executable/graph fingerprints match the
+  paired direct path;
+- `full` host-stage timings and throughput are not product-path evidence;
+- `basic` is the bounded direct-path attribution lane, with fallback and epoch
+  miss required to remain `0`;
+- candidate triage uses same-instance, same-cache `A-B-B-A`; each reversed
+  adjacent pair must move in the predicted direction. Only after it passes may
+  profile-off `A-B-B-A` run;
+- formal G09 evidence remains the complete `ABBA-BAAB`, the unchanged
+  `76.1583 tok/s` floor, and the external/legacy ratio gates above.
+
+For a device candidate, structural KEEP alone is insufficient. It must also
+improve direct-path completion/device time or paired profile-off throughput.
+Comparing a 25-request candidate mean against a stale 300-request historical
+mean is no longer an acceptance method. The G06 execution-path fingerprint
+contract is a dependency of the next paid GDN run.
+
+### 2026-07-24 Fused Conv/QK-Norm Packed-Decode Rejection
+
+Candidate `2154fed72e449e2b178191c552c93d11f1524783` tested the remaining
+obvious packed-decode design: convolution-state update, Q/K normalization, and
+QKVZ packing in one launch, with independent key-head and value-head CUDA
+workers. Its release binary SHA256 was
+`3fd5bae299398e3867006907229eb2409dbbec3d856c013600c8dc0ce6af5f3b`.
+
+The candidate first passed CUDA fused-vs-varlen parity `1/1`, actual-model
+`run`/`serve`/streaming correctness `3/3`, and 75 decode correlations covering
+2,250 recurrent-layer records at exactly `9 compute + 0 transfer`. The first
+same-session Basic product pair nevertheless failed its stop condition:
+
+| direct-path metric | A `8c58e3ea` | B `2154fed7` | B vs A |
+|---|---:|---:|---:|
+| throughput | `54.760873 tok/s` | `48.621077 tok/s` | `-11.21%` |
+| completion round trip | `7,575.265 us` | `7,687.385 us` | `+1.48%` |
+| resource prepare | `2,074.006 us` | `2,609.406 us` | `+25.81%` |
+| host encode/submit | `2,589.262 us` | `3,054.133 us` | `+17.95%` |
+| provider-node encode | `866.367 us` | `1,081.315 us` | `+24.81%` |
+
+Both slots completed 25/25 requests with `1,110` direct waves, zero fallback,
+and zero catalog-epoch miss, and both ended at 49 C, 2,715 MHz SM, and
+10,251 MHz memory clocks. The structural result therefore does not excuse the
+product-path regression. The immutable decision is:
+
+```text
+CUDA FUSED DECODE CANDIDATE REJECT: diagnostic-summary.json
+```
+
+No second pair or profile-off sweep ran. Commits `d9ebf8ab` and `f07959af`
+reverted the source; targeted replay contracts passed `9/9` after the revert.
+Vast `45319871` is confirmed `stopped/exited`. The local summary is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-fused-decode-cuda-2154fed7-20260724T173030Z/diagnostic-summary.json`;
+the complete artifact remains on the retained stopped instance.
+
+This permanently rejects both tested packed-decode trade-offs: repeated
+per-value-tile normalization and separate normalization dispatch were already
+rejected, and combining normalization with convolution/packing also failed
+the direct product path. The first-pair evidence does not prove that the fused
+kernel itself caused every host-stage increase. Before another paid GDN run,
+offline attribution must explain why resource preparation, host submission,
+and provider encoding moved together, identify the direct-path boundary
+responsible, and make a falsifiable prediction for a new source delta. A
+launch-count-only kernel proposal is not sufficient.
+
+### 2026-07-25 Attribution correction checkpoint
+
+The recovered first-pair artifact remains an immutable candidate REJECT, but
+offline source/artifact review did not establish that the fused kernel caused
+the co-moving resource-prepare, provider-encode, and host-submit increase.
+Both slots used `1,110` direct waves with zero fallback and zero catalog-epoch
+miss, while historical adjacent slots show that the three host counters can
+move together under CPU scheduling/order noise. Repeating another Basic pair
+would therefore re-measure the same ambiguity rather than isolate a source
+boundary.
+
+Commit `6a2c49a65077161f988ac04e372ff5a6fcc1adc3` implements the prerequisite
+direct-path Replay profiler described by G06. It records physical
+reusable/eager spans and executable fingerprints without switching CUDA to
+the `full/Kernel` logical-provider path. This is observability infrastructure,
+not a performance candidate and not formal G09 progress.
+
+The next paid action is limited to validating that profiler on the retained
+1x RTX 4090 after product correctness. No packed-decode source delta, Basic
+pair, profile-off pair, or throughput sweep may start until the resulting
+artifact proves direct reusable span coverage, zero fallback/epoch miss, and
+machine-readable JSONL attribution. After that checkpoint, the next kernel
+candidate must name one measured physical span/fingerprint, predict its
+device-time change, and retain the existing absolute throughput floor.
+
+### 2026-07-25 Compiled Wave Identity Candidate
+
+The bounded profiler prerequisite is now closed by clean source `a199da56`.
+Its validator printed:
+
+```text
+CUDA DIRECT REPLAY PRODUCT PROFILE WIRING PASS: /workspace/ferrum-artifacts/runtime-vnext-direct-replay-profiler-wiring-a199da56-20260724T194156Z
+```
+
+That artifact is an observability PASS, not a throughput result. Its two
+captured decode waves measured `wave_identity_bind=1.986930 ms/wave`,
+`provider_node_encode=1.185340 ms/wave`, and
+`device_runtime_submit=0.351861 ms/wave`. The identity stage alone was
+`5.65x` the host device-submit stage. Source review found that the product
+executor rebuilt and fingerprinted every immutable-plan node identity and
+every participant projection for every physical wave, even when the typed
+direct reusable program needed only the input boundary, per-wave binding
+nodes, and explicit eager nodes. Successful submission and completion
+receipts then eagerly rebuilt the same full participant projection.
+
+The source candidate therefore changes the ownership boundary rather than
+adding a CUDA/model special case:
+
+- plan, node, operation, provider, runtime, and lane topology compile once
+  into an immutable `CompiledSubmissionWaveIdentity`;
+- each wave binds only live participant/frame/session seeds and validates
+  their authority;
+- exact node identities materialize lazily for input, binding, eager,
+  failure, serialization, or profile/event consumers;
+- successful submission/completion receipts retain the compact batch
+  identity and lazily expand participant projections; failure
+  classification still requires and preserves exact identities;
+- `ferrum run` and `ferrum serve` use the same product executor path;
+  there is no model name, GPU name, backend name, fixed concurrency, or
+  hidden environment branch;
+- health evidence exposes `identity_materialization.waves`,
+  `logical_nodes`, `nodes_materialized_before_submit`, and
+  `full_participant_materializations_before_submit`.
+
+The first source slice is not G09 progress until a clean paid artifact
+passes the following bounded decision contract:
+
+1. Existing actual-model `run`, non-streaming `serve`, and streaming
+   `serve` correctness remain `3/3`; request/quality/blocker errors remain
+   `0`.
+2. Direct fallback, catalog miss, and catalog-epoch miss remain `0`.
+3. For decode direct waves,
+   `full_participant_materializations_before_submit == 0` and
+   `nodes_materialized_before_submit / logical_nodes <= 0.30`.
+4. Same-session Basic `A-B-B-A` must report candidate
+   `wave_identity_bind <=0.750 ms/wave` and at most `0.60x` its adjacent
+   baseline aggregate. Each reversed adjacent pair must move in the
+   predicted direction.
+5. Only after item 4 passes may profile-off `A-B-B-A` run. Candidate mean
+   throughput must improve by at least `5%`, neither reversed adjacent pair
+   may regress, completion/device time may not regress by more than `3%`,
+   and the unchanged absolute `76.1583 tok/s` gap must be reported.
+
+Missing the materialization or identity-stage signal is
+`REJECT_COMPILED_WAVE_IDENTITY`; hitting it without the profile-off product
+gain is `STRUCTURAL_KEEP_PERFORMANCE_REJECT`. Either result stops the paid
+lane after artifacts are copied back. No full sweep is authorized by this
+source slice.
+
+### 2026-07-25 Compiled Wave Identity CUDA Decision
+
+Clean source `790f29ce699460e08eb9c2f90476810c52ce1eee` was built on the retained
+single RTX 4090 in `5m09s`. The adjacent baseline and candidate binary
+SHA256 values were respectively
+`ac6179f2765a98fa9fb89fc1207b525baac8272a8f5b31853ded25a8dbff20ab`
+and
+`dcfde7bc7a4f3a7d5c3a1d34a8c048ac38bd5230cdab6904b45196e0442895e8`.
+Actual-model `run`, non-streaming `serve`, and streaming `serve` passed
+`3/3` with zero errors. Their health snapshot reported zero direct
+fallback, catalog miss, and catalog-epoch miss.
+
+The Basic `A-B-B-A` result was:
+
+| metric | baseline mean | candidate mean | candidate delta |
+|---|---:|---:|---:|
+| output throughput | `48.8984 tok/s` | `52.5072 tok/s` | `+7.38%` |
+| `wave_identity_bind` | `1.693364 ms` | `0.032536 ms` | `0.0192x` |
+| identity + provider encode | `2.763606 ms` | `1.604235 ms` | `-1.159371 ms` |
+| device submit | `0.359569 ms` | `0.365174 ms` | `+1.56%` |
+| completion round trip | `7.453175 ms` | `7.497199 ms` | `+0.59%` |
+
+Both reversed identity pairs followed the binary. Candidate node
+materialization was `51,510 / 185,820 = 27.7204%` in each slot and full
+participant materialization was `0`. Provider-node encode increased because
+the nodes that are actually required now materialize at the first real
+consumer; the combined identity-plus-provider interval still fell by
+`1.159371 ms/wave`. Each Basic slot recorded `30` initial shape catalog
+population misses on both binaries, with zero direct fallback and zero epoch
+miss. The predeclared zero-miss product correctness check remained `0/0/0`;
+the symmetric Basic population count is preserved in the artifact rather
+than being hidden.
+
+Only after those checks passed, typed product config `--profile-detail off`
+ran the second `A-B-B-A`:
+
+| slot | binary | throughput |
+|---|---|---:|
+| A1 | baseline | `48.5239 tok/s` |
+| B1 | candidate | `56.5147 tok/s` |
+| B2 | candidate | `54.0715 tok/s` |
+| A2 | baseline | `49.7432 tok/s` |
+
+The baseline and candidate means were `49.1335` and `55.2931 tok/s`,
+respectively: `+12.54%`. The two reversed pairs were `+16.47%` and
+`+8.70%`; profile-off outer host encode/submit fell `40.23%`, while
+completion improved `1.12%`. All `100` measured Basic requests and all
+`100` measured profile-off requests completed without request or quality
+error and used usage-derived output token counts.
+
+The bounded decision is `KEEP_COMPILED_WAVE_IDENTITY`, and its validator
+printed:
+
+```text
+CUDA COMPILED WAVE IDENTITY BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-compiled-identity-cuda-790f29ce-20260724T210959Z
+```
+
+The local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-compiled-identity-cuda-790f29ce-20260724T210959Z/`.
+GitHub artifact branch
+`artifact/runtime-vnext-compiled-identity-790f29ce-20260725` is at cleanup
+commit `38c58b3b3acf312942600efaac2b1f68ae91bb90`. Vast instance `45319871`
+is verified `stopped/exited`, with no billable or transitional sibling.
+
+This is bounded G09 development progress, not formal G09 completion. The
+candidate mean is still `4.5949 tok/s` below the best prior Ferrum point and
+`20.8652 tok/s` below the unchanged `76.1583 tok/s` floor, reaching only
+`72.60%` of that floor. No concurrency sweep or formal `n_repeats=3`
+comparison ran. The next performance work must use these artifacts to name
+one remaining completion/resource bottleneck before another paid run.
+
+### 2026-07-25 Lane-Stable Backing Certificate CUDA Decision
+
+The follow-up source audit found that lane-stable physical backing was already
+retained, but every wave still rebuilt physical-claim maps, revalidated
+immutable lease/layout facts, and re-encoded all allocation fingerprints.
+Clean source `24a2c6516680fc5b0db988725fab1bc766919f43` moved that cold proof
+into a `BackingClaimCertificate` owned by each lane-stable arena slot. A wave
+still binds current logical projection sizes, claims current logical
+capacity, and follows the existing defer, wait, retry, fence, and release
+paths. The change therefore does not hard-code capacity or bypass dynamic
+backpressure.
+
+Before CUDA, formatting, the bounded submission-wave and operation-wave
+contracts, adjacent batch/cancel/completion/dispatch contracts, and
+`cargo check --workspace --all-targets` passed. The CUDA release build took
+`5m08s`; its binary SHA256 was
+`84187c7cf1dd68fe1b67cb2d3ce09ca605eddc763c5ade843020a9d8aed43a2c`.
+Actual-model Qwen3.5-35B-A3B-GPTQ correctness then passed `3/3`:
+
+- resident three-turn `ferrum run` returned the exact expected identifier;
+- non-streaming `ferrum serve` returned `Paris`;
+- streaming `ferrum serve` returned `Paris`, one `[DONE]`, and usage-derived
+  output-token counts;
+- direct fallback, correctness catalog miss, and catalog-epoch miss remained
+  `0`, and full-participant materialization before submit remained `0`.
+
+The bounded Basic random `64/32`, c1, `25 + 5` warmup, seed `9271` slot
+measured the intended phases directly:
+
+| phase | prior adjacent candidate mean | certificate candidate | reduction |
+|---|---:|---:|---:|
+| transaction validate/fingerprint | `1064.203 us` | `4.101 us` | `99.61%` |
+| submission-wave prepare | `1139.794 us` | `169.975 us` | `85.09%` |
+
+The Basic slot completed `25/25` at `71.4755 tok/s` with zero request or
+quality error. The subsequent profile-off diagnostic completed `25/25` at
+`60.1407 tok/s`, also with zero error and usage-derived token counts. That
+single profile-off slot is `8.77%` above the preceding compiled-identity
+candidate mean, but it is not a formal comparison: it has one repeat, no
+adjacent reversal, and no confidence interval. It remains `16.0176 tok/s`
+below the unchanged `76.1583 tok/s` floor, reaching `78.97%` of the floor.
+
+The bounded decision is `KEEP_LANE_STABLE_BACKING_CERTIFICATE`. The validator
+printed:
+
+```text
+CUDA BACKING CERTIFICATE BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-backing-certificate-cuda-24a2c651-20260724T222019Z
+```
+
+The locally verified artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-backing-certificate-cuda-24a2c651-20260724T222019Z/`.
+GitHub artifact branch
+`artifact/runtime-vnext-backing-certificate-24a2c651-20260725` is at commit
+`5c4ef937`. At artifact finalization, the paid-lane record covered `20m57s`
+and an estimated `$0.1639`; GitHub transfer and shutdown followed immediately.
+Retained Vast instance `45319871` is verified `stopped/exited`, with no sibling
+instance.
+
+This closes repeated physical-claim validation as a G09 bottleneck. It does
+not complete G09. The retained Basic artifact now localizes the next work
+without another discovery run:
+
+| phase | prefill | decode |
+|---|---:|---:|
+| device execution | `13.7444 ms` | `7.2507 ms` |
+| completion round trip | `13.1125 ms` | `7.7148 ms` |
+| provider-node encode | `1.2640 ms` | `0.7615 ms` |
+| command enqueue | `1.3003 ms` | `0.2468 ms` |
+| resource prepare | `0.7510 ms` | `0.4021 ms` |
+
+No repeat CUDA run is authorized merely to reconfirm that device execution is
+now dominant. The next source candidate must use these saved phase values and
+the current vLLM implementation to predict a specific prefill or decode
+device/provider signal. Previously rejected packed-decode launch-count
+variants remain closed; they may not be rerun under a new label without a
+different source-level mechanism and a new falsifiable artifact prediction.
+
+### 2026-07-25 Elastic Prefill Budget CUDA Decision
+
+The backing-certificate artifact also showed that the default
+`max_batched_tokens=192`, `max_sequences=16` policy was silently deriving a
+static `prefill_step_chunk=12`. Clean source `1e6ea782` removed that derived
+cap while retaining explicit CLI/config overrides. The default scheduler now
+spends the live step budget and reports
+`prefill_first_until_active:16+prefill_token_budget:elastic`; no hidden
+`FERRUM_SCHED_PREFILL_STEP_CHUNK` setting was used.
+
+The first correctness attempt produced a bounded REJECT before any performance
+command ran:
+
+```text
+CUDA ELASTIC PREFILL BOUNDED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-1e6ea782-20260724T231246Z
+```
+
+Its exact failure class was
+`compiled-program-binding-slot-provider-patch-cardinality`. The larger eager
+prefill shape exposed that CUDA recurrent GDN and causal attention always
+registered provider patches as compiled-program bindings even when the core
+plan supplied no compiled slot. Commit `58ea9761` repaired the shared CUDA
+provider boundary: compiled invocations use program bindings and eager
+invocations use dynamic bindings. The local CUDA reusable-execution contract
+passed `9/9` before the follow-up paid run.
+
+The follow-up release build took `4m58s`. Its source tree was clean at
+`58ea9761d6e22aefec9c4075e92cad1cff4dbc5b`; binary SHA256 was
+`23e478b5801cfe32cab4147b48d7212a749baa9cfb6dd050592890a406f2466d`.
+Actual-model correctness passed all product paths before performance:
+
+- resident three-turn `ferrum run`;
+- non-streaming `ferrum serve`;
+- streaming `ferrum serve` with exactly one `[DONE]` and usage;
+- no malformed stream, request error, failed wave, direct fallback, or catalog
+  miss.
+
+The exact Basic c1 random `64/32`, `25 + 5` warmup, seed `9271` workload then
+completed `25/25` at `73.3855 tok/s` with zero errors and usage-derived token
+counts. The adjacent backing-certificate artifact is the comparison baseline:
+
+| metric | `24a2c651` baseline | `58ea9761` elastic | delta |
+|---|---:|---:|---:|
+| throughput | `71.4755 tok/s` | `73.3855 tok/s` | `+2.67%` |
+| prefill waves | `210` | `30` | `-85.71%` |
+| prefill device total | `2.8863 s` | `1.1342 s` | `-60.71%` |
+| prefill device mean | `13.7444 ms` | `37.8053 ms` | larger useful wave |
+| decode waves | `930` | `930` | unchanged |
+| decode device total | `6.7432 s` | `6.7565 s` | `+0.20%` |
+| failed waves | `0` | `0` | unchanged |
+
+The accepted decision is `KEEP_ELASTIC_PREFILL_TOKEN_BUDGET`. It preserves
+dynamic capacity rather than fixing a per-request chunk size and materially
+reduces wasted prefill fragmentation. The validator printed:
+
+```text
+CUDA ELASTIC PREFILL CORRECTNESS PASS: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/correctness
+CUDA ELASTIC PREFILL BOUNDED DIAGNOSTIC PASS: /workspace/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z
+```
+
+This remains bounded G09 development evidence, not formal G09 completion.
+The `76.1583 tok/s` floor is still open by `2.7728 tok/s` (`3.64%`).
+The SHA256-verified local artifacts are
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-1e6ea782-20260724T231246Z/`
+and
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/`;
+GitHub artifact branch
+`artifact/runtime-vnext-elastic-prefill-58ea9761-20260725` is at
+`25cc00a2cf1df9b50bc516210d6bc7bb001b90f8`. Vast instance `45319871` is
+verified `stopped/exited`.
+
+The new phase attribution changes the next lever. Prefill is now only
+`1.1342 s` while decode is `6.7565 s`, so CUDA chunked GDN prefill is not the
+next c1 candidate and no paid run is authorized for it merely because vLLM
+has a chunked implementation. Offline work must first audit the recurrent GDN
+decode state's repeated load/store and same-state copy behavior against the
+current vLLM implementation, then define a source-level specialization with
+one predicted trace/device counter. The rejected packed-decode
+launch-count lineage remains closed.
+
+#### Full register residency cubin rejection
+
+Commit `0e6f2841` implemented the first source candidate without changing
+scheduler, provider topology, resource authority, or launch count. For the
+official F32 tiled shape, each thread retained eight state elements across the
+reduction barriers and wrote them once after the token loop. F16 state kept
+its prior per-token quantization semantics. The typed artifact reports
+`64,389,120` recurrent-state bytes per sequence, so this would have removed
+`257,556,480` logical global-memory bytes per token/sequence.
+
+The predeclared cubin stop condition rejected it before correctness, release
+build, model load, or performance:
+
+| target kernel resource | `58ea9761` baseline | `0e6f2841` candidate |
+|---|---:|---:|
+| registers/thread | `42` | `80` |
+| stack bytes | `0` | `0` |
+| local bytes | `0` | `0` |
+| shared bytes/block | `16,448` | `16,448` |
+| theoretical active blocks/SM | `6` | `3` |
+
+The candidate avoided spill but halved theoretical occupancy, violating the
+explicit `active_blocks_per_sm_not_below_baseline` gate. Its source was
+reverted rather than benchmarked:
+
+```text
+CUDA GDN STATE TRAFFIC CUBIN REJECT: /workspace/ferrum-artifacts/runtime-vnext-gdn-state-traffic-cuda-0e6f2841-20260725T000311Z
+```
+
+The SHA256-verified local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-state-traffic-cuda-0e6f2841-20260725T000311Z/`.
+GitHub artifact branch
+`artifact/runtime-vnext-gdn-state-traffic-0e6f2841-20260725` is at
+`b21fb1870749434ef90b9200a79bf2a8125ca26b`. The cubin artifact itself took
+`1m06s`; the retained-instance start, publish, and confirmed stop window was
+about `4m36s`, approximately `$0.036`. Vast `45319871` is verified
+`stopped/exited`.
+
+No actual-model run is authorized for full per-thread register residency. The
+next offline candidate may instead compact the reduction scratch from
+`16 x 256` to the actual `16 x 128` contributors and use the reclaimed shared
+memory for state residency. Before correctness it must pass the same cubin
+gate with `0` spill/local bytes, shared bytes `<=16,448`, and theoretical
+active blocks/SM `>=6`.
+
+#### Shared-memory state residency product rejection
+
+Commit `add5241e` implemented that bounded follow-up. Two 128-thread groups
+owned disjoint even/odd value rows, compacted the reduction scratch to
+`16 x 128`, and reused the reclaimed shared memory for the complete
+`16 x 128` F32 recurrent-state tile. The indirect product path loaded state
+once before the token loop and wrote it once after the loop; the F16 path kept
+its previous per-token quantization semantics.
+
+The source audit found no mapping, race, barrier, reduction-tree, or indirect
+`state,state` alias blocker. The SM89 cubin gate then improved the target
+indirect kernel from `42` to `40` registers/thread while retaining `0` stack
+bytes, `0` local bytes, `16,448` shared bytes/block, and six theoretical
+active blocks/SM:
+
+```text
+CUDA GDN SHARED STATE CUBIN PASS: /workspace/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z
+```
+
+The exact CUDA numerical parity test passed `1/1`. The release build completed
+in `5m11s`; binary SHA256 was
+`9feca6789f5c29ecb9e8bc069cc84842126fc9ccf256997a5f3230de67a1324c`.
+Actual Qwen3.5-35B-A3B-GPTQ correctness then passed resident three-turn
+`ferrum run`, non-streaming `ferrum serve`, and streaming `ferrum serve` with
+exactly one `[DONE]`, usage, and no invalid-output marker:
+
+```text
+CUDA GDN SHARED STATE CORRECTNESS PASS: /workspace/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z/correctness
+```
+
+The one authorized Basic c1 random `64/32`, `25 + 5` warmup, seed `9271`
+diagnostic nevertheless missed its predeclared decode stop condition:
+
+| metric | `58ea9761` accepted baseline | `add5241e` candidate | delta / gate |
+|---|---:|---:|---:|
+| throughput | `73.3855 tok/s` | `73.6792 tok/s` | `+0.40%` |
+| prefill device total | `1.1342 s` | `0.7815 s` | `-31.10%` |
+| decode device total | `6.7565 s` | `6.6315 s` | `-1.85%`; required `<=6.5538 s` |
+| prefill/decode/submitted waves | `30 / 930 / 960` | `30 / 930 / 960` | unchanged |
+| failed waves | `0` | `0` | PASS |
+| request errors | `0` | `0` | PASS |
+| direct fallback/catalog/epoch miss | `0 / 0 / 0` | `0 / 0 / 0` | PASS |
+
+The candidate missed the decode threshold by `77,767,168 ns` and remained
+`2.4791 tok/s` (`3.26%`) below the formal `76.1583 tok/s` floor. Its failure
+class is `shared-state-gdn-decode-gain-below-three-percent`; correctness and a
+large prefill improvement do not override the decode-dominant KEEP contract:
+
+```text
+CUDA GDN SHARED STATE BOUNDED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z
+```
+
+The SHA256-verified local artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-gdn-shared-state-cuda-add5241e-20260725T001702Z/`.
+Its archive SHA256 is
+`3b862a8db2fa823d4bef1fffa60a856d3a09ee2ad8a814fd477ad88b5b50b1ba`;
+GitHub artifact branch
+`artifact/runtime-vnext-gdn-shared-state-add5241e-20260725` is at
+`e2badb69f77c9053f90b7f5fc2777c2786d67ad3`. The retained-instance start
+through confirmed stop window was about `21m13s`, approximately `$0.166`.
+Vast `45319871` is verified `stopped/exited`.
+
+Commit `954288bc` reverted the shared-state source candidate. This closes the
+state-residency-only lineage: no new paid run may merely move the same state
+between global memory, registers, or shared memory. Before another CUDA
+candidate, the saved replay/profile evidence must attribute enough
+decode-wave time to a specific GDN or non-GDN component to clear at least the
+remaining `3%` device-time requirement. The source proposal must name the
+kernel launches, reductions, barriers, or provider work it removes and
+predict the corresponding saved counter or timing change. Missing that
+offline headroom proof keeps the paid lane closed.
+
+### 2026-07-25 Execution Weight Materialization Contract Checkpoint
+
+The replay attribution artifact
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-replay-kernel-attribution-v2-32c53a6b-20260724T060439Z/`
+assigned `26.0783%` of replay wall time to the dominant FP16 cuBLAS GEMV
+lineage (`11,250` launches), while paged attention accounted for about
+`1.226%`. The next source lever therefore targets generic execution-weight
+materialization rather than another GDN state-residency or paged-attention
+candidate.
+
+The first source-only slice separates the prepared checkpoint `WeightSchema`
+from the physical `ExecutionWeightPlan` consumed by provider selection,
+resource identity, static memory planning, weight initialization, and plan
+wire/hash validation. It admits only a canonical identity materializer.
+Forged materializer identities or execution schemas remain unable to
+self-authorize through serialized plan data. This slice intentionally makes
+no CUDA performance claim and has not started a paid instance.
+
+Focused validation:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces \
+  --test vnext_program_plan_compiler_contract_tests \
+  --test vnext_plan_wire_contract_tests \
+  --test vnext_static_initialization_contract_tests -- --test-threads=2
+
+vnext_plan_wire_contract_tests: 12 passed
+vnext_program_plan_compiler_contract_tests: 8 passed
+vnext_static_initialization_contract_tests: 5 passed
+```
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.52s
+```
+
+The accepted performance reference remains
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z/`
+at `73.385528 tok/s`, `2.77277 tok/s` (`3.64%`) below the formal
+`76.1583 tok/s` floor. Vast instance `45319871` remains `stopped/exited`.
+
+The paid CUDA lane stays closed until a trusted materializer catalog,
+transformed-schema lineage validation, explicit derived-weight memory
+accounting, and focused source tests exist. The first candidate is the
+already-compiled Marlin FP8 W8A16 path for eligible dense FP16 GDN weights;
+selection must be typed and capability-driven, with no model-name, GPU-name,
+or hidden-environment branch. A later CUDA diagnostic must predict and verify
+movement in the attributed FP16 GEMV launch/time counters before it may run.
+
+### 2026-07-25 Trusted Weight Materializer Registry Checkpoint
+
+The second source slice adds a process-local `WeightMaterializerRegistry`,
+serializable capability descriptors, and a non-serializable
+`TrustedExecutionWeightPlan` witness. A descriptor in a catalog or execution
+plan cannot construct or authorize a transformed schema. The exact registered
+implementation must derive the schema again, and its id, contract version,
+implementation fingerprint, required device capabilities, source-schema
+fingerprint, and logical tensor contract must all match.
+
+`ProgramPlanCompileOptions` now carries an explicit typed materializer id.
+Identity remains the default. Non-identity selection requires
+`ProgramPlanCompiler::compile_with_weight_materializers`; it cannot be enabled
+through an environment variable. The resulting execution schema drives
+provider compatibility, resolved physical bindings, resource identities,
+static allocation bytes, plan hashing, and static initialization. A trusted
+witness selected against one capability catalog is rejected if reused with a
+catalog containing a different implementation descriptor.
+
+A synthetic non-identity materializer expands one physical dense component
+from `16` to `32` bytes without changing its logical tensor. Its focused
+contract proves:
+
+- plan-static memory increases by the exact `16` derived bytes;
+- the in-process semantic rebuild succeeds with the retained witness;
+- ordinary wire revalidation rejects the transformed plan;
+- wire revalidation succeeds only after the exact registry reissues a witness;
+- a materializer that changes logical dimensions is rejected;
+- a same-id catalog with a different implementation or required-capability
+  descriptor is rejected.
+
+Validation:
+
+```text
+cargo test -p ferrum-interfaces \
+  --test vnext_program_plan_compiler_contract_tests -- --test-threads=2
+10 passed; 0 failed
+```
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.60s
+```
+
+This checkpoint alone was source-only evidence and made no performance claim.
+The runtime authority is completed by the following checkpoint; the CUDA
+Marlin FP8 W8A16 provider remains separate.
+
+### 2026-07-25 Trusted Runtime Weight Materialization Checkpoint
+
+The third source slice replaces the planning-only materializer trait with one
+`WeightMaterializer` authority retained by the immutable execution plan. The
+same process-local implementation now owns both the transformed schema and the
+cold-path bytes uploaded for that schema. Static initialization can no longer
+call a checkpoint source directly for an execution component.
+
+Execution plan schema v7 adds an exact, ordered
+`execution_component -> [source_component...]` map. Validation requires:
+
+- map keys exactly equal the execution schema's component identities;
+- every source list is non-empty and duplicate-free;
+- every referenced source component exists in the prepared family;
+- every required source component participates in at least one mapping;
+- wire changes to the mapping fail semantic revalidation;
+- the retained implementation descriptor still matches the catalog and
+  non-serializable witness at materialization time.
+
+The lookup path uses normalized-schema binary search per component, rather
+than repeating whole-schema validation inside the upload loop. Transform work
+remains cold-path and component-at-a-time, so owned derived bytes do not retain
+a second full-model copy.
+
+A focused integration materializer gives two execution components new IDs and
+synthetic external names while explicitly mapping them to two original source
+components. Its source rejects the derived IDs, proving that initialization
+must resolve the source map first. The retained materializer emits distinct
+`0xa1` and `0xb2` payloads; the test runtime observes those exact uploaded
+bytes, proving that raw checkpoint bytes did not bypass the authority.
+
+Validation:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces \
+  --test vnext_program_plan_compiler_contract_tests \
+  --test vnext_plan_wire_contract_tests \
+  --test vnext_static_initialization_contract_tests -- --test-threads=2
+
+vnext_plan_wire_contract_tests: 12 passed
+vnext_program_plan_compiler_contract_tests: 10 passed
+vnext_static_initialization_contract_tests: 6 passed
+```
+
+```text
+CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.63s
+```
+
+This remains source-only correctness evidence, not a G09 performance PASS.
+The accepted CUDA reference remains
+`runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z` at
+`73.385528 tok/s`, `2.77277 tok/s` (`3.64%`) below the formal floor. The next
+slice is the generic Marlin FP8 W8A16 CPU transform, CUDA FFI, dense provider,
+and typed product selection. Vast `45319871` remains `stopped/exited`; the paid
+lane remains closed until that source slice has local correctness evidence and
+a counter-level KEEP/REJECT prediction.
+
+### 2026-07-25 Marlin FP8 W8A16 Candidate Correctness Blocker
+
+Commit `61398b66` implemented the Marlin FP8 lever described above, but the
+`61398b66 -> cc4f8130 -> bfdbf5db -> 0c9a2c31` sequence REJECTed respectively
+at CUDA build, plan ABI, static initialization, and first inference. Every run
+stopped before correctness completed, and no performance command was started.
+There is therefore no new throughput or kernel-counter conclusion.
+
+The accepted CUDA reference remains
+`runtime-vnext-elastic-prefill-cuda-58ea9761-20260724T232655Z` at
+`73.385528 tok/s`, `2.77277 tok/s` (`3.64%`) below the `76.1583 tok/s`
+formal floor.
+
+Commit `0b72bab2` corrects the mixed-schema resolver through component-local
+physical ABI validation. Only after current-HEAD `run`/`serve` correctness
+passes and the eligible GDN projection is proven to move from FP16 cuBLAS GEMV
+to a Marlin kernel may one bounded c1 diagnostic run. Missing the kernel signal
+or failing to exceed `73.385528 tok/s` stops the candidate without a full sweep.
+G09 remains Open.
+
+Those bounded conditions passed on clean
+`0b72bab2a319b71bc110a578c14b90c2936c0a89`:
+
+- `ferrum run`, non-streaming `serve`, and streaming `serve` correctness passed;
+- Nsight attribution passed at `0.994550` projection coverage;
+- the old `32c53a6b` profile had no non-MoE `marlin::Marlin` kernel, while the
+  candidate recorded the channelwise `group_size=-1` variant for `2,250`
+  launches and `69.643 ms`;
+- the only unprofiled c1 diagnostic completed `25/25`, zero errors, usage-derived
+  tokens, `30` prefill waves, `930` decode waves, zero failed waves, and zero
+  request deferrals at `77.069498 tok/s`;
+- versus `58ea9761`, throughput increased by `3.683970 tok/s` (`5.02%`), decode
+  device average fell from `7.2650 ms` to `6.4207 ms`, and prefill device total
+  remained effectively flat (`1.1342 s` to `1.1231 s`).
+
+The diagnostic exceeds the `76.1583 tok/s` absolute floor by
+`0.911198 tok/s` (`1.20%`) but has `n_repeats=1` and no confidence interval.
+It is a lever KEEP, not G09 PASS, and no full sweep was run. Formal G09 still
+requires the Goal's correctness prerequisites, repeat/CI protocol, required
+concurrency cells, same-hardware external comparison, and both backends.
+
+Evidence is archived on branch
+`artifact/runtime-vnext-component-abi-0b72bab2-20260725` at
+`0f978393e4d3003051d9e3427bf5284f797e4307`; the package SHA256 is
+`1904faf443d071206d9dfe9be5fd1e78e1576e2b4f6f2bb49974b6664b0114d6`.
+
+### 2026-07-25 Implicit Requantization Rejection And Exact-F16 Reset
+
+The `0b72bab2` performance KEEP is invalid for the required exact product lane.
+The follow-up current-source focused matrix stopped at C17:
+
+- C03 passed;
+- C17 expected exact output `中文正确` but emitted only `正确`;
+- the candidate emitted token `97901` and lost token `99986`;
+- UTF-8 framing, process exit, memory, and transport were valid, so this was a
+  numerical-output regression rather than mojibake or a crash.
+
+The root cause was architectural. The CUDA composition treated availability of
+the Marlin FP8 W8A16 kernel as authorization to cold-materialize source F16 GDN
+weights into FP8. That conversion is numerically approximate and was selected
+without a user-visible precision policy. The model's GPTQ configuration
+explicitly excludes `.*attn.*`; current vLLM therefore also preserves the GDN
+projection precision instead of silently applying this conversion. The
+`77.069498 tok/s` row measures a different numerical contract and cannot satisfy
+the exact `76.1583 tok/s` floor or any vLLM ratio.
+
+Commit `5149bbfbc6b69bf0c55fdd483f290b75ea05057e` makes fidelity typed and
+fail-closed:
+
+- `WeightMaterializerDescriptor` declares `Exact` or `Approximate`;
+- the default compiler path selects only exact materializers;
+- Marlin F16 -> FP8 is retained as an approximate capability, not selected by
+  the CUDA default;
+- catalog mutation from exact to approximate invalidates the trusted witness;
+- a packed-weight numerical test proves the transform has nonzero error.
+
+Local focused contracts, the packed numerical test, formatting, and
+`cargo check --workspace --all-targets` passed. The clean official CUDA build
+used binary SHA256
+`330b50ab6397908acd3d77ad34c2bfcba46bd93d7c43bcd1fed7af6de96bc01a`.
+Focused C17 then passed with exact content `中文正确`, visible token IDs
+`99986,97901`, two output chunks, zero blocker match, and the line:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP: /workspace/ferrum-artifacts/runtime-vnext-fidelity-c17-cuda-5149bbfb-20260725T063955Z/correctness/m2-qwen35-35b-a3b/cuda/focused-c17-report.json
+```
+
+This proves the C17 causal repair, not G08B or G09 completion. The accepted
+exact-precision performance reference remains `58ea9761` at
+`73.385528 tok/s`, still `2.77277 tok/s` (`3.64%`) below the floor. The next
+candidate must retain exact F16 semantics. The `32c53a6b` pre-fusion profile
+recorded `11,250` F16 cuBLAS GEMV launches and `243.858703 ms`, or `26.0783%`
+of replay wall; that count was exactly `75 correlations x 30 recurrent layers x
+5 projections`. The landed QKVZ/BA fusion reduced the current topology to three
+projections per layer, so a same-scope current trace is predicted to contain
+`6,750`, not `11,250`, projection GEMVs.
+
+Source comparison against vLLM `33c4f355` shows that its exact CUDA path also
+executes QKVZ, BA, and output linear projections; compile/CUDA graph replay does
+not remove those three operations. The next bounded exact candidate is therefore
+one cold-path, byte-exact row concatenation of QKVZ+BA into QKVZBA, retaining the
+dependent output projection. Its predeclared c1 signals are:
+
+- projection GEMV launches `6,750 -> 4,500`;
+- GDN dispatches per correlation `330 -> 300`;
+- complete device span improves by at least `0.24 ms/correlation`, targeting
+  approximately `7.84 ms` from the prior `8.097945 ms`.
+
+Commit `883ee9e0ed73cd5ed0578410e19fad9840c39532` implements that exact QKVZBA
+candidate for CUDA and Metal under operation schema v6. It concatenates source
+F16 QKVZ and BA rows once during cold preparation; hot execution preserves F16
+input/output and the existing FP32 recurrent state. Focused Qwen/schema tests,
+nine CUDA replay contracts, workspace all-target checking, formatting, and the
+real Metal recurrent numerical test passed locally. The v6 tolerance catalog
+adds seven rows without widening the v5 bounds.
+
+This is source and local numerical evidence, not a CUDA performance result.
+The paid-run contract remains: first replay the affected correctness case and
+product paths; then require `4,500` projection GEMVs and `300` GDN dispatches
+per correlation; then require at least `0.24 ms/correlation` device-span
+reduction before running c1 throughput. Missing the launch topology or span
+reduction is REJECT and does not authorize throughput. For `P>1`,
+participant-packed projection remains a separate follow-up (`3P -> 3`
+launches/layer); it predicts no c1 gain and cannot be used to accept this
+candidate.
+
+The bounded run then completed on clean current HEAD
+`557cdcf5f3c90fd5ab097d83bf265cf60ee8ad1f`, binary SHA256
+`a09caa066dda43883562d8a81491d40949b83182eff2c850dafed7d800e22784`,
+and one RTX 4090:
+
+- all 9 selected C03/C05/C06/C17 correctness cases passed before profiling;
+- typed GDN trace reported exactly `300` compute dispatches per correlation;
+- persistent CUDA graph nodes and GEMV shapes identified 30 QKVZBA plus 30
+  GDN output projections across 75 decode correlations, exactly `4,500` GEMVs;
+- the raw `9,000` cuBLAS kernel-name aggregate also included non-GDN projection
+  shapes and is not a valid GDN-only topology metric;
+- replay mean fell from `6.888088` to `6.483529 ms`; replay plus same-step eager
+  device duration was `7.697259 ms`, below the predeclared `7.857945 ms` target;
+- bounded random `64/32` c1, 25 requests plus 5 warmups, seed `9271`, completed
+  `25/25`, zero errors/quality issues, usage token counts, at
+  `73.380002 tok/s`.
+
+The c1 result is effectively equal to the exact `73.385528 tok/s` reference
+(`-0.0075%`) but misses the `76.1583 tok/s` floor by `2.778298 tok/s`
+(`3.6481%`). It has one repeat and no confidence interval. The exact source
+structure is retained because it removes dispatches and improves device time
+without changing precision, but this is a formal G09 performance REJECT and no
+full sweep was run:
+
+```text
+CUDA EXACT QKVZBA TOPOLOGY PASS: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/topology-summary.json
+CUDA EXACT QKVZBA STRUCTURAL CHECKPOINT KEEP: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/diagnostic-summary.json
+CUDA EXACT QKVZBA G09 PERFORMANCE REJECT: /workspace/ferrum-artifacts/runtime-vnext-exact-qkvzba-cuda-557cdcf5-20260725T074335Z/diagnostic-summary.json
+```
+
+The next lever must optimize exact dtype/shape execution or graph coverage.
+Implicit requantization is prohibited. The complete package is on GitHub branch
+`artifact/runtime-vnext-exact-qkvzba-557cdcf5-20260725` at
+`b161d69e592ec8593ca35384e586b83dbabfef16`; archive SHA256 is
+`ecd3fc9c503a436a2159f08012691b5acb7720bf0f04b8efc420795e9007965a`.
+The paid instance was verified `stopped/exited`, with zero paid or transitional
+sibling instance.
+
+### 2026-07-25 Typed Sparse Repetition c32 Checkpoint
+
+The next bounded lever targeted the product-default decode readback, not another
+c1 kernel change. Clean `acf9a6694a1dbdca723dfd4c84313df4c6dea7ab` completed
+the same-hardware random `64/32` c32 diagnostic at `109.164260 tok/s`, but the
+trace showed that all `164` greedy decode waves fell back to full logits because
+the typed selected-token operation could not express the default
+`repetition_penalty=1.1`. It copied `1,167,104,000` bytes back to the host and
+therefore produced a product-integration REJECT, not evidence for the device
+argmax lever.
+
+Commit `90057af124e43f1525de40db5b293958e2871cb7` adds exact typed sparse
+repetition inputs to the shared operation and both accelerator providers. After
+the nine focused correctness cases passed, the same retained RTX 4090, model
+revision, product config, workload, seed, request count, warmup count, and
+single-repeat benchmark produced:
+
+| metric | `acf9a669` | `90057af1` | delta |
+|---|---:|---:|---:|
+| c32 output throughput | `109.164260 tok/s` | `121.002505 tok/s` | `+10.8444%` |
+| readback bytes | `1,167,104,000` | `61,592,288` | `-94.7226%` |
+| greedy token waves | `0` | `166` | `+166` |
+| greedy policy fallback waves | `164` | `0` | `-164` |
+| sparse repetition waves | n/a | `166` | `+166` |
+
+The new run completed `64/64`, with zero request errors, zero quality counters,
+usage-sourced output token counts, final active/queued counts of zero, and no
+panic/OOM/log corruption. Its `42` remaining full-logits waves are prefill; the
+decode fallback counter is zero.
+
+```text
+CUDA VNEXT SPARSE REPETITION INTEGRATION KEEP: /workspace/ferrum-artifacts/runtime-vnext-sparse-repetition-cuda-90057af1-20260725T131140Z/diagnostic-summary.json
+```
+
+This accepts the typed product integration and rejects the old full-logits
+failure class. It does not produce G09 PASS: `n_repeats=1` has no CI, c1/c4/c16
+were not rerun, same-host vLLM comparison is absent, the three-model/two-backend
+matrix is incomplete, and the absolute c32 competitive floor is not waived.
+Before another paid run, current artifacts must be compared with the best
+historical Ferrum and vLLM source/release baseline to choose a new trace-backed
+bottleneck; the successful readback lever does not authorize an unscoped full
+sweep. Evidence is on GitHub branch
+`artifact/runtime-vnext-sparse-repetition-90057af1-20260725` at
+`65dfab41344a3751e2eff99e7b8d6ffbca6784c8`, archive SHA256
+`1cd3b1fc3e656ecce8cd9f71f23877404f208665ed4e1596b1304917983637d2`.
+The paid instance was verified `stopped/exited`, with zero paid or transitional
+sibling.
+
+### 2026-07-25 Packed GDN c32 Checkpoint
+
+The next source-backed lever removed the per-participant GDN projection and
+recurrent-kernel loop for shared physical token regions. Clean
+`affacd2c2a5fdc1274f5a77b014c2a2af00f2a6e` passed the official-feature build,
+real CUDA numerical tests `14/14`, and product correctness `110/110` before
+measurement. The same retained RTX 4090 and the same random `64/32` c32
+workload produced:
+
+| metric | `90057af1` | `affacd2c` | delta |
+|---|---:|---:|---:|
+| c32 output throughput | `121.002505 tok/s` | `155.138143 tok/s` | `+28.2107%` |
+| completed requests | `64/64` | `64/64` | unchanged |
+| request errors | `0` | `0` | unchanged |
+
+The candidate had zero malformed-stream, missing/duplicate `[DONE]`,
+zero-output, HTTP 500, panic, or output-quality counters, and usage-sourced
+output token counts. It is a single-repeat diagnostic without CI, not formal
+G09 performance evidence.
+
+The performance server command saved `scheduler-trace.jsonl` but accidentally
+omitted `--profile-jsonl`. The scheduler trace contains `6,480`
+`gated_delta_recurrent_attention` node events, but cannot directly establish
+the native work-attribution tuple `batching_form=packed`, physical compute
+dispatch count `10`, and transfer count `2`. Therefore the accepted decision is:
+
+```text
+CUDA VNEXT PACKED GDN CODE KEEP PENDING TRACE: affacd2c2a5fdc1274f5a77b014c2a2af00f2a6e
+```
+
+No full sweep is authorized from this result. The next paid action is a short
+trace-closure diagnostic on the retained instance with `--profile-jsonl` and
+`--profile-detail full`, asserting packed attribution for a participant count
+greater than one; it does not need to repeat the full performance matrix. The
+closure validator is:
+
+```text
+python3 scripts/release/native_work_attribution_gate.py \
+  --profile-jsonl <artifact>/profile.jsonl \
+  --operation-id operation.gated_delta_recurrent_attention \
+  --native-op-id vnext_gated_delta_recurrent_attention \
+  --batching-form packed \
+  --min-participants 2 \
+  --exact-compute-dispatches 10 \
+  --exact-transfer-commands 2 \
+  --require-all-eligible \
+  --source-git-sha <sha> \
+  --binary-sha256 <sha256> \
+  --out <artifact>/native-work-attribution
+```
+
+It must print
+`FERRUM NATIVE WORK ATTRIBUTION PASS: <artifact>/native-work-attribution`;
+missing profile output, no multi-participant compute event, participant-loop
+fallback, or a physical command-count mismatch is a hard REJECT. The remote
+artifact archive is
+`runtime-vnext-packed-gdn-cuda-affacd2c-20260725T153414Z.tar.gz`, SHA256
+`7116188660add41efa654d4256fc0c1d2f9b8d6ffef08e7230853125b2c65a49`.
+Its pending artifact commit is `a8bf6d6a` on
+`artifact/runtime-vnext-packed-gdn-affacd2c-20260725`. GitHub upload is blocked
+because the retained host has neither usable HTTPS credentials nor a
+GitHub-authorized forwarded SSH key; SCP was not used. The paid window was
+`47m53s`, approximately `$0.3747` at `$0.469444/h`, exceeding the stated
+`$0.313` cap by about `$0.0617` during artifact packaging/auth attempts. Future
+paid lanes must preflight GitHub push authentication before the instance is
+started. The instance is verified `stopped/exited`, with no paid or
+transitional sibling.
+
+### 2026-07-25 Packed GDN Native Attribution Closure
+
+Commit `e0a74fa0` added a streaming, backend-neutral native-work attribution
+gate. The first closure run used `profile-detail=basic`; it completed `32/32`
+requests with zero request and quality errors but correctly REJECTed the
+attribution claim because the profile contained 3,240 GDN node events and zero
+`vnext.device_native_work` events. Source inspection identified the exact
+contract: CUDA creates command attribution when `DeviceTimingMode::Kernel` is
+enabled or a reusable execution capture exists. `basic` selects completion
+timing, while `full` selects kernel attribution.
+
+The bounded `profile-detail=full` follow-up was terminated after it had
+generated sufficient attribution rather than waiting for a throughput sample.
+It produced 22,906 native-work events. The gate found 2,520 eligible
+multi-participant GDN compute events and accepted all `2,520/2,520`:
+
+| participant count | event count | batching | compute dispatches | transfers |
+|---:|---:|---|---:|---:|
+| 3 | 30 | packed | 10 | 2 |
+| 4 | 1,290 | packed | 10 | 2 |
+| 13 | 60 | packed | 10 | 2 |
+| 19 | 30 | packed | 10 | 2 |
+| 32 | 1,110 | packed | 10 | 2 |
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-packed-gdn-trace-affacd2c-20260725T161940Z/validation-full/native-work-attribution
+```
+
+This closes the pending packed-path integration claim. It does not upgrade the
+single-repeat `155.138143 tok/s` result to formal G09 evidence, and the
+full-profile run is explicitly ineligible as a performance sample. The compact
+artifact is on GitHub branch
+`artifact/runtime-vnext-packed-gdn-trace-affacd2c-20260725` at
+`fab7ac7512ea61d7584d0f41e11caf321de79520`; archive SHA256 is
+`ea93671ead07eec23bafc921a24962a0140ee9c21c933ffc09f90ea8f77cb909`.
+Raw profile/trace files total `2,612,056,519` bytes, are bound by
+`raw-files.sha256`, and remain on retained instance `45319871`.
+
+The paid window was `26m04s`, approximately `$0.2039`, exceeding the stated
+`$0.157` cap by about `$0.0469`. The failure class is
+`full-profile-overcollection`: future topology closure must use the minimum
+request count and terminate as soon as the validator has eligible events.
+Instance `45319871` is verified `stopped/exited`, with zero paid or transitional
+sibling.
 
 ### M3 Qwen3-30B historical floors
 

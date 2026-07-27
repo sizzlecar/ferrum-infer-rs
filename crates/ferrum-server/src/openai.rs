@@ -32,6 +32,20 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
+    /// vLLM-compatible top-k sampling extension. Values `-1` and `0`
+    /// disable top-k filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i64>,
+
+    /// vLLM-compatible minimum probability sampling extension. A value of
+    /// `0` disables minimum-probability filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+
+    /// vLLM-compatible repetition penalty extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
     /// Number of completions to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
@@ -120,10 +134,33 @@ pub struct ChatCompletionsRequest {
 }
 
 /// OpenAI streaming options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for StreamOptions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Object {
+            #[serde(default)]
+            include_usage: Option<bool>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            return Err(de::Error::custom("stream_options must be a JSON object"));
+        }
+        let parsed = serde_json::from_value::<Object>(value).map_err(de::Error::custom)?;
+        Ok(Self {
+            include_usage: parsed.include_usage,
+        })
+    }
 }
 
 /// Tool definition in OpenAI chat-completion requests.
@@ -494,6 +531,7 @@ pub struct ModelInfo {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    pub modalities: Vec<String>,
     pub permission: Vec<ModelPermission>,
     pub root: Option<String>,
     pub parent: Option<String>,

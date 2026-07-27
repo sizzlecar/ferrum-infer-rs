@@ -6,17 +6,19 @@ use clap::Args;
 use colored::*;
 use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
-use ferrum_server::{AxumServer, HttpServer, ServerConfig};
+use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
 use ferrum_types::{
-    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder,
-    HardwareCapabilities, ModelCapabilities, MoeCapabilities, ResolvedFerrumConfig, Result,
-    RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile,
-    M3_QWEN3_30B_A3B_INT4_PRESET, QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
+    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder, FerrumError,
+    HardwareCapabilities, ModelCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
+    QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 
 #[derive(Args)]
@@ -34,6 +36,19 @@ pub struct ServeCommand {
     )]
     pub model_option: Option<String>,
 
+    #[command(flatten)]
+    pub product_sources: crate::source_resolver::ProductSourceArgs,
+
+    /// Public OpenAI-compatible model names. The first name is primary and
+    /// additional names are aliases for the same loaded model.
+    #[arg(
+        long = "served-model-name",
+        value_name = "NAME",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    pub served_model_name: Vec<String>,
+
     /// Host to bind to
     #[arg(long)]
     pub host: Option<String>,
@@ -49,11 +64,6 @@ pub struct ServeCommand {
     /// Backend: auto, cpu, metal, cuda.
     #[arg(long, default_value = "auto")]
     pub backend: String,
-
-    /// Enable the explicit CPU/FP32 Qwen3.5/Qwen3.6 reference executor for W3
-    /// correctness bring-up. This is not a release-performance path.
-    #[arg(long)]
-    pub qwen35_reference: bool,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
@@ -82,6 +92,11 @@ pub struct ServeCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// Exact device-wide memory budget available to runtime weights and
+    /// dynamic resources. This is the same typed ceiling used by `run`.
+    #[arg(long, value_name = "BYTES")]
+    pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -93,6 +108,10 @@ pub struct ServeCommand {
     /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
+
+    /// Sequence fit gate used before prefill admission.
+    #[arg(long, value_enum)]
+    pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
 
     /// Prefer prefilling until this many requests are active before early decodes.
     #[arg(long, value_name = "N")]
@@ -171,6 +190,14 @@ pub struct ServeCommand {
     #[arg(long, conflicts_with = "batched_graph")]
     pub disable_batched_graph: bool,
 
+    /// Enable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "disable_reusable_execution")]
+    pub reusable_execution: bool,
+
+    /// Disable vNext reusable device-program preparation.
+    #[arg(long, conflicts_with = "reusable_execution")]
+    pub disable_reusable_execution: bool,
+
     /// Enable Llama/Gemma unified decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_unified_graph")]
     pub unified_graph: bool,
@@ -211,6 +238,9 @@ pub struct ServeCommand {
     /// Generate a synthetic/no-weight observability vertical-slice artifact and exit.
     #[arg(long, value_name = "DIR")]
     pub observability_vertical_slice_out: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
 
     /// Write native structured profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
@@ -269,19 +299,22 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let ServeCommand {
         model,
         model_option,
+        product_sources,
+        served_model_name,
         host,
         port,
         tts_slots,
         backend,
-        qwen35_reference,
         gpu_devices,
         layer_split_pipeline_mode,
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
+        runtime_memory_budget_bytes,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        sequence_fit_policy,
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
@@ -299,6 +332,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         disable_greedy_argmax,
         batched_graph,
         disable_batched_graph,
+        reusable_execution,
+        disable_reusable_execution,
         unified_graph,
         disable_unified_graph,
         unified_graph_layers_only,
@@ -309,6 +344,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         effective_config_json,
         decision_trace_jsonl,
         observability_vertical_slice_out,
+        vnext_checkpoint,
         profile_jsonl,
         profile_detail,
         memory_profile_jsonl,
@@ -401,49 +437,64 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Print banner
     print_banner();
 
-    // GGUF short-circuit: if the user passed a `.gguf` file path directly OR
-    // an alias resolving to a GGUF (e.g. `qwen3:8b-q4_k_m`), look up the
-    // file in the HF cache (or accept the path) and skip
-    // `ConfigManager::load_from_path` (which expects an HF safetensors
-    // directory). The engine's LlmExecutorFactory +
-    // HuggingFaceTokenizerFactory both detect `.gguf` and route to
-    // GgufLoader + sibling-tokenizer auto-discovery.
-    let cache_dir_for_gguf = get_hf_cache_dir(&config);
-    let gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&model_name) {
-        Some(PathBuf::from(&model_name))
-    } else if let Some((repo, filename)) = super::run::resolve_gguf_alias(&model_name) {
-        match super::run::find_cached_gguf(&cache_dir_for_gguf, &repo, &filename) {
-            Some(p) => Some(p),
-            None => {
-                eprintln!(
-                    "{} GGUF alias '{}' not in cache. Run: ferrum pull {}",
-                    "Error:".red().bold(),
-                    model_name,
-                    model_name
-                );
-                return Err(ferrum_types::FerrumError::model("GGUF model not found"));
-            }
-        }
-    } else {
-        None
+    // `run` and `serve` share one source decision. This covers exact GGUF
+    // aliases/files, local model directories, HF cache hits, and resumable HF
+    // download without an entrypoint-specific fallback chain.
+    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
+    let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
+        &model_name,
+        &cache_dir,
+        crate::source_resolver::DownloadPolicy::AutoDownload,
+        None,
+        &product_sources,
+    )
+    .await?;
+    let product_input = resolved.into_product_engine_input();
+    let requested_model = product_input.requested_model.clone();
+    let model_id = product_input.public_model_id.clone();
+    let source = product_input.source;
+    let product_engine_config = product_input.engine_config;
+    let model_sources = product_input.model_sources;
+    let prepared_model = model_sources
+        .as_ref()
+        .map(crate::source_resolver::prepare_registered_product_model)
+        .transpose()?
+        .flatten();
+    let vnext_plan_owns_context_capacity = prepared_model.is_some();
+    let model_chat_template = match prepared_model.as_deref() {
+        Some(prepared) => Some(crate::source_resolver::load_prepared_product_chat_template(
+            prepared,
+        )?),
+        None => match model_sources.as_deref() {
+            Some(sources) => crate::source_resolver::load_product_chat_template(sources),
+            None => crate::source_resolver::load_model_chat_template(&source.local_path),
+        },
     };
-
-    // Local safetensors directory passthrough: if `--model` is a path to
-    // a directory containing `config.json` (the canonical HF safetensors
-    // layout), use it directly without going through the HF cache lookup.
-    // Lets bench scripts / tooling point at any locally-staged model
-    // (e.g. `--local-dir` pulls or symlinked snapshots) without having
-    // to mimic the `models--owner--repo/snapshots/<sha>/` cache layout.
-    let local_dir_path: Option<PathBuf> = if gguf_path.is_none() {
-        let p = PathBuf::from(&model_name);
-        if p.is_dir() && p.join("config.json").is_file() {
-            Some(p)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let product_source_identity = prepared_model
+        .as_deref()
+        .map(|prepared| {
+            crate::source_resolver::prepared_product_source_identity(
+                prepared,
+                &requested_model,
+                &model_id,
+                model_chat_template.as_ref(),
+            )
+        })
+        .transpose()?;
+    let requested_public_model_name = matches!(
+        product_engine_config.model.source.as_ref(),
+        Some(ferrum_types::ModelSource::HuggingFace { .. })
+    )
+    .then_some(model_name.as_str());
+    let served_model_names =
+        effective_served_model_names(&model_id, requested_public_model_name, served_model_name)?;
+    let primary_served_model_name = served_model_names
+        .first()
+        .expect("effective served model names are non-empty")
+        .clone();
+    let gguf_path = (source.format == ModelFormat::GGUF).then(|| source.local_path.clone());
+    println!("{} {}", "Model:".dimmed(), model_id.cyan());
+    println!("{} {}", "Path:".dimmed(), source.local_path.display());
 
     let config_runtime_entries = config.runtime.runtime_config_entries();
     let configured_runtime_preset = runtime_preset
@@ -469,28 +520,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let mut materialized_runtime_keys =
         crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
 
-    let model_id = if let Some(p) = gguf_path.as_ref() {
-        // Use the GGUF stem as the OpenAI model id — the user sees this
-        // back in /v1/models responses + chat completion `model` field.
-        p.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| model_name.clone())
-    } else if let Some(p) = local_dir_path.as_ref() {
-        // Local safetensors dir → use the dir name as the public id.
-        p.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| model_name.clone())
-    } else {
-        resolve_model_alias(&model_name)
-    };
-    println!("{} {}", "Model:".dimmed(), model_id.cyan());
-
     let lora_specs = parse_lora_specs(&lora)?;
     let startup_lora_adapters = if lora_specs.is_empty() {
         Vec::new()
     } else {
         ferrum_models::load_startup_lora_adapters(
-            &model_id,
+            &primary_served_model_name,
             Some(&lora_model_id_template),
             &lora_specs,
         )?
@@ -515,43 +550,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         config.runtime.kv_dtype.as_deref(),
     );
 
-    let source: ferrum_models::source::ResolvedModelSource = if let Some(p) = gguf_path.clone() {
-        println!("{} {}", "Path:".dimmed(), p.display());
-        ferrum_models::source::ResolvedModelSource {
-            original: model_name.clone(),
-            local_path: p,
-            format: ModelFormat::Unknown, // GGUF — handled by engine
-            from_cache: true,
-        }
-    } else if let Some(p) = local_dir_path.clone() {
-        // Local safetensors directory passed via --model.
-        println!("{} {}", "Path:".dimmed(), p.display());
-        ferrum_models::source::ResolvedModelSource {
-            original: model_name.clone(),
-            local_path: p,
-            format: ModelFormat::SafeTensors,
-            from_cache: false,
-        }
-    } else {
-        // Find cached model
-        let cache_dir = get_hf_cache_dir(&config);
-        match crate::source_resolver::find_cached_model(&cache_dir, &model_id) {
-            Some(source) => {
-                println!("{} {}", "Path:".dimmed(), source.local_path.display());
-                source
-            }
-            None => {
-                eprintln!(
-                    "{} Model '{}' not found. Run: ferrum pull {}",
-                    "Error:".red().bold(),
-                    model_id,
-                    model_name
-                );
-                return Err(ferrum_types::FerrumError::model("Model not found"));
-            }
-        }
-    };
-
     let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     // Speculative decoding draft model: resolve the draft path and pass it
@@ -564,9 +562,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "Speculative decoding is not yet wired through the GGUF path",
             ));
         }
-        let draft_id = resolve_model_alias(draft_name);
+        let draft_id = crate::source_resolver::resolve_model_alias(draft_name);
         println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
-        let cache_dir = get_hf_cache_dir(&config);
+        let cache_dir = crate::source_resolver::hf_cache_dir(&config);
         let draft_source = crate::source_resolver::find_cached_model(&cache_dir, &draft_id)
             .ok_or_else(|| {
                 eprintln!(
@@ -589,6 +587,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
         &source.local_path,
         &device,
+        vnext_plan_owns_context_capacity,
         &RuntimeConfigSnapshot::capture_current(),
         RuntimeConfigSource::Default,
     );
@@ -624,7 +623,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // and route directly to the continuous-batching LLM engine — the
     // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
     println!();
-    let model_definition: Option<ferrum_models::ModelDefinition> = if gguf_path.is_some() {
+    let model_definition: Option<ferrum_models::ModelDefinition> = if prepared_model.is_some() {
+        None
+    } else if let Some(sources) = model_sources.as_deref() {
+        let mut config_manager = ferrum_models::ConfigManager::new();
+        Some(config_manager.load_from_bytes(sources.config_json())?)
+    } else if gguf_path.is_some() {
         None
     } else {
         let mut config_manager = ferrum_models::ConfigManager::new();
@@ -637,7 +641,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // gets the layer count from ModelDefinition; the GGUF path reads it
     // from the file header — without this the placeholder plan
     // (`layers=auto`) reaches the engine and is rejected.
-    let model_layer_count = if let Some(definition) = model_definition.as_ref() {
+    let model_layer_count = if let Some(prepared) = prepared_model.as_ref() {
+        Some(prepared.descriptor().layer_count())
+    } else if let Some(definition) = model_definition.as_ref() {
         Some(definition.num_hidden_layers)
     } else if let (Some(selection), Some(p)) = (gpu_selection.as_ref(), gguf_path.as_ref()) {
         if selection.selected_layer_split_plan.is_some() {
@@ -708,6 +714,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        runtime_memory_budget_bytes.map(std::num::NonZeroUsize::get),
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
@@ -730,9 +737,24 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
     );
+    startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+        "FERRUM_PROFILE_DETAIL",
+        profile_detail.as_str(),
+        RuntimeConfigSource::Cli,
+    ));
+    push_sequence_fit_policy_cli_entry(&mut startup_cli_runtime_entries, sequence_fit_policy);
     if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) =
+        batched_graph_cli_override(reusable_execution, disable_reusable_execution)
+    {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));
@@ -796,8 +818,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     materialized_runtime_keys.sort();
     materialized_runtime_keys.dedup();
+    let typed_model_capabilities = prepared_model
+        .as_ref()
+        .map(|prepared| prepared.model_capabilities())
+        .transpose()?;
     let startup_auto_config = startup_auto_config(
         &device,
+        typed_model_capabilities,
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
@@ -809,6 +836,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     write_startup_config_artifacts(
         &startup_auto_config,
+        product_source_identity.as_ref(),
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
     )?;
@@ -840,6 +868,25 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             )
         })
         .collect();
+    let served_model_kind = match arch_for_dispatch {
+        Some(ferrum_models::Architecture::Clip) => ServedModelKind::Embedding,
+        Some(ferrum_models::Architecture::Whisper) => ServedModelKind::Transcription,
+        Some(ferrum_models::Architecture::Qwen3TTS) => ServedModelKind::Speech,
+        _ => ServedModelKind::Llm,
+    };
+    let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
+    if vnext_checkpoint_capture.is_some() && served_model_kind != ServedModelKind::Llm {
+        return Err(FerrumError::unsupported(
+            "vNext checkpoint capture is only supported for causal language models",
+        ));
+    }
+    let served_model_registry = ServedModelRegistry::try_new(
+        model_id.clone(),
+        served_model_kind,
+        served_model_names,
+        lora_server_models,
+    )
+    .map_err(|error| FerrumError::config(error.to_string()))?;
 
     let mut cache_allocated_status = None;
     let server = match arch_for_dispatch {
@@ -852,8 +899,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_core::DType::F32,
             )?;
             let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
-            let mut engine_config = ferrum_types::EngineConfig::default();
-            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            let mut engine_config = product_engine_config;
+            engine_config.sampling.default_params = ferrum_server::default_chat_sampling_params();
             engine_config.backend.device = device;
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
@@ -872,8 +919,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_device,
                 candle_core::DType::F32,
             )?;
-            let mut engine_config = ferrum_types::EngineConfig::default();
-            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            let mut engine_config = product_engine_config;
             engine_config.backend.device = device;
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
@@ -922,24 +968,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "{}",
                 "Initializing engine (continuous batching)...".dimmed()
             );
-            let mut engine_config = ferrum_types::EngineConfig::default();
-            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            let mut engine_config = product_engine_config;
             engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config
                 .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
                 .map_err(ferrum_types::FerrumError::config)?;
+            engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
             engine_config.backend.backend_options.insert(
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
             );
-            if qwen35_reference {
-                engine_config.backend.backend_options.insert(
-                    "qwen35_reference".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-            }
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
             }
@@ -959,13 +999,20 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             }
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-                Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
+                Arc::from(match (prepared_model, model_sources) {
+                    (Some(prepared), _) => {
+                        ferrum_engine::create_prepared_product_engine(engine_config, prepared)
+                            .await?
+                    }
+                    (None, Some(sources)) => {
+                        ferrum_engine::create_product_engine(engine_config, sources).await?
+                    }
+                    (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+                });
             if product_memory_enabled {
                 cache_allocated_status = Some(engine.status().await);
             }
-            AxumServer::from_llm(engine).with_prompt_template(
-                crate::source_resolver::load_model_chat_template(&source.local_path),
-            )
+            AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
         }
     }
     .with_auto_config(startup_auto_config);
@@ -999,11 +1046,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             .or_else(|| model_loaded_sample.clone()),
         cache_allocated_sample.clone(),
     );
-    let server = if lora_server_models.is_empty() {
-        server
-    } else {
-        server.with_lora_adapters(model_id.clone(), lora_server_models)
-    };
+    let server = server.with_served_model_registry(served_model_registry);
     crate::observability_product::write_actual_serve_startup_observability(
         &product_observability,
         model_loaded_duration_us,
@@ -1057,18 +1100,46 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let pid_file = std::env::temp_dir().join("ferrum.pid");
     std::fs::write(&pid_file, std::process::id().to_string()).ok();
 
-    // Start server with graceful shutdown
-    tokio::select! {
-        result = server.start(&server_config) => {
-            if let Err(e) = result {
-                eprintln!("{} Server error: {}", "Error:".red().bold(), e);
-            }
+    // Keep the server future alive while stop requests graceful HTTP drain.
+    let server = Arc::new(server);
+    let mut server_task = {
+        let server = Arc::clone(&server);
+        let server_config = server_config.clone();
+        tokio::spawn(async move { server.start(&server_config).await })
+    };
+    let shutdown_timeout = Duration::from_secs(30);
+    let serve_result: Result<()> = tokio::select! {
+        joined = &mut server_task => {
+            let start_result = match joined {
+                Ok(result) => result,
+                Err(error) => Err(FerrumError::internal(format!(
+                    "serve task failed: {error}"
+                ))),
+            };
+            let stop_result = server.stop(shutdown_timeout).await;
+            start_result.and(stop_result)
         }
         _ = serve_shutdown_signal() => {
             println!();
             println!("{}", "Shutting down...".yellow());
+            let stop_result = server.stop(shutdown_timeout).await;
+            let start_result = match tokio::time::timeout(shutdown_timeout, &mut server_task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(FerrumError::internal(format!(
+                    "serve task failed during shutdown: {error}"
+                ))),
+                Err(_) => {
+                    server_task.abort();
+                    let _ = server_task.await;
+                    Err(FerrumError::internal(format!(
+                        "serve task did not stop within {} ms",
+                        shutdown_timeout.as_millis()
+                    )))
+                }
+            };
+            stop_result.and(start_result)
         }
-    }
+    };
 
     // Clean up PID file
     std::fs::remove_file(&pid_file).ok();
@@ -1098,6 +1169,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         ),
     )?;
 
+    serve_result?;
     Ok(())
 }
 
@@ -1195,20 +1267,6 @@ fn print_banner() {
     println!();
 }
 
-fn resolve_model_alias(name: &str) -> String {
-    // Single source of truth — see run.rs. serve/pull previously carried
-    // stale local copies, so new aliases worked in `run` but not `serve`.
-    super::run::resolve_model_alias(name)
-}
-
-fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        return PathBuf::from(hf_home);
-    }
-    let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
-    PathBuf::from(configured)
-}
-
 fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraSpec>> {
     let mut specs = Vec::with_capacity(values.len());
     for value in values {
@@ -1232,6 +1290,7 @@ fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraS
 
 fn startup_auto_config(
     device: &ferrum_types::Device,
+    typed_model_capabilities: Option<ModelCapabilities>,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -1245,13 +1304,15 @@ fn startup_auto_config(
     let runtime_config =
         merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
     let hardware = hardware_capabilities_for_device(device);
-    let model = model_definition
-        .map(|definition| {
-            model_capabilities_from_definition_with_weight_bytes_for_hardware(
-                definition,
-                model_weight_bytes,
-                &hardware,
-            )
+    let model = typed_model_capabilities
+        .or_else(|| {
+            model_definition.map(|definition| {
+                model_capabilities_from_definition_with_weight_bytes_for_hardware(
+                    definition,
+                    model_weight_bytes,
+                    &hardware,
+                )
+            })
         })
         .unwrap_or_else(ModelCapabilities::unknown);
     let workload = match runtime_preset {
@@ -1379,6 +1440,7 @@ fn serve_cli_runtime_entries(
     max_model_len: Option<usize>,
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
+    runtime_memory_budget_bytes: Option<usize>,
     scheduler_prefill_first_until_active: Option<usize>,
     scheduler_prefill_step_chunk: Option<usize>,
     scheduler_active_decode_prefill_chunk: Option<usize>,
@@ -1406,6 +1468,11 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_MAX_BATCHED_TOKENS",
         max_num_batched_tokens,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+        runtime_memory_budget_bytes,
     );
     push_cli_runtime_usize(
         &mut entries,
@@ -1554,6 +1621,17 @@ fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, valu
     }
 }
 
+fn push_sequence_fit_policy_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    policy: Option<crate::commands::SequenceFitPolicyArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        "FERRUM_SEQUENCE_FIT_POLICY",
+        policy.map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
+    );
+}
+
 fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
     if let Some(value) = value {
         entries.push(RuntimeConfigEntry::new(
@@ -1571,8 +1649,42 @@ fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types
     }
 }
 
+fn effective_served_model_names(
+    default_model_id: &str,
+    requested_model: Option<&str>,
+    requested_names: Vec<String>,
+) -> Result<Vec<String>> {
+    let names = if requested_names.is_empty() {
+        let mut names = Vec::with_capacity(2);
+        if let Some(requested_model) = requested_model {
+            names.push(requested_model.to_string());
+        }
+        if names.first().map(String::as_str) != Some(default_model_id) {
+            names.push(default_model_id.to_string());
+        }
+        names
+    } else {
+        requested_names
+    };
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in &names {
+        if name.is_empty() || name.trim() != name {
+            return Err(FerrumError::config(
+                "--served-model-name values must be non-empty and have no surrounding whitespace",
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(FerrumError::config(format!(
+                "duplicate --served-model-name value: {name}"
+            )));
+        }
+    }
+    Ok(names)
+}
+
 pub(crate) fn write_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
+    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -1581,7 +1693,20 @@ pub(crate) fn write_startup_config_artifacts(
             std::fs::create_dir_all(parent)
                 .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
         }
-        let bytes = serde_json::to_vec_pretty(&auto_config.effective_config_document())
+        let mut document = auto_config.effective_config_document();
+        if let Some(evidence) = resolution_evidence {
+            let object = document.as_object_mut().ok_or_else(|| {
+                ferrum_types::FerrumError::serialization(
+                    "effective startup config document must be an object",
+                )
+            })?;
+            object.insert(
+                "resolution_evidence".to_owned(),
+                serde_json::to_value(evidence)
+                    .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?,
+            );
+        }
+        let bytes = serde_json::to_vec_pretty(&document)
             .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?;
         std::fs::write(path, [bytes.as_slice(), b"\n"].concat())
             .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
@@ -1671,10 +1796,9 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     definition: &ferrum_models::ModelDefinition,
     model_weight_bytes: Option<u64>,
 ) -> ModelCapabilities {
-    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+    ferrum_models::legacy_capabilities::from_definition_with_weight_bytes(
         definition,
         model_weight_bytes,
-        ferrum_types::DataType::FP32,
     )
 }
 
@@ -1683,116 +1807,10 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes_for_hardware(
     model_weight_bytes: Option<u64>,
     hardware: &HardwareCapabilities,
 ) -> ModelCapabilities {
-    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+    ferrum_models::legacy_capabilities::from_definition_with_weight_bytes_for_hardware(
         definition,
         model_weight_bytes,
-        qwen35_recurrent_state_dtype_for_hardware(hardware),
-    )
-}
-
-fn model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
-    definition: &ferrum_models::ModelDefinition,
-    model_weight_bytes: Option<u64>,
-    recurrent_state_dtype: ferrum_types::DataType,
-) -> ModelCapabilities {
-    let architecture = match definition.architecture {
-        ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
-        ferrum_models::Architecture::Qwen35Moe => "qwen3_5_moe",
-        ferrum_models::Architecture::Gemma3 => "gemma3",
-        ferrum_models::Architecture::Qwen35 => "qwen3_5",
-        ferrum_models::Architecture::Qwen3 => "qwen3",
-        ferrum_models::Architecture::Qwen2 => "qwen2",
-        ferrum_models::Architecture::Llama => "llama",
-        ferrum_models::Architecture::Mistral => "mistral",
-        ferrum_models::Architecture::Phi => "phi",
-        ferrum_models::Architecture::GPT2 => "gpt2",
-        ferrum_models::Architecture::Bert => "bert",
-        ferrum_models::Architecture::Clip => "clip",
-        ferrum_models::Architecture::Whisper => "whisper",
-        ferrum_models::Architecture::Qwen3TTS => "qwen3_tts",
-        ferrum_models::Architecture::Unknown => "unknown",
-    }
-    .to_string();
-    let head_dim = definition
-        .extra_params
-        .get("head_dim")
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .or_else(|| {
-            (definition.num_attention_heads > 0)
-                .then_some(definition.hidden_size / definition.num_attention_heads)
-        });
-    let moe = if matches!(
-        definition.architecture,
-        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
-    ) {
-        let num_experts = definition
-            .extra_params
-            .get("num_experts")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0) as usize;
-        let experts_per_token = definition
-            .extra_params
-            .get("num_experts_per_tok")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0) as usize;
-        Some(MoeCapabilities {
-            num_experts,
-            experts_per_token,
-            moe_intermediate_size: definition
-                .extra_params
-                .get("moe_intermediate_size")
-                .and_then(|value| value.as_u64())
-                .map(|value| value as usize),
-        })
-    } else {
-        None
-    };
-    let recurrent_state_bytes_per_sequence =
-        recurrent_state_bytes_per_sequence_from_definition(definition, recurrent_state_dtype);
-
-    ModelCapabilities {
-        architecture,
-        quantization: quantization_from_definition(definition),
-        moe,
-        max_context_len: Some(definition.max_position_embeddings),
-        num_hidden_layers: Some(definition.num_hidden_layers),
-        head_dim,
-        kv_heads: definition.num_key_value_heads,
-        estimated_weight_bytes: model_weight_bytes
-            .filter(|value| *value > 0)
-            .or_else(|| estimated_weight_bytes_from_definition(definition)),
-        recurrent_state_bytes_per_sequence,
-        supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-        graph_safe_moe: false,
-    }
-}
-
-fn qwen35_recurrent_state_dtype_for_hardware(
-    hardware: &HardwareCapabilities,
-) -> ferrum_types::DataType {
-    if hardware.backend.eq_ignore_ascii_case("cuda") && hardware.compiled_features.cuda {
-        ferrum_types::DataType::FP16
-    } else {
-        ferrum_types::DataType::FP32
-    }
-}
-
-fn recurrent_state_bytes_per_sequence_from_definition(
-    definition: &ferrum_models::ModelDefinition,
-    dtype: ferrum_types::DataType,
-) -> Option<u64> {
-    if !matches!(
-        definition.architecture,
-        ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe
-    ) {
-        return None;
-    }
-    Some(
-        ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
-            .ok()?
-            .recurrent_state_bytes_per_slot(dtype)
-            .ok()?,
+        hardware,
     )
 }
 
@@ -1822,94 +1840,6 @@ pub(crate) fn model_weight_bytes_from_path(path: &Path) -> Option<u64> {
         }
     }
     (total > 0).then_some(total)
-}
-
-fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> Option<String> {
-    let quant = definition.extra_params.get("quantization_config")?;
-    let method = quant
-        .get("quant_method")
-        .or_else(|| quant.get("type"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("quantized");
-    let bits = quant.get("bits").and_then(|value| value.as_u64());
-    Some(match bits {
-        Some(bits) => format!("{method}_int{bits}"),
-        None => method.to_string(),
-    })
-}
-
-fn estimated_weight_bytes_from_definition(
-    definition: &ferrum_models::ModelDefinition,
-) -> Option<u64> {
-    let params = estimated_total_parameters_from_definition(definition)?;
-    if params == 0 {
-        return None;
-    }
-    let quant = definition.extra_params.get("quantization_config");
-    let bits_per_param = quant
-        .and_then(|quant| quant.get("bits"))
-        .and_then(|value| value.as_u64())
-        .filter(|bits| *bits > 0)
-        .unwrap_or(16);
-    Some(params.saturating_mul(bits_per_param).div_ceil(8))
-}
-
-fn estimated_total_parameters_from_definition(
-    definition: &ferrum_models::ModelDefinition,
-) -> Option<u64> {
-    let dense_params = definition.to_model_info("__auto_config").num_parameters;
-    if !matches!(
-        definition.architecture,
-        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
-    ) {
-        return Some(dense_params);
-    }
-
-    let hidden = definition.hidden_size as u128;
-    let layers = definition.num_hidden_layers as u128;
-    let vocab = definition.vocab_size as u128;
-    let num_experts = definition
-        .extra_params
-        .get("num_experts")
-        .and_then(|value| value.as_u64())? as u128;
-    let moe_intermediate = definition
-        .extra_params
-        .get("moe_intermediate_size")
-        .and_then(|value| value.as_u64())
-        .or_else(|| {
-            (definition.intermediate_size > 0).then_some(definition.intermediate_size as u64)
-        })? as u128;
-    let shared_intermediate = definition
-        .extra_params
-        .get("shared_expert_intermediate_size")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0) as u128;
-
-    let embedding_params = vocab.saturating_mul(hidden);
-    let lm_head_params = embedding_params;
-    let attention_params = layers
-        .saturating_mul(4)
-        .saturating_mul(hidden)
-        .saturating_mul(hidden);
-    let norm_params = layers.saturating_mul(2).saturating_mul(hidden);
-    let router_params = layers.saturating_mul(hidden).saturating_mul(num_experts);
-    let expert_params = layers
-        .saturating_mul(num_experts)
-        .saturating_mul(3)
-        .saturating_mul(hidden)
-        .saturating_mul(moe_intermediate);
-    let shared_expert_params = layers
-        .saturating_mul(3)
-        .saturating_mul(hidden)
-        .saturating_mul(shared_intermediate);
-    let total = embedding_params
-        .saturating_add(lm_head_params)
-        .saturating_add(attention_params)
-        .saturating_add(norm_params)
-        .saturating_add(router_params)
-        .saturating_add(expert_params)
-        .saturating_add(shared_expert_params);
-    Some(total.min(u64::MAX as u128) as u64)
 }
 
 pub(crate) fn hardware_capabilities_for_device(
@@ -2191,7 +2121,9 @@ impl RuntimePresetInferenceRule {
             return false;
         }
         if self.quantization.is_some()
-            && quantization_from_definition(definition).as_deref() != self.quantization
+            && ferrum_models::legacy_capabilities::quantization_from_definition(definition)
+                .as_deref()
+                != self.quantization
         {
             return false;
         }
@@ -2288,14 +2220,8 @@ fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
 mod tests {
     use super::*;
 
-    const QWEN35_ARTIFACT_ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
-        "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
-    );
-
     #[test]
-    fn serve_parses_explicit_qwen35_reference_flag() {
+    fn serve_rejects_removed_qwen35_flag() {
         use clap::Parser;
 
         #[derive(Parser)]
@@ -2304,20 +2230,82 @@ mod tests {
             serve: ServeCommand,
         }
 
-        let parsed = TestCli::parse_from(["ferrum", "--model", "qwen3.5", "--qwen35-reference"]);
+        let error =
+            match TestCli::try_parse_from(["ferrum", "--model", "qwen3.5", "--qwen35-reference"]) {
+                Ok(_) => panic!("product CLI exposed the legacy Qwen3.5 reference adapter"),
+                Err(error) => error,
+            };
 
-        assert!(parsed.serve.qwen35_reference);
+        assert!(error.to_string().contains("--qwen35-reference"));
+    }
+
+    #[test]
+    fn serve_parses_public_model_aliases() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+
+        let parsed = TestCli::parse_from([
+            "ferrum",
+            "--model",
+            "Qwen/Qwen3.5-4B",
+            "--served-model-name",
+            "ferrum,qwen35",
+            "--port",
+            "8001",
+        ]);
+
+        assert_eq!(parsed.serve.served_model_name, ["ferrum", "qwen35"]);
+    }
+
+    #[test]
+    fn served_model_names_default_and_reject_ambiguity() {
+        assert_eq!(
+            effective_served_model_names("Qwen/Qwen3.5-4B", Some("Qwen/Qwen3.5-4B"), vec![])
+                .unwrap(),
+            ["Qwen/Qwen3.5-4B"]
+        );
+        assert_eq!(
+            effective_served_model_names("Qwen3.5-4B-Q4_K_M", Some("qwen3.5:4b-q4_k_m"), vec![])
+                .unwrap(),
+            ["qwen3.5:4b-q4_k_m", "Qwen3.5-4B-Q4_K_M"]
+        );
+        assert!(effective_served_model_names(
+            "Qwen/Qwen3.5-4B",
+            Some("qwen3.5:4b"),
+            vec!["same".to_string(), "same".to_string()]
+        )
+        .is_err());
+        assert!(effective_served_model_names(
+            "Qwen/Qwen3.5-4B",
+            Some("qwen3.5:4b"),
+            vec![" ferrum".to_string()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn served_model_names_do_not_expose_non_hugging_face_source_names() {
+        assert_eq!(
+            effective_served_model_names("local-model", None, vec![]).unwrap(),
+            ["local-model"]
+        );
     }
 
     #[test]
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
-        let entries = serve_cli_runtime_entries(
+        let mut entries = serve_cli_runtime_entries(
             Some("int8"),
             Some(1024),
             Some(4096),
             Some(4096),
             Some(64),
             Some(2048),
+            Some(12_345),
             Some(8),
             Some(16),
             Some(24),
@@ -2334,6 +2322,10 @@ mod tests {
             Some(32),
             Some("{\"schema_version\":1}"),
             Some(crate::layer_split_pipeline::LayerSplitPipelineModeArg::Batch),
+        );
+        push_sequence_fit_policy_cli_entry(
+            &mut entries,
+            Some(crate::commands::SequenceFitPolicyArg::FullInputMustFit),
         );
         let snapshot = RuntimeConfigSnapshot::from_entries(entries);
         let entry = |key: &str| {
@@ -2358,6 +2350,16 @@ mod tests {
         );
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(
+            entry("FERRUM_RUNTIME_MEMORY_BUDGET_BYTES").effective_value,
+            "12345"
+        );
+        assert!(entry("FERRUM_RUNTIME_MEMORY_BUDGET_BYTES")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Memory));
+        assert!(entry("FERRUM_RUNTIME_MEMORY_BUDGET_BYTES")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "8"
@@ -2400,6 +2402,20 @@ mod tests {
         );
         assert_eq!(entry("FERRUM_PROFILE_CONCURRENCY").effective_value, "32");
         assert_eq!(
+            entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
+            "full-input-must-fit"
+        );
+        assert_eq!(
+            entry("FERRUM_SEQUENCE_FIT_POLICY").source,
+            RuntimeConfigSource::Cli
+        );
+        assert!(entry("FERRUM_SEQUENCE_FIT_POLICY")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Memory));
+        assert!(entry("FERRUM_SEQUENCE_FIT_POLICY")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
+        assert_eq!(
             entry(crate::layer_split_pipeline::LAYER_SPLIT_PIPELINE_MODE_KEY).effective_value,
             "batch"
         );
@@ -2437,10 +2453,11 @@ mod tests {
     fn serve_runtime_snapshot_prefers_cli_over_config_file() {
         let config_entries = crate::config::RuntimeCliConfig {
             kv_dtype: Some("fp16".to_string()),
+            sequence_fit_policy: Some(ferrum_types::SequenceFitPolicy::ImmediateOnly),
             ..Default::default()
         }
         .runtime_config_entries();
-        let cli_entries = serve_cli_runtime_entries(
+        let mut cli_entries = serve_cli_runtime_entries(
             Some("int8"),
             None,
             None,
@@ -2463,6 +2480,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+        );
+        push_sequence_fit_policy_cli_entry(
+            &mut cli_entries,
+            Some(crate::commands::SequenceFitPolicyArg::FullInputMustFit),
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -2477,6 +2499,13 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+        let sequence_fit = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .unwrap();
+        assert_eq!(sequence_fit.effective_value, "full-input-must-fit");
+        assert_eq!(sequence_fit.source, RuntimeConfigSource::Cli);
     }
 
     #[test]
@@ -2549,6 +2578,7 @@ mod tests {
             Some(4096),
             Some(8),
             Some(512),
+            None,
             Some(8),
             Some(16),
             Some(32),
@@ -2809,84 +2839,10 @@ mod tests {
         definition
     }
 
-    fn qwen35_moe_reference_definition() -> ferrum_models::ModelDefinition {
-        let raw = std::fs::read_to_string(format!(
-            "{QWEN35_ARTIFACT_ROOT}/moe_shared_expert_reference.config.json"
-        ))
-        .expect("read Qwen3.5 MoE reference config");
-        let root: serde_json::Value =
-            serde_json::from_str(&raw).expect("parse Qwen3.5 MoE reference config");
-        let text = root
-            .get("text_config")
-            .and_then(|value| value.as_object())
-            .expect("Qwen3.5 reference config should include text_config");
-        let mut extra_params = root
-            .as_object()
-            .expect("Qwen3.5 reference config root should be an object")
-            .clone();
-        for (key, value) in text {
-            extra_params.insert(key.clone(), value.clone());
-        }
-
-        ferrum_models::ModelDefinition {
-            architecture: ferrum_models::Architecture::Qwen35Moe,
-            hidden_size: 2048,
-            intermediate_size: 512,
-            num_hidden_layers: 40,
-            num_attention_heads: 16,
-            num_key_value_heads: Some(2),
-            max_position_embeddings: 262144,
-            vocab_size: 248320,
-            extra_params: serde_json::Value::Object(extra_params),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn qwen35_moe_model_capabilities_preserve_moe_shape() {
-        let definition = qwen35_moe_reference_definition();
-
-        let capabilities = model_capabilities_from_definition_with_weight_bytes(&definition, None);
-
-        assert_eq!(capabilities.architecture, "qwen3_5_moe");
-        assert_eq!(capabilities.head_dim, Some(256));
-        assert_eq!(capabilities.num_hidden_layers, Some(40));
-        let moe = capabilities.moe.expect("Qwen3.5 MoE should be marked MoE");
-        assert_eq!(moe.num_experts, 256);
-        assert_eq!(moe.experts_per_token, 8);
-        assert_eq!(moe.moe_intermediate_size, Some(512));
-        assert!(
-            capabilities.estimated_weight_bytes.unwrap() > 14 * 1024 * 1024 * 1024,
-            "Qwen3.5 MoE weight estimate must account for all resident experts, not only active params"
-        );
-        assert_eq!(
-            capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
-        );
-    }
-
-    #[test]
-    fn qwen35_moe_cuda_model_capabilities_use_cuda_recurrent_state_dtype() {
-        let definition = qwen35_moe_reference_definition();
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-
-        let capabilities = model_capabilities_from_definition_with_weight_bytes_for_hardware(
-            &definition,
-            None,
-            &hardware,
-        );
-
-        assert_eq!(
-            capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
-        );
-    }
-
     #[test]
     fn model_capabilities_prefer_measured_weight_bytes_from_model_source() {
         let mut definition = ferrum_models::ModelDefinition {
-            architecture: ferrum_models::Architecture::Qwen35Moe,
+            architecture: ferrum_models::Architecture::Qwen3Moe,
             hidden_size: 2048,
             intermediate_size: 512,
             num_hidden_layers: 40,
@@ -3251,6 +3207,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -3293,6 +3250,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -3307,6 +3265,7 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
@@ -3341,6 +3300,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -3355,6 +3315,7 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,

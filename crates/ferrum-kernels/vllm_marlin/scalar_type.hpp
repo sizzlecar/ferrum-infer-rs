@@ -82,83 +82,40 @@ class ScalarType {
 
   using Id = int64_t;
 
- private:
-  // Field size in id
-  template <typename T_>
-  static constexpr size_t member_id_field_width() {
-    using T = std::decay_t<T_>;
-    return std::is_same_v<T, bool> ? 1 : sizeof(T) * 8;
-  }
-
-  template <typename Fn, typename Init, typename Member, typename... Rest>
-  static constexpr auto reduce_members_helper(Fn f, Init val, Member member,
-                                              Rest... rest) {
-    auto new_val = f(val, member);
-    if constexpr (sizeof...(rest) > 0) {
-      return reduce_members_helper(f, new_val, rest...);
-    } else {
-      return new_val;
-    };
-  }
-
-  template <typename Fn, typename Init>
-  constexpr auto reduce_members(Fn f, Init init) const {
-    // Should be in constructor order for `from_id`
-    return reduce_members_helper(f, init, exponent, mantissa, signed_, bias,
-                                 finite_values_only, nan_repr);
-  };
-
-  template <typename Fn, typename Init>
-  static constexpr auto reduce_member_types(Fn f, Init init) {
-    constexpr auto dummy_type = ScalarType(0, 0, false, 0, false, NAN_NONE);
-    return dummy_type.reduce_members(f, init);
-  };
-
-  static constexpr auto id_size_bits() {
-    return reduce_member_types(
-        [](int acc, auto member) -> int {
-          return acc + member_id_field_width<decltype(member)>();
-        },
-        0);
-  }
-
  public:
   // unique id for this scalar type that can be computed at compile time for
   //  c++17 template specialization this is not needed once we migrate to
   //  c++20 and can pass literal classes as template parameters
   constexpr Id id() const {
-    static_assert(id_size_bits() <= sizeof(Id) * 8,
-                  "ScalarType id is too large to be stored");
-
-    auto or_and_advance = [](std::pair<Id, uint32_t> result,
-                             auto member) -> std::pair<Id, uint32_t> {
-      auto [id, bit_offset] = result;
-      auto constexpr bits = member_id_field_width<decltype(member)>();
-      return {id | (int64_t(member) & ((uint64_t(1) << bits) - 1))
-                       << bit_offset,
-              bit_offset + bits};
-    };
-    return reduce_members(or_and_advance, std::pair<Id, uint32_t>{}).first;
+    // Keep this layout explicit. CUDA 13 evaluated the former generic
+    // member-reduction implementation differently across translation units,
+    // which changed template symbol names and made generated kernels
+    // unreachable from the dispatcher.
+    return static_cast<Id>(
+        uint64_t(exponent) | (uint64_t(mantissa) << 8) |
+        (uint64_t(signed_) << 16) |
+        (uint64_t(static_cast<uint32_t>(bias)) << 17) |
+        (uint64_t(finite_values_only) << 49) |
+        (uint64_t(static_cast<uint8_t>(nan_repr)) << 50));
   }
 
   // create a ScalarType from an id, for c++17 template specialization,
   //  this is not needed once we migrate to c++20 and can pass literal
   //  classes as template parameters
   static constexpr ScalarType from_id(Id id) {
-    auto extract_and_advance = [id](auto result, auto member) {
-      using T = decltype(member);
-      auto [tuple, bit_offset] = result;
-      auto constexpr bits = member_id_field_width<T>();
-      auto extracted_val = static_cast<T>((int64_t(id) >> bit_offset) &
-                                          ((uint64_t(1) << bits) - 1));
-      auto new_tuple = std::tuple_cat(tuple, std::make_tuple(extracted_val));
-      return std::pair<decltype(new_tuple), int>{new_tuple, bit_offset + bits};
-    };
-
-    auto [tuple_args, _] = reduce_member_types(extract_and_advance,
-                                               std::pair<std::tuple<>, int>{});
-    return std::apply([](auto... args) { return ScalarType(args...); },
-                      tuple_args);
+    const auto raw = static_cast<uint64_t>(id);
+    const auto encoded_bias = static_cast<uint32_t>((raw >> 17) & 0xffffffffu);
+    const auto decoded_bias =
+        encoded_bias >= 0x80000000u
+            ? static_cast<int64_t>(encoded_bias) - (int64_t(1) << 32)
+            : static_cast<int64_t>(encoded_bias);
+    return ScalarType(
+        static_cast<uint8_t>(raw & 0xffu),
+        static_cast<uint8_t>((raw >> 8) & 0xffu),
+        static_cast<bool>((raw >> 16) & 0x1u),
+        static_cast<int32_t>(decoded_bias),
+        static_cast<bool>((raw >> 49) & 0x1u),
+        static_cast<NanRepr>((raw >> 50) & 0xffu));
   }
 
   constexpr int64_t size_bits() const {
@@ -354,4 +311,17 @@ static inline constexpr auto kFloat16 = kHalf;
 static inline constexpr auto kBFloat16 = kFE8M7;
 
 static inline constexpr auto kFloat16Id = kFloat16.id();
+
+static_assert(kFloat16.id() == INT64_C(1125899906910725),
+              "ScalarType FP16 ABI changed");
+static_assert(kFE4M3fn.id() == INT64_C(2814749767172868),
+              "ScalarType E4M3FN ABI changed");
+static_assert(kU4B8.id() == INT64_C(1125899907892224),
+              "ScalarType U4B8 ABI changed");
+static_assert(ScalarType::from_id(kFloat16.id()) == kFloat16,
+              "ScalarType FP16 ABI does not round trip");
+static_assert(ScalarType::from_id(kFE4M3fn.id()) == kFE4M3fn,
+              "ScalarType E4M3FN ABI does not round trip");
+static_assert(ScalarType::from_id(kU4B8.id()) == kU4B8,
+              "ScalarType U4B8 ABI does not round trip");
 };  // namespace vllm

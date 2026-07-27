@@ -35,14 +35,28 @@ struct GemvQ4KV2Params {
     int nb01;     // src0 row stride in BYTES = (K/256)*144
 };
 
-kernel void gemv_f32a_q4kw_v2(
-    device const block_q4_K * src0 [[buffer(0)]],   // [N, K/256] super-blocks
-    device const float      * src1 [[buffer(1)]],   // [K] activations
-    device       float      * dst  [[buffer(2)]],   // [N] output
-    constant GemvQ4KV2Params & p   [[buffer(3)]],
-    uint3  tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]])
+struct GemvQ4KBatchParams {
+    uint rows;
+    uint in_features;
+    uint out_features;
+    uint output_stride;
+    uint output_column_offset;
+};
+
+template <typename activation_t, typename output_t>
+void gemv_q4kw_v2_impl(
+    device const block_q4_K * src0,
+    device const activation_t * src1,
+    device output_t * dst,
+    int n,
+    int k,
+    int nb01,
+    uint batch_row,
+    uint output_stride,
+    uint output_column_offset,
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg)
 {
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
@@ -53,18 +67,18 @@ kernel void gemv_f32a_q4kw_v2(
     const short iq = it/4;     // 0 or 1 — which half (low/high nibble subblocks)
     const short ir = it%4;     // 0..3 — which sub-position
 
-    const int nb = p.K / QK_K;
+    const int nb = k / QK_K;
     const int r0 = tgpig.x;
 
     // First row this simdgroup handles. Each threadgroup spans
     // N_R0 * N_SG = 4 consecutive rows; this simdgroup gets rows
     // [first_row .. first_row + N_R0).
     const int first_row = (r0 * N_SG + sgitg) * N_R0;
-    if (first_row >= p.N) return;
+    if (first_row >= n) return;
 
     // src0 base pointer for first_row.
     device const block_q4_K * x = src0 + first_row * nb;
-    device const float      * y = src1;
+    device const activation_t * y = src1 + ulong(batch_row) * k;
 
     float yl[16];
     float yh[16];
@@ -73,7 +87,7 @@ kernel void gemv_f32a_q4kw_v2(
     // Activation pointer: (ix selects which super-block in the group of 4),
     // 64*iq picks the high or low half of the super-block,
     // 8*ir picks the sub-position.
-    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+    device const activation_t * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -95,7 +109,7 @@ kernel void gemv_f32a_q4kw_v2(
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
         device const half     * dh = &x[ib].d;
 
-        for (short row = 0; row < N_R0; row++) {
+        for (short row = 0; row < N_R0 && (first_row + row) < n; row++) {
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
             sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
@@ -131,19 +145,61 @@ kernel void gemv_f32a_q4kw_v2(
                           );
 
             // Advance pointers by one row stride (nb01 / sizeof(uint16_t) == nb01/2).
-            q1 += p.nb01 / 2;
-            sc += p.nb01 / 2;
-            dh += p.nb01 / 2;
+            q1 += nb01 / 2;
+            sc += nb01 / 2;
+            dh += nb01 / 2;
         }
 
         y4 += 4 * QK_K;
     }
 
     // Reduce across the simdgroup and write nr0 outputs.
-    for (short row = 0; row < N_R0 && (first_row + row) < p.N; ++row) {
+    for (short row = 0; row < N_R0 && (first_row + row) < n; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[first_row + row] = sum_all;
+            dst[ulong(batch_row) * output_stride + output_column_offset + first_row + row]
+                = output_t(sum_all);
         }
     }
+}
+
+kernel void gemv_f32a_q4kw_v2(
+    device const block_q4_K * src0 [[buffer(0)]],
+    device const float * src1 [[buffer(1)]],
+    device float * dst [[buffer(2)]],
+    constant GemvQ4KV2Params & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    gemv_q4kw_v2_impl(
+        src0, src1, dst, p.N, p.K, p.nb01, 0, p.N, 0, tgpig, tiisg, sgitg
+    );
+}
+
+kernel void gemv_f16a_q4kw_v2_batched(
+    device const half * src1 [[buffer(0)]],
+    device const block_q4_K * src0 [[buffer(1)]],
+    device half * dst [[buffer(2)]],
+    constant GemvQ4KBatchParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    if (tgpig.y >= p.rows) return;
+    const int nb01 = int((p.in_features / QK_K) * sizeof(block_q4_K));
+    gemv_q4kw_v2_impl(
+        src0,
+        src1,
+        dst,
+        int(p.out_features),
+        int(p.in_features),
+        nb01,
+        tgpig.y,
+        p.output_stride,
+        p.output_column_offset,
+        tgpig,
+        tiisg,
+        sgitg
+    );
 }

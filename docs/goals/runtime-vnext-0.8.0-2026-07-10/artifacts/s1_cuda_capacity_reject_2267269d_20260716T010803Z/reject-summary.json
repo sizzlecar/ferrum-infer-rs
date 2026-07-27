@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "status": "reject",
+  "failure_class": "prefill_first_wait_for_release_decode_livelock",
+  "lane": "vnext-s1-cuda-capacity",
+  "git_sha": "2267269d5392c1a8149e1849d2ef384c92569492",
+  "dirty_status": "",
+  "binary_sha256": "80f03fc858e2da9d1595f2a3e6e1ca9bc6254e31236266d81f0fb6a9cbbb7858",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 1,
+    "gpu_memory_mib": 23028,
+    "driver_version": "595.45.04"
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+  },
+  "build": {
+    "status": "pass",
+    "duration_seconds": 343,
+    "command": "CARGO_BUILD_JOBS=12 cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+  },
+  "run_entrypoint": {
+    "status": "pass",
+    "answer": "Paris",
+    "completion_tokens": 2,
+    "generation_ms": 484.728301
+  },
+  "warmup": {
+    "a_completion_tokens": 128,
+    "a_done_count": 1,
+    "a_usage_count": 1,
+    "c_completion_tokens": 16,
+    "c_done_count": 1,
+    "c_usage_count": 1
+  },
+  "pressure": {
+    "duration_seconds": 250.303642,
+    "a_request_id": "dc574b79-ab2e-47d3-a581-97db00b4253c",
+    "b_request_id": "62b8cc3e-1e01-48e3-b6ec-493100654bdc",
+    "c_request_id": "6fdad18e-297c-4950-9133-82e02e3a5af3",
+    "a_prefill_nodes_submitted_and_retired": 131,
+    "c_prefill_nodes_submitted_and_retired": 131,
+    "pressure_client_files_complete": false,
+    "capacity_pass_line_observed": false
+  },
+  "trace": {
+    "bytes": 226722786,
+    "lines": 119522,
+    "admission_probes": 12,
+    "unchanged_epoch_skips": 117432,
+    "admission_deferred": 8,
+    "backing_growth_requested": 8,
+    "admission_failed": 0,
+    "operation_submitted": 524,
+    "node_retired": 524,
+    "request_completed": 2,
+    "sequence_completed": 2
+  },
+  "terminal_scheduler_snapshot": {
+    "current_iteration": 117575,
+    "waiting_queue_len": 1,
+    "prefill_queue_len": 0,
+    "decode_queue_len": 2,
+    "active_len": 2,
+    "completed_total": 2,
+    "failed_total": 0,
+    "dynamic_admission_probes": 12,
+    "dynamic_admission_skipped_unchanged": 117432,
+    "capacity_backpressure_admit_limit": null,
+    "capacity_release_epoch": 2
+  },
+  "root_cause": {
+    "prefill_first_until_active": 4,
+    "typed_wait_action": "wait_for_release",
+    "typed_release_epoch": 310,
+    "typed_capacity_epoch": 845,
+    "cycle": "B waits for active decode release; fill-first sees B in waiting and suppresses A/C decode; no release epoch can advance",
+    "executor_decode_entered_during_stall": false
+  },
+  "classification": {
+    "cuda_oom": false,
+    "allocator_exhaustion": false,
+    "model_load_failure": false,
+    "kernel_failure": false,
+    "executor_lane_or_fence_lock": false,
+    "cause": "fill-first returned no batch when all waiting prefills were unchanged-epoch typed deferrals, starving the active decodes required to release capacity"
+  },
+  "canonical_artifact": {
+    "path": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/vnext_capacity_2267269d_20260716T010803Z.tar.gz",
+    "bytes": 4850651,
+    "sha256": "964604c78495af1dea600bae26c7b88745708b550bde605e8c82dd55eebab958"
+  },
+  "paid_instance": {
+    "provider": "vast",
+    "instance_id": 45022787,
+    "hourly_usd": 0.4285925925925926,
+    "cur_state": "stopped",
+    "actual_status": "exited"
+  },
+  "next_hypothesis": {
+    "source_change": "when fill-first schedules no runnable prefill after typed admission, restore active decode work within the same iteration",
+    "expected_signal": "A continues decoding while B has zero unchanged-epoch probe/submit delta, C bypasses B and completes, a release epoch advances, then B is admitted and completes",
+    "reject_threshold": "30 seconds without A/C token progress after B defers, more than 512 unchanged skips, target trace above 16 MiB, any stream correctness failure, or missing exact capacity PASS line"
+  }
+}

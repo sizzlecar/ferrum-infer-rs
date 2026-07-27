@@ -4,8 +4,8 @@ error[E0599]: no function or associated item named `new` found for struct `ferru
 5 |     let _ = PlanNodeResolution::new(
   |                                 ^^^ function or associated item not found in `ferrum_interfaces::vnext::PlanNodeResolution`
   |
-note: if you're trying to build a new `ferrum_interfaces::vnext::PlanNodeResolution`, consider using `ferrum_interfaces::vnext::PlanNodeResolution::resolve` which returns `Result<ferrum_interfaces::vnext::PlanNodeResolution, VNextError>`
- --> src/vnext/execution.rs
+note: if you're trying to build a new `ferrum_interfaces::vnext::PlanNodeResolution`, consider using `vnext::execution::resolution::<impl ferrum_interfaces::vnext::PlanNodeResolution>::resolve` which returns `Result<ferrum_interfaces::vnext::PlanNodeResolution, VNextError>`
+ --> src/vnext/execution/resolution.rs
   |
   | /     pub fn resolve<P: RuntimePolicy>(
   | |         family: &PreparedModelFamily,

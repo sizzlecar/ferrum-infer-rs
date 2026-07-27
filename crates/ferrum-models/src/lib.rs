@@ -26,6 +26,7 @@ pub mod gguf_engine_loader;
 pub mod gguf_runtime;
 pub mod hf_download;
 pub mod image_processor;
+pub mod legacy_capabilities;
 pub mod loader;
 pub mod lora;
 pub mod mel;
@@ -34,6 +35,7 @@ pub mod moe;
 pub mod moe_config;
 pub mod multimodal;
 pub mod qwen35_config;
+#[cfg(any(test, feature = "test-support"))]
 pub mod qwen35_s1;
 pub mod qwen35_weights;
 pub mod registry;
@@ -42,13 +44,17 @@ pub mod tensor_wrapper;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod tokenizer;
+pub mod vnext;
 pub mod weight_format;
 
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, ClipModelExecutor, LlmExecutor, Qwen35W3Executor, StubModelExecutor,
-    TtsModelExecutor, WhisperModelExecutor,
+    BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
+    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
+    VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
+    VNextExecutorConfig, VNextModelExecutor, WhisperModelExecutor,
+    MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;

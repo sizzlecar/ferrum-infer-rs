@@ -3,9 +3,9 @@
 ## 状态与依赖
 
 - 状态：Open
-- 总 PASS 依赖：G00、G01、G03
-- G07A 可在 G01 后与 G02-G06 并行；G07B 必须等待 G03 operation catalog/version 冻结
-- 下游：G08-G10
+- 总 PASS 依赖：G00P、live G03 catalog 和 S1 production build graph
+- G07A 在 S1 后立即与 S2/S3 并行，S4 前达到开发反馈目标；G07B 随 live operation catalog/version
+- 下游：S2-S7、G08-G10
 
 ## 目标
 
@@ -20,6 +20,10 @@
 
 G07 总 PASS 必须聚合 G07A/G07B；不能用编译时间 PASS 代替 ABI correctness，也不能用
 native artifact PASS 代替增量构建证据。
+
+G07 不再等待完整 G01/G02/G03 后启动。S1 一旦形成真实 model/runtime/provider/product dependency
+graph，就开始测量并拆分 invalidation domain；否则到 S4 大模型迁移时仍会承受 30 分钟反馈循环。
+普通 model program 修改运行 nvcc 的次数必须在 S4 前降为 `0`。
 
 G07A/G07B 是 canonical DAG checkpoint：
 
@@ -81,6 +85,21 @@ Metal-only 文件修改不得使 CUDA provider/native artifact dirty，反向同
 - 每次保存 edit before/after SHA、Cargo argv/messages、实际 rustc/nvcc/link invocation、起止
   monotonic/wall time、return code、binary SHA256 和 smoke receipt。五次必须使用相同 host/power
   policy/compiler/toolchain；混合 cold/warm 样本后只报一个 p95 禁止通过。
+
+### 2026-07-24 失效域诊断
+
+clean source `3ac6b65a` 只修改了 CUDA provider 的 Rust replay shape 和一项 Rust test，
+没有修改 CUDA/C++ TU、header、build script 或 feature set。retained RTX 4090 build host
+上的 release test target 仍重新执行整套 Marlin/MoE native 编译，耗时 `16m57s`；随后同一
+缓存上的正式 candidate release build 仍耗时 `4m54s`。这些是单次 diagnostic 数字，不是本文件
+要求的五样本 p95，也不能形成 G07A PASS。
+
+该样本已经证明当前 graph 未达到“Rust model/runtime leaf edit 不重编 native ops”的目标。
+test target 与 product target 使用不同的 `ferrum-kernels` Cargo build-output identity，使
+OUT_DIR 内的 native static-lib stamp 不能跨目标复用；在 native artifact 从 Cargo package
+fingerprint 中解耦前，继续微调 `nvcc --threads` 不能解决该失效域。G07A 必须保存本次
+`cuda-unit.log`、candidate `cargo.log`、两个 build output identity 和实际 nvcc invocation
+作为 invalidation fixture，并用目标 graph 证明相同 Rust leaf edit 的 nvcc TU 数量为 `0`。
 
 ## 验收
 

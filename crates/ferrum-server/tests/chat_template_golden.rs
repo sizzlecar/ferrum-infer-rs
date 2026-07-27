@@ -41,6 +41,28 @@ struct Case {
     messages: Vec<serde_json::Value>,
     #[serde(default)]
     tools: Option<Vec<ChatTool>>,
+    #[serde(default)]
+    render_kwargs: RenderKwargs,
+}
+
+fn openai_wire_message(mut message: serde_json::Value) -> ChatMessage {
+    if let Some(tool_calls) = message
+        .get_mut("tool_calls")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for tool_call in tool_calls {
+            let Some(arguments) = tool_call
+                .get_mut("function")
+                .and_then(|function| function.get_mut("arguments"))
+            else {
+                continue;
+            };
+            if !arguments.is_string() {
+                *arguments = serde_json::Value::String(serde_json::to_string(arguments).unwrap());
+            }
+        }
+    }
+    serde_json::from_value(message).unwrap()
 }
 
 fn fixture_root() -> PathBuf {
@@ -89,15 +111,23 @@ fn chat_template_goldens_match_transformers() {
             let messages: Vec<ChatMessage> = case
                 .messages
                 .iter()
-                .map(|m| serde_json::from_value(m.clone()).unwrap())
+                .cloned()
+                .map(openai_wire_message)
                 .collect();
+            let case_options = ChatTemplateOptions {
+                enable_thinking: case
+                    .render_kwargs
+                    .enable_thinking
+                    .or(options.enable_thinking),
+                now_override: options.now_override,
+            };
 
             let rendered = match &case.tools {
                 Some(tools) => render_chat_prompt_with_tools_and_model_template(
                     &messages,
                     &meta.model_id,
                     Some(&template),
-                    &options,
+                    &case_options,
                     tools,
                     None,
                     &[],
@@ -107,7 +137,7 @@ fn chat_template_goldens_match_transformers() {
                     &messages,
                     &meta.model_id,
                     Some(&template),
-                    &options,
+                    &case_options,
                 ),
             };
 

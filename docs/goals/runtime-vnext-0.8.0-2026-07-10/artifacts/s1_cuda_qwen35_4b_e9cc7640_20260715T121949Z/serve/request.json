@@ -1,0 +1,1 @@
+{"model":"851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a","messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}],"max_tokens":16,"temperature":0,"stream":true,"stream_options":{"include_usage":true}}

@@ -144,6 +144,7 @@ impl ModelFamilyProvider for TestFamily {
                     id: id("node.main"),
                     operation_id: id("operation.model-wire-test"),
                     required_version: ContractVersion::new(1, 0),
+                    work: ProgramNodeWorkSpec::Fixed,
                     inputs: vec![id("value.input"), id("value.weight"), id("value.state")],
                     outputs: vec![id("value.output")],
                     attributes: BTreeMap::new(),
@@ -159,6 +160,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
+                initialization: StateInitialization::Zero,
             }],
             vec![WeightReference {
                 weight_id: id("weight.tensor.model-wire-test"),
@@ -217,6 +219,71 @@ impl TestRegistry {
 impl ModelFamilyRegistry for TestRegistry {
     fn registrations(&self) -> Vec<&dyn ModelFamilyRegistration> {
         vec![&self.registration]
+    }
+}
+
+#[test]
+fn affine_dense_encoding_wire_preserves_transform_identity() {
+    let encoding = WeightEncoding::DenseAffine {
+        element_type: ElementType::F16,
+        scale: CanonicalRational::new(1, 1).unwrap(),
+        bias: CanonicalRational::new(1, 1).unwrap(),
+    };
+    let wire = serde_json::to_value(&encoding).unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "dense_affine": {
+                "element_type": "f16",
+                "scale": {"numerator": 1, "denominator": 1},
+                "bias": {"numerator": 1, "denominator": 1}
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<WeightEncoding>(wire.clone()).unwrap(),
+        encoding
+    );
+
+    let changed_bias = WeightEncoding::DenseAffine {
+        element_type: ElementType::F16,
+        scale: CanonicalRational::new(1, 1).unwrap(),
+        bias: CanonicalRational::new(0, 1).unwrap(),
+    };
+    assert_ne!(
+        serde_json::to_vec(&encoding).unwrap(),
+        serde_json::to_vec(&changed_bias).unwrap(),
+        "affine semantics must alter prepared-family fingerprint input"
+    );
+}
+
+#[test]
+fn canonical_rational_parses_decimal_without_binary_rounding() {
+    assert_eq!(
+        CanonicalRational::from_decimal_str("0.000001").unwrap(),
+        CanonicalRational::new(1, 1_000_000).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("1e-6").unwrap(),
+        CanonicalRational::new(1, 1_000_000).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("-0.125").unwrap(),
+        CanonicalRational::new(-1, 8).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("12.5e2").unwrap(),
+        CanonicalRational::new(1_250, 1).unwrap()
+    );
+    assert_eq!(
+        CanonicalRational::from_decimal_str("0").unwrap(),
+        CanonicalRational::new(0, 1).unwrap()
+    );
+    for invalid in ["", ".5", "1e", "1e2e3", "nan", "1e999"] {
+        assert!(
+            CanonicalRational::from_decimal_str(invalid).is_err(),
+            "{invalid:?} must fail closed"
+        );
     }
 }
 

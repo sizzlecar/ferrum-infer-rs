@@ -1,0 +1,5 @@
+started_at=2026-07-15T12:49:18Z
+git_sha=e9cc76403d8f69004a49199a407e90ff7007f88b
+c5036c63720c7e798a224e07110bab9c44ff28880902cf5e915f5d4e083cdf8b  target/release/ferrum
+command=target/release/ferrum serve /workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a --backend cuda --host 127.0.0.1 --port 18080 --profile-detail full --profile-sample-rate 1.0 --profile-jsonl /workspace/artifacts/s1_cuda_qwen35_4b_e9cc7640_20260715T121949Z/serve/profile.jsonl --scheduler-trace-jsonl /workspace/artifacts/s1_cuda_qwen35_4b_e9cc7640_20260715T121949Z/serve/scheduler-trace.jsonl
+finished_at=2026-07-15T12:52:01Z

@@ -1,0 +1,20 @@
+<|im_start|>user
+Use the calculator.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=calculator>
+<parameter=expression>
+7*3
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+21
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

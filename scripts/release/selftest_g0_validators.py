@@ -21,15 +21,86 @@ RUNTIME_VNEXT_INVENTORY = REPO_ROOT / "scripts/release/runtime_vnext_inventory.p
 RUNTIME_VNEXT_MODEL_RESOLVER = REPO_ROOT / "scripts/release/runtime_vnext_model_resolver.py"
 RUNTIME_VNEXT_HARDWARE_PROBE = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
 RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
+JSONL_PRODUCT_SESSION = REPO_ROOT / "scripts/release/jsonl_product_session.py"
 RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
+RUNTIME_VNEXT_EXPECTATION_AMENDMENT = REPO_ROOT / "scripts/release/runtime_vnext_expectation_amendment.py"
 RUNTIME_VNEXT_BLOCKED_LANE = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
+RUNTIME_VNEXT_PERFORMANCE_COLLECTOR = REPO_ROOT / "scripts/release/runtime_vnext_performance_collector.py"
 RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
 RUNTIME_VNEXT_G00_ORCHESTRATOR = REPO_ROOT / "scripts/release/runtime_vnext_g00_orchestrator.py"
 RUNTIME_VNEXT_HISTORICAL_CORPUS = REPO_ROOT / "scripts/release/runtime_vnext_historical_corpus.py"
+RUNTIME_VNEXT_HISTORICAL_REPLAY = REPO_ROOT / "scripts/release/runtime_vnext_historical_replay.py"
+RUNTIME_VNEXT_HISTORICAL_CAPTURE = REPO_ROOT / "scripts/release/runtime_vnext_historical_capture.py"
 RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py"
+RUNTIME_VNEXT_NUMERICAL_TOLERANCES = (
+    REPO_ROOT / "scripts/release/runtime_vnext_numerical_tolerances.py"
+)
+RUNTIME_VNEXT_CHECKPOINT_ARTIFACT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_checkpoint_artifact.py"
+)
+RUNTIME_VNEXT_CUDA_DETERMINISM = (
+    REPO_ROOT / "scripts/release/runtime_vnext_cuda_determinism.py"
+)
+QWEN35_GGUF_LINEAR_ATTENTION_REFERENCE = (
+    REPO_ROOT / "scripts/release/qwen35_gguf_linear_attention_reference.py"
+)
+QWEN35_GGUF_FULL_ATTENTION_REFERENCE = (
+    REPO_ROOT / "scripts/release/qwen35_gguf_full_attention_reference.py"
+)
+QWEN35_GGUF_MODEL_REFERENCE = (
+    REPO_ROOT / "scripts/release/qwen35_gguf_model_reference.py"
+)
+RUNTIME_VNEXT_QWEN35_LAYER_REFERENCE_GATE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_qwen35_layer_reference_gate.py"
+)
+RUNTIME_VNEXT_QWEN35_FULL_ATTENTION_GATE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_qwen35_full_attention_gate.py"
+)
+RUNTIME_VNEXT_QWEN35_MODEL_REFERENCE_GATE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_qwen35_model_reference_gate.py"
+)
+RUNTIME_VNEXT_S1_CUDA_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_checkpoint.py"
+)
+RUNTIME_VNEXT_S1_CUDA_BASIC_COLLECTOR = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_basic_collector.py"
+)
+RUNTIME_VNEXT_S1_CUDA_CAPACITY = REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_capacity.py"
+RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_decode_capacity.py"
+)
+RUNTIME_VNEXT_G08B_CUDA_MATRIX_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py"
+)
+RUNTIME_VNEXT_G08B_CUDA_MATRIX_PREPARE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08b_cuda_matrix_prepare.py"
+)
+RUNTIME_VNEXT_G08B_METAL_MATRIX_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08b_metal_matrix_checkpoint.py"
+)
+RUNTIME_VNEXT_G08B_METAL_MATRIX_PREPARE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08b_metal_matrix_prepare.py"
+)
+RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08_performance_smoke.py"
+)
+RUNTIME_VNEXT_CUDA_REPLAY_KERNEL_ATTRIBUTION = (
+    REPO_ROOT / "scripts/release/runtime_vnext_cuda_replay_kernel_attribution.py"
+)
+NATIVE_WORK_ATTRIBUTION_GATE = REPO_ROOT / "scripts/release/native_work_attribution_gate.py"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
+OPENAI_TOOL_CALL_REGRESSION = REPO_ROOT / "scripts/release/openai_tool_call_regression.py"
+RUNTIME_VNEXT_S2_RESPONSE_FORMAT_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s2_response_format_checkpoint.py"
+)
+RUNTIME_VNEXT_S2_API_MODALITY_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s2_api_modality_checkpoint.py"
+)
+RUNTIME_VNEXT_S2_STREAM_DISCONNECT_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s2_stream_disconnect_checkpoint.py"
+)
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
 BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
@@ -50,9 +121,9 @@ RUNTIME_VNEXT_BASELINE_FAST_SELFTEST_PASS = (
 RUNTIME_VNEXT_BASELINE_SELFTEST_SUMMARY_PREFIX = (
     "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
 )
-RUNTIME_VNEXT_BASELINE_MUTATION_COUNT = 102
+RUNTIME_VNEXT_BASELINE_MUTATION_COUNT = 115
 RUNTIME_VNEXT_BASELINE_MUTATION_MATRIX_SHA256 = (
-    "097f6af783d6b77311fea7853955a68e36f27867f4cc65e5627fa32feecfd99b"
+    "54a1cb0ffd4742f26c416b1c40f13803840d65fe7c7ba51c4866725fca9db3eb"
 )
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -162,6 +233,16 @@ def make_summary_artifact(root: Path) -> None:
 def load_release_binary_gate():
     spec = importlib.util.spec_from_file_location("release_binary_gate", RELEASE_BINARY_GATE)
     require(spec is not None and spec.loader is not None, "failed to load release binary gate")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_openai_tool_call_regression():
+    spec = importlib.util.spec_from_file_location(
+        "openai_tool_call_regression", OPENAI_TOOL_CALL_REGRESSION
+    )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -330,10 +411,22 @@ def test_runtime_vnext_build_timing_selftest() -> None:
     require("RUNTIME VNEXT BUILD TIMING SELF-TEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_jsonl_product_session_selftest() -> None:
+    ok = run([sys.executable, str(JSONL_PRODUCT_SESSION), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM JSONL PRODUCT SESSION SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_runtime_vnext_baseline_scenarios_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_BASELINE_SCENARIOS), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_expectation_amendment_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_EXPECTATION_AMENDMENT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("RUNTIME VNEXT EXPECTATION AMENDMENT SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
 def test_runtime_vnext_blocked_lane_selftest() -> None:
@@ -346,6 +439,12 @@ def test_runtime_vnext_resource_sampler_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_RESOURCE_SAMPLER), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("FERRUM RUNTIME VNEXT RESOURCE SAMPLER SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_performance_collector_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_PERFORMANCE_COLLECTOR), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUNTIME VNEXT PERFORMANCE COLLECTOR SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
 def test_runtime_vnext_g00a_checkpoint_selftest() -> None:
@@ -372,11 +471,269 @@ def test_runtime_vnext_historical_corpus_selftest() -> None:
     )
 
 
+def test_runtime_vnext_historical_replay_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_REPLAY), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT HISTORICAL REPLAY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_historical_capture_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_CAPTURE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G00 HISTORICAL CAPTURE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_g01a_checkpoint_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_G01A_CHECKPOINT), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require(
         "FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_numerical_tolerances_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_NUMERICAL_TOLERANCES), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT NUMERICAL TOLERANCE SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+    catalog = run(
+        [sys.executable, str(RUNTIME_VNEXT_NUMERICAL_TOLERANCES), "--working-tree"]
+    )
+    require(catalog.returncode == 0, catalog.stderr or catalog.stdout)
+    require(
+        "RUNTIME VNEXT NUMERICAL TOLERANCE WORKTREE VALID" in catalog.stdout,
+        catalog.stdout,
+    )
+
+
+def test_runtime_vnext_checkpoint_artifact_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_CHECKPOINT_ARTIFACT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT CHECKPOINT ARTIFACT SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_cuda_determinism_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_CUDA_DETERMINISM), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT CUDA DETERMINISM SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_qwen35_gguf_linear_attention_reference_selftest() -> None:
+    ok = run(
+        [sys.executable, str(QWEN35_GGUF_LINEAR_ATTENTION_REFERENCE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "QWEN35 GGUF LINEAR ATTENTION REFERENCE SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_qwen35_gguf_full_attention_reference_selftest() -> None:
+    ok = run(
+        [sys.executable, str(QWEN35_GGUF_FULL_ATTENTION_REFERENCE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "QWEN35 GGUF FULL ATTENTION REFERENCE SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_qwen35_gguf_model_reference_selftest() -> None:
+    ok = run([sys.executable, str(QWEN35_GGUF_MODEL_REFERENCE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "QWEN35 GGUF MODEL REFERENCE SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_qwen35_layer_reference_gate_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_QWEN35_LAYER_REFERENCE_GATE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT QWEN35 LINEAR ATTENTION NUMERICS SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_qwen35_full_attention_gate_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_QWEN35_FULL_ATTENTION_GATE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT QWEN35 FULL ATTENTION NUMERICS SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_qwen35_model_reference_gate_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_QWEN35_MODEL_REFERENCE_GATE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT QWEN35 MODEL NUMERICS SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s1_cuda_capacity_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_S1_CUDA_CAPACITY), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA CAPACITY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s1_cuda_checkpoint_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_S1_CUDA_CHECKPOINT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s1_cuda_basic_collector_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S1_CUDA_BASIC_COLLECTOR), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTOR SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s1_cuda_decode_capacity_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08b_cuda_matrix_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08B_CUDA_MATRIX_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08b_cuda_matrix_prepare_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08B_CUDA_MATRIX_PREPARE),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08B CUDA PREPARE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08b_metal_matrix_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08B_METAL_MATRIX_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08b_metal_matrix_prepare_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08B_METAL_MATRIX_PREPARE),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08B METAL PREPARE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08_performance_smoke_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08 PERFORMANCE SMOKE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_cuda_replay_kernel_attribution_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_CUDA_REPLAY_KERNEL_ATTRIBUTION),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "CUDA REPLAY KERNEL ATTRIBUTION SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_native_work_attribution_gate_selftest() -> None:
+    ok = run([sys.executable, str(NATIVE_WORK_ATTRIBUTION_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM NATIVE WORK ATTRIBUTION SELFTEST PASS" in ok.stdout,
         ok.stdout,
     )
 
@@ -391,6 +748,91 @@ def test_run_scenarios_selftest() -> None:
     ok = run([sys.executable, str(RUN_SCENARIOS), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("BACKEND SCENARIO RUNNER SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_openai_tool_call_auto_choice_semantics() -> None:
+    module = load_openai_tool_call_regression()
+    content = {
+        "finish_reason": "stop",
+        "message": {"role": "assistant", "content": "I can answer without a tool."},
+    }
+    require(
+        module.assert_auto_tool_choice_response("content", content)["outcome"] == "content",
+        "auto content outcome was not accepted",
+    )
+
+    tool_call = {
+        "finish_reason": "tool_calls",
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": json.dumps({"city": "北京", "unit": "celsius"}),
+                    },
+                }
+            ],
+        },
+    }
+    require(
+        module.assert_auto_tool_choice_response("tool", tool_call)["outcome"] == "tool_call",
+        "auto tool-call outcome was not accepted",
+    )
+
+    invalid = [
+        {"finish_reason": "stop", "message": {"role": "assistant", "content": ""}},
+        {
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "<tool_call>broken"},
+        },
+    ]
+    for index, choice in enumerate(invalid):
+        try:
+            module.assert_auto_tool_choice_response(f"invalid-{index}", choice)
+            raise AssertionError(f"invalid auto tool outcome {index} unexpectedly passed")
+        except RuntimeError:
+            pass
+
+
+def test_runtime_vnext_s2_response_format_checkpoint_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S2_RESPONSE_FORMAT_CHECKPOINT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s2_api_modality_checkpoint_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S2_API_MODALITY_CHECKPOINT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 API MODALITY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s2_stream_disconnect_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_S2_STREAM_DISCONNECT_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
 
 
 def test_product_backend_sentinel_selftest() -> None:
@@ -561,16 +1003,45 @@ def main() -> int:
     test_runtime_vnext_model_resolver_selftest()
     test_runtime_vnext_hardware_probe_selftest()
     test_runtime_vnext_build_timing_selftest()
+    test_jsonl_product_session_selftest()
     test_runtime_vnext_baseline_scenarios_selftest()
+    test_runtime_vnext_expectation_amendment_selftest()
     test_runtime_vnext_blocked_lane_selftest()
     test_runtime_vnext_resource_sampler_selftest()
+    test_runtime_vnext_performance_collector_selftest()
     test_runtime_vnext_g00a_checkpoint_selftest()
     test_runtime_vnext_g00_orchestrator_selftest()
     test_runtime_vnext_historical_corpus_selftest()
+    test_runtime_vnext_historical_replay_selftest()
+    test_runtime_vnext_historical_capture_selftest()
     test_runtime_vnext_g01a_checkpoint_selftest()
+    test_runtime_vnext_numerical_tolerances_selftest()
+    test_runtime_vnext_checkpoint_artifact_selftest()
+    test_runtime_vnext_cuda_determinism_selftest()
+    test_qwen35_gguf_linear_attention_reference_selftest()
+    test_qwen35_gguf_full_attention_reference_selftest()
+    test_qwen35_gguf_model_reference_selftest()
+    test_runtime_vnext_qwen35_layer_reference_gate_selftest()
+    test_runtime_vnext_qwen35_full_attention_gate_selftest()
+    test_runtime_vnext_qwen35_model_reference_gate_selftest()
+    test_runtime_vnext_s1_cuda_checkpoint_selftest()
+    test_runtime_vnext_s1_cuda_basic_collector_selftest()
+    test_runtime_vnext_s1_cuda_capacity_selftest()
+    test_runtime_vnext_s1_cuda_decode_capacity_selftest()
+    test_runtime_vnext_g08b_cuda_matrix_checkpoint_selftest()
+    test_runtime_vnext_g08b_cuda_matrix_prepare_selftest()
+    test_runtime_vnext_g08b_metal_matrix_checkpoint_selftest()
+    test_runtime_vnext_g08b_metal_matrix_prepare_selftest()
+    test_runtime_vnext_g08_performance_smoke_selftest()
+    test_runtime_vnext_cuda_replay_kernel_attribution_selftest()
+    test_native_work_attribution_gate_selftest()
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
+    test_openai_tool_call_auto_choice_semantics()
+    test_runtime_vnext_s2_response_format_checkpoint_selftest()
+    test_runtime_vnext_s2_api_modality_checkpoint_selftest()
+    test_runtime_vnext_s2_stream_disconnect_checkpoint_selftest()
     test_product_backend_sentinel_selftest()
     test_product_observability_l1_smoke_selftest()
     test_backend_runtime_goal_gate_selftest()

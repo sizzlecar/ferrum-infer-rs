@@ -17,19 +17,34 @@ pub struct RecurrentStateTensorSpec {
     pub name: String,
     /// Tensor shape excluding any request/batch slot dimension.
     pub shape: Vec<usize>,
+    /// Storage dtype for this state tensor.
+    pub dtype: DataType,
 }
 
 impl RecurrentStateTensorSpec {
-    pub fn new(layer_index: usize, name: impl Into<String>, shape: Vec<usize>) -> Self {
+    pub fn new(
+        layer_index: usize,
+        name: impl Into<String>,
+        shape: Vec<usize>,
+        dtype: DataType,
+    ) -> Self {
         Self {
             layer_index,
             name: name.into(),
             shape,
+            dtype,
         }
     }
 
+    pub fn checked_num_elements(&self) -> Option<usize> {
+        self.shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+    }
+
     pub fn num_elements(&self) -> usize {
-        self.shape.iter().product()
+        self.checked_num_elements().unwrap_or(usize::MAX)
     }
 }
 
@@ -42,8 +57,6 @@ pub struct RecurrentStateSpec {
     pub num_layers: usize,
     /// Concrete state tensors to allocate.
     pub tensors: Vec<RecurrentStateTensorSpec>,
-    /// State dtype.
-    pub dtype: DataType,
     /// Target device.
     pub device: Device,
     /// Number of request/batch slots reserved by this handle.
@@ -52,12 +65,14 @@ pub struct RecurrentStateSpec {
 
 impl RecurrentStateSpec {
     pub fn estimated_memory_bytes(&self) -> usize {
-        let state_elements: usize = self
-            .tensors
-            .iter()
-            .map(RecurrentStateTensorSpec::num_elements)
-            .sum();
-        state_elements * self.max_batch_slots * self.dtype.size_bytes()
+        let state_bytes_per_slot = self.tensors.iter().fold(0usize, |total, tensor| {
+            total.saturating_add(
+                tensor
+                    .num_elements()
+                    .saturating_mul(tensor.dtype.size_bytes()),
+            )
+        });
+        state_bytes_per_slot.saturating_mul(self.max_batch_slots)
     }
 }
 

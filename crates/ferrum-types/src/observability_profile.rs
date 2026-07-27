@@ -69,6 +69,8 @@ pub enum ObservabilityProfileDetail {
     Off,
     Basic,
     Debug,
+    Replay,
+    Verify,
     Full,
 }
 
@@ -78,6 +80,8 @@ impl ObservabilityProfileDetail {
             "off" => Some(Self::Off),
             "basic" => Some(Self::Basic),
             "debug" => Some(Self::Debug),
+            "replay" => Some(Self::Replay),
+            "verify" => Some(Self::Verify),
             "full" => Some(Self::Full),
             _ => None,
         }
@@ -88,12 +92,14 @@ impl ObservabilityProfileDetail {
             Self::Off => "off",
             Self::Basic => "basic",
             Self::Debug => "debug",
+            Self::Replay => "replay",
+            Self::Verify => "verify",
             Self::Full => "full",
         }
     }
 
     pub fn diagnostic_only(self) -> bool {
-        matches!(self, Self::Debug | Self::Full)
+        matches!(self, Self::Debug | Self::Replay | Self::Verify | Self::Full)
     }
 }
 
@@ -400,7 +406,42 @@ mod tests {
     }
 
     #[test]
+    fn replay_profile_detail_is_typed_and_diagnostic_only() {
+        assert_eq!(
+            ObservabilityProfileDetail::parse(" replay "),
+            Some(ObservabilityProfileDetail::Replay)
+        );
+        assert_eq!(ObservabilityProfileDetail::Replay.as_str(), "replay");
+        assert!(ObservabilityProfileDetail::Replay.diagnostic_only());
+        assert!(!ObservabilityProfileDetail::Basic.diagnostic_only());
+    }
+
+    #[test]
+    fn verification_profile_detail_is_typed_and_diagnostic_only() {
+        assert_eq!(
+            ObservabilityProfileDetail::parse(" verify "),
+            Some(ObservabilityProfileDetail::Verify)
+        );
+        assert_eq!(ObservabilityProfileDetail::Verify.as_str(), "verify");
+        assert!(ObservabilityProfileDetail::Verify.diagnostic_only());
+    }
+
+    #[test]
     fn observability_config_requires_artifact_path_when_detail_enabled() {
+        let disabled = FerrumObservabilityConfig::new(
+            ProfileEntrypoint::Serve,
+            "model",
+            None,
+            ObservabilityProfileDetail::Off,
+            None,
+            None,
+            None,
+            DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE,
+        );
+        assert!(!disabled.enabled());
+        assert!(!disabled.unified_product_profile_enabled());
+        assert!(disabled.validate().is_ok());
+
         let config = FerrumObservabilityConfig::new(
             ProfileEntrypoint::Run,
             "synthetic/no-weight",

@@ -11,6 +11,7 @@
 //!   - `{ "type": "number" }`  → `-?\d+(\.\d+)?([eE][+-]?\d+)?`
 //!   - `{ "type": "boolean" }` → `true|false`
 //!   - `{ "type": "null" }`    → `null`
+//!   - `{ "const": value }`     → the exact JSON literal for `value`
 //!   - `{ "enum": [...] }`     → alternation of JSON-quoted values
 //!   - `{ "type": "array", "items": T }` → `\[\s*(T(\s*,\s*T)*)?\s*\]`
 //!   - `{ "type": "object", "properties": {...}, "required": [...] }`
@@ -50,6 +51,12 @@ fn translate(node: &Value) -> Result<String> {
     // `enum` takes precedence over `type`.
     if let Some(en) = node.get("enum").and_then(|v| v.as_array()) {
         return enum_pattern(en);
+    }
+
+    // `const` constrains the complete JSON value, regardless of a broader
+    // (or inconsistent) `type` annotation on the same schema node.
+    if let Some(value) = node.get("const") {
+        return literal_pattern(value, "const");
     }
 
     let ty = node.get("type").and_then(|v| v.as_str());
@@ -101,14 +108,18 @@ fn enum_pattern(values: &[Value]) -> Result<String> {
     }
     let mut alts: Vec<String> = Vec::with_capacity(values.len());
     for v in values {
-        // Serialise each allowed value exactly as it would appear in JSON
-        // output, then escape regex metachars.
-        let literal = serde_json::to_string(v).map_err(|e| {
-            FerrumError::invalid_request(format!("enum value not JSON-serialisable: {e}"))
-        })?;
-        alts.push(regex_escape(&literal));
+        alts.push(literal_pattern(v, "enum")?);
     }
     Ok(format!("(?:{})", alts.join("|")))
+}
+
+fn literal_pattern(value: &Value, keyword: &str) -> Result<String> {
+    // Serialise the value exactly as it would appear in JSON output, then
+    // escape regex metacharacters without changing the JSON representation.
+    let literal = serde_json::to_string(value).map_err(|e| {
+        FerrumError::invalid_request(format!("{keyword} value not JSON-serialisable: {e}"))
+    })?;
+    Ok(regex_escape(&literal))
 }
 
 fn array_pattern(node: &Value) -> Result<String> {
@@ -291,6 +302,47 @@ mod tests {
         assert!(re.is_match("\"red\""));
         assert!(re.is_match("\"blue\""));
         assert!(!re.is_match("\"yellow\""));
+    }
+
+    #[test]
+    fn string_const_takes_precedence_over_type() {
+        let re = compile(&schema_to_regex(r#"{"type":"string","const":"a.b*"}"#).unwrap());
+        assert!(re.is_match(r#""a.b*""#));
+        assert!(!re.is_match(r#""anything else""#));
+    }
+
+    #[test]
+    fn number_const_takes_precedence_over_type() {
+        let re = compile(&schema_to_regex(r#"{"type":"number","const":3.14}"#).unwrap());
+        assert!(re.is_match("3.14"));
+        assert!(!re.is_match("3"));
+        assert!(!re.is_match("3.140"));
+    }
+
+    #[test]
+    fn boolean_const_takes_precedence_over_type() {
+        let re = compile(&schema_to_regex(r#"{"type":"boolean","const":true}"#).unwrap());
+        assert!(re.is_match("true"));
+        assert!(!re.is_match("false"));
+    }
+
+    #[test]
+    fn null_const_does_not_require_type() {
+        let re = compile(&schema_to_regex(r#"{"const":null}"#).unwrap());
+        assert!(re.is_match("null"));
+        assert!(!re.is_match("false"));
+    }
+
+    #[test]
+    fn object_const_matches_exact_json_literal() {
+        let re = compile(
+            &schema_to_regex(r#"{"type":"object","const":{"kind":"ok","count":2,"ready":true}}"#)
+                .unwrap(),
+        );
+        assert!(re.is_match(r#"{"count":2,"kind":"ok","ready":true}"#));
+        assert!(!re.is_match(r#"{"count":2, "kind":"ok","ready":true}"#));
+        assert!(!re.is_match(r#"{"kind":"ok","count":2,"ready":true}"#));
+        assert!(!re.is_match(r#"{"count":3,"kind":"ok","ready":true}"#));
     }
 
     #[test]

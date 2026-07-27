@@ -3,14 +3,20 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G01、G02、G03
-- 下游：G05、G06、G08-G10
+- 依赖：S0A contract split；S0B/S1 actual Qwen3.5-4B CUDA runtime；随 S2-S5 强化
+- 下游：S1-S7、G05、G06、G08-G10
 
 ## 目标
 
 建立唯一共享执行 runtime。模型只描述 program/block/state；runtime 管理 batch、prefill、
 decode、资源、执行次序和退出。解决当前 engine/model/KV manager 多重所有权以及模型复制
 unified runner 的问题。
+
+动态资源、transaction/lease、physical submission、fence/reaper/recovery 是核心 runtime 的不可约
+复杂度，不以缩短总 LOC 为目标。S0A 必须先按 capacity/provisioning、pool/extent、transaction/
+lease、request/sequence/session、step/invocation 和 completion/recovery 所有权拆分；S0B/S1 再允许
+由实际生产 consumer 驱动 breaking rewrite。固定并发、模型/GPU 特判或弱化 defer/resume 合同均不
+属于可接受的“简化”。
 
 ## Runtime 职责
 
@@ -24,8 +30,10 @@ unified runner 的问题。
 Admission 必须采用 continuous-batching 语义：配置并发只是 ceiling，实际 active 数由当前
 KV blocks、recurrent state、workspace、显存余量和请求形状共同决定。资源不足只 defer 当前
 请求；不得提交其 prefill，也不得停止已有 decode 或其他当前可满足的 waiting request。释放任何
-相关 lease 都递增 monotonic `capacity_release_epoch`，等待队列只在新 epoch、请求取消或策略变化
-时重新求值，避免 busy retry，同时必须有 aging/fairness 防止大请求永久饥饿。
+相关 lease 都递增 monotonic global audit `capacity_release_epoch` 和 exact availability source
+generation；等待队列只在自身 `CapacityWaitCondition` 相关 source、请求取消或策略发生变化时
+重新求值。无关 domain 即使推进 global audit epoch 也不得触发 admission probe。该合同避免 busy
+retry，同时必须有 aging/fairness 防止大请求永久饥饿。
 
 capacity 必须是 typed vector/domain authority，至少区分 KV group/page、recurrent arena、
 workspace arena、sequence count 和不可互换的 backend pool；禁止用单一 total bytes 假装这些资源
@@ -74,12 +82,51 @@ immediate-only）、chunked prefill 和 preempt/recompute 必须是 typed 产品
 不能由隐藏环境变量或模型/GPU 名分支决定。若未来引入真正的 capacity reservation，必须使用第四个
 独立 vector 计账并在 release 时归还；不得把 fit gate 伪称已经预留未来 KV。
 
-waiter 注册后必须重读 release epoch，封闭“检查失败与挂起之间发生释放”的 lost-wakeup 窗口；
-任何提高 effective available capacity 的 transition 都必须递增 epoch 并唤醒。独占全部 capacity
-仍不满足的请求返回 typed `Impossible`。暂时不满足的队首可以被后续 eligible 请求跳过；typed
-fairness policy 的默认 `max_bypass_release_epochs=8`，达到阈值后只暂停接纳新的 bypass 请求，
-不得停止 active decode。该 capacity-HOL=`0` 合同明确强于 vLLM v0.24.0 的队首 KV-allocation
-failure [`break` 行为](https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/v1/core/sched/scheduler.py#L888-L895)。
+每个 deferred 必须携带 coordinator identity 和 canonical exact source generations，至少覆盖被阻塞
+的 capacity domain 与 active-sequence slot。global release/capacity epochs 只作为 monotonic audit 和
+共享通知版本，不是 per-request retry predicate。waiter 必须遵循 subscribe -> snapshot -> exact
+recheck -> park，封闭“检查失败与挂起之间发生释放”的 lost-wakeup 窗口；任何提高 effective
+available capacity 的 transition 都必须同时推进对应 source generation 和 global audit epoch。无关
+通知可以唤醒 listener，但 exact recheck 必须继续等待且 admission probe 增量为 `0`。独占全部
+capacity 仍不满足的请求返回 typed `Impossible`。暂时不满足的队首可以被后续 eligible 请求跳过；
+typed fairness policy 的默认 `max_relevant_bypass_events=8`，只统计该请求 exact source 变化、
+重新求值后仍被后续请求绕过的事件；达到阈值后只暂停接纳新的 bypass 请求，不得停止 active
+decode。Ferrum 借鉴 vLLM 的 active-first、capacity defer 和 fence-delayed
+release，但不接受裸 `None`、1ms polling、队头 allocation failure `break` 或默认清空 KV 重算。
+
+`da9c1ee8` 的真实 Qwen3.5-4B CUDA artifact 已否定 phase-local `DecodeProgressLease` 足以保证
+全局活性的假设。该实现能够在 owner generation `49 -> 50` 后解除 admission barrier，但 victim
+进入 recompute prefill 后与原 decode owner 同时等待 domain `4` generation `73`，最终形成
+`1 blocked prefill + 1 blocked decode`，A/B 均无 `[DONE]`。因此当前 lease 只能作为迁移期
+diagnostic，不能计入 G04 或 S1 PASS，也不能继续通过增加 phase-specific flag 修补。
+
+vNext 的资源仲裁必须改为唯一的 typed logical work frontier。scheduler 只维护 request 的 logical
+token frontier、resident/computed frontier、已提交但未完成 frontier、committed output generation 和
+recompute origin；prefill、recompute、decode、speculative work 只是 executor `WorkKind`，不得成为
+彼此独立的资源活性 authority 或必须跨队列拼接的不完整状态机。该设计借鉴 vLLM 统一 computed-token
+frontier 和同轮 preemption 的原则，但不复制 Python object graph、裸 `None` allocation failure、
+运行时字典拼装或无 fence 的立即复用。
+
+权威 allocator 返回 temporary capacity failure 后才创建 cold-path `PressureEpisode`，并按 canonical
+exact capacity source 建立索引。episode 必须分别保存 immutable `progress_owner`、held participant set 和
+last transaction victim，禁止用一个可变 victim/owner 字段同时表达三者。状态至少覆盖
+`Open -> YieldPlanned -> AwaitReleaseFence -> Resumable -> Closed`；当 stable owner 在仍有 held peer 时
+释放自身资源进入 recompute，还必须经过
+`OwnerAdmissionPending --typed admission receipt--> Resumable`。token progress、wait-source topology 变化和
+另一个 participant 的排队顺序都不能转移 owner，也不能解除 held peer；owner 只有在 terminal release 后
+才释放 peer。若 recompute owner 无法取得执行 claim，必须返回 typed invariant/blocker，不能把 held peer
+晋升为新 owner 或静默轮转。一次 scheduler transaction 在提交 batch 前必须满足二选一：至少一个
+frontier 获得可执行 claim，或已经产生一个 typed yield/release transaction，且被让渡资源在 fence
+terminal 前不能复用；禁止把所有 frontier 先标成 passive wait 再期待另一个 phase 推进 source。
+unchanged exact source 不重新调用 allocator，也不产生逐 tick event 洪泛，只更新预分配 episode counter
+和有界 first/last sample。
+
+机制与策略必须分离。资源机制只负责 exact claim、rollback、fence-delayed release 和 transition
+ordering；调度策略基于 priority、相关 bypass age、resident/recompute cost、剩余 logical work、可形成的
+batch width 和预计释放收益选择继续当前 cohort、yield victim 或等待。选择只发生在真实 capacity
+boundary，不能按每 token、时间、模型名、GPU 型号或显存档位轮转。backend/provider 只提供 typed
+capacity snapshot、cost/capability hint 和 release fence；scheduler 核心不得出现 CUDA/Metal/model
+分支。
 
 ## Transaction 与 Lease 状态机
 
@@ -144,7 +191,10 @@ exact evaluated bytes，不能只比较 minimum bytes 或在 claim 后替换 wor
 物理 scheduler step/invocation 使用 core-minted `BatchStepId`/`BatchInvocationId`；每个 participant 同时保留自己的连续
 `ExecutionFrameId` 和 active-session fingerprint。长序列 frame=7、新加入序列 frame=2 可以进入同一
 batch，Step guard 按各自 frame 获取；request journal node invocation identity 也由各 participant
-cursor 独立生成。禁止要求 participant frame/node id 相等或复制 leader identity。
+cursor 独立生成。只有无 invocation、无 flight、无 submit 的 pristine Step 才能通过
+`RollbackUnsubmitted` 恢复各 participant 尚未执行的 frame；下一次物理尝试必须使用新的
+`BatchStepId`，但复用原 participant-local `ExecutionFrameId`。abort、Drop、possibly-submitted 或
+indeterminate 路径禁止回退 frame。禁止要求 participant frame/node id 相等或复制 leader identity。
 
 Step 内的 invocation registry 必须以 canonical
 `ParticipantNodeKey = (sequence authority, request authority, ExecutionFrameId, NodeId)` 占位；
@@ -250,11 +300,23 @@ scratch 和 graph workspace 多个 lease：
 - compile-pass 断言 root/binding 与 Request -> Invocation durable chain 为 `Send + 'static`、Arc target
   为 `Sync`；compile-fail 覆盖 root/binding 外部构造、static lease mint binding 和 consuming handoff 后
   再使用 transaction。source scan 禁止 owning chain 的 `'plan` 与 `CompletionReaper<'plan, ...>`。
-- lost-wakeup race、temporary defer 与 permanent impossible 分类、release epoch 单调、waiter
-  register/recheck；队首 large-ineligible + 后续 small-eligible 在下一 tick admission `100/100`，
-  aging 达阈值后不饿死且 active decode 不停。
+- lost-wakeup race、temporary defer 与 permanent impossible 分类、global audit epoch 与 exact
+  availability generation 单调、waiter register/recheck；只改变无关 domain 的 `10,000` 个事件中
+  admission probe 增量为 `0`，相关 domain/slot 释放后的 retry 成功率为 `100%`；队首
+  large-ineligible + 后续 small-eligible 在下一 tick admission `100/100`，aging 达阈值后不饿死且
+  active decode 不停。
 - mixed-size waiting queue：队首请求暂时不可满足时，active decode 与后续 eligible request
-  继续推进；释放 epoch 后队首自动重试；aging 后不存在永久饥饿。
+  继续推进；相关 source generation 推进后队首自动重试；无关 global audit 变化不得重新 probe；
+  aging 后不存在永久饥饿。
+- 从 `da9c1ee8` CUDA trace 固化 deterministic replay：最终 `active=2`、`blocked prefill=1`、
+  `blocked decode=1`、两者等待同一 domain/generation。replay 在进入 passive park 前必须产生一个
+  frontier claim 或 `YieldPlanned`，复现旧终态的次数为 `0/100`。
+- phase 变化不能改变 request 的资源活性 identity：recompute request 从 waiting 到 executor prefill、
+  再到 decode 的 transition 使用同一 frontier/pressure episode；跨 phase 复制或丢失 exact wait、
+  fairness age、logical progress 和 release obligation 的 case 数为 `0`。
+- transition journal 使用 scheduler-owned 单调 ordinal；同一 transaction 的 yield、release-fence、
+  admission、submit 顺序必须由 ordinal 验证，不能用 wall-clock timestamp 推断。trace sink 延迟、批量
+  flush 或关闭时 replay transition 与 batch membership 保持完全一致。
 - 对 ceiling=`1/32/4096/u32::MAX` 的同一 graph，plan descriptor 数和 build allocation 数保持
   不变；除 `0` 外无任意固定 concurrency guard，实际资源 claim 只随 admitted request 数增长。
 - 多资源第 N 个 reserve/commit 失败、逆序补偿、重复 rollback/release、defer retain/release、
@@ -283,8 +345,15 @@ scratch 和 graph workspace 多个 lease：
 - 所有 capacity reject/defer 在 kernel launch 前发生 `100%`。
 - 所有 capacity defer 的 provider encode/device submit/prefill launch 增量均为 `0`；同时存在
   eligible work 时 scheduler idle tick=`0`、全局 HOL block=`0`。
+- 任一 pressure snapshot 中，若所有 live frontier 在重叠 exact source 上不可执行，则必须存在一个
+  未完成的 typed yield/release-fence transaction；`all blocked + no pending release` 状态数为 `0`。
+- no-pressure c1/c4/c16/c32 路径创建 `PressureEpisode` 数为 `0`，跨队列/全历史 request scan 数为
+  `0`，batch membership 不因启用动态 pressure 机制而改变。pressure path 的每次 recompute/yield 都
+  必须释放本次失败 demand 涉及的 exact source 或产生明确 REJECT 诊断，盲目轮转数为 `0`。
 - cancel/disconnect 后同容量下一请求成功率 `100%`。
-- capacity release epoch 单调、无丢失唤醒，释放后 deferred request 成功重试 `100%`。
+- global release/capacity audit epoch 与每个 availability source generation 单调、无丢失唤醒；相关
+  domain/slot 释放后 deferred request 成功重试 `100%`，无关 source 变化时 admission probe、prefill
+  submit 和 device submit 增量均为 `0`。
 - `global_claimed_bytes == sum(live static buffer bytes) + sum(live backing segment bytes)`；
   `domain.total_units == sum(installed segment usable units)`；`domain.used_units == sum(live logical
   extent units)`，在正常、失败、cancel、panic 和 quarantine 路径均成立 `100%`。
@@ -321,11 +390,17 @@ scratch 和 graph workspace 多个 lease：
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32
   `<=2%` 由 G09 验收。
 - disabled event path overhead `<=1%`。
-- resource transaction 不增加每 token host allocation；steady decode host allocations/token=`0`。
+- resource transaction 不增加每 token host allocation；steady decode host allocations/token=`0`；
+  trace disabled 时 unchanged/irrelevant deferred scan 的 wait-condition clone/allocation 增量=`0`。
 - steady admission/decode 的 device allocations/request=`0`；arena grow 只能作为独立、可观测的
   backing transaction，不能伪装成 request admission。
 - plan build 的资源 descriptor/内存复杂度为 `O(graph)`，与 admission ceiling 无关；动态
   admission hot path 不扫描全部历史请求，scheduler bookkeeping 仍满足上述 wall-time 门。
+- steady decode 的 frontier 更新由 batch completion 一次提交，不增加每 token shared-atomic RMW；
+  pressure source index 只扫描相关 live cohort，不能扫描 waiting/prefill/decode 三套队列。
+- capacity pressure 解除后下一 tick 回到与无压力路径相同的 stable batch builder；不得因 fairness
+  bookkeeping 永久降低 decode cohort width。recompute/yield 次数、重算 token 数和被破坏 batch width
+  必须进入 artifact，并与策略选择时的 cost evidence 对应。
 
 ## 产物与 PASS
 

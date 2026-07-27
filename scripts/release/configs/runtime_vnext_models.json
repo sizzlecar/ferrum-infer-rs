@@ -145,9 +145,10 @@
       "reference": {
         "semantic_repo": "Qwen/Qwen3.5-35B-A3B",
         "semantic_revision": {"status": "pinned", "value": "59d61f3ce65a6d9863b86d2e96597125219dc754"},
-        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "required_semantic_files": ["README.md", "chat_template.jinja", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
         "semantic_file_sha256": {
           "README.md": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492",
+          "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
           "config.json": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
           "generation_config.json": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0",
           "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
@@ -194,9 +195,10 @@
       "reference": {
         "semantic_repo": "Qwen/Qwen3.5-35B-A3B",
         "semantic_revision": {"status": "pinned", "value": "59d61f3ce65a6d9863b86d2e96597125219dc754"},
-        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "required_semantic_files": ["README.md", "chat_template.jinja", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
         "semantic_file_sha256": {
           "README.md": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492",
+          "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
           "config.json": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
           "generation_config.json": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0",
           "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",

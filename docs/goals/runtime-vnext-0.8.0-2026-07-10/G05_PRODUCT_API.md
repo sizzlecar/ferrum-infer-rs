@@ -3,13 +3,17 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G02、G04
-- 下游：G06、G08-G10
+- 依赖：S1 basic composition root；S2 完整 Qwen3.5-4B CUDA product contract；S3-S5 双端/模型扩展
+- 下游：S1-S7、G06、G08-G10
 
 ## 目标
 
 让 `ferrum run` 和 `ferrum serve` 使用同一个 `ResolvedModelPlan`、同一个 engine 和同一套
 token/template/stop/sampling semantics。入口差异只允许存在于 terminal、HTTP 和 SSE I/O。
+
+S1 即要求 actual Qwen3.5-4B CUDA 同时通过共享 composition root 进入 `run` 和 `serve`；不能等到
+所有 contract/test/profile 完成后再接线。S2 补齐 stream/tools/schema/multi-turn/cancel/concurrency，
+S3-S5 复用同一产品根增加 backend/model，不再新增 per-model product decision。
 
 ## ResolvedModelPlan
 

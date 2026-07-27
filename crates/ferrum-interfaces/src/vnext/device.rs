@@ -4,12 +4,44 @@ use std::error::Error;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
-    ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, VNextError,
+    ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
+    ReusableExecutionBucketId, VNextError, WeightComponentPayload,
 };
+
+/// Backend-neutral device capability for an explicit cold-path reusable
+/// executable preparation lifecycle.
+pub const DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID: &str = "capability.device.reusable_execution.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExecutionLaneId(NonZeroU64);
+
+impl ExecutionLaneId {
+    pub(crate) fn mint() -> Result<Self, VNextError> {
+        static NEXT_LANE_ID: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT_LANE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| VNextError::InvalidExecutionPlan {
+                reason: "execution lane identity space is exhausted".to_owned(),
+            })?;
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "execution lane identity must be non-zero".to_owned(),
+            })
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 /// Cleanup pressure is independent from model size and normal request
 /// concurrency. Once one plan accumulates this many non-quiescent owners, new
@@ -468,6 +500,67 @@ pub struct BufferDescriptor {
     pub element_type: ElementType,
 }
 
+/// Opaque core ownership retained by backend commands that outlive the
+/// borrowed buffer view used to encode them. Backends may clone and store this
+/// value, but cannot inspect or manufacture resource ownership.
+#[derive(Clone)]
+pub struct DeviceBufferRetention {
+    _primary_owner: Arc<dyn Send + Sync + 'static>,
+    _secondary_owner: Option<Arc<dyn Send + Sync + 'static>>,
+    reusable_address_scope: Option<DeviceReusableAddressScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceReusableAddressScope {
+    Plan,
+    ExecutionLane(ExecutionLaneId),
+}
+
+impl DeviceBufferRetention {
+    pub(crate) fn plan<T>(owner: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            _primary_owner: owner,
+            _secondary_owner: None,
+            reusable_address_scope: Some(DeviceReusableAddressScope::Plan),
+        }
+    }
+
+    pub(crate) fn pair<T, U>(primary_owner: Arc<T>, secondary_owner: Arc<U>) -> Self
+    where
+        T: Send + Sync + 'static,
+        U: Send + Sync + 'static,
+    {
+        Self {
+            _primary_owner: primary_owner,
+            _secondary_owner: Some(secondary_owner),
+            reusable_address_scope: None,
+        }
+    }
+
+    pub(crate) fn lane_pair<T, U>(
+        lane_id: ExecutionLaneId,
+        primary_owner: Arc<T>,
+        secondary_owner: Arc<U>,
+    ) -> Self
+    where
+        T: Send + Sync + 'static,
+        U: Send + Sync + 'static,
+    {
+        Self {
+            _primary_owner: primary_owner,
+            _secondary_owner: Some(secondary_owner),
+            reusable_address_scope: Some(DeviceReusableAddressScope::ExecutionLane(lane_id)),
+        }
+    }
+
+    pub const fn reusable_address_scope(&self) -> Option<DeviceReusableAddressScope> {
+        self.reusable_address_scope
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BufferUsage {
@@ -477,6 +570,8 @@ pub enum BufferUsage {
     /// Provider/runtime workspace whose lifetime spans operations but is not
     /// model semantic state (for example packed metadata or persistent scratch).
     Persistent,
+    /// Request-shaped provider control data written before reusable compute.
+    Binding,
     Scratch,
     Transfer,
 }
@@ -556,6 +651,1327 @@ pub enum StreamState {
     Failed,
 }
 
+/// Backend timing is enabled monotonically before product requests start.
+/// `Off` must not allocate backend events or add host clock reads to the hot
+/// path; `Completion` measures only the existing submission terminal and
+/// readback boundaries; `Replay` measures physical executable/eager spans;
+/// `Kernel`
+/// additionally attributes backend-observed physical work to immutable-plan
+/// node indices. `Verification` retains full logical/kernel attribution.
+/// Execution-path selection and scratch initialization are independent typed
+/// submission policy; timing cannot silently change either one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTimingMode {
+    #[default]
+    Off = 0,
+    Completion = 1,
+    Replay = 2,
+    Kernel = 3,
+    Verification = 4,
+}
+
+impl DeviceTimingMode {
+    pub const fn completion_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub const fn physical_span_attribution_enabled(self) -> bool {
+        matches!(self, Self::Replay | Self::Kernel | Self::Verification)
+    }
+
+    pub const fn kernel_attribution_enabled(self) -> bool {
+        matches!(self, Self::Kernel | Self::Verification)
+    }
+
+    pub const fn direct_reusable_execution_allowed(self) -> bool {
+        !matches!(self, Self::Kernel | Self::Verification)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecutionPath {
+    Eager,
+    Replayed,
+}
+
+impl DeviceExecutionPath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::Replayed => "replayed",
+        }
+    }
+}
+
+/// Required compute implementation for one physical submission.
+///
+/// Initialization and dynamic/result binding commands remain eager boundaries;
+/// this requirement applies only to provider compute. Backends must reject a
+/// batch before submission when they cannot honor the requested path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceComputePathRequirement {
+    #[default]
+    Adaptive,
+    EagerOnly,
+    ReplayedOnly,
+}
+
+/// Backend evidence required for one physical submission.
+///
+/// This is independent from timing: deterministic correctness needs actual
+/// eager/replay path attribution without enabling per-kernel profiling or
+/// changing the selected compute path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceSubmissionAttributionRequirement {
+    #[default]
+    None,
+    LogicalExecutionPath,
+}
+
+impl DeviceSubmissionAttributionRequirement {
+    pub const fn logical_execution_path_required(self) -> bool {
+        matches!(self, Self::LogicalExecutionPath)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceBatchingForm {
+    Scalar,
+    Packed,
+    ParticipantLoop,
+}
+
+impl DeviceBatchingForm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Packed => "packed",
+            Self::ParticipantLoop => "participant_loop",
+        }
+    }
+}
+
+/// Core-owned logical work bound to a node-scoped device command.
+///
+/// Providers describe their own command work directly. Core-created commands,
+/// such as scratch initialization, use this value so backend-native
+/// attribution remains bound to the exact batch node instead of inventing a
+/// participant or token count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceCommandLogicalWork {
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+}
+
+impl DeviceCommandLogicalWork {
+    pub fn new(
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, super::VNextError> {
+        if participant_count == 0 {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "node-scoped device command has zero logical participants".to_owned(),
+            });
+        }
+        Ok(Self {
+            batching_form,
+            participant_count,
+            token_count,
+        })
+    }
+
+    pub const fn batching_form(self) -> DeviceBatchingForm {
+        self.batching_form
+    }
+
+    pub const fn participant_count(self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(self) -> u64 {
+        self.token_count
+    }
+}
+
+/// Typed host boundaries inside one backend submission. These intervals use
+/// the host monotonic clock and must not be combined with device-event time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSubmissionStage {
+    ValidateAndPrepare,
+    BeginTiming,
+    EnqueueCommands,
+    RecordFenceAndAccount,
+}
+
+/// Aggregate reusable-execution work observed inside one backend submission.
+///
+/// The observation carries no execution authority and is recorded only by an
+/// enabled diagnostic sink. Backends update one stack value while submitting;
+/// the product sink aggregates it without allocating on the hot path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionObservation {
+    candidate_segments: u64,
+    captured_segments: u64,
+    uploaded_segments: u64,
+    cache_hit_segments: u64,
+    cached_rejected_segments: u64,
+    capture_rejected_segments: u64,
+    quiescence_deferred_segments: u64,
+    capacity_deferred_segments: u64,
+    outside_preparation_segments: u64,
+    evicted_segments: u64,
+    replayed_segments: u64,
+    replayed_commands: u64,
+    eager_commands: u64,
+}
+
+impl DeviceReusableExecutionObservation {
+    pub fn observe_candidate_segment(&mut self) {
+        self.candidate_segments = self.candidate_segments.saturating_add(1);
+    }
+
+    pub fn observe_captured_segment(&mut self) {
+        self.captured_segments = self.captured_segments.saturating_add(1);
+    }
+
+    pub fn observe_uploaded_segment(&mut self) {
+        self.uploaded_segments = self.uploaded_segments.saturating_add(1);
+    }
+
+    pub fn observe_cache_hit_segment(&mut self) {
+        self.cache_hit_segments = self.cache_hit_segments.saturating_add(1);
+    }
+
+    pub fn observe_cached_rejected_segment(&mut self) {
+        self.cached_rejected_segments = self.cached_rejected_segments.saturating_add(1);
+    }
+
+    pub fn observe_capture_rejection(&mut self) {
+        self.capture_rejected_segments = self.capture_rejected_segments.saturating_add(1);
+    }
+
+    pub fn observe_quiescence_deferred_segment(&mut self) {
+        self.quiescence_deferred_segments = self.quiescence_deferred_segments.saturating_add(1);
+    }
+
+    pub fn observe_capacity_deferred_segment(&mut self) {
+        self.capacity_deferred_segments = self.capacity_deferred_segments.saturating_add(1);
+    }
+
+    pub fn observe_outside_preparation_segment(&mut self) {
+        self.outside_preparation_segments = self.outside_preparation_segments.saturating_add(1);
+    }
+
+    pub fn observe_evicted_segment(&mut self) {
+        self.evicted_segments = self.evicted_segments.saturating_add(1);
+    }
+
+    pub fn observe_replayed_segment(&mut self, command_count: usize) {
+        self.replayed_segments = self.replayed_segments.saturating_add(1);
+        self.replayed_commands = self
+            .replayed_commands
+            .saturating_add(u64::try_from(command_count).unwrap_or(u64::MAX));
+    }
+
+    pub fn observe_eager_command(&mut self) {
+        self.eager_commands = self.eager_commands.saturating_add(1);
+    }
+
+    pub const fn candidate_segments(self) -> u64 {
+        self.candidate_segments
+    }
+
+    pub const fn captured_segments(self) -> u64 {
+        self.captured_segments
+    }
+
+    pub const fn uploaded_segments(self) -> u64 {
+        self.uploaded_segments
+    }
+
+    pub const fn cache_hit_segments(self) -> u64 {
+        self.cache_hit_segments
+    }
+
+    pub const fn cached_rejected_segments(self) -> u64 {
+        self.cached_rejected_segments
+    }
+
+    pub const fn capture_rejected_segments(self) -> u64 {
+        self.capture_rejected_segments
+    }
+
+    pub const fn quiescence_deferred_segments(self) -> u64 {
+        self.quiescence_deferred_segments
+    }
+
+    pub const fn capacity_deferred_segments(self) -> u64 {
+        self.capacity_deferred_segments
+    }
+
+    pub const fn outside_preparation_segments(self) -> u64 {
+        self.outside_preparation_segments
+    }
+
+    pub const fn evicted_segments(self) -> u64 {
+        self.evicted_segments
+    }
+
+    pub const fn replayed_segments(self) -> u64 {
+        self.replayed_segments
+    }
+
+    pub const fn replayed_commands(self) -> u64 {
+        self.replayed_commands
+    }
+
+    pub const fn eager_commands(self) -> u64 {
+        self.eager_commands
+    }
+}
+
+/// Cold-path receipt for releasing backend reusable executables after an
+/// execution lane has reached proven quiescence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionTrim {
+    released_executables: u64,
+    released_rejections: u64,
+}
+
+/// Cold-path capacity selected by the model execution plan before reusable
+/// device executables are prepared.
+///
+/// The value is an upper bound on resident executable descriptors, not a
+/// hardware- or model-name heuristic. Product composition derives it from the
+/// immutable execution plan and the startup shape matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionPlan {
+    maximum_executables: usize,
+}
+
+impl DeviceReusableExecutionPlan {
+    pub fn new(maximum_executables: usize) -> Result<Self, super::VNextError> {
+        if maximum_executables == 0 {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "reusable execution plan requires non-zero capacity".to_owned(),
+            });
+        }
+        Ok(Self {
+            maximum_executables,
+        })
+    }
+
+    pub const fn maximum_executables(self) -> usize {
+        self.maximum_executables
+    }
+}
+
+/// Opaque provider-owned topology identity for one reusable compute program.
+///
+/// The core aggregates these fixed-size values with node and provider identity.
+/// Backends keep kernel-selection details private while the program catalog can
+/// still reject a stale executable before any command is encoded or submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DeviceReusableExecutionTopologyFingerprint([u8; 32]);
+
+impl DeviceReusableExecutionTopologyFingerprint {
+    pub const fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn static_program() -> Self {
+        Self([0; 32])
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Runtime-local identity for one immutable reusable program.
+///
+/// The bucket binds execution topology and capacity, while the plan and lane
+/// bind provider semantics and every lane-stable physical address. Request and
+/// sequence identities are deliberately excluded because their live state is
+/// supplied through explicit per-wave bindings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct DeviceReusableExecutionProgramId {
+    plan_hash: PlanHash,
+    runtime_implementation_fingerprint: String,
+    lane_id: ExecutionLaneId,
+    bucket_id: ReusableExecutionBucketId,
+    program_binding_layout_fingerprint: String,
+    lane_stable_layout_fingerprint: String,
+    lane_slot_id: u64,
+    immediate_sequences: u32,
+    immediate_tokens: u64,
+    immediate_pages: u64,
+    topology_fingerprint: DeviceReusableExecutionTopologyFingerprint,
+}
+
+impl DeviceReusableExecutionProgramId {
+    pub fn new(
+        plan_hash: PlanHash,
+        runtime_implementation_fingerprint: String,
+        lane_id: ExecutionLaneId,
+        bucket_id: ReusableExecutionBucketId,
+        program_binding_layout_fingerprint: String,
+        lane_stable_layout_fingerprint: String,
+        lane_slot_id: u64,
+        immediate_sequences: u32,
+        immediate_tokens: u64,
+        immediate_pages: u64,
+    ) -> Result<Self, VNextError> {
+        let is_sha256 = |value: &str| {
+            let digest = value.strip_prefix("sha256/").unwrap_or(value);
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !is_sha256(&runtime_implementation_fingerprint)
+            || !is_sha256(&program_binding_layout_fingerprint)
+            || !is_sha256(&lane_stable_layout_fingerprint)
+            || immediate_sequences == 0
+            || immediate_tokens == 0
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution program identity is incomplete or non-canonical"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            plan_hash,
+            runtime_implementation_fingerprint,
+            lane_id,
+            bucket_id,
+            program_binding_layout_fingerprint,
+            lane_stable_layout_fingerprint,
+            lane_slot_id,
+            immediate_sequences,
+            immediate_tokens,
+            immediate_pages,
+            topology_fingerprint: DeviceReusableExecutionTopologyFingerprint::static_program(),
+        })
+    }
+
+    pub fn with_topology_fingerprint(
+        mut self,
+        topology_fingerprint: DeviceReusableExecutionTopologyFingerprint,
+    ) -> Self {
+        self.topology_fingerprint = topology_fingerprint;
+        self
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.plan_hash
+    }
+
+    pub fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.runtime_implementation_fingerprint
+    }
+
+    pub const fn lane_id(&self) -> ExecutionLaneId {
+        self.lane_id
+    }
+
+    pub fn bucket_id(&self) -> &ReusableExecutionBucketId {
+        &self.bucket_id
+    }
+
+    pub fn program_binding_layout_fingerprint(&self) -> &str {
+        &self.program_binding_layout_fingerprint
+    }
+
+    pub fn lane_stable_layout_fingerprint(&self) -> &str {
+        &self.lane_stable_layout_fingerprint
+    }
+
+    pub const fn lane_slot_id(&self) -> u64 {
+        self.lane_slot_id
+    }
+
+    pub const fn immediate_sequences(&self) -> u32 {
+        self.immediate_sequences
+    }
+
+    pub const fn immediate_tokens(&self) -> u64 {
+        self.immediate_tokens
+    }
+
+    pub const fn immediate_pages(&self) -> u64 {
+        self.immediate_pages
+    }
+
+    pub const fn topology_fingerprint(&self) -> DeviceReusableExecutionTopologyFingerprint {
+        self.topology_fingerprint
+    }
+}
+
+/// Core metadata attached to a full eager encoding while a backend prepares
+/// reusable programs. The backend may publish a catalog entry only when every
+/// referenced segment is resident and the observed node topology is stable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionCapture {
+    program_id: DeviceReusableExecutionProgramId,
+    per_wave_binding_node_indices: Box<[u32]>,
+}
+
+impl DeviceReusableExecutionCapture {
+    pub fn new(
+        program_id: DeviceReusableExecutionProgramId,
+        mut per_wave_binding_node_indices: Vec<u32>,
+    ) -> Self {
+        per_wave_binding_node_indices.sort_unstable();
+        per_wave_binding_node_indices.dedup();
+        Self {
+            program_id,
+            per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+        }
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub fn per_wave_binding_node_indices(&self) -> &[u32] {
+        &self.per_wave_binding_node_indices
+    }
+}
+
+/// One contiguous node range owned by a resident backend executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionSegment {
+    ordinal: u32,
+    start_node_index: u32,
+    end_node_index: u32,
+    logical_command_count: u32,
+}
+
+impl DeviceReusableExecutionSegment {
+    pub fn new(
+        ordinal: u32,
+        start_node_index: u32,
+        end_node_index: u32,
+        logical_command_count: u32,
+    ) -> Result<Self, VNextError> {
+        if end_node_index <= start_node_index || logical_command_count == 0 {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution segment is empty".to_owned(),
+            });
+        }
+        Ok(Self {
+            ordinal,
+            start_node_index,
+            end_node_index,
+            logical_command_count,
+        })
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn start_node_index(&self) -> u32 {
+        self.start_node_index
+    }
+
+    pub const fn end_node_index(&self) -> u32 {
+        self.end_node_index
+    }
+
+    pub const fn logical_command_count(&self) -> u32 {
+        self.logical_command_count
+    }
+
+    pub const fn contains_node(&self, node_index: u32) -> bool {
+        node_index >= self.start_node_index && node_index < self.end_node_index
+    }
+}
+
+/// Immutable catalog row published only after the backend preparation window
+/// is sealed. Product requests may reference these segments directly instead
+/// of rebuilding their provider commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionProgram {
+    program_id: DeviceReusableExecutionProgramId,
+    segments: Box<[DeviceReusableExecutionSegment]>,
+    per_wave_binding_node_indices: Box<[u32]>,
+}
+
+impl DeviceReusableExecutionProgram {
+    pub fn new(
+        program_id: DeviceReusableExecutionProgramId,
+        segments: Vec<DeviceReusableExecutionSegment>,
+        mut per_wave_binding_node_indices: Vec<u32>,
+    ) -> Result<Self, VNextError> {
+        if segments.is_empty()
+            || segments
+                .iter()
+                .enumerate()
+                .any(|(ordinal, segment)| segment.ordinal() as usize != ordinal)
+            || segments
+                .windows(2)
+                .any(|pair| pair[0].end_node_index() > pair[1].start_node_index())
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution program segments are empty, unordered, or overlap"
+                    .to_owned(),
+            });
+        }
+        per_wave_binding_node_indices.sort_unstable();
+        per_wave_binding_node_indices.dedup();
+        if per_wave_binding_node_indices.iter().any(|node_index| {
+            !segments
+                .iter()
+                .any(|segment| segment.contains_node(*node_index))
+        }) {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution binding node is outside every resident segment"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            program_id,
+            segments: segments.into_boxed_slice(),
+            per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+        })
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub fn segments(&self) -> &[DeviceReusableExecutionSegment] {
+        &self.segments
+    }
+
+    pub fn per_wave_binding_node_indices(&self) -> &[u32] {
+        &self.per_wave_binding_node_indices
+    }
+}
+
+/// One exact invocation of a segment from the sealed reusable program catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionInvocation {
+    program_id: DeviceReusableExecutionProgramId,
+    segment: DeviceReusableExecutionSegment,
+    participant_count: u32,
+    token_count: u64,
+}
+
+impl DeviceReusableExecutionInvocation {
+    pub fn new(
+        program_id: DeviceReusableExecutionProgramId,
+        segment: DeviceReusableExecutionSegment,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, VNextError> {
+        if participant_count == 0 || token_count == 0 {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution invocation has no participants or tokens".to_owned(),
+            });
+        }
+        Ok(Self {
+            program_id,
+            segment,
+            participant_count,
+            token_count,
+        })
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub const fn segment(&self) -> &DeviceReusableExecutionSegment {
+        &self.segment
+    }
+
+    pub const fn participant_count(&self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceReusableExecutionPreparationState {
+    Unsupported,
+    Preparing,
+    Ready,
+}
+
+/// Backend receipt for the explicit configure -> prepare -> seal lifecycle.
+///
+/// Captures happen only between `Preparing` and `Ready`. Once sealed, a
+/// backend must replay a resident executable or use eager execution; it must
+/// not compile new work on a product request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionPreparation {
+    state: DeviceReusableExecutionPreparationState,
+    maximum_executables: u64,
+    resident_executables: u64,
+    rejected_executables: u64,
+    captured_executables: u64,
+    uploaded_executables: u64,
+    capacity_deferred_executables: u64,
+}
+
+impl DeviceReusableExecutionPreparation {
+    pub const fn unsupported() -> Self {
+        Self {
+            state: DeviceReusableExecutionPreparationState::Unsupported,
+            maximum_executables: 0,
+            resident_executables: 0,
+            rejected_executables: 0,
+            captured_executables: 0,
+            uploaded_executables: 0,
+            capacity_deferred_executables: 0,
+        }
+    }
+
+    pub fn preparing(plan: DeviceReusableExecutionPlan) -> Self {
+        Self {
+            state: DeviceReusableExecutionPreparationState::Preparing,
+            maximum_executables: u64::try_from(plan.maximum_executables()).unwrap_or(u64::MAX),
+            ..Self::unsupported()
+        }
+    }
+
+    pub fn preparing_with_progress(
+        plan: DeviceReusableExecutionPlan,
+        resident_executables: usize,
+        rejected_executables: usize,
+        captured_executables: u64,
+        uploaded_executables: u64,
+        capacity_deferred_executables: u64,
+    ) -> Result<Self, super::VNextError> {
+        Self::with_progress(
+            DeviceReusableExecutionPreparationState::Preparing,
+            plan,
+            resident_executables,
+            rejected_executables,
+            captured_executables,
+            uploaded_executables,
+            capacity_deferred_executables,
+        )
+    }
+
+    pub fn ready(
+        plan: DeviceReusableExecutionPlan,
+        resident_executables: usize,
+        rejected_executables: usize,
+        captured_executables: u64,
+        uploaded_executables: u64,
+        capacity_deferred_executables: u64,
+    ) -> Result<Self, super::VNextError> {
+        Self::with_progress(
+            DeviceReusableExecutionPreparationState::Ready,
+            plan,
+            resident_executables,
+            rejected_executables,
+            captured_executables,
+            uploaded_executables,
+            capacity_deferred_executables,
+        )
+    }
+
+    fn with_progress(
+        state: DeviceReusableExecutionPreparationState,
+        plan: DeviceReusableExecutionPlan,
+        resident_executables: usize,
+        rejected_executables: usize,
+        captured_executables: u64,
+        uploaded_executables: u64,
+        capacity_deferred_executables: u64,
+    ) -> Result<Self, super::VNextError> {
+        if resident_executables > plan.maximum_executables()
+            || uploaded_executables < u64::try_from(resident_executables).unwrap_or(u64::MAX)
+            || captured_executables < uploaded_executables
+        {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "reusable execution preparation receipt is internally inconsistent"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            state,
+            maximum_executables: u64::try_from(plan.maximum_executables()).unwrap_or(u64::MAX),
+            resident_executables: u64::try_from(resident_executables).unwrap_or(u64::MAX),
+            rejected_executables: u64::try_from(rejected_executables).unwrap_or(u64::MAX),
+            captured_executables,
+            uploaded_executables,
+            capacity_deferred_executables,
+        })
+    }
+
+    pub const fn state(self) -> DeviceReusableExecutionPreparationState {
+        self.state
+    }
+
+    pub const fn maximum_executables(self) -> u64 {
+        self.maximum_executables
+    }
+
+    pub const fn resident_executables(self) -> u64 {
+        self.resident_executables
+    }
+
+    pub const fn rejected_executables(self) -> u64 {
+        self.rejected_executables
+    }
+
+    pub const fn captured_executables(self) -> u64 {
+        self.captured_executables
+    }
+
+    pub const fn uploaded_executables(self) -> u64 {
+        self.uploaded_executables
+    }
+
+    pub const fn capacity_deferred_executables(self) -> u64 {
+        self.capacity_deferred_executables
+    }
+}
+
+impl DeviceReusableExecutionTrim {
+    pub fn new(released_executables: usize, released_rejections: usize) -> Self {
+        Self {
+            released_executables: u64::try_from(released_executables).unwrap_or(u64::MAX),
+            released_rejections: u64::try_from(released_rejections).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub const fn released_executables(self) -> u64 {
+        self.released_executables
+    }
+
+    pub const fn released_rejections(self) -> u64 {
+        self.released_rejections
+    }
+}
+
+/// Diagnostic-only sink for backend submission attribution.
+///
+/// `ENABLED = false` is the compile-time off path: a backend must not read a
+/// clock or call `record_device_submission` in that specialization. Enabled
+/// implementations run on the submission thread and must not block, allocate,
+/// or panic.
+pub trait DeviceSubmissionTimingSink: Send + Sync {
+    const ENABLED: bool;
+
+    fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
+
+    fn record_reusable_execution(&self, _observation: DeviceReusableExecutionObservation) {}
+}
+
+pub struct DisabledDeviceSubmissionTimingSink;
+
+impl DeviceSubmissionTimingSink for DisabledDeviceSubmissionTimingSink {
+    const ENABLED: bool = false;
+
+    fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {
+        unreachable!("disabled device submission timing cannot record")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTimingUnavailableReason {
+    BackendUnsupported,
+    BackendMeasurementFailed,
+    DurationOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum DeviceTimingMeasurement<T> {
+    NotRequested,
+    Measured(T),
+    Unavailable(DeviceTimingUnavailableReason),
+}
+
+impl<T> DeviceTimingMeasurement<T> {
+    pub const fn measured(&self) -> Option<&T> {
+        match self {
+            Self::Measured(measured) => Some(measured),
+            Self::NotRequested | Self::Unavailable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTimingClock {
+    DeviceEventElapsed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceExecutionTiming {
+    elapsed_ns: u64,
+    clock: DeviceTimingClock,
+}
+
+impl DeviceExecutionTiming {
+    pub const fn device_event_elapsed(elapsed_ns: u64) -> Self {
+        Self {
+            elapsed_ns,
+            clock: DeviceTimingClock::DeviceEventElapsed,
+        }
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+
+    pub const fn clock(self) -> DeviceTimingClock {
+        self.clock
+    }
+}
+
+/// One backend-counter interval relative to the first sampled command in an
+/// exact submission. Intervals remain in a device elapsed-time domain; they
+/// must not be subtracted from host timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecutionIntervalKind {
+    Compute,
+    Transfer,
+}
+
+impl DeviceExecutionIntervalKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compute => "compute",
+            Self::Transfer => "transfer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceExecutionInterval {
+    kind: DeviceExecutionIntervalKind,
+    start_offset_ns: u64,
+    end_offset_ns: u64,
+    subwork_id: Option<&'static str>,
+}
+
+impl DeviceExecutionInterval {
+    pub fn new(
+        kind: DeviceExecutionIntervalKind,
+        start_offset_ns: u64,
+        end_offset_ns: u64,
+    ) -> Option<Self> {
+        (end_offset_ns > start_offset_ns).then_some(Self {
+            kind,
+            start_offset_ns,
+            end_offset_ns,
+            subwork_id: None,
+        })
+    }
+
+    pub fn new_labeled(
+        kind: DeviceExecutionIntervalKind,
+        start_offset_ns: u64,
+        end_offset_ns: u64,
+        subwork_id: &'static str,
+    ) -> Option<Self> {
+        (!subwork_id.is_empty() && end_offset_ns > start_offset_ns).then_some(Self {
+            kind,
+            start_offset_ns,
+            end_offset_ns,
+            subwork_id: Some(subwork_id),
+        })
+    }
+
+    pub const fn kind(self) -> DeviceExecutionIntervalKind {
+        self.kind
+    }
+
+    pub const fn start_offset_ns(self) -> u64 {
+        self.start_offset_ns
+    }
+
+    pub const fn end_offset_ns(self) -> u64 {
+        self.end_offset_ns
+    }
+
+    pub const fn subwork_id(self) -> Option<&'static str> {
+        self.subwork_id
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.end_offset_ns - self.start_offset_ns
+    }
+}
+
+/// Backend-counter timing for one command entry in a core-owned submission.
+/// A command may own multiple physical encoder intervals, for example a
+/// gather-compute-scatter implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceCommandExecutionTiming {
+    command_index: u32,
+    intervals: Box<[DeviceExecutionInterval]>,
+    elapsed_ns: u64,
+}
+
+impl DeviceCommandExecutionTiming {
+    pub fn new(command_index: u32, intervals: Vec<DeviceExecutionInterval>) -> Option<Self> {
+        if intervals.is_empty()
+            || intervals
+                .windows(2)
+                .any(|pair| pair[0].end_offset_ns() > pair[1].start_offset_ns())
+        {
+            return None;
+        }
+        let elapsed_ns = intervals.iter().try_fold(0_u64, |total, interval| {
+            total.checked_add(interval.elapsed_ns())
+        })?;
+        Some(Self {
+            command_index,
+            intervals: intervals.into_boxed_slice(),
+            elapsed_ns,
+        })
+    }
+
+    pub const fn command_index(&self) -> u32 {
+        self.command_index
+    }
+
+    pub fn intervals(&self) -> &[DeviceExecutionInterval] {
+        &self.intervals
+    }
+
+    pub fn elapsed_ns(&self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceExecutionSpanKind {
+    EagerCommand,
+    ReusableExecutable,
+}
+
+impl DeviceExecutionSpanKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EagerCommand => "eager_command",
+            Self::ReusableExecutable => "reusable_executable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum DeviceExecutionSpanMeasurement {
+    Measured {
+        intervals: Box<[DeviceExecutionInterval]>,
+        elapsed_ns: u64,
+    },
+    Unavailable(DeviceTimingUnavailableReason),
+}
+
+impl DeviceExecutionSpanMeasurement {
+    pub fn measured(intervals: Vec<DeviceExecutionInterval>) -> Option<Self> {
+        if intervals.is_empty()
+            || intervals
+                .windows(2)
+                .any(|pair| pair[0].end_offset_ns() > pair[1].start_offset_ns())
+        {
+            return None;
+        }
+        let elapsed_ns = intervals.iter().try_fold(0_u64, |total, interval| {
+            total.checked_add(interval.elapsed_ns())
+        })?;
+        Some(Self::Measured {
+            intervals: intervals.into_boxed_slice(),
+            elapsed_ns,
+        })
+    }
+
+    pub const fn unavailable(reason: DeviceTimingUnavailableReason) -> Self {
+        Self::Unavailable(reason)
+    }
+
+    pub fn intervals(&self) -> Option<&[DeviceExecutionInterval]> {
+        match self {
+            Self::Measured { intervals, .. } => Some(intervals),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub const fn elapsed_ns(&self) -> Option<u64> {
+        match self {
+            Self::Measured { elapsed_ns, .. } => Some(*elapsed_ns),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub const fn unavailable_reason(&self) -> Option<DeviceTimingUnavailableReason> {
+        match self {
+            Self::Measured { .. } => None,
+            Self::Unavailable(reason) => Some(*reason),
+        }
+    }
+}
+
+/// One physical device interval owner inside an exact submission.
+///
+/// Eager spans own one core command. Reusable executable spans own one
+/// contiguous command range, because a single CUDA graph launch cannot be
+/// truthfully duplicated across each logical command it contains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionExecutionSpan {
+    start_command_index: u32,
+    end_command_index: u32,
+    kind: DeviceExecutionSpanKind,
+    measurement: DeviceExecutionSpanMeasurement,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reusable_executable_fingerprint: Option<Box<str>>,
+}
+
+impl DeviceSubmissionExecutionSpan {
+    pub fn measured(
+        start_command_index: u32,
+        end_command_index: u32,
+        kind: DeviceExecutionSpanKind,
+        intervals: Vec<DeviceExecutionInterval>,
+    ) -> Option<Self> {
+        let measurement = DeviceExecutionSpanMeasurement::measured(intervals)?;
+        Self::new(start_command_index, end_command_index, kind, measurement)
+    }
+
+    pub fn unavailable(
+        start_command_index: u32,
+        end_command_index: u32,
+        kind: DeviceExecutionSpanKind,
+        reason: DeviceTimingUnavailableReason,
+    ) -> Option<Self> {
+        Self::new(
+            start_command_index,
+            end_command_index,
+            kind,
+            DeviceExecutionSpanMeasurement::unavailable(reason),
+        )
+    }
+
+    fn new(
+        start_command_index: u32,
+        end_command_index: u32,
+        kind: DeviceExecutionSpanKind,
+        measurement: DeviceExecutionSpanMeasurement,
+    ) -> Option<Self> {
+        if end_command_index <= start_command_index
+            || (kind == DeviceExecutionSpanKind::EagerCommand
+                && end_command_index != start_command_index.checked_add(1)?)
+        {
+            return None;
+        }
+        Some(Self {
+            start_command_index,
+            end_command_index,
+            kind,
+            measurement,
+            reusable_executable_fingerprint: None,
+        })
+    }
+
+    pub fn with_reusable_executable_fingerprint(mut self, fingerprint: String) -> Option<Self> {
+        if self.kind != DeviceExecutionSpanKind::ReusableExecutable
+            || fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        self.reusable_executable_fingerprint = Some(fingerprint.into_boxed_str());
+        Some(self)
+    }
+
+    fn from_command(command: DeviceCommandExecutionTiming) -> Option<Self> {
+        let end_command_index = command.command_index.checked_add(1)?;
+        Self::measured(
+            command.command_index,
+            end_command_index,
+            DeviceExecutionSpanKind::EagerCommand,
+            command.intervals.into_vec(),
+        )
+    }
+
+    pub const fn start_command_index(&self) -> u32 {
+        self.start_command_index
+    }
+
+    pub const fn end_command_index(&self) -> u32 {
+        self.end_command_index
+    }
+
+    pub const fn command_count(&self) -> u32 {
+        self.end_command_index - self.start_command_index
+    }
+
+    pub const fn kind(&self) -> DeviceExecutionSpanKind {
+        self.kind
+    }
+
+    pub const fn measurement(&self) -> &DeviceExecutionSpanMeasurement {
+        &self.measurement
+    }
+
+    pub fn reusable_executable_fingerprint(&self) -> Option<&str> {
+        self.reusable_executable_fingerprint.as_deref()
+    }
+
+    pub const fn contains_command(&self, command_index: u32) -> bool {
+        command_index >= self.start_command_index && command_index < self.end_command_index
+    }
+}
+
+/// Terminal backend-counter evidence for one exact submission. Physical spans
+/// cover every core command exactly once, remain ordered, and may explicitly
+/// mark a range unavailable without discarding measured sibling spans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionExecutionTiming {
+    command_count: u32,
+    spans: Box<[DeviceSubmissionExecutionSpan]>,
+}
+
+impl DeviceSubmissionExecutionTiming {
+    pub fn new(commands: Vec<DeviceCommandExecutionTiming>) -> Option<Self> {
+        let command_count = commands.last()?.command_index().checked_add(1)?;
+        let spans = commands
+            .into_iter()
+            .map(DeviceSubmissionExecutionSpan::from_command)
+            .collect::<Option<Vec<_>>>()?;
+        Self::from_spans(command_count, spans)
+    }
+
+    pub fn from_spans(
+        command_count: u32,
+        spans: Vec<DeviceSubmissionExecutionSpan>,
+    ) -> Option<Self> {
+        if command_count == 0 || spans.is_empty() {
+            return None;
+        }
+        let mut expected_start = 0_u32;
+        for span in &spans {
+            if span.start_command_index() != expected_start
+                || span.end_command_index() > command_count
+            {
+                return None;
+            }
+            expected_start = span.end_command_index();
+        }
+        if expected_start != command_count {
+            return None;
+        }
+        Some(Self {
+            command_count,
+            spans: spans.into_boxed_slice(),
+        })
+    }
+
+    pub const fn command_count(&self) -> u32 {
+        self.command_count
+    }
+
+    pub fn spans(&self) -> &[DeviceSubmissionExecutionSpan] {
+        &self.spans
+    }
+
+    pub fn span_for_command(&self, command_index: u32) -> Option<&DeviceSubmissionExecutionSpan> {
+        let index = self
+            .spans
+            .partition_point(|span| span.end_command_index() <= command_index);
+        self.spans
+            .get(index)
+            .filter(|span| span.contains_command(command_index))
+    }
+}
+
+/// A terminal and its optional backend clock evidence are inseparable. This
+/// prevents timing from being queried before the exact fence proves quiescence.
+#[derive(Debug, Serialize)]
+#[must_use = "a device terminal receipt owns exact fence timing evidence"]
+pub struct DeviceTerminalReceipt<E> {
+    terminal: DeviceTerminal<E>,
+    execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+    submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+}
+
+impl<E> DeviceTerminalReceipt<E> {
+    pub fn unprofiled(terminal: DeviceTerminal<E>) -> Self {
+        Self {
+            terminal,
+            execution_timing: DeviceTimingMeasurement::NotRequested,
+            submission_timing: DeviceTimingMeasurement::NotRequested,
+        }
+    }
+
+    pub fn profiled(
+        terminal: DeviceTerminal<E>,
+        execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+    ) -> Self {
+        Self {
+            terminal,
+            execution_timing,
+            submission_timing: DeviceTimingMeasurement::NotRequested,
+        }
+    }
+
+    pub fn profiled_with_submission_timing(
+        terminal: DeviceTerminal<E>,
+        execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+        submission_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    ) -> Self {
+        Self {
+            terminal,
+            execution_timing,
+            submission_timing,
+        }
+    }
+
+    pub const fn terminal(&self) -> &DeviceTerminal<E> {
+        &self.terminal
+    }
+
+    pub const fn execution_timing(&self) -> &DeviceTimingMeasurement<DeviceExecutionTiming> {
+        &self.execution_timing
+    }
+
+    pub const fn submission_timing(
+        &self,
+    ) -> &DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
+        &self.submission_timing
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeviceTerminal<E>,
+        DeviceTimingMeasurement<DeviceExecutionTiming>,
+        DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
+    ) {
+        (self.terminal, self.execution_timing, self.submission_timing)
+    }
+}
+
 /// A submit failure that guarantees no device-visible work was enqueued.
 ///
 /// This wrapper is deliberately distinct from an arbitrary runtime error:
@@ -604,7 +2020,7 @@ impl<E> DeviceTerminal<E> {
 #[must_use = "a fence query must preserve pending or indeterminate ownership"]
 pub enum FenceQuery<E> {
     Pending,
-    Terminal(DeviceTerminal<E>),
+    Terminal(DeviceTerminalReceipt<E>),
     Indeterminate(E),
 }
 
@@ -721,6 +2137,768 @@ impl HostTransferLayout {
     }
 }
 
+/// Semantic phase of one command inside a core-owned submission batch.
+///
+/// Backends may use this phase to compile reusable device executables, but
+/// they must preserve the original ordering and may only reuse `Compute`
+/// commands whose backend provider supplied an exact replay contract.
+/// Initialization, dynamic binding, and result binding commands are explicit
+/// eager barriers: replaying them can reset live state, reuse stale request
+/// data, or write results into an earlier request's backing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceCommandPhase {
+    Initialization,
+    DynamicBinding,
+    Compute,
+    ResultBinding,
+}
+
+/// Backend-observed physical work for one core-owned command entry.
+///
+/// Rows are created only when core explicitly requests attribution. The node
+/// index is issued by core and binds backend work back to the immutable plan;
+/// backend labels and counters carry observation only and grant no execution
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceNativeWorkAttribution {
+    command_index: u32,
+    node_index: Option<u32>,
+    command_phase: DeviceCommandPhase,
+    native_op_id: &'static str,
+    execution_path: DeviceExecutionPath,
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
+    reusable_graph_node_count: Option<u64>,
+}
+
+impl DeviceNativeWorkAttribution {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        command_index: u32,
+        node_index: Option<u32>,
+        command_phase: DeviceCommandPhase,
+        native_op_id: &'static str,
+        execution_path: DeviceExecutionPath,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+        reusable_graph_node_count: Option<u64>,
+    ) -> Option<Self> {
+        if native_op_id.is_empty()
+            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+            || (node_index.is_some() && participant_count == 0)
+            || (reusable_graph_node_count.is_some()
+                && execution_path != DeviceExecutionPath::Replayed)
+        {
+            return None;
+        }
+        Some(Self {
+            command_index,
+            node_index,
+            command_phase,
+            native_op_id,
+            execution_path,
+            batching_form,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+            reusable_graph_node_count,
+        })
+    }
+
+    pub const fn command_index(&self) -> u32 {
+        self.command_index
+    }
+
+    pub const fn node_index(&self) -> Option<u32> {
+        self.node_index
+    }
+
+    pub const fn command_phase(&self) -> DeviceCommandPhase {
+        self.command_phase
+    }
+
+    pub const fn native_op_id(&self) -> &'static str {
+        self.native_op_id
+    }
+
+    pub const fn execution_path(&self) -> DeviceExecutionPath {
+        self.execution_path
+    }
+
+    pub const fn batching_form(&self) -> DeviceBatchingForm {
+        self.batching_form
+    }
+
+    pub const fn participant_count(&self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+
+    pub const fn compute_dispatch_count(&self) -> u64 {
+        self.compute_dispatch_count
+    }
+
+    pub const fn transfer_command_count(&self) -> u64 {
+        self.transfer_command_count
+    }
+
+    /// Actual native graph nodes captured for this replayed command.
+    ///
+    /// This observation may include kernels, copies, memsets, and dependency
+    /// nodes selected internally by a native library.
+    pub const fn reusable_graph_node_count(&self) -> Option<u64> {
+        self.reusable_graph_node_count
+    }
+}
+
+/// One logical plan-node command sealed inside a physical reusable executable.
+///
+/// A CUDA graph segment launches as one physical command, but release
+/// determinism must still prove which immutable-plan nodes were replayed and
+/// how much native graph work each logical command contributed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReplayedLogicalCommandAttribution {
+    logical_command_ordinal: u32,
+    node_index: u32,
+    native_op_id: &'static str,
+    batching_form: DeviceBatchingForm,
+    participant_count: u32,
+    token_count: u64,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
+    reusable_graph_node_count: u64,
+}
+
+impl DeviceReplayedLogicalCommandAttribution {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        logical_command_ordinal: u32,
+        node_index: u32,
+        native_op_id: &'static str,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+        reusable_graph_node_count: u64,
+    ) -> Option<Self> {
+        if native_op_id.is_empty()
+            || participant_count == 0
+            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+            || reusable_graph_node_count == 0
+        {
+            return None;
+        }
+        Some(Self {
+            logical_command_ordinal,
+            node_index,
+            native_op_id,
+            batching_form,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+            reusable_graph_node_count,
+        })
+    }
+
+    pub const fn logical_command_ordinal(&self) -> u32 {
+        self.logical_command_ordinal
+    }
+
+    pub const fn node_index(&self) -> u32 {
+        self.node_index
+    }
+
+    pub const fn native_op_id(&self) -> &'static str {
+        self.native_op_id
+    }
+
+    pub const fn batching_form(&self) -> DeviceBatchingForm {
+        self.batching_form
+    }
+
+    pub const fn participant_count(&self) -> u32 {
+        self.participant_count
+    }
+
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+
+    pub const fn compute_dispatch_count(&self) -> u64 {
+        self.compute_dispatch_count
+    }
+
+    pub const fn transfer_command_count(&self) -> u64 {
+        self.transfer_command_count
+    }
+
+    pub const fn reusable_graph_node_count(&self) -> u64 {
+        self.reusable_graph_node_count
+    }
+}
+
+/// Logical-node attribution for one physical reusable executable launch.
+///
+/// Physical timing remains indexed by `physical_command_index`; the ordered
+/// logical rows bind that launch back to every plan node captured in the
+/// sealed program segment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceReplayedSegmentAttribution {
+    physical_command_index: u32,
+    program_id: DeviceReusableExecutionProgramId,
+    segment: DeviceReusableExecutionSegment,
+    reusable_executable_fingerprint: String,
+    logical_commands: Box<[DeviceReplayedLogicalCommandAttribution]>,
+}
+
+impl DeviceReplayedSegmentAttribution {
+    pub fn new(
+        physical_command_index: u32,
+        program_id: DeviceReusableExecutionProgramId,
+        segment: DeviceReusableExecutionSegment,
+        reusable_executable_fingerprint: String,
+        logical_commands: Vec<DeviceReplayedLogicalCommandAttribution>,
+    ) -> Option<Self> {
+        let canonical_sha256 = reusable_executable_fingerprint.len() == 64
+            && reusable_executable_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !canonical_sha256
+            || segment
+                .start_node_index()
+                .checked_add(segment.logical_command_count())
+                != Some(segment.end_node_index())
+            || logical_commands.len() != segment.logical_command_count() as usize
+            || logical_commands
+                .iter()
+                .enumerate()
+                .any(|(ordinal, command)| {
+                    u32::try_from(ordinal).ok() != Some(command.logical_command_ordinal())
+                        || segment
+                            .start_node_index()
+                            .checked_add(command.logical_command_ordinal())
+                            != Some(command.node_index())
+                })
+        {
+            return None;
+        }
+        Some(Self {
+            physical_command_index,
+            program_id,
+            segment,
+            reusable_executable_fingerprint,
+            logical_commands: logical_commands.into_boxed_slice(),
+        })
+    }
+
+    pub const fn physical_command_index(&self) -> u32 {
+        self.physical_command_index
+    }
+
+    pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
+        &self.program_id
+    }
+
+    pub const fn segment(&self) -> &DeviceReusableExecutionSegment {
+        &self.segment
+    }
+
+    pub fn reusable_executable_fingerprint(&self) -> &str {
+        &self.reusable_executable_fingerprint
+    }
+
+    pub fn logical_commands(&self) -> &[DeviceReplayedLogicalCommandAttribution] {
+        &self.logical_commands
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSubmissionAttribution {
+    commands: Box<[DeviceNativeWorkAttribution]>,
+    replayed_segments: Box<[DeviceReplayedSegmentAttribution]>,
+}
+
+impl DeviceSubmissionAttribution {
+    pub fn new(commands: Vec<DeviceNativeWorkAttribution>) -> Option<Self> {
+        Self::with_replayed_segments(commands, Vec::new())
+    }
+
+    pub fn with_replayed_segments(
+        commands: Vec<DeviceNativeWorkAttribution>,
+        replayed_segments: Vec<DeviceReplayedSegmentAttribution>,
+    ) -> Option<Self> {
+        if commands.is_empty()
+            || commands
+                .windows(2)
+                .any(|pair| pair[0].command_index() >= pair[1].command_index())
+            || replayed_segments.windows(2).any(|pair| {
+                pair[0].physical_command_index() >= pair[1].physical_command_index()
+                    || pair[0].segment().end_node_index() > pair[1].segment().start_node_index()
+            })
+        {
+            return None;
+        }
+        for segment in &replayed_segments {
+            let physical_index = commands
+                .binary_search_by_key(&segment.physical_command_index(), |command| {
+                    command.command_index()
+                })
+                .ok()?;
+            let physical = commands.get(physical_index)?;
+            let first_logical = segment.logical_commands().first()?;
+            let logical_graph_node_count = segment
+                .logical_commands()
+                .iter()
+                .try_fold(0_u64, |total, logical| {
+                    total.checked_add(logical.reusable_graph_node_count())
+                })?;
+            if physical.command_index() != segment.physical_command_index()
+                || physical.command_phase() != DeviceCommandPhase::Compute
+                || physical.execution_path() != DeviceExecutionPath::Replayed
+                || physical.reusable_graph_node_count() != Some(logical_graph_node_count)
+                || physical.node_index() != Some(segment.segment().start_node_index())
+                || physical.participant_count() != first_logical.participant_count()
+                || physical.token_count() != first_logical.token_count()
+                || segment.logical_commands().iter().any(|logical| {
+                    logical.participant_count() != physical.participant_count()
+                        || logical.token_count() != physical.token_count()
+                })
+            {
+                return None;
+            }
+        }
+        Some(Self {
+            commands: commands.into_boxed_slice(),
+            replayed_segments: replayed_segments.into_boxed_slice(),
+        })
+    }
+
+    pub fn commands(&self) -> &[DeviceNativeWorkAttribution] {
+        &self.commands
+    }
+
+    pub fn replayed_segments(&self) -> &[DeviceReplayedSegmentAttribution] {
+        &self.replayed_segments
+    }
+}
+
+/// Provider-encoded work for one logical operation.
+///
+/// Core owns the phase boundaries: request-specific inputs are written before
+/// compute, and request-specific outputs are materialized afterwards. A
+/// backend may optimize the compute command, but cannot accidentally capture
+/// either dynamic boundary into a reusable executable.
+#[must_use = "encoded device operations must be appended to a submission batch"]
+pub struct EncodedDeviceOperation<C> {
+    program_bindings: Vec<C>,
+    dynamic_bindings: Vec<C>,
+    compute: C,
+    result_bindings: Vec<C>,
+}
+
+impl<C> EncodedDeviceOperation<C> {
+    pub fn compute(command: C) -> Self {
+        Self {
+            program_bindings: Vec::new(),
+            dynamic_bindings: Vec::new(),
+            compute: command,
+            result_bindings: Vec::new(),
+        }
+    }
+
+    /// Adds a binding that may execute in the wave-level program prelude.
+    ///
+    /// Providers may use this only for writes into their own non-aliasing
+    /// binding workspace. The command must not read provider outputs or depend
+    /// on earlier compute in the same wave.
+    pub fn with_program_binding(mut self, command: C) -> Self {
+        self.program_bindings.push(command);
+        self
+    }
+
+    pub fn with_dynamic_binding(mut self, command: C) -> Self {
+        self.dynamic_bindings.push(command);
+        self
+    }
+
+    pub fn with_result_binding(mut self, command: C) -> Self {
+        self.result_bindings.push(command);
+        self
+    }
+
+    pub fn dynamic_binding_count(&self) -> usize {
+        self.dynamic_bindings.len()
+    }
+
+    pub fn program_binding_count(&self) -> usize {
+        self.program_bindings.len()
+    }
+
+    pub fn result_binding_count(&self) -> usize {
+        self.result_bindings.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, C, Vec<C>) {
+        (
+            self.program_bindings,
+            self.dynamic_bindings,
+            self.compute,
+            self.result_bindings,
+        )
+    }
+}
+
+/// Per-wave commands that remain outside one resident reusable compute
+/// segment. Program bindings may be coalesced into the wave prelude; dynamic
+/// and result bindings preserve their position around the segment launch.
+#[must_use = "reusable execution bindings must accompany their segment launch"]
+pub struct EncodedReusableExecutionBindings<C> {
+    program_bindings: Vec<C>,
+    dynamic_bindings: Vec<C>,
+    result_bindings: Vec<C>,
+}
+
+impl<C> EncodedReusableExecutionBindings<C> {
+    pub fn empty() -> Self {
+        Self {
+            program_bindings: Vec::new(),
+            dynamic_bindings: Vec::new(),
+            result_bindings: Vec::new(),
+        }
+    }
+
+    pub fn with_program_binding(mut self, command: C) -> Self {
+        self.program_bindings.push(command);
+        self
+    }
+
+    pub fn with_dynamic_binding(mut self, command: C) -> Self {
+        self.dynamic_bindings.push(command);
+        self
+    }
+
+    pub fn with_result_binding(mut self, command: C) -> Self {
+        self.result_bindings.push(command);
+        self
+    }
+
+    pub fn from_operation(operation: EncodedDeviceOperation<C>) -> Self {
+        let (program_bindings, dynamic_bindings, _compute, result_bindings) =
+            operation.into_parts();
+        Self {
+            program_bindings,
+            dynamic_bindings,
+            result_bindings,
+        }
+    }
+
+    pub fn program_binding_count(&self) -> usize {
+        self.program_bindings.len()
+    }
+
+    pub fn dynamic_binding_count(&self) -> usize {
+        self.dynamic_bindings.len()
+    }
+
+    pub fn result_binding_count(&self) -> usize {
+        self.result_bindings.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, Vec<C>) {
+        (
+            self.program_bindings,
+            self.dynamic_bindings,
+            self.result_bindings,
+        )
+    }
+}
+
+/// One command plus the core-issued semantic phase that constrains backend
+/// execution optimizations.
+pub struct DeviceCommandEntry<C> {
+    phase: DeviceCommandPhase,
+    node_index: Option<u32>,
+    logical_work: Option<DeviceCommandLogicalWork>,
+    command: C,
+}
+
+impl<C> DeviceCommandEntry<C> {
+    pub const fn phase(&self) -> DeviceCommandPhase {
+        self.phase
+    }
+
+    pub const fn node_index(&self) -> Option<u32> {
+        self.node_index
+    }
+
+    pub const fn logical_work(&self) -> Option<DeviceCommandLogicalWork> {
+        self.logical_work
+    }
+
+    pub const fn command(&self) -> &C {
+        &self.command
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeviceCommandPhase,
+        Option<u32>,
+        Option<DeviceCommandLogicalWork>,
+        C,
+    ) {
+        (self.phase, self.node_index, self.logical_work, self.command)
+    }
+}
+
+/// Core-owned physical submission unit.
+///
+/// Operation providers produce individual commands, while the execution
+/// runtime decides which commands share one ordered device submission and
+/// completion fence. Construction stays private to core so a backend cannot
+/// silently split one admitted lane segment into unrelated submissions.
+#[must_use = "encoded device command batches must be submitted"]
+pub struct DeviceCommandBatch<C> {
+    commands: Vec<DeviceCommandEntry<C>>,
+    timing_mode: DeviceTimingMode,
+    compute_path_requirement: DeviceComputePathRequirement,
+    attribution_requirement: DeviceSubmissionAttributionRequirement,
+    reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
+}
+
+impl<C> DeviceCommandBatch<C> {
+    pub(crate) fn singleton(command: C) -> Self {
+        Self {
+            commands: vec![DeviceCommandEntry {
+                phase: DeviceCommandPhase::Compute,
+                node_index: None,
+                logical_work: None,
+                command,
+            }],
+            timing_mode: DeviceTimingMode::Off,
+            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            reusable_execution_capture: None,
+        }
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+            timing_mode: DeviceTimingMode::Off,
+            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            reusable_execution_capture: None,
+        }
+    }
+
+    pub(crate) fn with_capacity_and_timing(capacity: usize, timing_mode: DeviceTimingMode) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+            timing_mode,
+            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            reusable_execution_capture: None,
+        }
+    }
+
+    pub(crate) fn with_capacity_timing_and_compute_path(
+        capacity: usize,
+        timing_mode: DeviceTimingMode,
+        compute_path_requirement: DeviceComputePathRequirement,
+    ) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+            timing_mode,
+            compute_path_requirement,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            reusable_execution_capture: None,
+        }
+    }
+
+    pub(crate) fn require_logical_execution_path_attribution(&mut self) {
+        self.attribution_requirement = DeviceSubmissionAttributionRequirement::LogicalExecutionPath;
+    }
+
+    pub(crate) fn set_reusable_execution_capture(
+        &mut self,
+        capture: DeviceReusableExecutionCapture,
+    ) -> Result<(), VNextError> {
+        if self.reusable_execution_capture.is_some() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "device command batch already owns reusable execution capture metadata"
+                    .to_owned(),
+            });
+        }
+        self.reusable_execution_capture = Some(capture);
+        Ok(())
+    }
+
+    pub fn reusable_execution_capture(&self) -> Option<&DeviceReusableExecutionCapture> {
+        self.reusable_execution_capture.as_ref()
+    }
+
+    pub(crate) fn push_initialization(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Initialization,
+            node_index: None,
+            logical_work: None,
+            command,
+        });
+    }
+
+    pub(crate) fn push_node_initialization(
+        &mut self,
+        node_index: u32,
+        logical_work: DeviceCommandLogicalWork,
+        command: C,
+    ) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Initialization,
+            node_index: Some(node_index),
+            logical_work: Some(logical_work),
+            command,
+        });
+    }
+
+    pub(crate) fn push_dynamic_binding(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::DynamicBinding,
+            node_index: None,
+            logical_work: None,
+            command,
+        });
+    }
+
+    pub(crate) fn push_compute(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Compute,
+            node_index: None,
+            logical_work: None,
+            command,
+        });
+    }
+
+    pub(crate) fn push_result_binding(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::ResultBinding,
+            node_index: None,
+            logical_work: None,
+            command,
+        });
+    }
+
+    pub(crate) fn push_operation(&mut self, node_index: u32, operation: EncodedDeviceOperation<C>) {
+        let (program_bindings, dynamic_bindings, compute, result_bindings) = operation.into_parts();
+        for command in program_bindings {
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::DynamicBinding,
+                node_index: Some(node_index),
+                logical_work: None,
+                command,
+            });
+        }
+        self.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
+    }
+
+    pub(crate) fn push_operation_parts(
+        &mut self,
+        node_index: u32,
+        dynamic_bindings: Vec<C>,
+        compute: C,
+        result_bindings: Vec<C>,
+    ) {
+        for command in dynamic_bindings {
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::DynamicBinding,
+                node_index: Some(node_index),
+                logical_work: None,
+                command,
+            });
+        }
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Compute,
+            node_index: Some(node_index),
+            logical_work: None,
+            command: compute,
+        });
+        for command in result_bindings {
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::ResultBinding,
+                node_index: Some(node_index),
+                logical_work: None,
+                command,
+            });
+        }
+    }
+
+    pub(crate) fn push(&mut self, command: C) {
+        self.push_compute(command);
+    }
+
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    pub const fn timing_mode(&self) -> DeviceTimingMode {
+        self.timing_mode
+    }
+
+    pub const fn compute_path_requirement(&self) -> DeviceComputePathRequirement {
+        self.compute_path_requirement
+    }
+
+    pub const fn attribution_requirement(&self) -> DeviceSubmissionAttributionRequirement {
+        self.attribution_requirement
+    }
+
+    pub fn into_commands(self) -> Vec<C> {
+        self.commands
+            .into_iter()
+            .map(|entry| entry.command)
+            .collect()
+    }
+
+    pub fn into_entries(self) -> Vec<DeviceCommandEntry<C>> {
+        self.commands
+    }
+}
+
+/// Cold-path transaction for backends that can bind immutable weight
+/// components directly instead of allocating and uploading one contiguous
+/// physical arena.
+///
+/// The session must not publish a partially imported arena. [`Self::seal`]
+/// consumes the complete transaction and is the only point at which imported
+/// regions may become visible to device execution.
+pub trait StaticWeightImportSession<B, E> {
+    fn import_component(
+        &mut self,
+        payload: &WeightComponentPayload<'_>,
+        destination: &B,
+        destination_offset_bytes: u64,
+    ) -> Result<(), E>;
+
+    fn seal(self: Box<Self>) -> Result<(), E>;
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
 ///
 /// Associated buffer, stream, command, and error types preserve compile-time
@@ -743,9 +2921,81 @@ pub trait DeviceRuntime: Send + Sync + 'static {
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor;
 
+    /// Begins an optional all-or-nothing static-weight import transaction.
+    /// Returning `None` selects the portable zero-and-upload path. The default
+    /// preserves existing CUDA, CPU, and test runtime behavior.
+    fn begin_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        None
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error>;
 
     fn stream_state(&self, stream: &Self::Stream) -> StreamState;
+
+    /// Opens the bounded cold-path preparation window for one stream.
+    /// Backends without reusable executable support retain the no-op receipt.
+    fn configure_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+        _plan: DeviceReusableExecutionPlan,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
+    /// Permanently closes the preparation window for this stream. A sealed
+    /// stream may replay or fall back to eager execution but cannot capture on
+    /// a later product request.
+    fn seal_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
+    /// Returns the current preparation receipt without changing lifecycle
+    /// state. Product startup uses two snapshots to prove that its validation
+    /// pass replayed stable executables instead of compiling more work.
+    fn reusable_executable_preparation(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
+    /// Returns the immutable direct-submit catalog after preparation is sealed.
+    ///
+    /// Backends without direct reusable execution return an empty catalog.
+    fn reusable_execution_catalog(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Result<Vec<DeviceReusableExecutionProgram>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Encodes one lightweight reference to a resident reusable segment.
+    ///
+    /// Returning `None` selects the normal provider encoding path. The
+    /// reference itself owns no request resources; every dynamic target must be
+    /// retained by explicit per-wave binding commands and the completion fence.
+    fn encode_reusable_execution(
+        &self,
+        _invocation: DeviceReusableExecutionInvocation,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Releases reusable executable cache entries on a proven-quiescent
+    /// stream. Backends without such a cache retain the no-op default.
+    fn trim_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        Ok(DeviceReusableExecutionTrim::default())
+    }
 
     fn encode_copy(
         &self,
@@ -769,7 +3019,21 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         length_bytes: u64,
     ) -> Result<Self::Command, Self::Error>;
 
-    /// Submits one encoded command and returns its exact completion fence.
+    /// Coalesces independent provider binding writes into a wave prelude.
+    ///
+    /// The default preserves one command per provider. Backends may return a
+    /// smaller ordered set, but must retain every command-owned resource and
+    /// preserve the exact enqueue order and failure semantics.
+    fn coalesce_program_bindings(
+        &self,
+        commands: Vec<Self::Command>,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        Ok(commands)
+    }
+
+    /// Submits one non-empty ordered command batch and returns its exact
+    /// completion fence. A backend must preserve command order and must not
+    /// manufacture intermediate host-visible completion boundaries.
     ///
     /// The error type is intentionally closed over `DefinitelyNotSubmitted`:
     /// an ordinary backend error is not sufficient evidence that invocation
@@ -779,8 +3043,33 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn submit(
         &self,
         stream: &mut Self::Stream,
-        command: Self::Command,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>;
+
+    /// Profile-attached submission entrypoint. Backends override this only
+    /// when they can expose typed internal boundaries without changing
+    /// submission ownership or error semantics.
+    fn submit_with_timing<S>(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        timing_sink: &S,
+    ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>
+    where
+        Self: Sized,
+        S: DeviceSubmissionTimingSink,
+    {
+        let _ = timing_sink;
+        self.submit(stream, commands)
+    }
+
+    /// Returns backend-observed native work for an already submitted fence.
+    /// Attribution may be requested explicitly for correctness evidence or by
+    /// a diagnostic timing mode. The returned rows never grant completion or
+    /// resource-release authority.
+    fn submission_attribution(&self, _fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
+        None
+    }
 
     /// Observes a fence without blocking. `Indeterminate` is not terminal and
     /// therefore cannot release command-owned resources.
@@ -791,7 +3080,7 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn wait_fence(
         &self,
         fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>>;
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>>;
 
     fn synchronize(&self, stream: &mut Self::Stream) -> Result<(), Self::Error>;
 
@@ -832,6 +3121,414 @@ pub fn classify_device_error<R: DeviceRuntime + ?Sized>(
         });
     }
     IdentifiedFailure::new(identity, runtime.describe_error(error)?.into_failure())
+}
+
+#[cfg(test)]
+mod execution_timing_tests {
+    use super::*;
+    use crate::vnext::{
+        ReusableExecutionBucketSpec, ReusableExecutionCapacity, ReusableExecutionClassId,
+    };
+
+    #[test]
+    fn timing_capabilities_are_independent_from_compute_path_requirement() {
+        assert!(DeviceTimingMode::Replay.completion_enabled());
+        assert!(DeviceTimingMode::Replay.physical_span_attribution_enabled());
+        assert!(!DeviceTimingMode::Replay.kernel_attribution_enabled());
+        assert!(DeviceTimingMode::Kernel.physical_span_attribution_enabled());
+        assert!(DeviceTimingMode::Kernel.kernel_attribution_enabled());
+        assert!(!DeviceTimingMode::Kernel.direct_reusable_execution_allowed());
+        assert!(DeviceTimingMode::Verification.completion_enabled());
+        assert!(DeviceTimingMode::Verification.physical_span_attribution_enabled());
+        assert!(DeviceTimingMode::Verification.kernel_attribution_enabled());
+        assert!(!DeviceTimingMode::Verification.direct_reusable_execution_allowed());
+        assert!(!DeviceTimingMode::Completion.physical_span_attribution_enabled());
+        assert!(!DeviceTimingMode::Off.completion_enabled());
+
+        let mut batch = DeviceCommandBatch::<()>::with_capacity_timing_and_compute_path(
+            1,
+            DeviceTimingMode::Replay,
+            DeviceComputePathRequirement::EagerOnly,
+        );
+        assert_eq!(
+            batch.compute_path_requirement(),
+            DeviceComputePathRequirement::EagerOnly
+        );
+        assert_eq!(
+            batch.attribution_requirement(),
+            DeviceSubmissionAttributionRequirement::None
+        );
+        batch.require_logical_execution_path_attribution();
+        assert_eq!(
+            batch.attribution_requirement(),
+            DeviceSubmissionAttributionRequirement::LogicalExecutionPath
+        );
+        assert_eq!(batch.timing_mode(), DeviceTimingMode::Replay);
+    }
+
+    #[test]
+    fn command_timing_requires_positive_ordered_nonoverlapping_intervals() {
+        assert!(
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 10).is_none()
+        );
+        assert!(
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 11, 10).is_none()
+        );
+
+        let first =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 20).unwrap();
+        let adjacent =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 20, 30).unwrap();
+        let overlapping =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 19, 30).unwrap();
+        assert!(DeviceCommandExecutionTiming::new(0, vec![first, adjacent]).is_some());
+        assert!(DeviceCommandExecutionTiming::new(0, vec![first, overlapping]).is_none());
+        let labeled = DeviceExecutionInterval::new_labeled(
+            DeviceExecutionIntervalKind::Compute,
+            30,
+            40,
+            "projection.qkv",
+        )
+        .unwrap();
+        assert_eq!(labeled.subwork_id(), Some("projection.qkv"));
+        assert!(DeviceExecutionInterval::new_labeled(
+            DeviceExecutionIntervalKind::Compute,
+            30,
+            40,
+            "",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn submission_timing_requires_complete_nonoverlapping_command_coverage() {
+        let command = |command_index| {
+            DeviceCommandExecutionTiming::new(
+                command_index,
+                vec![
+                    DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 0, 1)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let commands = DeviceSubmissionExecutionTiming::new(vec![command(0), command(1)]).unwrap();
+        assert_eq!(commands.command_count(), 2);
+        assert_eq!(commands.spans().len(), 2);
+        assert!(commands
+            .spans()
+            .iter()
+            .all(|span| span.kind() == DeviceExecutionSpanKind::EagerCommand));
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(0), command(2)]).is_none());
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(1), command(1)]).is_none());
+        assert!(DeviceSubmissionExecutionTiming::new(vec![command(2), command(1)]).is_none());
+    }
+
+    #[test]
+    fn submission_timing_preserves_measured_and_unavailable_physical_spans() {
+        let eager = DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            vec![
+                DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 0, 10).unwrap(),
+            ],
+        )
+        .unwrap();
+        let replay = DeviceSubmissionExecutionSpan::measured(
+            1,
+            4,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            vec![DeviceExecutionInterval::new_labeled(
+                DeviceExecutionIntervalKind::Compute,
+                10,
+                40,
+                "cuda reusable executable",
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .with_reusable_executable_fingerprint("a".repeat(64))
+        .unwrap();
+        let unavailable = DeviceSubmissionExecutionSpan::unavailable(
+            4,
+            5,
+            DeviceExecutionSpanKind::EagerCommand,
+            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+        )
+        .unwrap();
+
+        let timing =
+            DeviceSubmissionExecutionTiming::from_spans(5, vec![eager, replay, unavailable])
+                .unwrap();
+        assert_eq!(timing.command_count(), 5);
+        assert_eq!(
+            timing.span_for_command(2).unwrap().kind(),
+            DeviceExecutionSpanKind::ReusableExecutable
+        );
+        assert_eq!(
+            timing
+                .span_for_command(2)
+                .unwrap()
+                .reusable_executable_fingerprint(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            serde_json::to_value(timing.span_for_command(2).unwrap())
+                .unwrap()
+                .get("reusable_executable_fingerprint"),
+            Some(&serde_json::json!(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        );
+        assert_eq!(
+            timing
+                .span_for_command(4)
+                .unwrap()
+                .measurement()
+                .unavailable_reason(),
+            Some(DeviceTimingUnavailableReason::BackendMeasurementFailed)
+        );
+        assert!(timing.span_for_command(5).is_none());
+    }
+
+    #[test]
+    fn physical_spans_reject_gaps_overlaps_and_invalid_eager_ranges() {
+        let interval = || {
+            vec![DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 0, 1).unwrap()]
+        };
+        assert!(DeviceSubmissionExecutionSpan::measured(
+            0,
+            2,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .is_none());
+        assert!(DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .unwrap()
+        .with_reusable_executable_fingerprint("a".repeat(64))
+        .is_none());
+        assert!(DeviceSubmissionExecutionSpan::measured(
+            0,
+            2,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            interval(),
+        )
+        .unwrap()
+        .with_reusable_executable_fingerprint("A".repeat(64))
+        .is_none());
+        let first = DeviceSubmissionExecutionSpan::measured(
+            0,
+            1,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .unwrap();
+        assert!(serde_json::to_value(&first)
+            .unwrap()
+            .get("reusable_executable_fingerprint")
+            .is_none());
+        let gap = DeviceSubmissionExecutionSpan::measured(
+            2,
+            3,
+            DeviceExecutionSpanKind::EagerCommand,
+            interval(),
+        )
+        .unwrap();
+        assert!(DeviceSubmissionExecutionTiming::from_spans(3, vec![first.clone(), gap]).is_none());
+        let overlap = DeviceSubmissionExecutionSpan::measured(
+            0,
+            2,
+            DeviceExecutionSpanKind::ReusableExecutable,
+            interval(),
+        )
+        .unwrap();
+        assert!(DeviceSubmissionExecutionTiming::from_spans(2, vec![first, overlap]).is_none());
+    }
+
+    #[test]
+    fn native_graph_node_observation_belongs_only_to_replayed_work() {
+        let row = |execution_path, graph_nodes| {
+            DeviceNativeWorkAttribution::new(
+                0,
+                Some(0),
+                DeviceCommandPhase::Compute,
+                "test.compute",
+                execution_path,
+                DeviceBatchingForm::Scalar,
+                1,
+                1,
+                1,
+                0,
+                graph_nodes,
+            )
+        };
+
+        assert!(row(DeviceExecutionPath::Eager, Some(2)).is_none());
+        let replayed = row(DeviceExecutionPath::Replayed, Some(2)).unwrap();
+        assert_eq!(replayed.reusable_graph_node_count(), Some(2));
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap()["reusable_graph_node_count"],
+            serde_json::json!(2)
+        );
+    }
+
+    fn replay_test_program_id() -> DeviceReusableExecutionProgramId {
+        let plan_hash: PlanHash =
+            serde_json::from_value(serde_json::json!("a".repeat(64))).unwrap();
+        let bucket = ReusableExecutionBucketSpec::new(
+            ReusableExecutionClassId::new("device-attribution-test").unwrap(),
+            ReusableExecutionCapacity::new(2, 3, 1).unwrap(),
+        )
+        .unwrap();
+        DeviceReusableExecutionProgramId::new(
+            plan_hash,
+            "b".repeat(64),
+            ExecutionLaneId::mint().unwrap(),
+            bucket.bucket_id().clone(),
+            "c".repeat(64),
+            "d".repeat(64),
+            7,
+            2,
+            3,
+            1,
+        )
+        .unwrap()
+    }
+
+    fn replay_test_physical(
+        execution_path: DeviceExecutionPath,
+        node_index: u32,
+        graph_node_count: Option<u64>,
+    ) -> DeviceNativeWorkAttribution {
+        DeviceNativeWorkAttribution::new(
+            0,
+            Some(node_index),
+            DeviceCommandPhase::Compute,
+            "vnext_reusable_execution",
+            execution_path,
+            DeviceBatchingForm::ParticipantLoop,
+            2,
+            3,
+            1,
+            0,
+            graph_node_count,
+        )
+        .unwrap()
+    }
+
+    fn replay_test_logical(
+        ordinal: u32,
+        node_index: u32,
+        graph_node_count: u64,
+    ) -> DeviceReplayedLogicalCommandAttribution {
+        DeviceReplayedLogicalCommandAttribution::new(
+            ordinal,
+            node_index,
+            "test.logical.compute",
+            DeviceBatchingForm::ParticipantLoop,
+            2,
+            3,
+            1,
+            0,
+            graph_node_count,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replayed_segment_separates_one_physical_launch_from_logical_plan_nodes() {
+        let segment = DeviceReusableExecutionSegment::new(0, 4, 6, 2).unwrap();
+        let replayed = DeviceReplayedSegmentAttribution::new(
+            0,
+            replay_test_program_id(),
+            segment,
+            "e".repeat(64),
+            vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 5, 3)],
+        )
+        .unwrap();
+        let attribution = DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(
+                DeviceExecutionPath::Replayed,
+                4,
+                Some(5),
+            )],
+            vec![replayed],
+        )
+        .unwrap();
+
+        assert_eq!(attribution.commands().len(), 1);
+        assert_eq!(attribution.replayed_segments().len(), 1);
+        assert_eq!(
+            attribution.replayed_segments()[0].logical_commands().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn replayed_segment_rejects_incomplete_or_mismatched_logical_attribution() {
+        assert!(DeviceReplayedLogicalCommandAttribution::new(
+            0,
+            4,
+            "test.logical.compute",
+            DeviceBatchingForm::ParticipantLoop,
+            2,
+            3,
+            1,
+            0,
+            0,
+        )
+        .is_none());
+
+        let segment = DeviceReusableExecutionSegment::new(0, 4, 6, 2).unwrap();
+        assert!(DeviceReplayedSegmentAttribution::new(
+            0,
+            replay_test_program_id(),
+            segment.clone(),
+            "e".repeat(64),
+            vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 6, 3)],
+        )
+        .is_none());
+
+        let replayed = || {
+            DeviceReplayedSegmentAttribution::new(
+                0,
+                replay_test_program_id(),
+                segment.clone(),
+                "e".repeat(64),
+                vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 5, 3)],
+            )
+            .unwrap()
+        };
+        assert!(DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(
+                DeviceExecutionPath::Replayed,
+                4,
+                Some(4),
+            )],
+            vec![replayed()],
+        )
+        .is_none());
+        assert!(DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(DeviceExecutionPath::Eager, 4, None)],
+            vec![replayed()],
+        )
+        .is_none());
+        assert!(DeviceSubmissionAttribution::with_replayed_segments(
+            vec![replay_test_physical(
+                DeviceExecutionPath::Replayed,
+                5,
+                Some(5),
+            )],
+            vec![replayed()],
+        )
+        .is_none());
+    }
 }
 
 #[cfg(test)]
@@ -905,6 +3602,107 @@ mod deferred_cleanup_tests {
             attempts,
             dropped,
         )
+    }
+
+    #[test]
+    fn encoded_operation_preserves_program_dynamic_compute_and_result_boundaries() {
+        let operation = EncodedDeviceOperation::compute("compute")
+            .with_program_binding("program-bind")
+            .with_dynamic_binding("bind-a")
+            .with_dynamic_binding("bind-b")
+            .with_result_binding("writeback");
+        let mut batch = DeviceCommandBatch::with_capacity(5);
+        batch.push_operation(0, operation);
+
+        let entries = batch.into_entries();
+        assert_eq!(
+            entries
+                .iter()
+                .map(DeviceCommandEntry::phase)
+                .collect::<Vec<_>>(),
+            vec![
+                DeviceCommandPhase::DynamicBinding,
+                DeviceCommandPhase::DynamicBinding,
+                DeviceCommandPhase::DynamicBinding,
+                DeviceCommandPhase::Compute,
+                DeviceCommandPhase::ResultBinding,
+            ]
+        );
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(DeviceCommandEntry::into_parts)
+                .map(|(_, _, _, command)| command)
+                .collect::<Vec<_>>(),
+            vec!["program-bind", "bind-a", "bind-b", "compute", "writeback",]
+        );
+    }
+
+    #[test]
+    fn node_initialization_carries_core_owned_logical_work() {
+        let logical_work =
+            DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 4, 17).unwrap();
+        let mut batch = DeviceCommandBatch::with_capacity(1);
+        batch.push_node_initialization(7, logical_work, "workspace-zero");
+
+        let mut entries = batch.into_entries();
+        assert_eq!(entries.len(), 1);
+        let entry = entries.pop().unwrap();
+        assert_eq!(entry.phase(), DeviceCommandPhase::Initialization);
+        assert_eq!(entry.node_index(), Some(7));
+        assert_eq!(entry.logical_work(), Some(logical_work));
+        assert_eq!(entry.command(), &"workspace-zero");
+        assert!(DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 0, 17).is_err());
+    }
+
+    #[test]
+    fn reusable_execution_observation_preserves_each_fallback_and_replay_counter() {
+        let mut observation = DeviceReusableExecutionObservation::default();
+        observation.observe_candidate_segment();
+        observation.observe_captured_segment();
+        observation.observe_uploaded_segment();
+        observation.observe_cache_hit_segment();
+        observation.observe_cached_rejected_segment();
+        observation.observe_capture_rejection();
+        observation.observe_quiescence_deferred_segment();
+        observation.observe_capacity_deferred_segment();
+        observation.observe_outside_preparation_segment();
+        observation.observe_evicted_segment();
+        observation.observe_replayed_segment(3);
+        observation.observe_eager_command();
+
+        assert_eq!(observation.candidate_segments(), 1);
+        assert_eq!(observation.captured_segments(), 1);
+        assert_eq!(observation.uploaded_segments(), 1);
+        assert_eq!(observation.cache_hit_segments(), 1);
+        assert_eq!(observation.cached_rejected_segments(), 1);
+        assert_eq!(observation.capture_rejected_segments(), 1);
+        assert_eq!(observation.quiescence_deferred_segments(), 1);
+        assert_eq!(observation.capacity_deferred_segments(), 1);
+        assert_eq!(observation.outside_preparation_segments(), 1);
+        assert_eq!(observation.evicted_segments(), 1);
+        assert_eq!(observation.replayed_segments(), 1);
+        assert_eq!(observation.replayed_commands(), 3);
+        assert_eq!(observation.eager_commands(), 1);
+
+        let value = serde_json::to_value(observation).expect("observation serializes");
+        for field in [
+            "candidate_segments",
+            "captured_segments",
+            "uploaded_segments",
+            "cache_hit_segments",
+            "cached_rejected_segments",
+            "capture_rejected_segments",
+            "quiescence_deferred_segments",
+            "capacity_deferred_segments",
+            "outside_preparation_segments",
+            "evicted_segments",
+            "replayed_segments",
+            "eager_commands",
+        ] {
+            assert_eq!(value[field], 1, "counter {field} must remain typed");
+        }
+        assert_eq!(value["replayed_commands"], 3);
     }
 
     #[test]

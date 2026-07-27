@@ -103,6 +103,18 @@ C01/C20 不生成模型输出的 negative case 不应用 sampling；C20 的纯�
 case 使用 `P_DETERMINISTIC`。M3 的 soft `/think`、`/no_think` 只改变 C19 和明确标记的 tool
 子组，不得改变其他 preset 的 hard `enable_thinking` 值。
 
+C11/C12 是上述 preset 的确定性 parity 子协议：保留 `P_NO_THINKING`/`P_THINKING` 的
+template kwargs、thinking mode 和 output budget，但把实际 request 的 sampling 字段显式替换为
+同模型 `P_DETERMINISTIC` 的 sampling vector，并在 request metadata 记录
+`g00_sampling_contract=deterministic-stream-parity`。C10/C13-C15 仍使用各自 preset 的官方
+sampling；C21 继续覆盖官方默认随机采样路径。不得用 fixed seed 下的随机采样逐 token 相等代替
+C11/C12 的确定性 sampling 控制，也不得因 parity 子协议而跳过 C21。这里的
+`deterministic-stream-parity` 冻结请求侧 sampling，不承诺未启用 typed batch-invariant mode
+时不同 GPU 执行之间的隐藏 reasoning 或 completion token 数逐值相等。C12 的硬 parity 边界是
+重组后的 tool call 语义和 stream 协议；隐藏 reasoning、completion/total usage 仅作诊断。
+只有未来显式提供并启用 typed batch-invariant mode 时，才能把这些字段升级为独立的逐 token
+硬门禁。C06/C17 已定义的 content/reasoning/finish/usage 精确 parity 不受此边界影响。
+
 下表是 vNext 在 G08/G10 的最终硬合同。G00 仍逐项运行可执行的 legacy case，但必须按
 `runtime_vnext_legacy_correctness_expectations.json` 冻结为 `pass`、`known-fail` 或
 `blocked`；未知事实先进入不产生 PASS 的 discovery 阶段。不得因为下表是最终标准，就把 G05
@@ -121,7 +133,7 @@ case 使用 `P_DETERMINISTIC`。M3 的 soft `/think`、`/no_think` 只改变 C19
 | C09 | cancel/timeout/disconnect | 每类 20 | cancel 被 runtime 接收后 `<=2` 个 scheduler tick 且 wall `<=5s` 到达 released/expected-cache 终态；后续同容量请求成功；无 double release/leak |
 | C10 | required tool | 每模型 `P_NO_THINKING`/`P_THINKING` 各 20；M3 soft mode 各 10 | `finish_reason=tool_calls`；name/arguments/schema 正确；reasoning 不污染 arguments |
 | C11 | auto tool | 同 C10，强触发 prompt | 产生预期 tool；不得把 JSON 塞入 content |
-| C12 | streamed tool delta | M1/M2 40：P_NO/P_THINK=`20/20`；M3 60：P_NO/P_THINK=`30/30`，其中 base/soft-think/soft-no-think=`40/10/10` | 每个 ordinal 与同 model/preset/ordinal 的 C11 auto-tool 配对，先 non-stream 后 stream；使用相同 payload，按 tool index/id 重组 name/arguments 后与 C11 deep-equal；arguments JSON/schema valid；一个 `[DONE]`、一个 usage；只统计 delta 数量不计 PASS |
+| C12 | streamed tool delta | M1/M2 40：P_NO/P_THINK=`20/20`；M3 60：P_NO/P_THINK=`30/30`，其中 base/soft-think/soft-no-think=`40/10/10` | 每个 ordinal 与同 model/preset/ordinal 的 C11 auto-tool 配对，先 non-stream 后 stream；使用相同 payload，两个响应均 `finish_reason=tool_calls` 且不得伪造 content；按 tool index/id 重组 name/arguments 后与 C11 deep-equal；arguments JSON/schema valid；两侧 usage 各自结构和算术有效、prompt token 相等，completion/total token 可不同；一个 `[DONE]`、一个 usage；只统计 delta 数量不计 PASS |
 | C13 | tool result continuation | 同 C10 | tool role/template 正确；最终回答引用 tool result；无重复 call/history 污染 |
 | C14 | strict `json_schema` | 每模型 `P_NO_THINKING` 50：required/type/additionalProperties/enum=`13/13/12/12`；`P_THINKING` 20：四类各 `5` | non-thinking 50/50、thinking 20/20 valid；四类使用不同 schema、prompt 和预期值，不能用同一 payload 重复计数；reasoning 与最终 JSON 分离 |
 | C15 | `json_object` | 每模型 `P_NO_THINKING` 50、`P_THINKING` 20 | non-thinking 50/50、thinking 20/20 可解析对象；无 markdown fence 和前后垃圾；reasoning 不进入 JSON |
@@ -171,7 +183,8 @@ case 使用 `P_DETERMINISTIC`。M3 的 soft `/think`、`/no_think` 只改变 C19
 ### 7.3 Deterministic 与用户默认路径
 
 - legacy token equality、stream/non-stream equality 使用明确的 `temperature=0` diagnostic
-  设置；这是回归工具，不是 Qwen 官方推荐的 thinking sampling。
+  设置；这是回归工具，不是 Qwen 官方推荐的 thinking sampling。精确 equality 只适用于表中
+  明确要求相等的字段；`temperature=0` 本身不等价于跨 GPU 执行 batch invariance。
 - C21 使用官方推荐参数和固定 seed，验证真实用户默认路径。因为 sampling 和 backend 数值
   差异，不要求 legacy/vNext 逐 token 相等，但 correctness/termination/resource hard gate 不变。
 

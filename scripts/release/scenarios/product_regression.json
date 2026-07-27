@@ -19,7 +19,11 @@
       "type": "run_multiturn",
       "secret": "ferrum-blue",
       "expected_recall": "ferrum-blue",
-      "min_assistant_turns": 2
+      "min_assistant_turns": 2,
+      "prompts": [
+        "The code is ferrum-blue. Reply with only OK.",
+        "What was the code from my previous message? Reply with only that code."
+      ]
     },
     {
       "name": "run_first_token_ux",

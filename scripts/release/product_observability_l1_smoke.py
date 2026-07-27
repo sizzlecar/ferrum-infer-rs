@@ -1168,6 +1168,9 @@ def selftest_profile_event(
     replay: dict[str, Any] | None = None,
     attributes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if resource is not None:
+        event_kind = "resource"
+        duration_us = None
     event: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "ts_unix_nanos": 1783036800000000000,

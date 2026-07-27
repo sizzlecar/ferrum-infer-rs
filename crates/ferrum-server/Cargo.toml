@@ -25,10 +25,10 @@ serde = { workspace = true }
 # key order to render byte-identically to transformers (BTreeMap sorting
 # breaks golden parity).
 serde_json = { workspace = true, features = ["preserve_order"] }
+jsonschema = { workspace = true }
 sha2 = "0.10"
 minijinja = { version = "2.20", features = ["json", "preserve_order"] }
 minijinja-contrib = { version = "2.20", features = ["pycompat"] }
-regex-lite = "0.1"
 
 # Error handling
 anyhow = { workspace = true }

@@ -51,6 +51,25 @@ struct FerrumVllmMoeRuntimeEnv {
   int force_blocks_per_sm;
 };
 
+// Keep this bound in sync with MARLIN_BLOCKS_PER_SM_BOUND in the typed Rust
+// workspace estimator. A larger launch would address beyond c_tmp.
+static constexpr int FERRUM_VLLM_MOE_MAX_BLOCKS_PER_SM = 4;
+static constexpr int FERRUM_VLLM_MOE_STATUS_STAGE_SHIFT = 16;
+
+enum FerrumVllmMoeStatusStage {
+  FERRUM_VLLM_MOE_STAGE_SM_COUNT = 1,
+  FERRUM_VLLM_MOE_STAGE_MAX_SHARED_MEMORY = 2,
+  FERRUM_VLLM_MOE_STAGE_ACT_ORDER_LAUNCH = 3,
+  FERRUM_VLLM_MOE_STAGE_BLOCKS_PER_SM = 4,
+  FERRUM_VLLM_MOE_STAGE_FUNCTION_ATTRIBUTE = 5,
+  FERRUM_VLLM_MOE_STAGE_KERNEL_LAUNCH = 6,
+};
+
+static int ferrum_vllm_moe_status(int stage, cudaError_t status) {
+  return (stage << FERRUM_VLLM_MOE_STATUS_STAGE_SHIFT) |
+         (static_cast<int>(status) & 0xffff);
+}
+
 static const char* ferrum_env_value(const char* name) {
   return std::getenv(name);
 }
@@ -721,17 +740,17 @@ exec_config_t determine_exec_config(const vllm::ScalarType& q_type, int prob_m,
 }
 
 template <typename scalar_t>
-void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
-               void* s, void* s2, void* zp, void* g_idx, void* perm,
-               void* a_tmp, void* sorted_token_ids, void* expert_ids,
-               void* num_tokens_past_padded, void* topk_weights,
-               int moe_block_size, int top_k, bool mul_topk_weights, bool is_ep,
-               int prob_m, int prob_n, int prob_k, void* workspace,
-               vllm::ScalarType const& q_type, bool has_bias,
-               bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
-               int group_size, int dev, cudaStream_t stream, int thread_k,
-               int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+int marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+              void* s, void* s2, void* zp, void* g_idx, void* perm,
+              void* a_tmp, void* sorted_token_ids, void* expert_ids,
+              void* num_tokens_past_padded, void* topk_weights,
+              int moe_block_size, int top_k, bool mul_topk_weights, bool is_ep,
+              int prob_m, int prob_n, int prob_k, void* workspace,
+              vllm::ScalarType const& q_type, bool has_bias,
+              bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
+              int group_size, int dev, cudaStream_t stream, int thread_k,
+              int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+              bool use_fp32_reduce, bool is_zp_float) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
 
@@ -812,6 +831,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         A_ptr, perm_ptr, a_tmp_ptr, sorted_token_ids_ptr, expert_ids_ptr,
         num_tokens_past_padded_ptr, prob_m, prob_k, top_k);
     // clang-format on
+    cudaError_t launch_status = cudaPeekAtLastError();
+    if (launch_status != cudaSuccess) {
+      return ferrum_vllm_moe_status(
+          FERRUM_VLLM_MOE_STAGE_ACT_ORDER_LAUNCH, launch_status);
+    }
     A_ptr = a_tmp_ptr;
     prob_m = prob_m * top_k;
     top_k = 1;
@@ -823,9 +847,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   }
 
   int max_shared_mem = 0;
-  cudaDeviceGetAttribute(&max_shared_mem,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  TORCH_CHECK(max_shared_mem > 0);
+  cudaError_t attribute_status = cudaDeviceGetAttribute(
+      &max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (attribute_status != cudaSuccess || max_shared_mem <= 0) {
+    return ferrum_vllm_moe_status(
+        FERRUM_VLLM_MOE_STAGE_MAX_SHARED_MEMORY,
+        attribute_status != cudaSuccess ? attribute_status
+                                        : cudaErrorInvalidValue);
+  }
 
   // Set thread config
   exec_config_t exec_cfg;
@@ -847,6 +876,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         is_zp_float, max_shared_mem, sms);
     if (blocks_per_sm != -1) exec_cfg.blocks_per_sm = blocks_per_sm;
     thread_tfg = exec_cfg.tb_cfg;
+  }
+  if (exec_cfg.blocks_per_sm <= 0 ||
+      exec_cfg.blocks_per_sm > FERRUM_VLLM_MOE_MAX_BLOCKS_PER_SM) {
+    return ferrum_vllm_moe_status(FERRUM_VLLM_MOE_STAGE_BLOCKS_PER_SM,
+                                  cudaErrorInvalidConfiguration);
   }
 
   int num_threads = thread_tfg.num_threads;
@@ -912,8 +946,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                 ", num_bits = ", num_bits);
   }
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       max_shared_mem);
+  cudaError_t function_status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+  if (function_status != cudaSuccess) {
+    return ferrum_vllm_moe_status(
+        FERRUM_VLLM_MOE_STAGE_FUNCTION_ATTRIBUTE, function_status);
+  }
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
@@ -922,6 +960,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
   // clang-format on
+  cudaError_t launch_status = cudaPeekAtLastError();
+  if (launch_status != cudaSuccess) {
+    return ferrum_vllm_moe_status(FERRUM_VLLM_MOE_STAGE_KERNEL_LAUNCH,
+                                  launch_status);
+  }
+  return 0;
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME
@@ -971,9 +1015,15 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
   // torch wrapper detects sms via cudaDeviceGetAttribute first; replicate
   // that here since our extern C entry point bypasses the wrapper.
   int sms = -1;
-  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  cudaError_t sms_status =
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (sms_status != cudaSuccess || sms <= 0) {
+    return ferrum_vllm_moe_status(
+        FERRUM_VLLM_MOE_STAGE_SM_COUNT,
+        sms_status != cudaSuccess ? sms_status : cudaErrorInvalidDevice);
+  }
   const auto& ferrum_env = ferrum_vllm_moe_runtime_env();
-  MARLIN_NAMESPACE_NAME::marlin_mm<half>(
+  return MARLIN_NAMESPACE_NAME::marlin_mm<half>(
       A, B, C, C_tmp,
       /*b_bias=*/nullptr,
       /*s=*/(void*)b_scales,
@@ -999,9 +1049,6 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       ferrum_env.force_blocks_per_sm,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
-  // marlin_mm aborts on bad inputs; if we reach here the launch was issued.
-  // Caller is responsible for stream sync.
-  return 0;
 }
 
 #if 0

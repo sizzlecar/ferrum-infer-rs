@@ -91,6 +91,7 @@ stable_identity!(TransactionId, "transaction");
 stable_identity!(WeightId, "weight");
 stable_identity!(WeightFormatId, "weight format");
 stable_identity!(WeightLayoutId, "weight layout");
+stable_identity!(WeightMaterializerId, "weight materializer");
 
 /// A versioned contract uses major for breaking and minor for additive changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -212,20 +212,24 @@ pub fn load_gguf_decoder_with_info(
                 // Wire the GGUF mmap into the Metal weight loader so subsequent
                 // `B::load_quant_*` calls produce zero-copy MTLBuffers. CRITICAL
                 // on a 32 GB Mac for 30B-A3B Q4_K_M (saves ~17 GB resident).
-                ferrum_kernels::backend::metal::register_gguf_mmap(
+                let mmap_registration = ferrum_kernels::backend::metal::register_gguf_mmap(
                     gguf_arc.mmap_bytes(),
                     gguf_arc.clone(),
                 )
                 .map_err(|e| FerrumError::model(format!("register_gguf_mmap: {e}")))?;
                 let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc.clone());
-                if let Some(mc) = moe_cfg {
+                let model: Box<dyn DecoderOnlyLLM> = if let Some(mc) = moe_cfg {
                     let model = Qwen3MoeModel::<MetalBackend>::new(mc, &loader, &gguf_arc)?;
                     Box::new(model)
                 } else {
                     let dc = dense_cfg.unwrap();
                     let model = LlamaFamilyModel::<MetalBackend>::new(dc, &loader)?;
                     Box::new(model)
-                }
+                };
+                mmap_registration
+                    .commit_residency()
+                    .map_err(|e| FerrumError::model(format!("commit_gguf_mmap_residency: {e}")))?;
+                model
             }
             #[cfg(not(feature = "metal"))]
             {

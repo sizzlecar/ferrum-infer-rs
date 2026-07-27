@@ -4,16 +4,16 @@
   "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
   "catalog": {
     "path": "scripts/release/configs/runtime_vnext_historical_bugs.json",
-    "sha256": "8269a599e4eceaf6421c994b52266adb16f7c1a55c9be2bb0eccc15a3717798e"
+    "sha256": "00a10fabce214bcc232c8315bdb645df27b1d7087beaba57ab4889e482cb0aad"
   },
   "goal_documents": [
     {
       "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
-      "sha256": "6bbcd14dcf23020d2fca9e6c2c8fde364b30bd0e5af4abe76007845212033b95"
+      "sha256": "e51fd26b9620a61e828587df6a22f35e8528a1d707e6ba5e50c42cf941519d33"
     },
     {
       "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",
-      "sha256": "0e5b3cbd0b51c59cfa8b73ac9b454ec7cd64351d1beb5fabb9313d88da5c006c"
+      "sha256": "86e1aa790ce5d7ef4da1e5c34e44884f6590c23f7c1f51a909d86677a7c9f33d"
     }
   ],
   "expected_family_ids": [

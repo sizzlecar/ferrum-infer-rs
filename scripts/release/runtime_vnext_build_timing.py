@@ -21,14 +21,24 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 PASS_PREFIX = "RUNTIME VNEXT BUILD TIMING PASS"
+REPAIR_PASS_PREFIX = "RUNTIME VNEXT BUILD TIMING CORE PTX REPAIR PASS"
+CORE_PTX_INPUT = "crates/ferrum-kernels/kernels/add_bias.cu"
+REJECTED_CORE_PTX_INPUT = "crates/ferrum-kernels/triton_ptx/add_bias_f16.ptx"
+REJECTED_COLLECTOR_SHA256 = "2579e30d6c04dd8dbb502ac0dadd267f4edc0eb3e1fe574bba4fb0b42f53b13e"
 SCENARIOS = (
     ("noop", "none", None),
     ("rust-model-leaf", "content-mutation", "crates/ferrum-models/src/lib.rs"),
     ("rust-runtime-leaf", "content-mutation", "crates/ferrum-engine/src/lib.rs"),
-    ("core-ptx", "content-mutation", "crates/ferrum-kernels/triton_ptx/add_bias_f16.ptx"),
+    ("core-ptx", "content-mutation", CORE_PTX_INPUT),
     ("native-tu", "content-mutation", "crates/ferrum-kernels/vllm_marlin/gptq_marlin_repack.cu"),
     ("clean-release", "cargo-clean", None),
 )
+SCENARIO_PACKAGES = {
+    "rust-model-leaf": "ferrum-models",
+    "rust-runtime-leaf": "ferrum-engine",
+    "core-ptx": "ferrum-kernels",
+    "native-tu": "ferrum-kernels",
+}
 BUILD_ARGV = [
     "cargo",
     "build",
@@ -145,6 +155,45 @@ def native_build_summary(log: str, input_rel: str | None) -> dict[str, Any]:
     }
 
 
+def validate_scenario_signal(
+    name: str,
+    cargo_summary: dict[str, Any],
+    log: str,
+    input_rel: str | None,
+) -> dict[str, Any]:
+    nonfresh_count = cargo_summary.get("nonfresh_artifact_count")
+    require(isinstance(nonfresh_count, int), f"{name} Cargo summary lacks a non-fresh artifact count")
+    if name == "noop":
+        require(nonfresh_count == 0, "noop build unexpectedly compiled non-fresh artifacts")
+    else:
+        require(nonfresh_count > 0, f"{name} build did not invalidate any Cargo artifact")
+
+    expected_package = SCENARIO_PACKAGES.get(name)
+    if expected_package is not None:
+        packages = cargo_summary.get("nonfresh_packages")
+        require(isinstance(packages, list), f"{name} Cargo summary lacks non-fresh packages")
+        require(
+            any(expected_package in str(package) for package in packages),
+            f"{name} build did not invalidate {expected_package}",
+        )
+
+    native_summary = native_build_summary(log, input_rel)
+    if name == "core-ptx":
+        log_input = str(input_rel).removeprefix("crates/ferrum-kernels/")
+        require(
+            f"artifact=core-ptx:{log_input} status=built" in log,
+            f"core-ptx build log does not prove {log_input} was rebuilt",
+        )
+        require(native_summary["compiled_tu_count"] == 0, "core-ptx unexpectedly compiled a native CUDA TU")
+    elif name == "native-tu":
+        require(native_summary["compiled_tu_count"] > 0, "native-tu did not compile a native CUDA TU")
+        require(
+            any(path.endswith("vllm_marlin/gptq_marlin_repack.cu") for path in native_summary["compiled_tu_paths"]),
+            "native-tu did not compile the selected CUDA TU",
+        )
+    return native_summary
+
+
 def run_build(source_root: Path, stdout: Path, stderr: Path) -> tuple[subprocess.CompletedProcess[str], str, str, float]:
     started_at = now_iso()
     started = time.monotonic()
@@ -225,6 +274,137 @@ def setup_sample(
     }, (original, before.st_atime_ns, before.st_mtime_ns)
 
 
+def collect_scenario(
+    source_root: Path,
+    artifact_root: Path,
+    scenario_dir: Path,
+    name: str,
+    setup_kind: str,
+    input_rel: str | None,
+    repeats: int,
+    canonical_binary_sha256: str,
+) -> dict[str, Any]:
+    samples = []
+    for repeat in range(repeats):
+        sample_dir = scenario_dir / f"sample-{repeat + 1}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        setup, restore_state = setup_sample(
+            source_root,
+            artifact_root,
+            sample_dir,
+            setup_kind,
+            input_rel,
+            f"{name}-{repeat + 1}",
+        )
+        stdout = sample_dir / "cargo-messages.jsonl"
+        stderr = sample_dir / "cargo.log"
+        try:
+            result, sample_started, sample_finished, sample_duration = run_build(source_root, stdout, stderr)
+        finally:
+            if input_rel is not None and restore_state is not None:
+                original, atime_ns, mtime_ns = restore_state
+                (source_root / input_rel).write_bytes(original)
+                os.utime(source_root / input_rel, ns=(atime_ns, mtime_ns))
+        require(result.returncode == 0, f"{name} sample {repeat + 1} failed: {result.stderr[-4000:]}")
+        cargo_summary = parse_cargo_messages(stdout)
+        native_summary = validate_scenario_signal(name, cargo_summary, result.stderr, input_rel)
+        timings_source = source_root / "target" / "cargo-timings" / "cargo-timing.html"
+        require(timings_source.is_file(), f"{name} sample {repeat + 1} did not produce Cargo timings")
+        timings_copy = sample_dir / "cargo-timing.html"
+        shutil.copy2(timings_source, timings_copy)
+        binary = source_root / "target" / "release" / "ferrum"
+        require(binary.is_file(), f"{name} sample {repeat + 1} did not produce ferrum")
+        copied_binary = sample_dir / "ferrum"
+        shutil.copy2(binary, copied_binary)
+        if setup_kind == "content-mutation":
+            path = source_root / str(input_rel)
+            setup["after_sha256"] = sha256(path)
+            setup["after_mtime_ns"] = path.stat().st_mtime_ns
+        post_status = git_value(source_root, "status", "--short").splitlines()
+        require(not post_status, f"{name} sample {repeat + 1} left a dirty worktree: {post_status}")
+        samples.append(
+            {
+                "sample_id": f"{name}-{repeat + 1}",
+                "argv": BUILD_ARGV,
+                "setup": setup,
+                "returncode": result.returncode,
+                "started_at": sample_started,
+                "finished_at": sample_finished,
+                "duration_sec": sample_duration,
+                "cargo_messages": artifact_ref(stdout, artifact_root),
+                "log": artifact_ref(stderr, artifact_root),
+                "cargo_summary": cargo_summary,
+                "cargo_timings": artifact_ref(timings_copy, artifact_root),
+                "native_build": native_summary,
+                "output_binary": artifact_ref(copied_binary, artifact_root),
+                "post_git_status": post_status,
+            }
+        )
+    restore_verification: dict[str, Any] | None = None
+    if setup_kind == "content-mutation":
+        restored_input = source_root / str(input_rel)
+        restored_stat = restored_input.stat()
+        restored_sha256 = sha256(restored_input)
+        expected_restored_sha256 = str(samples[-1]["setup"]["before_sha256"])
+        require(restored_sha256 == expected_restored_sha256, f"{name} input content was not restored")
+        verification_mtime_ns = max(time.time_ns(), restored_stat.st_mtime_ns + 1)
+        os.utime(restored_input, ns=(restored_stat.st_atime_ns, verification_mtime_ns))
+        verify_dir = scenario_dir / "restore-verification"
+        verify_dir.mkdir(parents=True, exist_ok=True)
+        verify_stdout = verify_dir / "cargo-messages.jsonl"
+        verify_stderr = verify_dir / "cargo.log"
+        try:
+            verify_result, verify_started, verify_finished, verify_duration = run_build(
+                source_root, verify_stdout, verify_stderr
+            )
+        finally:
+            os.utime(restored_input, ns=(restored_stat.st_atime_ns, restored_stat.st_mtime_ns))
+        require(verify_result.returncode == 0, f"{name} restore verification failed: {verify_result.stderr[-4000:]}")
+        verify_cargo_summary = parse_cargo_messages(verify_stdout)
+        validate_scenario_signal(name, verify_cargo_summary, verify_result.stderr, input_rel)
+        verify_timings_source = source_root / "target" / "cargo-timings" / "cargo-timing.html"
+        verify_timings = verify_dir / "cargo-timing.html"
+        shutil.copy2(verify_timings_source, verify_timings)
+        verify_binary = verify_dir / "ferrum"
+        shutil.copy2(source_root / "target" / "release" / "ferrum", verify_binary)
+        require(
+            sha256(verify_binary) == canonical_binary_sha256,
+            f"{name} restore build did not reproduce the canonical binary",
+        )
+        restore_verification = {
+            "argv": BUILD_ARGV,
+            "returncode": 0,
+            "started_at": verify_started,
+            "finished_at": verify_finished,
+            "duration_sec": verify_duration,
+            "cargo_messages": artifact_ref(verify_stdout, artifact_root),
+            "log": artifact_ref(verify_stderr, artifact_root),
+            "cargo_summary": verify_cargo_summary,
+            "cargo_timings": artifact_ref(verify_timings, artifact_root),
+            "output_binary": artifact_ref(verify_binary, artifact_root),
+            "restored_input": {
+                "input_path": input_rel,
+                "sha256": restored_sha256,
+                "before_verification_mtime_ns": restored_stat.st_mtime_ns,
+                "verification_mtime_ns": verification_mtime_ns,
+                "after_verification_mtime_ns": restored_input.stat().st_mtime_ns,
+            },
+            "post_git_status": git_value(source_root, "status", "--short").splitlines(),
+        }
+        require(not restore_verification["post_git_status"], f"{name} restore verification left a dirty worktree")
+    durations = sorted(float(row["duration_sec"]) for row in samples)
+    scenario_row: dict[str, Any] = {
+        "name": name,
+        "command": BUILD_ARGV,
+        "samples": samples,
+        "p50_sec": durations[2],
+        "p95_sec": durations[4],
+    }
+    if restore_verification is not None:
+        scenario_row["restore_verification"] = restore_verification
+    return scenario_row
+
+
 def collect(source_root: Path, out: Path, hardware_id: str, hardware_fingerprint: str, repeats: int) -> dict[str, Any]:
     require(repeats == 5, "canonical G00 build timing requires exactly five samples")
     require(len(hardware_fingerprint) == 64, "hardware fingerprint must be SHA256")
@@ -262,119 +442,18 @@ def collect(source_root: Path, out: Path, hardware_id: str, hardware_fingerprint
 
     scenario_rows = []
     for name, setup_kind, input_rel in SCENARIOS:
-        samples = []
-        for repeat in range(repeats):
-            sample_dir = out / name / f"sample-{repeat + 1}"
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            setup, restore_state = setup_sample(
+        scenario_rows.append(
+            collect_scenario(
                 source_root,
                 artifact_root,
-                sample_dir,
+                out / name,
+                name,
                 setup_kind,
                 input_rel,
-                f"{name}-{repeat + 1}",
+                repeats,
+                canonical_binary_sha256,
             )
-            stdout = sample_dir / "cargo-messages.jsonl"
-            stderr = sample_dir / "cargo.log"
-            try:
-                result, sample_started, sample_finished, sample_duration = run_build(source_root, stdout, stderr)
-            finally:
-                if input_rel is not None and restore_state is not None:
-                    original, atime_ns, mtime_ns = restore_state
-                    (source_root / input_rel).write_bytes(original)
-                    os.utime(source_root / input_rel, ns=(atime_ns, mtime_ns))
-            require(result.returncode == 0, f"{name} sample {repeat + 1} failed: {result.stderr[-4000:]}")
-            cargo_summary = parse_cargo_messages(stdout)
-            timings_source = source_root / "target" / "cargo-timings" / "cargo-timing.html"
-            require(timings_source.is_file(), f"{name} sample {repeat + 1} did not produce Cargo timings")
-            timings_copy = sample_dir / "cargo-timing.html"
-            shutil.copy2(timings_source, timings_copy)
-            binary = source_root / "target" / "release" / "ferrum"
-            require(binary.is_file(), f"{name} sample {repeat + 1} did not produce ferrum")
-            copied_binary = sample_dir / "ferrum"
-            shutil.copy2(binary, copied_binary)
-            if setup_kind == "content-mutation":
-                path = source_root / str(input_rel)
-                setup["after_sha256"] = sha256(path)
-                setup["after_mtime_ns"] = path.stat().st_mtime_ns
-            post_status = git_value(source_root, "status", "--short").splitlines()
-            require(not post_status, f"{name} sample {repeat + 1} left a dirty worktree: {post_status}")
-            samples.append(
-                {
-                    "sample_id": f"{name}-{repeat + 1}",
-                    "argv": BUILD_ARGV,
-                    "setup": setup,
-                    "returncode": result.returncode,
-                    "started_at": sample_started,
-                    "finished_at": sample_finished,
-                    "duration_sec": sample_duration,
-                    "cargo_messages": artifact_ref(stdout, artifact_root),
-                    "log": artifact_ref(stderr, artifact_root),
-                    "cargo_summary": cargo_summary,
-                    "cargo_timings": artifact_ref(timings_copy, artifact_root),
-                    "native_build": native_build_summary(result.stderr, input_rel),
-                    "output_binary": artifact_ref(copied_binary, artifact_root),
-                    "post_git_status": post_status,
-                }
-            )
-        restore_verification: dict[str, Any] | None = None
-        if setup_kind == "content-mutation":
-            restored_input = source_root / str(input_rel)
-            restored_stat = restored_input.stat()
-            restored_sha256 = sha256(restored_input)
-            expected_restored_sha256 = str(samples[-1]["setup"]["before_sha256"])
-            require(restored_sha256 == expected_restored_sha256, f"{name} input content was not restored")
-            verification_mtime_ns = max(time.time_ns(), restored_stat.st_mtime_ns + 1)
-            os.utime(restored_input, ns=(restored_stat.st_atime_ns, verification_mtime_ns))
-            verify_dir = out / name / "restore-verification"
-            verify_dir.mkdir(parents=True, exist_ok=True)
-            verify_stdout = verify_dir / "cargo-messages.jsonl"
-            verify_stderr = verify_dir / "cargo.log"
-            try:
-                verify_result, verify_started, verify_finished, verify_duration = run_build(
-                    source_root, verify_stdout, verify_stderr
-                )
-            finally:
-                os.utime(restored_input, ns=(restored_stat.st_atime_ns, restored_stat.st_mtime_ns))
-            require(verify_result.returncode == 0, f"{name} restore verification failed: {verify_result.stderr[-4000:]}")
-            verify_timings_source = source_root / "target" / "cargo-timings" / "cargo-timing.html"
-            verify_timings = verify_dir / "cargo-timing.html"
-            shutil.copy2(verify_timings_source, verify_timings)
-            verify_binary = verify_dir / "ferrum"
-            shutil.copy2(source_root / "target" / "release" / "ferrum", verify_binary)
-            require(sha256(verify_binary) == canonical_binary_sha256, f"{name} restore build did not reproduce the canonical binary")
-            restore_verification = {
-                "argv": BUILD_ARGV,
-                "returncode": 0,
-                "started_at": verify_started,
-                "finished_at": verify_finished,
-                "duration_sec": verify_duration,
-                "cargo_messages": artifact_ref(verify_stdout, artifact_root),
-                "log": artifact_ref(verify_stderr, artifact_root),
-                "cargo_summary": parse_cargo_messages(verify_stdout),
-                "cargo_timings": artifact_ref(verify_timings, artifact_root),
-                "output_binary": artifact_ref(verify_binary, artifact_root),
-                "restored_input": {
-                    "input_path": input_rel,
-                    "sha256": restored_sha256,
-                    "before_verification_mtime_ns": restored_stat.st_mtime_ns,
-                    "verification_mtime_ns": verification_mtime_ns,
-                    "after_verification_mtime_ns": restored_input.stat().st_mtime_ns,
-                },
-                "post_git_status": git_value(source_root, "status", "--short").splitlines(),
-            }
-            require(not restore_verification["post_git_status"], f"{name} restore verification left a dirty worktree")
-        durations = sorted(float(row["duration_sec"]) for row in samples)
-        scenario_row: dict[str, Any] = {
-            "name": name,
-            "command": BUILD_ARGV,
-            "samples": samples,
-            "p50_sec": durations[2],
-            "p95_sec": durations[4],
-        }
-        if restore_verification is not None:
-            scenario_row["restore_verification"] = restore_verification
-        scenario_rows.append(scenario_row)
+        )
     return {
         "schema_version": 1,
         "source_git_sha": git_value(source_root, "rev-parse", "HEAD"),
@@ -391,6 +470,139 @@ def collect(source_root: Path, out: Path, hardware_id: str, hardware_fingerprint
     }
 
 
+def read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BuildTimingError(f"cannot read JSON object {path}: {exc}") from exc
+    require(isinstance(value, dict), f"{path} must contain one JSON object")
+    return value
+
+
+def validate_rejected_core_ptx_base(
+    source_root: Path,
+    base_out: Path,
+    hardware_id: str,
+    hardware_fingerprint: str,
+) -> tuple[dict[str, Any], str]:
+    require(base_out.name == "build-timings", "core PTX repair base must be the canonical build-timings directory")
+    summary_path = base_out / "summary.json"
+    require(summary_path.is_file() and not summary_path.is_symlink(), "core PTX repair base summary is missing")
+    summary = read_json_object(summary_path)
+    require(summary.get("schema_version") == 1, "core PTX repair base schema mismatch")
+    require(summary.get("source_git_sha") == git_value(source_root, "rev-parse", "HEAD"), "core PTX repair source SHA mismatch")
+    require(
+        summary.get("source_tree_sha") == git_value(source_root, "rev-parse", "HEAD^{tree}"),
+        "core PTX repair source tree mismatch",
+    )
+    require(summary.get("dirty_status") == {"is_dirty": False, "status_short": []}, "core PTX repair base is dirty")
+    collector = summary.get("collector")
+    require(isinstance(collector, dict), "core PTX repair base collector is missing")
+    require(collector.get("path") == Path(__file__).resolve().relative_to(ROOT).as_posix(), "core PTX repair base collector path mismatch")
+    require(collector.get("sha256") == REJECTED_COLLECTOR_SHA256, "core PTX repair base is not the reviewed rejected collector")
+    require(summary.get("hardware_id") == hardware_id, "core PTX repair hardware id mismatch")
+    require(summary.get("hardware_fingerprint") == hardware_fingerprint, "core PTX repair hardware fingerprint mismatch")
+    rows = summary.get("scenarios")
+    require(isinstance(rows, list) and len(rows) == len(SCENARIOS), "core PTX repair base scenario matrix mismatch")
+    indexed = {row.get("name"): row for row in rows if isinstance(row, dict)}
+    require(set(indexed) == {row[0] for row in SCENARIOS}, "core PTX repair base scenario names mismatch")
+    rejected = indexed["core-ptx"]
+    samples = rejected.get("samples")
+    require(isinstance(samples, list) and len(samples) == 5, "rejected core PTX base must have five samples")
+    for index, sample in enumerate(samples):
+        require(isinstance(sample, dict), f"rejected core PTX sample {index} is malformed")
+        setup = sample.get("setup")
+        cargo_summary = sample.get("cargo_summary")
+        require(isinstance(setup, dict) and setup.get("input_path") == REJECTED_CORE_PTX_INPUT, f"rejected core PTX sample {index} input mismatch")
+        require(
+            isinstance(cargo_summary, dict)
+            and cargo_summary.get("nonfresh_artifact_count") == 0
+            and cargo_summary.get("fresh_artifact_count") == cargo_summary.get("compiler_artifact_count"),
+            f"rejected core PTX sample {index} does not reproduce the all-Fresh failure",
+        )
+    restore = rejected.get("restore_verification")
+    require(isinstance(restore, dict), "rejected core PTX base lacks restore verification")
+    restored_input = restore.get("restored_input")
+    restore_summary = restore.get("cargo_summary")
+    require(
+        isinstance(restored_input, dict) and restored_input.get("input_path") == REJECTED_CORE_PTX_INPUT,
+        "rejected core PTX restore input mismatch",
+    )
+    require(
+        isinstance(restore_summary, dict) and restore_summary.get("nonfresh_artifact_count") == 0,
+        "rejected core PTX restore does not reproduce the all-Fresh failure",
+    )
+    canonical_shas = {
+        sample.get("output_binary", {}).get("sha256")
+        for name in ("noop", "clean-release")
+        for sample in indexed[name].get("samples", [])
+        if isinstance(sample, dict) and isinstance(sample.get("output_binary"), dict)
+    }
+    require(len(canonical_shas) == 1, "core PTX repair base canonical binary identity is inconsistent")
+    canonical_sha = next(iter(canonical_shas))
+    require(isinstance(canonical_sha, str) and len(canonical_sha) == 64, "core PTX repair base binary SHA256 is invalid")
+    return summary, canonical_sha
+
+
+def collect_core_ptx_repair(
+    source_root: Path,
+    out: Path,
+    base_out: Path,
+    hardware_id: str,
+    hardware_fingerprint: str,
+    repeats: int,
+) -> dict[str, Any]:
+    require(repeats == 5, "canonical G00 core PTX repair requires exactly five samples")
+    require(len(hardware_fingerprint) == 64, "hardware fingerprint must be SHA256")
+    status = git_value(source_root, "status", "--short").splitlines()
+    require(not status, f"source root must be clean before core PTX repair: {status}")
+    base_out = base_out.resolve()
+    artifact_root = base_out.parent
+    expected_out = artifact_root / "build-timing-repairs" / "core-ptx"
+    require(out.resolve() == expected_out.resolve(), f"core PTX repair output must be {expected_out}")
+    require(not out.exists(), f"core PTX repair output already exists: {out}")
+    _base_summary, canonical_binary_sha256 = validate_rejected_core_ptx_base(
+        source_root,
+        base_out,
+        hardware_id,
+        hardware_fingerprint,
+    )
+    binary = source_root / "target" / "release" / "ferrum"
+    require(binary.is_file(), "core PTX repair requires the warmed canonical ferrum binary")
+    require(sha256(binary) == canonical_binary_sha256, "warmed ferrum binary differs from the rejected base")
+    out.mkdir(parents=True)
+    scenario = collect_scenario(
+        source_root,
+        artifact_root,
+        out / "samples",
+        "core-ptx",
+        "content-mutation",
+        CORE_PTX_INPUT,
+        repeats,
+        canonical_binary_sha256,
+    )
+    return {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_build_timing_core_ptx_repair",
+        "source_git_sha": git_value(source_root, "rev-parse", "HEAD"),
+        "source_tree_sha": git_value(source_root, "rev-parse", "HEAD^{tree}"),
+        "dirty_status": {"is_dirty": False, "status_short": []},
+        "collector": {
+            "path": Path(__file__).resolve().relative_to(ROOT).as_posix(),
+            "sha256": sha256(Path(__file__).resolve()),
+        },
+        "hardware_id": hardware_id,
+        "hardware_fingerprint": hardware_fingerprint,
+        "base_summary": artifact_ref(base_out / "summary.json", artifact_root),
+        "base_failure": "build-timings.core-ptx.samples[0] touch did not invalidate any Cargo artifact",
+        "rejected_collector_sha256": REJECTED_COLLECTOR_SHA256,
+        "rejected_input": REJECTED_CORE_PTX_INPUT,
+        "replacement_input": CORE_PTX_INPUT,
+        "canonical_binary_sha256": canonical_binary_sha256,
+        "scenario": scenario,
+    }
+
+
 def self_test() -> None:
     with Path(__file__).open("rb") as handle:
         require(len(handle.read(32)) == 32, "collector file cannot be read")
@@ -398,6 +610,8 @@ def self_test() -> None:
     require(fixture.is_file(), "model catalog is missing")
     require(len(SCENARIOS) == 6 and len({row[0] for row in SCENARIOS}) == 6, "scenario matrix mismatch")
     require(BUILD_ARGV[0:2] == ["cargo", "build"] and "--release" in BUILD_ARGV, "build argv mismatch")
+    build_script = ROOT / "crates/ferrum-kernels/build.rs"
+    require(f'"{CORE_PTX_INPUT.removeprefix("crates/ferrum-kernels/")}"' in build_script.read_text(encoding="utf-8"), "core PTX timing input is not registered by ferrum-kernels/build.rs")
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-build-timing-") as raw_tmp:
         root = Path(raw_tmp)
         messages = root / "cargo-messages.jsonl"
@@ -407,7 +621,7 @@ def self_test() -> None:
                     json.dumps(
                         {
                             "reason": "compiler-artifact",
-                            "package_id": "fixture 0.1.0",
+                            "package_id": "ferrum-kernels 0.1.0",
                             "target": {"kind": ["lib"]},
                             "fresh": False,
                         }
@@ -422,6 +636,17 @@ def self_test() -> None:
         summary = parse_cargo_messages(messages)
         require(summary["message_count"] == 2, "mixed Cargo JSON message count mismatch")
         require(summary["verbose_build_script_line_count"] == 1, "verbose Cargo line count mismatch")
+        core_log = f"[ferrum-kernels] [cuda-build-summary] artifact=core-ptx:{CORE_PTX_INPUT.removeprefix('crates/ferrum-kernels/')} status=built reason=signature-changed\n"
+        signal = validate_scenario_signal("core-ptx", summary, core_log, CORE_PTX_INPUT)
+        require(signal["compiled_tu_count"] == 0, "core PTX signal self-test compiled a native TU")
+        fresh_summary = dict(summary)
+        fresh_summary.update({"nonfresh_artifact_count": 0, "nonfresh_packages": []})
+        try:
+            validate_scenario_signal("core-ptx", fresh_summary, core_log, CORE_PTX_INPUT)
+        except BuildTimingError as exc:
+            require("did not invalidate any Cargo artifact" in str(exc), "unexpected fresh core PTX rejection")
+        else:
+            raise BuildTimingError("fresh core PTX sample unexpectedly passed")
         messages.write_text("not cargo JSON\n", encoding="utf-8")
         try:
             parse_cargo_messages(messages)
@@ -439,6 +664,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--hardware-id")
     parser.add_argument("--hardware-fingerprint")
+    parser.add_argument("--repair-core-ptx-from", type=Path)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -448,14 +674,27 @@ def main() -> int:
     if not all((args.out, args.hardware_id, args.hardware_fingerprint)):
         parser.error("--out, --hardware-id and --hardware-fingerprint are required")
     try:
-        summary = collect(
-            args.source_root.resolve(), args.out.resolve(), args.hardware_id, args.hardware_fingerprint, args.repeats
-        )
+        if args.repair_core_ptx_from is None:
+            summary = collect(
+                args.source_root.resolve(), args.out.resolve(), args.hardware_id, args.hardware_fingerprint, args.repeats
+            )
+        else:
+            summary = collect_core_ptx_repair(
+                args.source_root.resolve(),
+                args.out.resolve(),
+                args.repair_core_ptx_from.resolve(),
+                args.hardware_id,
+                args.hardware_fingerprint,
+                args.repeats,
+            )
         write_json(args.out / "summary.json", summary)
     except (BuildTimingError, OSError, ValueError) as exc:
         print(f"RUNTIME VNEXT BUILD TIMING FAIL: {exc}", file=sys.stderr)
         return 1
-    print(f"{PASS_PREFIX}: {args.out}")
+    if args.repair_core_ptx_from is not None:
+        print(f"{REPAIR_PASS_PREFIX}: {args.out}")
+    else:
+        print(f"{PASS_PREFIX}: {args.out}")
     return 0
 
 

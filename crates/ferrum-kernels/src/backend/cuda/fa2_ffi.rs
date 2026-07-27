@@ -168,7 +168,7 @@ pub(super) unsafe fn call_paged_varlen_fn(
     let (seq_ptr, _sg) = seq_lens.device_ptr(stream);
     let (bt_ptr, _bg) = block_tables.device_ptr(stream);
     let raw_stream = stream.cu_stream() as *mut c_void;
-    let mut err_buf = vec![0i8; 512];
+    let mut err_buf = vec![0 as c_char; 512];
     let ret = paged_varlen(
         q_ptr as *const c_void,
         k_ptr as *const c_void,

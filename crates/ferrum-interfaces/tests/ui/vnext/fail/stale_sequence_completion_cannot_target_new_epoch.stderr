@@ -5,12 +5,12 @@ error[E0061]: this method takes 0 arguments but 1 argument was supplied
   |                    ^^^^^^^^ ----- unexpected argument of type `ActiveSequenceCompletionReceipt`
   |
 note: method defined here
- --> src/vnext/resource.rs
+ --> src/vnext/resource/invocation.rs
   |
   |     pub fn complete(mut self) -> Result<ActiveSequenceCompletionReceipt, VNextError> {
   |            ^^^^^^^^
 help: remove the extra argument
-      |
+  |
 8 -     let _ = second.complete(stale);
 8 +     let _ = second.complete();
   |

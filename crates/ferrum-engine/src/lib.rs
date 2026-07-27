@@ -53,6 +53,7 @@ pub(crate) mod layer_split;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
+mod product_composition;
 pub mod recurrent_state;
 pub mod registry;
 pub(crate) mod resource_lifecycle;
@@ -60,6 +61,8 @@ pub mod speculative;
 pub mod tensor_factory;
 pub mod transcription_engine;
 pub mod tts_engine;
+#[cfg(feature = "cuda")]
+pub mod vnext_determinism;
 
 // Re-exports of interfaces
 pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
@@ -89,7 +92,9 @@ pub use recurrent_state::{
 };
 
 // Re-exports of builder
-pub use builder::{create_engine, EngineBuilder};
+pub use builder::{
+    create_engine, create_prepared_product_engine, create_product_engine, EngineBuilder,
+};
 
 // Re-exports of registry
 pub use registry::{

@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GOAL = "release-regression-hardening-2026-06-28"
 DEFAULT_RULES = REPO_ROOT / "scripts/release/change_impact_rules.json"
 DEFAULT_FIXTURES = REPO_ROOT / "scripts/release/fixtures/change_impact/planner_fixtures.json"
+PRODUCT_SCENARIOS = REPO_ROOT / "scripts/release/scenarios/product_regression.json"
 PASS_LINE = "CHANGE IMPACT GATE PLAN PASS"
 SELFTEST_PASS_LINE = "CHANGE IMPACT GATE PLAN SELFTEST PASS"
 FINAL_STAGE_GATES = {
@@ -132,6 +133,14 @@ def load_rules(path: Path) -> list[dict[str, Any]]:
         "owner",
         "reason",
     }
+    scenario_manifest = json.loads(PRODUCT_SCENARIOS.read_text(encoding="utf-8"))
+    available_scenarios = {
+        str(scenario.get("name"))
+        for scenario in scenario_manifest.get("scenarios", [])
+        if isinstance(scenario, dict) and scenario.get("name")
+    }
+    if not available_scenarios:
+        raise PlannerError(f"{PRODUCT_SCENARIOS}: scenarios must be a non-empty list")
     for idx, rule in enumerate(rules):
         if not isinstance(rule, dict):
             raise PlannerError(f"{path}: rules[{idx}] must be an object")
@@ -141,6 +150,19 @@ def load_rules(path: Path) -> list[dict[str, Any]]:
         for key in ("path_globs", "domains", "required_gates", "release_invalidation"):
             if not isinstance(rule[key], list):
                 raise PlannerError(f"{path}: rules[{idx}].{key} must be a list")
+        required_scenarios = rule.get("required_scenarios", [])
+        if not isinstance(required_scenarios, list):
+            raise PlannerError(f"{path}: rules[{idx}].required_scenarios must be a list")
+        if not all(isinstance(item, str) and item for item in required_scenarios):
+            raise PlannerError(
+                f"{path}: rules[{idx}].required_scenarios must contain non-empty strings"
+            )
+        unknown_scenarios = sorted(set(required_scenarios) - available_scenarios)
+        if unknown_scenarios:
+            raise PlannerError(
+                f"{path}: rules[{idx}].required_scenarios are absent from "
+                f"{PRODUCT_SCENARIOS}: {unknown_scenarios}"
+            )
         if not isinstance(rule["exceptions"], list):
             raise PlannerError(f"{path}: rules[{idx}].exceptions must be a list")
     return rules
@@ -275,6 +297,7 @@ def plan_from_files(
     changed_files = normalize_changed_files(changed_files)
     impact_domains: set[str] = set()
     required_gates: set[str] = set()
+    required_product_scenarios: set[str] = set()
     invalidated: set[str] = set()
     optional_diagnostic_gates: set[str] = set()
     unknown_files: list[str] = []
@@ -288,7 +311,11 @@ def plan_from_files(
             matched = True
             impact_domains.update(str(domain) for domain in rule["domains"])
             before_gates = set(required_gates)
+            before_scenarios = set(required_product_scenarios)
             required_gates.update(str(gate) for gate in rule["required_gates"])
+            required_product_scenarios.update(
+                str(scenario) for scenario in rule.get("required_scenarios", [])
+            )
             invalidated.update(str(gate) for gate in rule["release_invalidation"])
             apply_exceptions(changed, rule, required_gates, decision_log)
             decision_log.append(
@@ -297,6 +324,9 @@ def plan_from_files(
                     "rule_id": rule["id"],
                     "domains": rule["domains"],
                     "required_gates_added": sorted(required_gates - before_gates),
+                    "required_product_scenarios_added": sorted(
+                        required_product_scenarios - before_scenarios
+                    ),
                     "release_invalidation": rule["release_invalidation"],
                     "owner": rule["owner"],
                     "reason": rule["reason"],
@@ -336,6 +366,7 @@ def plan_from_files(
         "changed_files": changed_files,
         "impact_domains": sorted(impact_domains),
         "required_gates": sorted(required_gates),
+        "required_product_scenarios": sorted(required_product_scenarios),
         "optional_diagnostic_gates": sorted(optional_diagnostic_gates),
         "invalidated_previous_gates": sorted(invalidated),
         "unknown_files": unknown_files,
@@ -356,6 +387,8 @@ def markdown_plan(plan: dict[str, Any]) -> str:
         f"- dirty: `{plan['dirty']}`",
         f"- impact domains: {', '.join(plan['impact_domains']) or '(none)'}",
         f"- required gates: {', '.join(plan['required_gates']) or '(none)'}",
+        "- required product scenarios: "
+        f"{', '.join(plan['required_product_scenarios']) or '(none)'}",
         f"- invalidated gates: {', '.join(plan['invalidated_previous_gates']) or '(none)'}",
         "",
         "## Changed Files",
@@ -387,6 +420,7 @@ def release_candidate_manifest(plan: dict[str, Any]) -> dict[str, Any]:
         "changed_files": plan["changed_files"],
         "impact_domains": plan["impact_domains"],
         "required_gates": plan["required_gates"],
+        "required_product_scenarios": plan["required_product_scenarios"],
         "satisfied_gates": [
             artifact.get("gate") for artifact in plan["satisfied_artifacts"] if artifact.get("gate")
         ],
@@ -463,6 +497,7 @@ def write_standard_artifact_files(
         "inputs": {
             "rules": str(rules),
             "fixtures": str(fixtures),
+            "product_scenarios": str(PRODUCT_SCENARIOS),
             "base_sha": plan["base_sha"],
             "head_sha": plan["head_sha"],
             "changed_files": plan["changed_files"],
@@ -478,6 +513,7 @@ def write_standard_artifact_files(
         "validation_summary": {
             "impact_domains": plan["impact_domains"],
             "required_gates": plan["required_gates"],
+            "required_product_scenarios": plan["required_product_scenarios"],
             "unknown_file_count": len(plan["unknown_files"]),
             "stale_artifact_count": len(plan["stale_artifacts"]),
             "satisfied_artifact_count": len(plan["satisfied_artifacts"]),
@@ -538,6 +574,11 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
         fixture_failures += assert_contains(
             "required_gates", plan["required_gates"], list(fixture.get("expect_required_gates") or [])
         )
+        fixture_failures += assert_contains(
+            "required_product_scenarios",
+            plan["required_product_scenarios"],
+            list(fixture.get("expect_required_scenarios") or []),
+        )
         fixture_failures += assert_not_contains(
             "required_gates", plan["required_gates"], list(fixture.get("forbid_required_gates") or [])
         )
@@ -574,6 +615,7 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
                 "plan_status": plan["status"],
                 "impact_domains": plan["impact_domains"],
                 "required_gates": plan["required_gates"],
+                "required_product_scenarios": plan["required_product_scenarios"],
                 "unknown_files": plan["unknown_files"],
                 "invalidated_previous_gates": plan["invalidated_previous_gates"],
                 "failures": fixture_failures,

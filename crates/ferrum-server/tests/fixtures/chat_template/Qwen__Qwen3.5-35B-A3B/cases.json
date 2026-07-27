@@ -51,6 +51,38 @@
       }
     ]
   },
+  "tool_result_history": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Use the calculator."
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "calculator",
+              "arguments": {
+                "expression": "7*3"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "21"
+      }
+    ],
+    "render_kwargs": {
+      "enable_thinking": true
+    }
+  },
   "tools": {
     "messages": [
       {

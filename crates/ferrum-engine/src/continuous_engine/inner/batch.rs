@@ -7,6 +7,12 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
+        if self.model_executor.execution_resource_authority()
+            == ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
+        {
+            return self.process_batch_plan_runtime(batch).await;
+        }
+
         // Single-shot unified path: prefill + decode items go through ONE
         // `model_executor.unified_decode` call. Phase-2/3 redesign goal —
         // prefill chunks and decode tokens are co-batched at the kernel
@@ -33,35 +39,159 @@ impl EngineInner {
         self.process_batch_unified(batch).await
     }
 
+    fn classify_published_batch_sequences(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<(Vec<RequestId>, Vec<RequestId>)> {
+        let sequences = self.sequences.read();
+        let mut prefill_ids = Vec::new();
+        let mut decode_ids = Vec::new();
+        for scheduled_request in &batch.requests {
+            let request_id = &scheduled_request.request.id;
+            let sequence = sequences.get(request_id).ok_or_else(|| {
+                FerrumError::internal(format!(
+                    "scheduler batch {:?} references request {} without atomically published sequence state",
+                    batch.batch_id, request_id
+                ))
+            })?;
+            if sequence.prefill_complete {
+                decode_ids.push(request_id.clone());
+            } else {
+                prefill_ids.push(request_id.clone());
+            }
+        }
+        Ok((prefill_ids, decode_ids))
+    }
+
+    #[cfg(test)]
+    fn publish_missing_test_sequences(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
+        let missing_requests = {
+            let sequences = self.sequences.read();
+            batch
+                .requests
+                .iter()
+                .filter(|scheduled| !sequences.contains_key(&scheduled.request.id))
+                .map(|scheduled| scheduled.request.clone())
+                .collect::<Vec<_>>()
+        };
+        for request in missing_requests {
+            let input_tokens = self.tokenizer.encode(&request.prompt, true)?;
+            let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+                request.clone(),
+                input_tokens,
+                Some(self.tokenizer.clone()),
+                Some(self.model_executor.info().vocab_size),
+            );
+            self.sequences.write().entry(request.id).or_insert(sequence);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::continuous_engine) async fn process_batch_with_test_sequences(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
+        self.publish_missing_test_sequences(batch)?;
+        self.process_batch(batch).await
+    }
+
+    #[cfg(test)]
+    pub(in crate::continuous_engine) async fn process_batch_legacy_split_with_test_sequences(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
+        self.publish_missing_test_sequences(batch)?;
+        self.process_batch_legacy_split(batch).await
+    }
+
+    /// Product path for runtimes that own request/sequence/session resources.
+    /// Fresh prefill enters the executor without a legacy KV or recurrent
+    /// allocation, and decode preserves the opaque executor handle returned by
+    /// the preceding step. Resource pressure therefore has one authority and
+    /// is surfaced to the scheduler before another request is dispatched.
+    async fn process_batch_plan_runtime(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
+        let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
+
+        let mut batch_prefill_finished = false;
+        if prefill_ids.len() > 1 {
+            let scheduled = prefill_ids
+                .iter()
+                .map(|rid| {
+                    batch
+                        .requests
+                        .iter()
+                        .find(|scheduled| scheduled.request.id == *rid)
+                        .ok_or_else(|| {
+                            FerrumError::internal(format!(
+                                "PlanRuntime batch {:?} lost scheduled request {rid}",
+                                batch.batch_id
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            match self.run_plan_runtime_batch_prefill(&scheduled).await {
+                Ok(completed) => batch_prefill_finished = completed,
+                Err(error) => {
+                    warn!(
+                        "Plan-runtime physical batch prefill failed for {} requests: {}",
+                        prefill_ids.len(),
+                        error
+                    );
+                    for rid in &prefill_ids {
+                        self.complete_request(rid, FinishReason::Error).await?;
+                    }
+                    batch_prefill_finished = true;
+                }
+            }
+        }
+        if !batch_prefill_finished {
+            for rid in &prefill_ids {
+                let scheduled = batch
+                    .requests
+                    .iter()
+                    .find(|scheduled| scheduled.request.id == *rid)
+                    .ok_or_else(|| {
+                        FerrumError::internal(format!(
+                            "PlanRuntime batch {:?} lost scheduled request {rid}",
+                            batch.batch_id
+                        ))
+                    })?;
+                if let Err(error) = self.run_plan_runtime_prefill(scheduled).await {
+                    warn!("Plan-runtime prefill failed for {}: {}", rid, error);
+                    if is_resource_exhausted_error(&error) {
+                        warn!(
+                            request_id = %rid,
+                            "Plan-runtime prefill crossed typed admission with insufficient capacity"
+                        );
+                    }
+                    self.complete_request(rid, FinishReason::Error).await?;
+                }
+            }
+        }
+
+        let decode_ids = self.decode_ready_request_ids(&decode_ids);
+        if !decode_ids.is_empty() {
+            if let Err(error) = self
+                .run_plan_runtime_batch_decode_adaptive(&decode_ids)
+                .await
+            {
+                warn!(
+                    "Plan-runtime adaptive decode control failed for {} request(s): {}",
+                    decode_ids.len(),
+                    error
+                );
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// Legacy split path: separate prefill (batched via run_batch_prefill)
     /// then decode (batched via run_batch_decode). Used for chunked-prefill
     /// and speculative-decoding flows that the unified path doesn't model yet.
     async fn process_batch_legacy_split(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
-        let mut prefill_ids = Vec::new();
-        let mut decode_ids = Vec::new();
-        {
-            let mut sequences = self.sequences.write();
-            for scheduled_req in &batch.requests {
-                let rid = &scheduled_req.request.id;
-                let seq = sequences.entry(rid.clone()).or_insert_with(|| {
-                    let input_tokens = self
-                        .tokenizer
-                        .encode(&scheduled_req.request.prompt, true)
-                        .unwrap_or_else(|_| vec![TokenId::new(0)]);
-                    SequenceState::new_with_tokenizer_and_model_vocab_size(
-                        scheduled_req.request.clone(),
-                        input_tokens,
-                        Some(self.tokenizer.clone()),
-                        Some(self.model_executor.info().vocab_size),
-                    )
-                });
-                if !seq.prefill_complete {
-                    prefill_ids.push(rid.clone());
-                } else {
-                    decode_ids.push(rid.clone());
-                }
-            }
-        }
+        let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
         if !prefill_ids.is_empty() {
             if let Err(e) = self.run_batch_prefill(&prefill_ids).await {
                 warn!("Batch prefill failed: {}; falling back to per-request", e);
@@ -121,8 +251,7 @@ impl EngineInner {
         use ferrum_interfaces::KvCacheHandle;
 
         // ── 0. Materialize SequenceState for every request, classify ──
-        let mut prefill_ids: Vec<RequestId> = Vec::new();
-        let mut decode_ids: Vec<RequestId> = Vec::new();
+        let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
         let scheduled_tokens_by_id: HashMap<RequestId, usize> = batch
             .requests
             .iter()
@@ -132,30 +261,6 @@ impl EngineInner {
                     .map(|tokens| (scheduled_req.request.id.clone(), tokens))
             })
             .collect();
-        {
-            let mut sequences = self.sequences.write();
-            for scheduled_req in &batch.requests {
-                let rid = &scheduled_req.request.id;
-                let seq = sequences.entry(rid.clone()).or_insert_with(|| {
-                    let input_tokens = self
-                        .tokenizer
-                        .encode(&scheduled_req.request.prompt, true)
-                        .unwrap_or_else(|_| vec![TokenId::new(0)]);
-                    SequenceState::new_with_tokenizer_and_model_vocab_size(
-                        scheduled_req.request.clone(),
-                        input_tokens,
-                        Some(self.tokenizer.clone()),
-                        Some(self.model_executor.info().vocab_size),
-                    )
-                });
-                if !seq.prefill_complete {
-                    prefill_ids.push(rid.clone());
-                } else {
-                    decode_ids.push(rid.clone());
-                }
-            }
-        }
-
         // ── 1. Per-prefill setup: prefix-cache check, KV alloc, gather tokens ──
         // Prefix-cache hits short-circuit through the legacy single-prompt
         // path (they don't enter the unified batch — they have no model
@@ -178,7 +283,7 @@ impl EngineInner {
             metadata: std::collections::HashMap<String, serde_json::Value>,
             logits_policy: LogitsReturnPolicy,
             can_use_prefix_cache: bool,
-            kv_resource_blocks: Option<usize>,
+            legacy_kv_allocation: SequenceKvAllocation,
             owned_resources: UnifiedPrefillOwnedResources,
             chunk_start: usize,
             chunk_len: usize,
@@ -193,7 +298,7 @@ impl EngineInner {
                 input_tokens,
                 num_tokens,
                 existing_kv,
-                existing_kv_resource_blocks,
+                existing_legacy_kv_allocation,
                 existing_recurrent_state,
                 chunk_start,
                 mut metadata,
@@ -209,7 +314,7 @@ impl EngineInner {
                     seq.prefill_context_tokens(),
                     seq.prefill_context_len(),
                     resources.kv_cache,
-                    resources.kv_resource_blocks,
+                    resources.legacy_kv_allocation,
                     resources.recurrent_state,
                     resources.prefill_tokens_processed,
                     seq.model_decode_metadata(),
@@ -235,11 +340,11 @@ impl EngineInner {
                     .find_prefix(&input_tokens)
                     .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
                 if let Some((_, cached_kv, cached_logits)) = hit {
-                    let cloned_kv = cached_kv.clone_handle()?;
-                    let (first_token, model_cache_update) = {
+                    let prefix_hit_result = (|| {
+                        let cloned_kv = cached_kv.clone_handle()?;
                         let mut sequences = self.sequences.write();
                         let Some(seq) = sequences.get_mut(rid) else {
-                            continue;
+                            return Ok(None);
                         };
                         seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
@@ -250,7 +355,24 @@ impl EngineInner {
                         seq.generated_tokens.push(token);
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                        (token, model_cache_update)
+                        Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
+                            token,
+                            model_cache_update,
+                        )))
+                    })();
+                    let prefix_hit = match prefix_hit_result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!(
+                                "Unified prefix-cache prefill post-process failed for {}: {}",
+                                rid, error
+                            );
+                            self.complete_request_with_error(rid, error).await?;
+                            continue;
+                        }
+                    };
+                    let Some((first_token, model_cache_update)) = prefix_hit else {
+                        continue;
                     };
                     self.apply_model_cache_ref_update(rid, model_cache_update);
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
@@ -268,9 +390,10 @@ impl EngineInner {
             }
 
             if existing_recurrent_state.is_none() {
-                if let (Some(spec), Some(manager)) =
-                    (recurrent_state_spec.as_ref(), &self.recurrent_state_manager)
-                {
+                if let (Some(spec), Some(manager)) = (
+                    recurrent_state_spec.as_ref(),
+                    self.recurrent_state_manager(),
+                ) {
                     if !manager.can_allocate(spec) {
                         warn!(
                             "Unified prefill recurrent-state alloc deferred for {}: insufficient capacity",
@@ -318,8 +441,22 @@ impl EngineInner {
                 }
             }
 
-            let (kv_handle, kv_resource_blocks) = if let Some(kv) = existing_kv {
-                (kv, existing_kv_resource_blocks)
+            let existing_kv = match (existing_kv, existing_legacy_kv_allocation) {
+                (Some(kv), Some(allocation)) => Some((kv, allocation)),
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(FerrumError::internal(format!(
+                        "legacy unified prefill for {rid} has a model cache without its KV-manager allocation"
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(FerrumError::internal(format!(
+                        "legacy unified prefill for {rid} has a KV-manager allocation without its model cache"
+                    )));
+                }
+            };
+            let (kv_handle, legacy_kv_allocation) = if let Some(existing) = existing_kv {
+                existing
             } else {
                 // Allocate KV pages for a fresh prefill. This is waiting-request
                 // admission, so capacity failure should defer the prefill rather
@@ -350,9 +487,10 @@ impl EngineInner {
                     }
                 };
                 let allocated = lease.handle();
-                let (_allocation_request_id, blocks) = lease.into_committed_parts();
-                owned_resources = owned_resources.with_fresh_kv(rid.clone(), blocks);
-                (allocated, Some(blocks))
+                let (allocation_request_id, blocks) = lease.into_committed_parts();
+                let allocation = SequenceKvAllocation::new(allocation_request_id, blocks);
+                owned_resources = owned_resources.with_fresh_kv(allocation.clone());
+                (allocated, allocation)
             };
             let remaining = num_tokens - chunk_start;
             let chunk_len = [
@@ -380,7 +518,7 @@ impl EngineInner {
                 metadata,
                 logits_policy,
                 can_use_prefix_cache,
-                kv_resource_blocks,
+                legacy_kv_allocation,
                 owned_resources,
                 chunk_start,
                 chunk_len,
@@ -609,7 +747,7 @@ impl EngineInner {
                             .map(|seq| {
                                 seq.commit_prefill_chunk_physical_resources(
                                     model_kv,
-                                    work.kv_resource_blocks,
+                                    work.legacy_kv_allocation.clone(),
                                     unified.items[i].recurrent_state.clone(),
                                     work.chunk_start.saturating_add(work.chunk_len),
                                     false,
@@ -668,7 +806,7 @@ impl EngineInner {
                 seq.generated_tokens.push(token);
                 let model_cache_update = seq.commit_prefill_chunk_physical_resources(
                     model_kv,
-                    work.kv_resource_blocks,
+                    work.legacy_kv_allocation.clone(),
                     unified.items[i].recurrent_state.clone(),
                     num_tokens,
                     true,
@@ -696,8 +834,7 @@ impl EngineInner {
                         std::mem::take(&mut work.owned_resources)
                             .release(self, &work.rid)
                             .await;
-                        self.complete_request(&work.rid, FinishReason::Error)
-                            .await?;
+                        self.complete_request_with_error(&work.rid, e).await?;
                         continue;
                     }
                 };
@@ -762,8 +899,10 @@ impl EngineInner {
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
                 None => {
-                    warn!("Unified decode result missing for {}", rid);
-                    self.complete_request(&rid, FinishReason::Error).await?;
+                    let error =
+                        FerrumError::internal(format!("unified decode result missing for {rid}"));
+                    warn!("{}", error);
+                    self.complete_request_with_error(&rid, error).await?;
                     continue;
                 }
             };
@@ -787,7 +926,7 @@ impl EngineInner {
                 let cache_id = seq.decode_model_cache_id_or_request_id(&rid);
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
-                seq.commit_decode_step_physical_resources(model_kv);
+                seq.commit_decode_step_physical_resources(model_kv)?;
                 // pos_offset is sourced from SequenceState bookkeeping above
                 // (`input_tokens.len() + generated_tokens.len() - 1`); the
                 // engine-side KV handle's `sequence_length` field is no
@@ -803,7 +942,7 @@ impl EngineInner {
                 Ok(None) => continue,
                 Err(e) => {
                     warn!("Unified decode post-process failed for {}: {}", rid, e);
-                    self.complete_request(&rid, FinishReason::Error).await?;
+                    self.complete_request_with_error(&rid, e).await?;
                     continue;
                 }
             };
@@ -931,6 +1070,14 @@ impl EngineInner {
         self.release_sequence_physical_resources(request_id, physical_resources)
             .await;
         self.scheduler.defer_prefill_to_waiting(request_id);
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_capacity_defer",
+            "request_id": request_id.to_string(),
+            "scheduler": self.scheduler.trace_snapshot(),
+            "recurrent_state": self
+                .recurrent_state_manager()
+                .map(|manager| manager.stats()),
+        }));
         self.trace_scheduler_defer(
             request_id,
             "engine_scheduler_prefill_capacity_defer",
@@ -940,6 +1087,426 @@ impl EngineInner {
     }
 
     pub(super) async fn defer_decode_for_capacity_recompute(
+        &self,
+        request_id: &RequestId,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> bool {
+        self.defer_decode_for_capacity_recompute_inner(
+            request_id,
+            attempted_decode_width,
+            observed_free_blocks,
+        )
+        .await
+    }
+
+    pub(in crate::continuous_engine) fn execution_capacity_release_snapshot(
+        &self,
+    ) -> Result<ExecutionCapacityReleaseSnapshot> {
+        let authorities = self
+            .sequences
+            .read()
+            .iter()
+            .filter_map(|(request_id, sequence)| {
+                sequence
+                    .model_cache_id()
+                    .map(|cache_id| (request_id.clone(), cache_id.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let mut capabilities = Vec::with_capacity(authorities.len());
+        for (request_id, cache_id) in authorities {
+            let preemption =
+                ExecutorExecutionCapacityPreemption::new(request_id.clone(), cache_id)?;
+            let mut sources = Vec::new();
+            if self
+                .model_executor
+                .write_execution_capacity_release_sources(&preemption, &mut sources)?
+            {
+                capabilities.push((request_id, sources));
+            }
+        }
+        Ok(ExecutionCapacityReleaseSnapshot::new(capabilities))
+    }
+
+    fn reconcile_capacity_yield_error(
+        &self,
+        transaction: &PressureYieldTransaction,
+        victim_released: bool,
+        attempted_width: usize,
+        observed_free_blocks: Option<usize>,
+        error: FerrumError,
+    ) -> FerrumError {
+        match self.scheduler.abort_execution_capacity_yield(
+            transaction,
+            victim_released,
+            attempted_width,
+            observed_free_blocks,
+        ) {
+            Ok((victim_requeued, aborted_ordinal, closed_ordinal)) => {
+                self.write_scheduler_trace_event(serde_json::json!({
+                    "event": "scheduler_pressure_yield_aborted",
+                    "episode_id": transaction.episode_id().get(),
+                    "handoff_generation": transaction.handoff_generation(),
+                    "victim_request_id": transaction.victim_request_id(),
+                    "progress_owner_id": transaction.progress_owner_id(),
+                    "victim_released": victim_released,
+                    "victim_requeued": victim_requeued,
+                    "aborted_transition_ordinal": aborted_ordinal.get(),
+                    "closed_transition_ordinal": closed_ordinal.get(),
+                    "error": error.to_string(),
+                    "scheduler": self.scheduler.trace_snapshot(),
+                }));
+                error
+            }
+            Err(reconcile_error) => FerrumError::internal(format!(
+                "execution-capacity yield failed ({error}) and reconciliation failed ({reconcile_error})"
+            )),
+        }
+    }
+
+    pub(in crate::continuous_engine) async fn execute_capacity_yield(
+        &self,
+        transaction: &PressureYieldTransaction,
+        attempted_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> Result<bool> {
+        let cache_id = self
+            .sequences
+            .read()
+            .get(transaction.victim_request_id())
+            .and_then(SequenceState::model_cache_id)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    false,
+                    attempted_width,
+                    observed_free_blocks,
+                    FerrumError::internal(format!(
+                        "execution-capacity yield victim {} does not own a model-runtime cache authority",
+                        transaction.victim_request_id()
+                    )),
+                )
+            })?;
+        let armed_ordinal = self
+            .scheduler
+            .arm_execution_capacity_yield(transaction)
+            .map_err(|error| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    false,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                )
+            })?;
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_pressure_release_fence_armed",
+            "episode_id": transaction.episode_id().get(),
+            "handoff_generation": transaction.handoff_generation(),
+            "yield_kind": transaction.kind().as_str(),
+            "victim_request_id": transaction.victim_request_id(),
+            "progress_owner_id": transaction.progress_owner_id(),
+            "planned_ordinal": transaction.planned_ordinal().get(),
+            "transition_ordinal": armed_ordinal.get(),
+            "wait_condition": transaction.wait_condition(),
+            "scheduler": self.scheduler.trace_snapshot(),
+        }));
+        self.write_executor_scheduler_profile_event(
+            transaction.victim_request_id(),
+            "vnext.execution_capacity_pressure_release_fence_armed",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "episode_id".to_string(),
+                    serde_json::json!(transaction.episode_id().get()),
+                ),
+                (
+                    "handoff_generation".to_string(),
+                    serde_json::json!(transaction.handoff_generation()),
+                ),
+                (
+                    "yield_kind".to_string(),
+                    serde_json::json!(transaction.kind().as_str()),
+                ),
+                (
+                    "planned_transition_ordinal".to_string(),
+                    serde_json::json!(transaction.planned_ordinal().get()),
+                ),
+                (
+                    "transition_ordinal".to_string(),
+                    serde_json::json!(armed_ordinal.get()),
+                ),
+                (
+                    "physical_release_completed".to_string(),
+                    serde_json::json!(false),
+                ),
+            ]),
+            BTreeMap::from([
+                (
+                    "progress_owner_id".to_string(),
+                    serde_json::json!(transaction.progress_owner_id()),
+                ),
+                (
+                    "wait_condition".to_string(),
+                    serde_json::json!(transaction.wait_condition()),
+                ),
+            ]),
+            None,
+        );
+
+        let preemption = ExecutorExecutionCapacityPreemption::new(
+            transaction.victim_request_id().clone(),
+            cache_id.clone(),
+        )
+        .map_err(|error| {
+            self.reconcile_capacity_yield_error(
+                transaction,
+                false,
+                attempted_width,
+                observed_free_blocks,
+                error,
+            )
+        })?;
+        let release_receipt = match self
+            .model_executor
+            .preempt_execution_capacity(preemption)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self.reconcile_capacity_yield_error(
+                    transaction,
+                    false,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                ));
+            }
+        };
+        if release_receipt.request_id() != transaction.victim_request_id()
+            || release_receipt.cache_id() != cache_id
+        {
+            return Err(self.reconcile_capacity_yield_error(
+                transaction,
+                true,
+                attempted_width,
+                observed_free_blocks,
+                FerrumError::internal(format!(
+                    "execution-capacity release receipt identity mismatch for victim {}",
+                    transaction.victim_request_id()
+                )),
+            ));
+        }
+        let release_authority = release_receipt.authority();
+
+        let mut physical_resources = {
+            let mut sequences = self.sequences.write();
+            sequences
+                .get_mut(transaction.victim_request_id())
+                .map(|sequence| {
+                    let resources = sequence.take_physical_resources_for_recompute();
+                    sequence.preemption_count += 1;
+                    resources
+                })
+                .unwrap_or_default()
+        };
+        let taken_cache_id = physical_resources.model_cache_id.take();
+        if taken_cache_id.as_deref() != Some(cache_id.as_str()) {
+            return Err(self.reconcile_capacity_yield_error(
+                transaction,
+                true,
+                attempted_width,
+                observed_free_blocks,
+                FerrumError::internal(format!(
+                    "execution-capacity yield victim {} lost or replaced its model cache authority after release fence arm",
+                    transaction.victim_request_id()
+                )),
+            ));
+        }
+        // The executor's typed preemption receipt proves that this exact cache
+        // authority was released. Record the engine-side ownership transition
+        // without issuing a second name-based release that could target a
+        // recomputed generation using the same product request identity.
+        self.trace_model_cache_ref_release(transaction.victim_request_id());
+        if !physical_resources.is_empty() {
+            self.release_sequence_physical_resources(
+                transaction.victim_request_id(),
+                physical_resources,
+            )
+            .await;
+        }
+
+        let mut availability = Vec::new();
+        let capacity_snapshot = self
+            .model_executor
+            .write_execution_capacity_snapshot(&mut availability)
+            .map_err(|error| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    true,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                )
+            })?;
+        if capacity_snapshot.is_none()
+            || !transaction
+                .wait_condition()
+                .changed_since(&availability)
+                .map_err(|error| {
+                    self.reconcile_capacity_yield_error(
+                        transaction,
+                        true,
+                        attempted_width,
+                        observed_free_blocks,
+                        FerrumError::internal(error.to_string()),
+                    )
+                })?
+        {
+            return Err(self.reconcile_capacity_yield_error(
+                transaction,
+                true,
+                attempted_width,
+                observed_free_blocks,
+                FerrumError::internal(format!(
+                    "execution-capacity release for victim {} did not advance the failed exact source",
+                    transaction.victim_request_id()
+                )),
+            ));
+        }
+
+        let completion = self
+            .scheduler
+            .complete_execution_capacity_yield(transaction, attempted_width, observed_free_blocks)
+            .map_err(|error| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    true,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                )
+            })?;
+        let release_ordinal = completion.release_transition_ordinal();
+        let resumable_ordinal = completion.resumable_transition_ordinal();
+        let owner_admission_pending_ordinal =
+            completion.owner_admission_pending_transition_ordinal();
+        let closed_ordinal = completion.closed_transition_ordinal();
+        let closed_reason = completion.closed_reason();
+        let moved = completion.victim_requeued();
+        let progress_owner_resumable = completion.progress_owner_resumable();
+        let completion_disposition = completion.disposition().as_str();
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_pressure_release_fence_completed",
+            "episode_id": transaction.episode_id().get(),
+            "handoff_generation": transaction.handoff_generation(),
+            "yield_kind": transaction.kind().as_str(),
+            "victim_request_id": transaction.victim_request_id(),
+            "progress_owner_id": transaction.progress_owner_id(),
+            "release_transition_ordinal": release_ordinal.get(),
+            "resumable_transition_ordinal": resumable_ordinal.map(|ordinal| ordinal.get()),
+            "owner_admission_pending_transition_ordinal": owner_admission_pending_ordinal.map(|ordinal| ordinal.get()),
+            "closed_transition_ordinal": closed_ordinal.map(|ordinal| ordinal.get()),
+            "closed_reason": closed_reason.map(|reason| reason.as_str()),
+            "completion_disposition": completion_disposition,
+            "release_authority": release_authority,
+            "exact_source_advanced": true,
+            "transaction_wait_condition_advanced": true,
+            "progress_owner_resumable": progress_owner_resumable,
+            "moved": moved,
+            "scheduler": self.scheduler.trace_snapshot(),
+        }));
+        self.write_executor_scheduler_profile_event(
+            transaction.victim_request_id(),
+            "vnext.execution_capacity_pressure_release_fence_completed",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "episode_id".to_string(),
+                    serde_json::json!(transaction.episode_id().get()),
+                ),
+                (
+                    "handoff_generation".to_string(),
+                    serde_json::json!(transaction.handoff_generation()),
+                ),
+                (
+                    "yield_kind".to_string(),
+                    serde_json::json!(transaction.kind().as_str()),
+                ),
+                (
+                    "release_transition_ordinal".to_string(),
+                    serde_json::json!(release_ordinal.get()),
+                ),
+                (
+                    "resumable_transition_ordinal".to_string(),
+                    serde_json::json!(resumable_ordinal.map(|ordinal| ordinal.get())),
+                ),
+                (
+                    "owner_admission_pending_transition_ordinal".to_string(),
+                    serde_json::json!(owner_admission_pending_ordinal.map(|ordinal| ordinal.get())),
+                ),
+                (
+                    "closed_transition_ordinal".to_string(),
+                    serde_json::json!(closed_ordinal.map(|ordinal| ordinal.get())),
+                ),
+                (
+                    "closed_reason".to_string(),
+                    serde_json::json!(closed_reason.map(|reason| reason.as_str())),
+                ),
+                (
+                    "completion_disposition".to_string(),
+                    serde_json::json!(completion_disposition),
+                ),
+                (
+                    "physical_release_completed".to_string(),
+                    serde_json::json!(true),
+                ),
+                ("exact_source_advanced".to_string(), serde_json::json!(true)),
+                (
+                    "transaction_wait_condition_advanced".to_string(),
+                    serde_json::json!(true),
+                ),
+                (
+                    "release_authority".to_string(),
+                    serde_json::json!(release_authority),
+                ),
+                (
+                    "progress_owner_resumable".to_string(),
+                    serde_json::json!(progress_owner_resumable),
+                ),
+                ("victim_requeued".to_string(), serde_json::json!(moved)),
+            ]),
+            BTreeMap::from([
+                (
+                    "progress_owner_id".to_string(),
+                    serde_json::json!(transaction.progress_owner_id()),
+                ),
+                (
+                    "current_capacity_availability".to_string(),
+                    serde_json::json!(availability),
+                ),
+            ]),
+            None,
+        );
+        if moved {
+            self.total_preemptions.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.preemptions_total").increment(1);
+            self.trace_scheduler_defer(
+                transaction.victim_request_id(),
+                "engine_scheduler_execution_capacity_yield",
+                "execution capacity yielded for phase-independent recompute",
+            );
+            self.work_notify.notify_waiters();
+        }
+        Ok(progress_owner_resumable)
+    }
+
+    async fn defer_decode_for_capacity_recompute_inner(
         &self,
         request_id: &RequestId,
         attempted_decode_width: usize,

@@ -1,7 +1,11 @@
 use super::*;
 use crate::vnext::{
-    CopyRegion, DefinitelyNotSubmitted, DeviceClass, DeviceErrorReport, DeviceTerminal,
-    FenceIndeterminate, FenceQuery, HostTransferLayout,
+    CapacityAvailabilitySource, CopyRegion, DeferredAction, DefinitelyNotSubmitted,
+    DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
+    DeviceTerminal, DeviceTerminalReceipt, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec, ReusableExecutionCapacity,
+    ReusableExecutionClassId, ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget,
+    TrustedActiveSequenceBinding,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -253,20 +257,20 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _command: Self::Command,
+        _commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         Ok(())
     }
 
     fn query_fence(&self, _fence: &Self::Fence) -> FenceQuery<Self::Error> {
-        FenceQuery::Terminal(DeviceTerminal::Succeeded)
+        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
     fn wait_fence(
         &self,
         _fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>> {
-        Ok(DeviceTerminal::Succeeded)
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
+        Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
     fn synchronize(&self, _stream: &mut Self::Stream) -> Result<(), Self::Error> {
@@ -336,11 +340,37 @@ fn pool_catalog(
     maximum_resident_bytes: u64,
     demand: TestDemand,
 ) -> PoolCatalog {
+    pool_catalog_with_options(
+        profile,
+        lifetime,
+        layout_digit,
+        resource_count,
+        maximum_resident_bytes,
+        demand,
+        "state",
+        false,
+        StateInitialization::None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pool_catalog_with_options(
+    profile: DynamicStorageProfile,
+    lifetime: AllocationLifetime,
+    layout_digit: char,
+    resource_count: usize,
+    maximum_resident_bytes: u64,
+    demand: TestDemand,
+    usage: &str,
+    share_step_slot: bool,
+    initialization: StateInitialization,
+) -> PoolCatalog {
+    assert!(!share_step_slot || lifetime == AllocationLifetime::Step && resource_count > 1);
     let layout_fingerprint = layout_digit.to_string().repeat(64);
     let compatibility = json!({
         "version": {"major": 1, "minor": 0},
         "profile": profile,
-        "usage": "state",
+        "usage": usage,
         "element_type": "u8",
         "logical_layout_fingerprint": layout_fingerprint,
         "alignment_bytes": 16
@@ -367,7 +397,7 @@ fn pool_catalog(
                 "base_resource_id": resource_id,
                 "demand": demand,
                 "alignment_bytes": 16,
-                "usage": "state",
+                "usage": usage,
                 "element_type": "u8",
                 "lifetime": match lifetime {
                     AllocationLifetime::Request => "request",
@@ -381,6 +411,7 @@ fn pool_catalog(
                     "logical_layout_fingerprint": layout_fingerprint
                 },
                 "pool_id": pool_id_text,
+                "initialization": initialization,
                 "theoretical_maximum_instances": 64
             }))
             .unwrap(),
@@ -390,13 +421,37 @@ fn pool_catalog(
     descriptors.sort_by(|left: &DynamicResourceDescriptor, right| {
         left.base_resource_id().cmp(right.base_resource_id())
     });
-    let minimum = 64 * u64::try_from(resource_count).unwrap();
+    let minimum = if share_step_slot {
+        64
+    } else {
+        64 * u64::try_from(resource_count).unwrap()
+    };
     let theoretical_per_descriptor = match demand {
         TestDemand::Fixed => 64_u128,
         TestDemand::Tokens => 256_u128,
     };
     let theoretical_ceiling =
         theoretical_per_descriptor * 64 * u128::try_from(resource_count).unwrap();
+    let step_resource_slots = if lifetime == AllocationLifetime::Step {
+        if share_step_slot {
+            vec![serde_json::json!({
+                "kind": "ordered_single_fence_step_wave",
+                "resource_ids": resource_ids
+            })]
+        } else {
+            resource_ids
+                .iter()
+                .map(|resource_id| {
+                    serde_json::json!({
+                        "kind": "dedicated",
+                        "resource_ids": [resource_id]
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
+    } else {
+        Vec::new()
+    };
     let pool: DynamicBackingPoolSpec = serde_json::from_value(json!({
             "pool_id": pool_id_text,
             "compatibility": compatibility,
@@ -405,7 +460,9 @@ fn pool_catalog(
             "minimum_sequence_bytes": if lifetime == AllocationLifetime::Sequence { minimum } else { 0 },
             "minimum_step_bytes": if lifetime == AllocationLifetime::Step { minimum } else { 0 },
             "minimum_invocation_peak_bytes": 0,
+            "step_resource_slots": step_resource_slots,
             "theoretical_ceiling_bytes": theoretical_ceiling.to_string(),
+            "reusable_workspace_ceiling_bytes": 0,
             "provisioning": {
                 "mode": "demand_driven_elastic",
                 "minimum_resident_bytes": minimum,
@@ -421,6 +478,20 @@ fn pool_catalog(
         pool_id,
         profile,
     }
+}
+
+fn shared_step_activation_catalog(profile: DynamicStorageProfile) -> PoolCatalog {
+    pool_catalog_with_options(
+        profile,
+        AllocationLifetime::Step,
+        'c',
+        2,
+        256,
+        TestDemand::Tokens,
+        "activations",
+        true,
+        StateInitialization::None,
+    )
 }
 
 fn combine_catalogs(catalogs: &[PoolCatalog]) -> PoolCatalog {
@@ -467,6 +538,56 @@ fn harness(
     usable_capacity_bytes: u64,
     mismatched_coordinator: bool,
 ) -> Harness {
+    harness_with_nodes(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        mismatched_coordinator,
+        Arc::from(Vec::<PlanNode>::new()),
+    )
+}
+
+fn harness_with_nodes(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    mismatched_coordinator: bool,
+    nodes: Arc<[PlanNode]>,
+) -> Harness {
+    harness_with_nodes_and_reusable(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        mismatched_coordinator,
+        nodes,
+        None,
+    )
+}
+
+fn harness_with_reusable(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    reusable_execution: ReusableExecutionMemoryPlan,
+) -> Harness {
+    harness_with_nodes_and_reusable(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        false,
+        Arc::from(Vec::<PlanNode>::new()),
+        Some(reusable_execution),
+    )
+}
+
+fn harness_with_nodes_and_reusable(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    mismatched_coordinator: bool,
+    nodes: Arc<[PlanNode]>,
+    reusable_execution: Option<ReusableExecutionMemoryPlan>,
+) -> Harness {
     let generation = issue_generation().unwrap();
     let plan_id = PlanId::new(format!("plan/dynamic-pool-test/{generation}")).unwrap();
     let plan_hash: PlanHash = serde_json::from_value(json!("1".repeat(64))).unwrap();
@@ -506,7 +627,6 @@ fn harness(
         binding.device_capacity_bytes(),
     )
     .unwrap();
-    let budget = account.register_budget(usable_capacity_bytes).unwrap();
     let (planned_coordinator, domains) = plan_dynamic_pool_admission(
         binding.maximum_active_sequences(),
         &catalog.pools,
@@ -529,6 +649,7 @@ fn harness(
     } else {
         planned_coordinator
     };
+    let budget = account.register_budget(usable_capacity_bytes).unwrap();
     let dynamic_pools = Arc::new(
         DynamicPoolSet::new(
             Arc::clone(&runtime),
@@ -536,7 +657,8 @@ fn harness(
             budget,
             logical_admission,
             domains,
-            Arc::from(Vec::<PlanNode>::new()),
+            nodes,
+            reusable_execution,
         )
         .unwrap(),
     );
@@ -584,13 +706,33 @@ fn shape(tokens: u64) -> DynamicResourceShape {
 }
 
 fn work(tokens: usize) -> ResourceWorkShape {
+    ResourceWorkShape::single(token_span(tokens)).unwrap()
+}
+
+fn work_with_ceiling(tokens: usize, maximum_tokens: usize) -> ResourceWorkShape {
     let token_ids = (0..tokens)
         .map(|token| u32::try_from(token).unwrap())
         .collect::<Vec<_>>();
     ResourceWorkShape::single(
-        TokenSpanWork::from_token_ids(&token_ids, 0..token_ids.len()).unwrap(),
+        TokenSpanWork::from_token_ids_with_fit(&token_ids, 0..token_ids.len(), maximum_tokens)
+            .unwrap(),
     )
     .unwrap()
+}
+
+fn token_span(tokens: usize) -> TokenSpanWork {
+    let token_ids = (0..tokens)
+        .map(|token| u32::try_from(token).unwrap())
+        .collect::<Vec<_>>();
+    TokenSpanWork::from_token_ids(&token_ids, 0..token_ids.len()).unwrap()
+}
+
+fn chunked_work(tokens: usize, immediate_range: std::ops::Range<usize>) -> ResourceWorkShape {
+    let token_ids = (0..tokens)
+        .map(|token| u32::try_from(token).unwrap())
+        .collect::<Vec<_>>();
+    ResourceWorkShape::single(TokenSpanWork::from_token_ids(&token_ids, immediate_range).unwrap())
+        .unwrap()
 }
 
 fn request_admission() -> RequestResourceAdmissionRequest {
@@ -624,9 +766,34 @@ fn admitted_sequence(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     suffix: &str,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
-    let request = admitted_request(root, suffix);
+    admitted_sequence_with_ceiling(root, suffix, 1)
+}
+
+fn admitted_sequence_with_ceiling(
+    root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    suffix: &str,
+    maximum_tokens: usize,
+) -> Arc<AdmittedSequenceResources<TestRuntime>> {
+    let work = work_with_ceiling(1, maximum_tokens);
+    let binding = root.trusted_runtime_binding().unwrap();
+    let request = match binding
+        .try_admit_request(
+            RequestResourceAdmissionRequest::new(
+                work.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new(format!("run/{suffix}")).unwrap(),
+            RequestIdentity::new(format!("request/{suffix}")).unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::Admitted(request) => request,
+        _ => panic!("test request must be admitted from resident backing"),
+    };
     let admission = SequenceResourceAdmissionRequest::new(
-        work(1),
+        work,
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -664,17 +831,207 @@ fn claim_size(
     pool: &Arc<DynamicBackingPool<TestRuntime>>,
     size_bytes: u64,
 ) -> LogicalBackingSliceAuthority {
-    let request = EvaluatedBackingRequest {
-        domain: &pool.domain,
-        descriptor: &pool.domain.descriptors[0],
-        size_bytes,
-    };
+    let request = evaluated_request(pool, size_bytes);
     let BackingPrepareDecision::Prepared(prepared) =
         pools.prepare_claim(std::slice::from_ref(&request)).unwrap()
     else {
         panic!("resident test pool must prepare its exact physical claim")
     };
     prepared.commit().pop().unwrap()
+}
+
+fn evaluated_request<'a>(
+    pool: &'a Arc<DynamicBackingPool<TestRuntime>>,
+    size_bytes: u64,
+) -> EvaluatedBackingRequest<'a> {
+    evaluated_descriptor_request(pool, 0, size_bytes)
+}
+
+fn evaluated_descriptor_request<'a>(
+    pool: &'a Arc<DynamicBackingPool<TestRuntime>>,
+    descriptor_index: usize,
+    size_bytes: u64,
+) -> EvaluatedBackingRequest<'a> {
+    let descriptor = &pool.domain.descriptors[descriptor_index];
+    EvaluatedBackingRequest {
+        domain: &pool.domain,
+        claim_identity: PhysicalBackingClaimIdentity::new(
+            pool.domain.pool_id().clone(),
+            vec![descriptor.base_resource_id().clone()],
+        )
+        .unwrap(),
+        capacity_size_bytes: size_bytes,
+        reusable_execution_bucket_id: None,
+        projections: vec![EvaluatedBackingProjection {
+            descriptor,
+            physical_offset_bytes: 0,
+            logical_size_bytes: size_bytes,
+            capacity_size_bytes: size_bytes,
+        }],
+    }
+}
+
+fn reusable_step_memory_plan(
+    pool_id: DynamicBackingPoolId,
+) -> (ReusableExecutionMemoryPlan, ReusableExecutionBucketSpec) {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.single-sequence-packed-token").unwrap(),
+        ReusableExecutionCapacity::new(1, 4, 1).unwrap(),
+    )
+    .unwrap();
+    let resolved = ResolvedReusableExecutionBucket::new(
+        bucket.clone(),
+        vec![ReusablePoolWorkspaceBudget::new(pool_id, 256, 0).unwrap()],
+    )
+    .unwrap();
+    (
+        ReusableExecutionMemoryPlan::new(1, 1, vec![resolved]).unwrap(),
+        bucket,
+    )
+}
+
+#[test]
+fn reused_extent_receives_a_fresh_pending_initialization_authority() {
+    let catalog = pool_catalog_with_options(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        64,
+        TestDemand::Fixed,
+        "state",
+        false,
+        StateInitialization::Zero,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(runtime, catalog, 64, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+
+    let first = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let first_segment = first.evidence().segments()[0].clone();
+    let first_generation = first.evidence().segment_generation();
+    let first_cell = Arc::clone(first.initialization_cell().unwrap());
+    assert_eq!(
+        first.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
+    assert!(first_cell.prepare("wave/a").unwrap());
+    first_cell.mark_in_flight("wave/a").unwrap();
+    first_cell.finish("wave/a", true).unwrap();
+    assert_eq!(
+        first.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Initialized)
+    );
+    let retained = first.retained();
+    assert!(Arc::ptr_eq(
+        retained.initialization_cell().unwrap(),
+        &first_cell
+    ));
+    drop(first);
+    assert_eq!(
+        retained.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Initialized)
+    );
+    drop(retained);
+
+    let second = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let second_segment = &second.evidence().segments()[0];
+    assert_eq!(second_segment.chunk(), first_segment.chunk());
+    assert_eq!(second_segment.offset_bytes(), first_segment.offset_bytes());
+    assert_ne!(second.evidence().segment_generation(), first_generation);
+    assert!(!Arc::ptr_eq(
+        second.initialization_cell().unwrap(),
+        &first_cell
+    ));
+    assert_eq!(
+        second.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
+}
+
+#[test]
+fn failed_initialization_poison_is_scoped_to_one_extent_generation() {
+    let catalog = pool_catalog_with_options(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        64,
+        TestDemand::Fixed,
+        "state",
+        false,
+        StateInitialization::Zero,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(runtime, catalog, 64, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+
+    let failed = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let failed_generation = failed.evidence().segment_generation();
+    let failed_segment = failed.evidence().segments()[0].clone();
+    let failed_cell = Arc::clone(failed.initialization_cell().unwrap());
+    assert!(failed_cell.prepare("wave/failed").unwrap());
+    failed_cell.mark_in_flight("wave/failed").unwrap();
+    failed_cell.finish("wave/failed", false).unwrap();
+    assert_eq!(
+        failed.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Poisoned)
+    );
+    drop(failed);
+
+    let recovered = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let recovered_segment = &recovered.evidence().segments()[0];
+    assert_eq!(recovered_segment.chunk(), failed_segment.chunk());
+    assert_eq!(
+        recovered_segment.offset_bytes(),
+        failed_segment.offset_bytes()
+    );
+    assert_ne!(recovered.evidence().segment_generation(), failed_generation);
+    assert!(!Arc::ptr_eq(
+        recovered.initialization_cell().unwrap(),
+        &failed_cell
+    ));
+    assert_eq!(
+        recovered.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
+}
+
+#[test]
+fn logical_projection_range_crosses_physical_chunks_without_prefix_aliasing() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Request,
+        'd',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let segments = vec![
+        BackingSegment::from_chunk(&catalog.pool_id, 1, 7, 0, 64).unwrap(),
+        BackingSegment::from_chunk(&catalog.pool_id, 2, 8, 0, 64).unwrap(),
+    ];
+
+    let projection = backing_segment_range(&segments, 32, 80).unwrap();
+
+    assert_eq!(projection.len(), 2);
+    assert_eq!(projection[0].chunk_ordinal(), 1);
+    assert_eq!(projection[0].offset_bytes(), 32);
+    assert_eq!(projection[0].length_bytes(), 32);
+    assert_eq!(projection[1].chunk_ordinal(), 2);
+    assert_eq!(projection[1].offset_bytes(), 0);
+    assert_eq!(projection[1].length_bytes(), 48);
+    assert!(backing_segment_range(&segments, 96, 64).is_err());
 }
 
 struct CleanupPressureTask {
@@ -761,9 +1118,9 @@ fn zero_initial_capacity_defers_until_typed_initialization() {
     let RequestResourceAdmissionDecision::BackingDeferred(deferred) = decision else {
         panic!("zero-resident pool must defer")
     };
-    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.evidence().blockers().len(), 1);
     assert_eq!(
-        deferred.blockers()[0].reason(),
+        deferred.evidence().blockers()[0].reason(),
         DynamicBackingDeferralReason::GrowthRequired
     );
     assert_eq!(harness.runtime.allocate_calls(), 0);
@@ -779,6 +1136,1208 @@ fn zero_initial_capacity_defers_until_typed_initialization() {
         .unwrap()
         .is_none());
     assert_eq!(harness.runtime.allocate_calls(), 1);
+}
+
+#[test]
+fn backing_deferral_reports_the_whole_pool_shortfall() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        3,
+        192,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(runtime, catalog, 192, false);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let admission = || {
+        binding
+            .try_admit_request(
+                request_admission(),
+                RunId::new("run/batch-shortfall").unwrap(),
+                RequestIdentity::new("request/batch-shortfall").unwrap(),
+            )
+            .unwrap()
+    };
+    let RequestResourceAdmissionDecision::BackingDeferred(deferred) = admission() else {
+        panic!("zero-resident pool must expose its complete batch shortfall")
+    };
+    assert_eq!(deferred.evidence().blockers().len(), 1);
+    assert_eq!(deferred.evidence().blockers()[0].requested_bytes(), 192);
+    assert_eq!(deferred.evidence().blockers()[0].free_bytes(), 0);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = deferred.maintain().unwrap()
+    else {
+        panic!("current batch shortfall must grow its pool")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(receipt.growths()[0].chunk_bytes(), 192);
+    assert_eq!(harness.runtime.allocate_calls(), 1);
+    assert!(matches!(
+        admission(),
+        RequestResourceAdmissionDecision::Admitted(_)
+    ));
+}
+
+#[test]
+fn logical_fit_deferral_grows_unclaimed_backing_capacity() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let request = match binding
+        .try_admit_request(
+            RequestResourceAdmissionRequest::new(
+                work_with_ceiling(1, 4),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/logical-fit-growth").unwrap(),
+            RequestIdentity::new("request/logical-fit-growth").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::Admitted(request) => request,
+        _ => panic!("test request must be admitted from resident backing"),
+    };
+    let admission = SequenceResourceAdmissionRequest::new(
+        chunked_work(4, 0..1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::Deferred(deferred) =
+        request.try_admit_sequence(admission.clone()).unwrap()
+    else {
+        panic!("full-fit capacity above current residency must request logical growth")
+    };
+    assert_eq!(deferred.action(), DeferredAction::AwaitBackingGrowth);
+    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.blockers()[0].requested().get(), 256);
+    assert_eq!(deferred.blockers()[0].current_total().get(), 64);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = harness
+        .root
+        .maintain_for_admission_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("current logical growth deferral must materialize fit capacity")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(receipt.growths()[0].chunk_bytes(), 192);
+    assert_eq!(receipt.growths()[0].published_capacity_bytes(), 256);
+    assert!(matches!(
+        request.try_admit_sequence(admission).unwrap(),
+        SequenceResourceAdmissionDecision::Admitted(_)
+    ));
+}
+
+#[test]
+fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_change() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(Arc::clone(&runtime), catalog, 64, false);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let held_backing = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let deferred = match binding
+        .try_admit_request(
+            request_admission(),
+            RunId::new("run/capacity-wait-second").unwrap(),
+            RequestIdentity::new("request/capacity-wait-second").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("occupied resident backing must ask for physical growth"),
+    };
+    let before = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .epochs()
+        .unwrap();
+    let churned = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .notify_domain_availability_changed(pool.domain.domain_id)
+        .unwrap();
+    assert_ne!(churned, before);
+    let allocations_before = runtime.allocate_calls();
+
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        current_epochs,
+        pressure,
+        ..
+    } = deferred.maintain().unwrap()
+    else {
+        panic!("unrelated epoch churn must preserve typed request backing pressure")
+    };
+    assert_eq!(current_epochs, churned);
+    assert_eq!(
+        pressure.device_capacity().unwrap().scope(),
+        &DeviceCapacityPressureScope::PlanBudget
+    );
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    let status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(status.process_claimed_bytes(), 64);
+    assert_eq!(status.budget_claimed_bytes(), 64);
+    assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
+
+    drop(held_backing);
+    let after_release = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .epochs()
+        .unwrap();
+    assert!(after_release.capacity_epoch() > before.capacity_epoch());
+    assert!(matches!(
+        binding
+            .try_admit_request(
+                request_admission(),
+                RunId::new("run/capacity-wait-second-retry").unwrap(),
+                RequestIdentity::new("request/capacity-wait-second-retry").unwrap(),
+            )
+            .unwrap(),
+        RequestResourceAdmissionDecision::Admitted(_)
+    ));
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn theoretical_pool_ceiling_remains_terminal_after_device_budget_accepts_growth() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'b',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(Arc::clone(&runtime), catalog, 128, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&harness.pool_ids[0]).unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let error = maintenance
+        .grow_pool(&harness.pool_ids[0], 64)
+        .expect_err("theoretical pool ceiling must remain fail-closed");
+    let VNextError::DynamicPoolResidentUnavailable(pressure) = error else {
+        panic!("explicit pool growth must preserve typed resident pressure")
+    };
+    assert_eq!(pressure.pool_id(), &harness.pool_ids[0]);
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.resident_bytes(), 64);
+    assert_eq!(pressure.maximum_resident_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
+    let status = maintenance.status().unwrap();
+    assert_eq!(status.budget_claimed_bytes(), 64);
+    assert_eq!(status.process_claimed_bytes(), 64);
+    assert_eq!(status.pools()[0].resident_bytes(), 64);
+    assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn eager_step_backing_releases_when_the_step_retires_while_lane_remains_live() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        '9',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(Arc::clone(&runtime), catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+
+    let sequence = admitted_sequence(&harness.root, "eager-step-release");
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident eager step backing must admit"),
+    };
+    assert_eq!(
+        harness
+            .root
+            .maintenance_controller
+            .status()
+            .unwrap()
+            .pools()[0]
+            .live_segments(),
+        1
+    );
+
+    step.try_retire_normal().unwrap();
+    assert_eq!(
+        harness
+            .root
+            .maintenance_controller
+            .status()
+            .unwrap()
+            .pools()[0]
+            .live_segments(),
+        0,
+        "ordinary eager backing must not become a lane-lifetime cache"
+    );
+
+    session.try_complete().unwrap();
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn eager_alternate_layout_reuses_released_pool_without_maintenance() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'c',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(Arc::clone(&runtime), catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let first_sequence = admitted_sequence_with_ceiling(&harness.root, "idle-cache-first", 2);
+    let first_session = first_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let first_request = StepResourceAdmissionRequest::new(
+        first_batch.bind_work_shape(vec![token_span(2)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let first_step = match first_batch.try_begin_step(first_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident two-token eager layout must admit"),
+    };
+    first_step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    drop(first_batch);
+    drop(first_session);
+    drop(first_sequence);
+
+    let second_sequence = admitted_sequence(&harness.root, "idle-cache-second");
+    let second_session = second_sequence.open_session().unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+    let second_request = StepResourceAdmissionRequest::new(
+        second_batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let second_step = match second_batch.try_begin_step(second_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("alternate eager layout must reuse backing immediately after release"),
+    };
+    assert_eq!(second_step.backing_slices()[0].size_bytes(), 64);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    second_step.try_retire_normal().unwrap();
+    second_session.try_complete().unwrap();
+    drop(second_batch);
+    drop(second_session);
+    drop(second_sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'e',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(Arc::clone(&runtime), catalog, 256, memory_plan);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+
+    let (first_demand, first_requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(1),
+            shape(1),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    assert_eq!(
+        first_demand.immediate_claim().entries()[0].units().get(),
+        64
+    );
+    assert_eq!(first_requests[0].capacity_size_bytes, 256);
+    let LaneBackingPrepareDecision::Prepared(first_prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &first_requests)
+        .unwrap()
+    else {
+        panic!("resident reusable capacity bucket must prepare")
+    };
+    let first_committed = first_prepared.commit();
+    let first_certificate = Arc::clone(first_committed.certificate());
+    let (first_slices, first_slot) = first_committed.into_parts();
+    let first_evidence = first_slices[0].evidence().clone();
+    assert_eq!(first_evidence.size_bytes(), 64);
+    assert_eq!(first_evidence.capacity_size_bytes(), 256);
+    assert_eq!(first_evidence.physical_size_bytes(), 256);
+    assert_eq!(
+        first_evidence
+            .segments()
+            .iter()
+            .map(BackingSegment::length_bytes)
+            .sum::<u64>(),
+        256
+    );
+    drop(first_slices);
+    drop(first_slot);
+
+    let (second_demand, second_requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(2),
+            shape(2),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    assert_eq!(
+        second_demand.immediate_claim().entries()[0].units().get(),
+        128
+    );
+    assert_eq!(second_requests[0].capacity_size_bytes, 256);
+    let LaneBackingPrepareDecision::Prepared(second_prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &second_requests)
+        .unwrap()
+    else {
+        panic!("same reusable bucket must reclaim its idle stable slot")
+    };
+    let second_committed = second_prepared.commit();
+    assert!(
+        Arc::ptr_eq(&first_certificate, second_committed.certificate()),
+        "an idle lane slot must reuse its cold physical backing certificate"
+    );
+    let (second_slices, second_slot) = second_committed.into_parts();
+    let second_evidence = second_slices[0].evidence();
+    assert_eq!(second_evidence.size_bytes(), 128);
+    assert_eq!(second_evidence.capacity_size_bytes(), 256);
+    assert_eq!(second_evidence.segments(), first_evidence.segments());
+    assert_eq!(
+        second_evidence.pool_instance_id(),
+        first_evidence.pool_instance_id()
+    );
+    let second_view = harness.root.dynamic_pools.view(&second_slices[0]).unwrap();
+    assert_eq!(second_view.size_bytes(), 128);
+    assert_eq!(second_view.capacity_size_bytes(), 256);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    drop(second_view);
+    drop(second_slices);
+    drop(second_slot);
+    drop(binding);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn reusable_bucket_outside_immutable_plan_is_rejected_before_allocation() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'f',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(Arc::clone(&runtime), catalog, 256, memory_plan);
+    let lane = harness.root.create_execution_lane().unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let (_, mut requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(1),
+            shape(1),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    let foreign = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.foreign-packed-token").unwrap(),
+        bucket.capacity(),
+    )
+    .unwrap();
+    requests[0].reusable_execution_bucket_id = Some(foreign.bucket_id().clone());
+    let allocations_before = runtime.allocate_calls();
+    let error = match harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &requests)
+    {
+        Err(error) => error,
+        Ok(_) => panic!("foreign reusable bucket must fail closed"),
+    };
+    assert!(error.to_string().contains("outside its immutable plan"));
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    drop(binding);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn reusable_bucket_step_admission_keeps_logical_claim_exact() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        '7',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(Arc::clone(&runtime), catalog, 256, memory_plan);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let lane = harness.root.create_execution_lane().unwrap();
+    let sequence = admitted_sequence(&harness.root, "bucket-step-admission");
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap()
+    .with_reusable_execution_bucket(bucket.bucket_id().clone());
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("plan-owned reusable bucket must admit its exact logical work"),
+    };
+    assert_eq!(
+        step.reusable_execution_bucket()
+            .map(ReusableExecutionBucketSpec::bucket_id),
+        Some(bucket.bucket_id())
+    );
+    assert_eq!(step.backing_slices()[0].size_bytes(), 64);
+    assert_eq!(step.backing_slices()[0].capacity_size_bytes(), 256);
+    step.try_retire_normal().unwrap();
+    session.try_complete().unwrap();
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn busy_eager_backing_returns_pool_wait_then_retries_after_release() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'd',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(Arc::clone(&runtime), catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let first_sequence = admitted_sequence_with_ceiling(&harness.root, "busy-cache-first", 2);
+    let first_session = first_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let first_step = match first_batch
+        .try_begin_step(
+            StepResourceAdmissionRequest::new(
+                first_batch.bind_work_shape(vec![token_span(2)]).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            &lane,
+        )
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident busy eager layout must admit"),
+    };
+
+    let second_sequence = admitted_sequence(&harness.root, "busy-cache-second");
+    let second_session = second_sequence.open_session().unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+    let second_request = StepResourceAdmissionRequest::new(
+        second_batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let deferred = match second_batch
+        .try_begin_step(second_request.clone(), &lane)
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("busy alternate eager layout must defer physical backing"),
+    };
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        wait_condition,
+        pressure,
+        ..
+    } = deferred.maintain().unwrap()
+    else {
+        panic!("busy eager backing must become typed pool pressure")
+    };
+    let pool_pressure = pressure
+        .pool_resident()
+        .expect("busy cache pressure must identify its resident pool");
+    assert_eq!(pool_pressure.pool_id(), &harness.pool_ids[0]);
+    assert_eq!(pool_pressure.requested_bytes(), 64);
+    assert_eq!(pool_pressure.resident_bytes(), 128);
+    assert_eq!(pool_pressure.maximum_resident_bytes(), 128);
+    let waiter = harness
+        .root
+        .register_capacity_waiter(&wait_condition)
+        .unwrap();
+    assert!(!waiter.recheck().unwrap().should_retry());
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    first_step.try_retire_normal().unwrap();
+    assert!(waiter.recheck().unwrap().should_retry());
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+    drop(deferred);
+    let second_step = match second_batch.try_begin_step(second_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("released eager backing must admit the waiting alternate layout"),
+    };
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    second_step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(waiter);
+    drop(first_batch);
+    drop(second_batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first_sequence);
+    drop(second_sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '2',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '3',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    let donor_growth = maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let request = evaluated_request(&target_pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("occupied target backing must defer under the exact plan budget")
+    };
+    let device_epochs_before = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("idle donor residency must be rebalanced into the blocked target pool")
+    };
+    assert_eq!(growth.growths().len(), 1);
+    assert_eq!(growth.growths()[0].pool_id(), &target_pool_id);
+    assert_eq!(growth.growths()[0].chunk_bytes(), 64);
+    let rebalance = growth
+        .rebalance()
+        .expect("cross-pool maintenance must expose its reclaim receipt");
+    assert_eq!(rebalance.reclaimed_chunks(), 1);
+    assert_eq!(rebalance.reclaimed_bytes(), 64);
+    assert_eq!(rebalance.pools().len(), 1);
+    assert_eq!(rebalance.pools()[0].pool_id(), &donor_pool_id);
+    assert_eq!(
+        rebalance.pools()[0].chunks(),
+        std::slice::from_ref(donor_growth.chunk())
+    );
+    assert_eq!(rebalance.pools()[0].published_capacity_bytes(), 64);
+    let serialized_rebalance = serde_json::to_value(rebalance).unwrap();
+    assert_eq!(
+        serialized_rebalance["pools"][0]["pool_id"],
+        json!(donor_pool_id.as_str())
+    );
+    assert_eq!(
+        serialized_rebalance["pools"][0]["chunks"][0]["ordinal"],
+        json!(donor_growth.chunk().ordinal())
+    );
+    assert_eq!(
+        serialized_rebalance["pools"][0]["chunks"][0]["generation"],
+        json!(donor_growth.chunk().generation())
+    );
+    assert!(rebalance.plan_device_capacity_epoch() > device_epochs_before.plan_epoch());
+    assert!(rebalance.process_device_capacity_epoch() > device_epochs_before.process_epoch());
+
+    let status = maintenance.status().unwrap();
+    let donor = status
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &donor_pool_id)
+        .unwrap();
+    let target = status
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &target_pool_id)
+        .unwrap();
+    assert_eq!(donor.resident_bytes(), 64);
+    assert_eq!(donor.resident_chunks(), 1);
+    assert_eq!(target.resident_bytes(), 128);
+    assert_eq!(target.resident_chunks(), 2);
+    assert_eq!(status.budget_claimed_bytes(), 192);
+    assert_eq!(status.process_claimed_bytes(), 192);
+    assert_eq!(runtime.allocate_calls(), 4);
+
+    drop(held_target);
+    let BackingPrepareDecision::Prepared(prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("rebalanced target pool must satisfy the original claim")
+    };
+    drop(prepared.commit());
+}
+
+#[test]
+fn live_idle_donor_boundary_waits_then_rebalances_after_exact_release() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '4',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '5',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(runtime, catalog, 192, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+    let donor_pool = Arc::clone(&harness.root.dynamic_pools.pools[&donor_pool_id]);
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let donor_minimum = claim_size(&harness.root.dynamic_pools, &donor_pool, 64);
+    let donor_excess = claim_size(&harness.root.dynamic_pools, &donor_pool, 64);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let request = evaluated_request(&target_pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("full target pool must defer")
+    };
+
+    assert!(matches!(
+        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    let blocked = maintenance.status().unwrap();
+    assert_eq!(blocked.budget_claimed_bytes(), 192);
+    assert_eq!(
+        blocked
+            .pools()
+            .iter()
+            .find(|pool| pool.pool_id() == &donor_pool_id)
+            .unwrap()
+            .resident_chunks(),
+        2
+    );
+
+    drop(donor_excess);
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("the exact donor release must make one whole chunk reclaimable")
+    };
+    assert_eq!(growth.rebalance().unwrap().reclaimed_chunks(), 1);
+    assert_eq!(growth.rebalance().unwrap().reclaimed_bytes(), 64);
+    assert_eq!(maintenance.status().unwrap().budget_claimed_bytes(), 192);
+
+    drop(donor_minimum);
+    drop(held_target);
+}
+
+#[test]
+fn insufficient_idle_reclaim_keeps_all_residency_and_returns_typed_wait() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '6',
+        1,
+        96,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '7',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 160);
+    let harness = harness(runtime, catalog, 160, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 32).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let request = evaluated_request(&target_pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("full target pool must defer")
+    };
+    let before = maintenance.status().unwrap();
+    let device_epochs_before = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease { pressure, .. } =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("a partial donor chunk must not be reclaimed without satisfying the deficit")
+    };
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
+    let after = maintenance.status().unwrap();
+    assert_eq!(after.pools(), before.pools());
+    assert_eq!(after.budget_claimed_bytes(), before.budget_claimed_bytes());
+    assert_eq!(
+        after.process_claimed_bytes(),
+        before.process_claimed_bytes()
+    );
+    let device_epochs_after = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+    assert_eq!(device_epochs_after, device_epochs_before);
+
+    drop(held_target);
+}
+
+#[test]
+fn initial_bundle_waits_without_partial_request_and_allows_smaller_bypass() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '8',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        '9',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let sequence_pool_id = sequence_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 320);
+    let harness = harness(runtime, catalog, 320, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&request_pool_id).unwrap();
+    maintenance.grow_pool(&request_pool_id, 128).unwrap();
+    maintenance.initialize_pool(&sequence_pool_id).unwrap();
+    maintenance.grow_pool(&sequence_pool_id, 64).unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+
+    let work_a = work_with_ceiling(1, 1);
+    let active = match binding
+        .try_admit_initial_sequence(
+            RequestResourceAdmissionRequest::new(
+                work_a.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            SequenceResourceAdmissionRequest::new(
+                work_a,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/initial-bundle-a").unwrap(),
+            RequestIdentity::new("request/initial-bundle-a").unwrap(),
+        )
+        .unwrap()
+    {
+        InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("A must occupy one request and sequence slice"),
+    };
+    let before_b = maintenance.status().unwrap();
+    let logical_before_b = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+
+    let work_b = work_with_ceiling(2, 2);
+    let deferred = match binding
+        .try_admit_initial_sequence(
+            RequestResourceAdmissionRequest::new(
+                work_b.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            SequenceResourceAdmissionRequest::new(
+                work_b,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/initial-bundle-b").unwrap(),
+            RequestIdentity::new("request/initial-bundle-b").unwrap(),
+        )
+        .unwrap()
+    {
+        InitialSequenceResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("B must wait for its larger sequence backing"),
+    };
+    assert_eq!(
+        deferred.evidence().scope(),
+        DynamicBackingClaimScope::InitialSequenceBundle
+    );
+    let request_domain = harness.root.dynamic_pools.pools[&request_pool_id]
+        .domain
+        .domain_id;
+    let sequence_domain = harness.root.dynamic_pools.pools[&sequence_pool_id]
+        .domain
+        .domain_id;
+    assert_eq!(
+        deferred
+            .evidence()
+            .protected_immediate()
+            .units_for(request_domain)
+            .unwrap()
+            .get(),
+        128
+    );
+    assert_eq!(
+        deferred
+            .evidence()
+            .protected_immediate()
+            .units_for(sequence_domain)
+            .unwrap()
+            .get(),
+        128
+    );
+    let after_b = maintenance.status().unwrap();
+    let logical_after_b = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(after_b.pools(), before_b.pools());
+    assert_eq!(logical_after_b.domains(), logical_before_b.domains());
+    assert_eq!(logical_after_b.active_requests(), 1);
+    assert_eq!(logical_after_b.active_sequences(), 1);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+
+    let work_c = work_with_ceiling(1, 1);
+    let bypass = match binding
+        .try_admit_initial_sequence(
+            RequestResourceAdmissionRequest::new(
+                work_c.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            SequenceResourceAdmissionRequest::new(
+                work_c,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/initial-bundle-c").unwrap(),
+            RequestIdentity::new("request/initial-bundle-c").unwrap(),
+        )
+        .unwrap()
+    {
+        InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("C must bypass B while A remains active"),
+    };
+    let with_c = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(with_c.active_requests(), 2);
+    assert_eq!(with_c.active_sequences(), 2);
+
+    drop(deferred);
+    drop(bypass);
+    drop(active);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn plan_budget_wait_retains_staged_parent_and_reuses_released_sequence_backing() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '2',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        '3',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let sequence_pool_id = sequence_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&request_pool_id)
+        .unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&sequence_pool_id)
+        .unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&request_pool_id, 64)
+        .unwrap();
+
+    let active = admitted_sequence(&harness.root, "capacity-wait-active");
+    let staged = admitted_request(&harness.root, "capacity-wait-staged");
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::BackingDeferred(deferred) =
+        staged.try_admit_sequence(admission.clone()).unwrap()
+    else {
+        panic!("active sequence must occupy the staged request's sequence backing")
+    };
+    assert!(harness
+        .root
+        .trusted_runtime_binding()
+        .unwrap()
+        .maintain_request_backing_for_deferred(deferred.evidence())
+        .is_err());
+    let churned = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .notify_domain_availability_changed(
+            harness.root.dynamic_pools.pools[&request_pool_id]
+                .domain
+                .domain_id,
+        )
+        .unwrap();
+    assert_ne!(churned, deferred.evidence().epochs());
+    let allocations_before = runtime.allocate_calls();
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        current_epochs,
+        pressure,
+        ..
+    } = deferred.maintain().unwrap()
+    else {
+        panic!("retained parent must tolerate unrelated epoch churn")
+    };
+    assert_eq!(current_epochs, churned);
+    assert_eq!(
+        pressure.device_capacity().unwrap().scope(),
+        &DeviceCapacityPressureScope::PlanBudget
+    );
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    let retained = deferred.into_parent();
+    assert!(Arc::ptr_eq(&retained, &staged));
+    drop(active);
+    let released_epochs = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .epochs()
+        .unwrap();
+    assert!(released_epochs.capacity_epoch() > current_epochs.capacity_epoch());
+    let admitted = match retained.try_admit_sequence(admission).unwrap() {
+        SequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("retained staged parent must reuse released sequence backing"),
+    };
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    drop(admitted);
+    drop(retained);
+    drop(staged);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -805,7 +2364,7 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
         RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident pool must defer before waiter registration"),
     };
-    let waiter = binding.register_backing_waiter(&deferred).unwrap();
+    let waiter = deferred.register_waiter().unwrap();
     drop(binding);
 
     let first_close = match PlanRuntimeResources::close(harness.root) {
@@ -818,7 +2377,7 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
             strong_count,
             ..
         } => {
-            assert_eq!(strong_count, 2);
+            assert_eq!(strong_count, 3);
             resources
         }
         PlanRuntimeCloseOutcome::Closed(_) => {
@@ -827,13 +2386,14 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
     };
     assert!(root.is_closing());
     assert!(root.trusted_runtime_binding().is_err());
-    assert!(root.maintain_for_deferred(&deferred).is_err());
+    assert!(deferred.maintain().is_err());
     assert!(matches!(
         waiter.recheck(),
         Err(VNextError::InvalidExecutionPlan { reason })
             if reason == "closing plan runtime cannot recheck a capacity waiter"
     ));
     drop(waiter);
+    drop(deferred);
 
     let final_close = match PlanRuntimeResources::close(root) {
         Ok(outcome) => outcome,
@@ -847,6 +2407,46 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
             panic!("released waiter must allow the owning root to close")
         }
     }
+}
+
+#[test]
+fn device_buffer_retention_keeps_plan_root_referenced_until_release() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'e',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "plan-root-retention");
+    let retention = sequence.device_buffer_retention();
+    drop(sequence);
+
+    let root = match PlanRuntimeResources::close(harness.root) {
+        Ok(PlanRuntimeCloseOutcome::Referenced {
+            resources,
+            strong_count,
+            ..
+        }) => {
+            assert_eq!(strong_count, 2);
+            resources
+        }
+        Ok(PlanRuntimeCloseOutcome::Closed(_)) => {
+            panic!("live device buffer retention unexpectedly allowed root close")
+        }
+        Err(failure) => panic!("retained root close failed: {:?}", failure.failure()),
+    };
+
+    drop(retention);
+    close_dynamic_test_root(root);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -873,7 +2473,7 @@ async fn closing_root_wakes_capacity_waiter_without_lost_notification() {
         RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident pool must defer before async waiter registration"),
     };
-    let waiter = binding.register_backing_waiter(&deferred).unwrap();
+    let waiter = deferred.register_waiter().unwrap();
     drop(binding);
     let task = tokio::spawn(waiter.wait_for_change());
 
@@ -893,6 +2493,7 @@ async fn closing_root_wakes_capacity_waiter_without_lost_notification() {
         Err(VNextError::InvalidExecutionPlan { reason })
             if reason == "closing plan runtime cancelled its capacity waiter"
     ));
+    drop(deferred);
 
     let final_close = match PlanRuntimeResources::close(root) {
         Ok(outcome) => outcome,
@@ -1034,7 +2635,7 @@ fn lifecycle_gate_linearizes_maintenance_before_close() {
                 close
             })
             .expect("the single bounded close-race worker starts");
-        let maintenance = root.maintain_for_deferred(&deferred);
+        let maintenance = deferred.maintain();
         let close = worker
             .join()
             .expect("the bounded close-race worker does not panic");
@@ -1054,7 +2655,8 @@ fn lifecycle_gate_linearizes_maintenance_before_close() {
     };
     assert!(closing_root.is_closing());
     assert!(closing_root.trusted_runtime_binding().is_err());
-    assert!(closing_root.maintain_for_deferred(&deferred).is_err());
+    assert!(deferred.maintain().is_err());
+    drop(deferred);
     drop(root);
     match PlanRuntimeResources::close(closing_root) {
         Ok(PlanRuntimeCloseOutcome::Closed(_)) => {}
@@ -1063,6 +2665,39 @@ fn lifecycle_gate_linearizes_maintenance_before_close() {
         }
         Err(failure) => panic!("final close failed: {:?}", failure.failure()),
     }
+}
+
+#[test]
+fn quiescent_sequence_abort_is_one_terminal_transition() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'f',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    let _initialization = harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "quiescent-atomic-abort");
+    let session = sequence.open_session().unwrap();
+
+    let terminal = session.try_abort_if_quiescent().unwrap();
+
+    assert_eq!(
+        terminal.disposition(),
+        SequenceSessionTerminalDisposition::Aborted
+    );
+    assert!(session.request_cancel().is_err());
+    drop(terminal);
+    drop(session);
+    drop(sequence);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -1614,6 +3249,7 @@ fn scoped_demand_merges_per_pool_and_release_coalesces_extents() {
             None,
             shape(1),
             shape(1),
+            None,
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
@@ -1654,6 +3290,710 @@ fn scoped_demand_merges_per_pool_and_release_coalesces_extents() {
 }
 
 #[test]
+fn physical_region_retention_prevents_dynamic_extent_reuse() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'e',
+        1,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let admitted = admitted_request(&harness.root, "retained-physical-region");
+    let retained_bytes = admitted.backing_slices()[0]
+        .evidence()
+        .physical_size_bytes();
+    let retention = {
+        let view = harness
+            .root
+            .dynamic_pools
+            .view(&admitted.backing_slices()[0])
+            .unwrap();
+        view.segment_bindings()[0].retention()
+    };
+
+    drop(admitted);
+    let retained_status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(retained_status.pools()[0].live_segments(), 1);
+    assert_eq!(retained_status.pools()[0].free_bytes(), 0);
+
+    drop(retention);
+    let released_status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(released_status.pools()[0].live_segments(), 0);
+    assert_eq!(released_status.pools()[0].free_bytes(), retained_bytes);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn request_token_backing_covers_nonzero_chunk_source_range() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let request = RequestResourceAdmissionRequest::new(
+        chunked_work(4, 2..3),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let admitted = match binding
+        .try_admit_request(
+            request,
+            RunId::new("run/chunked-request-backing").unwrap(),
+            RequestIdentity::new("request/chunked-request-backing").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::Admitted(admitted) => admitted,
+        _ => panic!("resident full-input request backing must admit"),
+    };
+
+    assert_eq!(admitted.work_shape().immediate_tokens(), 1);
+    assert_eq!(admitted.work_shape().fit_tokens(), 4);
+    assert_eq!(admitted.backing_slices().len(), 1);
+    assert_eq!(admitted.backing_slices()[0].size_bytes(), 256);
+    let snapshot = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(snapshot.domains()[0].used().get(), 256);
+
+    drop(admitted);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn step_captures_the_exact_sequence_backing_snapshot() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "sequence-backing-snapshot");
+    let admitted_snapshot = sequence.backing_snapshot().unwrap();
+    assert_eq!(admitted_snapshot.generation().get(), 1);
+    assert_eq!(admitted_snapshot.backing_slices().len(), 1);
+    assert_eq!(admitted_snapshot.backing_slices()[0].size_bytes(), 64);
+
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident sequence snapshot step must admit"),
+    };
+    assert!(Arc::ptr_eq(
+        step.participant_backing_snapshot(BatchParticipantAuthority::new(
+            sequence.sequence_authority(),
+            sequence.request_authority(),
+        ))
+        .unwrap(),
+        &admitted_snapshot
+    ));
+
+    step.try_retire_normal().unwrap();
+    session.try_complete().unwrap();
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(admitted_snapshot);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn step_backing_deferral_retains_exact_participant_session_until_retry() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'b',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    let sequence = admitted_sequence(&harness.root, "step-deferral-parent");
+    let session = sequence.open_session().unwrap();
+    let session_weak = Arc::downgrade(&session);
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+
+    let deferred = match batch.try_begin_step(request.clone(), &lane).unwrap() {
+        StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("zero-resident step backing must defer"),
+    };
+    assert_eq!(deferred.participant_count(), 1);
+    assert_eq!(
+        deferred.work_fingerprint(),
+        request.work_shape().fingerprint()
+    );
+    drop(batch);
+    drop(session);
+    assert!(session_weak.upgrade().is_some());
+
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::Maintained(_)
+    ));
+    let retained_session = session_weak
+        .upgrade()
+        .expect("step backing authority retains its exact participant session");
+    drop(deferred);
+    let retry_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&retained_session)]).unwrap();
+    let step = match retry_batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("maintained step backing must admit for the retained participant"),
+    };
+    step.try_retire_normal().unwrap();
+    retained_session.try_complete().unwrap();
+    drop(retry_batch);
+    drop(retained_session);
+    assert!(session_weak.upgrade().is_none());
+    drop(sequence);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_backing_extension_publishes_atomically_between_frames() {
+    let catalog = pool_catalog_with_options(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+        "state",
+        false,
+        StateInitialization::Zero,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "sequence-backing-extension", 2);
+    let initial = sequence.backing_snapshot().unwrap();
+    let initial_cell = Arc::clone(initial.backing_slices()[0].initialization_cell().unwrap());
+    assert!(initial_cell.prepare("wave/initial").unwrap());
+    initial_cell.mark_in_flight("wave/initial").unwrap();
+    initial_cell.finish("wave/initial", true).unwrap();
+    let session = sequence.open_session().unwrap();
+    let active_before = TrustedActiveSequenceBinding::from_session(&session).unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let participant =
+        BatchParticipantAuthority::new(sequence.sequence_authority(), sequence.request_authority());
+
+    let first_step = match batch
+        .try_begin_step(
+            StepResourceAdmissionRequest::new(
+                batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            &lane,
+        )
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident first frame must admit"),
+    };
+    let first_captured = Arc::clone(
+        first_step
+            .participant_backing_snapshot(participant)
+            .unwrap(),
+    );
+    match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::RetryRequired(current) => {
+            assert!(Arc::ptr_eq(&current, &initial));
+        }
+        _ => panic!("an active frame must defer sequence backing publication"),
+    }
+    first_step.try_retire_normal().unwrap();
+
+    let extended = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("resident paged capacity must extend after frame retirement"),
+    };
+    assert_eq!(initial.generation().get(), 1);
+    assert_eq!(first_captured.generation().get(), 1);
+    assert_eq!(extended.generation().get(), 2);
+    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.backing_slices().len(), 2);
+    assert!(Arc::ptr_eq(
+        extended.backing_slices()[0].initialization_cell().unwrap(),
+        &initial_cell
+    ));
+    assert_eq!(
+        extended.backing_slices()[0]
+            .initialization_status()
+            .unwrap(),
+        Some(BackingInitializationStatus::Initialized)
+    );
+    assert!(!Arc::ptr_eq(
+        extended.backing_slices()[1].initialization_cell().unwrap(),
+        &initial_cell
+    ));
+    assert_eq!(
+        extended.backing_slices()[1]
+            .initialization_status()
+            .unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
+    assert_eq!(
+        extended
+            .backing_slices()
+            .iter()
+            .map(LogicalBackingSliceAuthority::size_bytes)
+            .sum::<u64>(),
+        128
+    );
+    let active_after = TrustedActiveSequenceBinding::from_session(&session).unwrap();
+    assert_eq!(active_before.fingerprint(), active_after.fingerprint());
+
+    let second_step = match batch
+        .try_begin_step(
+            StepResourceAdmissionRequest::new(
+                batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            &lane,
+        )
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident second frame must admit"),
+    };
+    assert!(Arc::ptr_eq(
+        second_step
+            .participant_backing_snapshot(participant)
+            .unwrap(),
+        &extended
+    ));
+    let resource_id = extended.backing_slices()[0].resource_id().clone();
+    let view = second_step
+        .participant_backing_view(participant, &resource_id)
+        .unwrap();
+    assert_eq!(view.size_bytes(), 128);
+    assert_eq!(view.segment_bindings().len(), 2);
+
+    second_step.try_retire_normal().unwrap();
+    let covered_prefix = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(1), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Current(snapshot) => snapshot,
+        _ => panic!("a committed backing frontier must cover a narrower execution prefix"),
+    };
+    assert!(Arc::ptr_eq(&covered_prefix, &extended));
+
+    let over_ceiling = match session.try_ensure_backing_covers(
+        SequenceResourceExtensionRequest::new(work(3), AdmissionPressureAction::WaitForRelease)
+            .unwrap(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("sequence extension above the request ceiling must fail"),
+    };
+    assert!(over_ceiling
+        .to_string()
+        .contains("parent request token ceiling"));
+    session.try_complete().unwrap();
+    drop(active_after);
+    drop(active_before);
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(first_captured);
+    drop(initial);
+    drop(covered_prefix);
+    drop(extended);
+    let released = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert!(!released.poisoned());
+    assert_eq!(released.active_child_claims(), 0);
+    assert_eq!(released.active_sequences(), 0);
+    assert_eq!(released.active_requests(), 0);
+    assert!(released
+        .domains()
+        .iter()
+        .all(|domain| domain.used().get() == 0));
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let first = admitted_sequence_with_ceiling(&harness.root, "extension-wait-first", 2);
+    let second = admitted_sequence_with_ceiling(&harness.root, "extension-wait-second", 2);
+    let session = first.open_session().unwrap();
+
+    let deferred = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("resident sequence backing pressure must wait for release"),
+    };
+    let waiter = deferred.register_waiter().unwrap();
+    assert!(!waiter.recheck().unwrap().should_retry());
+
+    drop(second);
+    assert!(waiter.recheck().unwrap().should_retry());
+    drop(waiter);
+    drop(deferred);
+
+    let extended = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("released backing capacity must admit the pending extension"),
+    };
+    assert_eq!(extended.generation().get(), 2);
+    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.backing_slices().len(), 2);
+
+    session.request_cancel().unwrap();
+    session.try_abort().unwrap();
+    drop(session);
+    drop(first);
+    drop(extended);
+    let released = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert!(!released.poisoned());
+    assert_eq!(released.active_child_claims(), 0);
+    assert_eq!(released.active_sequences(), 0);
+    assert_eq!(released.active_requests(), 0);
+    assert!(released
+        .domains()
+        .iter()
+        .all(|domain| domain.used().get() == 0));
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_extension_deferral_retains_exact_session_and_rejects_stale_generation() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'b',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let first = admitted_sequence_with_ceiling(&harness.root, "extension-owner-first", 2);
+    let second = admitted_sequence_with_ceiling(&harness.root, "extension-owner-second", 2);
+    let session = first.open_session().unwrap();
+    let target = work(2);
+
+    let deferred = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(
+                target.clone(),
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("occupied backing must defer the exact sequence extension"),
+    };
+    assert_eq!(deferred.expected_generation().get(), 1);
+    assert_eq!(deferred.target_fingerprint(), target.fingerprint());
+
+    let session_weak = Arc::downgrade(&session);
+    drop(session);
+    assert!(session_weak.upgrade().is_some());
+    drop(second);
+
+    let retained_session = session_weak
+        .upgrade()
+        .expect("the deferred authority retains its exact session");
+    let extended = match retained_session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(target, AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("released backing must extend through the retained session"),
+    };
+    assert_eq!(extended.generation().get(), 2);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+
+    retained_session.request_cancel().unwrap();
+    let terminal = retained_session.try_abort().unwrap();
+    assert!(deferred.maintain().is_err());
+    drop(terminal);
+    drop(deferred);
+    drop(retained_session);
+    assert!(session_weak.upgrade().is_none());
+    drop(first);
+    drop(extended);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn invocation_subset_maps_its_local_participant_to_the_step_snapshot() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_nodes(
+        runtime,
+        catalog,
+        256,
+        false,
+        Arc::from(vec![PlanNode::resource_test_node(
+            NodeId::new("node/dynamic-pool-test").unwrap(),
+        )]),
+    );
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let first = admitted_sequence(&harness.root, "snapshot-subset-first");
+    let second = admitted_sequence(&harness.root, "snapshot-subset-second");
+    let first_session = first.open_session().unwrap();
+    let second_session = second.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![
+        Arc::clone(&second_session),
+        Arc::clone(&first_session),
+    ])
+    .unwrap();
+    let step_request = StepResourceAdmissionRequest::new(
+        batch
+            .bind_work_shape(vec![token_span(1), token_span(1)])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(step_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident two-participant step must admit"),
+    };
+
+    let selected = batch.sessions()[1].resources();
+    let selected_snapshot = selected.backing_snapshot().unwrap();
+    let unselected_snapshot = batch.sessions()[0].resources().backing_snapshot().unwrap();
+    let selected_authority =
+        BatchParticipantAuthority::new(selected.sequence_authority(), selected.request_authority());
+    let invocation_request = InvocationResourceAdmissionRequest::new(
+        NodeId::new("node/dynamic-pool-test").unwrap(),
+        step.bind_invocation_work_shape(vec![(selected_authority, token_span(1))])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let invocation = match step.try_admit_invocation(invocation_request).unwrap() {
+        InvocationResourceAdmissionDecision::Admitted(invocation) => invocation,
+        _ => panic!("resident invocation subset must admit"),
+    };
+    let captured = invocation.participant_backing_snapshot(0).unwrap();
+    assert!(Arc::ptr_eq(captured, &selected_snapshot));
+    assert!(!Arc::ptr_eq(captured, &unselected_snapshot));
+
+    drop(invocation);
+    step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first);
+    drop(second);
+    drop(selected_snapshot);
+    drop(unselected_snapshot);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn step_slot_projects_two_logical_activations_from_one_physical_extent() {
+    let catalog = shared_step_activation_catalog(linear_profile());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "shared-step-slot");
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident shared Step slot must admit"),
+    };
+
+    assert_eq!(
+        step.claimed_backing().demand().immediate_claim().entries()[0]
+            .units()
+            .get(),
+        64
+    );
+    assert_eq!(step.backing_slices().len(), 2);
+    assert_eq!(step.claimed_backing().physical_claim_count(), 1);
+    assert!(step.claimed_backing().has_shared_physical_claims());
+    let first = step.backing_slices()[0].evidence();
+    let second = step.backing_slices()[1].evidence();
+    assert_eq!(
+        first.physical_claim_identity(),
+        second.physical_claim_identity()
+    );
+    assert_eq!(first.physical_size_bytes(), 64);
+    assert_eq!(second.physical_size_bytes(), 64);
+    assert_eq!(first.segments(), second.segments());
+    assert_eq!(
+        harness
+            .root
+            .maintenance_controller
+            .status()
+            .unwrap()
+            .pools()[0]
+            .live_segments(),
+        1
+    );
+    let invocation = InvocationResourceAdmissionRequest::for_all_step_participants(
+        NodeId::new("node/shared-step-slot").unwrap(),
+        step.bind_all_invocation_work_shape(vec![token_span(1)])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let error = match step.try_admit_invocation(invocation) {
+        Err(error) => error,
+        Ok(_) => panic!("single-node dispatch consumed a wave-only Step slot"),
+    };
+    assert!(error.to_string().contains("single-fence submission wave"));
+
+    step.try_retire_normal().unwrap();
+    let status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(status.pools()[0].live_segments(), 0);
+    assert_eq!(status.pools()[0].free_bytes(), 64);
+}
+
+#[test]
 fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
     let catalog = pool_catalog(
         linear_profile(),
@@ -1675,13 +4015,12 @@ fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
     let last = claim_size(&harness.root.dynamic_pools, &pool, 64);
     drop(first);
     drop(last);
-    let request = EvaluatedBackingRequest {
-        domain: &pool.domain,
-        descriptor: &pool.domain.descriptors[0],
-        size_bytes: pool.domain.descriptors[0]
+    let request = evaluated_request(
+        &pool,
+        pool.domain.descriptors[0]
             .evaluate_request_bytes(&work(2))
             .unwrap(),
-    };
+    );
     let BackingPrepareDecision::Deferred(deferred) = harness
         .root
         .dynamic_pools
@@ -1712,6 +4051,121 @@ fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
     let authority = prepared.commit().pop().unwrap();
     assert_eq!(authority.evidence().segments().len(), 1);
     assert_eq!(authority.evidence().segments()[0].length_bytes(), 128);
+}
+
+#[test]
+fn contiguous_batch_deferral_retains_whole_packing_demand_and_grows_to_progress() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'c',
+        2,
+        2_048,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 2_048);
+    let harness = harness(runtime, catalog, 2_048, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.grow_pool(&harness.pool_ids[0], 640).unwrap();
+    maintenance.grow_pool(&harness.pool_ids[0], 256).unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let requests = vec![
+        evaluated_descriptor_request(&pool, 0, 448),
+        evaluated_descriptor_request(&pool, 1, 448),
+    ];
+
+    let BackingPrepareDecision::Deferred(deferred) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("640+256 free bytes cannot initially pack two 448-byte claims")
+    };
+    let blocker = &deferred.blockers()[0];
+    assert_eq!(
+        blocker.reason(),
+        DynamicBackingDeferralReason::FragmentedContiguous
+    );
+    assert_eq!(blocker.free_bytes(), 896);
+    assert_eq!(blocker.largest_contiguous_bytes(), 640);
+    assert_eq!(blocker.requested_bytes(), 448);
+    assert_eq!(
+        blocker.contiguous_claim_bytes_descending(),
+        Some([448, 448].as_slice())
+    );
+    assert!(blocker
+        .free_extent_layout_fingerprint()
+        .starts_with("sha256/"));
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("whole-transaction fragmentation must grow or wait, never retry unchanged")
+    };
+    assert_eq!(growth.growths().len(), 1);
+    assert_eq!(growth.growths()[0].chunk_bytes(), 448);
+
+    let BackingPrepareDecision::Prepared(prepared) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("the progress-producing growth must make the exact batch packable")
+    };
+    let authorities = prepared.commit();
+    assert_eq!(authorities.len(), 2);
+    drop(authorities);
+    let status = maintenance.status().unwrap();
+    assert_eq!(status.pools()[0].resident_bytes(), 1_344);
+    assert_eq!(status.pools()[0].free_bytes(), 1_344);
+}
+
+#[test]
+fn contiguous_batch_shortfall_grows_for_packability_not_aggregate_bytes() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'd',
+        3,
+        4_096,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 4_096);
+    let harness = harness(runtime, catalog, 4_096, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.grow_pool(&harness.pool_ids[0], 368).unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let requests = vec![
+        evaluated_descriptor_request(&pool, 0, 720),
+        evaluated_descriptor_request(&pool, 1, 720),
+        evaluated_descriptor_request(&pool, 2, 720),
+    ];
+
+    let BackingPrepareDecision::Deferred(deferred) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("one undersized chunk cannot hold three contiguous claims")
+    };
+    let blocker = &deferred.blockers()[0];
+    assert_eq!(
+        blocker.reason(),
+        DynamicBackingDeferralReason::GrowthRequired
+    );
+    assert_eq!(blocker.free_bytes(), 368);
+    assert_eq!(blocker.largest_contiguous_bytes(), 368);
+    assert_eq!(blocker.requested_bytes(), 2_160);
+    assert_ne!(blocker.requested_bytes(), 2_160 - 368);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("contiguous shortfall must install one transaction-packable chunk")
+    };
+    assert_eq!(growth.growths()[0].chunk_bytes(), 2_160);
+    let BackingPrepareDecision::Prepared(prepared) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("one transaction-packable growth must satisfy all three claims")
+    };
+    let authorities = prepared.commit();
+    assert_eq!(authorities.len(), 3);
+    drop(authorities);
 }
 
 #[test]
@@ -1774,11 +4228,9 @@ fn two_plans_contend_on_one_process_wide_device_account() {
         RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident first plan must defer"),
     };
-    assert!(second
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&foreign)
-        .is_err());
+    assert!(
+        PlanBackingDeferral::new(Arc::clone(&second.root), foreign.evidence().clone(),).is_err()
+    );
     let first_status = &first.root.maintenance_controller.status().unwrap();
     let second_status = &second.root.maintenance_controller.status().unwrap();
     assert_eq!(first_status.effective_device_usable_ceiling_bytes(), 96);
@@ -1795,12 +4247,56 @@ fn two_plans_contend_on_one_process_wide_device_account() {
     assert_eq!(first_status.process_claimed_bytes(), 96);
     assert_eq!(first_status.budget_claimed_bytes(), 96);
     assert_eq!(second_status.budget_claimed_bytes(), 0);
-    assert!(second
+    let second_deferred = match second
         .root
-        .maintenance_controller
-        .grow_pool(&second.pool_ids[0], 64)
-        .is_err());
+        .trusted_runtime_binding()
+        .unwrap()
+        .try_admit_request(
+            request_admission(),
+            RunId::new("run/process-wide-deferred").unwrap(),
+            RequestIdentity::new("request/process-wide-deferred").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("zero-resident second plan must defer its own backing"),
+    };
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        wait_condition,
+        pressure,
+        ..
+    } = second_deferred.maintain().unwrap()
+    else {
+        panic!("process-wide pressure must become a typed capacity wait")
+    };
+    assert_eq!(
+        pressure.device_capacity().unwrap().scope(),
+        &DeviceCapacityPressureScope::ProcessWide
+    );
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
+    assert!(wait_condition
+        .observed()
+        .iter()
+        .any(|entry| { entry.source() == CapacityAvailabilitySource::ProcessDeviceCapacity }));
+    let registration = second
+        .root
+        .register_capacity_waiter(&wait_condition)
+        .unwrap();
+    assert!(!registration.recheck().unwrap().should_retry());
+    assert!(matches!(
+        second
+            .root
+            .maintenance_controller
+            .grow_pool(&second.pool_ids[0], 64),
+        Err(VNextError::DeviceCapacityUnavailable(pressure))
+            if pressure.scope() == &DeviceCapacityPressureScope::ProcessWide
+                && pressure.requested_bytes() == 64
+                && pressure.available_bytes() == 0
+    ));
+    drop(foreign);
     drop(first);
+    assert!(registration.recheck().unwrap().should_retry());
     second
         .root
         .maintenance_controller
@@ -1882,26 +4378,128 @@ fn controller_maintains_current_deferral_and_retries_stale_epoch_without_growth(
     assert_eq!(before.pools()[0].resident_bytes(), 0);
     assert_eq!(before.budget_claimed_bytes(), 0);
 
-    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = harness
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&deferred)
-        .unwrap()
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = deferred.maintain().unwrap()
     else {
         panic!("current deferral must be maintained")
     };
     assert_eq!(receipt.growths().len(), 1);
     assert_eq!(runtime.allocate_calls(), 1);
-    let DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs } = harness
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&deferred)
-        .unwrap()
+    let DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } =
+        deferred.maintain().unwrap()
     else {
         panic!("stale deferral must retry without another growth")
     };
-    assert_ne!(current_epochs, deferred.epochs());
+    assert_ne!(current_epochs, deferred.evidence().epochs());
     assert_eq!(runtime.allocate_calls(), 1);
+}
+
+#[test]
+fn sequence_backing_deferral_remains_current_while_parent_request_is_retained() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'd',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'e',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let sequence_pool_id = sequence_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&request_pool_id)
+        .unwrap();
+    let request = admitted_request(&harness.root, "retained-parent-deferral");
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::BackingDeferred(deferred) =
+        request.try_admit_sequence(admission).unwrap()
+    else {
+        panic!("zero-resident sequence backing must defer")
+    };
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = deferred.maintain().unwrap()
+    else {
+        panic!("retained parent must keep the child backing evidence current")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(receipt.growths()[0].pool_id(), &sequence_pool_id);
+    assert_eq!(runtime.allocate_calls(), 2);
+
+    drop(deferred);
+    drop(request);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_backing_deferral_retains_exact_parent_after_external_parent_release() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'f',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        '1',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&request_pool_id)
+        .unwrap();
+    let request = admitted_request(&harness.root, "released-parent-deferral");
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::BackingDeferred(deferred) =
+        request.try_admit_sequence(admission).unwrap()
+    else {
+        panic!("zero-resident sequence backing must defer")
+    };
+    let parent_authority = request.request_authority();
+    assert_eq!(deferred.parent().request_authority(), parent_authority);
+    drop(request);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = deferred.maintain().unwrap()
+    else {
+        panic!("typed sequence deferral must retain its exact parent authority")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(runtime.allocate_calls(), 2);
+    let retained = deferred.into_parent();
+    assert_eq!(retained.request_authority(), parent_authority);
+    drop(retained);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -1930,6 +4528,12 @@ fn descriptor_mismatch_is_observable_and_explicit_cleanup_returns_its_grant() {
     assert_eq!(quarantined.pools()[0].quarantined_bytes(), 64);
     assert_eq!(quarantined.pools()[0].descriptor_mismatch_chunks(), 1);
     assert_eq!(quarantined.pools()[0].publication_rejected_chunks(), 0);
+    let before_release = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
 
     let released = harness
         .root
@@ -1943,6 +4547,14 @@ fn descriptor_mismatch_is_observable_and_explicit_cleanup_returns_its_grant() {
     assert_eq!(clean.process_claimed_bytes(), 0);
     assert_eq!(clean.budget_claimed_bytes(), 0);
     assert_eq!(clean.pools()[0].quarantined_chunks(), 0);
+    let after_release = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+    assert!(after_release.plan_epoch() > before_release.plan_epoch());
+    assert!(after_release.process_epoch() > before_release.process_epoch());
 }
 
 #[test]
@@ -2084,16 +4696,8 @@ fn multi_pool_invalid_request_and_prepared_drop_have_zero_partial_claim() {
         .unwrap();
     let first = &harness.root.dynamic_pools.pools[&harness.pool_ids[0]];
     let second = &harness.root.dynamic_pools.pools[&harness.pool_ids[1]];
-    let valid = EvaluatedBackingRequest {
-        domain: &first.domain,
-        descriptor: &first.domain.descriptors[0],
-        size_bytes: 64,
-    };
-    let invalid = EvaluatedBackingRequest {
-        domain: &second.domain,
-        descriptor: &second.domain.descriptors[0],
-        size_bytes: 1,
-    };
+    let valid = evaluated_request(first, 64);
+    let invalid = evaluated_request(second, 1);
     assert!(harness
         .root
         .dynamic_pools
@@ -2110,11 +4714,7 @@ fn multi_pool_invalid_request_and_prepared_drop_have_zero_partial_claim() {
         .iter()
         .map(|pool_id| {
             let pool = &harness.root.dynamic_pools.pools[pool_id];
-            EvaluatedBackingRequest {
-                domain: &pool.domain,
-                descriptor: &pool.domain.descriptors[0],
-                size_bytes: 64,
-            }
+            evaluated_request(pool, 64)
         })
         .collect::<Vec<_>>();
     let BackingPrepareDecision::Prepared(prepared) = harness
@@ -2167,11 +4767,7 @@ fn nth_pool_allocator_fault_rolls_back_prior_pool_and_poison_closes_faulted_pool
         .iter()
         .map(|pool_id| {
             let pool = &harness.root.dynamic_pools.pools[pool_id];
-            EvaluatedBackingRequest {
-                domain: &pool.domain,
-                descriptor: &pool.domain.descriptors[0],
-                size_bytes: 64,
-            }
+            evaluated_request(pool, 64)
         })
         .collect::<Vec<_>>();
     assert!(harness.root.dynamic_pools.prepare_claim(&requests).is_err());
