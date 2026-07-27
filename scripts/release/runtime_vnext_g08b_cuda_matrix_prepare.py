@@ -13,7 +13,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import bounded_command
 import runtime_vnext_baseline_scenarios as matrix
@@ -22,8 +22,8 @@ import runtime_vnext_baseline_scenarios as matrix
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_REPO_PATH = SCRIPT_PATH.relative_to(REPO_ROOT).as_posix()
-MODEL_KEY = "m2-qwen35-35b-a3b"
-SERVED_MODEL_NAME = "m2-qwen35-35b-a3b"
+G08B_MODEL_KEY = "m2-qwen35-35b-a3b"
+G08B_SERVED_MODEL_NAME = "m2-qwen35-35b-a3b"
 BUILD_DIR = Path("build/candidate")
 BUILD_RECEIPT_REL = BUILD_DIR / "candidate-build-receipt.json"
 BUILD_BINARY_REL = BUILD_DIR / "ferrum"
@@ -50,6 +50,8 @@ BUILD_ENV_KEYS = (
 @dataclass(frozen=True)
 class BackendSpec:
     backend: str
+    model_key: str
+    model_label: str
     model_lock_path: Path
     lock_id: str
     weight_revision: str
@@ -64,10 +66,14 @@ class BackendSpec:
     typed_serve_config: dict[str, Any]
     run_extra_args: tuple[str, ...]
     serve_extra_args: tuple[str, ...]
+    source_repo_paths: tuple[str, ...]
+    selftest_temp_prefix: str
 
 
 CUDA_SPEC = BackendSpec(
     backend="cuda",
+    model_key=G08B_MODEL_KEY,
+    model_label="G08B M2",
     model_lock_path=SCRIPT_PATH.parent
     / "configs/runtime_vnext_g08b_m2_cuda.models.lock.json",
     lock_id="runtime-vnext-g08b-m2-cuda-v1",
@@ -93,7 +99,7 @@ CUDA_SPEC = BackendSpec(
         "backend": "cuda",
         "gpu_devices": [0],
         "gpu_memory_utilization": 0.9,
-        "served_model_name": SERVED_MODEL_NAME,
+        "served_model_name": G08B_SERVED_MODEL_NAME,
     },
     run_extra_args=(
         "--gpu-devices",
@@ -107,12 +113,16 @@ CUDA_SPEC = BackendSpec(
         "--gpu-memory-utilization",
         "0.90",
         "--served-model-name",
-        SERVED_MODEL_NAME,
+        G08B_SERVED_MODEL_NAME,
     ),
+    source_repo_paths=(SCRIPT_REPO_PATH,),
+    selftest_temp_prefix="ferrum-g08b-cuda-prepare-",
 )
 
 METAL_SPEC = BackendSpec(
     backend="metal",
+    model_key=G08B_MODEL_KEY,
+    model_label="G08B M2",
     model_lock_path=SCRIPT_PATH.parent
     / "configs/runtime_vnext_g08b_m2_metal.models.lock.json",
     lock_id="runtime-vnext-g08b-m2-metal-v1",
@@ -139,7 +149,7 @@ METAL_SPEC = BackendSpec(
     typed_serve_config={
         "backend": "metal",
         "gpu_memory_utilization": 0.9,
-        "served_model_name": SERVED_MODEL_NAME,
+        "served_model_name": G08B_SERVED_MODEL_NAME,
     },
     run_extra_args=(
         "--gpu-memory-utilization",
@@ -149,8 +159,13 @@ METAL_SPEC = BackendSpec(
         "--gpu-memory-utilization",
         "0.90",
         "--served-model-name",
-        SERVED_MODEL_NAME,
+        G08B_SERVED_MODEL_NAME,
     ),
+    source_repo_paths=(
+        SCRIPT_REPO_PATH,
+        "scripts/release/runtime_vnext_g08b_metal_matrix_prepare.py",
+    ),
+    selftest_temp_prefix="ferrum-g08b-metal-prepare-",
 )
 
 BACKEND_SPECS = {
@@ -193,17 +208,24 @@ def run_text(argv: Sequence[str], *, timeout: float = 30.0) -> str:
     return result.stdout.strip()
 
 
-def source_observation() -> dict[str, Any]:
+def source_observation(spec: BackendSpec) -> dict[str, Any]:
     status = run_text(["git", "status", "--short", "--untracked-files=all"])
     require(not status, "candidate preparation requires a clean worktree")
     source_git_sha = run_text(["git", "rev-parse", "HEAD"])
     source_tree_sha = run_text(["git", "rev-parse", "HEAD^{tree}"])
     require(matrix.GIT_SHA_RE.fullmatch(source_git_sha) is not None, "candidate source SHA is invalid")
     require(matrix.GIT_SHA_RE.fullmatch(source_tree_sha) is not None, "candidate source tree SHA is invalid")
-    require(
-        run_text(["git", "cat-file", "-e", f"{source_git_sha}:{SCRIPT_REPO_PATH}"]) == "",
-        "candidate prepare script is not checked in at the source SHA",
-    )
+    for source_repo_path in spec.source_repo_paths:
+        require(
+            run_text(
+                ["git", "cat-file", "-e", f"{source_git_sha}:{source_repo_path}"]
+            )
+            == "",
+            (
+                "candidate prepare source is not checked in at the source SHA: "
+                f"{source_repo_path}"
+            ),
+        )
     return {
         "source_git_sha": source_git_sha,
         "source_tree_sha": source_tree_sha,
@@ -255,26 +277,42 @@ def validate_checked_in_lock(spec: BackendSpec) -> dict[str, Any]:
     )
     document = matrix.require_object(
         matrix.read_json(spec.model_lock_path),
-        f"G08B M2 {spec.backend.upper()} model lock",
+        f"{spec.model_label} {spec.backend.upper()} model lock",
     )
-    require(document.get("schema_version") == matrix.SCHEMA_VERSION, "G08B model lock schema mismatch")
-    require(document.get("lock_id") == spec.lock_id, "G08B model lock id mismatch")
-    sources = matrix.locked_execution_sources(document, MODEL_KEY, spec.backend)
+    require(
+        document.get("schema_version") == matrix.SCHEMA_VERSION,
+        f"{spec.model_label} model lock schema mismatch",
+    )
+    require(
+        document.get("lock_id") == spec.lock_id,
+        f"{spec.model_label} model lock id mismatch",
+    )
+    sources = matrix.locked_execution_sources(
+        document,
+        spec.model_key,
+        spec.backend,
+    )
     require(
         sources["weight_revision"] == spec.weight_revision,
-        "G08B weight revision drift",
+        f"{spec.model_label} weight revision drift",
     )
     require(
         sources["weight_format"] == spec.weight_format,
-        "G08B weight format drift",
+        f"{spec.model_label} weight format drift",
     )
     require(
         len(sources["weight_files"]) == spec.weight_file_count,
-        f"G08B weight lock must contain exactly {spec.weight_file_count} files",
+        (
+            f"{spec.model_label} weight lock must contain exactly "
+            f"{spec.weight_file_count} files"
+        ),
     )
     require(
         len(sources["semantic_source"]["files"]) == spec.semantic_file_count,
-        f"G08B semantic lock must contain exactly {spec.semantic_file_count} files",
+        (
+            f"{spec.model_label} semantic lock must contain exactly "
+            f"{spec.semantic_file_count} files"
+        ),
     )
     return {"document": document, "sources": sources}
 
@@ -285,7 +323,7 @@ def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
     binary_path = root / BUILD_BINARY_REL
     require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
     require(not binary_path.exists(), f"candidate build binary already exists: {binary_path}")
-    before = source_observation()
+    before = source_observation(spec)
     probes = {
         name: capture_probe(root, name, argv)
         for name, argv in spec.probe_commands.items()
@@ -315,7 +353,7 @@ def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
         and bounded_receipt.get("rc") == 0,
         f"bounded {spec.backend.upper()} build failed; inspect {bounded_path}",
     )
-    after = source_observation()
+    after = source_observation(spec)
     require(
         after == before,
         f"candidate source changed during the {spec.backend.upper()} build",
@@ -421,7 +459,7 @@ def prepare_manifest(
     require(1 <= port <= 65535, "execution port must be in 1..65535")
     manifest_path = root / EXECUTION_MANIFEST_REL
     require(not manifest_path.exists(), f"execution manifest already exists: {manifest_path}")
-    source = source_observation()
+    source = source_observation(spec)
     checked_lock = validate_checked_in_lock(spec)
     lock_path = root / MODELS_LOCK_REL
     materialize_exact(lock_path, spec.model_lock_path.read_bytes(), "models.lock")
@@ -442,7 +480,8 @@ def prepare_manifest(
     semantic_source_root = semantic_source_root.expanduser().resolve()
     sources = checked_lock["sources"]
     effective_path = (
-        root / f"correctness/{MODEL_KEY}/{spec.backend}/effective-config.json"
+        root
+        / f"correctness/{spec.model_key}/{spec.backend}/effective-config.json"
     )
     effective = {
         "schema_version": matrix.SCHEMA_VERSION,
@@ -450,7 +489,7 @@ def prepare_manifest(
         **source,
         "models_lock_sha256": matrix.file_sha256(lock_path),
         "binary_sha256": binary_sha256,
-        "model_key": MODEL_KEY,
+        "model_key": spec.model_key,
         "backend": spec.backend,
         "model_revision": sources["weight_revision"],
         "model_files": sources["weight_files"],
@@ -468,7 +507,7 @@ def prepare_manifest(
         **source,
         "models_lock_sha256": matrix.file_sha256(lock_path),
         "binary_sha256": binary_sha256,
-        "model_key": MODEL_KEY,
+        "model_key": spec.model_key,
         "backend": spec.backend,
         "model_revision": sources["weight_revision"],
         "model_files": sources["weight_files"],
@@ -498,7 +537,7 @@ def self_test(spec: BackendSpec) -> None:
     checked = validate_checked_in_lock(spec)
     require(
         checked["sources"]["weight_format"] == spec.weight_format,
-        "G08B format drift",
+        f"{spec.model_label} format drift",
     )
     require(
         set(spec.probe_commands) == matrix.CANDIDATE_BUILD_PROBES[spec.backend],
@@ -528,7 +567,7 @@ def self_test(spec: BackendSpec) -> None:
         "serve model name is missing from the product command",
     )
     with tempfile.TemporaryDirectory(
-        prefix=f"ferrum-g08b-{spec.backend}-prepare-"
+        prefix=spec.selftest_temp_prefix
     ) as tmp:
         root = Path(tmp)
         blob = root / "blobs" / ("a" * 64)
@@ -595,6 +634,7 @@ def parse_args(
     *,
     default_backend: str = "cuda",
     fixed_backend: bool = False,
+    backend_specs: Mapping[str, BackendSpec] = BACKEND_SPECS,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
@@ -603,7 +643,7 @@ def parse_args(
     else:
         parser.add_argument(
             "--backend",
-            choices=tuple(BACKEND_SPECS),
+            choices=tuple(backend_specs),
             default=default_backend,
         )
     subparsers = parser.add_subparsers(dest="command")
@@ -628,13 +668,16 @@ def main(
     *,
     default_backend: str = "cuda",
     fixed_backend: bool = False,
+    backend_specs: Mapping[str, BackendSpec] = BACKEND_SPECS,
+    error_label: str = "runtime_vnext_g08b_matrix_prepare",
 ) -> int:
     try:
         args = parse_args(
             default_backend=default_backend,
             fixed_backend=fixed_backend,
+            backend_specs=backend_specs,
         )
-        spec = BACKEND_SPECS[args.backend]
+        spec = backend_specs[args.backend]
         if args.self_test:
             self_test(spec)
         elif args.command == "build":
@@ -654,7 +697,7 @@ def main(
         else:
             raise PreparationError(f"unsupported command: {args.command}")
     except (PreparationError, matrix.ScenarioError, OSError, subprocess.SubprocessError) as error:
-        print(f"runtime_vnext_g08b_matrix_prepare: error: {error}", file=sys.stderr)
+        print(f"{error_label}: error: {error}", file=sys.stderr)
         return 1
     return 0
 

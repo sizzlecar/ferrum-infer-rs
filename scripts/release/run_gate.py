@@ -56,6 +56,8 @@ LANES = (
     "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
+    "vnext-g08c-cuda",
+    "vnext-g08c-metal",
     "vnext-g08-performance-smoke",
     "unit",
     "metal",
@@ -1011,6 +1013,50 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-g08b-metal",
+        )
+    if lane == "vnext-g08c-cuda":
+        if args.g08c_artifact_root is None:
+            raise GateError("vnext-g08c-cuda requires --g08c-artifact-root")
+        if args.g08c_scenario_report is None:
+            raise GateError("vnext-g08c-cuda requires --g08c-scenario-report")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g08c_cuda_matrix_checkpoint.py",
+                "--artifact-root",
+                str(args.g08c_artifact_root.resolve()),
+                "--scenario-report",
+                str(args.g08c_scenario_report.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08C CUDA MODEL MATRIX PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g08c-cuda",
+        )
+    if lane == "vnext-g08c-metal":
+        if args.g08c_artifact_root is None:
+            raise GateError("vnext-g08c-metal requires --g08c-artifact-root")
+        if args.g08c_scenario_report is None:
+            raise GateError("vnext-g08c-metal requires --g08c-scenario-report")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g08c_metal_matrix_checkpoint.py",
+                "--artifact-root",
+                str(args.g08c_artifact_root.resolve()),
+                "--scenario-report",
+                str(args.g08c_scenario_report.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08C METAL MODEL MATRIX PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g08c-metal",
         )
     if lane == "vnext-g08-performance-smoke":
         if args.g08_performance_artifact_root is None:
@@ -6942,6 +6988,108 @@ def self_test() -> int:
             ],
             g08b_metal_manifest,
         )
+        g08c_root = root / "g08c-artifact-root"
+        g08c_report = (
+            g08c_root
+            / "correctness/m3-qwen3-30b-a3b/cuda/scenario-report.json"
+        )
+        g08c_out = root / "g08c-cuda-dry-run"
+        g08c_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g08c-cuda",
+                "--g08c-artifact-root",
+                str(g08c_root),
+                "--g08c-scenario-report",
+                str(g08c_report),
+                "--out",
+                str(g08c_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(g08c_dry.returncode == 0, g08c_dry.stderr or g08c_dry.stdout)
+        g08c_manifest = json.loads((g08c_out / "gate.manifest.json").read_text())
+        require_selftest(
+            g08c_manifest["status"] == "dry-run"
+            and g08c_manifest["lane"] == "vnext-g08c-cuda",
+            g08c_manifest,
+        )
+        require_selftest(
+            g08c_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g08c_cuda_matrix_checkpoint.py",
+                "--artifact-root",
+                str(g08c_root.resolve()),
+                "--scenario-report",
+                str(g08c_report.resolve()),
+                "--out",
+                str(g08c_out.resolve()),
+            ],
+            g08c_manifest,
+        )
+        require_selftest(
+            g08c_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT G08C CUDA MODEL MATRIX PASS: "
+                f"{g08c_out.resolve()}"
+            ),
+            g08c_manifest,
+        )
+        g08c_metal_report = (
+            g08c_root
+            / "correctness/m3-qwen3-30b-a3b/metal/scenario-report.json"
+        )
+        g08c_metal_out = root / "g08c-metal-dry-run"
+        g08c_metal_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g08c-metal",
+                "--g08c-artifact-root",
+                str(g08c_root),
+                "--g08c-scenario-report",
+                str(g08c_metal_report),
+                "--out",
+                str(g08c_metal_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g08c_metal_dry.returncode == 0,
+            g08c_metal_dry.stderr or g08c_metal_dry.stdout,
+        )
+        g08c_metal_manifest = json.loads(
+            (g08c_metal_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g08c_metal_manifest["status"] == "dry-run"
+            and g08c_metal_manifest["lane"] == "vnext-g08c-metal",
+            g08c_metal_manifest,
+        )
+        require_selftest(
+            g08c_metal_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g08c_metal_matrix_checkpoint.py",
+                "--artifact-root",
+                str(g08c_root.resolve()),
+                "--scenario-report",
+                str(g08c_metal_report.resolve()),
+                "--out",
+                str(g08c_metal_out.resolve()),
+            ],
+            g08c_metal_manifest,
+        )
+        require_selftest(
+            g08c_metal_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT G08C METAL MODEL MATRIX PASS: "
+                f"{g08c_metal_out.resolve()}"
+            ),
+            g08c_metal_manifest,
+        )
         g08_performance_root = root / "g08-performance-artifact-root"
         g08_performance_out = root / "g08-performance-dry-run"
         g08_performance_dry = run_selftest_command(
@@ -7881,6 +8029,8 @@ def main() -> int:
     parser.add_argument("--cuda-determinism-artifact-root", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
+    parser.add_argument("--g08c-artifact-root", type=Path)
+    parser.add_argument("--g08c-scenario-report", type=Path)
     parser.add_argument("--g08-performance-artifact-root", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
