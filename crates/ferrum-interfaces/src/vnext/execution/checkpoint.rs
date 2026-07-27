@@ -1,7 +1,7 @@
 use super::{
-    invalid_plan, BTreeSet, BufferUsage, Deserialize, NodeId, PlanNode, ProgramValueId,
-    ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole, ResourceId,
-    Serialize, TensorAccess, VNextError,
+    invalid_plan, BTreeSet, BufferUsage, Deserialize, NodeId, PlanNode, PreparedModelFamily,
+    ProgramValueId, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
+    ResolvedValueRole, ResourceId, Serialize, TensorAccess, VNextError,
 };
 use crate::vnext::{CompletionReadbackRequest, HostTransferLayout};
 
@@ -15,6 +15,33 @@ pub struct CompletionRetentionSpec {
 impl CompletionRetentionSpec {
     pub fn new(values: BTreeSet<ProgramValueId>) -> Self {
         Self { values }
+    }
+
+    /// Retains every semantic operation output for a terminal determinism
+    /// readback. Duplicate output identities are rejected because they cannot
+    /// be attributed to exactly one producer.
+    pub fn for_determinism_outputs(family: &PreparedModelFamily) -> Result<Self, VNextError> {
+        let mut values = BTreeSet::new();
+        for node in family
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+        {
+            for value_id in &node.outputs {
+                if !values.insert(value_id.clone()) {
+                    return Err(invalid_plan(format!(
+                        "determinism output `{value_id}` has more than one producer"
+                    )));
+                }
+            }
+        }
+        if values.is_empty() {
+            return Err(invalid_plan(
+                "determinism output retention requires at least one operation output",
+            ));
+        }
+        Ok(Self { values })
     }
 
     pub fn insert(&mut self, value_id: ProgramValueId) -> bool {

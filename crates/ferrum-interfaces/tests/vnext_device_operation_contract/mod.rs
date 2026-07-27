@@ -1847,7 +1847,13 @@ pub(crate) fn resolved_model_plan_with_zero_state(
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let runtime_policy = policy();
     let catalog = catalog_with_zero_state(zero_state);
-    resolved_model_plan_with_zero_state_and_policy(registry, zero_state, &runtime_policy, &catalog)
+    resolved_model_plan_with_zero_state_and_policy(
+        registry,
+        zero_state,
+        &runtime_policy,
+        &catalog,
+        false,
+    )
 }
 
 fn resolved_model_plan_with_zero_state_and_policy(
@@ -1855,6 +1861,7 @@ fn resolved_model_plan_with_zero_state_and_policy(
     zero_state: bool,
     runtime_policy: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
+    retain_determinism_outputs: bool,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
     let raw_config = if zero_state {
@@ -1873,8 +1880,16 @@ fn resolved_model_plan_with_zero_state_and_policy(
             zero_state,
         ),
     ];
+    let completion_retention = if retain_determinism_outputs {
+        CompletionRetentionSpec::for_determinism_outputs(&family).unwrap()
+    } else {
+        CompletionRetentionSpec::default()
+    };
     let plan = ExecutionPlan::build(
-        PlanBuildRequest::new(&family, catalog, runtime_policy, resolutions.clone()).unwrap(),
+        PlanBuildRequest::new(&family, catalog, runtime_policy, resolutions.clone())
+            .unwrap()
+            .with_completion_retention(completion_retention.clone())
+            .unwrap(),
     )
     .unwrap();
     let config_fingerprint = family.config_fingerprint().to_owned();
@@ -1998,7 +2013,8 @@ fn resolved_model_plan_with_zero_state_and_policy(
         catalog.device(),
         &catalog,
         runtime_policy,
-    );
+    )
+    .with_completion_retention(completion_retention);
     (
         ResolvedModelPlan::new(inputs, bindings, &context).unwrap(),
         plan,
@@ -2015,7 +2031,13 @@ pub(crate) fn plan_for_registry_with_zero_state(
 ) -> ExecutionPlan {
     let runtime_policy = policy();
     let catalog = catalog_with_zero_state(zero_state);
-    plan_for_registry_with_zero_state_and_policy(registry, zero_state, &runtime_policy, &catalog)
+    plan_for_registry_with_zero_state_and_policy(
+        registry,
+        zero_state,
+        &runtime_policy,
+        &catalog,
+        false,
+    )
 }
 
 fn plan_for_registry_with_zero_state_and_policy(
@@ -2023,6 +2045,7 @@ fn plan_for_registry_with_zero_state_and_policy(
     zero_state: bool,
     runtime_policy: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
+    retain_determinism_outputs: bool,
 ) -> ExecutionPlan {
     let raw_config = if zero_state {
         json!({"width": 4, "zero_state": true})
@@ -2032,6 +2055,11 @@ fn plan_for_registry_with_zero_state_and_policy(
     let family = TypedFamilyRegistration::new(TestFamily)
         .prepare(&raw_config)
         .unwrap();
+    let completion_retention = if retain_determinism_outputs {
+        CompletionRetentionSpec::for_determinism_outputs(&family).unwrap()
+    } else {
+        CompletionRetentionSpec::default()
+    };
     ExecutionPlan::build(
         PlanBuildRequest::new(
             &family,
@@ -2054,6 +2082,8 @@ fn plan_for_registry_with_zero_state_and_policy(
                 ),
             ],
         )
+        .unwrap()
+        .with_completion_retention(completion_retention)
         .unwrap(),
     )
     .unwrap()
@@ -2350,11 +2380,25 @@ pub(crate) fn fixture_with_provider_behavior(
     zero_state: bool,
     behavior: ProviderBehavior,
 ) -> Fixture {
-    fixture_with_provider_behavior_and_execution_semantics(
+    fixture_with_provider_behavior_and_execution_semantics_and_retention(
         zero_state,
         behavior,
         ProviderExecutionSemantics::bitwise_eager_and_replay(),
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+    )
+}
+
+pub(crate) fn fixture_with_determinism_provider_behavior(
+    zero_state: bool,
+    behavior: ProviderBehavior,
+) -> Fixture {
+    fixture_with_provider_behavior_and_execution_semantics_and_retention(
+        zero_state,
+        behavior,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        true,
     )
 }
 
@@ -2363,6 +2407,22 @@ pub(crate) fn fixture_with_provider_behavior_and_execution_semantics(
     behavior: ProviderBehavior,
     execution_semantics: ProviderExecutionSemantics,
     execution_determinism: ExecutionDeterminismRequirement,
+) -> Fixture {
+    fixture_with_provider_behavior_and_execution_semantics_and_retention(
+        zero_state,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        false,
+    )
+}
+
+fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
+    zero_state: bool,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
 ) -> Fixture {
     let scratch = if matches!(
         behavior,
@@ -2421,6 +2481,7 @@ pub(crate) fn fixture_with_provider_behavior_and_execution_semantics(
         zero_state,
         &runtime_policy,
         &catalog,
+        retain_determinism_outputs,
     );
     let impostor_registry = operation_registry(
         &catalog,
@@ -2432,6 +2493,7 @@ pub(crate) fn fixture_with_provider_behavior_and_execution_semantics(
         zero_state,
         &runtime_policy,
         &catalog,
+        retain_determinism_outputs,
     )
     .plan_hash()
     .clone();

@@ -1234,7 +1234,7 @@ impl InvocationRegistry {
     ) -> Result<ActiveInvocationWaveGuard, VNextError> {
         if covered_participant_nodes == 0 {
             return Err(invalid_resource(
-                "full-plan submission wave ledger requires non-zero participant-node coverage",
+                "submission wave ledger requires non-zero participant-node coverage",
             ));
         }
         let mut state = self
@@ -1246,7 +1246,7 @@ impl InvocationRegistry {
         }
         if state.submission_wave.is_some() || !state.entries.is_empty() {
             return Err(invalid_resource(
-                "full-plan submission wave overlaps prepared, in-flight, or retired participant-node topology in this step",
+                "submission wave overlaps prepared, in-flight, or retired participant-node topology in this step",
             ));
         }
         let ledger = ParticipantNodeLedgerEntry {
@@ -1260,7 +1260,7 @@ impl InvocationRegistry {
         });
         Ok(ActiveInvocationWaveGuard {
             registry: Arc::clone(self),
-            topology: ActiveInvocationLedgerTopology::FullPlanSubmissionWave {
+            topology: ActiveInvocationLedgerTopology::SubmissionWave {
                 covered_participant_nodes,
             },
             work_fingerprint: topology_fingerprint.to_owned(),
@@ -1272,7 +1272,7 @@ impl InvocationRegistry {
 
 enum ActiveInvocationLedgerTopology {
     ParticipantNodes(Vec<ParticipantNodeKey>),
-    FullPlanSubmissionWave { covered_participant_nodes: usize },
+    SubmissionWave { covered_participant_nodes: usize },
 }
 
 pub(super) struct ActiveInvocationWaveGuard {
@@ -1287,7 +1287,7 @@ impl ActiveInvocationWaveGuard {
     pub(super) const fn physical_entry_count(&self) -> usize {
         match &self.topology {
             ActiveInvocationLedgerTopology::ParticipantNodes(keys) => keys.len(),
-            ActiveInvocationLedgerTopology::FullPlanSubmissionWave { .. } => 1,
+            ActiveInvocationLedgerTopology::SubmissionWave { .. } => 1,
         }
     }
 
@@ -1319,7 +1319,7 @@ impl ActiveInvocationWaveGuard {
                         .iter()
                         .all(|key| state.entries.get(key) == Some(&expected_entry))
             }
-            ActiveInvocationLedgerTopology::FullPlanSubmissionWave {
+            ActiveInvocationLedgerTopology::SubmissionWave {
                 covered_participant_nodes,
             } => {
                 state.entries.is_empty()
@@ -1347,11 +1347,11 @@ impl ActiveInvocationWaveGuard {
                     entry.phase = next;
                 }
             }
-            ActiveInvocationLedgerTopology::FullPlanSubmissionWave { .. } => {
+            ActiveInvocationLedgerTopology::SubmissionWave { .. } => {
                 let entry = &mut state
                     .submission_wave
                     .as_mut()
-                    .expect("validated full-plan submission wave remains present")
+                    .expect("validated submission wave remains present")
                     .ledger;
                 entry.batch_invocation_id = next_attempt;
                 entry.phase = next;
@@ -1420,7 +1420,7 @@ impl Drop for ActiveInvocationWaveGuard {
                         .iter()
                         .all(|key| state.entries.get(key) == Some(&expected))
             }
-            ActiveInvocationLedgerTopology::FullPlanSubmissionWave {
+            ActiveInvocationLedgerTopology::SubmissionWave {
                 covered_participant_nodes,
             } => {
                 state.entries.is_empty()
@@ -1445,11 +1445,11 @@ impl Drop for ActiveInvocationWaveGuard {
                         .phase = PhysicalInvocationPhase::Retired;
                 }
             }
-            ActiveInvocationLedgerTopology::FullPlanSubmissionWave { .. } => {
+            ActiveInvocationLedgerTopology::SubmissionWave { .. } => {
                 state
                     .submission_wave
                     .as_mut()
-                    .expect("validated full-plan submission wave remains present")
+                    .expect("validated submission wave remains present")
                     .ledger
                     .phase = PhysicalInvocationPhase::Retired;
             }
@@ -1741,6 +1741,7 @@ pub struct ClaimedSubmissionWaveBacking {
     logical_capacity: Option<LogicalBatchCapacityLease>,
     plan_hash: PlanHash,
     node_count: usize,
+    plan_node_count: usize,
     work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
@@ -1754,6 +1755,7 @@ impl ClaimedSubmissionWaveBacking {
     pub(super) fn new(
         plan_hash: PlanHash,
         node_count: usize,
+        plan_node_count: usize,
         work_shape: Arc<BatchWorkShape>,
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
@@ -1764,6 +1766,7 @@ impl ClaimedSubmissionWaveBacking {
             committed_backing.into_certified_parts();
         let participants = work_shape.participants();
         if node_count == 0
+            || node_count > plan_node_count
             || participants.is_empty()
             || participants
                 .windows(2)
@@ -1791,7 +1794,7 @@ impl ClaimedSubmissionWaveBacking {
                     })?;
                 ProgramBindingExecutionBinding::bind(
                     plan_hash.clone(),
-                    node_count,
+                    plan_node_count,
                     layout,
                     lane_slot_identity,
                     &backing_slices,
@@ -1804,6 +1807,7 @@ impl ClaimedSubmissionWaveBacking {
             domain: &'static str,
             plan_hash: &'a PlanHash,
             node_count: usize,
+            plan_node_count: usize,
             work_fingerprint: &'a str,
             demand: &'a AdmissionDemand,
             backing_certificate_fingerprint: &'a str,
@@ -1813,6 +1817,7 @@ impl ClaimedSubmissionWaveBacking {
             domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v5",
             plan_hash: &plan_hash,
             node_count,
+            plan_node_count,
             work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
             backing_certificate_fingerprint: bound_certificate.fingerprint(),
@@ -1837,6 +1842,7 @@ impl ClaimedSubmissionWaveBacking {
             logical_capacity,
             plan_hash,
             node_count,
+            plan_node_count,
             work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
@@ -1860,6 +1866,10 @@ impl ClaimedSubmissionWaveBacking {
 
     pub const fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    pub const fn plan_node_count(&self) -> usize {
+        self.plan_node_count
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {

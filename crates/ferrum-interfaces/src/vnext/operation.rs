@@ -4137,9 +4137,10 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
     fn program_binding_node(self) -> Option<ProgramBindingNodeBinding> {
         match self {
             Self::Invocation(_) => None,
-            Self::Wave { wave, node_index } => {
-                wave.claimed_backing().program_binding_node(node_index)
-            }
+            Self::Wave { wave, node_index } => wave.nodes().get(node_index).and_then(|node| {
+                wave.claimed_backing()
+                    .program_binding_node(node.plan_node_index())
+            }),
         }
     }
 
