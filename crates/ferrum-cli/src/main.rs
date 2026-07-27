@@ -48,6 +48,9 @@ enum Commands {
     /// Validate and replay a request replay bundle without starting HTTP.
     ReplayBundle(replay_bundle::ReplayBundleCommand),
 
+    /// Collect bitwise CUDA vNext evidence for the release model matrix.
+    VnextDeterminism(vnext_determinism::VNextDeterminismCommand),
+
     /// Generate text embeddings using BERT models
     #[command(visible_alias = "e")]
     Embed(embed::EmbedCommand),
@@ -101,6 +104,7 @@ async fn main() {
         Commands::Bench(cmd) => bench::execute(cmd, config).await,
         Commands::BenchServe(cmd) => bench_serve::execute(cmd, config).await,
         Commands::ReplayBundle(cmd) => replay_bundle::execute(cmd, config).await,
+        Commands::VnextDeterminism(cmd) => vnext_determinism::execute(cmd).await,
         Commands::Embed(cmd) => embed::execute(cmd, config).await,
         Commands::Transcribe(cmd) => transcribe::execute(cmd, config).await,
         Commands::Tts(cmd) => tts::execute(cmd, config).await,
