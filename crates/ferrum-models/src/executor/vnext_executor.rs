@@ -94,7 +94,7 @@ fn resolve_reusable_execution_policy(
     maximum_active_sequences: u32,
     maximum_scheduled_tokens: u64,
     maximum_model_tokens: usize,
-    prefill_token_counts: &[usize],
+    prefill_chunks: &[PrefillChunk],
 ) -> Result<ReusableExecutionPolicy> {
     let maximum_active_sequences = usize::try_from(maximum_active_sequences)
         .map_err(|_| FerrumError::config("vNext active sequence limit exceeds usize"))?;
@@ -132,10 +132,9 @@ fn resolve_reusable_execution_policy(
         width = width.saturating_mul(2).min(maximum_width);
     }
 
-    let mut prefill_token_counts = prefill_token_counts
+    let mut prefill_token_counts = prefill_chunks
         .iter()
-        .copied()
-        .filter(|token_count| *token_count > 0)
+        .map(|chunk| chunk.tokens_to_process())
         .map(|token_count| {
             token_count
                 .min(maximum_scheduled_tokens)
@@ -173,7 +172,7 @@ pub struct VNextExecutorConfig {
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub device_reusable_execution_enabled: bool,
-    pub reusable_execution_prefill_token_counts: Vec<usize>,
+    pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
 }
 
 impl VNextExecutorConfig {
@@ -181,6 +180,41 @@ impl VNextExecutorConfig {
         engine: &EngineConfig,
         info: &ModelInfo,
         runtime: &R,
+    ) -> Result<Self> {
+        Self::from_engine_config_with_prefill_chunks(engine, info, runtime, &[])
+    }
+
+    pub fn for_determinism_collection<R: DeviceRuntime>(
+        engine: &EngineConfig,
+        info: &ModelInfo,
+        runtime: &R,
+    ) -> Result<Self> {
+        let required_chunks = [
+            PrefillChunk::new(0, 1, 1)?,
+            PrefillChunk::new(0, 4, 4)?,
+            PrefillChunk::new(4, 4, 8)?,
+        ];
+        let config =
+            Self::from_engine_config_with_prefill_chunks(engine, info, runtime, &required_chunks)?;
+        if config.runtime_policy.memory().maximum_active_sequences
+            < u32::try_from(MAX_VNEXT_DETERMINISM_PARTICIPANTS)
+                .map_err(|_| FerrumError::config("determinism width exceeds u32"))?
+            || config.runtime_policy.admission().maximum_scheduled_tokens
+                < u64::try_from(MAX_VNEXT_DETERMINISM_PARTICIPANTS)
+                    .map_err(|_| FerrumError::config("determinism width exceeds u64"))?
+        {
+            return Err(FerrumError::config(format!(
+                "vNext determinism collection requires at least {MAX_VNEXT_DETERMINISM_PARTICIPANTS} active sequences and scheduled tokens"
+            )));
+        }
+        Ok(config)
+    }
+
+    fn from_engine_config_with_prefill_chunks<R: DeviceRuntime>(
+        engine: &EngineConfig,
+        info: &ModelInfo,
+        runtime: &R,
+        additional_prefill_chunks: &[PrefillChunk],
     ) -> Result<Self> {
         let descriptor = runtime.descriptor();
         descriptor
@@ -230,22 +264,45 @@ impl VNextExecutorConfig {
             .copied()
             .collect::<Vec<_>>();
 
-        let mut reusable_execution_prefill_token_counts = [
+        let mut reusable_execution_prefill_chunks = [
             engine.scheduler.prefill_step_chunk,
             engine.scheduler.active_decode_prefill_chunk,
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>();
-        reusable_execution_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
-        reusable_execution_prefill_token_counts.dedup();
+        .filter_map(|token_count| {
+            let token_count = token_count
+                .min(engine.batching.max_num_batched_tokens)
+                .min(maximum_model_tokens);
+            (token_count > 0).then_some(token_count)
+        })
+        .map(|token_count| PrefillChunk::new(0, token_count, token_count))
+        .collect::<Result<Vec<_>>>()?;
+        reusable_execution_prefill_chunks.extend_from_slice(additional_prefill_chunks);
+        if reusable_execution_prefill_chunks.iter().any(|chunk| {
+            !chunk.is_final()
+                || chunk.total_prompt_tokens() > maximum_model_tokens
+                || chunk.tokens_to_process() > engine.batching.max_num_batched_tokens
+        }) {
+            return Err(FerrumError::config(
+                "vNext reusable prefill capture requires a final chunk within model and scheduled-token limits",
+            ));
+        }
+        reusable_execution_prefill_chunks.sort_unstable_by(|left, right| {
+            right
+                .tokens_to_process()
+                .cmp(&left.tokens_to_process())
+                .then_with(|| left.tokens_processed().cmp(&right.tokens_processed()))
+                .then_with(|| left.total_prompt_tokens().cmp(&right.total_prompt_tokens()))
+        });
+        reusable_execution_prefill_chunks.dedup();
         // Stable workspace buckets are backend-independent memory policy.
         // Device executable capture remains capability/config gated at startup.
         let reusable_execution_policy = Some(resolve_reusable_execution_policy(
             maximum_active_sequences,
             maximum_scheduled_tokens,
             maximum_model_tokens,
-            &reusable_execution_prefill_token_counts,
+            &reusable_execution_prefill_chunks,
         )?);
         let execution_determinism = if engine.backend.enable_reusable_execution
             && descriptor
@@ -292,7 +349,7 @@ impl VNextExecutorConfig {
             static_initialization,
             runtime_policy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
-            reusable_execution_prefill_token_counts,
+            reusable_execution_prefill_chunks,
         })
     }
 }
@@ -310,7 +367,9 @@ enum VNextReusableExecutionDescriptor {
         request_capacity: usize,
     },
     Prefill {
+        tokens_processed: usize,
         token_capacity: usize,
+        total_prompt_tokens: usize,
         request_capacity: usize,
     },
 }
@@ -324,9 +383,11 @@ impl VNextReusableExecutionDescriptor {
         }
     }
 
-    const fn prefill(token_count: usize) -> Self {
+    const fn prefill(chunk: PrefillChunk) -> Self {
         Self::Prefill {
-            token_capacity: token_count,
+            tokens_processed: chunk.tokens_processed(),
+            token_capacity: chunk.tokens_to_process(),
+            total_prompt_tokens: chunk.total_prompt_tokens(),
             request_capacity: 1,
         }
     }
@@ -335,6 +396,7 @@ impl VNextReusableExecutionDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct VNextReusableExecutionStartupPlan {
     descriptors: Vec<VNextReusableExecutionDescriptor>,
+    prefill_chunks: Vec<PrefillChunk>,
     maximum_decode_sequence_tokens: usize,
     device_plan: DeviceReusableExecutionPlan,
 }
@@ -344,7 +406,7 @@ impl VNextReusableExecutionStartupPlan {
         maximum_active_sequences: u32,
         maximum_scheduled_tokens: u64,
         maximum_model_tokens: usize,
-        prefill_token_counts: &[usize],
+        prefill_chunks: &[PrefillChunk],
         execution_node_count: usize,
     ) -> Result<Self> {
         let maximum_active_sequences = usize::try_from(maximum_active_sequences)
@@ -369,19 +431,24 @@ impl VNextReusableExecutionStartupPlan {
         }
         decode_widths.sort_unstable_by(|left, right| right.cmp(left));
 
-        let mut prefill_token_counts = prefill_token_counts
-            .iter()
-            .copied()
-            .filter(|token_count| *token_count > 0)
-            .map(|token_count| {
-                token_count
-                    .min(maximum_scheduled_tokens)
-                    .min(maximum_model_tokens)
-            })
-            .filter(|token_count| *token_count > 0)
-            .collect::<Vec<_>>();
-        prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
-        prefill_token_counts.dedup();
+        let mut prefill_chunks = prefill_chunks.iter().copied().collect::<Vec<_>>();
+        if prefill_chunks.iter().any(|chunk| {
+            !chunk.is_final()
+                || chunk.total_prompt_tokens() > maximum_model_tokens
+                || chunk.tokens_to_process() > maximum_scheduled_tokens
+        }) {
+            return Err(FerrumError::config(
+                "vNext reusable execution prefill chunk exceeds its immutable startup limits",
+            ));
+        }
+        prefill_chunks.sort_unstable_by(|left, right| {
+            right
+                .tokens_to_process()
+                .cmp(&left.tokens_to_process())
+                .then_with(|| left.tokens_processed().cmp(&right.tokens_processed()))
+                .then_with(|| left.total_prompt_tokens().cmp(&right.total_prompt_tokens()))
+        });
+        prefill_chunks.dedup();
 
         let passes_per_width = REUSABLE_EXECUTION_WARMUP_PASSES
             + REUSABLE_EXECUTION_CAPTURE_PASSES
@@ -398,23 +465,30 @@ impl VNextReusableExecutionStartupPlan {
         }
 
         let descriptors = decode_widths
-            .into_iter()
+            .iter()
+            .copied()
             .map(VNextReusableExecutionDescriptor::uniform_decode)
             .chain(
-                prefill_token_counts
-                    .into_iter()
+                prefill_chunks
+                    .iter()
+                    .copied()
                     .map(VNextReusableExecutionDescriptor::prefill),
             )
             .collect::<Vec<_>>();
 
+        let prefill_wave_shapes = prefill_chunks
+            .iter()
+            .map(|chunk| usize::from(chunk.tokens_processed() > 0) + 1)
+            .sum::<usize>();
         let maximum_executables = execution_node_count
             .max(1)
-            .checked_mul(descriptors.len())
+            .checked_mul(decode_widths.len().saturating_add(prefill_wave_shapes))
             .ok_or_else(|| FerrumError::config("vNext reusable executable capacity overflowed"))?;
         let device_plan = DeviceReusableExecutionPlan::new(maximum_executables)
             .map_err(|error| FerrumError::config(error.to_string()))?;
         Ok(Self {
             descriptors,
+            prefill_chunks,
             maximum_decode_sequence_tokens,
             device_plan,
         })
@@ -432,16 +506,26 @@ impl VNextReusableExecutionStartupPlan {
             .collect()
     }
 
+    fn prefill_chunks(&self) -> Vec<PrefillChunk> {
+        self.prefill_chunks.clone()
+    }
+
     fn prefill_token_counts(&self) -> Vec<usize> {
-        self.descriptors
+        let mut token_counts = self
+            .prefill_chunks()
+            .into_iter()
+            .map(PrefillChunk::tokens_to_process)
+            .collect::<Vec<_>>();
+        token_counts.sort_unstable_by(|left, right| right.cmp(left));
+        token_counts.dedup();
+        token_counts
+    }
+
+    fn prefill_wave_shapes(&self) -> usize {
+        self.prefill_chunks()
             .iter()
-            .filter_map(|descriptor| match descriptor {
-                VNextReusableExecutionDescriptor::UniformDecode { .. } => None,
-                VNextReusableExecutionDescriptor::Prefill { token_capacity, .. } => {
-                    Some(*token_capacity)
-                }
-            })
-            .collect()
+            .map(|chunk| usize::from(chunk.tokens_processed() > 0) + 1)
+            .sum()
     }
 
     fn widths_for_available_sequences(&self, available: usize) -> Vec<usize> {
@@ -468,6 +552,8 @@ struct VNextReusableExecutionStartupReport {
     prepared_decode_widths: Vec<usize>,
     requested_prefill_token_counts: Vec<usize>,
     prepared_prefill_token_counts: Vec<usize>,
+    requested_prefill_chunks: Vec<PrefillChunk>,
+    prepared_prefill_chunks: Vec<PrefillChunk>,
     synthetic_sequences: usize,
     eager_warmup_waves: usize,
     capture_waves: usize,
@@ -3070,10 +3156,45 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
-        let executor_startup = StartupPhaseTimer::start("executor_composition_total");
-        let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let config =
             VNextExecutorConfig::from_engine_config(engine_config, &info, runtime.as_ref())?;
+        Self::from_runtime_composition_with_config(
+            prepared,
+            info,
+            engine_config,
+            config,
+            runtime,
+            registry,
+            weight_materializers,
+            weight_materializer_id,
+            catalog,
+            resolve_plan,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_runtime_composition_with_config<F>(
+        prepared: &PreparedProductionModel,
+        info: ModelInfo,
+        engine_config: &EngineConfig,
+        config: VNextExecutorConfig,
+        runtime: Arc<R>,
+        registry: OperationRuntimeRegistry<R>,
+        weight_materializers: WeightMaterializerRegistry,
+        weight_materializer_id: WeightMaterializerId,
+        catalog: CapabilityCatalog,
+        resolve_plan: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &PreparedProductionModel,
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        let executor_startup = StartupPhaseTimer::start("executor_composition_total");
+        let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let checkpoint_selection = VNextCheckpointSelection::from_config(
             engine_config.runtime.vnext_checkpoint_capture.as_ref(),
         )?;
@@ -3290,7 +3411,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     config.runtime_policy.memory().maximum_active_sequences,
                     config.runtime_policy.admission().maximum_scheduled_tokens,
                     config.maximum_model_tokens,
-                    &config.reusable_execution_prefill_token_counts,
+                    &config.reusable_execution_prefill_chunks,
                     resolved_plan.execution_plan().payload().nodes().len(),
                 )?)
             } else {
@@ -3368,6 +3489,37 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         input_tensor: &TensorRef,
         maximum_sequence_tokens: usize,
     ) -> Result<bool> {
+        let Some(request_id) = self
+            .reserve_startup_sequence(resources, input_tokens, maximum_sequence_tokens)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let input_token_count = input_tokens.len();
+        let chunk = PrefillChunk::new(0, input_token_count, input_token_count)?;
+        let Some(kv_cache) = self
+            .execute_startup_prefill_chunk(
+                resources,
+                &request_id,
+                input_tensor,
+                maximum_sequence_tokens,
+                chunk,
+                "decode-sequence admission",
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        resources.activate(kv_cache);
+        Ok(true)
+    }
+
+    async fn reserve_startup_sequence(
+        &self,
+        resources: &mut VNextStartupSequenceGuard<'_, R>,
+        input_tokens: &[TokenId],
+        maximum_sequence_tokens: usize,
+    ) -> Result<Option<RequestId>> {
         let request_id = RequestId::new();
         resources.begin_request(request_id.clone());
         let mut maintenance_attempts = 0_u32;
@@ -3397,7 +3549,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         | ExecutorPrefillMaintenanceOutcome::RetryAdmission { .. } => continue,
                         ExecutorPrefillMaintenanceOutcome::WaitForRelease { .. } => {
                             resources.cancel_pending();
-                            return Ok(false);
+                            return Ok(None);
                         }
                         ExecutorPrefillMaintenanceOutcome::NoLongerPending => {
                             return Err(FerrumError::internal(
@@ -3408,7 +3560,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
                 ExecutorPrefillAdmissionDecision::Deferred(_) => {
                     resources.cancel_pending();
-                    return Ok(false);
+                    return Ok(None);
                 }
                 ExecutorPrefillAdmissionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::resource_exhausted(format!(
@@ -3417,36 +3569,45 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         }
+        Ok(Some(request_id))
+    }
 
-        let input_token_count = input_tokens.len();
-        let chunk = PrefillChunk::new(0, input_token_count, input_token_count)?;
+    async fn execute_startup_prefill_chunk(
+        &self,
+        resources: &mut VNextStartupSequenceGuard<'_, R>,
+        request_id: &RequestId,
+        input_tensor: &TensorRef,
+        maximum_sequence_tokens: usize,
+        chunk: PrefillChunk,
+        phase: &'static str,
+    ) -> Result<Option<Arc<dyn KvCacheHandle>>> {
         let input = PrefillInput::new(Arc::clone(input_tensor))
-            .with_request_context(request_id, maximum_sequence_tokens)
+            .with_request_context(request_id.clone(), maximum_sequence_tokens)
             .with_chunk(chunk);
         match self.execute_prefill_with_capacity(&input).await? {
             ExecutorPrefillOutcome::Completed(completion) => {
                 let (output, planned, completed, _) = completion.into_parts();
                 if planned != chunk || completed != chunk {
                     return Err(FerrumError::internal(format!(
-                        "vNext startup prefill did not complete its exact {input_token_count}-token frontier"
+                        "vNext startup {phase} did not complete its exact {:?} frontier",
+                        chunk.range()
                     )));
                 }
-                resources.activate(output.kv_cache);
-                Ok(true)
+                Ok(Some(output.kv_cache))
             }
             ExecutorPrefillOutcome::Deferred(_) => {
                 resources.cancel_pending();
-                Ok(false)
+                Ok(None)
             }
         }
     }
 
     async fn execute_startup_prefill_request(
         &self,
-        token_count: usize,
+        chunk: PrefillChunk,
         phase: &'static str,
     ) -> Result<()> {
-        let raw_tokens = vec![0_u32; token_count];
+        let raw_tokens = vec![0_u32; chunk.total_prompt_tokens()];
         let input_tokens = raw_tokens
             .iter()
             .copied()
@@ -3454,14 +3615,53 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Vec<_>>();
         let input_tensor = Self::startup_token_tensor(&raw_tokens)?;
         let mut resources = VNextStartupSequenceGuard::new(self);
-        if !self
-            .admit_startup_sequence(&mut resources, &input_tokens, &input_tensor, token_count)
+        let Some(request_id) = self
+            .reserve_startup_sequence(&mut resources, &input_tokens, chunk.total_prompt_tokens())
             .await?
-        {
+        else {
             return Err(FerrumError::resource_exhausted(format!(
-                "vNext startup {phase} could not admit a {token_count}-token prefill descriptor"
+                "vNext startup {phase} could not admit prefill chunk {:?}",
+                chunk.range()
             )));
+        };
+        if chunk.tokens_processed() > 0 {
+            let prefix =
+                PrefillChunk::new(0, chunk.tokens_processed(), chunk.total_prompt_tokens())?;
+            if self
+                .execute_startup_prefill_chunk(
+                    &mut resources,
+                    &request_id,
+                    &input_tensor,
+                    chunk.total_prompt_tokens(),
+                    prefix,
+                    phase,
+                )
+                .await?
+                .is_none()
+            {
+                return Err(FerrumError::resource_exhausted(format!(
+                    "vNext startup {phase} deferred the prerequisite prefill chunk {:?}",
+                    prefix.range()
+                )));
+            }
         }
+        let Some(kv_cache) = self
+            .execute_startup_prefill_chunk(
+                &mut resources,
+                &request_id,
+                &input_tensor,
+                chunk.total_prompt_tokens(),
+                chunk,
+                phase,
+            )
+            .await?
+        else {
+            return Err(FerrumError::resource_exhausted(format!(
+                "vNext startup {phase} deferred prefill chunk {:?}",
+                chunk.range()
+            )));
+        };
+        resources.activate(kv_cache);
         if resources.sequences.len() != 1 {
             return Err(FerrumError::internal(format!(
                 "vNext startup {phase} retained {} sequences for one prefill descriptor",
@@ -3539,6 +3739,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 prepared_decode_widths: Vec::new(),
                 requested_prefill_token_counts: Vec::new(),
                 prepared_prefill_token_counts: Vec::new(),
+                requested_prefill_chunks: Vec::new(),
+                prepared_prefill_chunks: Vec::new(),
                 synthetic_sequences: 0,
                 eager_warmup_waves: 0,
                 capture_waves: 0,
@@ -3551,10 +3753,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         let requested_descriptors = plan.descriptors.clone();
         let requested_decode_widths = plan.decode_widths();
+        let requested_prefill_chunks = plan.prefill_chunks();
         let requested_prefill_token_counts = plan.prefill_token_counts();
         for _ in 0..REUSABLE_EXECUTION_WARMUP_PASSES {
-            for token_count in requested_prefill_token_counts.iter().copied() {
-                self.execute_startup_prefill_request(token_count, "eager prefill warmup")
+            for chunk in requested_prefill_chunks.iter().copied() {
+                self.execute_startup_prefill_request(chunk, "eager prefill warmup")
                     .await?;
             }
         }
@@ -3665,15 +3868,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         drop(resources);
 
         let mut captured = replayed;
-        for token_count in requested_prefill_token_counts.iter().copied() {
-            self.execute_startup_prefill_request(token_count, "prefill capture")
+        for chunk in requested_prefill_chunks.iter().copied() {
+            self.execute_startup_prefill_request(chunk, "prefill capture")
                 .await?;
             let prefill_captured =
                 self.lane
                     .reusable_executable_preparation()
                     .map_err(|error| {
                         FerrumError::device(format!(
-                            "vNext {token_count}-token prefill capture inspection failed: {error}"
+                            "vNext {:?} prefill capture inspection failed: {error}",
+                            chunk.range()
                         ))
                     })?;
             if prefill_captured.state() != DeviceReusableExecutionPreparationState::Preparing
@@ -3684,25 +3888,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 || prefill_captured.captured_executables() < captured.captured_executables()
             {
                 return Err(FerrumError::device(format!(
-                    "vNext {token_count}-token prefill capture receipt is incomplete: before={captured:?}, after={prefill_captured:?}"
+                    "vNext {:?} prefill capture receipt is incomplete: before={captured:?}, after={prefill_captured:?}",
+                    chunk.range()
                 )));
             }
 
-            self.execute_startup_prefill_request(token_count, "fresh-request prefill replay")
+            self.execute_startup_prefill_request(chunk, "fresh-request prefill replay")
                 .await?;
-            let prefill_replayed = self
-                .lane
-                .reusable_executable_preparation()
-                .map_err(|error| {
-                    FerrumError::device(format!(
-                        "vNext {token_count}-token fresh-request prefill replay inspection failed: {error}"
-                    ))
-                })?;
+            let prefill_replayed =
+                self.lane
+                    .reusable_executable_preparation()
+                    .map_err(|error| {
+                        FerrumError::device(format!(
+                            "vNext {:?} fresh-request prefill replay inspection failed: {error}",
+                            chunk.range()
+                        ))
+                    })?;
             if prefill_replayed.state() != DeviceReusableExecutionPreparationState::Preparing
                 || !reusable_executable_inventory_matches(prefill_captured, prefill_replayed)
             {
                 return Err(FerrumError::device(format!(
-                    "vNext {token_count}-token fresh-request prefill replay changed executable state: before={prefill_captured:?}, after={prefill_replayed:?}"
+                    "vNext {:?} fresh-request prefill replay changed executable state: before={prefill_captured:?}, after={prefill_replayed:?}",
+                    chunk.range()
                 )));
             }
             captured = prefill_replayed;
@@ -3761,14 +3968,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .copied()
             .map(VNextReusableExecutionDescriptor::uniform_decode)
             .chain(
-                requested_prefill_token_counts
+                requested_prefill_chunks
                     .iter()
                     .copied()
                     .map(VNextReusableExecutionDescriptor::prefill),
             )
             .collect::<Vec<_>>();
-        let prepared_wave_shapes =
-            prepared_decode_widths.len() + requested_prefill_token_counts.len();
+        let prepared_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
         Ok(VNextReusableExecutionStartupReport {
             enabled: true,
             supported: true,
@@ -3779,6 +3985,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             prepared_decode_widths: prepared_decode_widths.clone(),
             requested_prefill_token_counts: requested_prefill_token_counts.clone(),
             prepared_prefill_token_counts: requested_prefill_token_counts,
+            requested_prefill_chunks: requested_prefill_chunks.clone(),
+            prepared_prefill_chunks: requested_prefill_chunks,
             synthetic_sequences,
             eager_warmup_waves: prepared_wave_shapes * REUSABLE_EXECUTION_WARMUP_PASSES,
             capture_waves: prepared_wave_shapes * REUSABLE_EXECUTION_CAPTURE_PASSES,
@@ -7524,7 +7732,7 @@ mod tests {
         VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
-        GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
+        GreedyRepetitionPenalty, LogitsReturnPolicy, PrefillChunk, TokenSelectionMask,
     };
     use ferrum_interfaces::vnext::{
         CompletionReadbackBatchObservation, DeviceComputePathRequirement, DeviceExecutionInterval,
@@ -7649,28 +7857,58 @@ mod tests {
 
     #[test]
     fn reusable_execution_startup_plan_is_policy_derived_largest_first_and_bounded() {
+        let chunk_64 = PrefillChunk::new(0, 64, 64).unwrap();
         let plan =
-            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, &[64, 64], 23).unwrap();
+            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, &[chunk_64, chunk_64], 23)
+                .unwrap();
 
         assert_eq!(plan.decode_widths(), [32, 16, 8, 4, 2, 1]);
         assert_eq!(plan.prefill_token_counts(), [64]);
+        assert_eq!(plan.prefill_chunks(), [chunk_64]);
         assert_eq!(plan.maximum_decode_sequence_tokens, 19);
         assert_eq!(plan.device_plan.maximum_executables(), 161);
         assert_eq!(
             plan.descriptors.last(),
-            Some(&VNextReusableExecutionDescriptor::prefill(64))
+            Some(&VNextReusableExecutionDescriptor::prefill(chunk_64))
         );
         assert_eq!(
             plan.widths_for_available_sequences(20),
             [20, 16, 8, 4, 2, 1]
         );
 
+        let chunk_7 = PrefillChunk::new(0, 7, 7).unwrap();
+        let chunk_4 = PrefillChunk::new(0, 4, 4).unwrap();
         let non_power_of_two =
-            VNextReusableExecutionStartupPlan::resolve(7, 7, 64, &[64, 4], 2).unwrap();
+            VNextReusableExecutionStartupPlan::resolve(7, 7, 64, &[chunk_7, chunk_4], 2).unwrap();
         assert_eq!(non_power_of_two.decode_widths(), [7, 4, 2, 1]);
         assert_eq!(non_power_of_two.prefill_token_counts(), [7, 4]);
         assert_eq!(non_power_of_two.device_plan.maximum_executables(), 12);
-        assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[64], 23).is_err());
+        assert!(
+            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[chunk_64], 23).is_err()
+        );
+    }
+
+    #[test]
+    fn reusable_execution_startup_plan_preserves_exact_chunk_boundaries() {
+        let chunk_single = PrefillChunk::new(0, 1, 1).unwrap();
+        let chunk_multi = PrefillChunk::new(0, 4, 4).unwrap();
+        let chunk_boundary = PrefillChunk::new(4, 4, 8).unwrap();
+        let plan = VNextReusableExecutionStartupPlan::resolve(
+            32,
+            2_048,
+            128,
+            &[chunk_single, chunk_multi, chunk_boundary],
+            23,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.prefill_chunks(),
+            [chunk_multi, chunk_boundary, chunk_single]
+        );
+        assert_eq!(plan.prefill_token_counts(), [4, 1]);
+        assert_eq!(plan.prefill_wave_shapes(), 4);
+        assert_eq!(plan.device_plan.maximum_executables(), 230);
     }
 
     #[test]
@@ -7701,7 +7939,11 @@ mod tests {
 
     #[test]
     fn reusable_workspace_policy_is_backend_neutral_and_bucketed() {
-        let policy = resolve_reusable_execution_policy(16, 2_048, 4_096, &[128, 64]).unwrap();
+        let chunks = [
+            PrefillChunk::new(0, 128, 128).unwrap(),
+            PrefillChunk::new(0, 64, 64).unwrap(),
+        ];
+        let policy = resolve_reusable_execution_policy(16, 2_048, 4_096, &chunks).unwrap();
         let decode_widths = policy
             .buckets()
             .iter()
