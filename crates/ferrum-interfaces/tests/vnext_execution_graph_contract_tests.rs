@@ -1,5 +1,6 @@
 mod vnext_core_contract;
 
+use sha2::{Digest, Sha256};
 use vnext_core_contract::*;
 
 fn graph_operation(
@@ -646,7 +647,13 @@ fn execution_determinism_witness_scope_is_exact_canonical_and_plan_derived() {
         ExecutionDeterminismWitnessPlan::decode_untrusted(&encoded).unwrap(),
         witness_plan
     );
-    assert_eq!(witness_plan.fingerprint().unwrap().len(), 64);
+    assert_eq!(
+        witness_plan.fingerprint().unwrap(),
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&witness_plan).unwrap())
+        )
+    );
 
     let mut missing_output: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     missing_output["witnesses"]

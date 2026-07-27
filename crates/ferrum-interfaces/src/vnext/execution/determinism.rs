@@ -573,7 +573,12 @@ impl ExecutionDeterminismWitnessPlan {
     }
 
     pub fn fingerprint(&self) -> Result<String, VNextError> {
-        Ok(format!("{:x}", Sha256::digest(self.to_json()?)))
+        self.validate_shape()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| VNextError::Serialization {
+            context: "fingerprint execution determinism witness plan",
+            message: error.to_string(),
+        })?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
     pub fn decode_untrusted(bytes: &[u8]) -> Result<Self, VNextError> {

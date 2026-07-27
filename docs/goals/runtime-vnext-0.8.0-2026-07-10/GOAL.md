@@ -395,6 +395,7 @@ G03 tolerance catalog，两类门互不替代。
 
 ```text
 FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: <out_dir>
+FERRUM GATE vnext-cuda-determinism PASS: <out_dir>
 ```
 
 它由 `run_gate.py` 注册，必须在 M1/M2/M3 CUDA correctness matrix、CUDA performance 和 G10

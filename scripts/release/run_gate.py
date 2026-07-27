@@ -53,6 +53,7 @@ LANES = (
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
     "vnext-s1-cuda-decode-capacity",
+    "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
     "vnext-g08-performance-smoke",
@@ -946,6 +947,26 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s1-cuda-decode-capacity",
+        )
+    if lane == "vnext-cuda-determinism":
+        if args.cuda_determinism_artifact_root is None:
+            raise GateError(
+                "vnext-cuda-determinism requires "
+                "--cuda-determinism-artifact-root"
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_cuda_determinism.py",
+                str(args.cuda_determinism_artifact_root.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-cuda-determinism",
         )
     if lane == "vnext-g08b-cuda":
         if args.g08b_artifact_root is None:
@@ -6794,6 +6815,51 @@ def self_test() -> int:
             dry_manifest,
         )
         g08b_root = root / "g08b-artifact-root"
+        determinism_root = root / "cuda-determinism-artifact-root"
+        determinism_out = root / "cuda-determinism-dry-run"
+        determinism_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-cuda-determinism",
+                "--cuda-determinism-artifact-root",
+                str(determinism_root),
+                "--out",
+                str(determinism_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            determinism_dry.returncode == 0,
+            determinism_dry.stderr or determinism_dry.stdout,
+        )
+        determinism_manifest = json.loads(
+            (determinism_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            determinism_manifest["status"] == "dry-run"
+            and determinism_manifest["lane"] == "vnext-cuda-determinism",
+            determinism_manifest,
+        )
+        require_selftest(
+            determinism_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_cuda_determinism.py",
+                str(determinism_root.resolve()),
+                "--out",
+                str(determinism_out.resolve()),
+            ],
+            determinism_manifest,
+        )
+        require_selftest(
+            determinism_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: "
+                f"{determinism_out.resolve()}"
+            ),
+            determinism_manifest,
+        )
         g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
         g08b_out = root / "g08b-cuda-dry-run"
         g08b_dry = run_selftest_command(
@@ -7812,6 +7878,7 @@ def main() -> int:
     parser.add_argument("--g00a", type=Path)
     parser.add_argument("--g00f", type=Path)
     parser.add_argument("--s1-artifact", type=Path)
+    parser.add_argument("--cuda-determinism-artifact-root", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
     parser.add_argument("--g08-performance-artifact-root", type=Path)
