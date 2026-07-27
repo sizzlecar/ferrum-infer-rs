@@ -1395,10 +1395,11 @@ impl OperationDispatch {
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        let readback_plan = SubmissionWaveDeterminismReadbackPlan::from_prepared_wave(
+        let readback_plan = SubmissionWaveDeterminismReadbackPlan::from_restore(
             resolved,
             batch_identity,
             &wave,
+            restore,
         )
         .map_err(SubmissionWaveDispatchError::Contract)?;
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
@@ -1442,10 +1443,11 @@ impl OperationDispatch {
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        let readback_plan = SubmissionWaveDeterminismReadbackPlan::from_prepared_wave(
+        let readback_plan = SubmissionWaveDeterminismReadbackPlan::from_restore(
             resolved,
             batch_identity,
             &wave,
+            restore,
         )
         .map_err(SubmissionWaveDispatchError::Contract)?;
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
@@ -1630,7 +1632,14 @@ impl OperationDispatch {
         }
         if let Some(restore) = determinism_restore {
             restore
-                .validate_for_submission(resolved, batch_identity, &wave)
+                .validate_for_submission(
+                    lane.runtime(),
+                    providers,
+                    resolved,
+                    batch_identity,
+                    active_bindings.clone(),
+                    &wave,
+                )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
             if !input_uploads.is_empty()
                 || usize::try_from(restore.participant_count()).ok()
@@ -2436,7 +2445,7 @@ where
     R: DeviceRuntime,
 {
     restore
-        .validate_for_submission(resolved, batch_identity, completion.wave())
+        .validate_for(resolved)
         .map_err(SubmissionWaveDispatchError::Contract)?;
     let participant_count = usize::try_from(restore.participant_count()).map_err(|_| {
         SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -2518,6 +2527,13 @@ where
                         "determinism restore payload matrix is incomplete",
                     ))
                 })?;
+            let range = restore
+                .initialization_range(participant_index_u32, initialization_index)
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "determinism restore range matrix is incomplete",
+                    ))
+                })?;
             let backing = completion
                 .backing_view(
                     location.node_id(),
@@ -2531,7 +2547,7 @@ where
                 &backing,
                 location.usage(),
                 location.element_type(),
-                location.logical_offset_bytes(),
+                range.logical_offset_bytes(),
                 bytes,
                 "determinism restore",
                 |command| {

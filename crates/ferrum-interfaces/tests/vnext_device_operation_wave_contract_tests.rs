@@ -63,6 +63,12 @@ fn prepare_wave_for_node_scope(
     node_ids: &[NodeId],
     determinism: bool,
 ) -> PreparedStepSubmissionWave<TestRuntime> {
+    let participant_work = step
+        .work_shape()
+        .participant_work()
+        .iter()
+        .map(|work| work.token_span().clone())
+        .collect::<Vec<_>>();
     let requests = node_ids
         .iter()
         .map(|node| {
@@ -74,11 +80,8 @@ fn prepare_wave_for_node_scope(
                 .expect("test wave node belongs to its exact plan");
             InvocationResourceAdmissionRequest::for_all_step_participants(
                 node.id().clone(),
-                step.bind_all_invocation_work_shape(vec![
-                    one_token_span();
-                    step.participant_count() as usize
-                ])
-                .unwrap(),
+                step.bind_all_invocation_work_shape(participant_work.clone())
+                    .unwrap(),
                 AdmissionFitPolicy::ImmediateOnly,
                 AdmissionPressureAction::WaitForRelease,
             )
@@ -149,38 +152,51 @@ fn wave_active_bindings(
     vec![active]
 }
 
-fn determinism_restore(plan: &ExecutionPlan, fill_byte: u8) -> SubmissionWaveDeterminismRestore {
-    let node_ids = plan
-        .payload()
-        .nodes()
-        .iter()
-        .map(|node| node.id().clone())
-        .collect::<Vec<_>>();
-    determinism_restore_for_nodes(plan, &node_ids, fill_byte)
-}
-
-fn determinism_restore_for_nodes(
-    plan: &ExecutionPlan,
-    node_ids: &[NodeId],
+fn determinism_restore(
+    fixture: &Fixture,
+    providers: &[BoundOperationProvider<'_, TestRuntime>],
+    batch_identity: &BatchOperationIdentity,
+    active_bindings: &[TrustedActiveSequenceBinding],
+    wave: &PreparedStepSubmissionWave<TestRuntime>,
     fill_byte: u8,
 ) -> SubmissionWaveDeterminismRestore {
-    let witness_plan = plan.determinism_witness_plan_for_nodes(node_ids).unwrap();
+    let layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
+        fixture.runtime.as_ref(),
+        providers,
+        &fixture.resolved,
+        batch_identity,
+        active_bindings.iter(),
+        wave,
+    )
+    .unwrap();
     assert!(
-        !witness_plan.initializations().is_empty(),
+        !layout.witness_plan().initializations().is_empty(),
         "determinism fixture must have at least one typed initialization"
     );
-    let payloads = witness_plan
-        .initializations()
-        .iter()
-        .map(|initialization| {
-            vec![
-                fill_byte;
-                usize::try_from(initialization.location().canonical_length_bytes())
-                    .expect("test initialization length fits usize")
-            ]
+    let participant_payloads = determinism_payloads(&layout, fill_byte);
+    layout.bind(participant_payloads).unwrap()
+}
+
+fn determinism_payloads(
+    layout: &SubmissionWaveDeterminismRestoreLayout,
+    fill_byte: u8,
+) -> Vec<Vec<Vec<u8>>> {
+    (0..layout.participant_count())
+        .map(|participant_index| {
+            layout
+                .participant_initialization_ranges(participant_index)
+                .unwrap()
+                .iter()
+                .map(|range| {
+                    vec![
+                        fill_byte;
+                        usize::try_from(range.length_bytes())
+                            .expect("test initialization length fits usize")
+                    ]
+                })
+                .collect::<Vec<_>>()
         })
-        .collect();
-    SubmissionWaveDeterminismRestore::new(&witness_plan, vec![payloads]).unwrap()
+        .collect()
 }
 
 fn teardown(
@@ -722,26 +738,6 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
     );
-    let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
-    let mut invalid_payloads = witness_plan
-        .initializations()
-        .iter()
-        .map(|initialization| {
-            vec![
-                0x31;
-                usize::try_from(initialization.location().canonical_length_bytes())
-                    .expect("test initialization length fits usize")
-            ]
-        })
-        .collect::<Vec<_>>();
-    invalid_payloads
-        .first_mut()
-        .expect("fixture has one typed initialization")
-        .pop();
-    assert!(SubmissionWaveDeterminismRestore::new(&witness_plan, vec![invalid_payloads]).is_err());
-    assert!(SubmissionWaveDeterminismRestore::new(&witness_plan, vec![Vec::new()]).is_err());
-    let restore = determinism_restore(&fixture.plan, 0x31);
-
     let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
@@ -760,6 +756,21 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
         &lane,
     )
     .unwrap();
+    let layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
+        fixture.runtime.as_ref(),
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        &wave,
+    )
+    .unwrap();
+    let valid_payloads = determinism_payloads(&layout, 0x31);
+    let mut invalid_payloads = valid_payloads.clone();
+    invalid_payloads[0][0].pop();
+    assert!(layout.clone().bind(invalid_payloads).is_err());
+    assert!(layout.clone().bind(vec![Vec::new()]).is_err());
+    let restore = layout.bind(valid_payloads).unwrap();
 
     let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
         &providers,
@@ -849,7 +860,6 @@ fn determinism_submission_rejects_unretained_outputs_before_provider_encode() {
         .payload()
         .retained_completion_values()
         .is_empty());
-    let restore = determinism_restore(&fixture.plan, 0x31);
     let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
@@ -868,6 +878,14 @@ fn determinism_submission_rejects_unretained_outputs_before_provider_encode() {
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x31,
+    );
 
     let error = match OperationDispatch::encode_and_submit_determinism_eager_wave(
         &providers,
@@ -925,7 +943,6 @@ fn determinism_readback_collects_writable_state_with_exact_typed_usage() {
             ExecutionDeterminismWitnessKind::StateEffect { .. }
         ) && witness.location().usage() == BufferUsage::State
     }));
-    let restore = determinism_restore_for_nodes(&fixture.plan, &node_ids, 0x27);
     let wave = prepare_determinism_wave_for_nodes(
         &fixture.plan_resources,
         &fixture.plan,
@@ -952,6 +969,14 @@ fn determinism_readback_collects_writable_state_with_exact_typed_usage() {
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x27,
+    );
 
     let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
         &providers,
@@ -1000,11 +1025,175 @@ fn determinism_readback_collects_writable_state_with_exact_typed_usage() {
 }
 
 #[test]
+fn determinism_chunk_binds_the_exact_paged_state_prefix_from_the_provider_view() {
+    let fixture = fixture_with_token_scaled_paged_state();
+    let full_input = [11, 12, 13, 14];
+    let sequence = logical_resources_with_work(
+        &fixture.plan_resources,
+        "run.device-operation.paged-determinism",
+        "request.device-operation.paged-determinism",
+        TokenSpanWork::from_token_ids(&full_input, 0..full_input.len()).unwrap(),
+    );
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    let step = begin_single_participant_step_on_lane_with_bucket_and_work(
+        &batch,
+        &lane,
+        None,
+        TokenSpanWork::from_token_ids(&full_input, 2..3).unwrap(),
+    );
+    let node_ids = [id("node.tail")];
+    let wave = prepare_determinism_wave_for_nodes(
+        &fixture.plan_resources,
+        &fixture.plan,
+        &step,
+        &node_ids,
+    );
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let providers = wave
+        .nodes()
+        .iter()
+        .map(|node| {
+            fixture
+                .registry
+                .bind(&fixture.resolved, node.node_id())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
+        fixture.runtime.as_ref(),
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        &wave,
+    )
+    .unwrap();
+
+    let state_initialization_index = layout
+        .witness_plan()
+        .initializations()
+        .iter()
+        .position(|initialization| initialization.location().usage() == BufferUsage::State)
+        .expect("token-scaled state must have one deterministic initialization");
+    let state_initialization = &layout.witness_plan().initializations()[state_initialization_index];
+    assert_eq!(state_initialization.location().declared_length_bytes(), 4);
+    assert!(matches!(
+        state_initialization.location().extent(),
+        ExecutionDeterminismValueExtent::ActiveTokenPrefix {
+            bytes_per_token: 4,
+            maximum_tokens: 16,
+            maximum_storage_bytes: 64,
+        }
+    ));
+    let state_range =
+        layout.participant_initialization_ranges(0).unwrap()[state_initialization_index];
+    assert_eq!(state_range.logical_offset_bytes(), 0);
+    assert_eq!(state_range.length_bytes(), 16);
+    assert!(state_range.length_bytes() > 3 * 4);
+    assert_eq!(state_range.length_bytes() % TEST_PAGED_BLOCK_BYTES, 0);
+
+    let external_input_index = layout
+        .witness_plan()
+        .initializations()
+        .iter()
+        .position(|initialization| {
+            matches!(
+                initialization.kind(),
+                ExecutionDeterminismInitializationKind::ExternalInput { .. }
+            )
+        })
+        .expect("tail chunk must bind its external activation input");
+    let external_input_range =
+        layout.participant_initialization_ranges(0).unwrap()[external_input_index];
+    assert_eq!(external_input_range.logical_offset_bytes(), 0);
+    assert_eq!(external_input_range.length_bytes(), 4);
+
+    let state_witness_index = layout
+        .witness_plan()
+        .witnesses()
+        .iter()
+        .position(|witness| {
+            matches!(
+                witness.kind(),
+                ExecutionDeterminismWitnessKind::StateEffect { .. }
+            )
+        })
+        .expect("tail chunk must retain its writable state witness");
+    assert_eq!(
+        layout
+            .witness_participant_ranges(state_witness_index)
+            .unwrap()[0],
+        state_range
+    );
+
+    let participant_payloads = determinism_payloads(&layout, 0x27);
+    let restore = layout.bind(participant_payloads).unwrap();
+    let reaper = CompletionReaper::new();
+    let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Completion,
+        &restore,
+        0x5a,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let state_readback = handle
+        .readback_plan()
+        .targets()
+        .iter()
+        .flat_map(|target| target.batch().requests())
+        .find(|request| request.expected_usage() == BufferUsage::State)
+        .expect("token-scaled state must have one exact terminal readback");
+    assert_eq!(state_readback.logical_offset_bytes(), 0);
+    assert_eq!(state_readback.output_layout().byte_len().unwrap(), 16);
+
+    let readback = match handle.wait_with_determinism_readback().unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("paged-state determinism readback did not terminate: {other:?}"),
+    };
+    assert!(readback.dispositions().iter().any(|disposition| {
+        matches!(
+            disposition,
+            CompletionReadbackDisposition::Succeeded(output)
+                if output.request().expected_usage() == BufferUsage::State
+                    && output.bytes().len() == 16
+        )
+    }));
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert!(trace
+            .uploaded_payloads
+            .iter()
+            .any(|payload| { payload.len() == 16 && payload.iter().all(|byte| *byte == 0x27) }));
+        assert!(trace.readback_lengths.contains(&16));
+    }
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn determinism_submission_rejects_state_overwritten_later_in_the_same_wave() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_determinism_provider_behavior(true, ProviderBehavior::Success),
     );
-    let restore = determinism_restore(&fixture.plan, 0x27);
     let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
@@ -1023,6 +1212,14 @@ fn determinism_submission_rejects_state_overwritten_later_in_the_same_wave() {
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x27,
+    );
 
     let error = match OperationDispatch::encode_and_submit_determinism_eager_wave(
         &providers,
@@ -1061,16 +1258,57 @@ fn determinism_submission_rejects_restore_for_a_different_wave_scope() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::Success),
     );
-    let restore = determinism_restore(&fixture.plan, 0x27);
     let node_ids = [id("node.tail")];
-    let wave = prepare_determinism_wave_for_nodes(
+    let lane = Arc::clone(step.execution_lane());
+    let source_wave = prepare_determinism_wave_for_nodes(
         &fixture.plan_resources,
         &fixture.plan,
         &step,
         &node_ids,
     );
+    let source_active_bindings = wave_active_bindings(&source_wave, &session);
+    let source_providers = source_wave
+        .nodes()
+        .iter()
+        .map(|node| {
+            fixture
+                .registry
+                .bind(&fixture.resolved, node.node_id())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let source_batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        source_active_bindings.iter(),
+        &source_wave,
+        &lane,
+    )
+    .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &source_providers,
+        &source_batch_identity,
+        &source_active_bindings,
+        &source_wave,
+        0x27,
+    );
+    drop(source_providers);
+    drop(source_active_bindings);
+    drop(source_wave);
+    step.try_retire_normal().unwrap();
+    let target_step = begin_single_participant_step_on_lane_with_bucket(
+        &batch,
+        &lane,
+        fixture.reusable_execution_bucket.as_ref(),
+    );
+
+    let wave = prepare_determinism_wave_for_nodes(
+        &fixture.plan_resources,
+        &fixture.plan,
+        &target_step,
+        &node_ids,
+    );
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = wave
         .nodes()
@@ -1108,7 +1346,7 @@ fn determinism_submission_rejects_restore_for_a_different_wave_scope() {
     assert!(matches!(
         error,
         SubmissionWaveDispatchError::Contract(ref error)
-            if error.to_string().contains("node scope differs from its exact prepared wave")
+            if error.to_string().contains("differs from its prepared wave or physical batch identity")
     ));
     assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
     assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
@@ -1119,7 +1357,7 @@ fn determinism_submission_rejects_restore_for_a_different_wave_scope() {
     drop(active_bindings);
     drop(reaper);
     drop(lane);
-    teardown(fixture, sequence, session, batch, step);
+    teardown(fixture, sequence, session, batch, target_step);
 }
 
 #[test]
@@ -1128,7 +1366,6 @@ fn determinism_single_node_replay_preserves_the_immutable_plan_node_index() {
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding),
     );
     let node_ids = [id("node.tail")];
-    let restore = determinism_restore_for_nodes(&fixture.plan, &node_ids, 0x42);
     let wave = prepare_determinism_wave_for_nodes(
         &fixture.plan_resources,
         &fixture.plan,
@@ -1155,6 +1392,14 @@ fn determinism_single_node_replay_preserves_the_immutable_plan_node_index() {
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x42,
+    );
     let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
         &providers,
         &fixture.resolved,
@@ -1343,7 +1588,6 @@ fn determinism_dispatch_rejects_a_product_wave_before_provider_encode() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::Success),
     );
-    let restore = determinism_restore(&fixture.plan, 0x42);
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
@@ -1362,6 +1606,14 @@ fn determinism_dispatch_rejects_a_product_wave_before_provider_encode() {
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x42,
+    );
 
     let error = match OperationDispatch::encode_and_submit_determinism_eager_wave(
         &providers,
@@ -1407,6 +1659,13 @@ fn determinism_readback_rejects_a_foreign_plan_before_submission() {
     let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
         active_bindings.iter(),
@@ -1414,18 +1673,28 @@ fn determinism_readback_rejects_a_foreign_plan_before_submission() {
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x27,
+    );
 
-    let error = SubmissionWaveDeterminismReadbackPlan::from_prepared_wave(
+    let error = SubmissionWaveDeterminismReadbackPlan::from_restore(
         &foreign_fixture.resolved,
         &batch_identity,
         &wave,
+        &restore,
     )
     .unwrap_err();
     assert!(error
         .to_string()
-        .contains("differs from its prepared wave or physical batch identity"));
+        .contains("differs from the exact immutable plan initialization denominator"));
     assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
 
+    drop(providers);
     drop(active_bindings);
     drop(lane);
     drop(wave);
@@ -2048,7 +2317,6 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding),
     );
-    let restore = determinism_restore(&fixture.plan, 0x42);
     let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
@@ -2067,6 +2335,14 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         &lane,
     )
     .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x42,
+    );
     let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
         &providers,
         &fixture.resolved,
