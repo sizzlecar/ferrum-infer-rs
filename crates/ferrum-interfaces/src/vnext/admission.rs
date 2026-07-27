@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,15 +164,37 @@ impl CapacityVector {
         self.0.is_empty()
     }
 
-    fn units_for(&self, domain: CapacityDomainId) -> Option<CapacityUnits> {
+    pub(crate) fn units_for(&self, domain: CapacityDomainId) -> Option<CapacityUnits> {
         self.0
             .binary_search_by_key(&domain, |entry| entry.domain)
             .ok()
             .map(|index| self.0[index].units)
     }
+
+    pub(crate) fn checked_sum(left: &Self, right: &Self) -> Result<Self, VNextError> {
+        let mut units_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
+        for entry in left.entries().iter().chain(right.entries()) {
+            let units = units_by_domain.entry(entry.domain()).or_default();
+            *units = units.checked_add(entry.units().get()).ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::ArithmeticOverflow,
+                    "combined admission demand overflows u64",
+                )
+            })?;
+        }
+        if units_by_domain.is_empty() {
+            return Ok(Self::empty());
+        }
+        Self::new(
+            units_by_domain
+                .into_iter()
+                .map(|(domain, units)| CapacityEntry::new(domain, CapacityUnits::new(units)))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionFitPolicy {
     ImmediateOnly,
@@ -244,6 +266,27 @@ impl AdmissionDemand {
 
     pub const fn pressure_action(&self) -> AdmissionPressureAction {
         self.pressure_action
+    }
+
+    fn initial_sequence_bundle(request: &Self, sequence: &Self) -> Result<Self, VNextError> {
+        if request.pressure_action != sequence.pressure_action {
+            return Err(invalid_admission(
+                "initial request and sequence require one pressure action",
+            ));
+        }
+        let fit_policy = if request.fit_policy == AdmissionFitPolicy::FullInputMustFit
+            || sequence.fit_policy == AdmissionFitPolicy::FullInputMustFit
+        {
+            AdmissionFitPolicy::FullInputMustFit
+        } else {
+            AdmissionFitPolicy::ImmediateOnly
+        };
+        Self::from_plan(
+            CapacityVector::checked_sum(&request.immediate_claim, &sequence.immediate_claim)?,
+            CapacityVector::checked_sum(&request.fit_requirement, &sequence.fit_requirement)?,
+            fit_policy,
+            request.pressure_action,
+        )
     }
 }
 
@@ -416,6 +459,219 @@ impl CapacityEpochs {
     }
 }
 
+/// One independently changing source that can make a deferred capacity
+/// decision worth recomputing. Global release/capacity epochs remain audit
+/// versions; scheduler retry eligibility is derived from these exact sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityAvailabilitySource {
+    Domain(CapacityDomainId),
+    ActiveSequenceSlots,
+    PlanDeviceBudget,
+    ProcessDeviceCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct CapacityAvailabilityEpoch {
+    source: CapacityAvailabilitySource,
+    epoch: u64,
+}
+
+impl CapacityAvailabilityEpoch {
+    pub fn new(source: CapacityAvailabilitySource, epoch: u64) -> Result<Self, VNextError> {
+        if epoch == 0 {
+            return Err(invalid_admission(
+                "capacity availability epoch must be non-zero",
+            ));
+        }
+        Ok(Self { source, epoch })
+    }
+
+    pub const fn source(self) -> CapacityAvailabilitySource {
+        self.source
+    }
+
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Exact, non-authoritative retry predicate captured with one deferral.
+/// Copying this value cannot allocate capacity; it can only suppress or permit
+/// a later authoritative admission probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapacityWaitCondition {
+    coordinator_id: LogicalAdmissionCoordinatorId,
+    observed: Vec<CapacityAvailabilityEpoch>,
+}
+
+impl CapacityWaitCondition {
+    pub fn from_observation(
+        coordinator_id: u64,
+        observed: Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<Self, VNextError> {
+        if coordinator_id == 0 {
+            return Err(invalid_admission(
+                "capacity wait coordinator id must be non-zero",
+            ));
+        }
+        Self::new(LogicalAdmissionCoordinatorId(coordinator_id), observed)
+    }
+
+    pub fn new(
+        coordinator_id: LogicalAdmissionCoordinatorId,
+        mut observed: Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<Self, VNextError> {
+        if observed.is_empty() {
+            return Err(invalid_admission(
+                "capacity wait condition requires at least one availability source",
+            ));
+        }
+        observed.sort_by_key(|entry| entry.source);
+        if observed
+            .windows(2)
+            .any(|pair| pair[0].source == pair[1].source)
+        {
+            return Err(invalid_admission(
+                "capacity wait condition contains a duplicate availability source",
+            ));
+        }
+        Ok(Self {
+            coordinator_id,
+            observed,
+        })
+    }
+
+    pub const fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
+        self.coordinator_id
+    }
+
+    pub fn observed(&self) -> &[CapacityAvailabilityEpoch] {
+        &self.observed
+    }
+
+    pub fn validate_sources_present(
+        &self,
+        current: &[CapacityAvailabilityEpoch],
+    ) -> Result<(), VNextError> {
+        if current
+            .windows(2)
+            .any(|pair| pair[0].source >= pair[1].source)
+        {
+            return Err(invalid_admission(
+                "capacity availability snapshot is not canonical",
+            ));
+        }
+        for observed in &self.observed {
+            current
+                .binary_search_by_key(&observed.source, |entry| entry.source)
+                .map_err(|_| {
+                    invalid_admission("capacity availability snapshot omitted a waited source")
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn changed_since(&self, current: &[CapacityAvailabilityEpoch]) -> Result<bool, VNextError> {
+        self.validate_sources_present(current)?;
+        let mut changed = false;
+        for observed in &self.observed {
+            let index = current
+                .binary_search_by_key(&observed.source, |entry| entry.source)
+                .expect("validated availability source remains present");
+            let current_epoch = current[index].epoch;
+            if current_epoch < observed.epoch {
+                return Err(admission_fault(
+                    DynamicAdmissionFaultKind::EpochRegression,
+                    "capacity availability epoch regressed",
+                ));
+            }
+            changed |= current_epoch > observed.epoch;
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn refreshed_from(
+        &self,
+        current: &[CapacityAvailabilityEpoch],
+    ) -> Result<Self, VNextError> {
+        self.validate_sources_present(current)?;
+        Self::new(
+            self.coordinator_id,
+            self.observed
+                .iter()
+                .map(|observed| {
+                    let index = current
+                        .binary_search_by_key(&observed.source, |entry| entry.source)
+                        .expect("validated availability source remains present");
+                    current[index]
+                })
+                .collect(),
+        )
+    }
+}
+
+/// One coherent observation used to publish a deferred capacity decision.
+///
+/// The audit epochs and exact retry predicate are sampled while holding the
+/// coordinator lock once. Callers that inspect a second resource owner must
+/// capture this snapshot before that inspection, so a release racing with the
+/// inspection is either visible to the inspection or advances this predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapacityWaitSnapshot {
+    epochs: CapacityEpochs,
+    wait_condition: CapacityWaitCondition,
+}
+
+impl CapacityWaitSnapshot {
+    fn new(epochs: CapacityEpochs, wait_condition: CapacityWaitCondition) -> Self {
+        debug_assert_eq!(epochs.coordinator_id(), wait_condition.coordinator_id());
+        Self {
+            epochs,
+            wait_condition,
+        }
+    }
+
+    pub const fn epochs(&self) -> CapacityEpochs {
+        self.epochs
+    }
+
+    pub fn wait_condition(&self) -> &CapacityWaitCondition {
+        &self.wait_condition
+    }
+
+    pub(crate) fn narrow_to_domains(
+        self,
+        domains: impl IntoIterator<Item = CapacityDomainId>,
+    ) -> Result<Self, VNextError> {
+        let sources = domains
+            .into_iter()
+            .map(CapacityAvailabilitySource::Domain)
+            .collect::<BTreeSet<_>>();
+        if sources.is_empty() {
+            return Err(invalid_admission(
+                "capacity wait snapshot cannot be narrowed to no domains",
+            ));
+        }
+        let observed = sources
+            .into_iter()
+            .map(|source| {
+                self.wait_condition
+                    .observed
+                    .binary_search_by_key(&source, |entry| entry.source)
+                    .map(|index| self.wait_condition.observed[index])
+                    .map_err(|_| {
+                        invalid_admission("capacity wait snapshot cannot add an unobserved domain")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::new(
+            self.epochs,
+            CapacityWaitCondition::new(self.wait_condition.coordinator_id, observed)?,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct SequenceAuthorityId {
     sparse_id: u32,
@@ -481,6 +737,7 @@ pub struct AdmissionDeferred {
     action: DeferredAction,
     release_epoch: u64,
     capacity_epoch: u64,
+    wait_condition: CapacityWaitCondition,
 }
 
 impl AdmissionDeferred {
@@ -519,6 +776,10 @@ impl AdmissionDeferred {
             capacity_epoch: self.capacity_epoch,
         }
     }
+
+    pub fn wait_condition(&self) -> &CapacityWaitCondition {
+        &self.wait_condition
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -551,6 +812,26 @@ pub enum RequestAdmissionDecision {
     Admitted(LogicalRequestLease),
     Deferred(AdmissionDeferred),
     PermanentRejected(AdmissionRejected),
+}
+
+pub(crate) enum InitialSequenceAdmissionDecision {
+    Admitted(LogicalInitialSequenceAdmission),
+    Deferred,
+    PermanentRejected(AdmissionRejected),
+}
+
+/// Atomic logical authority for a request root and its first child sequence.
+/// Field order is intentional: an unconsumed bundle releases the child before
+/// the parent request.
+pub(crate) struct LogicalInitialSequenceAdmission {
+    sequence: LogicalAdmissionLease,
+    request: LogicalRequestLease,
+}
+
+impl LogicalInitialSequenceAdmission {
+    pub(crate) fn into_parts(self) -> (LogicalRequestLease, LogicalAdmissionLease) {
+        (self.request, self.sequence)
+    }
 }
 
 pub(crate) enum AdmissionPreflightDecision {
@@ -597,6 +878,7 @@ impl SequenceCapacityParent {
 struct DomainState {
     spec: CapacityDomainSpec,
     used: u64,
+    availability_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -627,6 +909,7 @@ struct CoordinatorState {
     next_sequence_generation: u64,
     release_epoch: u64,
     capacity_epoch: u64,
+    active_sequence_availability_epoch: u64,
     poisoned: bool,
 }
 
@@ -683,6 +966,183 @@ impl CoordinatorState {
             release_epoch: self.release_epoch,
             capacity_epoch: self.capacity_epoch,
         }
+    }
+
+    fn write_availability_epochs(&self, out: &mut Vec<CapacityAvailabilityEpoch>) {
+        out.clear();
+        out.extend(
+            self.domains
+                .iter()
+                .map(|(domain, state)| CapacityAvailabilityEpoch {
+                    source: CapacityAvailabilitySource::Domain(*domain),
+                    epoch: state.availability_epoch,
+                }),
+        );
+        out.push(CapacityAvailabilityEpoch {
+            source: CapacityAvailabilitySource::ActiveSequenceSlots,
+            epoch: self.active_sequence_availability_epoch,
+        });
+    }
+
+    fn wait_condition_for_blockers(
+        &self,
+        coordinator_id: LogicalAdmissionCoordinatorId,
+        blockers: &[CapacityShortfall],
+    ) -> Result<CapacityWaitCondition, VNextError> {
+        let mut sources = BTreeSet::new();
+        for blocker in blockers {
+            match (blocker.kind, blocker.domain) {
+                (CapacityShortfallKind::ActiveSequenceCeiling, None) => {
+                    sources.insert(CapacityAvailabilitySource::ActiveSequenceSlots);
+                }
+                (CapacityShortfallKind::PermanentDomainMaximum, _) => {
+                    return Err(invalid_admission(
+                        "permanent capacity blocker cannot produce a wait condition",
+                    ));
+                }
+                (_, Some(domain)) => {
+                    if !self.domains.contains_key(&domain) {
+                        return Err(admission_fault(
+                            DynamicAdmissionFaultKind::UnknownDomain,
+                            "capacity blocker references an unknown wait domain",
+                        ));
+                    }
+                    sources.insert(CapacityAvailabilitySource::Domain(domain));
+                }
+                (_, None) => {
+                    return Err(invalid_admission(
+                        "capacity blocker contains no availability source",
+                    ));
+                }
+            }
+        }
+        self.wait_condition_for_sources(coordinator_id, sources)
+    }
+
+    fn wait_condition_for_domains(
+        &self,
+        coordinator_id: LogicalAdmissionCoordinatorId,
+        domains: impl IntoIterator<Item = CapacityDomainId>,
+    ) -> Result<CapacityWaitCondition, VNextError> {
+        self.wait_condition_for_sources(
+            coordinator_id,
+            domains
+                .into_iter()
+                .map(CapacityAvailabilitySource::Domain)
+                .collect(),
+        )
+    }
+
+    fn wait_condition_for_sources(
+        &self,
+        coordinator_id: LogicalAdmissionCoordinatorId,
+        sources: BTreeSet<CapacityAvailabilitySource>,
+    ) -> Result<CapacityWaitCondition, VNextError> {
+        let observed = sources
+            .into_iter()
+            .map(|source| {
+                let epoch = match source {
+                    CapacityAvailabilitySource::Domain(domain) => {
+                        self.domains
+                            .get(&domain)
+                            .ok_or_else(|| {
+                                admission_fault(
+                                    DynamicAdmissionFaultKind::UnknownDomain,
+                                    "capacity wait references an unknown domain",
+                                )
+                            })?
+                            .availability_epoch
+                    }
+                    CapacityAvailabilitySource::ActiveSequenceSlots => {
+                        self.active_sequence_availability_epoch
+                    }
+                    CapacityAvailabilitySource::PlanDeviceBudget
+                    | CapacityAvailabilitySource::ProcessDeviceCapacity => {
+                        return Err(invalid_admission(
+                            "device capacity availability is owned by the device account",
+                        ));
+                    }
+                };
+                CapacityAvailabilityEpoch::new(source, epoch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        CapacityWaitCondition::new(coordinator_id, observed)
+    }
+
+    fn availability_epoch_for(
+        &self,
+        source: CapacityAvailabilitySource,
+    ) -> Result<u64, VNextError> {
+        match source {
+            CapacityAvailabilitySource::Domain(domain) => self
+                .domains
+                .get(&domain)
+                .map(|state| state.availability_epoch)
+                .ok_or_else(|| {
+                    admission_fault(
+                        DynamicAdmissionFaultKind::UnknownDomain,
+                        "capacity wait references an unknown domain",
+                    )
+                }),
+            CapacityAvailabilitySource::ActiveSequenceSlots => {
+                Ok(self.active_sequence_availability_epoch)
+            }
+            CapacityAvailabilitySource::PlanDeviceBudget
+            | CapacityAvailabilitySource::ProcessDeviceCapacity => Err(invalid_admission(
+                "device capacity availability is owned by the device account",
+            )),
+        }
+    }
+
+    fn wait_condition_changed(
+        &self,
+        coordinator_id: LogicalAdmissionCoordinatorId,
+        observed: &CapacityWaitCondition,
+    ) -> Result<bool, VNextError> {
+        if observed.coordinator_id != coordinator_id {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::ForeignCoordinator,
+                "capacity wait condition belongs to a different coordinator",
+            ));
+        }
+        let mut changed = false;
+        for entry in &observed.observed {
+            let current = self.availability_epoch_for(entry.source)?;
+            if current < entry.epoch {
+                return Err(admission_fault(
+                    DynamicAdmissionFaultKind::EpochRegression,
+                    "capacity availability epoch regressed",
+                ));
+            }
+            changed |= current > entry.epoch;
+        }
+        Ok(changed)
+    }
+
+    fn refresh_wait_condition(
+        &self,
+        coordinator_id: LogicalAdmissionCoordinatorId,
+        observed: &CapacityWaitCondition,
+    ) -> Result<CapacityWaitCondition, VNextError> {
+        if observed.coordinator_id != coordinator_id {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::ForeignCoordinator,
+                "capacity wait condition belongs to a different coordinator",
+            ));
+        }
+        CapacityWaitCondition::new(
+            coordinator_id,
+            observed
+                .observed
+                .iter()
+                .map(|entry| {
+                    CapacityAvailabilityEpoch::new(
+                        entry.source,
+                        self.availability_epoch_for(entry.source)?,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
     }
 
     fn preview_request_authority(&self) -> Result<RequestAuthorityReservation, VNextError> {
@@ -956,7 +1416,14 @@ impl LogicalAdmissionCoordinator {
         let mut registered = BTreeMap::new();
         for (domain, spec) in domains {
             if registered
-                .insert(domain, DomainState { spec, used: 0 })
+                .insert(
+                    domain,
+                    DomainState {
+                        spec,
+                        used: 0,
+                        availability_epoch: 1,
+                    },
+                )
                 .is_some()
             {
                 return Err(invalid_admission("duplicate coordinator capacity domain"));
@@ -986,6 +1453,7 @@ impl LogicalAdmissionCoordinator {
                     next_sequence_generation: 1,
                     release_epoch: 1,
                     capacity_epoch: 1,
+                    active_sequence_availability_epoch: 1,
                     poisoned: false,
                 }),
                 epoch_tx,
@@ -1030,6 +1498,8 @@ impl LogicalAdmissionCoordinator {
         }
         if !evaluation.blockers.is_empty() {
             let action = deferred_action(demand, evaluation.growth_required);
+            let wait_condition =
+                state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
             let snapshot = state.snapshot(self.id());
             return Ok(RequestAdmissionDecision::Deferred(AdmissionDeferred {
                 immediate_requested: demand.immediate_claim.clone(),
@@ -1039,6 +1509,7 @@ impl LogicalAdmissionCoordinator {
                 available: snapshot,
                 blockers: evaluation.blockers,
                 action,
+                wait_condition,
             }));
         }
 
@@ -1093,6 +1564,237 @@ impl LogicalAdmissionCoordinator {
         }))
     }
 
+    /// Rejects an impossible initial request/sequence pair and observes the
+    /// global sequence ceiling before physical backing is prepared. Ordinary
+    /// capacity blockers deliberately remain eligible here because elastic
+    /// backing maintenance may increase their current totals before the final
+    /// atomic admission check.
+    pub(crate) fn preflight_initial_sequence(
+        &self,
+        request: &AdmissionDemand,
+        sequence: &AdmissionDemand,
+    ) -> Result<AdmissionPreflightDecision, VNextError> {
+        let demand = AdmissionDemand::initial_sequence_bundle(request, sequence)?;
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        let mut evaluation = evaluate_demand(&state, &demand)?;
+        if !evaluation.permanent.is_empty() {
+            return Ok(AdmissionPreflightDecision::PermanentRejected(
+                AdmissionRejected {
+                    immediate_requested: demand.immediate_claim,
+                    fit_requested: demand.fit_requirement,
+                    maximum: state.snapshot(self.id()),
+                    blockers: evaluation.permanent,
+                },
+            ));
+        }
+        if state.active_sequences < state.maximum_active_sequences {
+            return Ok(AdmissionPreflightDecision::Eligible);
+        }
+        evaluation.blockers.push(CapacityShortfall {
+            domain: None,
+            kind: CapacityShortfallKind::ActiveSequenceCeiling,
+            requested: CapacityUnits::new(1),
+            available: CapacityUnits::ZERO,
+            current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+            maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+        });
+        let wait_condition = state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
+        let snapshot = state.snapshot(self.id());
+        Ok(AdmissionPreflightDecision::Deferred(AdmissionDeferred {
+            immediate_requested: demand.immediate_claim,
+            fit_requested: demand.fit_requirement,
+            release_epoch: snapshot.release_epoch,
+            capacity_epoch: snapshot.capacity_epoch,
+            available: snapshot,
+            blockers: evaluation.blockers,
+            action: match demand.pressure_action {
+                AdmissionPressureAction::WaitForRelease => DeferredAction::WaitForRelease,
+                AdmissionPressureAction::PreemptAndRecompute => DeferredAction::PreemptAndRecompute,
+            },
+            wait_condition,
+        }))
+    }
+
+    /// Re-observes the complete bundle after unpublished physical reservations
+    /// have been rolled back. The returned wait condition therefore cannot be
+    /// invalidated by the caller's own rollback notification.
+    pub(crate) fn observe_initial_sequence(
+        &self,
+        request: &AdmissionDemand,
+        sequence: &AdmissionDemand,
+    ) -> Result<AdmissionPreflightDecision, VNextError> {
+        let demand = AdmissionDemand::initial_sequence_bundle(request, sequence)?;
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        let mut evaluation = evaluate_demand(&state, &demand)?;
+        if !evaluation.permanent.is_empty() {
+            return Ok(AdmissionPreflightDecision::PermanentRejected(
+                AdmissionRejected {
+                    immediate_requested: demand.immediate_claim,
+                    fit_requested: demand.fit_requirement,
+                    maximum: state.snapshot(self.id()),
+                    blockers: evaluation.permanent,
+                },
+            ));
+        }
+        if state.active_sequences >= state.maximum_active_sequences {
+            evaluation.blockers.push(CapacityShortfall {
+                domain: None,
+                kind: CapacityShortfallKind::ActiveSequenceCeiling,
+                requested: CapacityUnits::new(1),
+                available: CapacityUnits::ZERO,
+                current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+                maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+            });
+        }
+        if evaluation.blockers.is_empty() {
+            return Ok(AdmissionPreflightDecision::Eligible);
+        }
+        let action = deferred_action(&demand, evaluation.growth_required);
+        let wait_condition = state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
+        let snapshot = state.snapshot(self.id());
+        Ok(AdmissionPreflightDecision::Deferred(AdmissionDeferred {
+            immediate_requested: demand.immediate_claim,
+            fit_requested: demand.fit_requirement,
+            release_epoch: snapshot.release_epoch,
+            capacity_epoch: snapshot.capacity_epoch,
+            available: snapshot,
+            blockers: evaluation.blockers,
+            action,
+            wait_condition,
+        }))
+    }
+
+    /// Commits a request root and its first child sequence under one mutation
+    /// lock. No request authority or capacity claim can escape when the child
+    /// sequence is deferred or permanently rejected.
+    pub(crate) fn try_admit_initial_sequence(
+        &self,
+        request_demand: &AdmissionDemand,
+        sequence_demand: &AdmissionDemand,
+    ) -> Result<InitialSequenceAdmissionDecision, VNextError> {
+        let demand = AdmissionDemand::initial_sequence_bundle(request_demand, sequence_demand)?;
+        let mut state = self.inner.lock_mutation()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+
+        let mut evaluation = evaluate_demand(&state, &demand)?;
+        if !evaluation.permanent.is_empty() {
+            return Ok(InitialSequenceAdmissionDecision::PermanentRejected(
+                AdmissionRejected {
+                    immediate_requested: demand.immediate_claim,
+                    fit_requested: demand.fit_requirement,
+                    maximum: state.snapshot(self.id()),
+                    blockers: evaluation.permanent,
+                },
+            ));
+        }
+        if state.active_sequences >= state.maximum_active_sequences {
+            evaluation.blockers.push(CapacityShortfall {
+                domain: None,
+                kind: CapacityShortfallKind::ActiveSequenceCeiling,
+                requested: CapacityUnits::new(1),
+                available: CapacityUnits::ZERO,
+                current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+                maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+            });
+        }
+        if !evaluation.blockers.is_empty() {
+            return Ok(InitialSequenceAdmissionDecision::Deferred);
+        }
+
+        let request_reservation = state.preview_request_authority()?;
+        let sequence_reservation = state.preview_sequence_authority()?;
+        let mut next_usage = Vec::with_capacity(demand.immediate_claim.entries().len());
+        for entry in demand.immediate_claim.entries() {
+            let domain = state
+                .domains
+                .get(&entry.domain)
+                .expect("known bundle demand domain was preflight validated");
+            let used = domain.used.checked_add(entry.units.get()).ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::ArithmeticOverflow,
+                    "initial request/sequence capacity usage overflows u64",
+                )
+            })?;
+            next_usage.push((entry.domain, used));
+        }
+        let next_active_requests = state.active_requests.checked_add(1).ok_or_else(|| {
+            admission_fault(
+                DynamicAdmissionFaultKind::AuthorityExhausted,
+                "active request count is exhausted",
+            )
+        })?;
+        let next_active_sequences = state.active_sequences.checked_add(1).ok_or_else(|| {
+            admission_fault(
+                DynamicAdmissionFaultKind::ArithmeticOverflow,
+                "active sequence count overflows u32",
+            )
+        })?;
+        state
+            .release_epoch
+            .checked_add(u64::from(next_active_requests))
+            .and_then(|epoch| epoch.checked_add(u64::from(next_active_sequences)))
+            .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::EpochExhausted,
+                    "release epoch cannot represent the initial request/sequence bundle",
+                )
+            })?;
+        state.prepare_request_storage(request_reservation)?;
+        state.prepare_sequence_storage(sequence_reservation)?;
+
+        let request = state.commit_request_authority(request_reservation);
+        let sequence = state.commit_sequence_authority(sequence_reservation, request);
+        for (domain, used) in next_usage {
+            state
+                .domains
+                .get_mut(&domain)
+                .expect("validated bundle capacity domain remains registered")
+                .used = used;
+        }
+        state.active_requests = next_active_requests;
+        state.active_sequences = next_active_sequences;
+        state.live_requests[request.sparse_id as usize]
+            .as_mut()
+            .expect("new initial request remains live")
+            .active_sequences = 1;
+
+        Ok(InitialSequenceAdmissionDecision::Admitted(
+            LogicalInitialSequenceAdmission {
+                sequence: LogicalAdmissionLease {
+                    inner: Arc::clone(&self.inner),
+                    request,
+                    sequence,
+                    claims: sequence_demand.immediate_claim.clone(),
+                    released: false,
+                },
+                request: LogicalRequestLease {
+                    inner: Arc::clone(&self.inner),
+                    request,
+                    claims: request_demand.immediate_claim.clone(),
+                    released: false,
+                },
+            },
+        ))
+    }
+
     pub(crate) fn try_admit_sequence_for_request(
         &self,
         request: &LogicalRequestLease,
@@ -1144,6 +1846,8 @@ impl LogicalAdmissionCoordinator {
         }
         if !evaluation.blockers.is_empty() {
             let action = deferred_action(demand, evaluation.growth_required);
+            let wait_condition =
+                state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
             let snapshot = state.snapshot(self.id());
             return Ok(AdmissionDecision::Deferred(AdmissionDeferred {
                 immediate_requested: demand.immediate_claim.clone(),
@@ -1153,6 +1857,7 @@ impl LogicalAdmissionCoordinator {
                 available: snapshot,
                 blockers: evaluation.blockers,
                 action,
+                wait_condition,
             }));
         }
 
@@ -1278,6 +1983,7 @@ impl LogicalAdmissionCoordinator {
             current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
             maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
         });
+        let wait_condition = state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
         let snapshot = state.snapshot(self.id());
         Ok(AdmissionPreflightDecision::Deferred(AdmissionDeferred {
             immediate_requested: demand.immediate_claim.clone(),
@@ -1290,6 +1996,7 @@ impl LogicalAdmissionCoordinator {
                 AdmissionPressureAction::WaitForRelease => DeferredAction::WaitForRelease,
                 AdmissionPressureAction::PreemptAndRecompute => DeferredAction::PreemptAndRecompute,
             },
+            wait_condition,
         }))
     }
 
@@ -1396,6 +2103,8 @@ impl LogicalAdmissionCoordinator {
         }
         if !evaluation.blockers.is_empty() {
             let action = deferred_action(demand, evaluation.growth_required);
+            let wait_condition =
+                state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
             let snapshot = state.snapshot(self.id());
             return Ok(BatchCapacityClaimDecision::Deferred(AdmissionDeferred {
                 immediate_requested: demand.immediate_claim.clone(),
@@ -1405,6 +2114,7 @@ impl LogicalAdmissionCoordinator {
                 available: snapshot,
                 blockers: evaluation.blockers,
                 action,
+                wait_condition,
             }));
         }
 
@@ -1497,6 +2207,61 @@ impl LogicalAdmissionCoordinator {
         Ok(state.epochs(self.id()))
     }
 
+    pub(crate) fn subscribe_epochs(&self) -> watch::Receiver<CapacityEpochs> {
+        self.inner.epoch_tx.subscribe()
+    }
+
+    /// Writes a canonical point-in-time availability vector into caller-owned
+    /// storage. Reusing the buffer keeps steady scheduler ticks allocation-free.
+    pub fn write_availability_epochs(
+        &self,
+        out: &mut Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<CapacityEpochs, VNextError> {
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        state.write_availability_epochs(out);
+        Ok(state.epochs(self.id()))
+    }
+
+    pub(crate) fn wait_snapshot_for_domains(
+        &self,
+        domains: impl IntoIterator<Item = CapacityDomainId>,
+    ) -> Result<CapacityWaitSnapshot, VNextError> {
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        Ok(CapacityWaitSnapshot::new(
+            state.epochs(self.id()),
+            state.wait_condition_for_domains(self.id(), domains)?,
+        ))
+    }
+
+    pub(crate) fn refresh_wait_snapshot(
+        &self,
+        observed: &CapacityWaitCondition,
+    ) -> Result<CapacityWaitSnapshot, VNextError> {
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        Ok(CapacityWaitSnapshot::new(
+            state.epochs(self.id()),
+            state.refresh_wait_condition(self.id(), observed)?,
+        ))
+    }
+
     pub(crate) fn set_domain_total(
         &self,
         domain: CapacityDomainId,
@@ -1537,6 +2302,14 @@ impl LogicalAdmissionCoordinator {
                     "capacity update is below live use or above maximum total",
                 ));
             }
+            if new_total.get() > domain_state.spec.total_units.get()
+                && domain_state.availability_epoch == u64::MAX
+            {
+                return Err(admission_fault(
+                    DynamicAdmissionFaultKind::EpochExhausted,
+                    "domain availability epoch is exhausted",
+                ));
+            }
             changed |= *new_total != domain_state.spec.total_units;
         }
         if !changed {
@@ -1549,12 +2322,14 @@ impl LogicalAdmissionCoordinator {
             )
         })?;
         for (domain, new_total) in updates {
-            state
+            let domain_state = state
                 .domains
                 .get_mut(domain)
-                .expect("validated capacity domain remains registered")
-                .spec
-                .total_units = *new_total;
+                .expect("validated capacity domain remains registered");
+            if new_total.get() > domain_state.spec.total_units.get() {
+                domain_state.availability_epoch += 1;
+            }
+            domain_state.spec.total_units = *new_total;
         }
         state.capacity_epoch = next_capacity_epoch;
         let epochs = state.epochs(self.id());
@@ -1583,12 +2358,26 @@ impl LogicalAdmissionCoordinator {
                 "availability update references unknown domain",
             ));
         }
-        state.capacity_epoch = state.capacity_epoch.checked_add(1).ok_or_else(|| {
+        let next_capacity_epoch = state.capacity_epoch.checked_add(1).ok_or_else(|| {
             admission_fault(
                 DynamicAdmissionFaultKind::EpochExhausted,
                 "capacity epoch is exhausted",
             )
         })?;
+        let domain_state = state
+            .domains
+            .get_mut(&domain)
+            .expect("validated availability domain remains registered");
+        domain_state.availability_epoch = domain_state
+            .availability_epoch
+            .checked_add(1)
+            .ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::EpochExhausted,
+                    "domain availability epoch is exhausted",
+                )
+            })?;
+        state.capacity_epoch = next_capacity_epoch;
         let epochs = state.epochs(self.id());
         self.inner.epoch_tx.send_replace(epochs);
         drop(state);
@@ -1597,7 +2386,7 @@ impl LogicalAdmissionCoordinator {
 
     pub fn register_waiter(
         &self,
-        observed: CapacityEpochs,
+        observed: CapacityWaitCondition,
     ) -> Result<CapacityWaitRegistration, VNextError> {
         if observed.coordinator_id != self.id() {
             return Err(admission_fault(
@@ -1606,7 +2395,14 @@ impl LogicalAdmissionCoordinator {
             ));
         }
         let receiver = self.inner.epoch_tx.subscribe();
-        let registered = self.epochs()?;
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        let registered = state.refresh_wait_condition(self.id(), &observed)?;
         Ok(CapacityWaitRegistration {
             inner: Arc::clone(&self.inner),
             observed,
@@ -1815,12 +2611,24 @@ impl LogicalRequestLease {
             self.inner.epoch_tx.send_replace(epochs);
             return false;
         };
+        if self.claims.entries().iter().any(|claim| {
+            state
+                .domains
+                .get(&claim.domain)
+                .is_some_and(|domain| domain.availability_epoch == u64::MAX)
+        }) {
+            state.poisoned = true;
+            let epochs = state.epochs(self.coordinator_id());
+            self.inner.epoch_tx.send_replace(epochs);
+            return false;
+        }
         for claim in self.claims.entries() {
             let domain = state
                 .domains
                 .get_mut(&claim.domain)
                 .expect("validated request capacity domain remains registered");
             domain.used -= claim.units.get();
+            domain.availability_epoch += 1;
         }
         state.active_requests -= 1;
         state.live_requests[self.request.sparse_id as usize] = None;
@@ -1922,14 +2730,29 @@ impl LogicalAdmissionLease {
             self.inner.epoch_tx.send_replace(epochs);
             return false;
         };
+        if state.active_sequence_availability_epoch == u64::MAX
+            || self.claims.entries().iter().any(|claim| {
+                state
+                    .domains
+                    .get(&claim.domain)
+                    .is_some_and(|domain| domain.availability_epoch == u64::MAX)
+            })
+        {
+            state.poisoned = true;
+            let epochs = state.epochs(self.coordinator_id());
+            self.inner.epoch_tx.send_replace(epochs);
+            return false;
+        }
         for claim in self.claims.entries() {
             let domain = state
                 .domains
                 .get_mut(&claim.domain)
                 .expect("validated logical claim domain remains registered");
             domain.used -= claim.units.get();
+            domain.availability_epoch += 1;
         }
         state.active_sequences -= 1;
+        state.active_sequence_availability_epoch += 1;
         state.live_requests[self.request.sparse_id as usize]
             .as_mut()
             .expect("validated parent request remains live")
@@ -2049,12 +2872,24 @@ impl LogicalBatchCapacityLease {
             self.inner.epoch_tx.send_replace(epochs);
             return false;
         };
+        if self.claims.entries().iter().any(|claim| {
+            state
+                .domains
+                .get(&claim.domain)
+                .is_some_and(|domain| domain.availability_epoch == u64::MAX)
+        }) {
+            state.poisoned = true;
+            let epochs = state.epochs(self.coordinator_id());
+            self.inner.epoch_tx.send_replace(epochs);
+            return false;
+        }
         for claim in self.claims.entries() {
             let domain = state
                 .domains
                 .get_mut(&claim.domain)
                 .expect("validated child capacity domain remains registered");
             domain.used -= claim.units.get();
+            domain.availability_epoch += 1;
         }
         state.active_child_claims -= 1;
         for parent in &self.parents {
@@ -2081,8 +2916,8 @@ impl Drop for LogicalBatchCapacityLease {
 #[derive(Debug)]
 pub struct CapacityWaitRegistration {
     inner: Arc<CoordinatorInner>,
-    observed: CapacityEpochs,
-    registered: CapacityEpochs,
+    observed: CapacityWaitCondition,
+    registered: CapacityWaitCondition,
     receiver: watch::Receiver<CapacityEpochs>,
 }
 
@@ -2105,8 +2940,10 @@ impl CapacityWaitRegistration {
         let current = state.epochs(self.inner.id);
         Ok(CapacityWaitRecheck {
             current,
-            changed_since_observation: current != self.observed,
-            changed_since_registration: current != self.registered,
+            changed_since_observation: state
+                .wait_condition_changed(self.inner.id, &self.observed)?,
+            changed_since_registration: state
+                .wait_condition_changed(self.inner.id, &self.registered)?,
         })
     }
 
@@ -2128,6 +2965,18 @@ impl CapacityWaitRegistration {
 }
 
 impl CapacityWaitRecheck {
+    pub(crate) const fn new(
+        current: CapacityEpochs,
+        changed_since_observation: bool,
+        changed_since_registration: bool,
+    ) -> Self {
+        Self {
+            current,
+            changed_since_observation,
+            changed_since_registration,
+        }
+    }
+
     pub const fn current(self) -> CapacityEpochs {
         self.current
     }
@@ -2303,6 +3152,17 @@ mod tests {
         .unwrap()
     }
 
+    fn wait_for_domains(
+        coordinator: &LogicalAdmissionCoordinator,
+        domains: &[u32],
+    ) -> CapacityWaitCondition {
+        coordinator
+            .wait_snapshot_for_domains(domains.iter().copied().map(domain))
+            .unwrap()
+            .wait_condition()
+            .clone()
+    }
+
     fn admitted(decision: AdmissionDecision) -> LogicalAdmissionLease {
         match decision {
             AdmissionDecision::Admitted(lease) => lease,
@@ -2433,6 +3293,78 @@ mod tests {
     }
 
     #[test]
+    fn initial_sequence_defer_retains_no_partial_request_or_capacity() {
+        let coordinator = coordinator(2);
+        let held = match coordinator
+            .try_admit_initial_sequence(
+                &demand(&[(1, 1)], &[(1, 1)]),
+                &demand(&[(2, 3)], &[(2, 3)]),
+            )
+            .unwrap()
+        {
+            InitialSequenceAdmissionDecision::Admitted(bundle) => bundle,
+            _ => panic!("first initial bundle must be admitted"),
+        };
+        let before = coordinator.snapshot().unwrap();
+
+        assert!(matches!(
+            coordinator
+                .try_admit_initial_sequence(
+                    &demand(&[(1, 1)], &[(1, 1)]),
+                    &demand(&[(2, 2)], &[(2, 2)]),
+                )
+                .unwrap(),
+            InitialSequenceAdmissionDecision::Deferred
+        ));
+        let after = coordinator.snapshot().unwrap();
+        assert_eq!(after.active_requests(), before.active_requests());
+        assert_eq!(after.active_sequences(), before.active_sequences());
+        assert_eq!(after.domains, before.domains);
+
+        drop(held);
+        let empty = coordinator.snapshot().unwrap();
+        assert_eq!(empty.active_requests(), 0);
+        assert_eq!(empty.active_sequences(), 0);
+        assert!(empty
+            .domains()
+            .iter()
+            .all(|domain| domain.used().get() == 0));
+    }
+
+    #[test]
+    fn initial_sequence_bundle_sums_overlapping_domains_and_releases_child_first() {
+        let coordinator = coordinator(1);
+        let bundle = match coordinator
+            .try_admit_initial_sequence(
+                &demand(&[(1, 2), (2, 1)], &[(1, 2), (2, 1)]),
+                &demand(&[(1, 3), (2, 2)], &[(1, 3), (2, 2)]),
+            )
+            .unwrap()
+        {
+            InitialSequenceAdmissionDecision::Admitted(bundle) => bundle,
+            _ => panic!("overlapping initial bundle must be admitted atomically"),
+        };
+        let admitted = coordinator.snapshot().unwrap();
+        assert_eq!(admitted.active_requests(), 1);
+        assert_eq!(admitted.active_sequences(), 1);
+        assert_eq!(admitted.domains()[0].used().get(), 5);
+        assert_eq!(admitted.domains()[1].used().get(), 3);
+
+        let (request, sequence) = bundle.into_parts();
+        assert_eq!(request.request(), sequence.request());
+        drop(sequence);
+        drop(request);
+        let released = coordinator.snapshot().unwrap();
+        assert!(!released.poisoned());
+        assert_eq!(released.active_requests(), 0);
+        assert_eq!(released.active_sequences(), 0);
+        assert!(released
+            .domains()
+            .iter()
+            .all(|domain| domain.used().get() == 0));
+    }
+
+    #[test]
     fn request_authority_reuses_sparse_storage_with_new_generation() {
         let coordinator = coordinator(u32::MAX);
         let mut previous_generation = 0;
@@ -2488,7 +3420,7 @@ mod tests {
         let observed = match deferred {
             AdmissionDecision::Deferred(value) => {
                 assert_eq!(value.action(), DeferredAction::WaitForRelease);
-                value.epochs()
+                value.wait_condition().clone()
             }
             _ => panic!("expected capacity defer"),
         };
@@ -3387,7 +4319,7 @@ mod tests {
     fn waiter_recheck_closes_release_and_growth_races() {
         let coordinator = coordinator(1);
         let request = request(&coordinator);
-        let observed = coordinator.epochs().unwrap();
+        let observed = wait_for_domains(&coordinator, &[1]);
         let registration = coordinator.register_waiter(observed).unwrap();
         assert!(!registration.recheck().unwrap().should_retry());
 
@@ -3403,7 +4335,7 @@ mod tests {
             &request,
             &demand(&[(1, 1), (2, 1)], &[(1, 1), (2, 1)]),
         );
-        let before_release = coordinator.epochs().unwrap();
+        let before_release = wait_for_domains(&coordinator, &[1]);
         drop(lease);
         let late_registration = coordinator.register_waiter(before_release).unwrap();
         assert!(late_registration
@@ -3414,10 +4346,118 @@ mod tests {
     }
 
     #[test]
+    fn waiter_retries_only_when_its_exact_domain_changes() {
+        let coordinator = coordinator(8);
+        let observed = wait_for_domains(&coordinator, &[1]);
+        let registration = coordinator.register_waiter(observed).unwrap();
+
+        let before = coordinator.epochs().unwrap();
+        coordinator
+            .notify_domain_availability_changed(domain(2))
+            .unwrap();
+        let unrelated = registration.recheck().unwrap();
+        assert_eq!(
+            unrelated.current().capacity_epoch(),
+            before.capacity_epoch() + 1
+        );
+        assert!(!unrelated.changed_since_observation());
+        assert!(!unrelated.changed_since_registration());
+        assert!(!unrelated.should_retry());
+
+        coordinator
+            .notify_domain_availability_changed(domain(1))
+            .unwrap();
+        let relevant = registration.recheck().unwrap();
+        assert!(relevant.changed_since_observation());
+        assert!(relevant.changed_since_registration());
+        assert!(relevant.should_retry());
+    }
+
+    #[test]
+    fn wait_snapshot_keeps_pre_mutation_audit_and_exact_source_together() {
+        let coordinator = coordinator(8);
+        let snapshot = coordinator
+            .wait_snapshot_for_domains([domain(1), domain(2)])
+            .unwrap()
+            .narrow_to_domains([domain(1)])
+            .unwrap();
+        let observed_epochs = snapshot.epochs();
+
+        coordinator
+            .notify_domain_availability_changed(domain(1))
+            .unwrap();
+        let mut current = Vec::new();
+        let current_epochs = coordinator.write_availability_epochs(&mut current).unwrap();
+
+        assert_eq!(
+            snapshot.wait_condition().observed(),
+            &[
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::Domain(domain(1)), 1,)
+                    .unwrap()
+            ]
+        );
+        assert_eq!(observed_epochs.capacity_epoch(), 1);
+        assert_eq!(current_epochs.capacity_epoch(), 2);
+        assert!(snapshot.wait_condition().changed_since(&current).unwrap());
+    }
+
+    #[test]
+    fn active_sequence_waiter_retries_when_a_slot_is_released() {
+        let coordinator = coordinator(1);
+        let first_request = request(&coordinator);
+        let first = admit_sequence(&coordinator, &first_request, &empty_demand());
+        let second_request = request(&coordinator);
+        let deferred = match coordinator
+            .try_admit_sequence_for_request(&second_request, &empty_demand())
+            .unwrap()
+        {
+            AdmissionDecision::Deferred(deferred) => deferred,
+            _ => panic!("active-sequence ceiling must defer the second sequence"),
+        };
+        assert_eq!(
+            deferred.wait_condition().observed()[0].source(),
+            CapacityAvailabilitySource::ActiveSequenceSlots
+        );
+        let registration = coordinator
+            .register_waiter(deferred.wait_condition().clone())
+            .unwrap();
+        assert!(!registration.recheck().unwrap().should_retry());
+
+        drop(first);
+        assert!(registration.recheck().unwrap().should_retry());
+    }
+
+    #[test]
+    fn changed_source_cannot_hide_another_source_regression() {
+        let first = CapacityAvailabilitySource::Domain(domain(1));
+        let second = CapacityAvailabilitySource::Domain(domain(2));
+        let observed = CapacityWaitCondition::from_observation(
+            41,
+            vec![
+                CapacityAvailabilityEpoch::new(first, 5).unwrap(),
+                CapacityAvailabilityEpoch::new(second, 5).unwrap(),
+            ],
+        )
+        .unwrap();
+        let current = vec![
+            CapacityAvailabilityEpoch::new(first, 6).unwrap(),
+            CapacityAvailabilityEpoch::new(second, 4).unwrap(),
+        ];
+
+        assert!(matches!(
+            observed.changed_since(&current),
+            Err(VNextError::DynamicAdmissionContract {
+                kind: DynamicAdmissionFaultKind::EpochRegression,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn allocator_availability_change_advances_capacity_epoch_without_recounting_units() {
         let coordinator = coordinator(8);
         let before = coordinator.snapshot().unwrap();
-        let observed = coordinator.epochs().unwrap();
+        let observed = wait_for_domains(&coordinator, &[1]);
         let registration = coordinator.register_waiter(observed).unwrap();
 
         let changed = coordinator
@@ -3472,7 +4512,8 @@ mod tests {
             &request,
             &demand(&[(1, 1), (2, 1)], &[(1, 1), (2, 1)]),
         );
-        let observed = coordinator.epochs().unwrap();
+        let observed_epochs = coordinator.epochs().unwrap();
+        let observed = wait_for_domains(&coordinator, &[1]);
         let registration = coordinator.register_waiter(observed).unwrap();
         assert!(!registration.recheck().unwrap().should_retry());
         drop(lease);
@@ -3483,14 +4524,14 @@ mod tests {
         .await
         .expect("listener must not miss a release between recheck and park")
         .unwrap();
-        assert!(changed.release_epoch() > observed.release_epoch());
+        assert!(changed.release_epoch() > observed_epochs.release_epoch());
         assert_eq!(changed.coordinator_id(), coordinator.id());
     }
 
     #[tokio::test]
     async fn mutation_unwind_wakes_parked_waiter_with_terminal_error() {
         let coordinator = coordinator(1);
-        let observed = coordinator.epochs().unwrap();
+        let observed = wait_for_domains(&coordinator, &[1]);
         let registration = coordinator.register_waiter(observed).unwrap();
         let waiter = tokio::spawn(async move { registration.wait_for_change().await });
         tokio::task::yield_now().await;

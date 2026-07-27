@@ -43,6 +43,15 @@ pub fn ferrum_to_gguf(name: &str) -> Option<String> {
 /// attention OUTPUT (GGUF `post_attention_norm`), while the same ferrum
 /// name on Llama families is the pre-MLP norm (GGUF `ffn_norm`).
 pub fn ferrum_to_gguf_with_arch(arch: &str, name: &str) -> Option<String> {
+    // Multimodal Hugging Face packages nest the text model below
+    // `model.language_model`, while GGUF stores the text tensors at its root.
+    // Normalize that packaging detail here so model programs do not carry a
+    // checkpoint-format branch.
+    let normalized = name
+        .strip_prefix("model.language_model.")
+        .map(|suffix| format!("model.{suffix}"));
+    let name = normalized.as_deref().unwrap_or(name);
+
     // Top-level tensors first — they don't fit the layer pattern.
     if let Some(out) = map_top_level(name) {
         return Some(out);
@@ -62,11 +71,17 @@ fn map_top_level(name: &str) -> Option<String> {
         "model.embed_tokens.weight" => "token_embd.weight",
         "model.norm" => "output_norm",
         "model.norm.weight" => "output_norm.weight",
+        "model.lm_head" => "output",
+        "model.lm_head.weight" => "output.weight",
         "lm_head" => "output",
         "lm_head.weight" => "output.weight",
         _ => return None,
     };
     Some(mapped.to_string())
+}
+
+fn is_qwen35_text_architecture(arch: &str) -> bool {
+    matches!(arch, "qwen35" | "qwen35moe")
 }
 
 fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
@@ -85,7 +100,9 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Gemma 3 sandwich norms: post_attention_layernorm applies to the
         // attention output (pre-residual); pre_feedforward is the pre-MLP
         // slot; post_feedforward wraps the MLP output.
-        "post_attention_layernorm" if arch == "gemma3" => "post_attention_norm",
+        "post_attention_layernorm" if arch == "gemma3" || is_qwen35_text_architecture(arch) => {
+            "post_attention_norm"
+        }
         "pre_feedforward_layernorm" => "ffn_norm",
         "post_feedforward_layernorm" => "post_ffw_norm",
         "post_attention_layernorm" => "ffn_norm",
@@ -97,6 +114,17 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Qwen3 QK-norm — only present on that family
         "self_attn.q_norm" => "attn_q_norm",
         "self_attn.k_norm" => "attn_k_norm",
+        // Qwen3.5 gated-delta recurrent attention. These are storage names,
+        // not operation names; execution remains selected by typed contracts.
+        "linear_attn.in_proj_qkv" if is_qwen35_text_architecture(arch) => "attn_qkv",
+        "linear_attn.in_proj_z" if is_qwen35_text_architecture(arch) => "attn_gate",
+        "linear_attn.in_proj_b" if is_qwen35_text_architecture(arch) => "ssm_beta",
+        "linear_attn.in_proj_a" if is_qwen35_text_architecture(arch) => "ssm_alpha",
+        "linear_attn.conv1d" if is_qwen35_text_architecture(arch) => "ssm_conv1d",
+        "linear_attn.A_log" if is_qwen35_text_architecture(arch) => "ssm_a",
+        "linear_attn.dt_bias" if is_qwen35_text_architecture(arch) => "ssm_dt.bias",
+        "linear_attn.norm" if is_qwen35_text_architecture(arch) => "ssm_norm",
+        "linear_attn.out_proj" if is_qwen35_text_architecture(arch) => "ssm_out",
         // Dense MLP projections
         "mlp.gate_proj" => "ffn_gate",
         "mlp.up_proj" => "ffn_up",
@@ -109,6 +137,11 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Loaded as flat fp32 buffers; the MoE runtime slices per-expert
         // at forward time.
         "mlp.router" => "ffn_gate_inp",
+        "mlp.gate" if is_qwen35_text_architecture(arch) => "ffn_gate_inp",
+        "mlp.shared_expert_gate" if is_qwen35_text_architecture(arch) => "ffn_gate_inp_shexp",
+        "mlp.shared_expert.gate_proj" if is_qwen35_text_architecture(arch) => "ffn_gate_shexp",
+        "mlp.shared_expert.up_proj" if is_qwen35_text_architecture(arch) => "ffn_up_shexp",
+        "mlp.shared_expert.down_proj" if is_qwen35_text_architecture(arch) => "ffn_down_shexp",
         "mlp.gate_exps" => "ffn_gate_exps",
         "mlp.up_exps" => "ffn_up_exps",
         "mlp.down_exps" => "ffn_down_exps",
@@ -197,6 +230,95 @@ mod tests {
             ferrum_to_gguf("model.layers.0.self_attn.k_norm.weight"),
             Some("blk.0.attn_k_norm.weight".into())
         );
+    }
+
+    #[test]
+    fn maps_qwen35_nested_text_and_recurrent_attention_tensors() {
+        let cases = [
+            (
+                "model.language_model.embed_tokens.weight",
+                "token_embd.weight",
+            ),
+            ("model.language_model.lm_head.weight", "output.weight"),
+            (
+                "model.language_model.layers.0.post_attention_layernorm.weight",
+                "blk.0.post_attention_norm.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                "blk.0.attn_qkv.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+                "blk.0.attn_gate.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+                "blk.0.ssm_beta.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+                "blk.0.ssm_alpha.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                "blk.0.ssm_conv1d.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.A_log",
+                "blk.0.ssm_a",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.dt_bias",
+                "blk.0.ssm_dt.bias",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.norm.weight",
+                "blk.0.ssm_norm.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                "blk.0.ssm_out.weight",
+            ),
+        ];
+        for architecture in ["qwen35", "qwen35moe"] {
+            for (source, expected) in cases {
+                assert_eq!(
+                    ferrum_to_gguf_with_arch(architecture, source).as_deref(),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maps_qwen35_routed_and_shared_moe_tensors() {
+        let cases = [
+            ("mlp.gate.weight", "ffn_gate_inp.weight"),
+            ("mlp.shared_expert_gate.weight", "ffn_gate_inp_shexp.weight"),
+            (
+                "mlp.shared_expert.gate_proj.weight",
+                "ffn_gate_shexp.weight",
+            ),
+            ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
+            (
+                "mlp.shared_expert.down_proj.weight",
+                "ffn_down_shexp.weight",
+            ),
+            ("mlp.gate_exps.weight", "ffn_gate_exps.weight"),
+            ("mlp.up_exps.weight", "ffn_up_exps.weight"),
+            ("mlp.down_exps.weight", "ffn_down_exps.weight"),
+        ];
+        for architecture in ["qwen35", "qwen35moe"] {
+            for (suffix, expected) in cases {
+                let source = format!("model.language_model.layers.7.{suffix}");
+                let expected = format!("blk.7.{expected}");
+                assert_eq!(
+                    ferrum_to_gguf_with_arch(architecture, &source).as_deref(),
+                    Some(expected.as_str())
+                );
+            }
+        }
     }
 
     #[test]

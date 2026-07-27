@@ -5,11 +5,15 @@
 
 use crate::{KvCacheHandle, RecurrentStateHandle, RecurrentStateSpec, TensorRef};
 use async_trait::async_trait;
-use ferrum_types::{ModelInfo, RequestId, Result, TokenId};
+use ferrum_types::{FerrumError, ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    future::Future,
     hash::{Hash, Hasher},
+    num::NonZeroU64,
+    ops::Range,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -133,16 +137,26 @@ impl LogitsReturnPolicy {
 /// common greedy chat path while preserving repeat avoidance.
 #[derive(Clone, Debug)]
 pub struct GreedyRepetitionPenalty {
-    pub penalty: f32,
-    pub token_ids: Arc<[u32]>,
+    penalty: f32,
+    token_ids: Arc<[u32]>,
 }
 
 impl GreedyRepetitionPenalty {
-    pub fn new(penalty: f32, token_ids: Vec<u32>) -> Self {
+    pub fn new(penalty: f32, mut token_ids: Vec<u32>) -> Self {
+        let mut seen = HashSet::with_capacity(token_ids.len());
+        token_ids.retain(|token| seen.insert(*token));
         Self {
             penalty,
             token_ids: Arc::from(token_ids),
         }
+    }
+
+    pub const fn penalty(&self) -> f32 {
+        self.penalty
+    }
+
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
     }
 
     pub fn is_empty(&self) -> bool {
@@ -150,9 +164,31 @@ impl GreedyRepetitionPenalty {
     }
 }
 
+#[cfg(test)]
+mod greedy_repetition_penalty_tests {
+    use super::GreedyRepetitionPenalty;
+
+    #[test]
+    fn constructor_preserves_first_seen_order_and_removes_duplicates() {
+        let repetition = GreedyRepetitionPenalty::new(1.1, vec![7, 3, 7, 9, 3]);
+        assert_eq!(repetition.penalty(), 1.1);
+        assert_eq!(repetition.token_ids(), [7, 3, 9]);
+    }
+}
+
 /// Input for prefill phase (processing the initial prompt)
 #[derive(Debug, Clone)]
 pub struct PrefillInput {
+    /// Stable product request identity for plan-runtime resources.
+    pub request_id: Option<RequestId>,
+    /// Maximum sequence extent this request may reach, including the prompt.
+    /// Executors use this for fit validation without allocating future pages.
+    pub maximum_sequence_tokens: Option<usize>,
+    /// Exact scheduler-owned prompt chunk for this invocation.
+    ///
+    /// The input tensor still contains the full prompt so token identity and
+    /// global offsets remain stable. Plan runtimes execute only this range.
+    pub chunk: Option<PrefillChunk>,
     /// Input token IDs [batch_size, sequence_length]
     pub input_ids: TensorRef,
     /// Attention mask [batch_size, sequence_length] (optional)
@@ -171,6 +207,9 @@ impl PrefillInput {
     /// Create new prefill input
     pub fn new(input_ids: TensorRef) -> Self {
         Self {
+            request_id: None,
+            maximum_sequence_tokens: None,
+            chunk: None,
             input_ids,
             attention_mask: None,
             position_ids: None,
@@ -178,6 +217,23 @@ impl PrefillInput {
             recurrent_state: None,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Attach the typed request boundary consumed by plan runtimes.
+    pub fn with_request_context(
+        mut self,
+        request_id: RequestId,
+        maximum_sequence_tokens: usize,
+    ) -> Self {
+        self.request_id = Some(request_id);
+        self.maximum_sequence_tokens = Some(maximum_sequence_tokens);
+        self
+    }
+
+    /// Attach the exact scheduler-published prompt chunk.
+    pub fn with_chunk(mut self, chunk: PrefillChunk) -> Self {
+        self.chunk = Some(chunk);
+        self
     }
 
     /// Create prefill input with a pre-allocated KV cache handle.
@@ -222,6 +278,87 @@ impl PrefillInput {
         } else {
             1
         }
+    }
+}
+
+/// Exact, validated prompt progress assigned to one prefill invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrefillChunk {
+    tokens_processed: usize,
+    tokens_to_process: usize,
+    total_prompt_tokens: usize,
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::PrefillChunk;
+
+    #[test]
+    fn validates_exact_progress_and_finality() {
+        let first = PrefillChunk::new(0, 3, 8).unwrap();
+        assert_eq!(first.range(), 0..3);
+        assert_eq!(first.end(), 3);
+        assert!(!first.is_final());
+
+        let final_chunk = PrefillChunk::new(3, 5, 8).unwrap();
+        assert_eq!(final_chunk.range(), 3..8);
+        assert!(final_chunk.is_final());
+    }
+
+    #[test]
+    fn rejects_empty_out_of_bounds_and_overflowing_progress() {
+        assert!(PrefillChunk::new(0, 0, 8).is_err());
+        assert!(PrefillChunk::new(0, 1, 0).is_err());
+        assert!(PrefillChunk::new(7, 2, 8).is_err());
+        assert!(PrefillChunk::new(usize::MAX, 1, usize::MAX).is_err());
+    }
+}
+
+impl PrefillChunk {
+    pub fn new(
+        tokens_processed: usize,
+        tokens_to_process: usize,
+        total_prompt_tokens: usize,
+    ) -> Result<Self> {
+        let end = tokens_processed
+            .checked_add(tokens_to_process)
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::request_validation("prefill chunk overflows")
+            })?;
+        if tokens_to_process == 0 || total_prompt_tokens == 0 || end > total_prompt_tokens {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "prefill chunk must be non-empty and within the full prompt",
+            ));
+        }
+        Ok(Self {
+            tokens_processed,
+            tokens_to_process,
+            total_prompt_tokens,
+        })
+    }
+
+    pub const fn tokens_processed(self) -> usize {
+        self.tokens_processed
+    }
+
+    pub const fn tokens_to_process(self) -> usize {
+        self.tokens_to_process
+    }
+
+    pub const fn total_prompt_tokens(self) -> usize {
+        self.total_prompt_tokens
+    }
+
+    pub fn range(self) -> Range<usize> {
+        self.tokens_processed..self.tokens_processed + self.tokens_to_process
+    }
+
+    pub const fn end(self) -> usize {
+        self.tokens_processed + self.tokens_to_process
+    }
+
+    pub const fn is_final(self) -> bool {
+        self.end() == self.total_prompt_tokens
     }
 }
 
@@ -281,6 +418,8 @@ impl PrefillOutput {
 /// Input for decode phase (generating one token at a time)
 #[derive(Debug, Clone)]
 pub struct DecodeInput {
+    /// Stable product request identity for plan-runtime resources.
+    pub request_id: Option<RequestId>,
     /// Input token ID for current step [batch_size, 1]
     pub input_ids: TensorRef,
     /// Existing KV cache from previous steps
@@ -299,6 +438,7 @@ impl DecodeInput {
     /// Create new decode input
     pub fn new(input_ids: TensorRef, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
         Self {
+            request_id: None,
             input_ids,
             kv_cache,
             recurrent_state: None,
@@ -306,6 +446,12 @@ impl DecodeInput {
             metadata: HashMap::new(),
             logits_policy: LogitsReturnPolicy::FullLogits,
         }
+    }
+
+    /// Attach the product request identity to this decode step.
+    pub fn with_request_id(mut self, request_id: RequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 
     /// Add position IDs
@@ -451,11 +597,908 @@ impl DecodeOutput {
     }
 }
 
+/// Product-authoritative evidence for a successfully completed sequence.
+///
+/// Physical cache release is not completion evidence: cancellation, failure,
+/// recompute, and successful generation all release the same cache authority.
+/// The engine constructs this receipt only after it has finalized user-visible
+/// token usage, allowing plan runtimes to reconcile terminal events without
+/// inferring output counts from execution frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorSequenceCompletion {
+    request_id: RequestId,
+    cache_id: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl ExecutorSequenceCompletion {
+    pub fn new(
+        request_id: RequestId,
+        cache_id: String,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) -> Result<Self> {
+        if cache_id.is_empty() {
+            return Err(FerrumError::request_validation(
+                "executor sequence completion requires a cache identity",
+            ));
+        }
+        let input_tokens = u64::try_from(input_tokens).map_err(|_| {
+            FerrumError::request_validation("executor completion input token count exceeds u64")
+        })?;
+        let output_tokens = u64::try_from(output_tokens).map_err(|_| {
+            FerrumError::request_validation("executor completion output token count exceeds u64")
+        })?;
+        Ok(Self {
+            request_id,
+            cache_id,
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+
+    pub const fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+
+    pub const fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+}
+
+/// Declares the authoritative runtime for request-lifetime accelerator resources.
+///
+/// This is a lifecycle boundary, not a capacity limit. `PlanRuntime` means the
+/// shared execution runtime owns admission, allocation, fences, and release;
+/// a model executor may adapt those operations but is not their owner. The
+/// engine must not reserve a second KV or recurrent-state allocation for the
+/// same request. `LegacyEngine` exists only while old executors are migrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionResourceAuthority {
+    LegacyEngine,
+    PlanRuntime,
+}
+
+/// Request-scoped authority selected for a capacity-pressure preemption.
+///
+/// The cache identity prevents the engine from releasing a newer sequence
+/// incarnation after a stale scheduler decision. Implementations must retire
+/// retained prefill and active decode authority through the same operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorExecutionCapacityPreemption {
+    request_id: RequestId,
+    cache_id: String,
+}
+
+impl ExecutorExecutionCapacityPreemption {
+    pub fn new(request_id: RequestId, cache_id: String) -> Result<Self> {
+        if cache_id.is_empty() {
+            return Err(FerrumError::request_validation(
+                "execution-capacity preemption requires a cache identity",
+            ));
+        }
+        Ok(Self {
+            request_id,
+            cache_id,
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorExecutionCapacityPreemptionAuthority {
+    RetainedPrefill,
+    ActiveSequence,
+}
+
+/// Proof that the executor retired one exact request authority to a terminal
+/// state. Source-generation advancement remains independently verified by the
+/// engine before the scheduler may resume another frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorExecutionCapacityPreemptionReceipt {
+    request_id: RequestId,
+    cache_id: String,
+    authority: ExecutorExecutionCapacityPreemptionAuthority,
+}
+
+impl ExecutorExecutionCapacityPreemptionReceipt {
+    pub fn new(
+        request_id: RequestId,
+        cache_id: String,
+        authority: ExecutorExecutionCapacityPreemptionAuthority,
+    ) -> Self {
+        Self {
+            request_id,
+            cache_id,
+            authority,
+        }
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+
+    pub const fn authority(&self) -> ExecutorExecutionCapacityPreemptionAuthority {
+        self.authority
+    }
+}
+
+/// Point-in-time memory evidence emitted by the shared plan runtime.
+///
+/// Static model allocations are separated from dynamic request resources so
+/// product telemetry never reports model weights as KV or recurrent-state
+/// usage. Process-wide claims are included because another live plan can
+/// consume capacity visible to this runtime. Dynamic free bytes remain
+/// reusable by this plan; quarantined and other claimed bytes do not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRuntimeResourceSnapshot {
+    device_capacity_bytes: u64,
+    usable_capacity_bytes: u64,
+    process_claimed_bytes: u64,
+    plan_claimed_bytes: u64,
+    static_bytes: u64,
+    dynamic_resident_bytes: u64,
+    dynamic_free_bytes: u64,
+    pending_growth_bytes: u64,
+    quarantined_bytes: u64,
+}
+
+impl PlanRuntimeResourceSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device_capacity_bytes: u64,
+        usable_capacity_bytes: u64,
+        process_claimed_bytes: u64,
+        plan_claimed_bytes: u64,
+        static_bytes: u64,
+        dynamic_resident_bytes: u64,
+        dynamic_free_bytes: u64,
+        pending_growth_bytes: u64,
+        quarantined_bytes: u64,
+    ) -> Result<Self> {
+        if usable_capacity_bytes > device_capacity_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime usable capacity {usable_capacity_bytes} exceeds device capacity {device_capacity_bytes}"
+            )));
+        }
+        if process_claimed_bytes > usable_capacity_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime process claims {process_claimed_bytes} exceed usable capacity {usable_capacity_bytes}"
+            )));
+        }
+        if plan_claimed_bytes > process_claimed_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime plan claims {plan_claimed_bytes} exceed process claims {process_claimed_bytes}"
+            )));
+        }
+        if dynamic_free_bytes > dynamic_resident_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime dynamic free bytes {dynamic_free_bytes} exceed resident bytes {dynamic_resident_bytes}"
+            )));
+        }
+        let minimum_plan_claim = static_bytes
+            .checked_add(dynamic_resident_bytes)
+            .and_then(|bytes| bytes.checked_add(quarantined_bytes))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::internal(
+                    "plan runtime static, resident, and quarantined bytes overflow u64",
+                )
+            })?;
+        if minimum_plan_claim > plan_claimed_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime accounted plan bytes {minimum_plan_claim} exceed plan claims {plan_claimed_bytes}"
+            )));
+        }
+        Ok(Self {
+            device_capacity_bytes,
+            usable_capacity_bytes,
+            process_claimed_bytes,
+            plan_claimed_bytes,
+            static_bytes,
+            dynamic_resident_bytes,
+            dynamic_free_bytes,
+            pending_growth_bytes,
+            quarantined_bytes,
+        })
+    }
+
+    pub const fn device_capacity_bytes(&self) -> u64 {
+        self.device_capacity_bytes
+    }
+
+    pub const fn usable_capacity_bytes(&self) -> u64 {
+        self.usable_capacity_bytes
+    }
+
+    pub const fn process_claimed_bytes(&self) -> u64 {
+        self.process_claimed_bytes
+    }
+
+    pub const fn plan_claimed_bytes(&self) -> u64 {
+        self.plan_claimed_bytes
+    }
+
+    pub const fn static_bytes(&self) -> u64 {
+        self.static_bytes
+    }
+
+    pub const fn dynamic_resident_bytes(&self) -> u64 {
+        self.dynamic_resident_bytes
+    }
+
+    pub const fn dynamic_free_bytes(&self) -> u64 {
+        self.dynamic_free_bytes
+    }
+
+    pub const fn dynamic_used_bytes(&self) -> u64 {
+        self.dynamic_resident_bytes - self.dynamic_free_bytes
+    }
+
+    pub const fn pending_growth_bytes(&self) -> u64 {
+        self.pending_growth_bytes
+    }
+
+    pub const fn quarantined_bytes(&self) -> u64 {
+        self.quarantined_bytes
+    }
+
+    /// Capacity immediately reusable by this plan without reclaiming another
+    /// plan: process-wide unclaimed bytes plus free extents already resident
+    /// in this plan's dynamic pools.
+    pub fn available_bytes(&self) -> Result<u64> {
+        self.usable_capacity_bytes
+            .checked_sub(self.process_claimed_bytes)
+            .and_then(|bytes| bytes.checked_add(self.dynamic_free_bytes))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::internal(
+                    "plan runtime available capacity calculation overflowed",
+                )
+            })
+    }
+
+    pub fn used_bytes(&self) -> Result<u64> {
+        self.available_bytes().and_then(|available| {
+            self.usable_capacity_bytes
+                .checked_sub(available)
+                .ok_or_else(|| {
+                    ferrum_types::FerrumError::internal(
+                        "plan runtime available bytes exceed usable capacity",
+                    )
+                })
+        })
+    }
+}
+
+#[cfg(test)]
+mod plan_runtime_resource_snapshot_tests {
+    use super::PlanRuntimeResourceSnapshot;
+
+    #[test]
+    fn separates_static_and_dynamic_usage() {
+        let snapshot =
+            PlanRuntimeResourceSnapshot::new(1_000, 900, 710, 710, 400, 300, 200, 20, 10).unwrap();
+
+        assert_eq!(snapshot.available_bytes().unwrap(), 390);
+        assert_eq!(snapshot.used_bytes().unwrap(), 510);
+        assert_eq!(snapshot.dynamic_resident_bytes(), 300);
+        assert_eq!(snapshot.dynamic_used_bytes(), 100);
+        assert_eq!(snapshot.dynamic_free_bytes(), 200);
+        assert_eq!(snapshot.pending_growth_bytes(), 20);
+        assert_eq!(snapshot.quarantined_bytes(), 10);
+    }
+
+    #[test]
+    fn rejects_incoherent_capacity_evidence() {
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 1_001, 0, 0, 0, 0, 0, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 901, 0, 0, 0, 0, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 500, 501, 0, 0, 0, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 100, 100, 0, 100, 101, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 500, 500, 400, 100, 0, 0, 1).is_err());
+    }
+}
+
+/// Borrowed, already-tokenized input used to probe plan-runtime prefill
+/// admission before the request can enter a device submission batch.
+///
+/// This carries semantic token identity rather than an aggregate token count:
+/// vNext derives the exact resource work shape and its fingerprint from this
+/// boundary. The request remains owned by the scheduler while the executor
+/// retains any admitted authority internally until [`ModelExecutor::prefill`]
+/// consumes it or cancellation releases it.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutorPrefillAdmission<'a> {
+    pub request_id: &'a RequestId,
+    pub input_tokens: &'a [TokenId],
+    pub maximum_sequence_tokens: usize,
+}
+
+impl<'a> ExecutorPrefillAdmission<'a> {
+    pub const fn new(
+        request_id: &'a RequestId,
+        input_tokens: &'a [TokenId],
+        maximum_sequence_tokens: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            input_tokens,
+            maximum_sequence_tokens,
+        }
+    }
+}
+
+/// Scheduler-visible proof that an executor retained request and sequence
+/// authority for future scheduler-owned prefill chunks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorPrefillAdmissionReceipt {
+    pub request_id: RequestId,
+}
+
+/// Stable scheduler-facing projection of one plan-runtime capacity domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecutorAdmissionEpochs {
+    pub coordinator_id: NonZeroU64,
+    pub release_epoch: u64,
+    pub capacity_epoch: u64,
+}
+
+impl ExecutorAdmissionEpochs {
+    pub const fn new(coordinator_id: NonZeroU64, release_epoch: u64, capacity_epoch: u64) -> Self {
+        Self {
+            coordinator_id,
+            release_epoch,
+            capacity_epoch,
+        }
+    }
+
+    pub fn from_capacity(epochs: crate::vnext::CapacityEpochs) -> Self {
+        Self::new(
+            NonZeroU64::new(epochs.coordinator_id().get())
+                .expect("core-issued admission coordinator ids are non-zero"),
+            epochs.release_epoch(),
+            epochs.capacity_epoch(),
+        )
+    }
+}
+
+type ExecutorCapacityWaitFuture =
+    Pin<Box<dyn Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static>>;
+
+/// Type-erased, single-use registration for one plan-runtime capacity wait.
+///
+/// Registration is created synchronously so the executor can subscribe before
+/// the engine releases its iteration lock. Awaiting it never grants resources;
+/// it only returns fresh epochs that permit another authoritative admission
+/// probe.
+#[must_use = "capacity wait registrations must be awaited or explicitly dropped"]
+pub struct ExecutorCapacityWaitRegistration {
+    future: ExecutorCapacityWaitFuture,
+}
+
+impl ExecutorCapacityWaitRegistration {
+    pub fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static,
+    {
+        Self {
+            future: Box::pin(future),
+        }
+    }
+
+    pub async fn wait_for_change(self) -> Result<ExecutorAdmissionEpochs> {
+        self.future.await
+    }
+}
+
+/// Pre-submit runtime stage that could not acquire its exact dynamic capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorExecutionCapacityStage {
+    SequenceExtension,
+    StepAdmission,
+    SubmissionWave,
+}
+
+/// Scheduler-visible proof that an execution attempt was not submitted and
+/// must not be retried until one of its exact capacity sources changes.
+///
+/// This value owns no resource authority. The executor retains the committed
+/// request/sequence authority and has already retired any unsubmitted step or
+/// submission-wave authority before returning it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorExecutionCapacityDeferral {
+    observed: ExecutorAdmissionEpochs,
+    wait_condition: crate::vnext::CapacityWaitCondition,
+    stage: ExecutorExecutionCapacityStage,
+    shortfalls: Vec<crate::vnext::CapacityShortfall>,
+}
+
+impl ExecutorExecutionCapacityDeferral {
+    pub fn new(
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if wait_condition.coordinator_id().get() != observed.coordinator_id.get() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "executor execution deferral belongs to a different capacity coordinator",
+            ));
+        }
+        Ok(Self {
+            observed,
+            wait_condition,
+            stage,
+            shortfalls: Vec::new(),
+        })
+    }
+
+    pub fn from_admission(
+        deferred: &crate::vnext::AdmissionDeferred,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if deferred.action() != crate::vnext::DeferredAction::WaitForRelease {
+            return Err(ferrum_types::FerrumError::internal(
+                "execution capacity deferral must be reduced to WaitForRelease before export",
+            ));
+        }
+        let mut result = Self::new(
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
+            stage,
+        )?;
+        result.shortfalls = deferred.blockers().to_vec();
+        Ok(result)
+    }
+
+    pub fn from_maintenance(
+        source: &crate::vnext::AdmissionDeferred,
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if source.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
+            return Err(ferrum_types::FerrumError::internal(
+                "execution maintenance source must await backing growth",
+            ));
+        }
+        let mut result = Self::new(observed, wait_condition, stage)?;
+        result.shortfalls = source.blockers().to_vec();
+        Ok(result)
+    }
+
+    pub const fn observed(&self) -> ExecutorAdmissionEpochs {
+        self.observed
+    }
+
+    pub fn wait_condition(&self) -> &crate::vnext::CapacityWaitCondition {
+        &self.wait_condition
+    }
+
+    pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
+        self.stage
+    }
+
+    pub fn shortfalls(&self) -> &[crate::vnext::CapacityShortfall] {
+        &self.shortfalls
+    }
+
+    /// Return a strictly smaller, capacity-informed prefill width.
+    ///
+    /// This is a cold pressure-path hint, not allocator authority. The caller
+    /// must probe the returned prefix through normal typed admission before any
+    /// provider encode or device submission. A bounded reduction prevents a
+    /// large frontier from producing an unbounded sequence of near-identical
+    /// probes when the shortfall is small.
+    pub fn narrower_prefill_tokens(&self, attempted_tokens: usize) -> Option<usize> {
+        if attempted_tokens <= 1 {
+            return None;
+        }
+        let maximum_next = attempted_tokens
+            .saturating_sub(attempted_tokens.div_ceil(4))
+            .max(1);
+        let proportional = self
+            .shortfalls
+            .iter()
+            .filter_map(|shortfall| {
+                let requested = shortfall.requested().get();
+                let available = shortfall.available().get();
+                (requested > available).then(|| {
+                    let scaled = (attempted_tokens as u128).saturating_mul(available as u128)
+                        / requested as u128;
+                    usize::try_from(scaled)
+                        .unwrap_or(usize::MAX)
+                        .clamp(1, attempted_tokens - 1)
+                })
+            })
+            .min();
+        Some(
+            proportional
+                .unwrap_or_else(|| attempted_tokens.div_ceil(2))
+                .min(maximum_next)
+                .max(1),
+        )
+    }
+}
+
+#[cfg(test)]
+mod execution_capacity_deferral_tests {
+    use super::{
+        ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+    };
+    use crate::vnext::{
+        CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+    };
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn prefill_narrowing_is_strict_bounded_and_stops_at_one_token() {
+        let observed =
+            CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 7)
+                .unwrap();
+        let condition = CapacityWaitCondition::from_observation(19, vec![observed]).unwrap();
+        let deferred = ExecutorExecutionCapacityDeferral::new(
+            ExecutorAdmissionEpochs::new(NonZeroU64::new(19).unwrap(), 3, 5),
+            condition,
+            ExecutorExecutionCapacityStage::StepAdmission,
+        )
+        .unwrap();
+
+        assert_eq!(deferred.narrower_prefill_tokens(342), Some(171));
+        assert_eq!(deferred.narrower_prefill_tokens(2), Some(1));
+        assert_eq!(deferred.narrower_prefill_tokens(1), None);
+    }
+}
+
+/// Capacity-aware batch decode result.
+///
+/// `Deferred` is only legal before provider encode or device submission. All
+/// possibly-submitted failures remain ordinary errors and retain their typed
+/// fence/recovery authority inside the executor.
+pub enum ExecutorBatchDecodeOutcome {
+    Completed(Vec<DecodeOutput>),
+    Deferred(ExecutorExecutionCapacityDeferral),
+}
+
+/// Capacity-aware result for one planned prefill frontier.
+///
+/// `Deferred` is only legal before provider encode or device submission. The
+/// executor may complete a strict prefix after typed capacity probes; the
+/// scheduler commits only that prefix and learns the narrower execution ceiling.
+pub struct ExecutorPrefillCompletion {
+    output: PrefillOutput,
+    planned_chunk: PrefillChunk,
+    completed_chunk: PrefillChunk,
+    capacity_probe_count: u32,
+}
+
+impl ExecutorPrefillCompletion {
+    pub fn new(
+        output: PrefillOutput,
+        planned_chunk: PrefillChunk,
+        completed_chunk: PrefillChunk,
+        capacity_probe_count: u32,
+    ) -> Result<Self> {
+        if completed_chunk.tokens_processed() != planned_chunk.tokens_processed()
+            || completed_chunk.total_prompt_tokens() != planned_chunk.total_prompt_tokens()
+            || completed_chunk.tokens_to_process() > planned_chunk.tokens_to_process()
+        {
+            return Err(ferrum_types::FerrumError::internal(
+                "completed prefill chunk is not a non-empty prefix of its planned chunk",
+            ));
+        }
+        if completed_chunk != planned_chunk && capacity_probe_count == 0 {
+            return Err(ferrum_types::FerrumError::internal(
+                "partial prefill completion requires a failed capacity probe",
+            ));
+        }
+        Ok(Self {
+            output,
+            planned_chunk,
+            completed_chunk,
+            capacity_probe_count,
+        })
+    }
+
+    pub fn exact(output: PrefillOutput, chunk: PrefillChunk) -> Self {
+        Self {
+            output,
+            planned_chunk: chunk,
+            completed_chunk: chunk,
+            capacity_probe_count: 0,
+        }
+    }
+
+    pub const fn planned_chunk(&self) -> PrefillChunk {
+        self.planned_chunk
+    }
+
+    pub const fn completed_chunk(&self) -> PrefillChunk {
+        self.completed_chunk
+    }
+
+    pub const fn capacity_probe_count(&self) -> u32 {
+        self.capacity_probe_count
+    }
+
+    pub fn into_parts(self) -> (PrefillOutput, PrefillChunk, PrefillChunk, u32) {
+        (
+            self.output,
+            self.planned_chunk,
+            self.completed_chunk,
+            self.capacity_probe_count,
+        )
+    }
+}
+
+pub enum ExecutorPrefillOutcome {
+    Completed(ExecutorPrefillCompletion),
+    Deferred(ExecutorExecutionCapacityDeferral),
+}
+
+/// Transactional result of attempting one physical prefill batch.
+///
+/// `NotSubmitted` proves that no participant in the batch reached provider
+/// encode or device submission. The caller may therefore retry a narrower
+/// partition or the existing per-request capacity path without duplicating
+/// model work. `Unsupported` keeps the optimization optional for legacy
+/// executors while plan-runtime implementations provide the real batch edge.
+pub enum ExecutorBatchPrefillOutcome {
+    Completed(Vec<ExecutorPrefillCompletion>),
+    NotSubmitted(ExecutorExecutionCapacityDeferral),
+    Unsupported,
+}
+
+/// Stage that must advance before a plan-runtime prefill can be admitted.
+///
+/// This is scheduler evidence, not allocator authority. The executor retains
+/// the sealed logical or physical deferral that authorizes maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorPrefillMaintenanceStage {
+    LogicalCapacity,
+    PhysicalBacking,
+}
+
+/// Scheduler-visible reason that a prefill needs plan-runtime backing
+/// maintenance. These values are projections only and cannot allocate memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ExecutorPrefillMaintenanceBlocker {
+    Capacity {
+        domain_id: Option<u32>,
+        kind: crate::vnext::CapacityShortfallKind,
+        requested: u64,
+        available: u64,
+        current_total: u64,
+        maximum_total: u64,
+    },
+    Backing {
+        pool_id: String,
+        domain_id: u32,
+        lifetime: crate::vnext::DynamicBackingClaimScope,
+        reason: crate::vnext::DynamicBackingDeferralReason,
+        requested_bytes: u64,
+        free_bytes: u64,
+        largest_contiguous_bytes: u64,
+    },
+}
+
+/// Non-authoritative projection of plan-runtime maintenance work.
+///
+/// The request id is the only handle returned to the engine. Implementations
+/// must retain the sealed deferral internally and validate it again when
+/// [`ModelExecutor::maintain_prefill_backing`] is called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorPrefillMaintenanceDeferral {
+    request_id: RequestId,
+    observed: ExecutorAdmissionEpochs,
+    wait_condition: crate::vnext::CapacityWaitCondition,
+    stage: ExecutorPrefillMaintenanceStage,
+    blockers: Vec<ExecutorPrefillMaintenanceBlocker>,
+}
+
+impl ExecutorPrefillMaintenanceDeferral {
+    pub fn new(
+        request_id: RequestId,
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        stage: ExecutorPrefillMaintenanceStage,
+        blockers: Vec<ExecutorPrefillMaintenanceBlocker>,
+    ) -> Result<Self> {
+        if blockers.is_empty() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "executor prefill maintenance deferral requires at least one blocker",
+            ));
+        }
+        if wait_condition.coordinator_id().get() != observed.coordinator_id.get() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "executor prefill maintenance wait condition belongs to a different coordinator",
+            ));
+        }
+        Ok(Self {
+            request_id,
+            observed,
+            wait_condition,
+            stage,
+            blockers,
+        })
+    }
+
+    pub fn from_admission(
+        request_id: &RequestId,
+        deferred: &crate::vnext::AdmissionDeferred,
+    ) -> Result<Self> {
+        if deferred.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
+            return Err(ferrum_types::FerrumError::internal(
+                "logical prefill maintenance projection requires AwaitBackingGrowth",
+            ));
+        }
+        let blockers = deferred
+            .blockers()
+            .iter()
+            .map(|blocker| ExecutorPrefillMaintenanceBlocker::Capacity {
+                domain_id: blocker.domain().map(|domain| domain.get()),
+                kind: blocker.kind(),
+                requested: blocker.requested().get(),
+                available: blocker.available().get(),
+                current_total: blocker.current_total().get(),
+                maximum_total: blocker.maximum_total().get(),
+            })
+            .collect();
+        Self::new(
+            request_id.clone(),
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
+            ExecutorPrefillMaintenanceStage::LogicalCapacity,
+            blockers,
+        )
+    }
+
+    pub fn from_backing(
+        request_id: &RequestId,
+        deferred: &crate::vnext::DynamicBackingDeferred,
+    ) -> Result<Self> {
+        let blockers = deferred
+            .blockers()
+            .iter()
+            .map(|blocker| ExecutorPrefillMaintenanceBlocker::Backing {
+                pool_id: blocker.pool_id().as_str().to_string(),
+                domain_id: blocker.domain_id().get(),
+                lifetime: deferred.scope(),
+                reason: blocker.reason(),
+                requested_bytes: blocker.requested_bytes(),
+                free_bytes: blocker.free_bytes(),
+                largest_contiguous_bytes: blocker.largest_contiguous_bytes(),
+            })
+            .collect();
+        Self::new(
+            request_id.clone(),
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
+            ExecutorPrefillMaintenanceStage::PhysicalBacking,
+            blockers,
+        )
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub const fn observed(&self) -> ExecutorAdmissionEpochs {
+        self.observed
+    }
+
+    pub fn wait_condition(&self) -> &crate::vnext::CapacityWaitCondition {
+        &self.wait_condition
+    }
+
+    pub const fn stage(&self) -> ExecutorPrefillMaintenanceStage {
+        self.stage
+    }
+
+    pub fn blockers(&self) -> &[ExecutorPrefillMaintenanceBlocker] {
+        &self.blockers
+    }
+}
+
+/// Result of one bounded plan-runtime backing maintenance attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ExecutorPrefillMaintenanceOutcome {
+    /// Cancellation won the race before the maintenance task consumed the
+    /// retained deferral.
+    NoLongerPending,
+    /// The physical allocator changed while maintenance was installing its
+    /// wait predicate. The scheduler must clear the old backing deferral and
+    /// perform one authoritative admission probe, even if publication of the
+    /// corresponding capacity epoch is still in flight.
+    RetryAdmission { current: ExecutorAdmissionEpochs },
+    /// The requested backing is valid but cannot be installed while current
+    /// device claims remain live. The scheduler must wait for release evidence
+    /// rather than completing the request as an error.
+    WaitForRelease {
+        current: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        pressure: crate::vnext::DynamicBackingPressure,
+    },
+    /// The executor installed real backing and published the resulting
+    /// capacity epoch.
+    Maintained {
+        current: ExecutorAdmissionEpochs,
+        pools_grown: usize,
+        allocated_bytes: u64,
+        pools_reclaimed: usize,
+        chunks_reclaimed: usize,
+        reclaimed_bytes: u64,
+        /// Exact allocator-issued rebalance receipt. The aggregate counters
+        /// above remain for stable metrics and must reconcile with this value.
+        rebalance: Option<crate::vnext::DynamicPoolRebalanceReceipt>,
+    },
+}
+
+/// Typed result of probing plan-runtime prefill capacity.
+///
+/// `Deferred` and `MaintenanceDeferred` preserve the capacity domains and
+/// epochs required by the plan-local dynamic admission queue. They must never
+/// be flattened into a generic resource error at the scheduler boundary.
+#[derive(Debug, Clone)]
+pub enum ExecutorPrefillAdmissionDecision {
+    Admitted(ExecutorPrefillAdmissionReceipt),
+    Deferred(crate::vnext::AdmissionDeferred),
+    MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
+    PermanentRejected(crate::vnext::AdmissionRejected),
+}
+
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
+
+    /// Selects the single authority for request-lifetime model resources.
+    /// Existing executors remain on the transitional legacy-engine path by
+    /// default. A runtime that returns `PlanRuntime` must return the shared
+    /// runtime's opaque cache handle from prefill/decode and delegate release
+    /// of that authority from `release_cache`.
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::LegacyEngine
+    }
+
+    /// Returns the immutable product plan that owns planning, provider
+    /// selection, and resource authority for a plan-runtime executor.
+    /// Legacy executors return `None`; `PlanRuntime` executors must expose the
+    /// exact plan used for provisioning and dispatch.
+    fn resolved_model_plan(&self) -> Option<&crate::vnext::ResolvedModelPlan> {
+        None
+    }
+
+    /// Returns the authoritative memory breakdown for a shared plan runtime.
+    /// `LegacyEngine` executors return `None`; `PlanRuntime` executors must
+    /// return `Some` while they are ready.
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        Ok(None)
+    }
 
     /// Whether this executor's backend can run the unified mixed prefill+decode
     /// forward natively. When false, the engine routes Qwen3-MoE batches through
@@ -473,6 +1516,110 @@ pub trait ModelExecutor: Send + Sync {
     /// runtime cache window than the model's declared context length.
     fn kv_capacity(&self) -> Option<usize> {
         None
+    }
+
+    /// Installs the product-owned execution event sink before requests start.
+    ///
+    /// Legacy executors have no typed execution journal and keep the default
+    /// no-op. Executors backed by the vNext runtime retain this sink with each
+    /// admitted request so node/operation events share the product artifact.
+    fn attach_execution_event_sink(&self, _sink: Arc<dyn crate::vnext::ExecutionEventSink>) {}
+
+    /// Current plan-local capacity evidence for scheduler wake suppression.
+    /// Legacy-engine executors return `None`; an executor declaring
+    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some`.
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(None)
+    }
+
+    /// Writes the canonical per-source availability generations into
+    /// caller-owned storage and returns the matching global audit epochs.
+    /// Executors with typed dynamic admission override this to avoid allocating
+    /// on steady scheduler ticks.
+    fn write_execution_capacity_snapshot(
+        &self,
+        availability: &mut Vec<crate::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        availability.clear();
+        self.execution_capacity_epochs()
+    }
+
+    /// Synchronously subscribes to every source named by one passive capacity
+    /// wait. The returned registration must remain alive until it is awaited or
+    /// deliberately cancelled by being dropped.
+    ///
+    /// Legacy-engine executors return `None`. An executor declaring
+    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some` for a
+    /// wait condition issued by its own admission coordinator.
+    fn register_execution_capacity_waiter(
+        &self,
+        _observed: &crate::vnext::CapacityWaitCondition,
+    ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
+        Ok(None)
+    }
+
+    /// Probe and retain the exact request/sequence authority needed by a
+    /// future prefill. No provider encode, kernel launch, or device submit may
+    /// occur in this method.
+    fn try_admit_prefill(
+        &self,
+        _input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "plan-runtime prefill admission is not implemented",
+        ))
+    }
+
+    /// Release an admitted but not yet active prefill authority.
+    ///
+    /// Returns true only when a retained authority was found and released.
+    fn cancel_prefill_admission(&self, _request_id: &RequestId) -> bool {
+        false
+    }
+
+    /// Writes the exact availability sources advanced when this request
+    /// authority is preempted for recompute.
+    ///
+    /// `true` proves that `preemption` still identifies a live, quiescently
+    /// releasable authority and that `sources` is its complete release
+    /// footprint. Callers must treat `false` as not releasable; a generic
+    /// "owns some cache" observation is not evidence that another request can
+    /// advance the source on which the current frontier is blocked.
+    fn write_execution_capacity_release_sources(
+        &self,
+        _preemption: &ExecutorExecutionCapacityPreemption,
+        sources: &mut Vec<crate::vnext::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        Ok(false)
+    }
+
+    /// Retire one exact request-scoped runtime authority for recompute.
+    ///
+    /// Success is a terminal release fence: all provider/device work that can
+    /// access the authority is quiescent and the request can be admitted as a
+    /// new sequence incarnation. Implementations must fail closed on identity
+    /// mismatch or an in-flight authority they cannot terminalize.
+    async fn preempt_execution_capacity(
+        &self,
+        _preemption: ExecutorExecutionCapacityPreemption,
+    ) -> Result<ExecutorExecutionCapacityPreemptionReceipt> {
+        Err(FerrumError::unsupported(
+            "request-scoped execution-capacity preemption is not implemented",
+        ))
+    }
+
+    /// Consume one retained logical/physical backing deferral after the
+    /// scheduler waiting lock has been released. Implementations must perform
+    /// at most one bounded maintenance attempt and publish capacity epochs only
+    /// after real backing is installed.
+    fn maintain_prefill_backing(
+        &self,
+        _request_id: &RequestId,
+    ) -> Result<ExecutorPrefillMaintenanceOutcome> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "plan-runtime prefill backing maintenance is not implemented",
+        ))
     }
 
     /// Reserve model-owned KV slots before a forward is dispatched.
@@ -509,6 +1656,19 @@ pub trait ModelExecutor: Send + Sync {
     /// Execute prefill phase (process initial prompt)
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput>;
 
+    /// Execute one exact prefill chunk with an explicit pre-submit capacity
+    /// deferral edge. Legacy executors inherit full-prefill behavior.
+    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
+        let output = self.prefill(input).await?;
+        let chunk = match input.chunk {
+            Some(chunk) => chunk,
+            None => PrefillChunk::new(0, input.sequence_length(), input.sequence_length())?,
+        };
+        Ok(ExecutorPrefillOutcome::Completed(
+            ExecutorPrefillCompletion::exact(output, chunk),
+        ))
+    }
+
     /// Batch prefill: process multiple prompts' prefill in ONE forward pass.
     ///
     /// Default implementation falls back to per-request `prefill()` (serial,
@@ -529,19 +1689,52 @@ pub trait ModelExecutor: Send + Sync {
         Ok(outputs)
     }
 
+    /// Attempt one physical, capacity-aware prefill batch.
+    ///
+    /// Implementations must either complete every input in original order or
+    /// return `NotSubmitted` after restoring every retained prefill authority
+    /// to a retryable state. Partial device submission is an ordinary error,
+    /// never a `NotSubmitted` result.
+    async fn batch_prefill_with_capacity(
+        &self,
+        _inputs: &[PrefillInput],
+    ) -> Result<ExecutorBatchPrefillOutcome> {
+        Ok(ExecutorBatchPrefillOutcome::Unsupported)
+    }
+
     /// Execute decode phase (generate next token)
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput>;
 
     /// Batch decode: process multiple sequences in one forward pass.
     ///
-    /// Default implementation falls back to per-request `decode()`.
-    /// Executors with batched CUDA runners should override this.
+    /// A successful result must contain exactly one output per input, in the
+    /// original input order, and each output cache must retain the identity of
+    /// its corresponding input cache. Implementations must not expose partial
+    /// success as a shorter or reordered vector.
+    ///
+    /// The default implementation falls back to serial per-request `decode()`.
+    /// Executors with a typed batch submission path should override this so one
+    /// call maps to one resource step and one terminal submission fence.
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
             outputs.push(self.decode(input).await?);
         }
         Ok(outputs)
+    }
+
+    /// Batch decode with an explicit pre-submit capacity deferral edge.
+    ///
+    /// Legacy executors inherit the successful/error-only behavior. A runtime
+    /// with typed resource authority overrides this method so temporary
+    /// capacity pressure is never flattened into a stringly resource error.
+    async fn batch_decode_with_capacity(
+        &self,
+        inputs: &[DecodeInput],
+    ) -> Result<ExecutorBatchDecodeOutcome> {
+        self.batch_decode(inputs)
+            .await
+            .map(ExecutorBatchDecodeOutcome::Completed)
     }
 
     /// Unified mixed-batch forward: process a [`UnifiedBatch`] containing
@@ -628,6 +1821,17 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Complete executor-owned startup preparation before either product
+    /// entrypoint can accept a request.
+    ///
+    /// Implementations use this cold-path hook for work that requires the
+    /// fully constructed executor but must not be charged to a user's first
+    /// request, such as compiling reusable execution shapes. The default is a
+    /// no-op so existing executors remain source compatible.
+    async fn prepare_startup(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Warm up executor (load model, allocate memory, etc.)
     async fn warmup(&mut self) -> Result<()> {
         // Default no-op implementation
@@ -640,11 +1844,22 @@ pub trait ModelExecutor: Send + Sync {
         Ok(())
     }
 
-    /// Release KV cache and state for a completed sequence.
+    /// Complete and release one cache authority with product-authoritative
+    /// terminal token counts.
     ///
-    /// Called by the engine when a request finishes (success or error) to free
-    /// GPU memory held by the sequence's KV cache. The `cache_id` matches the
-    /// value embedded in the `KvCacheHandle` returned by prefill/decode.
+    /// Legacy executors only need physical release and inherit that behavior.
+    /// Plan runtimes with terminal journals override this method so completion
+    /// cannot be inferred from a generic release operation.
+    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        self.release_cache(completion.cache_id());
+        Ok(())
+    }
+
+    /// Release KV cache and state without asserting successful completion.
+    ///
+    /// Called for cancellation, failure, recompute, and legacy cleanup. The
+    /// `cache_id` matches the value embedded in the `KvCacheHandle` returned by
+    /// prefill/decode. Successful product completion uses [`Self::complete_cache`].
     fn release_cache(&self, _cache_id: &str) {
         // Default no-op — executors that manage per-sequence KV caches should override.
     }

@@ -4,6 +4,107 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-07-26 的当前 clean HEAD 为
+`277309dda27f8b2f83f630695637017d5dad8390`。正式 G00-G10 PASS 仍为
+`0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前 M2 CUDA
+correctness artifact
+`/workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-matrix-277309dd-20260726T1410Z`
+在 canonical 703-case runner 中完成 `404` 个 PASS 后，于第 `405` 个 case
+`c13-022` 以 `c13-contract-violation` 停止：请求携带 calculator tool call 和 tool
+result `21`，产品响应却要求用户提供算式。该结果是当前产品正确性 blocker，不是正式
+PASS，也不能由 2026-07-23 的 stale `6fa8e215` 703/703 artifact 替代。相同当前 SHA
+已经在独立 focused lane 和 canonical lane 中分别证明 C09 `60/60`，canonical C12
+也为 `40/40`；C09/C12 不再是当前 blocker。
+
+两台 retained RTX 4090 实例 `45319871`、`45897840` 均已确认
+`cur_state=stopped`、`actual_status=exited`，当前没有 paid/transitional sibling。
+在下一次 paid CUDA work 之前只允许完成 C13 的 source/artifact 证据链：比较旧/新
+rendered prompt identity 和首个分叉 logit/token，先以本地 prompt contract 证伪
+history/template 丢失，再决定 product composition 或数值执行修复。禁止输出过滤、模型名
+特判、降低 C13 oracle 或直接重跑完整 703。修复后的执行顺序固定为 exact replay
+`c13-022`、C13 affected-contract、尚未执行的 C13-C16/C18/C20 suffix scenarios，
+最后只运行一次 canonical 703 和 `vnext-g08b-cuda` validator。
+
+截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
+correctness matrix 仍为 `0/6`。当前生产纵切是
+`G03 weight ABI/fidelity contract -> G08B M2 CUDA current-HEAD correctness -> G09
+exact-precision performance`。`0b72bab2` 的隐式 F16 -> FP8 candidate 虽曾取得窄
+`run`/`serve` smoke、Marlin dispatch profile 和单次 c1 bounded KEEP，随后在 `7bc46122`
+的 C17 deterministic Unicode case 中丢失首 token，已判定 correctness REJECT。`5149bbfb`
+禁止默认近似重量化并恢复 exact-F16 C17 输出；`883ee9e0` 进一步把 exact QKVZ+BA
+冷打包为单个 QKVZBA projection，并在 CUDA/Metal 共用 schema v6。源码、replay contract
+和真实 Metal 数值用例已通过。clean `557cdcf5` 的 1x RTX 4090 focused CUDA lane 随后通过
+9 个 C03/C05/C06/C17 用例、`4,500` 个 GDN projection GEMV、每 correlation `300`
+dispatch 和 `7.6973 ms` device-duration target；bounded c1 为 `73.3800 tok/s`，与
+`73.3855 tok/s` exact reference 持平，但仍比 `76.1583 tok/s` floor 低 `3.65%`。
+2026-07-25 owner 决定按 G09 的窄范围 M2 CUDA c1 修订把该差距作为 development
+checkpoint 接受，并停止继续进行 c1-only 优化。
+
+后续 clean `acf9a669` 首次把 typed device token selection 接入产品执行，但默认
+`repetition_penalty=1.1` 仍触发 full-logits fallback；同机 bounded c32 为
+`109.1643 tok/s`，trace 是 `greedy_token_waves=0`、
+`greedy_policy_fallback_waves=164`、readback `1,167,104,000 bytes`，因此形成
+product-default integration REJECT。commit `90057af1` 把 selection contract 升级到 v2，
+用固定容量 typed token IDs、offsets 和 penalty 在 CUDA/Metal provider 内精确执行 sparse
+repetition，再返回单个 token。clean 1x RTX 4090 release build 用时 `5m12s`，9 个
+C03/C05/C06/C17 `run`/`serve`/stream/Unicode 用例全部通过；相同 c32 workload 为
+`121.0025 tok/s`，比 `acf9a669` 提升 `10.84%`，decode fallback 降为 `0`，readback 降至
+`61,592,288 bytes`（`-94.72%`）。该 artifact 仍只有一次 repeat、无 CI，且不是 703-case
+CUDA matrix，所以仍不是 G03、G08B 或 G09 canonical PASS，也不降低 same-host vLLM、
+并发矩阵、正确性或最终发布标准。最新证据在 GitHub branch
+`artifact/runtime-vnext-sparse-repetition-90057af1-20260725` commit `65dfab41`，
+archive SHA256 `1cd3b1fc3e656ecce8cd9f71f23877404f208665ed4e1596b1304917983637d2`；
+付费实例已确认 `stopped/exited`，无 paid/transitional sibling。
+
+commit `d995201e` 随后把共享物理 token 区域的多请求 GDN wave 合并为一个 packed
+projection/prepare/conv/delta/output 链，并以每序列 state pointer table 保留独立 recurrent
+state；`affacd2c` 修复基础 CUDA feature 的 `c_void` 编译边界。clean `affacd2c` 的官方
+CUDA feature build 用时 `5m05s`，binary SHA256 为
+`4123b86531951cb802693776ec93c798ac953a065d0d2ec570402fbb60ee2d2d`；真实 CUDA
+GDN/linear-attention 数值测试 `14/14` 通过。focus-scenario 命令实际选择了 `110` 个
+C03/C05/C06/C17 产品用例而不是预期的 9 个，结果 `110/110` 通过；相同 4090、相同
+random `64/32` c32 workload 完成 `64/64`、零错误，得到 `155.1381 tok/s`，比
+`90057af1` 的 `121.0025 tok/s` 提升 `28.21%`。本轮性能命令漏传
+`--profile-jsonl`，scheduler trace 只能证明 GDN node 执行，不能直接证明 native
+`batching_form=packed` 和物理 dispatch 计数，因此结论是
+`KEEP_CODE_AND_PERFORMANCE_PENDING_PACKED_ATTRIBUTION_TRACE`，不是 G08B/G09 PASS。
+远端压缩 artifact SHA256 为
+`7116188660add41efa654d4256fc0c1d2f9b8d6ffef08e7230853125b2c65a49`；因远端
+GitHub credential/SSH key 不可用，archive 与 commit 暂留 retained stopped instance，
+本机只有 stop/inventory metadata，未使用 SCP。实例已确认 `stopped/exited`，无
+paid/transitional sibling。
+
+后续 `e0a74fa0` 加入通用 native-work attribution gate，并通过临时 stdin credential
+先把旧 archive 完整推到 GitHub。`profile-detail=basic` 的首轮 closure 明确 REJECT：
+有 `3,240` 个 GDN node event，但没有 native-work event；源码确认 CUDA 只有 kernel
+attribution 或 reusable capture 才构造物理 command attribution。`profile-detail=full`
+随后产生 `22,906` 个 native-work event；其中 `2,520/2,520` 个多参与者 GDN compute
+event 全部满足 `batching_form=packed`、compute dispatch `10`、transfer `2`，参与者数
+覆盖 `3/4/13/19/32`，并打印：
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-packed-gdn-trace-affacd2c-20260725T161940Z/validation-full/native-work-attribution
+```
+
+因此 packed GDN 的“代码存在但产品未调用”风险已关闭，结论升级为
+`KEEP_PACKED_GDN_NATIVE_ATTRIBUTION`。这仍不是 G08B/G09 PASS：完整 CUDA matrix、
+三模型双后端、置信区间、legacy/external comparison 和 release gate 均未完成。compact
+evidence 在 GitHub branch
+`artifact/runtime-vnext-packed-gdn-trace-affacd2c-20260725` commit `fab7ac75`，
+archive SHA256 为
+`ea93671ead07eec23bafc921a24962a0140ee9c21c933ffc09f90ea8f77cb909`；原始
+`2,612,056,519` bytes profile/trace 由逐文件 SHA256 绑定并保留在 stopped instance。
+本次 paid window 为 `26m04s`、约 `$0.2039`，比 `$0.157` cap 超出约 `$0.0469`，
+失败分类为 full-profile overcollection；后续只采最小请求数并在 attribution 命中后立即
+停止。实例已确认 `stopped/exited`，无 paid/transitional sibling。
+
+2026-07-14 起，开发顺序和阶段依赖以
+[`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
+为准。G00-G10 继续定义最终能力与验收维度；S0-S7 定义实际生产纵切顺序。修订不降低本文件的
+三模型、双后端、正确性、性能和发布标准。该修订中的“收敛”只冻结无证据扩散和补丁堆叠；真实
+模型证据若暴露正确性、性能、扩展性或产品力的系统性架构缺陷，必须中止 gate 并彻底重构根抽象，
+不能用冻结策略保留错误设计。
+
 本目标不是在现有 Architecture v2、`Backend` 大 trait、模型专属 runner 和
 `run`/`serve` 分叉上继续打补丁。目标是重新设计 Ferrum 的核心推理架构，并把
 已经可靠的测试、benchmark、artifact、kernel 和 release 能力收敛到新架构。
@@ -176,6 +277,20 @@ contract。每个 operation 必须具备：
 解析为不可变 `ExecutionPlan`。计划必须可序列化、可 snapshot、可 diff，并包含每个选择、
 fallback 和拒绝原因。capability 判断不得留在 token hot loop。
 
+权重物化的数值保真度是计划契约，不是 kernel registry 的附带属性：
+
+- 每个 materializer descriptor 必须声明 `Exact` 或 `Approximate`，计划证据同时记录 source
+  dtype/quantization、selected materializer、目标 physical format 和 fidelity；
+- 默认配置、正式正确性矩阵、legacy no-regression 和 release gate 只能选择 `Exact`；
+  layout/repack 只有在数值无损时才属于 `Exact`；
+- backend 存在更快 kernel 只证明 capability，不能授权改变 checkpoint 精度。`Approximate`
+  必须由用户可见的 typed CLI/config policy 显式选择，并有独立精度预算、正确性矩阵和性能
+  artifact；hidden env、backend feature 或自动 preset 不得授权；
+- approximate lane 不能替代同模型原始格式的 required correctness/performance cell，也不能把
+  不同数值合同的吞吐提升计入 exact no-regression；
+- compiler、static initialization 和 trusted catalog 都必须 fail closed：exact policy 遇到
+  approximate descriptor 时在分配设备权重前拒绝。
+
 ### 5.5 执行与资源层
 
 共享 `ExecutionRuntime` 负责 batching、prefill/decode、layer traversal、logits、sampling
@@ -243,6 +358,8 @@ HTTP/SSE 的 I/O 适配，不得各自解析模型 alias、能力、默认值、
 | release binary 中 legacy executor/factory/runtime | `0` |
 | silent fallback / silent default success | `0` |
 | 未声明 sunset 的 compatibility adapter | `0` |
+| 声明 replay-equivalent 但没有当前 provider/binary 的 CUDA 数值证明 | `0` |
+| 用 graph inventory、最终文本或 tolerance 代替同实现 bitwise 证明 | `0` |
 
 必须通过四个扩展演练：
 
@@ -253,6 +370,38 @@ HTTP/SSE 的 I/O 适配，不得各自解析模型 alias、能力、默认值、
 3. 新增 reference backend，模型生产代码改动为 `0`。
 4. 注入 unsupported capability、kernel failure、资源泄漏和坏输出，单个 artifact 必须给出
    request、plan node、operation、phase、资源状态和 first failure event。
+
+### 6.1 CUDA vNext 确定性执行边界
+
+CUDA reusable execution 不是单纯的性能开关。provider 一旦声明
+`bitwise_eager_equivalent`，该声明必须贯穿 provider descriptor、policy selection、plan hash、
+compiled wave identity、runtime binding、receipt/event/profile 和发布证据，任何层都不能推断、
+补默认值或静默降级。
+
+在同一 immutable plan/provider/runtime/device binding 下，给定完全相同的逻辑输入、显式 RNG、
+初始 KV/recurrent state 和已初始化 workspace，以下三组结果必须逐字节相同：
+
+1. eager A 与 eager B；
+2. replay A 与 replay B；
+3. eager witness 与 replay witness。
+
+比较集合必须包含每个 plan node 的全部 declared outputs，以及所有 `Write`/`ReadWrite`
+`PlanStateEffect` 的 post-state；只比较最终 token、文本、logits 摘要、graph 数量或 executable
+inventory 均不合格。scratch 使用至少两个确定性 poison pattern 后仍必须产生相同 witness，
+从而暴露未初始化读取。该 bitwise 门只证明同实现执行语义；CPU/FP32/reference parity 继续使用
+G03 tolerance catalog，两类门互不替代。
+
+统一 child gate 为：
+
+```text
+FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: <out_dir>
+FERRUM GATE vnext-cuda-determinism PASS: <out_dir>
+```
+
+它由 `run_gate.py` 注册，必须在 M1/M2/M3 CUDA correctness matrix、CUDA performance 和 G10
+release candidate gate 之前通过。任一 mismatch 立即停止 expensive matrix，保存 first differing
+provider/node/value/state、byte offset、两侧 SHA256 和执行路径；修复后先复跑 exact case，再跑
+affected provider/shape，直到下一冻结点才允许完整矩阵。
 
 ## 7. 正确性总标准
 
@@ -279,6 +428,9 @@ synthetic fixture 代替：
 - natural EOS、custom stop、`max_tokens`、context limit、cancel、timeout 全部通过。
 - Qwen3.5 默认 thinking 与 `enable_thinking=false` 硬切换、Qwen3 的硬/软 thinking 切换、
   content/final/history 隔离均按 [`MODEL_MATRIX.md`](MODEL_MATRIX.md) 分别验证。
+- 所有 CUDA model plan 中被选择且声明 replay-equivalent 的 provider，必须由当前
+  provider implementation fingerprint、plan hash 和 binary SHA256 绑定的 CUDA determinism
+  artifact 覆盖；coverage `100%`，waiver/skip `0`。
 - panic、OOM、resource leak、串话、`<unk>`、`[PAD]`、U+FFFD、mojibake、特殊 token
   泄漏、missing/duplicate DONE 均为 `0`。
 - CUDA client c=1/4/16/32、Metal client c=1/4/16 marker/checksum 隔离全部正确；每 cell
@@ -393,21 +545,23 @@ artifact 和独立 source-build lane。
 
 | ID | 文档 | 依赖 | 目标 |
 |---|---|---|---|
-| G00 | [`G00_BASELINE.md`](G00_BASELINE.md) | 无 | 冻结 legacy、真实六个主 lane、外部基线和编译基线 |
-| G01 | [`G01_CORE_CONTRACTS.md`](G01_CORE_CONTRACTS.md) | G01A<-G00a；G01B<-G00+G01A；G01 聚合 A/B | 新核心 type/trait/program/plan/resource contract |
-| G02 | [`G02_TEST_EVIDENCE.md`](G02_TEST_EVIDENCE.md) | G00,G01 | 先建立可信测试层次、artifact 图和 historical bug kill |
-| G03 | [`G03_BACKEND_OPS.md`](G03_BACKEND_OPS.md) | G01,G02 | operation contracts、CPU oracle、CUDA/Metal providers |
-| G04 | [`G04_RUNTIME_RESOURCES.md`](G04_RUNTIME_RESOURCES.md) | G01,G02,G03 | 共享 runtime、scheduler、资源事务与状态所有权 |
-| G05 | [`G05_PRODUCT_API.md`](G05_PRODUCT_API.md) | G02,G04 | 唯一产品组合根和 OpenAI API 语义 |
-| G06 | [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md) | G01,G02,G04,G05 | 定位、replay、统一 profile 和性能实验协议 |
-| G07 | [`G07_BUILD_NATIVE_OPS.md`](G07_BUILD_NATIVE_OPS.md) | G07A<-G00+G01；G07B<-G03+G07A；G07 聚合 A/B | crate/build graph、native ops、增量编译 |
-| G08 | [`G08_MODEL_MIGRATION.md`](G08_MODEL_MIGRATION.md) | G03-G07；内部 A->B->C->D | 三主模型逐个迁移、parity、legacy 删除和长尾处置 |
-| G09 | [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) | G00,G06,G07,G08 | 三模型双端性能恢复及竞争性外部线 |
+| G00 | [`G00_BASELINE.md`](G00_BASELINE.md) | G00F 无前置；G00M1-M3 随模型；G00P 在 G09 前 | 事实锁、逐模型 baseline、最终完整 external/legacy/build baseline |
+| G01 | [`G01_CORE_CONTRACTS.md`](G01_CORE_CONTRACTS.md) | S0A<-G00F；S0B 与 S1 同里程碑 | 拆分现有 contract，并由真实 Qwen3.5-4B CUDA `run`/`serve` consumer 收敛核心边界 |
+| G02 | [`G02_TEST_EVIDENCE.md`](G02_TEST_EVIDENCE.md) | L0 随 S0；L1/impact 随 S1-S2；full 在 S6 | 分层测试、artifact 图和 historical bug kill |
+| G03 | [`G03_BACKEND_OPS.md`](G03_BACKEND_OPS.md) | S1 提取最小 CUDA ops；随 S3-S5 扩展 | operation contracts、CPU oracle、CUDA/Metal providers |
+| G04 | [`G04_RUNTIME_RESOURCES.md`](G04_RUNTIME_RESOURCES.md) | S0 contract split；S1 首个 production runtime | 共享 runtime、动态 scheduler、资源事务与状态所有权 |
+| G05 | [`G05_PRODUCT_API.md`](G05_PRODUCT_API.md) | S1 basic composition；S2 完整 M1 产品合同 | 唯一产品组合根和 OpenAI API 语义 |
+| G06 | [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md) | basic/resource 随 S1；full kernel/replay 在 S6 前 | 定位、replay、统一 profile 和性能实验协议 |
+| G07 | [`G07_BUILD_NATIVE_OPS.md`](G07_BUILD_NATIVE_OPS.md) | G07A 在 S1 后并行；G07B 随 operation catalog | crate/build graph、native ops、增量编译；S4 前完成开发反馈目标 |
+| G08 | [`G08_MODEL_MIGRATION.md`](G08_MODEL_MIGRATION.md) | S1-S5 逐模型 CUDA->Metal；每模型立即删除 legacy | 三主模型逐个迁移、parity、legacy 删除和长尾处置 |
+| G09 | [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) | G00P,G06,G07,G08；S6 | 三模型双端性能恢复及竞争性外部线 |
 | G10 | [`G10_RELEASE.md`](G10_RELEASE.md) | G10A<-G00-G09 dev PASS；G10A->fresh G08-RC/G09-RC->G10B | release freeze、候选 SHA 重验、发布、安装后回归和最终 PASS |
 
 ### Canonical gate 入口
 
-所有阶段必须注册到现有 `scripts/release/run_gate.py`，不能形成一套可独立 PASS 的 sidecar：
+所有 milestone completion 和最终阶段必须注册到现有 `scripts/release/run_gate.py`，不能形成一套
+可独立 PASS 的 sidecar。内部 mechanical commit 运行 focused tests，不要求先写完整 collector；
+S milestone 声称退出前才必须有 canonical artifact：
 
 ```text
 python3 scripts/release/run_gate.py vnext-g00 --out <out>
@@ -415,7 +569,7 @@ python3 scripts/release/run_gate.py vnext-g00 --out <out>
 python3 scripts/release/run_gate.py vnext-g10 --out <out>
 ```
 
-`run_gate.py --list-lanes` 必须列出 G00a、G00-G10、G01A/G01B、G07A/G07B、G08A-G08D、
+`run_gate.py --list-lanes` 最终必须列出 G00F/G00M/G00P、S milestone、G00-G10、G07A/G07B、G08A-G08D、
 G10A/G08-RC/G09-RC/G10B，以及 G10 定义的三模型 source/published/prepromotion lanes。
 stage-specific validator 可以作为内部模块存在，但有效 PASS 必须来自 `run_gate.py` 写出的统一
 `gate.manifest.json`。
@@ -431,26 +585,29 @@ legacy worktree 和 validator worktree 必须分别保持可辨识；不能通�
 独立的 PASS。`g0_release_summary.py` 和 completion manifest 必须把三主模型矩阵设为
 v0.8.0 required input，不能把它留成可漏跑的旁路。
 
-依赖 DAG。`G00a` 是只读 inventory、historical bug catalog、模型解析与 preset 锁全部通过
-各自 validator 后形成的不可变 checkpoint；它只解锁 G01A 的 ADR、纯 contract 和无产品路由的
-compile/unit/trybuild 工作，不代表 G00 PASS，也不能解锁 G01B、性能结论或模型迁移：
+开发 DAG 与最终证据 DAG 分开。`G00F` 是只读 inventory、historical bug catalog、模型解析与
+preset 锁形成的事实 checkpoint；它解锁 S0A contract/test 结构拆分和 S1 production slice，
+不代表 G00P、性能或模型迁移 PASS：
 
 ```text
-G00a -> G01A
-G00 + G01A -> G01B
-G01A + G01B -> G01 -> G02 -> G03 -> G04 -> G05
-                              |       |             |      |
-                              |       +------------>G06<---+
-G00 + G01 ------------------->G07A
-G03 + G07A ------------------>G07B
-G07A + G07B ----------------->G07
+G00F -> S0A contract/test structural split
+  -> S0B + S1 Qwen3.5-4B CUDA basic run/serve
+  -> S2 Qwen3.5-4B CUDA complete product contract
+  -> S3 Qwen3.5-4B Metal + M1 legacy deletion
+  -> S4 Qwen3.5-35B-A3B CUDA -> Metal + M2 legacy deletion
+  -> S5 Qwen3-30B-A3B CUDA -> Metal + M3 legacy deletion
 
-G03 + G04 + G05 + G06 + G07
-  -> G08A -> G08B -> G08C -> G08D -> G08 -> G09-dev
+S1 -> G07A in parallel with S2/S3
+per-model G00M -> corresponding legacy deletion/parity claim
+G02 determinism evidence + G03 provider execution contract
+  -> CUDA determinism gate
+  -> per-model CUDA correctness matrix
+  -> CUDA performance
+G00P + G06 + G07 + G08 -> S6/G09-dev
   -> G10A-release-freeze
   -> G08-RC + G09-RC
   -> G10B-stage-publish-promote
-  -> G10
+  -> S7/G10
 ```
 
 `G10A-release-freeze` 生成唯一 `release_candidate_sha`，完成 version/release notes/workflow policy
@@ -461,9 +618,10 @@ lane correctness，G09-RC 必须在该 SHA 重跑全部正式 comparison。二�
 拼接旧 G08/G09 rows。G10B 只能消费 fresh G08-RC/G09-RC。G00 legacy binary 仍固定
 `cff4c477...`，这是 comparator 身份，不受 candidate SHA 相等规则影响。
 
-### G00a 事实检查点
+### G00F 事实检查点
 
-G00a 的 canonical 输入必须是源码工作树外的两个真实 artifact：冻结 `cff4c477...` 由当前
+G00F 的 canonical 输入沿用现有 G00a facts contract：源码工作树外的两个真实 artifact，冻结
+`cff4c477...` 由当前
 checked-in analyzer 重算得到的 `coupling-inventory.json`，以及 clean current HEAD 通过实时
 Hugging Face HTTPS 解析得到的 `model-resolution.json`。有效入口是：
 
@@ -472,7 +630,13 @@ python3 scripts/release/run_gate.py vnext-g00a \
   --coupling-inventory <external-cff4-inventory.json> \
   --model-resolution <external-current-head-resolution.json> \
   --out <external-g00a-out>
+python3 scripts/release/run_gate.py vnext-g00f \
+  --g00a <external-g00a-out>/gate.manifest.json \
+  --out <external-g00f-out>
 ```
+
+`vnext-g00f` 是 G00a 事实 artifact 的 freshness-bound DAG 引用，不复制或重跑同一事实
+collector；它只把开发解锁范围收敛到 `S0A`/`S1`。
 
 checkpoint 必须冻结 12/12 model/backend lane、M1-M3 四类 generation preset、15 个 historical
 bug family/28 个 concrete case 的 catalog 事实和完整 analyzer/catalog/goal source identity。collector
@@ -493,15 +657,14 @@ FERRUM GATE vnext-g00a PASS: <out_dir>
 ```
 
 任一 collector contract、model catalog、resolver、inventory analyzer、模型解析请求、目标文档、
-Git HEAD/tree 或 clean 状态变化都会使 checkpoint stale。该 PASS 的机器可读 `unlocks` 只能是
-`["G01A"]`；`G00`、`G01B`、模型迁移、性能和发布均必须位于 `does_not_prove`。
+Git HEAD/tree 或 clean 状态变化都会使 checkpoint stale。策略修订后的 manifest 必须把
+`S0A`/`S1` 作为唯一开发解锁项；`G00P`、正式模型迁移、性能和发布仍必须位于 `does_not_prove`。
 `model-facts.lock.json` 只保存 normalized facts/fingerprint，必须在相同事实下字节确定；带
 `generated_at`、绝对路径和原始输入 SHA 的采集 provenance 只进入 manifest/index。
 
-G01A 的设计或测试发现 G00a 锁定事实有误时必须废弃 checkpoint 并重采；G01 的最终 PASS
-必须同时消费完整 G00 PASS 和 G01A artifact。G03/G04 的实现允许小型纵切验证，但 G08 前
-不得批量迁移模型。G07A 可与 G02-G06 并行，
-G07B 必须消费 G03 冻结的 operation catalog。
+现有 G01A artifact 保留为 historical isolated-contract checkpoint，但不再解锁生产迁移或冻结当前
+contract。S0A 先保持语义拆分，S0B 必须与 S1 production consumer 同里程碑；G01 不再依赖完整
+G00P。G07A 在 S1 后与 S2/S3 并行，G07B 仍消费已被真实 provider 使用的 operation catalog。
 任何后续 Goal 修改已通过的核心 contract，都必须自动 invalidate 受影响的上游/模型 artifact
 并重新运行，不能靠人工判断“应该没影响”。
 
@@ -509,21 +672,130 @@ G07B 必须消费 G03 冻结的 operation catalog。
 
 | 里程碑 | 包含 | 退出条件 |
 |---|---|---|
-| M0 事实冻结 | G00 | baseline artifact 完整，已支持/缺口不再靠口头判断 |
-| M1 架构合同 | G01-G02 | contract、failure model、测试证据先于生产迁移 |
-| M2 新运行时纵切 | G03-G05 | tiny real-weight vNext runtime 经统一 run/serve composition root 完成纵切；不提前宣称主模型迁移 |
-| M3 可诊断可迭代 | G06-G07 | 一次失败可定位；dev compile 达标 |
-| M4 三模型迁移 | G08 | 三模型 CUDA -> Metal，旧路径随模型删除 |
-| M5 性能闭环 | G09 | legacy 不回退且三模型逐 cell 达主流实现 90%、矩阵几何平均 95% |
-| M6 发布 | G10A -> G08-RC/G09-RC -> G10B -> G10 | release-candidate SHA 重验后，`v0.8.0` 已发布且安装产物双端复验 |
+| S0 合同拆分 | G00F、G01-S0A | 46K contract/test 按责任拆分，既有动态资源语义保持，focused/aggregate bounded tests 通过 |
+| S1 CUDA 基础纵切 | G01/G03/G04/G05/G06 basic slice | actual Qwen3.5-4B CUDA 同时跑通 vNext `run`/`serve`、动态 admission 和 basic/resource trace |
+| S2 CUDA 完整产品 | G02 core、G04/G05/G06 M1 | M1 CUDA tools/schema/stream/multi-turn/cancel/concurrency 与历史资源问题通过 |
+| S3 M1 双端 | G03 Metal、G08A | 同一 program 跑通 Metal，M1 dual-backend milestone PASS，M1 legacy 已删除 |
+| S4 M2 双端 | G08B、G07 | Qwen3.5-35B-A3B CUDA->Metal，c32 资源合同和开发编译目标通过，M2 legacy 已删除 |
+| S5 M3 双端 | G08C/G08D | Qwen3-30B-A3B CUDA->Metal，主模型 legacy/runtime 分叉清零 |
+| S6 严格证据 | G00P、G02 full、G06、G07、G08、G09 | 六 lane correctness、正式 performance、historical kill、build/profile 全部通过 |
+| S7 发布 | G10A -> G08-RC/G09-RC -> G10B -> G10 | exact staged/published/installed binary 双端复验并发布 `v0.8.0` |
 
 CUDA 优先顺序：Qwen3.5-4B -> Qwen3.5-35B-A3B -> Qwen3-30B-A3B。Metal 在每个模型
 CUDA contract 稳定后开始，但不得把三个 Metal lane 全部拖到发布前一次性补做。
+
+S1 CUDA 基础纵切的 production evidence 通过统一 gate 固化：
+
+```text
+python3 scripts/release/runtime_vnext_s1_cuda_basic_collector.py collect \
+  --repo <clean-source-root> \
+  --model <qwen35-4b-hf-snapshot> \
+  --out <qwen35-4b-cuda-raw-artifact>
+
+python3 scripts/release/run_gate.py vnext-s1-cuda \
+  --s1-artifact <qwen35-4b-cuda-raw-artifact> \
+  --out <external-out>
+```
+
+child validator 必须从原始 `run`、`serve`、stream、`bench-serve`、scheduler trace 和 ABBA-BAAB
+样本重新计算结果，不能信任手工摘要。要求 basic trace 每请求只捕获一个完整 execution frame、operation
+identity 完整、terminal token 与 usage 对账、trace `<=1 MiB/request`。profile 必须由正式
+`--profile-detail off|basic|debug|full` 与 artifact path 控制，默认 `off`；off slot 不得创建 profile/
+scheduler-trace artifact，device completion timing 样本必须为 `0`。同一 RTX 4090 的 ABBA-BAAB
+仍重算并报告均值/中位数开销、两组 CV 与硬件 telemetry，但 `<=2%` overhead 和 `<=5%` CV 是
+profile-on 质量目标，不再阻塞 S1。默认关闭路径的真实性能回归由 G09 的 legacy/vLLM 同硬件门负责，
+不得用 profile lane 的高方差替代或豁免。精确 PASS 行为：
+
+collector 固定 workload、seed、repeat 和 slot order，不暴露性能口径参数；每个 slot 必须保存 bench
+前、bench 中至少 `3` 个样本和 bench 后的同一 GPU UUID/P-state/graphics-SM-memory clocks/power/
+temperature/utilization/memory 以及 host CPU ticks/load/memory/swap。telemetry 只观测、不得设置 clocks、
+power limit 或产品隐藏环境变量。首四 slot 的 `overhead.first-half.json` 只保存当时的真实诊断状态，允许
+PASS 或 REJECT；正式 validator 必须重算它，禁止要求、伪造或复用历史 noisy REJECT。
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS: <out_dir>
+FERRUM GATE vnext-s1-cuda PASS: <out_dir>
+```
+
+该 checkpoint 只解锁 G01B 的 production-reference 重构；它不证明 S1 里程碑、G01B、aggregate
+G01、full G06、完整模型迁移或发布完成。S1 仍须由 G01B 中的共享动态 admission/backpressure 和
+零 legacy runtime fallback 证据闭环。
+
+S1 的共享动态 admission/backpressure 使用独立的有界 CUDA capacity-pressure lane，避免为一次
+容量语义诊断重跑 ABBA/BAAB 性能 sweep：
+
+```text
+python3 scripts/release/runtime_vnext_s1_cuda_capacity.py collect \
+  --binary target/release/ferrum --model <qwen35-4b-model-dir> --out <raw-out>
+python3 scripts/release/run_gate.py vnext-s1-cuda-capacity \
+  --s1-artifact <raw-out> --out <external-out>
+```
+
+collector 必须先在同一 clean SHA/binary 上通过真实 `ferrum run`，再用 `serve` 校准 A+C 的已安装
+backing 并通过 typed `--runtime-memory-budget-bytes` 重放精确预算。压力序列固定为 A active、B 先到
+但 `WaitForRelease`、C 后到且先完成；B 在 unchanged epoch 下 probe/submit 增量为 `0`，A 在等待窗
+继续 decode，release epoch 前进后 B admission/submit/completion。stream 必须各有且仅有一个
+`[DONE]` 和 usage，最终 active/queued/pending/maintenance 均为 `0`。精确 PASS 行为：
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE PASS: <out_dir>
+FERRUM GATE vnext-s1-cuda-capacity PASS: <out_dir>
+```
+
+该 lane 只证明当前 SHA 的 Qwen3.5-4B CUDA 容量压力纵切，不单独证明 G01B、S1、性能或发布完成。
+
+decode execution-capacity 使用独立的补充 lane，证明 active decode 在 Step/Invocation 动态容量
+耗尽时不会热循环、互相等待或依赖某个请求先终态：
+
+```text
+python3 scripts/release/runtime_vnext_s1_cuda_decode_capacity.py collect \
+  --binary target/release/ferrum --model <qwen35-4b-model-dir> --out <raw-out>
+python3 scripts/release/run_gate.py vnext-s1-cuda-decode-capacity \
+  --s1-artifact <raw-out> --out <external-out>
+```
+
+collector 必须在一个有界 A/B/C 压力序列中观察 wide work cohort split、exact-source park、typed
+yield/recompute transaction 和 fence-delayed release。每个 pressure boundary 必须由 scheduler-owned
+transition ordinal 证明：至少一个 logical work frontier 获得可执行 claim，或存在一个尚未完成的
+`YieldPlanned/AwaitReleaseFence`；禁止出现 overlapping exact source 上
+`all live frontiers blocked + no pending release`。unchanged source 的 allocator/admission probe 增量
+为 `0`，无压力路径不得创建 pressure episode、改变 batch membership 或增加 host allocation。
+
+同一 target server 还必须把 plan-owner 跨池回收与上述 decode 压力分成两个因果窗口。先复放
+target-sizing workload，直到 quiescent pool snapshot 恰好占满校准后的全局动态预算；再发送一个
+仍处于 `max_model_len` 内、但 token demand 高于 A/B/C 的真实 stream 请求，只接受带非零
+`pools_reclaimed`、`chunks_reclaimed` 和 `reclaimed_bytes` 的 typed maintenance receipt。随后才运行
+A/B/C decode-pressure 序列。validator 必须分别从 rebalance-probe 和 decode 窗口重算两类证据，
+禁止用任意历史 maintenance 事件补足 decode 结果，也禁止硬编码 pool hash、domain id、GPU 名称或
+显存档位来制造回收。
+
+`DecodeProgressLease` baseline/release trace 可以保留为迁移期诊断，但不能再作为该 lane 的充分
+PASS 条件。正式 validator 必须消费统一 logical frontier、pressure episode、resource transaction 和
+ordered transition journal；不能依赖 wall-clock event 顺序，也不得用 token 阈值、时间、模型、GPU、
+显存档位代替 capacity/cost contract。A/B/C 最终各有且仅有一个 `[DONE]` 和 usage，任一角色连续
+30 秒无 token progress 时 REJECT，所有 scheduler/resource ownership 和 pending fence 清零。精确
+PASS 行为：
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS: <out_dir>
+FERRUM GATE vnext-s1-cuda-decode-capacity PASS: <out_dir>
+```
+
+该补充 lane 是 correctness-only 证据，不执行性能 sweep，也不单独证明 G01B、S1、性能或发布完成。
+
+`da9c1ee8363c686e71420fd5df8042c496e69757` 的 1x RTX 4090/Qwen3.5-4B collection 是
+`cross_phase_capacity_progress_deadlock` REJECT：lease 在 generation `49 -> 50` 后解除，但最终
+snapshot 为 `active=2`、`blocked prefill=1`、`blocked decode=1`，共同等待 domain `4` generation
+`73`；A/B/C content 为 `81/33/16`，仅 C 有 `[DONE]`，B progress timeout `30.010s`。该 artifact
+否定 phase-local lease 方案并强制上述 unified frontier/pressure transaction 重构；不得原样重跑或
+通过提高 timeout 改写结果。
 
 ## 12. 分支、提交和停止规则
 
 - 每个子 Goal 使用小而可审阅的提交；核心 contract、kernel 优化、release gate 大改不得混在
   同一个 patch。
+- S0A 先做保持语义的 mechanical split；S0B 才允许与 production consumer 同里程碑做 breaking
+  semantic rewrite。除修复已复现的 runner blocker外，连续 gate-only commit 不得超过 `2` 个。
 - 长期分支提交前执行 `git pull --rebase --autostash`，验证后及时 push。
 - correctness 失败时停止性能 sweep。
 - 同一 paid GPU failure class 连续两个 REJECT 后，必须回到 source/artifact 分析。

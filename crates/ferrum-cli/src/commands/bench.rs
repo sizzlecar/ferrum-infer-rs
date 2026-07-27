@@ -127,42 +127,24 @@ fn measured_request_count(cmd: &BenchCommand) -> Result<u32> {
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
-    // GGUF alias short-circuit (kept here because aliases like
-    // `qwen3:8b-q4_k_m` map to a sibling .gguf file in the cache,
-    // which `source_resolver` doesn't yet resolve directly).
-    let cache_dir = super::run::get_hf_cache_dir(&config);
-    let (model_id, source) =
-        if let Some((repo, filename)) = super::run::resolve_gguf_alias(&cmd.model) {
-            let gguf_path =
-                super::run::find_cached_gguf(&cache_dir, &repo, &filename).ok_or_else(|| {
-                    eprintln!(
-                        "GGUF alias '{}' not in cache. Run: ferrum pull {}",
-                        cmd.model, cmd.model
-                    );
-                    ferrum_types::FerrumError::model("GGUF model not found")
-                })?;
-            let id = gguf_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| cmd.model.clone());
-            let src = ferrum_models::source::ResolvedModelSource {
-                original: cmd.model.clone(),
-                local_path: gguf_path,
-                format: ferrum_models::source::ModelFormat::GGUF,
-                from_cache: true,
-            };
-            (id, src)
-        } else {
-            let resolved = crate::source_resolver::resolve_model_source(
-                &cmd.model,
-                &cache_dir,
-                crate::source_resolver::DownloadPolicy::AutoDownload,
-                None,
-            )
-            .await?;
-            let id = resolved.source.original.clone();
-            (id, resolved.source)
-        };
+    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
+    let resolved = crate::source_resolver::resolve_model_source(
+        &cmd.model,
+        &cache_dir,
+        crate::source_resolver::DownloadPolicy::AutoDownload,
+        None,
+    )
+    .await?;
+    let product_input = resolved.into_product_engine_input();
+    let model_id = product_input.public_model_id.clone();
+    let source = product_input.source;
+    let mut engine_config = product_input.engine_config;
+    let model_sources = product_input.model_sources;
+    let prepared_model = model_sources
+        .as_ref()
+        .map(crate::source_resolver::prepare_registered_product_model)
+        .transpose()?
+        .flatten();
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 
@@ -198,8 +180,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         }
     }
 
-    let mut engine_config = ferrum_types::EngineConfig::default();
-    engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+    engine_config.sampling.default_params = bench_sampling_params(cmd.max_tokens);
     engine_config.backend.device = device;
     engine_config.backend.backend_options.insert(
         "model_path".to_string(),
@@ -214,7 +195,15 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = ferrum_engine::create_default_engine(engine_config).await?;
+    let engine = match (prepared_model, model_sources) {
+        (Some(prepared), _) => {
+            ferrum_engine::create_prepared_product_engine(engine_config, prepared).await?
+        }
+        (None, Some(sources)) => {
+            ferrum_engine::create_product_engine(engine_config, sources).await?
+        }
+        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+    };
 
     let prompt = if cmd.long_context {
         generate_long_prompt()
@@ -425,18 +414,7 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         id: RequestId(Uuid::new_v4()),
         model_id: ferrum_types::ModelId(model_id.to_string()),
         prompt: prompt.to_string(),
-        sampling_params: SamplingParams {
-            max_tokens: max_tokens as usize,
-            temperature: 0.0, // greedy — matches PLAYBOOK § 0.5 L3 determinism contract
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            stop_sequences: vec![
-                "<|im_end|>".to_string(),
-                "</s>".to_string(),
-                "<|endoftext|>".to_string(),
-            ],
-            ..Default::default()
-        },
+        sampling_params: bench_sampling_params(max_tokens),
         stream: true,
         priority: Priority::Normal,
         client_id: None,
@@ -444,6 +422,21 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         created_at: Utc::now(),
         api_request: None,
         metadata: HashMap::new(),
+    }
+}
+
+fn bench_sampling_params(max_tokens: u32) -> SamplingParams {
+    SamplingParams {
+        max_tokens: max_tokens as usize,
+        temperature: 0.0, // greedy — matches PLAYBOOK § 0.5 L3 determinism contract
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        stop_sequences: vec![
+            "<|im_end|>".to_string(),
+            "</s>".to_string(),
+            "<|endoftext|>".to_string(),
+        ],
+        ..Default::default()
     }
 }
 

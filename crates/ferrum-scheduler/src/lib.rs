@@ -23,6 +23,7 @@
 pub mod implementations;
 pub mod metrics;
 pub mod queue;
+pub mod vnext;
 
 // Re-exports of interfaces from ferrum-interfaces
 pub use ferrum_interfaces::{

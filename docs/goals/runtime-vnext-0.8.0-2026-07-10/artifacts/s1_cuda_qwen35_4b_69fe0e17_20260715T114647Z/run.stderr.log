@@ -1,0 +1,21 @@
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat model=Generic)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=8.7 GB budget / 8.7 GB total | layers=32 budget | scratch reserve=4.0 GB | KV pool budget 8.9 GB → max_blocks=4561
+[auto-size] KV_MAX_BLOCKS=4561 PAGED_MAX_SEQS=2 KV_CAPACITY=16384
+Loading /workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-07-15T11:52:50.968174Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-07-15T11:52:50.968204Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-07-15T11:52:50.968278Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/tokenizer.json"
+[2m2026-07-15T11:52:51.297220Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-07-15T11:52:51.297254Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-07-15T11:52:51.297271Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-07-15T11:52:51.297290Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=4561
+[2m2026-07-15T11:52:51.297342Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a (format: safetensors)
+[2m2026-07-15T11:52:51.297547Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Qwen35, Layers: 32, Vocab: 248320
+[2m2026-07-15T11:52:51.472851Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-07-15T11:52:51.472878Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Resolving Qwen3.5/Qwen3.6 CUDA production executor
+[2m2026-07-15T11:52:51.480098Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building Qwen3.5 from the typed vNext CUDA execution plan [3mfamily_id[0m[2m=[0mfamily.qwen3_5.dense_hybrid [3mfamily_fingerprint[0m[2m=[0m"156ec30381d6df59125b6743c8dde3b4d0b3c4c49ee1c235ba6b9fddddf1e371" [3mprogram_fingerprint[0m[2m=[0m"21ff13314e0e499b8d0c4daf448dbd2d8ce27e3de74f25830580aff210323ecf"
+Model loaded in 24.4s.
+[2m2026-07-15T11:53:15.178159Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Executor-owned prefill failed for 45a96a86-df61-4fdb-ba0a-b4576d7fc3e8: Backend error: operation dispatch contract failed: invalid execution plan: resource `resource/activation/sha256/ec38d0719b0d6ae9a455969982209971c071b65cd1df61852ab342c2f491368f` differs from its value binding
+[2m2026-07-15T11:53:15.178193Z[0m [33m WARN[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request 45a96a86-df61-4fdb-ba0a-b4576d7fc3e8 completed with error during prefill: Error

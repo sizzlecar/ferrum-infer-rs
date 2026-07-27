@@ -1,3 +1,4 @@
+{"schema_version":1,"event_kind":"instant","phase":"vnext.prefill_admission","status":"ok","scenario":"trace_replay_selftest"}
 {"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"request_slot","action":"request_open","capacity":1}
 {"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"reserve","amount":1,"before":0,"after":1,"capacity":4}
 {"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"commit","amount":1,"before":0,"after":1,"capacity":4}

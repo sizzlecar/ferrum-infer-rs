@@ -1,0 +1,364 @@
+started_at=2026-07-15T09:25:45Z
+git_sha=d43b2af19c5a8aa12a36ab7c9fd249b6c0271d83
+git_status=
+NVIDIA GeForce RTX 4090, 24564 MiB, 580.119.02
+Build cuda_12.4.r12.4/compiler.34097967_0
+command=CARGO_BUILD_JOBS=16 cargo check -p ferrum-engine --lib --features cuda
+warning: method `set_domain_total` is never used
+    --> crates/ferrum-interfaces/src/vnext/admission.rs:1500:19
+     |
+ 946 | impl LogicalAdmissionCoordinator {
+     | -------------------------------- method in this implementation
+...
+1500 |     pub(crate) fn set_domain_total(
+     |                   ^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `fence`, `batch_identity`, and `submission` are never read
+    --> crates/ferrum-interfaces/src/vnext/completion.rs:1014:9
+     |
+1011 |     InFlight {
+     |     -------- fields in this variant
+...
+1014 |         fence: R::Fence,
+     |         ^^^^^
+1015 |         batch_identity: BatchOperationIdentity,
+     |         ^^^^^^^^^^^^^^
+1016 |         submission: SubmittedOperationReceipt,
+     |         ^^^^^^^^^^
+
+warning: field `batch_identity` is never read
+    --> crates/ferrum-interfaces/src/vnext/completion.rs:1021:9
+     |
+1018 |     SubmissionIndeterminate {
+     |     ----------------------- field in this variant
+...
+1021 |         batch_identity: BatchOperationIdentity,
+     |         ^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/ferrum-interfaces/src/vnext/execution/work.rs:17:19
+   |
+16 | impl DynamicResourceShape {
+   | ------------------------- associated function in this implementation
+17 |     pub(crate) fn new(sequences: u32, tokens: u64, pages: u64) -> Result...
+   |                   ^^^
+
+warning: associated function `new` is never used
+   --> crates/ferrum-interfaces/src/vnext/execution/work.rs:146:19
+    |
+145 | impl CommittedPageWork {
+    | ---------------------- associated function in this implementation
+146 |     pub(crate) fn new(pages: u64, fingerprint: String) -> Result<Self, ...
+    |                   ^^^
+
+warning: methods `is_fixed` and `is_valid_for_sequence_scope` are never used
+   --> crates/ferrum-interfaces/src/vnext/execution/work.rs:670:19
+    |
+417 | impl DynamicResourceDemand {
+    | -------------------------- methods in this implementation
+...
+670 |     pub(super) fn is_fixed(&self) -> bool {
+    |                   ^^^^^^^^
+...
+674 |     pub(super) fn is_valid_for_sequence_scope(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/ferrum-interfaces/src/vnext/resource/dynamic_pool.rs:73:19
+   |
+72 | impl BackingSegment {
+   | ------------------- associated function in this implementation
+73 |     pub(crate) fn new(
+   |                   ^^^
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+   --> crates/ferrum-interfaces/src/vnext/resource/static_lease.rs:352:33
+    |
+328 |         impl $name {
+    |         ---------- methods in this implementation
+...
+352 |             pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^^^^^^^
+...
+356 |             pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^
+...
+374 | scoped_resource_admission_request!(RequestResourceAdmissionRequest, false);
+    | -------------------------------------------------------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `scoped_resource_admission_request` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+   --> crates/ferrum-interfaces/src/vnext/resource/static_lease.rs:352:33
+    |
+328 |         impl $name {
+    |         ---------- methods in this implementation
+...
+352 |             pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^^^^^^^
+...
+356 |             pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^
+...
+375 | scoped_resource_admission_request!(SequenceResourceAdmissionRequest, true);
+    | -------------------------------------------------------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `scoped_resource_admission_request` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+  --> crates/ferrum-interfaces/src/vnext/resource/work.rs:32:25
+   |
+15 | impl StepResourceAdmissionRequest {
+   | --------------------------------- methods in this implementation
+...
+32 |     pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+   |                         ^^^^^^^^^^^^^^^
+...
+36 |     pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+   |                         ^^^^^^^^^
+
+warning: method `canonical_key` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/work.rs:390:14
+    |
+362 | impl StepParticipantFrameAssignment {
+    | ----------------------------------- method in this implementation
+...
+390 |     const fn canonical_key(self) -> (u32, u64, u32, u64) {
+    |              ^^^^^^^^^^^^^
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+   --> crates/ferrum-interfaces/src/vnext/resource/work.rs:435:25
+    |
+403 | impl InvocationResourceAdmissionRequest {
+    | --------------------------------------- methods in this implementation
+...
+435 |     pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    |                         ^^^^^^^^^^^^^^^
+...
+439 |     pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    |                         ^^^^^^^^^
+
+warning: constant `SEQUENCE_DISPATCH_COUNT_MASK` is never used
+  --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:34:7
+   |
+34 | const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT...
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SequenceDispatchGuard` is never constructed
+  --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:40:19
+   |
+40 | pub(super) struct SequenceDispatchGuard<'a> {
+   |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `enter_sequence_dispatch` is never used
+  --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:51:15
+   |
+51 | pub(super) fn enter_sequence_dispatch(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `0` is never read
+   --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:443:14
+    |
+443 |     Terminal(SequenceSessionTerminalReceipt),
+    |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `SequenceSessionSlotState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+443 -     Terminal(SequenceSessionTerminalReceipt),
+443 +     Terminal(()),
+    |
+
+warning: method `ensure_live_identity` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:543:19
+    |
+487 | impl SequenceSessionLiveWitness {
+    | ------------------------------- method in this implementation
+...
+543 |     pub(crate) fn ensure_live_identity(
+    |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `acquire_session_frames` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/batch.rs:543:15
+    |
+543 | pub(super) fn acquire_session_frames(
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `session_frame_candidates` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/batch.rs:623:15
+    |
+623 | pub(super) fn session_frame_candidates<R: DeviceRuntime>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `participant_backing_views` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:415:19
+    |
+ 96 | / impl<R> StepResourceLease<R>
+ 97 | | where
+ 98 | |     R: DeviceRuntime,
+    | |_____________________- method in this implementation
+...
+415 |       pub(crate) fn participant_backing_views(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `participant_node_keys` is never used
+    --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:1122:19
+     |
+1070 | / impl<R> PreparedStepSubmissionWave<R>
+1071 | | where
+1072 | |     R: DeviceRuntime,
+     | |_____________________- method in this implementation
+...
+1122 |       pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNod...
+     |                     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `participant_backing_snapshot` and `participant_backing_views` are never used
+    --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:1480:19
+     |
+1266 | / impl<R> InvocationResourceLease<R>
+1267 | | where
+1268 | |     R: DeviceRuntime,
+     | |_____________________- methods in this implementation
+...
+1480 |       pub(crate) fn participant_backing_snapshot(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1547 |       pub(crate) fn participant_backing_views(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `with_runtime_and_stream` is never used
+    --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:1983:19
+     |
+1947 | / impl<'resources, 'exec, R> ActiveSequencePermit<'resources, 'exec, R>
+1948 | | where
+1949 | |     R: DeviceRuntime,
+     | |_____________________- method in this implementation
+...
+1983 |       pub(crate) fn with_runtime_and_stream<T>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `ferrum-interfaces` (lib) generated 23 warnings
+    Checking candle-kernels v0.9.2
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+    Checking candle-core v0.9.2
+error: failed to run custom build command for `ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)`
+
+Caused by:
+  process didn't exit successfully: `/workspace/ferrum-infer-rs/target/debug/build/ferrum-kernels-5fe97357a43f97b4/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-changed=build.rs
+  cargo:rerun-if-env-changed=CARGO_FEATURE_NATIVE_OP_ARTIFACT
+  cargo:rerun-if-env-changed=FERRUM_FA2_NATIVE_MANIFEST
+  cargo:rerun-if-env-changed=FERRUM_FA2_NATIVE_ARTIFACT
+  cargo:rerun-if-env-changed=FERRUM_FA2_NATIVE_SOURCE_SHA256
+  cargo:rerun-if-env-changed=FERRUM_FA2_NATIVE_INPUTS_SHA256
+  cargo:rustc-env=FERRUM_FA2_NATIVE_ARTIFACT_COMPILE=not_configured
+  cargo:rerun-if-changed=kernels/fused_add_rms_norm.cu
+  cargo:rerun-if-changed=kernels/fused_silu_mul.cu
+  cargo:rerun-if-changed=kernels/rms_norm.cu
+  cargo:rerun-if-changed=kernels/sandwich_norm.cu
+  cargo:rerun-if-changed=kernels/rope.cu
+  cargo:rerun-if-changed=kernels/decode_attention.cu
+  cargo:rerun-if-changed=kernels/residual_add.cu
+  cargo:rerun-if-changed=kernels/scaled_add_inplace.cu
+  cargo:rerun-if-changed=kernels/flash_decode_attention.cu
+  cargo:rerun-if-changed=kernels/paged_decode_attention.cu
+  cargo:rerun-if-changed=kernels/paged_varlen_attention.cu
+  cargo:rerun-if-changed=kernels/paged_varlen_attention_vllm.cu
+  cargo:rerun-if-changed=kernels/dequant_int4.cu
+  cargo:rerun-if-changed=kernels/batched_decode_attention.cu
+  cargo:rerun-if-changed=kernels/softmax.cu
+  cargo:rerun-if-changed=kernels/embedding_lookup.cu
+  cargo:rerun-if-changed=kernels/flash_attn_full.cu
+  cargo:rerun-if-changed=kernels/batched_flash_decode_attention.cu
+  cargo:rerun-if-changed=kernels/qk_norm_rope.cu
+  cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache.cu
+  cargo:rerun-if-changed=kernels/transpose.cu
+  cargo:rerun-if-changed=kernels/kv_cache_append.cu
+  cargo:rerun-if-changed=kernels/split_qkv.cu
+  cargo:rerun-if-changed=kernels/add_bias.cu
+  cargo:rerun-if-changed=kernels/layer_norm.cu
+  cargo:rerun-if-changed=kernels/gelu.cu
+  cargo:rerun-if-changed=kernels/decode_attention_hm.cu
+  cargo:rerun-if-changed=kernels/gather_columns.cu
+  cargo:rerun-if-changed=kernels/moe_combine.cu
+  cargo:rerun-if-changed=kernels/moe_router.cu
+  cargo:rerun-if-changed=kernels/moe_align_block_size.cu
+  cargo:rerun-if-changed=kernels/moe_align_block_size_pair_ids.cu
+  cargo:rerun-if-changed=kernels/moe_build_pairs.cu
+  cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu
+  cargo:rerun-if-changed=kernels/argmax_rows.cu
+  cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu
+  cargo:rerun-if-changed=kernels/gated_delta_rule.cu
+  cargo:rerun-if-changed=kernels/linear_attention.cu
+  cargo:rerun-if-changed=kernels/vnext_causal_attention.cu
+  cargo:rerun-if-changed=kernels/qwen35_paged_qkv.cu
+  cargo:rerun-if-changed=kernels/common.cuh
+  cargo:rerun-if-env-changed=NVCC_CCBIN
+  cargo:rerun-if-env-changed=CUDA_HOME
+  cargo:rerun-if-env-changed=CUDA_PATH
+  cargo:rerun-if-env-changed=CUDA_ROOT
+  cargo:rerun-if-env-changed=CUDA_TOOLKIT_ROOT_DIR
+  cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP
+  cargo:rustc-env=CUDA_COMPUTE_CAP=89
+
+  --- stderr
+  [cuda-build-summary] artifact=core-ptx:kernels/fused_add_rms_norm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:f0fee901b7370ad3
+  [cuda-build-summary] artifact=core-ptx:kernels/fused_silu_mul.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:c13f517e8a09b37e
+  [cuda-build-summary] artifact=core-ptx:kernels/rms_norm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:6af405c26bdda866
+  [cuda-build-summary] artifact=core-ptx:kernels/sandwich_norm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:3074298c86356bb2
+  [cuda-build-summary] artifact=core-ptx:kernels/rope.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:aa5eba536da03a8c
+  [cuda-build-summary] artifact=core-ptx:kernels/decode_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:6ec54601783b286d
+  [cuda-build-summary] artifact=core-ptx:kernels/residual_add.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:c43a7c475b54b337
+  [cuda-build-summary] artifact=core-ptx:kernels/scaled_add_inplace.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:70f4a45a4fc90cc6
+  [cuda-build-summary] artifact=core-ptx:kernels/flash_decode_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:e1e83a441886af2f
+  [cuda-build-summary] artifact=core-ptx:kernels/paged_decode_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:0aadb3e6943a63fa
+  [cuda-build-summary] artifact=core-ptx:kernels/paged_varlen_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:e85e262c020f5359
+  [cuda-build-summary] artifact=core-ptx:kernels/paged_varlen_attention_vllm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:c39c20704b2756a8
+  [cuda-build-summary] artifact=core-ptx:kernels/dequant_int4.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:5dbdab432967f7a5
+  [cuda-build-summary] artifact=core-ptx:kernels/batched_decode_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:79ab0493fc32099f
+  [cuda-build-summary] artifact=core-ptx:kernels/softmax.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:330e6b9efb805cea
+  [cuda-build-summary] artifact=core-ptx:kernels/embedding_lookup.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:8269f39a4a5c2f27
+  [cuda-build-summary] artifact=core-ptx:kernels/flash_attn_full.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:59c2929a8c890c1c
+  [cuda-build-summary] artifact=core-ptx:kernels/batched_flash_decode_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:bca81615300322dd
+  [cuda-build-summary] artifact=core-ptx:kernels/qk_norm_rope.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:0914b8c254a2ecff
+  [cuda-build-summary] artifact=core-ptx:kernels/split_qkv_norm_rope_into_paged_cache.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:4e909a05ac7e48a0
+  [cuda-build-summary] artifact=core-ptx:kernels/transpose.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:4d9dfbc088e041e5
+  [cuda-build-summary] artifact=core-ptx:kernels/kv_cache_append.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:53c733701294656e
+  [cuda-build-summary] artifact=core-ptx:kernels/split_qkv.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:97468497c3074529
+  [cuda-build-summary] artifact=core-ptx:kernels/add_bias.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:6f50e1043dbdf95b
+  [cuda-build-summary] artifact=core-ptx:kernels/layer_norm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:045ff739645489ce
+  [cuda-build-summary] artifact=core-ptx:kernels/gelu.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:b3ca036abebe5cd0
+  [cuda-build-summary] artifact=core-ptx:kernels/decode_attention_hm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:cf76149528347d14
+  [cuda-build-summary] artifact=core-ptx:kernels/gather_columns.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:24abfa2dc201a173
+  [cuda-build-summary] artifact=core-ptx:kernels/moe_combine.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:844851ab2047bfbc
+  [cuda-build-summary] artifact=core-ptx:kernels/moe_router.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:725b304e3e49b177
+  [cuda-build-summary] artifact=core-ptx:kernels/moe_align_block_size.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:a63f168ef4c44234
+  [cuda-build-summary] artifact=core-ptx:kernels/moe_align_block_size_pair_ids.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:481a29fb254af18a
+  [cuda-build-summary] artifact=core-ptx:kernels/moe_build_pairs.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:3d29a617dcd1caec
+  [cuda-build-summary] artifact=core-ptx:kernels/int8_paged_decode_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:9231bdb8ee629fb5
+  [cuda-build-summary] artifact=core-ptx:kernels/argmax_rows.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:e3a743b9fd491ad5
+  [cuda-build-summary] artifact=core-ptx:kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:3b2958516e1abd44
+  [cuda-build-summary] artifact=core-ptx:kernels/gated_delta_rule.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:b60b6c3f5d321897
+  [cuda-build-summary] artifact=core-ptx:kernels/linear_attention.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:b99ce04cb5a2e532
+
+  thread 'main' (10846) panicked at crates/ferrum-kernels/build.rs:675:21:
+  [core-ptx] nvcc failed compiling kernels/vnext_causal_attention.cu: "nvcc" "--gpu-architecture=sm_89" "--ptx" "--default-stream" "per-thread" "--output-directory" "/workspace/ferrum-infer-rs/target/debug/build/ferrum-kernels-00d1a7bfe013a4bb/out" "-Ikernels" "--expt-relaxed-constexpr" "-std=c++17" "-O3" "--use_fast_math" "kernels/vnext_causal_attention.cu"
+
+  # stdout
+
+
+  # stderr
+  kernels/vnext_causal_attention.cu(250): error: identifier "CUDART_INF_F" is undefined
+      float running_max = -CUDART_INF_F;
+                           ^
+
+  1 error detected in the compilation of "kernels/vnext_causal_attention.cu".
+
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
+finished_at=2026-07-15T09:25:47Z

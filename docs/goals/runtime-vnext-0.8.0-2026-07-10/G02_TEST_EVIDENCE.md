@@ -3,14 +3,72 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G00、G01
-- 下游：G03-G10
+- 依赖：L0 随 S0A contract split；L1/change-impact 随 S1-S2；full historical/matrix evidence 在 S6
+- 下游：S1-S7、G03-G10
 
 ## 目标
 
-在大规模生产迁移前建立可信测试层次和门禁依赖图。PASS 必须证明真实命令执行过，而不是
-仅证明 JSON 中写了 `PASS`。本 Goal 吸收并修复现有 test-architecture、release-hardening、
-scenario 和 change-impact 资产，不再创建平行的第四套 gate。
+随真实生产纵切建立可信测试层次和门禁依赖图，而不是先建设完整 release 设施再接入生产。
+PASS 必须证明真实命令执行过，而不是仅证明 JSON 中写了 `PASS`。本 Goal 吸收并激进重构现有
+test-architecture、release-hardening、scenario 和 change-impact 资产，不再创建平行的第四套 gate。
+
+## 分阶段交付
+
+- S0A：测试按 contract invariant owner 拆分，单 target logical LOC `<=2,000`，bounded focused
+  test 和 aggregate interface test 通过；不追求保留当前 test count。
+- S1：L0/L1 与 Qwen3.5-4B CUDA basic `run`/`serve` smoke 接入 change-impact planner。
+- S2-S5：每个 model/backend 只补齐受影响的 actual scenarios 和 historical mutations。
+- S6：完成本文件后续的 full historical corpus、mutation、matrix consumer 和 PR timing PASS。
+
+CUDA vNext 的确定性执行证明从 S1 起即为 correctness 前置条件，不允许拖到 S6 或性能阶段补做。
+结构契约可在本地 L0 验证；真实 eager/replay 数值 witness 必须在受控 CUDA L1/L2 lane 生成。
+
+测试可以因架构重写而删除、合并或重写；保留依据是 invariant coverage、historical kill、真实产品
+consumer 或 backend conformance，而不是已有测试数量。任何 product-visible change 同时计划
+`run`/`serve` 的规则从 S1 开始生效。
+
+## 失败后的分层回归与证据复用
+
+开发阶段不得因一个 case 失败立即从 C01 重跑完整 C01-C21。统一采用三层调度：
+
+1. `exact replay`：先复跑失败 case 或最小 historical reproducer，保存失败前后同口径 artifact。
+2. `change-impact`：由 checked-in path/domain 规则选择 L0/L1、`run`/`serve` product scenario 和
+   actual-model/backend 的受影响纵切；tool protocol、stream、structured output、sampling/EOS、
+   resource/admission 等 capability 必须显式出现在计划中，未知路径 hard fail。
+3. `full matrix`：代码冻结后在 S6/S7、正式性能前和发布候选阶段执行完整 C01-C21；同一冻结候选
+   只因正式 artifact 自身失败或代码再次变化而重跑。
+
+703 基线执行器的快速入口与完整入口共用同一套 case 生成、真实 `run`/`serve` 执行和 oracle：
+
+```bash
+# 单个失败 case；--focus-case 可重复
+python3 scripts/release/runtime_vnext_baseline_scenarios.py \
+  --manifest <execution-manifest.json> --artifact-root <focused-root> \
+  --out <focused-root>/focused-report.json --execute --focus-case c11-017
+
+# 完整受影响 contract；--focus-scenario 可重复，也可与 --focus-case 取并集
+python3 scripts/release/runtime_vnext_baseline_scenarios.py \
+  --manifest <execution-manifest.json> --artifact-root <focused-root> \
+  --out <focused-root>/focused-report.json --execute --focus-scenario C11
+```
+
+focused 成功只打印 `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`，artifact 必须携带
+`formal_pass_allowed=false`、选中 case、完整 evidence identity 和原始 case evidence。它不能生成
+或冒充 C01-C21 PASS；不带 focus 参数的 canonical 模式仍由完整分母 validator 验收。
+
+断点或分片证据只有在 source git SHA、dirty status、binary SHA256、model revision/files、
+effective config、runner/dependency SHA 和输入 SHA 全部相同时才允许聚合。代码变化后，旧分片只能
+作为诊断输入；最终 full-matrix PASS 禁止混合不同 evidence identity。基础设施中断可在相同 identity
+下继续，产品正确性失败后的修复必须先跑 exact replay 和受影响纵切，再等待下一冻结点做全量。
+
+量化门：
+
+- warm exact replay（非并发压力 case）`<=2min`；
+- PR/change-impact required gate p95 `<=10min`，并同时包含所需 `run`/`serve` scenario；
+- planner 未分类路径数 `0`，漏选入口/backend/capability 数 `0`；
+- 非 C09/C18 case 不重复嵌入 scheduler trace 行，资源语义证据缺失数 `0`；
+- 不同 evidence identity 的分片被聚合器拒绝率 `100%`；
+- 完整 C01-C21 仍保持 MODEL_MATRIX 精确分母与最终 validator，不以 focused PASS 替代。
 
 ## 测试层次
 
@@ -27,15 +85,79 @@ G02 PASS 只证明 L0/L1 和 L2-L5 的 runner、schema、依赖图、negative fi
 不得提前声称 Qwen3.5 actual vNext lane 已通过。G02 使用 G00 legacy actual artifacts 验证
 L2-L5 artifact consumer 能拒绝缺入口、缺 backend、stale 和伪造结果。
 
+## CUDA vNext Determinism Evidence
+
+该门不是又一套 ad hoc correctness script，而是 operation conformance 的统一执行证据层。
+runner 从当前实际 CUDA catalog 和三个主模型的 resolved plans 计算 coverage 分母，禁止手写一个
+固定 provider 数量后让新增 provider 漏跑。
+
+每个 proof case 必须保存：
+
+- git SHA、dirty status、构建命令、binary SHA256、CUDA/driver/GPU identity；
+- model revision/files/config 或 synthetic fixture identity、plan hash、runtime/device fingerprint；
+- provider id、provider implementation fingerprint、execution-contract version/fingerprint；
+- node/operation/schema、prefill/decode、participant/token shape、dtype/quantization；
+- input/RNG/initial-state/workspace-poison digest；
+- eager A/B、replay A/B 的每个 declared output 和 `Write`/`ReadWrite` state-effect raw SHA256；
+- replay attribution，证明 replay witness 真实走 reusable executable，而不是第二次 eager；
+- first mismatch 的 semantic value/state id、resource、byte offset、两侧 byte/digest 和 failure class。
+
+同一 case 至少执行：
+
+| 比较 | 最低次数 | 标准 |
+|---|---:|---|
+| eager/eager | `5` | 所有 witness bitwise 相同 |
+| replay/replay | `5` | 所有 witness bitwise 相同，且每次有 replay attribution |
+| eager/replay | `5` paired | 所有 witness bitwise 相同 |
+
+最小 shape/state 分区：
+
+- prefill：single-token、multi-token、chunk boundary；
+- decode：c1、multi-participant，最终三个主模型计划覆盖 c32；
+- state：zero 与 nonzero KV/recurrent state；
+- workspace：`0x00`、`0xA5` 两种已初始化 poison；
+- provider：实际 resolved plans 选择的每个 replay-equivalent provider `>=1` case；GDN、
+  causal paged attention、routed MoE 各同时覆盖 prefill/decode 或其声明的适用域。
+
+源代码 focused gate 只验证 typed semantics、plan/hash/runtime 绑定、缺字段 fail-closed 和
+coverage registry 完整性，不能打印硬件 PASS。真实 CUDA runner/validator 的唯一 PASS 行是：
+
+```text
+python3 scripts/release/run_gate.py vnext-cuda-determinism \
+  --cuda-determinism-artifact-root <runner_artifact> \
+  --out <out_dir>
+```
+
+```text
+FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: <out_dir>
+FERRUM GATE vnext-cuda-determinism PASS: <out_dir>
+```
+
+validator 必须拒绝以下 mutation：
+
+- catalog/plan 中任一 replay-equivalent provider 没有 proof case；
+- provider/runtime/plan/binary fingerprint stale 或不一致；
+- 只有最终 token/text/logits，没有 node output 或 state-effect witness；
+- 缺 eager/eager、replay/replay、eager/replay 任一比较；
+- replay attribution 缺失或实际走 eager fallback；
+- 用 numerical tolerance、rounding、输出过滤或“差异未影响 token”放行 bitwise mismatch；
+- scratch 未初始化、只使用一种 poison、state 只有 zero fixture；
+- 复用另一个模型/backend/provider implementation 的 artifact。
+
+该 gate PASS 后，代码只要修改 operation schema、provider implementation、replay runtime、
+program binding、state/resource layout 或 CUDA native source，artifact 自动 stale，并由
+change-impact planner 选择受影响 proof case。普通产品文案或 server-only 改动不得无理由触发
+全量 CUDA determinism gate。
+
 ## Historical bug corpus
 
-以下 H01-H15 是稳定的 bug family 分母。每个 family 内逗号分隔的独立失败必须拆为
+以下 H01-H16 是稳定的 bug family 分母。每个 family 内逗号分隔的独立失败必须拆为
 `Hxx.y` concrete case；每个 case 保存 source commit、原始 artifact/issue、最小 reproducer、
 受影响入口/backend、expected failure class 和 mutation/revert patch。family 只有在所属 concrete
-case 全部 kill 时才算 1/15。G00 冻结 concrete case 总数 `M`；后续只能追加 case，不能合并或
+case 全部 kill 时才算 1/16。G00 冻结 concrete case 总数 `M`；后续只能追加 case，不能合并或
 删除失败来提高通过率。
 
-至少包含以下 15 个 family，使用真实最小输入和预期失败层：
+至少包含以下 16 个 family，使用真实最小输入和预期失败层：
 
 - H01：run/serve auto-config 未物化导致 CUDA MoE 慢路径。
 - H02：serve 默认值导致 run context-full/swap/hang。
@@ -52,6 +174,8 @@ case 全部 kill 时才算 1/15。G00 冻结 concrete case 总数 `M`；后续�
 - H13：missing/duplicate `[DONE]` 或 usage。
 - H14：Qwen3-Coder CUDA 首 token EOS/empty answer。
 - H15：Qwen3.5 c32 recurrent/KV resource livelock 或错误复用。
+- H16：CUDA vNext 只验证 reusable executable inventory，不验证相同初态下 eager/replay 的
+  declared outputs、KV/recurrent post-state，导致 provider 的 replay-equivalent 声明无数值证据。
 
 ## Gate graph
 
@@ -76,10 +200,10 @@ case 全部 kill 时才算 1/15。G00 冻结 concrete case 总数 `M`；后续�
 
 ## 验收
 
-- historical corpus `15/15` family、`M/M` concrete case 都有证据引用、最小 fixture、期望层和
+- historical corpus `16/16` family、`M/M` concrete case 都有证据引用、最小 fixture、期望层和
   failure class，orphan/重复 evidence 数 `0`；validator fixture kill rate `100%`。至少
-  `10/15` family 还必须在冻结 legacy/replay 输入上重现。
-- G08 必须把 `15/15` family 和 `M/M` concrete case 全部提升为 vNext production
+  `11/16` family 还必须在冻结 legacy/replay 输入上重现。
+- G08 必须把 `16/16` family 和 `M/M` concrete case 全部提升为 vNext production
   mutation/revert-to-bug kill；G02 的
   synthetic fixture PASS 不能替代该下游条件。
 - 顶层 self-test 注入任一子 gate failure 时，顶层 `100%` fail。
@@ -120,6 +244,7 @@ docs/release/runtime-vnext/0.8.0/g02-test-evidence/
   mutation-report.json
   ci-timings.json
   planner-fixtures/
+  cuda-determinism/
 ```
 
 ```text

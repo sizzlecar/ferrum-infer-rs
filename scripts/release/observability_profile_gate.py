@@ -137,7 +137,7 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
         ] > 0:
             raise GateError(f"{context} reports resource_leak_count={event_attrs['resource_leak_count']}")
         if event_attrs.get("performance_claim") is True and (
-            event_attrs.get("profile_detail") in {"debug", "full"}
+            event_attrs.get("profile_detail") in {"debug", "replay", "verify", "full"}
             or event_attrs.get("diagnostic_only") is True
         ):
             raise GateError(f"{context} uses diagnostic profile as performance claim")

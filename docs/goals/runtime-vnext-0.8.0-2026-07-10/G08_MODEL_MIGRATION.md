@@ -3,8 +3,8 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G03、G04、G05、G06、G07
-- 内部依赖：G08A -> G08B -> G08C -> G08D；G08 只聚合四个未 stale PASS
+- 依赖：M1 从 S1 live slice 开始；每个模型只依赖其实际需要的 G03-G07 capability；full G08 在 S6 聚合
+- 内部依赖：S1/S2 -> G08A(S3) -> G08B(S4) -> G08C/G08D(S5)；G08 只聚合四个未 stale PASS
 - 下游：G09、G10
 
 ## 目标
@@ -12,6 +12,10 @@
 用三个主模型证明 vNext 不只适合简单 dense decoder：先迁 CUDA，再迁 Metal；每个模型
 parity 后立即删除对应 legacy 路径。最后处置所有其余 support row，使 release binary 只包含
 vNext runtime。
+
+模型迁移不再等待 G03-G07 全部抽象和 full gate 先完成。Qwen3.5-4B CUDA 是 S1/S2 的架构
+consumer，Metal 在 S3 立即跟进；G07A 必须在 S4 前完成。每个模型 milestone 仍必须在同阶段删除
+对应 legacy entry，不能以“先纵切、以后再删”为由保留双 runtime。
 
 ## 迁移顺序
 
@@ -55,7 +59,7 @@ M1 用于证明 dense hybrid 不被错误绑定到 MoE。仅 config probe 或 to
 - support contract 和 README row 指向 vNext artifact。
 
 此外，G02 historical corpus 必须在 vNext production mutation/revert-to-bug 上达到
-`15/15 family` 和 `M/M concrete case` kill；仅复用 G02 synthetic analyzer fixture 不算完成。
+`16/16 family` 和 `M/M concrete case` kill；仅复用 G02 synthetic analyzer fixture 不算完成。
 
 G08 的 `performance smoke` 统一为低成本 diagnostic：random `64 input / 32 output`、c=1 和该
 backend 最高 required client concurrency、`--fail-on-error --seed 9271 --n-repeats 3`、每 repeat
@@ -109,6 +113,10 @@ Qwen3-Coder 与 DeepSeek-R1 补充 lane必须迁移，因为它们承担 agent/r
 
 M2/M3 如果修改 G01-G04 contract，必须 reopen 受影响 Goal，并自动 stale 之前 M1/M2 artifact。
 不允许以“另一个模型还能跑”为理由继续迁移。
+
+`0b72bab2` 修改了 G03 resolved-weight/provider ABI，因此 `6fa8e215` 的 M2 CUDA
+703-case PASS 只保留为 historical/intermediate evidence，对 current HEAD 已 stale。
+必须重新取得 current-HEAD CUDA correctness，并在 source freeze 后再执行完整矩阵。
 
 G08 的开发迁移 PASS 不能跨过 v0.8.0 release freeze 自动成为发布候选正确性证据。G10A 生成
 唯一 `release_candidate_sha` 后必须执行：

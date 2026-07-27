@@ -8,10 +8,12 @@ use std::io::{self, Write};
 
 use super::model::PreparedModelFamilyWire;
 use super::{
-    CapabilityCatalog, ContractVersion, DeviceDescriptor, DynamicStorageProfile, ExecutionPlan,
-    ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId, RuntimePolicy,
-    SpecialTokenRole, TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
-    UnvalidatedPreparedModelFamily, VNextError,
+    AdmissionFitPolicy, CapabilityCatalog, CompletionRetentionSpec, ContractVersion,
+    DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView, ExecutionDeterminismRequirement,
+    ExecutionPlan, ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId,
+    ReusableExecutionPolicy, RuntimePolicy, SpecialTokenRole, TokenizerDescriptor,
+    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, UnvalidatedPreparedModelFamily,
+    VNextError,
 };
 
 /// Maximum raw byte length accepted for one resolution source artifact.
@@ -619,6 +621,351 @@ pub struct ResolvedModelSource {
     pub files: Vec<FileFingerprint>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelArtifactSourceRole {
+    Semantic,
+    Tokenizer,
+    Weights,
+}
+
+impl ModelArtifactSourceRole {
+    pub const ALL: [Self; 3] = [Self::Semantic, Self::Tokenizer, Self::Weights];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Tokenizer => "tokenizer",
+            Self::Weights => "weights",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginalModelSources {
+    pub semantic: OriginalModelSource,
+    pub tokenizer: OriginalModelSource,
+    pub weights: OriginalModelSource,
+}
+
+impl OriginalModelSources {
+    pub const fn for_role(&self, role: ModelArtifactSourceRole) -> &OriginalModelSource {
+        match role {
+            ModelArtifactSourceRole::Semantic => &self.semantic,
+            ModelArtifactSourceRole::Tokenizer => &self.tokenizer,
+            ModelArtifactSourceRole::Weights => &self.weights,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelSources {
+    pub semantic: ResolvedModelSource,
+    pub tokenizer: ResolvedModelSource,
+    pub weights: ResolvedModelSource,
+}
+
+impl ResolvedModelSources {
+    pub const fn for_role(&self, role: ModelArtifactSourceRole) -> &ResolvedModelSource {
+        match role {
+            ModelArtifactSourceRole::Semantic => &self.semantic,
+            ModelArtifactSourceRole::Tokenizer => &self.tokenizer,
+            ModelArtifactSourceRole::Weights => &self.weights,
+        }
+    }
+
+    fn for_role_mut(&mut self, role: ModelArtifactSourceRole) -> &mut ResolvedModelSource {
+        match role {
+            ModelArtifactSourceRole::Semantic => &mut self.semantic,
+            ModelArtifactSourceRole::Tokenizer => &mut self.tokenizer,
+            ModelArtifactSourceRole::Weights => &mut self.weights,
+        }
+    }
+}
+
+pub const PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION: u32 = 1;
+
+/// One selected artifact inside a role-specific model source.
+///
+/// `container_sha256` binds the complete source file. `content_sha256` is
+/// present when runtime selects content inside that file, for example the
+/// chat-template string inside `tokenizer_config.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductModelArtifactBinding {
+    pub role: ModelArtifactSourceRole,
+    pub source_file: String,
+    pub container_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+}
+
+impl ProductModelArtifactBinding {
+    pub fn new(
+        role: ModelArtifactSourceRole,
+        source_file: impl Into<String>,
+        container_sha256: impl Into<String>,
+        content_sha256: Option<String>,
+    ) -> Result<Self, VNextError> {
+        let binding = Self {
+            role,
+            source_file: source_file.into(),
+            container_sha256: container_sha256.into(),
+            content_sha256,
+        };
+        binding.validate("product_model_artifact_binding")?;
+        Ok(binding)
+    }
+
+    fn validate(&self, field: &str) -> Result<(), VNextError> {
+        if !validate_source_path(&self.source_file) {
+            return Err(invalid_plan(
+                format!("{field}.source_file"),
+                "must be a portable relative source path",
+            ));
+        }
+        if !is_canonical_sha256(&self.container_sha256) {
+            return Err(invalid_plan(
+                format!("{field}.container_sha256"),
+                "must be a canonical SHA-256",
+            ));
+        }
+        if self
+            .content_sha256
+            .as_deref()
+            .is_some_and(|sha256| !is_canonical_sha256(sha256))
+        {
+            return Err(invalid_plan(
+                format!("{field}.content_sha256"),
+                "must be a canonical SHA-256",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable product-facing identity for the exact model sources selected by
+/// resolution and family preparation.
+///
+/// Keeping the raw request separate from the stable resolved model id avoids
+/// exposing machine-local cache paths as public model names. The role-specific
+/// sources and selected artifacts are the same inputs consumed by the typed
+/// model family and `ResolvedModelPlan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductModelSourceIdentity {
+    pub schema_version: u32,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub original_sources: OriginalModelSources,
+    pub resolved_sources: ResolvedModelSources,
+    pub semantic_config: ProductModelArtifactBinding,
+    pub tokenizer: ProductModelArtifactBinding,
+    pub template: ProductModelArtifactBinding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_config: Option<ProductModelArtifactBinding>,
+}
+
+impl ProductModelSourceIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        requested_model: impl Into<String>,
+        resolved_model: impl Into<String>,
+        original_sources: OriginalModelSources,
+        resolved_sources: ResolvedModelSources,
+        semantic_config: ProductModelArtifactBinding,
+        tokenizer: ProductModelArtifactBinding,
+        template: ProductModelArtifactBinding,
+        weight_config: Option<ProductModelArtifactBinding>,
+    ) -> Result<Self, VNextError> {
+        let identity = Self {
+            schema_version: PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION,
+            requested_model: requested_model.into(),
+            resolved_model: resolved_model.into(),
+            original_sources,
+            resolved_sources,
+            semantic_config,
+            tokenizer,
+            template,
+            weight_config,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<(), VNextError> {
+        if self.schema_version != PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION {
+            return Err(invalid_plan(
+                "product_model_source_identity.schema_version",
+                format!("must be {}", PRODUCT_MODEL_SOURCE_IDENTITY_SCHEMA_VERSION),
+            ));
+        }
+        for (field, value) in [
+            ("requested_model", self.requested_model.as_str()),
+            ("resolved_model", self.resolved_model.as_str()),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(invalid_plan(
+                    format!("product_model_source_identity.{field}"),
+                    "must be non-empty and have no surrounding whitespace",
+                ));
+            }
+        }
+        for role in ModelArtifactSourceRole::ALL {
+            self.validate_original_source(role)?;
+            self.validate_resolved_source(role)?;
+        }
+        self.validate_binding(
+            "semantic_config",
+            &self.semantic_config,
+            ModelArtifactSourceRole::Semantic,
+        )?;
+        self.validate_binding(
+            "tokenizer",
+            &self.tokenizer,
+            ModelArtifactSourceRole::Tokenizer,
+        )?;
+        self.validate_binding(
+            "template",
+            &self.template,
+            ModelArtifactSourceRole::Tokenizer,
+        )?;
+        if self.template.content_sha256.is_none() {
+            return Err(invalid_plan(
+                "product_model_source_identity.template.content_sha256",
+                "selected template content must be fingerprinted",
+            ));
+        }
+        if let Some(binding) = &self.weight_config {
+            self.validate_binding("weight_config", binding, ModelArtifactSourceRole::Weights)?;
+        }
+        Ok(())
+    }
+
+    fn validate_original_source(&self, role: ModelArtifactSourceRole) -> Result<(), VNextError> {
+        let source = self.original_sources.for_role(role);
+        if source.location.is_empty() || source.location.trim() != source.location {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.original_sources.{}.location",
+                    role.as_str()
+                ),
+                "must be non-empty and have no surrounding whitespace",
+            ));
+        }
+        if source
+            .requested_revision
+            .as_deref()
+            .is_some_and(|revision| revision.is_empty() || revision.trim() != revision)
+        {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.original_sources.{}.requested_revision",
+                    role.as_str()
+                ),
+                "must be non-empty and have no surrounding whitespace when present",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_resolved_source(&self, role: ModelArtifactSourceRole) -> Result<(), VNextError> {
+        let source = self.resolved_sources.for_role(role);
+        for (field, value) in [
+            ("canonical_location", source.canonical_location.as_str()),
+            ("resolved_revision", source.resolved_revision.as_str()),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(invalid_plan(
+                    format!(
+                        "product_model_source_identity.resolved_sources.{}.{field}",
+                        role.as_str()
+                    ),
+                    "must be non-empty and have no surrounding whitespace",
+                ));
+            }
+        }
+        if source.files.is_empty() {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.resolved_sources.{}.files",
+                    role.as_str()
+                ),
+                "must not be empty",
+            ));
+        }
+        for (index, file) in source.files.iter().enumerate() {
+            let field = format!(
+                "product_model_source_identity.resolved_sources.{}.files[{index}]",
+                role.as_str()
+            );
+            if !validate_source_path(&file.relative_path) {
+                return Err(invalid_plan(
+                    format!("{field}.relative_path"),
+                    "must be a portable relative source path",
+                ));
+            }
+            if file.size_bytes == 0 {
+                return Err(invalid_plan(
+                    format!("{field}.size_bytes"),
+                    "must be positive",
+                ));
+            }
+            if !is_canonical_sha256(&file.sha256) {
+                return Err(invalid_plan(
+                    format!("{field}.sha256"),
+                    "must be a canonical SHA-256",
+                ));
+            }
+        }
+        if source
+            .files
+            .windows(2)
+            .any(|pair| pair[0].relative_path >= pair[1].relative_path)
+        {
+            return Err(invalid_plan(
+                format!(
+                    "product_model_source_identity.resolved_sources.{}.files",
+                    role.as_str()
+                ),
+                "must be strictly sorted by relative_path without duplicates",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_binding(
+        &self,
+        field: &str,
+        binding: &ProductModelArtifactBinding,
+        expected_role: ModelArtifactSourceRole,
+    ) -> Result<(), VNextError> {
+        binding.validate(&format!("product_model_source_identity.{field}"))?;
+        if binding.role != expected_role {
+            return Err(invalid_plan(
+                format!("product_model_source_identity.{field}.role"),
+                format!("must be {expected_role:?}"),
+            ));
+        }
+        let source = self.resolved_sources.for_role(binding.role);
+        match source
+            .files
+            .iter()
+            .find(|file| file.relative_path == binding.source_file)
+        {
+            Some(file) if file.sha256 == binding.container_sha256 => Ok(()),
+            Some(file) => Err(invalid_plan(
+                format!("product_model_source_identity.{field}.container_sha256"),
+                format!("does not match resolved source file {}", file.relative_path),
+            )),
+            None => Err(invalid_plan(
+                format!("product_model_source_identity.{field}.source_file"),
+                format!("is absent from resolved {} source", binding.role.as_str()),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfigFingerprint {
     pub source_file: String,
@@ -652,6 +999,8 @@ pub struct RuntimeMemoryPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionPolicy {
     pub maximum_queue_depth: u32,
+    pub maximum_scheduled_tokens: u64,
+    pub sequence_fit_policy: AdmissionFitPolicy,
     pub allow_defer: bool,
     pub cancellation_check_interval_steps: u32,
 }
@@ -663,6 +1012,8 @@ struct RuntimePolicyFingerprintPayload<'a> {
     scheduling: SchedulingDiscipline,
     memory: &'a RuntimeMemoryPolicy,
     admission: &'a AdmissionPolicy,
+    execution_determinism: ExecutionDeterminismRequirement,
+    reusable_execution: &'a Option<ReusableExecutionPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -672,6 +1023,8 @@ pub struct ResolvedRuntimePolicy {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    execution_determinism: ExecutionDeterminismRequirement,
+    reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
 }
 
@@ -683,6 +1036,8 @@ struct ResolvedRuntimePolicyWire {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    execution_determinism: ExecutionDeterminismRequirement,
+    reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
 }
 
@@ -698,6 +1053,8 @@ impl<'de> Deserialize<'de> for ResolvedRuntimePolicy {
             wire.scheduling,
             wire.memory,
             wire.admission,
+            wire.execution_determinism,
+            wire.reusable_execution,
         )
         .map_err(serde::de::Error::custom)?;
         if wire.fingerprint != policy.fingerprint {
@@ -717,17 +1074,34 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: RuntimeMemoryPolicy,
         admission: AdmissionPolicy,
+        execution_determinism: ExecutionDeterminismRequirement,
+        reusable_execution: Option<ReusableExecutionPolicy>,
     ) -> Result<Self, VNextError> {
         let policy_id = policy_id.into();
-        Self::validate_fields(&policy_id, version, &memory, &admission)?;
-        let fingerprint =
-            Self::compute_fingerprint(&policy_id, version, scheduling, &memory, &admission)?;
+        Self::validate_fields(
+            &policy_id,
+            version,
+            &memory,
+            &admission,
+            reusable_execution.as_ref(),
+        )?;
+        let fingerprint = Self::compute_fingerprint(
+            &policy_id,
+            version,
+            scheduling,
+            &memory,
+            &admission,
+            execution_determinism,
+            &reusable_execution,
+        )?;
         Ok(Self {
             policy_id,
             version,
             scheduling,
             memory,
             admission,
+            execution_determinism,
+            reusable_execution,
             fingerprint,
         })
     }
@@ -737,6 +1111,7 @@ impl ResolvedRuntimePolicy {
         version: ContractVersion,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        reusable_execution: Option<&ReusableExecutionPolicy>,
     ) -> Result<(), VNextError> {
         validate_portable_identifier("runtime_policy.policy_id", policy_id, 160)?;
         if version.major == 0 {
@@ -762,11 +1137,26 @@ impl ResolvedRuntimePolicy {
                 "capacity and reserve must be valid and maximum_active_sequences must be non-zero",
             ));
         }
-        if admission.maximum_queue_depth == 0 || admission.cancellation_check_interval_steps == 0 {
+        if admission.maximum_queue_depth == 0
+            || admission.maximum_scheduled_tokens == 0
+            || admission.cancellation_check_interval_steps == 0
+        {
             return Err(invalid_plan(
                 "runtime_policy.admission",
-                "queue depth and cancellation interval must be non-zero",
+                "queue depth, scheduled-token ceiling, and cancellation interval must be non-zero",
             ));
+        }
+        if let Some(reusable_execution) = reusable_execution {
+            reusable_execution.validate()?;
+            if reusable_execution.buckets().iter().any(|bucket| {
+                bucket.capacity().maximum_sequences() > memory.maximum_active_sequences
+                    || bucket.capacity().maximum_tokens() > admission.maximum_scheduled_tokens
+            }) {
+                return Err(invalid_plan(
+                    "runtime_policy.reusable_execution",
+                    "bucket capacity exceeds the scheduler policy ceiling",
+                ));
+            }
         }
         Ok(())
     }
@@ -777,6 +1167,8 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        execution_determinism: ExecutionDeterminismRequirement,
+        reusable_execution: &Option<ReusableExecutionPolicy>,
     ) -> Result<String, VNextError> {
         canonical_fingerprint(
             &RuntimePolicyFingerprintPayload {
@@ -785,6 +1177,8 @@ impl ResolvedRuntimePolicy {
                 scheduling,
                 memory,
                 admission,
+                execution_determinism,
+                reusable_execution,
             },
             "serialize resolved runtime policy",
         )
@@ -810,6 +1204,14 @@ impl ResolvedRuntimePolicy {
         &self.admission
     }
 
+    pub const fn execution_determinism(&self) -> ExecutionDeterminismRequirement {
+        self.execution_determinism
+    }
+
+    pub fn reusable_execution(&self) -> Option<&ReusableExecutionPolicy> {
+        self.reusable_execution.as_ref()
+    }
+
     pub fn fingerprint_str(&self) -> &str {
         &self.fingerprint
     }
@@ -832,18 +1234,38 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
         self.memory.maximum_active_sequences
     }
 
+    fn maximum_scheduled_tokens(&self) -> u64 {
+        self.admission.maximum_scheduled_tokens
+    }
+
+    fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
+        self.execution_determinism
+    }
+
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {
         &self.memory.dynamic_storage_profile_order
     }
 
+    fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy> {
+        self.reusable_execution.as_ref()
+    }
+
     fn validate(&self) -> Result<(), VNextError> {
-        Self::validate_fields(&self.policy_id, self.version, &self.memory, &self.admission)?;
+        Self::validate_fields(
+            &self.policy_id,
+            self.version,
+            &self.memory,
+            &self.admission,
+            self.reusable_execution.as_ref(),
+        )?;
         let computed = Self::compute_fingerprint(
             &self.policy_id,
             self.version,
             self.scheduling,
             &self.memory,
             &self.admission,
+            self.execution_determinism,
+            &self.reusable_execution,
         )?;
         if self.fingerprint != computed {
             return Err(invalid_plan(
@@ -1101,10 +1523,44 @@ impl SamplingPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopTokenCollisionPolicy {
+    allowed_model_roles: BTreeSet<SpecialTokenRole>,
+}
+
+impl StopTokenCollisionPolicy {
+    pub fn new(allowed_model_roles: BTreeSet<SpecialTokenRole>) -> Result<Self, VNextError> {
+        if allowed_model_roles.contains(&SpecialTokenRole::Stop) {
+            return Err(invalid_plan(
+                "stop.collision_policy",
+                "a stop-token collision policy can only name model-owned roles",
+            ));
+        }
+        Ok(Self {
+            allowed_model_roles,
+        })
+    }
+
+    pub fn require_distinct() -> Self {
+        Self {
+            allowed_model_roles: BTreeSet::new(),
+        }
+    }
+
+    pub fn allows(&self, model_role: SpecialTokenRole) -> bool {
+        self.allowed_model_roles.contains(&model_role)
+    }
+
+    pub fn allowed_model_roles(&self) -> &BTreeSet<SpecialTokenRole> {
+        &self.allowed_model_roles
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopPolicy {
     pub maximum_output_tokens: u32,
     pub token_ids: BTreeSet<u32>,
     pub strings: Vec<String>,
+    pub collision_policy: StopTokenCollisionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1118,8 +1574,8 @@ pub enum StructuredOutputPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionField {
-    OriginalSource,
-    ResolvedSource,
+    OriginalSources,
+    ResolvedSources,
     Config,
     ExternalMetadata,
     Family,
@@ -1157,8 +1613,8 @@ pub enum ResolutionDecisionSource {
 impl ResolutionField {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::OriginalSource => "original_source",
-            Self::ResolvedSource => "resolved_source",
+            Self::OriginalSources => "original_sources",
+            Self::ResolvedSources => "resolved_sources",
             Self::Config => "config",
             Self::ExternalMetadata => "external_metadata",
             Self::Family => "family",
@@ -1188,11 +1644,11 @@ impl ResolutionField {
         use ResolutionField as Field;
 
         match self {
-            Field::OriginalSource => matches!(
+            Field::OriginalSources => matches!(
                 source,
                 Source::UserInput | Source::CommandLine | Source::ConfigFile
             ),
-            Field::ResolvedSource => {
+            Field::ResolvedSources => {
                 matches!(source, Source::ModelMetadata | Source::TypedModelResolution)
             }
             Field::Config => matches!(
@@ -1376,6 +1832,7 @@ impl fmt::Display for ResolutionArtifactId {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ResolutionSourceProvenance {
     LockedModelFile {
+        source_role: ModelArtifactSourceRole,
         relative_path: String,
     },
     Upstream {
@@ -1390,7 +1847,10 @@ pub enum ResolutionSourceProvenance {
 impl ResolutionSourceProvenance {
     fn validate(&self) -> Result<(), VNextError> {
         match self {
-            Self::LockedModelFile { relative_path } => {
+            Self::LockedModelFile {
+                source_role: _,
+                relative_path,
+            } => {
                 if !validate_source_path(relative_path) {
                     return Err(invalid_plan(
                         "resolution_source_provenance.locked_model_file",
@@ -1433,7 +1893,10 @@ impl ResolutionSourceProvenance {
 
     pub fn locator(&self) -> &str {
         match self {
-            Self::LockedModelFile { relative_path } => relative_path,
+            Self::LockedModelFile {
+                source_role: _,
+                relative_path,
+            } => relative_path,
             Self::Upstream {
                 artifact_locator, ..
             } => artifact_locator,
@@ -1445,7 +1908,19 @@ fn resolution_provenance_bytes(
     provenance: &ResolutionSourceProvenance,
 ) -> Result<usize, VNextError> {
     match provenance {
-        ResolutionSourceProvenance::LockedModelFile { relative_path } => Ok(relative_path.len()),
+        ResolutionSourceProvenance::LockedModelFile {
+            source_role,
+            relative_path,
+        } => source_role
+            .as_str()
+            .len()
+            .checked_add(relative_path.len())
+            .ok_or_else(|| {
+                invalid_plan(
+                    "resolution_source_evidence.provenance",
+                    "provenance byte count overflowed",
+                )
+            }),
         ResolutionSourceProvenance::Upstream {
             producer_id,
             producer_implementation_fingerprint,
@@ -2089,8 +2564,8 @@ impl ResolutionDecisionBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelPlanInputs {
-    pub original_source: OriginalModelSource,
-    pub resolved_source: ResolvedModelSource,
+    pub original_sources: OriginalModelSources,
+    pub resolved_sources: ResolvedModelSources,
     pub config: ModelConfigFingerprint,
     pub external_metadata_id: super::ExternalModelMetadataId,
     pub prepared_family: PreparedModelFamily,
@@ -2108,8 +2583,8 @@ pub struct ResolvedModelPlanInputs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedModelPlanParts {
     source_artifacts: Vec<ResolutionSourceArtifact>,
-    pub original_source: OriginalModelSource,
-    pub resolved_source: ResolvedModelSource,
+    pub original_sources: OriginalModelSources,
+    pub resolved_sources: ResolvedModelSources,
     pub config: ModelConfigFingerprint,
     pub external_metadata_id: super::ExternalModelMetadataId,
     pub prepared_family: PreparedModelFamily,
@@ -2146,6 +2621,7 @@ pub struct ResolvedPlanValidationContext<'a> {
     device: &'a DeviceDescriptor,
     capabilities: &'a CapabilityCatalog,
     runtime: &'a ResolvedRuntimePolicy,
+    completion_retention: CompletionRetentionSpec,
 }
 
 impl<'a> ResolvedPlanValidationContext<'a> {
@@ -2164,7 +2640,19 @@ impl<'a> ResolvedPlanValidationContext<'a> {
             device,
             capabilities,
             runtime,
+            completion_retention: CompletionRetentionSpec::default(),
         }
+    }
+
+    /// Installs the trusted diagnostic retention selected before compilation.
+    /// The serialized execution plan cannot grant itself additional retained
+    /// activations during semantic revalidation.
+    pub fn with_completion_retention(
+        mut self,
+        completion_retention: CompletionRetentionSpec,
+    ) -> Self {
+        self.completion_retention = completion_retention;
+        self
     }
 
     pub fn registry(&self) -> &dyn ModelFamilyRegistry {
@@ -2193,6 +2681,10 @@ impl<'a> ResolvedPlanValidationContext<'a> {
     pub fn runtime(&self) -> &ResolvedRuntimePolicy {
         self.runtime
     }
+
+    pub fn completion_retention(&self) -> &CompletionRetentionSpec {
+        &self.completion_retention
+    }
 }
 
 /// The single validated, data-only result consumed by a product entrypoint.
@@ -2202,12 +2694,26 @@ pub struct ResolvedModelPlan {
     fingerprint: ResolutionFingerprint,
 }
 
+impl ExecutablePlanView for ResolvedModelPlan {
+    fn execution_plan(&self) -> &ExecutionPlan {
+        &self.parts.execution_plan
+    }
+
+    fn device(&self) -> &DeviceDescriptor {
+        &self.parts.device
+    }
+
+    fn capabilities(&self) -> &CapabilityCatalog {
+        &self.parts.capabilities
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnvalidatedResolvedModelPlanParts {
     source_artifacts: Vec<UnvalidatedResolutionSourceArtifact>,
-    original_source: OriginalModelSource,
-    resolved_source: ResolvedModelSource,
+    original_sources: OriginalModelSources,
+    resolved_sources: ResolvedModelSources,
     config: ModelConfigFingerprint,
     external_metadata_id: super::ExternalModelMetadataId,
     prepared_family: PreparedModelFamilyWire,
@@ -2279,8 +2785,8 @@ impl UnvalidatedResolvedModelPlan {
     ) -> Result<ResolvedModelPlan, VNextError> {
         let UnvalidatedResolvedModelPlanParts {
             source_artifacts,
-            original_source,
-            resolved_source,
+            original_sources,
+            resolved_sources,
             config,
             external_metadata_id,
             prepared_family,
@@ -2309,12 +2815,14 @@ impl UnvalidatedResolvedModelPlan {
                 "serialized device, capability catalog, or runtime policy differs from external trusted inputs",
             ));
         }
-        let execution_plan = UnvalidatedExecutionPlan::from(execution_plan).revalidate(
-            &prepared_family,
-            context.capabilities(),
-            context.runtime(),
-            context.node_resolutions().to_vec(),
-        )?;
+        let execution_plan = UnvalidatedExecutionPlan::from(execution_plan)
+            .revalidate_with_completion_retention(
+                &prepared_family,
+                context.capabilities(),
+                context.runtime(),
+                context.node_resolutions().to_vec(),
+                context.completion_retention().clone(),
+            )?;
         let serialized_decisions = decisions;
         let decision_bindings = serialized_decisions
             .iter()
@@ -2330,8 +2838,8 @@ impl UnvalidatedResolvedModelPlan {
             .collect::<Result<Vec<_>, VNextError>>()?;
         let rebuilt = ResolvedModelPlan::from_verified_inputs(
             ResolvedModelPlanInputs {
-                original_source,
-                resolved_source,
+                original_sources,
+                resolved_sources,
                 config,
                 external_metadata_id,
                 prepared_family,
@@ -2434,8 +2942,8 @@ impl ResolvedModelPlan {
     ) -> Result<Self, VNextError> {
         Self::validate_external_inputs(&inputs, context)?;
         let ResolvedModelPlanInputs {
-            original_source,
-            resolved_source,
+            original_sources,
+            resolved_sources,
             config,
             external_metadata_id,
             prepared_family,
@@ -2451,8 +2959,8 @@ impl ResolvedModelPlan {
         } = inputs;
         let mut parts = ResolvedModelPlanParts {
             source_artifacts,
-            original_source,
-            resolved_source,
+            original_sources,
+            resolved_sources,
             config,
             external_metadata_id,
             prepared_family,
@@ -2470,7 +2978,11 @@ impl ResolvedModelPlan {
         Self::normalize(&mut parts);
         parts.decisions = Self::bind_decisions(&parts, decision_bindings)?;
         Self::normalize(&mut parts);
-        Self::validate(&parts, context.node_resolutions())?;
+        Self::validate(
+            &parts,
+            context.node_resolutions(),
+            context.completion_retention(),
+        )?;
         let fingerprint = ResolutionFingerprint::new(canonical_fingerprint(
             &parts,
             "serialize resolved model plan",
@@ -2664,10 +3176,13 @@ impl ResolvedModelPlan {
         parts
             .source_artifacts
             .sort_by(|left, right| left.id.cmp(&right.id));
-        parts
-            .resolved_source
-            .files
-            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        for role in ModelArtifactSourceRole::ALL {
+            parts
+                .resolved_sources
+                .for_role_mut(role)
+                .files
+                .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        }
         parts.stop.strings.sort();
         parts.decisions.sort_by_key(|decision| decision.field);
     }
@@ -2675,6 +3190,7 @@ impl ResolvedModelPlan {
     fn validate(
         parts: &ResolvedModelPlanParts,
         node_resolutions: &[PlanNodeResolution],
+        completion_retention: &CompletionRetentionSpec,
     ) -> Result<(), VNextError> {
         let mut source_artifacts = BTreeMap::new();
         for artifact in &parts.source_artifacts {
@@ -2689,9 +3205,13 @@ impl ResolvedModelPlan {
             }
             artifact.provenance.validate()?;
             match &artifact.provenance {
-                ResolutionSourceProvenance::LockedModelFile { relative_path } => {
+                ResolutionSourceProvenance::LockedModelFile {
+                    source_role,
+                    relative_path,
+                } => {
                     let Some(file) = parts
-                        .resolved_source
+                        .resolved_sources
+                        .for_role(*source_role)
                         .files
                         .iter()
                         .find(|file| &file.relative_path == relative_path)
@@ -2699,8 +3219,8 @@ impl ResolvedModelPlan {
                         return Err(invalid_plan(
                             "source_artifacts.provenance",
                             format!(
-                                "artifact `{}` does not resolve to locked file `{relative_path}`",
-                                artifact.id
+                                "artifact `{}` does not resolve to {source_role:?} locked file `{relative_path}`",
+                                artifact.id,
                             ),
                         ));
                     };
@@ -2730,36 +3250,40 @@ impl ResolvedModelPlan {
                 ResolutionSourceProvenance::Upstream { .. } => {}
             }
         }
-        if parts.original_source.location.trim().is_empty()
-            || matches!(
-                parts.original_source.requested_revision.as_deref(),
-                Some(revision) if revision.trim().is_empty()
-            )
-            || parts.resolved_source.canonical_location.trim().is_empty()
-            || parts.resolved_source.resolved_revision.trim().is_empty()
-        {
-            return Err(invalid_plan(
-                "source",
-                "source locations and revisions must be non-empty",
-            ));
-        }
-        if parts.resolved_source.files.is_empty() {
-            return Err(invalid_plan(
-                "resolved_source.files",
-                "at least one fingerprinted file is required",
-            ));
-        }
-        let mut paths = BTreeSet::new();
-        if parts.resolved_source.files.iter().any(|file| {
-            !validate_source_path(&file.relative_path)
-                || file.size_bytes == 0
-                || !is_canonical_sha256(&file.sha256)
-                || !paths.insert(file.relative_path.clone())
-        }) {
-            return Err(invalid_plan(
-                "resolved_source.files",
-                "file paths, sizes, and canonical hashes must be valid and unique",
-            ));
+        for role in ModelArtifactSourceRole::ALL {
+            let original = parts.original_sources.for_role(role);
+            let resolved = parts.resolved_sources.for_role(role);
+            if original.location.trim().is_empty()
+                || matches!(
+                    original.requested_revision.as_deref(),
+                    Some(revision) if revision.trim().is_empty()
+                )
+                || resolved.canonical_location.trim().is_empty()
+                || resolved.resolved_revision.trim().is_empty()
+            {
+                return Err(invalid_plan(
+                    format!("{}_source", role.as_str()),
+                    "source locations and revisions must be non-empty",
+                ));
+            }
+            if resolved.files.is_empty() {
+                return Err(invalid_plan(
+                    format!("resolved_sources.{}.files", role.as_str()),
+                    "at least one fingerprinted file is required",
+                ));
+            }
+            let mut paths = BTreeSet::new();
+            if resolved.files.iter().any(|file| {
+                !validate_source_path(&file.relative_path)
+                    || file.size_bytes == 0
+                    || !is_canonical_sha256(&file.sha256)
+                    || !paths.insert(file.relative_path.clone())
+            }) {
+                return Err(invalid_plan(
+                    format!("resolved_sources.{}.files", role.as_str()),
+                    "file paths, sizes, and canonical hashes must be valid and unique",
+                ));
+            }
         }
         let family = &parts.prepared_family;
         let program_fingerprint = family.program().fingerprint()?;
@@ -2774,7 +3298,8 @@ impl ResolvedModelPlan {
             ));
         }
         Self::validate_source_file_binding(
-            &parts.resolved_source,
+            ModelArtifactSourceRole::Semantic,
+            &parts.resolved_sources.semantic,
             &parts.config.source_file,
             &parts.config.sha256,
             "config",
@@ -2786,25 +3311,30 @@ impl ResolvedModelPlan {
             ));
         }
         Self::validate_source_file_binding(
-            &parts.resolved_source,
+            ModelArtifactSourceRole::Tokenizer,
+            &parts.resolved_sources.tokenizer,
             &parts.tokenizer.source_file,
             &parts.tokenizer.sha256,
             "tokenizer",
         )?;
         Self::validate_source_file_binding(
-            &parts.resolved_source,
+            ModelArtifactSourceRole::Tokenizer,
+            &parts.resolved_sources.tokenizer,
             &family.metadata().template.source_file,
             &family.metadata().template.sha256,
             "template",
         )?;
         Self::validate_token_contract(parts)?;
         parts.runtime.validate()?;
-        parts.execution_plan.validate_against(
-            family,
-            &parts.capabilities,
-            &parts.runtime,
-            node_resolutions,
-        )?;
+        parts
+            .execution_plan
+            .validate_against_with_completion_retention(
+                family,
+                &parts.capabilities,
+                &parts.runtime,
+                node_resolutions,
+                completion_retention.clone(),
+            )?;
         let runtime_fingerprint = super::canonical_runtime_policy_fingerprint(&parts.runtime)?;
         let capability_fingerprint = parts.capabilities.fingerprint()?;
         if &parts.device != parts.capabilities.device()
@@ -2813,8 +3343,19 @@ impl ResolvedModelPlan {
             || family_fingerprint != parts.execution_plan.payload().prepared_family_fingerprint()
             || runtime_fingerprint != parts.execution_plan.payload().policy_fingerprint()
             || program_fingerprint != parts.execution_plan.payload().program_fingerprint()
-            || &family.weight_schema().format_id != parts.execution_plan.payload().weight_format()
-            || family.weight_schema().quantization_formats()
+            || &parts
+                .execution_plan
+                .payload()
+                .execution_weights()
+                .schema()
+                .format_id
+                != parts.execution_plan.payload().weight_format()
+            || parts
+                .execution_plan
+                .payload()
+                .execution_weights()
+                .schema()
+                .quantization_formats()
                 != *parts.execution_plan.payload().quantization_formats()
             || capability_fingerprint
                 != parts
@@ -2841,7 +3382,9 @@ impl ResolvedModelPlan {
             ));
         }
         for node in parts.execution_plan.payload().nodes() {
-            let providers = parts.capabilities.providers_for(node.operation_id())?;
+            let providers = parts
+                .capabilities
+                .providers_for_node(node.id(), node.operation_id())?;
             let selected = providers
                 .iter()
                 .find(|provider| provider.provider_id() == node.selection().selected_provider())
@@ -2950,6 +3493,19 @@ impl ResolvedModelPlan {
                     ),
                 ));
             }
+            if let ResolutionSourceProvenance::LockedModelFile { source_role, .. } =
+                &artifact.provenance
+            {
+                if !Self::locked_source_role_allowed(decision.field, *source_role) {
+                    return Err(invalid_plan(
+                        "decisions.source_role",
+                        format!(
+                            "decision for `{:?}` cannot use a {source_role:?} locked source",
+                            decision.field
+                        ),
+                    ));
+                }
+            }
             let source_field = artifact
                 .fields
                 .get(decision.evidence.source_field_path())
@@ -3009,6 +3565,7 @@ impl ResolvedModelPlan {
     }
 
     fn validate_source_file_binding(
+        role: ModelArtifactSourceRole,
         source: &ResolvedModelSource,
         source_file: &str,
         sha256: &str,
@@ -3035,14 +3592,61 @@ impl ResolvedModelPlan {
             )),
             None => Err(invalid_plan(
                 format!("{field}.source_file"),
-                format!("`{source_file}` is absent from resolved_source.files"),
+                format!(
+                    "`{source_file}` is absent from resolved_sources.{}.files",
+                    role.as_str()
+                ),
             )),
+        }
+    }
+
+    const fn locked_source_role_allowed(
+        field: ResolutionField,
+        role: ModelArtifactSourceRole,
+    ) -> bool {
+        match field {
+            ResolutionField::Config
+            | ResolutionField::ExternalMetadata
+            | ResolutionField::Family => matches!(role, ModelArtifactSourceRole::Semantic),
+            ResolutionField::Tokenizer | ResolutionField::Template => {
+                matches!(role, ModelArtifactSourceRole::Tokenizer)
+            }
+            ResolutionField::SpecialTokens => matches!(
+                role,
+                ModelArtifactSourceRole::Semantic | ModelArtifactSourceRole::Tokenizer
+            ),
+            ResolutionField::WeightSchema => matches!(
+                role,
+                ModelArtifactSourceRole::Semantic | ModelArtifactSourceRole::Weights
+            ),
+            ResolutionField::WeightFormat => matches!(role, ModelArtifactSourceRole::Weights),
+            ResolutionField::OriginalSources
+            | ResolutionField::ResolvedSources
+            | ResolutionField::Device
+            | ResolutionField::Capabilities
+            | ResolutionField::RuntimePreset
+            | ResolutionField::RuntimeMemory
+            | ResolutionField::Admission
+            | ResolutionField::Engine
+            | ResolutionField::ExecutionPlan
+            | ResolutionField::Sampling
+            | ResolutionField::Stop
+            | ResolutionField::StructuredOutput => true,
         }
     }
 
     fn validate_token_contract(parts: &ResolvedModelPlanParts) -> Result<(), VNextError> {
         let vocabulary_size = parts.tokenizer.vocabulary_size;
         let special = &parts.prepared_family.metadata().special_tokens;
+        if special.collision_policy.allowed().iter().any(|collision| {
+            collision.first() == SpecialTokenRole::Stop
+                || collision.second() == SpecialTokenRole::Stop
+        }) {
+            return Err(invalid_plan(
+                "special_tokens.collision_policy",
+                "model metadata cannot authorize product-owned stop-token collisions",
+            ));
+        }
         let mut roles = Vec::new();
         if let Some(token_id) = special.bos_token_id {
             roles.push((SpecialTokenRole::Bos, token_id));
@@ -3074,20 +3678,45 @@ impl ResolvedModelPlan {
                 "a model or stop token id exceeds the tokenizer vocabulary",
             ));
         }
+        let mut observed_stop_collisions = BTreeSet::new();
         for (index, (role, token_id)) in roles.iter().enumerate() {
             for (other_role, other_token_id) in &roles[..index] {
-                if token_id == other_token_id
-                    && role != other_role
-                    && !special.collision_policy.allows(*role, *other_role)
-                {
-                    return Err(invalid_plan(
-                        "special_tokens.collision_policy",
-                        format!(
-                            "token id {token_id} is shared by {role:?} and {other_role:?} without an explicit policy"
-                        ),
-                    ));
+                if token_id == other_token_id && role != other_role {
+                    let (policy_field, allowed) = if *role == SpecialTokenRole::Stop
+                        || *other_role == SpecialTokenRole::Stop
+                    {
+                        let model_role = if *role == SpecialTokenRole::Stop {
+                            *other_role
+                        } else {
+                            *role
+                        };
+                        observed_stop_collisions.insert(model_role);
+                        (
+                            "stop.collision_policy",
+                            parts.stop.collision_policy.allows(model_role),
+                        )
+                    } else {
+                        (
+                            "special_tokens.collision_policy",
+                            special.collision_policy.allows(*role, *other_role),
+                        )
+                    };
+                    if !allowed {
+                        return Err(invalid_plan(
+                            policy_field,
+                            format!(
+                                "token id {token_id} is shared by {role:?} and {other_role:?} without an explicit policy"
+                            ),
+                        ));
+                    }
                 }
             }
+        }
+        if observed_stop_collisions != *parts.stop.collision_policy.allowed_model_roles() {
+            return Err(invalid_plan(
+                "stop.collision_policy",
+                "declared model-role collisions must exactly match observed stop-token aliases",
+            ));
         }
         Ok(())
     }
@@ -3110,14 +3739,14 @@ impl ResolvedModelPlan {
         }
 
         insert_value!(
-            ResolutionField::OriginalSource,
-            &parts.original_source,
-            "serialize original model source decision"
+            ResolutionField::OriginalSources,
+            &parts.original_sources,
+            "serialize original model sources decision"
         );
         insert_value!(
-            ResolutionField::ResolvedSource,
-            &parts.resolved_source,
-            "serialize resolved model source decision"
+            ResolutionField::ResolvedSources,
+            &parts.resolved_sources,
+            "serialize resolved model sources decision"
         );
         insert_value!(
             ResolutionField::Config,

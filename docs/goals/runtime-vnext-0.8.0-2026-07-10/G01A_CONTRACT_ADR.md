@@ -1,9 +1,12 @@
 # ADR: Runtime vNext Core Contract Boundary
 
-- Status: Pending G01A contract checkpoint; acceptance requires both exact PASS lines in
-  [`G01_CORE_CONTRACTS.md`](G01_CORE_CONTRACTS.md)
+- Status: Historical design input. The 2026-07-13 isolated-contract checkpoint passed, but this ADR
+  no longer defines the active G01A completion contract. S0A/S0B and production acceptance are
+  superseded by
+  [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md) and
+  [`G01_CORE_CONTRACTS.md`](G01_CORE_CONTRACTS.md).
 - Scope: contract design only
-- Depends on: canonical G00a checkpoint `G00a`
+- Depends on: historical canonical G00a checkpoint `G00a`
 - Decision owner: G01
 - Migration owner: G03 and G08
 - Legacy deletion owner: G08D
@@ -17,9 +20,11 @@ policy, profiling, and unsupported defaults. A method added for one model or one
 backend therefore changes a shared trait, expands the compile surface, and can move a
 failure from planning into a late runtime call.
 
-G01A defines an isolated contract. It does not route `ferrum run` or `ferrum serve`,
-change runtime defaults, migrate a production model, or establish a performance
-result. The authoritative legacy classification is
+The historical G01A checkpoint defines an isolated contract. It does not route
+`ferrum run` or `ferrum serve`, change runtime defaults, migrate a production model,
+or establish a performance result. Its types are candidates for S0A ownership-preserving
+split and S0B production-driven rewrite, not frozen public architecture. The authoritative
+legacy classification is
 [`G01A_LEGACY_CONTRACT_MAP.json`](G01A_LEGACY_CONTRACT_MAP.json).
 
 ## Decision Drivers
@@ -88,6 +93,65 @@ and `ExecutionEventSink` are peers of execution rather than backend extensions.
 `ResolvedModelPlan` is the validated, data-only product composition result; G01A does
 not connect it to a product entrypoint.
 
+### 2026-07-19 exact completion timing amendment
+
+Real CUDA S1 evidence showed that a host-only completion interval cannot distinguish
+device execution, fence wait, and readback. Timing policy remains selected through the
+typed `ExecutionEventSink`, but the exact request is copied into `DeviceCommandBatch`
+and the result is inseparable from the quiescent terminal receipt. This is a bounded
+extension of the device primitive contract, not an operation-provider or model-family
+branch.
+
+The amendment has four invariants:
+
+1. `Off` creates no backend start event, takes no host clock reading, and allocates no
+   timing side channel on the submission hot path.
+2. `Completion` records at most one backend start event per physical submission; the
+   existing terminal fence event is the end event.
+3. Device elapsed time can only be consumed with the exact terminal receipt. There is
+   no second fence query and no timing owner outside completion/reaper ownership.
+4. Device elapsed, host fence wait, and host readback use distinct clocks, may overlap,
+   and must never be summed into a fabricated total.
+
+Completion output ownership and completion identity are deliberately separate. A
+successful readback receipt continues to own the exact raw output bytes and their
+validated SHA256. Stable single and batch readback fingerprints bind the request,
+typed disposition/failure evidence, and that already-computed output digest; they must
+not serialize or hash the raw bytes again. The corrected batch projection uses the
+`ferrum.runtime-vnext.completion-readback-batch.v2` domain so the semantic change is
+explicit rather than silently reusing the old digest domain.
+
+### 2026-07-19 immutable submission evidence amendment
+
+CUDA host-boundary attribution also found repeated ownership work before submit. A
+physical wave cloned validated batch, node, participant, execution-envelope and
+submitted-receipt values at several ownership boundaries. Those clones recursively
+copied the same immutable identity tree. Batch identity construction then serialized
+that complete tree into a temporary JSON buffer and hashed it again even though each
+node already carried a validated semantic fingerprint.
+
+Validated submission evidence is therefore a shared immutable value with these rules:
+
+1. Cloning an execution envelope, batch/node participant identity, or submitted receipt
+   shares one private `Arc`-backed payload; it does not recursively copy evidence.
+2. Sharing is process-local ownership only. Manual serialization preserves the existing
+   transparent wire shape exactly and never exposes an implementation `data` wrapper,
+   pointer, allocation identity or reference count.
+3. Node identity retains its existing full semantic digest. Batch identity v2 hashes
+   the canonical batch fields plus the ordered, already-validated node fingerprints;
+   it does not serialize the nested node/operation/participant trees a second time.
+4. Fingerprint JSON is streamed directly into SHA256. Trusted deserialization and
+   reconstruction rules remain unchanged; shared storage never becomes validation
+   authority.
+5. Hot-path evidence remains immutable after construction. Runtime counters, terminal
+   state, fences and mutable resource ownership cannot be placed in these shared
+   payloads.
+
+This amendment changes process-local ownership and the explicit batch fingerprint
+domain, not provider selection or model routing. The bounded CUDA checkpoint is
+recorded in `S1_STATUS_2026-07-17.md`; formal dispatch and event-sink overhead remain
+owned by the G01B proof plan.
+
 ## Frozen Contract Rules
 
 ### Object safety and typed dispatch
@@ -100,8 +164,11 @@ not connect it to a product entrypoint.
   `Indeterminate`. Only a quiescent terminal proves buffers release-safe. Core, not the
   backend, attaches exact execution identity and the fixed `Device` failure domain. Blocking
   fence wait and lane drain are recovery/shutdown correctness tools, never normal request
-  progress. Device timing is emitted through `ExecutionEventSink` and the
-  `OperationContract::profile_phase` identity rather than expanding this stable trait.
+  progress. Device timing policy is selected through `ExecutionEventSink` and the
+  `OperationContract::profile_phase` identity. Under the exact-completion amendment,
+  `DeviceCommandBatch` carries the typed request and the terminal receipt carries the
+  optional measurement or typed unavailability reason; timing never becomes a global
+  backend switch or a second post-terminal query.
 - `OperationContract` is object-safe metadata and validation. It contains an operation
   id and schema-major-compatible version plus shape, dtype, layout, typed attribute
   schema and constraints, resource, oracle, and profile-phase requirements.
@@ -153,6 +220,10 @@ not connect it to a product entrypoint.
   ownership, so dropping it cannot release device-visible resources. Raw commands never escape
   for submission on another runtime or lane. Provider errors are accepted only when their
   execution identity and profile phase equal the dispatch context.
+- Execution envelopes, batch/node participant identities and submitted receipts are immutable
+  evidence objects. Their process-local clones share private payload storage while their
+  serialized form remains the canonical contract form. Batch composition consumes ordered
+  validated node digests rather than recursively reserializing the node evidence tree.
 - A plan node records the selected provider identity. The execution loop neither asks
   `supports_*` questions nor branches on a concrete backend or architecture.
 - Every shape-dependent plan node records a core-derived `NodeWorkContract` in the immutable plan
@@ -289,19 +360,22 @@ not connect it to a product entrypoint.
   overcommit policy.
 - Dynamic admission has three typed outcomes: `Admitted` with a committed logical lease,
   temporary `Deferred` with exact immediate/fit vectors, per-domain requested/available/maximum
-  shortfalls, retry action, release epoch and capacity epoch, or permanent `Impossible` when the
-  request cannot fit even exclusive maximum backing or violates a typed ceiling. A deferred or
-  impossible value cannot construct the sealed authority accepted by provider encode, device
-  submit or prefill. A large deferred request does not mutate capacity and cannot prevent a later
-  eligible request from admission.
+  shortfalls, retry action, global audit epochs and a canonical exact-source `CapacityWaitCondition`,
+  or permanent `Impossible` when the request cannot fit even exclusive maximum backing or violates
+  a typed ceiling. A deferred or impossible value cannot construct the sealed authority accepted by
+  provider encode, device submit or prefill. A large deferred request does not mutate capacity and
+  cannot prevent a later eligible request from admission.
 - Active-sequence authority is a sparse coordinator-issued id plus a monotonically changing
   generation; callers cannot choose an index. Coordinator storage grows only with actual live or
   reusable records and never allocates a `Vec` from the configured ceiling. Releasing a logical
-  claim returns its exact capacity-domain units and increments `release_epoch`. A backing grow or
-  any other change to effective available capacity increments `capacity_epoch`. A waiter first
-  installs a listener, then rechecks both epochs before parking; either epoch change notifies that
-  listener. This closes the check/register/park lost-wakeup window without polling, a busy loop or
-  a global head-of-line block.
+  claim returns its exact capacity-domain units, increments that domain's availability generation
+  and advances global audit `release_epoch`; sequence release also advances the active-slot
+  generation. A backing grow, extent availability change or other increase to effective capacity
+  advances the relevant domain generation and global audit `capacity_epoch`. A waiter installs the
+  shared listener, snapshots the exact sources, rechecks its own generations, then parks. Global
+  epoch changes may notify all listeners, but only a relevant source or policy change permits an
+  admission probe. This closes the check/register/park lost-wakeup window without polling, a busy
+  loop, unrelated-domain retry amplification or a global head-of-line block.
 - `AdmittedRequestResources` owns Request-scoped physical/logical state once. Each
   `AdmittedSequenceResources` owns an `Arc` parent and a coordinator-issued sparse id/generation.
   Each admitted sequence also owns one fail-closed execution-authority source selector. The first
@@ -380,7 +454,11 @@ not connect it to a product entrypoint.
   transitions from pre-plan to a plan-bound state using
   `TrustedExecutionTopology::from_plan`. Every execution frame starts at one and advances
   contiguously; each frame executes every trusted plan node exactly once, node invocation
-  ids are globally monotonic, and dependencies must complete in the same frame. Repeating
+  ids are globally monotonic, and dependencies must complete in the same frame. A pristine
+  Step that proves `RollbackUnsubmitted` restores each participant's unexecuted frame; its
+  retry uses a fresh `BatchStepId`/physical attempt id but the same participant-local
+  `ExecutionFrameId`. Abort, arbitrary Drop, prepared/in-flight work, or an indeterminate
+  submission cannot rewind a frame. Repeating
   a plan node in later decode frames is valid; repeating an invocation is not. Node and
   operation events require a live typed sequence session, whose active fingerprint cannot
   be substituted with a resource-journal hash. Active operation invocation and failure
@@ -400,7 +478,9 @@ not connect it to a product entrypoint.
   installs the durable fence and only then publishes the external Submitted receipt.
   `DefinitelyNotSubmitted` is the only
   transition that mints a sealed retry authority; retry requires the exact topology and work-shape
-  fingerprints and a fresh attempt id. Provider failure, arbitrary Drop, a changed shape or a
+  fingerprints and a fresh attempt id. A whole pristine Step rollback follows the same distinction:
+  it changes the physical attempt identity without creating a gap in the request journal's frame
+  identity. Provider failure, arbitrary Drop, a changed shape or a
   possibly-submitted error cannot relabel a key as retryable. Request journals contain only
   participant projections linked to that shared submission/completion fingerprint. They cannot
   construct, duplicate or count a physical command/fence. Replay requires closure over every

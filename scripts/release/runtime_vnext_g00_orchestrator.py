@@ -848,15 +848,28 @@ def self_test() -> None:
             if lane["phases"]["discovery"]["required"]
         }
         require(
-            discovery_lanes
-            == {
-                "m1-qwen35-4b/cuda",
-                "m2-qwen35-35b-a3b/cuda",
-                "m3-qwen3-30b-a3b/cuda",
-                "m3-qwen3-30b-a3b/metal",
-            },
+            discovery_lanes == set(),
             "checked-in discovery/formal dependency matrix drifted",
         )
+        executable_lanes = {
+            "m1-qwen35-4b/cuda",
+            "m2-qwen35-35b-a3b/cuda",
+            "m3-qwen3-30b-a3b/cuda",
+            "m3-qwen3-30b-a3b/metal",
+        }
+        for lane_id in executable_lanes:
+            lane = next(row for row in real_plan["lanes"] if row["lane_id"] == lane_id)
+            require(lane["expectation_statuses"] == ["known-fail", "pass"], f"{lane_id} formal status set drifted")
+            require(not lane["phases"]["discovery"]["required"], f"{lane_id} unexpectedly regressed to discovery")
+            require(
+                not lane["phases"]["expectation-amendment"]["required"],
+                f"{lane_id} unexpectedly requires another expectation amendment",
+            )
+            require(
+                lane["phases"]["formal-correctness"]["dependencies"]
+                == ["global.models-lock", "global.legacy-binaries"],
+                f"{lane_id} formal correctness still depends on discovery",
+            )
         lock_path = partial / "models.lock.json"
         lock_bytes = lock_path.read_bytes()
         atomic_write(lock_path, lock_bytes + b" ")

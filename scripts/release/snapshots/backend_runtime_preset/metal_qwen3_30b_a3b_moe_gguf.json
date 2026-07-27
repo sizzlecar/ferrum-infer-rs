@@ -28,7 +28,7 @@
     "queue_depth": 0,
     "recurrent_state_max_slots": null,
     "rejected_requests_total": 0,
-    "scheduler_policy": "prefill_first_until_active:32+prefill_step_chunk:64",
+    "scheduler_policy": "prefill_first_until_active:32+prefill_token_budget:elastic",
     "schema_version": 1
   },
   "candidate_groups": [
@@ -292,6 +292,27 @@
         "correctness"
       ],
       "candidates": [
+        "enabled_when_runtime_capable",
+        "disabled"
+      ],
+      "rejected": [
+        {
+          "reason": "reusable device programs are disabled",
+          "value": "enabled_when_runtime_capable"
+        }
+      ],
+      "schema_version": 1,
+      "selected": "disabled",
+      "selection": "reusable_execution_policy",
+      "source": "hardware_capability",
+      "source_key": null
+    },
+    {
+      "affects": [
+        "performance",
+        "correctness"
+      ],
+      "candidates": [
         "unified_decode_graph_layers_only",
         "unified_decode_graph_lm_head_eager",
         "unified_decode_graph",
@@ -396,11 +417,12 @@
         "prefill_first_until_active",
         "prefill_first_until_active+active_decode_prefill_chunk",
         "active_decode_prefill_chunk",
-        "prefill_step_chunk"
+        "prefill_step_chunk",
+        "prefill_token_budget:elastic"
       ],
       "rejected": [],
       "schema_version": 1,
-      "selected": "prefill_first_until_active:32+prefill_step_chunk:64",
+      "selected": "prefill_first_until_active:32+prefill_token_budget:elastic",
       "selection": "scheduler_admission_policy",
       "source": "default",
       "source_key": null
@@ -455,18 +477,20 @@
     },
     {
       "affects": [
-        "performance"
+        "correctness",
+        "performance",
+        "memory"
       ],
-      "effective_value": "32",
-      "key": "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
-      "source": "default"
+      "effective_value": "0",
+      "key": "FERRUM_REUSABLE_EXECUTION",
+      "source": "memory_profile"
     },
     {
       "affects": [
         "performance"
       ],
-      "effective_value": "64",
-      "key": "FERRUM_SCHED_PREFILL_STEP_CHUNK",
+      "effective_value": "32",
+      "key": "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
       "source": "default"
     },
     {
@@ -584,7 +608,7 @@
     "model_architecture": "qwen3_moe",
     "model_quantization": "q4_k_m",
     "moe_decode_path": "legacy_moe",
-    "scheduler": "prefill_first_until_active:32+prefill_step_chunk:64"
+    "scheduler": "prefill_first_until_active:32+prefill_token_budget:elastic"
   },
   "workload_profile": {
     "output_length_class": "unknown",

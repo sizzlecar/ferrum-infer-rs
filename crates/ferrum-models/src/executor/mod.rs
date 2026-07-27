@@ -9,15 +9,22 @@ pub mod bert_executor;
 pub mod clip_executor;
 pub mod common;
 pub mod llm_executor;
-pub mod qwen35_executor;
 pub mod stub_executor;
 pub mod tts_executor;
+mod vnext_checkpoint;
+mod vnext_completion_worker;
+pub mod vnext_executor;
+mod vnext_timing;
 pub mod whisper_executor;
 
 pub use bert_executor::BertModelExecutor;
 pub use clip_executor::ClipModelExecutor;
 pub use llm_executor::LlmExecutor;
-pub use qwen35_executor::Qwen35W3Executor;
 pub use stub_executor::StubModelExecutor;
 pub use tts_executor::TtsModelExecutor;
+pub use vnext_executor::{
+    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
+    VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
+    VNextExecutorConfig, VNextModelExecutor, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+};
 pub use whisper_executor::WhisperModelExecutor;

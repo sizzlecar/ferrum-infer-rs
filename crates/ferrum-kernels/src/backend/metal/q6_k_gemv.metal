@@ -33,27 +33,41 @@ struct GemvQ6KParams {
     int nb01;     // src0 row stride in BYTES = (K/256)*210
 };
 
-kernel void gemv_f32a_q6kw_v2(
-    device const block_q6_K * src0 [[buffer(0)]],   // [N, K/256] super-blocks
-    device const float      * src1 [[buffer(1)]],   // [K] activations
-    device       float      * dst  [[buffer(2)]],   // [N] output
-    constant GemvQ6KParams  & p    [[buffer(3)]],
-    uint3  tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]])
+struct GemvQ6KBatchParams {
+    uint rows;
+    uint in_features;
+    uint out_features;
+    uint output_stride;
+    uint output_column_offset;
+};
+
+template <typename activation_t, typename output_t>
+void gemv_q6kw_v2_impl(
+    device const block_q6_K * src0,
+    device const activation_t * src1,
+    device output_t * dst,
+    int n,
+    int k,
+    int nb01,
+    uint batch_row,
+    uint output_stride,
+    uint output_column_offset,
+    uint3 tgpig,
+    ushort tiisg,
+    ushort sgitg)
 {
     constexpr uint8_t kmask1 = 0x03;
     constexpr uint8_t kmask2 = 0x0C;
     constexpr uint8_t kmask3 = 0x30;
     constexpr uint8_t kmask4 = 0xC0;
 
-    const int nb = p.K / QK_K;
+    const int nb = k / QK_K;
     const int r0 = tgpig.x;
     const int first_row = (r0 * N_SG + sgitg) * N_R0;
-    if (first_row >= p.N) return;
+    if (first_row >= n) return;
 
     device const block_q6_K * x = src0 + first_row * nb;
-    device const float      * yy = src1;
+    device const activation_t * yy = src1 + ulong(batch_row) * k;
 
     float sumf[N_R0] = { 0.f };
     float yl[16];
@@ -76,7 +90,7 @@ kernel void gemv_f32a_q6kw_v2(
         device const int8_t * sc = x[i].scales + is;
         device const half   * dh = &x[i].d;
 
-        device const float * y = yy + i * QK_K + y_offset;
+        device const activation_t * y = yy + i * QK_K + y_offset;
 
         FOR_UNROLL (short l = 0; l < 4; ++l) {
             yl[4*l + 0] = y[l +  0];
@@ -85,7 +99,7 @@ kernel void gemv_f32a_q6kw_v2(
             yl[4*l + 3] = y[l + 96];
         }
 
-        for (short row = 0; row < N_R0; ++row) {
+        for (short row = 0; row < N_R0 && (first_row + row) < n; ++row) {
             float4 sums = {0.f, 0.f, 0.f, 0.f};
 
             FOR_UNROLL (short l = 0; l < 4; ++l) {
@@ -102,18 +116,60 @@ kernel void gemv_f32a_q6kw_v2(
             // Advance pointers by ONE row stride. nb01 is the byte stride of
             // src0 between consecutive output rows. q1, q2, qh are uchar*; sc
             // is int8*; dh is half*. nb01 is in bytes for all of these.
-            q1 += p.nb01;
-            q2 += p.nb01;
-            qh += p.nb01;
-            sc += p.nb01;
-            dh += p.nb01 / 2;
+            q1 += nb01;
+            q2 += nb01;
+            qh += nb01;
+            sc += nb01;
+            dh += nb01 / 2;
         }
     }
 
-    for (int row = 0; row < N_R0 && (first_row + row) < p.N; ++row) {
+    for (int row = 0; row < N_R0 && (first_row + row) < n; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[first_row + row] = sum_all;
+            dst[ulong(batch_row) * output_stride + output_column_offset + first_row + row]
+                = output_t(sum_all);
         }
     }
+}
+
+kernel void gemv_f32a_q6kw_v2(
+    device const block_q6_K * src0 [[buffer(0)]],
+    device const float * src1 [[buffer(1)]],
+    device float * dst [[buffer(2)]],
+    constant GemvQ6KParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    gemv_q6kw_v2_impl(
+        src0, src1, dst, p.N, p.K, p.nb01, 0, p.N, 0, tgpig, tiisg, sgitg
+    );
+}
+
+kernel void gemv_f16a_q6kw_v2_batched(
+    device const half * src1 [[buffer(0)]],
+    device const block_q6_K * src0 [[buffer(1)]],
+    device half * dst [[buffer(2)]],
+    constant GemvQ6KBatchParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    if (tgpig.y >= p.rows) return;
+    const int nb01 = int((p.in_features / QK_K) * sizeof(block_q6_K));
+    gemv_q6kw_v2_impl(
+        src0,
+        src1,
+        dst,
+        int(p.out_features),
+        int(p.in_features),
+        nb01,
+        tgpig.y,
+        p.output_stride,
+        p.output_column_offset,
+        tgpig,
+        tiisg,
+        sgitg
+    );
 }

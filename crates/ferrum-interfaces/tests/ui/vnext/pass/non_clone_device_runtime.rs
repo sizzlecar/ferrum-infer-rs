@@ -25,8 +25,20 @@ impl RuntimePolicy for Policy {
         4
     }
 
+    fn maximum_scheduled_tokens(&self) -> u64 {
+        4
+    }
+
+    fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
+    }
+
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {
         &self.dynamic_storage_profile_order
+    }
+
+    fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy> {
+        None
     }
 
     fn validate(&self) -> Result<(), VNextError> {
@@ -107,7 +119,7 @@ impl DeviceRuntime for Runtime {
     fn submit(
         &self,
         _stream: &mut Stream,
-        _command: Command,
+        _commands: DeviceCommandBatch<Command>,
     ) -> Result<Fence, DefinitelyNotSubmitted<io::Error>> {
         Ok(Fence)
     }

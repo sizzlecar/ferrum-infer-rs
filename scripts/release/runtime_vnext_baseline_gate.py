@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,9 +55,11 @@ INVENTORY_ANALYZER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_inventory.p
 MODEL_RESOLVER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_model_resolver.py"
 HARDWARE_PROBE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
 BUILD_TIMING_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
+BUILD_TIMING_CORE_PTX_REPAIR_REL = Path("build-timing-repairs/core-ptx/summary.json")
 INVENTORY_REVIEW_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_inventory_review.json"
 SCENARIO_RUNNER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
 RESOURCE_SAMPLER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
+PERFORMANCE_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_performance_collector.py"
 BLOCKED_LANE_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 CONTRACT_PATHS = (
     REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
@@ -71,6 +74,7 @@ CONTRACT_PATHS = (
     BUILD_TIMING_COLLECTOR_PATH,
     SCENARIO_RUNNER_PATH,
     RESOURCE_SAMPLER_PATH,
+    PERFORMANCE_COLLECTOR_PATH,
     BLOCKED_LANE_COLLECTOR_PATH,
     Path(__file__).resolve(),
 )
@@ -84,6 +88,14 @@ SELFTEST_SUMMARY_PREFIX = "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
 SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SECRET_KEY_RE = re.compile(
+    r"(?:^|[_-])(?:token|secret|password|api[_-]?key|credential|authorization|auth[_-]?key|bearer|cookie|private[_-]?key)(?:$|[_-])",
+    re.IGNORECASE,
+)
+SECRET_VALUE_RE = re.compile(
+    r"(?:--(?:token|secret|password|api[-_]?key|authorization|auth[-_]?key)(?=$|[=:\s])|authorization:|bearer\s)",
+    re.IGNORECASE,
+)
 SAFETENSORS_SHARD_RE = re.compile(
     r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
 )
@@ -170,20 +182,29 @@ SELFTEST_MUTATION_NAMES = (
     "errors",
     "usage",
     "ab-identity-swap",
+    "ab-request-model-alias",
     "duplicate-server-session",
     "server-session-same-lane-overlap",
     "cross-lane-session-id-conflict",
     "server-cell-window-overlap",
     "report-outside-cell-window",
     "server-process-start-marker",
+    "server-process-receipt-env",
     "ready-probe-returncode",
     "loaded-model-probe",
+    "external-identity-probe",
+    "external-active-cap-argv",
+    "external-server-bind-argv",
+    "external-vllm-positional-model",
+    "performance-collector-plan",
+    "performance-collector-config-fingerprint",
     "server-effective-config-model",
     "server-product-config-cap",
     "server-effective-config-argv",
     "benchmark-client-tree-binding",
     "benchmark-client-rust-allowlist",
     "bench-canonical-argv",
+    "bench-http-connection-argv",
     "dataset-sha",
     "tokenizer-sha",
     "config-sha",
@@ -195,6 +216,7 @@ SELFTEST_MUTATION_NAMES = (
     "resource-observation-process-start",
     "resource-summary-forgery",
     "resource-http-process-probe",
+    "resource-http-exit-reason",
     "raw-report-sha",
     "raw-report-metric",
     "raw-report-usage",
@@ -213,7 +235,9 @@ SELFTEST_MUTATION_NAMES = (
     "warmup-error",
     "bench-thinking-payload",
     "bench-env-hash",
+    "bench-http-connection-env",
     "run-real-command",
+    "run-process-receipt-missing",
     "run-session-global-overlap",
     "run-command-window-binding",
     "inventory-source-coverage",
@@ -224,6 +248,7 @@ SELFTEST_MUTATION_NAMES = (
     "build-raw-summary",
     "build-finished-failure",
     "build-content-evidence",
+    "build-repair-base-binding",
     "build-native-log-derivation",
     "build-restore-fresh",
     "build-restore-binary",
@@ -284,19 +309,28 @@ SELFTEST_PERFORMANCE_MUTATIONS = frozenset(
         "errors",
         "usage",
         "ab-identity-swap",
+        "ab-request-model-alias",
         "duplicate-server-session",
         "server-session-same-lane-overlap",
         "server-cell-window-overlap",
         "report-outside-cell-window",
         "server-process-start-marker",
+        "server-process-receipt-env",
         "ready-probe-returncode",
         "loaded-model-probe",
+        "external-identity-probe",
+        "external-active-cap-argv",
+        "external-server-bind-argv",
+        "external-vllm-positional-model",
+        "performance-collector-plan",
+        "performance-collector-config-fingerprint",
         "server-effective-config-model",
         "server-product-config-cap",
         "server-effective-config-argv",
         "benchmark-client-tree-binding",
         "benchmark-client-rust-allowlist",
         "bench-canonical-argv",
+        "bench-http-connection-argv",
         "dataset-sha",
         "tokenizer-sha",
         "config-sha",
@@ -308,6 +342,7 @@ SELFTEST_PERFORMANCE_MUTATIONS = frozenset(
         "resource-observation-process-start",
         "resource-summary-forgery",
         "resource-http-process-probe",
+        "resource-http-exit-reason",
         "raw-report-sha",
         "raw-report-metric",
         "raw-report-usage",
@@ -326,7 +361,9 @@ SELFTEST_PERFORMANCE_MUTATIONS = frozenset(
         "warmup-error",
         "bench-thinking-payload",
         "bench-env-hash",
+        "bench-http-connection-env",
         "run-real-command",
+        "run-process-receipt-missing",
         "run-session-global-overlap",
         "run-command-window-binding",
         "malformed-artifact-type",
@@ -347,6 +384,7 @@ SELFTEST_BUILD_MUTATIONS = frozenset(
         "build-raw-summary",
         "build-finished-failure",
         "build-content-evidence",
+        "build-repair-base-binding",
         "build-native-log-derivation",
         "build-restore-fresh",
         "build-restore-binary",
@@ -379,10 +417,12 @@ BUILD_SCENARIO_INPUTS = {
     "noop": ("none", None, None),
     "rust-model-leaf": ("content-mutation", "crates/ferrum-models/src/lib.rs", "ferrum-models"),
     "rust-runtime-leaf": ("content-mutation", "crates/ferrum-engine/src/lib.rs", "ferrum-engine"),
-    "core-ptx": ("content-mutation", "crates/ferrum-kernels/triton_ptx/add_bias_f16.ptx", "ferrum-kernels"),
+    "core-ptx": ("content-mutation", "crates/ferrum-kernels/kernels/add_bias.cu", "ferrum-kernels"),
     "native-tu": ("content-mutation", "crates/ferrum-kernels/vllm_marlin/gptq_marlin_repack.cu", "ferrum-kernels"),
     "clean-release": ("cargo-clean", None, None),
 }
+REJECTED_BUILD_TIMING_COLLECTOR_SHA256 = "2579e30d6c04dd8dbb502ac0dadd267f4edc0eb3e1fe574bba4fb0b42f53b13e"
+REJECTED_CORE_PTX_INPUT = "crates/ferrum-kernels/triton_ptx/add_bias_f16.ptx"
 PRIMARY_MODELS = {
     "m1-qwen35-4b": "Qwen/Qwen3.5-4B",
     "m2-qwen35-35b-a3b": "Qwen/Qwen3.5-35B-A3B",
@@ -433,6 +473,7 @@ PRESET_FIELDS = {
     "repetition_penalty",
     "seed",
     "max_tokens",
+    "output_budget_mode",
     "stop",
     "eos_token_ids",
     "enable_thinking",
@@ -441,6 +482,7 @@ PRESET_FIELDS = {
 }
 FORBIDDEN_OUTPUT_KEYS = {"waiver", "waivers", "skipped", "placeholder"}
 BENCHMARK_CLIENT_RUST_ALLOWLIST = (
+    "crates/ferrum-bench-core/src/env.rs",
     "crates/ferrum-bench-core/src/lib.rs",
     "crates/ferrum-bench-core/src/report.rs",
     "crates/ferrum-cli/src/commands/bench.rs",
@@ -469,6 +511,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
+    record_selftest_mutation_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -588,6 +631,19 @@ def require_no_forbidden_markers(value: Any, label: str) -> None:
     elif isinstance(value, list):
         for index, child in enumerate(value):
             require_no_forbidden_markers(child, f"{label}[{index}]")
+
+
+def require_no_secret_material(value: Any, label: str) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            require(isinstance(key, str), f"{label} contains a non-string key")
+            require(not SECRET_KEY_RE.search(key), f"{label} contains secret-bearing key {key!r}")
+            require_no_secret_material(child, f"{label}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            require_no_secret_material(child, f"{label}[{index}]")
+    elif isinstance(value, str):
+        require(not SECRET_VALUE_RE.search(value), f"{label} contains secret-bearing command material")
     elif isinstance(value, str):
         lowered = value.lower()
         require("selftest pass" not in lowered and "self-test pass" not in lowered, f"{label} uses selftest evidence")
@@ -811,6 +867,7 @@ def recompute_bench_env_hash(raw: dict[str, Any], label: str) -> str:
         "cuda",
         "rust",
         "ferrum_features",
+        "http_connection_mode",
         "gpu_clock_lock_mhz",
         "gpu_power_limit_w",
         "gpu_persistence_mode",
@@ -2293,6 +2350,20 @@ def validate_models_lock(
                 require(isinstance(top_k, int) and not isinstance(top_k, bool) and top_k >= 0, f"models[{key}].generation_presets.{preset_name}.top_k must be a non-negative integer")
                 max_tokens = preset.get("max_tokens")
                 require(isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0, f"models[{key}].generation_presets.{preset_name}.max_tokens must be positive")
+                output_budget_mode = preset.get("output_budget_mode")
+                require(
+                    output_budget_mode in {"explicit", "auto-ceiling"},
+                    f"models[{key}].generation_presets.{preset_name}.output_budget_mode invalid",
+                )
+                expected_budget_mode = (
+                    "auto-ceiling"
+                    if preset_name in {"P_THINKING", "P_OFFICIAL_DEFAULT"}
+                    else "explicit"
+                )
+                require(
+                    output_budget_mode == expected_budget_mode,
+                    f"models[{key}].generation_presets.{preset_name}.output_budget_mode must be {expected_budget_mode}",
+                )
                 require(isinstance(preset.get("stop"), list), f"models[{key}].generation_presets.{preset_name}.stop must be a list")
                 eos_ids = preset.get("eos_token_ids")
                 require(isinstance(eos_ids, list) and eos_ids and all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in eos_ids), f"models[{key}].generation_presets.{preset_name}.eos_token_ids invalid")
@@ -2627,6 +2698,31 @@ def validate_benchmark_client(
     return client
 
 
+def validate_engine_identity_probe(
+    root: Path,
+    raw: Any,
+    label: str,
+    *,
+    name: str,
+    expected: str,
+) -> None:
+    probe = require_object(raw, label)
+    require(probe.get("name") == name, f"{label}.name mismatch")
+    argv = require_list(probe.get("argv"), f"{label}.argv")
+    require(argv and all(isinstance(item, str) and item for item in argv), f"{label}.argv must be non-empty argv")
+    environment = require_object(probe.get("env"), f"{label}.env")
+    require(bool(environment), f"{label}.env must not be empty")
+    require(not any(str(key).startswith("FERRUM_") for key in environment), f"{label}.env contains hidden FERRUM_* controls")
+    require(probe.get("expected") == expected, f"{label}.expected mismatch")
+    require(probe.get("timeout_sec") == 60.0, f"{label}.timeout_sec must be 60 seconds")
+    require(probe.get("returncode") == 0, f"{label}.returncode must be zero")
+    validate_execution_window(probe, label)
+    stdout = require_artifact_sha(root, probe.get("stdout"), probe.get("stdout_sha256"), f"{label}.stdout")
+    stderr = require_artifact_sha(root, probe.get("stderr"), probe.get("stderr_sha256"), f"{label}.stderr")
+    observed = f"{stdout.read_text(encoding='utf-8', errors='replace')}\n{stderr.read_text(encoding='utf-8', errors='replace')}"
+    require(expected in observed, f"{label} logs do not contain the declared engine identity")
+
+
 def validate_server_identity(
     root: Path,
     raw: Any,
@@ -2646,8 +2742,24 @@ def validate_server_identity(
     expected_engine = "vllm" if backend == "cuda" else "llama.cpp"
     if implementation == "A":
         require(engine == expected_engine, f"{label}.engine must be {expected_engine}")
-        require_string(identity.get("engine_version"), f"{label}.engine_version")
-        require_git_sha(identity.get("engine_revision"), f"{label}.engine_revision", frozen=False)
+        engine_version = require_string(identity.get("engine_version"), f"{label}.engine_version")
+        engine_revision = require_git_sha(identity.get("engine_revision"), f"{label}.engine_revision", frozen=False)
+        probes = require_object(identity.get("identity_probes"), f"{label}.identity_probes")
+        require(set(probes) == {"version", "revision"}, f"{label}.identity_probes must contain version/revision")
+        validate_engine_identity_probe(
+            root,
+            probes["version"],
+            f"{label}.identity_probes.version",
+            name="external-version",
+            expected=engine_version,
+        )
+        validate_engine_identity_probe(
+            root,
+            probes["revision"],
+            f"{label}.identity_probes.revision",
+            name="external-revision",
+            expected=engine_revision,
+        )
     else:
         require(engine == "ferrum", f"{label}.engine must be ferrum")
         require_git_sha(identity.get("source_git_sha"), f"{label}.source_git_sha")
@@ -2671,12 +2783,13 @@ def validate_server_identity(
         "model_revision": model_lane["revision"],
         "model_format": model_lane["format"],
         "model_files": locked_file_map(model, backend),
-        "request_model": model["official_model_id"],
+        "official_model_id": model["official_model_id"],
         "enable_thinking": False,
     }
     for field, expected in required_config.items():
         require(config.get(field) == expected, f"{label}.effective_config.{field} mismatch")
     model_origin_path = require_string(config.get("model_origin_path"), f"{label}.effective_config.model_origin_path")
+    request_model = require_string(config.get("request_model"), f"{label}.effective_config.request_model")
     cap = require_positive_int(config.get("typed_active_cap"), f"{label}.effective_config.typed_active_cap")
     memory_budget = require_positive_int(
         config.get("memory_budget_bytes"), f"{label}.effective_config.memory_budget_bytes"
@@ -2689,7 +2802,8 @@ def validate_server_identity(
         ("model_revision", model_lane["revision"]),
         ("model_format", model_lane["format"]),
         ("model_files", locked_file_map(model, backend)),
-        ("request_model", model["official_model_id"]),
+        ("official_model_id", model["official_model_id"]),
+        ("request_model", request_model),
         ("model_origin_path", model_origin_path),
         ("memory_budget_bytes", memory_budget),
     ):
@@ -2739,6 +2853,64 @@ def validate_endpoint_probe(
     finished = parse_timestamp(receipt.get("finished_at"), f"{label}.receipt.finished_at")
     body = read_json(body_path)
     return receipt, body, started, finished
+
+
+def validate_process_receipt(
+    root: Path,
+    raw: Any,
+    label: str,
+    *,
+    pid: int,
+    pgid: int,
+    process_start_marker: str,
+    process_start_source: Any,
+    argv: list[Any],
+    environment: dict[str, Any],
+) -> datetime:
+    evidence = require_object(raw, label)
+    receipt_path = require_artifact_sha(
+        root,
+        evidence.get("path"),
+        evidence.get("sha256"),
+        label,
+    )
+    receipt = read_json(receipt_path)
+    require(receipt.get("schema_version") == COLLECTOR_SCHEMA_VERSION, f"{label} schema mismatch")
+    require(receipt.get("pid") == pid and receipt.get("pgid") == pgid, f"{label} pid/pgid mismatch")
+    require(receipt.get("process_start_marker") == process_start_marker, f"{label} process start marker mismatch")
+    require(receipt.get("process_start_source") == process_start_source, f"{label} process start source mismatch")
+    try:
+        derived_marker = resource_sampler.process_marker_from_source(pid, receipt.get("process_start_source"))
+    except resource_sampler.ResourceEvidenceError as exc:
+        raise BaselineError(f"{label} process start source rejected: {exc}") from exc
+    require(derived_marker == process_start_marker, f"{label} process start marker is not derived from OS identity")
+    require(receipt.get("argv") == argv, f"{label} argv differs from the executed session")
+    require(receipt.get("argv_sha256") == canonical_json_sha256(argv), f"{label} argv SHA256 mismatch")
+    receipt_env = require_object(receipt.get("environment"), f"{label}.environment")
+    require(bool(receipt_env), f"{label}.environment must not be empty")
+    require(receipt_env == environment, f"{label} environment differs from the executed session")
+    require(
+        not any(str(key).startswith("FERRUM_") for key in receipt_env),
+        f"{label}.environment contains hidden FERRUM_* controls",
+    )
+    require(
+        receipt.get("environment_sha256") == canonical_json_sha256(receipt_env),
+        f"{label} environment SHA256 mismatch",
+    )
+    ps_stdout_raw = receipt.get("ps_stdout")
+    require(isinstance(ps_stdout_raw, str) and bool(ps_stdout_raw.strip()), f"{label}.ps_stdout must be non-empty")
+    ps_stdout = ps_stdout_raw
+    require(
+        receipt.get("ps_stdout_sha256") == hashlib.sha256(ps_stdout.encode("utf-8")).hexdigest(),
+        f"{label} ps stdout SHA256 mismatch",
+    )
+    match = re.match(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$", ps_stdout, re.DOTALL)
+    require(match is not None, f"{label}.ps_stdout is not a raw pid/ppid/pgid/command receipt")
+    assert match is not None
+    require(int(match.group(1)) == pid and int(match.group(3)) == pgid, f"{label}.ps_stdout pid/pgid mismatch")
+    require(int(match.group(2)) >= 0, f"{label}.ps_stdout ppid is invalid")
+    require(Path(str(argv[0])).name in match.group(4), f"{label}.ps_stdout command does not identify argv[0]")
+    return parse_timestamp(receipt.get("captured_at"), f"{label}.captured_at")
 
 
 def validate_server_sessions(
@@ -2798,8 +2970,36 @@ def validate_server_sessions(
         require(process_marker == derived_process_marker, f"{label}[{index}].process_start_marker is not derived from raw OS identity evidence")
         argv = require_list(session.get("server_argv"), f"{label}[{index}].server_argv")
         require(argv and all(isinstance(part, str) and part for part in argv), f"{label}[{index}].server_argv must be argv")
+        base_url = require_string(session.get("base_url"), f"{label}[{index}].base_url")
+        parsed_base_url = urllib.parse.urlsplit(base_url)
+        try:
+            base_url_port = parsed_base_url.port
+        except ValueError as exc:
+            raise BaselineError(f"{label}[{index}].base_url has an invalid port") from exc
+        require(
+            parsed_base_url.scheme == "http"
+            and bool(parsed_base_url.hostname)
+            and base_url_port is not None
+            and parsed_base_url.path in {"", "/"}
+            and not parsed_base_url.query
+            and not parsed_base_url.fragment,
+            f"{label}[{index}].base_url must be an HTTP origin with an explicit port",
+        )
+        environment = require_object(session.get("env"), f"{label}[{index}].env")
+        process_receipt_at = validate_process_receipt(
+            root,
+            session.get("process_receipt"),
+            f"{label}[{index}].process_receipt",
+            pid=pid,
+            pgid=pgid,
+            process_start_marker=process_marker,
+            process_start_source=session.get("process_start_source"),
+            argv=argv,
+            environment=environment,
+        )
         _, options, _ = parse_argv(argv, f"{label}[{index}].server_argv")
-        joined = " ".join(argv).lower()
+        require_option(options, "--host", parsed_base_url.hostname, f"{label}[{index}].server_argv")
+        require_option(options, "--port", base_url_port, f"{label}[{index}].server_argv")
         if implementation == "B":
             require(Path(argv[0]).name == "ferrum" and "serve" in argv[1:], f"{label}[{index}] must execute frozen ferrum serve")
             serve_index = argv.index("serve")
@@ -2839,12 +3039,31 @@ def validate_server_sessions(
                 f"{label}[{index}].product_effective_config active cap mismatch",
             )
         else:
-            marker = "vllm" if identity["engine"] == "vllm" else "llama"
-            require(marker in joined, f"{label}[{index}].server_argv does not identify {identity['engine']}")
-            require_option(options, "--model", identity["model_origin_path"], f"{label}[{index}].server_argv")
-            alias_option = "--served-model-name" if identity["engine"] == "vllm" else "--alias"
-            require_option(options, alias_option, identity["request_model"], f"{label}[{index}].server_argv")
-        require_string(session.get("base_url"), f"{label}[{index}].base_url")
+            command_label = f"{label}[{index}].server_argv"
+            if identity["engine"] == "vllm":
+                require(Path(argv[0]).name == "vllm", f"{command_label} must execute the vllm binary")
+                require(
+                    len(argv) >= 3 and argv[1] == "serve",
+                    f"{command_label} must execute vllm serve",
+                )
+                require(
+                    argv[2] == identity["model_origin_path"],
+                    f"{command_label} positional model origin mismatch",
+                )
+                require(
+                    "--model" not in options,
+                    f"{command_label} must use the vllm serve positional model argument",
+                )
+                require_option(options, "--served-model-name", identity["request_model"], command_label)
+                require_option(options, "--max-num-seqs", cap, command_label)
+            else:
+                require(
+                    "llama" in Path(argv[0]).name.lower(),
+                    f"{command_label} must execute a llama.cpp server binary",
+                )
+                require_option(options, "--model", identity["model_origin_path"], command_label)
+                require_option(options, "--alias", identity["request_model"], command_label)
+                require_option(options, "--parallel", cap, command_label)
         validate_execution_window(session, f"{label}[{index}]")
         started_at = parse_timestamp(session.get("started_at"), f"{label}[{index}].started_at")
         ready_at = parse_timestamp(session.get("ready_at"), f"{label}[{index}].ready_at")
@@ -2861,6 +3080,10 @@ def validate_server_sessions(
         require(
             started_at < ready_at < measurement_started_at < measurement_finished_at < shutdown_started_at < finished_at,
             f"{label}[{index}] must follow start -> ready -> measurement -> shutdown -> finish",
+        )
+        require(
+            started_at <= process_receipt_at < ready_at,
+            f"{label}[{index}].process_receipt must be captured after start and before readiness",
         )
         cell_windows_raw = require_list(session.get("cell_windows"), f"{label}[{index}].cell_windows")
         require(
@@ -2940,6 +3163,7 @@ def validate_server_sessions(
         require_string(session.get("runtime_log_origin_path"), f"{label}[{index}].runtime_log_origin_path")
         session["_pid"] = pid
         session["_pgid"] = pgid
+        session["_runtime_log_path"] = runtime_log
         session["_identity"] = identity
         session["_timeline"] = {
             "started_at": started_at,
@@ -2996,7 +3220,7 @@ def validate_resource_metrics(
     argv, options, _ = parse_argv(evidence.get("sampler_argv"), f"{label}.sampler_argv")
     require(
         len(argv) >= 2
-        and Path(argv[0]).name in {"python", "python3"}
+        and Path(argv[0]).name.startswith("python")
         and Path(argv[1]).name == RESOURCE_SAMPLER_PATH.name,
         f"{label}.sampler_argv must execute the checked-in resource sampler",
     )
@@ -3017,14 +3241,44 @@ def validate_resource_metrics(
     require_option(options, "--max-duration-sec", 7200, f"{label}.sampler_argv")
     require("--stop-file" in options, f"{label}.sampler_argv must use a bounded stop file")
     probe_format = options.get("--active-probe-format")
-    require(probe_format in {"json", "prometheus", "process"}, f"{label}.sampler_argv active probe format missing")
+    require(
+        probe_format in {"json", "prometheus", "process", resource_sampler.LLAMACPP_LOG_PROBE_FORMAT},
+        f"{label}.sampler_argv active probe format missing",
+    )
     if allow_process_probe:
         require(probe_format == "process", f"{label}.sampler_argv one-shot run must use process-alive active evidence")
         require_option(options, "--active-selector", "process-alive", f"{label}.sampler_argv")
         require_option(options, "--active-semantics", "process-alive", f"{label}.sampler_argv")
+    elif probe_format == resource_sampler.LLAMACPP_LOG_PROBE_FORMAT:
+        require(not allow_process_probe, f"{label}.sampler_argv one-shot run cannot use a llama.cpp log probe")
+        require("--active-path" not in options, f"{label}.sampler_argv log probe cannot use an HTTP path")
+        require_option(
+            options,
+            "--active-selector",
+            resource_sampler.LLAMACPP_LOG_PROBE_SELECTOR,
+            f"{label}.sampler_argv",
+        )
+        require_option(
+            options,
+            "--active-semantics",
+            "scheduler-active-high-water",
+            f"{label}.sampler_argv",
+        )
     else:
         require(probe_format != "process", f"{label}.sampler_argv HTTP measurements cannot use process-alive active evidence")
         require("--active-path" in options and "--active-selector" in options, f"{label}.sampler_argv active HTTP probe is incomplete")
+        require_option(
+            options,
+            "--active-probe-timeout-ms",
+            resource_sampler.ACTIVE_PROBE_TIMEOUT_MS,
+            f"{label}.sampler_argv",
+        )
+        require_option(
+            options,
+            "--active-probe-max-attempts",
+            resource_sampler.ACTIVE_PROBE_MAX_ATTEMPTS,
+            f"{label}.sampler_argv",
+        )
         require_option(
             options,
             "--active-semantics",
@@ -3050,11 +3304,21 @@ def validate_resource_metrics(
             requested_concurrency=requested_concurrency,
             typed_active_cap=typed_active_cap,
             runtime_log_path=runtime_log_origin_path,
+            runtime_log_evidence_path=(
+                Path(session["_runtime_log_path"])
+                if probe_format == resource_sampler.LLAMACPP_LOG_PROBE_FORMAT
+                else None
+            ),
         )
     except resource_sampler.ResourceEvidenceError as exc:
         raise BaselineError(f"{label} raw resource evidence rejected: {exc}") from exc
     summary = require_object(evidence.get("summary"), f"{label}.summary")
     require(summary == recomputed, f"{label}.summary is not derived from raw resource observations")
+    expected_exit_reason = "process-exit" if allow_process_probe else "stop-file"
+    require(
+        summary.get("exit_reason") == expected_exit_reason,
+        f"{label}.summary.exit_reason must be {expected_exit_reason}",
+    )
     peak = require_positive_int(summary.get("peak_memory_bytes"), f"{label}.summary.peak_memory_bytes")
     budget = require_positive_int(summary.get("memory_budget_bytes"), f"{label}.summary.memory_budget_bytes")
     require(peak <= budget <= hardware_memory_bytes, f"{label} memory peak/budget exceeds frozen hardware")
@@ -3145,6 +3409,8 @@ def validate_bench_argv(
     require_option(options, "--base-url", session["base_url"], label)
     require_option(options, "--model", workload["_config"]["request_model"], label)
     require_option(options, "--tokenizer", workload["tokenizer_origin_path"], label)
+    require_option(options, "--target-backend", backend, label)
+    require_option(options, "--http-connection-mode", "fresh", label)
     require_option(options, "--concurrency", concurrency, label)
     require_option(options, "--random-output-len", 128, label)
     require_option(options, "--num-prompts", 100, label)
@@ -3404,6 +3670,7 @@ def validate_raw_bench_report(
     require(env.get("commit_sha") == client["source_git_sha"], f"{label}.env.commit_sha must identify benchmark client")
     require(env.get("hw_id") == session["hardware_id"], f"{label}.env.hw_id mismatch")
     require(isinstance(env.get("ferrum_features"), list), f"{label}.env.ferrum_features must be a list")
+    require(env.get("http_connection_mode") == "fresh", f"{label}.env.http_connection_mode must be fresh")
     require(env.get("ferrum_env") == {}, f"{label}.env.ferrum_env must not contain hidden benchmark-client switches")
     env_hash = require_string(report.get("env_hash"), f"{label}.env_hash")
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", env_hash) is not None, f"{label}.env_hash must be sha256:<digest>")
@@ -3742,6 +4009,33 @@ def validate_run_legacy(
         require(sample.get("tokenizer_sha256") == workload["tokenizer_sha256"], f"{label}.samples[{index}].tokenizer_sha256 mismatch")
         argv, options, switches = parse_argv(sample.get("argv"), f"{label}.samples[{index}].argv")
         require(Path(argv[0]).name == "ferrum" and "run" in argv[1:], f"{label}.samples[{index}].argv must execute ferrum run")
+        launcher_argv = require_list(sample.get("launcher_argv"), f"{label}.samples[{index}].launcher_argv")
+        require(
+            len(launcher_argv) > len(argv) + 5
+            and Path(str(launcher_argv[0])).name.startswith("python")
+            and Path(str(launcher_argv[1])).name == PERFORMANCE_COLLECTOR_PATH.name,
+            f"{label}.samples[{index}].launcher_argv must execute the checked-in performance collector",
+        )
+        require("--exec-barrier-child" in launcher_argv, f"{label}.samples[{index}].launcher_argv lacks exec barrier mode")
+        require("--release-file" in launcher_argv and "--" in launcher_argv, f"{label}.samples[{index}].launcher_argv lacks barrier arguments")
+        release_index = launcher_argv.index("--release-file")
+        delimiter_index = launcher_argv.index("--")
+        require(
+            release_index + 1 < delimiter_index and launcher_argv[delimiter_index + 1 :] == argv,
+            f"{label}.samples[{index}].launcher_argv product argv mismatch",
+        )
+        barrier_origin = require_string(
+            sample.get("barrier_release_origin_path"),
+            f"{label}.samples[{index}].barrier_release_origin_path",
+        )
+        require(launcher_argv[release_index + 1] == barrier_origin, f"{label}.samples[{index}].barrier release origin mismatch")
+        barrier_release = require_artifact_sha(
+            root,
+            sample.get("barrier_release"),
+            sample.get("barrier_release_sha256"),
+            f"{label}.samples[{index}].barrier_release",
+        )
+        require(barrier_release.read_text(encoding="utf-8") == "release\n", f"{label}.samples[{index}].barrier release is invalid")
         run_index = argv.index("run")
         require(run_index + 1 < len(argv) and argv[run_index + 1] == workload["_config"]["request_model"], f"{label}.samples[{index}].argv model mismatch")
         require_option(options, "--prompt", prompt, f"{label}.samples[{index}].argv")
@@ -3794,6 +4088,21 @@ def validate_run_legacy(
         except resource_sampler.ResourceEvidenceError as exc:
             raise BaselineError(f"{label}.samples[{index}].process_start_source rejected: {exc}") from exc
         require(process_marker == derived_process_marker, f"{label}.samples[{index}].process_start_marker is not derived from raw OS identity evidence")
+        process_receipt_at = validate_process_receipt(
+            root,
+            sample.get("process_receipt"),
+            f"{label}.samples[{index}].process_receipt",
+            pid=pid,
+            pgid=pgid,
+            process_start_marker=process_marker,
+            process_start_source=sample.get("process_start_source"),
+            argv=argv,
+            environment=env,
+        )
+        require(
+            sample_started <= process_receipt_at < sample_finished,
+            f"{label}.samples[{index}].process_receipt must be captured during the command window",
+        )
         stdout = require_artifact_sha(root, sample.get("stdout"), sample.get("stdout_sha256"), f"{label}.samples[{index}].stdout")
         stderr = require_artifact_sha(root, sample.get("stderr"), sample.get("stderr_sha256"), f"{label}.samples[{index}].stderr")
         stderr_text = stderr.read_text(encoding="utf-8", errors="replace").lower()
@@ -3855,12 +4164,112 @@ def validate_run_legacy(
         require(close_enough(require_number(stats.get("p95"), f"{label}.summary.{metric}.p95", positive=True), percentile_linear(values, 0.95)), f"{label}.summary.{metric}.p95 mismatch")
 
 
+def validate_performance_collection(
+    root: Path,
+    raw: Any,
+    label: str,
+    *,
+    model: dict[str, Any],
+    backend: str,
+    hardware_id: str,
+    correctness_status: str,
+) -> dict[str, Any]:
+    evidence = require_object(raw, label)
+    require(
+        set(evidence)
+        == {"collector_path", "collector_sha256", "plan", "plan_sha256", "config_fingerprint"},
+        f"{label} field set mismatch",
+    )
+    collector_path = PERFORMANCE_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+    require(evidence.get("collector_path") == collector_path, f"{label}.collector_path mismatch")
+    collector_sha = file_sha256(PERFORMANCE_COLLECTOR_PATH)
+    require(evidence.get("collector_sha256") == collector_sha, f"{label}.collector_sha256 mismatch")
+    expected_plan_rel = f"collection/{model['key']}/{backend}/plan.json"
+    require(evidence.get("plan") == expected_plan_rel, f"{label}.plan path mismatch")
+    plan_path = require_artifact_sha(
+        root,
+        evidence.get("plan"),
+        evidence.get("plan_sha256"),
+        f"{label}.plan",
+    )
+    plan = read_json(plan_path)
+    require_schema(plan, f"{label}.plan")
+    require(
+        plan.get("artifact_type") == "runtime_vnext_g00_performance_collection_plan",
+        f"{label}.plan artifact type mismatch",
+    )
+    fingerprint = require_sha256(evidence.get("config_fingerprint"), f"{label}.config_fingerprint")
+    require(plan.get("config_fingerprint") == fingerprint, f"{label}.plan config fingerprint mismatch")
+    expected_config_rel = f"collection/{model['key']}/{backend}/config.normalized.json"
+    require(plan.get("config") == expected_config_rel, f"{label}.plan config path mismatch")
+    config_path = require_artifact_sha(
+        root,
+        plan.get("config"),
+        plan.get("config_sha256"),
+        f"{label}.plan.config",
+    )
+    config = read_json(config_path)
+    require_schema(config, f"{label}.plan.config")
+    require_no_secret_material(config, f"{label}.plan.config")
+    require(config.get("model_key") == model["key"], f"{label}.plan config model key mismatch")
+    require(config.get("backend") == backend, f"{label}.plan config backend mismatch")
+    require(plan.get("collector_path") == collector_path, f"{label}.plan collector path mismatch")
+    require(plan.get("collector_sha256") == collector_sha, f"{label}.plan collector SHA256 mismatch")
+    require(plan.get("model_key") == model["key"], f"{label}.plan model key mismatch")
+    require(plan.get("backend") == backend, f"{label}.plan backend mismatch")
+    require(plan.get("hardware_id") == hardware_id, f"{label}.plan hardware id mismatch")
+    require(
+        plan.get("correctness_status") == correctness_status,
+        f"{label}.plan correctness status mismatch",
+    )
+    correctness_path = root / "correctness" / model["key"] / backend / "lane.json"
+    require(
+        plan.get("correctness_lane_sha256") == file_sha256(correctness_path),
+        f"{label}.plan correctness lane SHA256 mismatch",
+    )
+    require_sha256(plan.get("external_binary_sha256"), f"{label}.plan.external_binary_sha256")
+    fingerprint_material = {
+        "collector_sha256": collector_sha,
+        "models_lock_sha256": file_sha256(root / "models.lock.json"),
+        "legacy_binaries_sha256": file_sha256(root / "legacy-binaries.json"),
+        "correctness_lane_sha256": file_sha256(correctness_path),
+        "external_binary_sha256": plan["external_binary_sha256"],
+        "config": config,
+    }
+    require(
+        fingerprint == canonical_json_sha256(fingerprint_material),
+        f"{label}.config_fingerprint is not derived from the frozen inputs",
+    )
+    expected_cell_plan = [
+        {"dataset": dataset, "concurrency": concurrency}
+        for dataset, concurrency in sorted(expected_cells(backend))
+    ]
+    require(plan.get("cells") == expected_cell_plan, f"{label}.plan fixed cell matrix mismatch")
+    expected_slots = [
+        {"slot": slot, "implementation": implementation}
+        for slot, implementation in enumerate(SLOT_ORDER, start=1)
+        if correctness_status == "pass" or implementation == "A"
+    ]
+    require(plan.get("slots") == expected_slots, f"{label}.plan fixed slot order mismatch")
+    require(
+        plan.get("paid_work_started_by_collector") is False,
+        f"{label}.plan must state that capacity lifecycle is external",
+    )
+    return {
+        "evidence": evidence,
+        "plan": plan,
+        "config": config,
+        "external_binary_sha256": plan["external_binary_sha256"],
+    }
+
+
 def validate_external_summary(
     root: Path,
     *,
     model: dict[str, Any],
     backend: str,
     hardware: dict[str, Any],
+    correctness_status: str,
     allow_synthetic: bool,
 ) -> dict[str, Any]:
     path = root / "external-baselines" / model["key"] / backend / "summary.json"
@@ -3876,6 +4285,15 @@ def validate_external_summary(
     require(data.get("model_revision") == model["lanes"][backend]["revision"], f"{label}.model_revision mismatch")
     require(data.get("model_files") == locked_file_map(model, backend), f"{label}.model_files mismatch")
     require_no_forbidden_markers(data, label)
+    collection = validate_performance_collection(
+        root,
+        data.get("collection"),
+        f"{label}.collection",
+        model=model,
+        backend=backend,
+        hardware_id=hardware_id,
+        correctness_status=correctness_status,
+    )
     client = validate_benchmark_client(
         root,
         data.get("benchmark_client"),
@@ -3892,6 +4310,36 @@ def validate_external_summary(
         model=model,
         hardware_memory_bytes=int(hardware["memory_bytes"]),
     )
+    require(
+        identity["binary_sha256"] == collection["external_binary_sha256"],
+        f"{label}.collection external binary SHA256 mismatch",
+    )
+    collection_config = collection["config"]
+    for field in ("request_model", "model_origin_path", "typed_active_cap", "memory_budget_bytes"):
+        require(
+            collection_config.get(field) == identity[field],
+            f"{label}.collection config {field} differs from external identity",
+        )
+    configured_external = require_object(
+        collection_config.get("external"), f"{label}.collection.config.external"
+    )
+    for field in ("engine", "engine_version", "engine_revision"):
+        require(
+            configured_external.get(field) == identity[field],
+            f"{label}.collection config external.{field} differs from external identity",
+        )
+    configured_client = require_object(
+        collection_config.get("benchmark_client"),
+        f"{label}.collection.config.benchmark_client",
+    )
+    require(
+        configured_client.get("source_git_sha") == client["source_git_sha"],
+        f"{label}.collection config benchmark client SHA mismatch",
+    )
+    require(
+        configured_client.get("cargo_features") == client["cargo_features"],
+        f"{label}.collection config benchmark client features mismatch",
+    )
     sessions = validate_server_sessions(
         root,
         data.get("sessions"),
@@ -3902,6 +4350,20 @@ def validate_external_summary(
         require_abba=False,
         backend=backend,
         model=model,
+    )
+    configured_server = require_object(
+        collection_config.get("server"), f"{label}.collection.config.server"
+    )
+    configured_host = require_string(
+        configured_server.get("host"), f"{label}.collection.config.server.host"
+    )
+    configured_port = require_positive_int(
+        configured_server.get("port"), f"{label}.collection.config.server.port"
+    )
+    configured_origin = f"http://{configured_host}:{configured_port}"
+    require(
+        all(session.get("base_url") == configured_origin for session in sessions.values()),
+        f"{label}.collection config server origin differs from executed sessions",
     )
     require_log(root, data.get("command_log"), f"{label}.command_log")
     require_log(root, data.get("runtime_log"), f"{label}.runtime_log")
@@ -3945,6 +4407,7 @@ def validate_external_summary(
     data["_validated_identity"] = identity
     data["_validated_cap"] = cap
     data["_validated_sessions"] = sessions
+    data["_validated_collection"] = collection
     return data
 
 
@@ -3965,12 +4428,26 @@ def validate_performance_lane(
     expected_status = "pass" if correctness_status == "pass" else "blocked"
     require(data.get("status") == expected_status, f"{label}.status must be {expected_status}")
     hardware_item = hardware[model["lanes"][backend]["hardware_id"]]
+    collection = validate_performance_collection(
+        root,
+        data.get("collection"),
+        f"{label}.collection",
+        model=model,
+        backend=backend,
+        hardware_id=str(data["hardware_id"]),
+        correctness_status=correctness_status,
+    )
     external = validate_external_summary(
         root,
         model=model,
         backend=backend,
         hardware=hardware_item,
+        correctness_status=correctness_status,
         allow_synthetic=allow_synthetic,
+    )
+    require(
+        collection == external["_validated_collection"],
+        f"{label}.collection differs from external baseline collection evidence",
     )
     if expected_status == "blocked":
         require(data.get("comparable") is False, f"{label}.comparable must be false")
@@ -4017,6 +4494,10 @@ def validate_performance_lane(
         hardware_memory_bytes=int(hardware_item["memory_bytes"]),
     )
     require(cap_a == cap_b, f"{label} A/B typed active caps must match")
+    require(
+        identity_a["request_model"] == identity_b["request_model"],
+        f"{label} A/B request model aliases must match",
+    )
     if model["key"] == "m2-qwen35-35b-a3b" and backend == "cuda":
         require(cap_b >= 16, f"{label} M2 CUDA typed active cap must be at least 16")
     sessions = validate_server_sessions(
@@ -4228,11 +4709,118 @@ def validate_build_timings(
     hardware: dict[str, dict[str, Any]],
     binaries: dict[str, str],
 ) -> None:
-    data = read_json(root / "build-timings" / "summary.json")
+    base_data = read_json(root / "build-timings" / "summary.json")
+    base_collector = require_object(base_data.get("collector"), "build-timings.collector")
+    collector_path = BUILD_TIMING_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+    require(base_collector.get("path") == collector_path, "build-timings collector path mismatch")
+    current_collector_sha = file_sha256(BUILD_TIMING_COLLECTOR_PATH)
+    if base_collector.get("sha256") == current_collector_sha:
+        require(
+            not (root / BUILD_TIMING_CORE_PTX_REPAIR_REL).exists(),
+            "build-timings contains an unexpected core PTX repair for the current collector",
+        )
+        data = base_data
+    else:
+        require(
+            base_collector.get("sha256") == REJECTED_BUILD_TIMING_COLLECTOR_SHA256,
+            "build-timings collector SHA256 mismatch",
+        )
+        repair_path = root / BUILD_TIMING_CORE_PTX_REPAIR_REL
+        require(repair_path.is_file() and not repair_path.is_symlink(), "rejected build-timings collector requires core PTX repair evidence")
+        repair = read_json(repair_path)
+        require_schema(repair, "build-timing-core-ptx-repair")
+        require_source_identity(repair, "build-timing-core-ptx-repair")
+        require(
+            repair.get("artifact_type") == "runtime_vnext_build_timing_core_ptx_repair",
+            "build-timing-core-ptx-repair artifact type mismatch",
+        )
+        repair_collector = require_object(repair.get("collector"), "build-timing-core-ptx-repair.collector")
+        require(repair_collector.get("path") == collector_path, "build-timing-core-ptx-repair collector path mismatch")
+        require(repair_collector.get("sha256") == current_collector_sha, "build-timing-core-ptx-repair collector SHA256 mismatch")
+        base_ref = require_object(repair.get("base_summary"), "build-timing-core-ptx-repair.base_summary")
+        require(base_ref.get("path") == "build-timings/summary.json", "build-timing-core-ptx-repair base summary path mismatch")
+        build_artifact_ref(root, base_ref, "build-timing-core-ptx-repair.base_summary")
+        require(
+            repair.get("base_failure")
+            == "build-timings.core-ptx.samples[0] touch did not invalidate any Cargo artifact",
+            "build-timing-core-ptx-repair failure class mismatch",
+        )
+        require(
+            repair.get("rejected_collector_sha256") == REJECTED_BUILD_TIMING_COLLECTOR_SHA256,
+            "build-timing-core-ptx-repair rejected collector mismatch",
+        )
+        require(repair.get("rejected_input") == REJECTED_CORE_PTX_INPUT, "build-timing-core-ptx-repair rejected input mismatch")
+        require(
+            repair.get("replacement_input") == BUILD_SCENARIO_INPUTS["core-ptx"][1],
+            "build-timing-core-ptx-repair replacement input mismatch",
+        )
+        require(repair.get("hardware_id") == base_data.get("hardware_id"), "build-timing-core-ptx-repair hardware id mismatch")
+        require(
+            repair.get("hardware_fingerprint") == base_data.get("hardware_fingerprint"),
+            "build-timing-core-ptx-repair hardware fingerprint mismatch",
+        )
+        require(
+            repair.get("canonical_binary_sha256") == binaries["cuda"],
+            "build-timing-core-ptx-repair canonical binary mismatch",
+        )
+        base_rows = require_list(base_data.get("scenarios"), "build-timings.scenarios")
+        rejected_rows = [row for row in base_rows if isinstance(row, dict) and row.get("name") == "core-ptx"]
+        require(len(rejected_rows) == 1, "rejected build-timings core PTX scenario is missing or duplicated")
+        rejected_row = rejected_rows[0]
+        rejected_samples = require_list(rejected_row.get("samples"), "rejected-build-timings.core-ptx.samples")
+        require(len(rejected_samples) == 5, "rejected build-timings core PTX sample count mismatch")
+        for index, sample_raw in enumerate(rejected_samples):
+            label = f"rejected-build-timings.core-ptx.samples[{index}]"
+            sample = require_object(sample_raw, label)
+            _, cargo_summary, _, _ = validate_build_record(
+                root,
+                sample,
+                label,
+                require_binary_sha=None,
+                require_output_binary=True,
+            )
+            setup = require_object(sample.get("setup"), f"{label}.setup")
+            require(setup.get("input_path") == REJECTED_CORE_PTX_INPUT, f"{label} rejected input mismatch")
+            require(
+                cargo_summary["nonfresh_artifact_count"] == 0
+                and cargo_summary["fresh_artifact_count"] == cargo_summary["compiler_artifact_count"],
+                f"{label} does not reproduce the reviewed all-Fresh failure",
+            )
+        rejected_restore = require_object(
+            rejected_row.get("restore_verification"),
+            "rejected-build-timings.core-ptx.restore_verification",
+        )
+        _, rejected_restore_summary, _, _ = validate_build_record(
+            root,
+            rejected_restore,
+            "rejected-build-timings.core-ptx.restore_verification",
+            require_binary_sha=binaries["cuda"],
+            require_output_binary=True,
+        )
+        rejected_restored_input = require_object(
+            rejected_restore.get("restored_input"),
+            "rejected-build-timings.core-ptx.restore_verification.restored_input",
+        )
+        require(
+            rejected_restored_input.get("input_path") == REJECTED_CORE_PTX_INPUT,
+            "rejected-build-timings core PTX restore input mismatch",
+        )
+        require(
+            rejected_restore_summary["nonfresh_artifact_count"] == 0,
+            "rejected-build-timings core PTX restore does not reproduce the all-Fresh failure",
+        )
+        repaired_scenario = require_object(repair.get("scenario"), "build-timing-core-ptx-repair.scenario")
+        require(repaired_scenario.get("name") == "core-ptx", "build-timing-core-ptx-repair scenario mismatch")
+        data = copy.deepcopy(base_data)
+        data["collector"] = copy.deepcopy(repair_collector)
+        data["scenarios"] = [
+            copy.deepcopy(repaired_scenario) if isinstance(row, dict) and row.get("name") == "core-ptx" else row
+            for row in base_rows
+        ]
     require_schema(data, "build-timings")
     require_source_identity(data, "build-timings")
     collector = require_object(data.get("collector"), "build-timings.collector")
-    require(collector.get("path") == BUILD_TIMING_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(), "build-timings collector path mismatch")
+    require(collector.get("path") == collector_path, "build-timings collector path mismatch")
     require(collector.get("sha256") == file_sha256(BUILD_TIMING_COLLECTOR_PATH), "build-timings collector SHA256 mismatch")
     hardware_id = require_string(data.get("hardware_id"), "build-timings.hardware_id")
     require(hardware_id in hardware and hardware[hardware_id]["backend"] == "cuda", "build-timings must use frozen CUDA hardware")
@@ -4310,6 +4898,11 @@ def validate_build_timings(
                 if name in {"core-ptx", "native-tu"}:
                     expected_log_input = str(expected_input).removeprefix("crates/ferrum-kernels/")
                     require(expected_log_input in log_text, f"{label}.log does not bind the edited input")
+                    if name == "core-ptx":
+                        require(
+                            f"artifact=core-ptx:{expected_log_input} status=built" in log_text,
+                            f"{label}.log does not prove the selected PTX input was rebuilt",
+                        )
             else:
                 require(setup.get("argv") == ["cargo", "clean"], f"{label}.setup.argv must be cargo clean")
                 require(setup.get("returncode") == 0, f"{label}.setup cargo clean failed")
@@ -4337,6 +4930,17 @@ def validate_build_timings(
             )
             require(restore_summary["nonfresh_artifact_count"] > 0, f"build-timings.{name}.restore_verification was Fresh")
             require(any(expected_package in package for package in restore_summary["nonfresh_packages"]), f"build-timings.{name}.restore_verification did not rebuild {expected_package}")
+            if name == "core-ptx":
+                restore_log = build_artifact_ref(
+                    root,
+                    require_object(row["restore_verification"].get("log"), "build-timings.core-ptx.restore_verification.log"),
+                    "build-timings.core-ptx.restore_verification.log",
+                ).read_text(encoding="utf-8")
+                expected_log_input = str(expected_input).removeprefix("crates/ferrum-kernels/")
+                require(
+                    f"artifact=core-ptx:{expected_log_input} status=built" in restore_log,
+                    "build-timings.core-ptx.restore_verification.log does not prove the canonical PTX input was rebuilt",
+                )
             restored = require_object(row["restore_verification"].get("restored_input"), f"build-timings.{name}.restore_verification.restored_input")
             require(restored.get("input_path") == expected_input, f"build-timings.{name}.restore_verification input mismatch")
             restored_sha = require_sha256(restored.get("sha256"), f"build-timings.{name}.restore_verification restored SHA256")
@@ -4802,6 +5406,68 @@ def synthetic_process_identity(pid: int, started_at: datetime) -> tuple[str, dic
     return resource_sampler.process_marker_from_source(pid, source), source
 
 
+def synthetic_process_receipt(
+    root: Path,
+    *,
+    stem: str,
+    pid: int,
+    pgid: int,
+    marker: str,
+    source: dict[str, str],
+    argv: list[str],
+    environment: dict[str, str],
+    captured_at: datetime,
+) -> dict[str, Any]:
+    rel = f"{stem}.process-receipt.json"
+    ps_stdout = f"{pid} 999 {pgid} {' '.join(argv)}\n"
+    write_json(
+        root / rel,
+        {
+            "schema_version": COLLECTOR_SCHEMA_VERSION,
+            "captured_at": iso_at(captured_at),
+            "pid": pid,
+            "pgid": pgid,
+            "process_start_marker": marker,
+            "process_start_source": source,
+            "argv": argv,
+            "argv_sha256": canonical_json_sha256(argv),
+            "environment": environment,
+            "environment_sha256": canonical_json_sha256(environment),
+            "ps_stdout": ps_stdout,
+            "ps_stdout_sha256": hashlib.sha256(ps_stdout.encode("utf-8")).hexdigest(),
+        },
+    )
+    return {"path": rel, "sha256": file_sha256(root / rel)}
+
+
+def synthetic_engine_identity_probe(
+    root: Path,
+    *,
+    stem: str,
+    name: str,
+    expected: str,
+) -> dict[str, Any]:
+    stdout_rel = synthetic_log(root, f"{stem}.{name}.stdout.log", f"{expected}\n")
+    stderr_rel = synthetic_log(root, f"{stem}.{name}.stderr.log", "identity probe completed\n")
+    started_at = datetime(2025, 12, 1, tzinfo=timezone.utc)
+    finished_at = started_at + timedelta(seconds=1)
+    return {
+        "name": name,
+        "argv": [f"/selftest/{name}", "--version"],
+        "env": {"NO_COLOR": "1", "PATH": "/usr/bin"},
+        "expected": expected,
+        "timeout_sec": 60.0,
+        "started_at": iso_at(started_at),
+        "finished_at": iso_at(finished_at),
+        "duration_sec": 1.0,
+        "returncode": 0,
+        "stdout": stdout_rel,
+        "stdout_sha256": file_sha256(root / stdout_rel),
+        "stderr": stderr_rel,
+        "stderr_sha256": file_sha256(root / stderr_rel),
+    }
+
+
 def synthetic_resource_evidence(
     root: Path,
     *,
@@ -4852,6 +5518,7 @@ def synthetic_resource_evidence(
             "url": probe_url,
             "selector": "process-alive" if process_probe else "engine.active_requests",
             "semantics": "process-alive" if process_probe else "scheduler-active-high-water",
+            **resource_sampler.active_probe_policy(probe_format),
         },
     }
     active = min(concurrency, cap)
@@ -4870,6 +5537,9 @@ def synthetic_resource_evidence(
             "physical_headroom_bytes": memory_bytes // 2,
             "swap_used_bytes": 0,
             "active_requests": active,
+            "active_probe_attempts": 1,
+            "active_probe_duration_ms": 0.0,
+            "active_probe_errors": [],
             "oom_count": 0,
             "admission_error_count": 0,
         }
@@ -4882,7 +5552,7 @@ def synthetic_resource_evidence(
         "record_type": "footer",
         "finished_at": iso_at(finished + timedelta(seconds=2)),
         "sample_count": len(samples),
-        "exit_reason": "stop-file",
+        "exit_reason": "process-exit" if process_probe else "stop-file",
     }
     observation_path = root / observation_rel
     observation_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4925,7 +5595,16 @@ def synthetic_resource_evidence(
         "7200",
     ]
     if not process_probe:
-        argv.extend(["--active-path", "/health"])
+        argv.extend(
+            [
+                "--active-path",
+                "/health",
+                "--active-probe-timeout-ms",
+                str(resource_sampler.ACTIVE_PROBE_TIMEOUT_MS),
+                "--active-probe-max-attempts",
+                str(resource_sampler.ACTIVE_PROBE_MAX_ATTEMPTS),
+            ]
+        )
     summary = resource_sampler.derive_summary(
         observation_path,
         session_id=session["session_id"],
@@ -5053,6 +5732,7 @@ def synthetic_bench_report(
         "hw_id": hardware_id,
         "rust": "rustc-selftest",
         "ferrum_features": [backend],
+        "http_connection_mode": "fresh",
         "ferrum_env": {},
         "runtime_config": {"entries": []},
     }
@@ -5159,6 +5839,10 @@ def synthetic_http_implementation(
             workload_config["request_model"],
             "--tokenizer",
             workload["tokenizer_origin_path"],
+            "--target-backend",
+            backend,
+            "--http-connection-mode",
+            "fresh",
             "--concurrency",
             str(concurrency),
             "--dataset",
@@ -5472,6 +6156,7 @@ def synthetic_server_identity(
             "model_revision": model_lane["revision"],
             "model_format": model_lane["format"],
             "model_files": locked_file_map(model, backend),
+            "official_model_id": model["official_model_id"],
             "request_model": model["official_model_id"],
             "model_origin_path": model_origin_path,
             "memory_budget_bytes": memory_bytes // 2,
@@ -5490,20 +6175,123 @@ def synthetic_server_identity(
         "model_revision": model_lane["revision"],
         "model_format": model_lane["format"],
         "model_files": locked_file_map(model, backend),
+        "official_model_id": model["official_model_id"],
         "request_model": model["official_model_id"],
         "model_origin_path": model_origin_path,
         "memory_budget_bytes": memory_bytes // 2,
     }
     if implementation == "A":
+        engine_version = "selftest-1.0"
+        engine_revision = synthetic_sha(f"external-revision-{backend}")[:40]
+        probe_stem = f"server-config/{model_key}/{backend}/{implementation}"
         identity.update(
             {
-                "engine_version": "selftest-1.0",
-                "engine_revision": synthetic_sha(f"external-revision-{backend}")[:40],
+                "engine_version": engine_version,
+                "engine_revision": engine_revision,
+                "identity_probes": {
+                    "version": synthetic_engine_identity_probe(
+                        root,
+                        stem=probe_stem,
+                        name="external-version",
+                        expected=engine_version,
+                    ),
+                    "revision": synthetic_engine_identity_probe(
+                        root,
+                        stem=probe_stem,
+                        name="external-revision",
+                        expected=engine_revision,
+                    ),
+                },
             }
         )
     else:
         identity["source_git_sha"] = FROZEN_LEGACY_SHA
     return identity
+
+
+def synthetic_performance_collection(
+    root: Path,
+    *,
+    model_key: str,
+    backend: str,
+    hardware_id: str,
+    correctness_status: str,
+    external_identity: dict[str, Any],
+    benchmark_client: dict[str, Any],
+) -> dict[str, Any]:
+    collector_path = PERFORMANCE_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+    config_rel = f"collection/{model_key}/{backend}/config.normalized.json"
+    config_path = root / config_rel
+    config = {
+        "schema_version": COLLECTOR_SCHEMA_VERSION,
+        "model_key": model_key,
+        "backend": backend,
+        "model_origin_path": external_identity["model_origin_path"],
+        "request_model": external_identity["request_model"],
+        "typed_active_cap": external_identity["typed_active_cap"],
+        "memory_budget_bytes": external_identity["memory_budget_bytes"],
+        "server": {"host": "127.0.0.1", "port": 9100},
+        "benchmark_client": {
+            "source_git_sha": benchmark_client["source_git_sha"],
+            "cargo_features": benchmark_client["cargo_features"],
+        },
+        "external": {
+            "engine": external_identity["engine"],
+            "engine_version": external_identity["engine_version"],
+            "engine_revision": external_identity["engine_revision"],
+        },
+    }
+    write_json(config_path, config)
+    external_binary_sha256 = external_identity["binary_sha256"]
+    fingerprint = canonical_json_sha256(
+        {
+            "collector_sha256": file_sha256(PERFORMANCE_COLLECTOR_PATH),
+            "models_lock_sha256": file_sha256(root / "models.lock.json"),
+            "legacy_binaries_sha256": file_sha256(root / "legacy-binaries.json"),
+            "correctness_lane_sha256": file_sha256(
+                root / "correctness" / model_key / backend / "lane.json"
+            ),
+            "external_binary_sha256": external_binary_sha256,
+            "config": config,
+        }
+    )
+    plan_rel = f"collection/{model_key}/{backend}/plan.json"
+    plan_path = root / plan_rel
+    plan = {
+        "schema_version": COLLECTOR_SCHEMA_VERSION,
+        "artifact_type": "runtime_vnext_g00_performance_collection_plan",
+        "collector_path": collector_path,
+        "collector_sha256": file_sha256(PERFORMANCE_COLLECTOR_PATH),
+        "config_fingerprint": fingerprint,
+        "config": config_rel,
+        "config_sha256": file_sha256(config_path),
+        "correctness_lane_sha256": file_sha256(
+            root / "correctness" / model_key / backend / "lane.json"
+        ),
+        "external_binary_sha256": external_binary_sha256,
+        "model_key": model_key,
+        "backend": backend,
+        "correctness_status": correctness_status,
+        "hardware_id": hardware_id,
+        "cells": [
+            {"dataset": dataset, "concurrency": concurrency}
+            for dataset, concurrency in sorted(expected_cells(backend))
+        ],
+        "slots": [
+            {"slot": slot, "implementation": implementation}
+            for slot, implementation in enumerate(SLOT_ORDER, start=1)
+            if correctness_status == "pass" or implementation == "A"
+        ],
+        "paid_work_started_by_collector": False,
+    }
+    write_json(plan_path, plan)
+    return {
+        "collector_path": collector_path,
+        "collector_sha256": file_sha256(PERFORMANCE_COLLECTOR_PATH),
+        "plan": plan_rel,
+        "plan_sha256": file_sha256(plan_path),
+        "config_fingerprint": fingerprint,
+    }
 
 
 def synthetic_server_sessions(
@@ -5554,7 +6342,7 @@ def synthetic_server_sessions(
             f"server session {session_id} loaded model and shut down cleanly after measured cells\n",
         )
         runtime_origin = f"/remote/{runtime_rel}"
-        base_url = f"http://127.0.0.1:{9100 + slot}"
+        base_url = "http://127.0.0.1:9100"
         models_body = {"object": "list", "data": [{"id": identity["request_model"]}]}
         ready_probe = synthetic_endpoint_probe(
             root,
@@ -5594,6 +6382,10 @@ def synthetic_server_sessions(
                 identity["model_origin_path"],
                 "--backend",
                 backend,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9100",
                 "--effective-config-json",
                 product_origin,
             ]
@@ -5604,13 +6396,17 @@ def synthetic_server_sessions(
             }
         elif backend == "cuda":
             argv = [
-                "python",
-                "-m",
-                "vllm.entrypoints.openai.api_server",
-                "--model",
+                "/selftest/vllm",
+                "serve",
                 identity["model_origin_path"],
                 "--served-model-name",
                 identity["request_model"],
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9100",
+                "--max-num-seqs",
+                str(identity["typed_active_cap"]),
             ]
         else:
             argv = [
@@ -5619,7 +6415,25 @@ def synthetic_server_sessions(
                 identity["model_origin_path"],
                 "--alias",
                 identity["request_model"],
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9100",
+                "--parallel",
+                str(identity["typed_active_cap"]),
             ]
+        environment = {"NO_COLOR": "1", "PATH": "/usr/bin"}
+        process_receipt = synthetic_process_receipt(
+            root,
+            stem=f"sessions/{model_key}/{backend}/{implementation}/slot-{slot}",
+            pid=pid,
+            pgid=pgid,
+            marker=process_marker,
+            source=process_source,
+            argv=argv,
+            environment=environment,
+            captured_at=session_start + timedelta(seconds=1),
+        )
         rows.append(
             {
                 "session_id": session_id,
@@ -5636,7 +6450,9 @@ def synthetic_server_sessions(
                 "pgid": pgid,
                 "process_start_marker": process_marker,
                 "process_start_source": process_source,
+                "process_receipt": process_receipt,
                 "server_argv": argv,
+                "env": environment,
                 "base_url": base_url,
                 "started_at": iso_at(session_start),
                 "ready_at": iso_at(ready_at),
@@ -5860,6 +6676,57 @@ def synthetic_run_legacy(
                 cap=1,
                 process_probe=True,
             )
+            run_argv = [
+                "/selftest/legacy/ferrum",
+                "run",
+                model["official_model_id"],
+                "--prompt",
+                "Return the word Paris and then stop.",
+                "--tokenizer",
+                workload["tokenizer_origin_path"],
+                "--max-tokens",
+                "128",
+                "--disable-thinking",
+                "--seed",
+                "9271",
+                "--temperature",
+                "0.0",
+                "--top-k",
+                "20",
+                "--top-p",
+                "0.8",
+                "--repeat-penalty",
+                "1.0",
+                "--backend",
+                backend,
+                "--output-format",
+                "jsonl",
+                "--effective-config-json",
+                product_config_origin,
+            ]
+            run_environment = {"NO_COLOR": "1", "PATH": "/usr/bin", "RUST_LOG": "info"}
+            barrier_rel = synthetic_log(root, f"{stem}.exec-barrier.release", "release\n")
+            barrier_origin = f"/remote/{barrier_rel}"
+            launcher_argv = [
+                "python3",
+                f"/repo/{PERFORMANCE_COLLECTOR_PATH.name}",
+                "--exec-barrier-child",
+                "--release-file",
+                barrier_origin,
+                "--",
+                *run_argv,
+            ]
+            process_receipt = synthetic_process_receipt(
+                root,
+                stem=stem,
+                pid=pid,
+                pgid=pid,
+                marker=process_marker,
+                source=process_source,
+                argv=run_argv,
+                environment=run_environment,
+                captured_at=command_started + timedelta(seconds=1),
+            )
             samples.append(
                 {
                     "sample_id": sample_id,
@@ -5873,35 +6740,12 @@ def synthetic_run_legacy(
                     "effective_config_sha256": file_sha256(root / config_rel),
                     "prompt_sha256": prompt_sha,
                     "tokenizer_sha256": tokenizer_sha,
-                    "argv": [
-                        "/selftest/legacy/ferrum",
-                        "run",
-                        model["official_model_id"],
-                        "--prompt",
-                        "Return the word Paris and then stop.",
-                        "--tokenizer",
-                        workload["tokenizer_origin_path"],
-                        "--max-tokens",
-                        "128",
-                        "--disable-thinking",
-                        "--seed",
-                        "9271",
-                        "--temperature",
-                        "0.0",
-                        "--top-k",
-                        "20",
-                        "--top-p",
-                        "0.8",
-                        "--repeat-penalty",
-                        "1.0",
-                        "--backend",
-                        backend,
-                        "--output-format",
-                        "jsonl",
-                        "--effective-config-json",
-                        product_config_origin,
-                    ],
-                    "env": {"RUST_LOG": "info"},
+                    "argv": run_argv,
+                    "launcher_argv": launcher_argv,
+                    "barrier_release_origin_path": barrier_origin,
+                    "barrier_release": barrier_rel,
+                    "barrier_release_sha256": file_sha256(root / barrier_rel),
+                    "env": run_environment,
                     "started_at": window["started_at"],
                     "finished_at": window["finished_at"],
                     "duration_sec": (command_finished - command_started).total_seconds(),
@@ -5911,6 +6755,7 @@ def synthetic_run_legacy(
                     "pgid": pid,
                     "process_start_marker": process_marker,
                     "process_start_source": process_source,
+                    "process_receipt": process_receipt,
                     "returncode": 0,
                     "stdout": stdout_rel,
                     "stdout_sha256": file_sha256(root / stdout_rel),
@@ -6510,6 +7355,15 @@ def make_synthetic_root(root: Path) -> None:
                 binary_sha256=binary_map[backend],
                 memory_bytes=hardware_item["memory_bytes"],
             )
+            collection = synthetic_performance_collection(
+                root,
+                model_key=model_key,
+                backend=backend,
+                hardware_id=hardware_item["id"],
+                correctness_status="blocked" if blocked else "pass",
+                external_identity=identity_a,
+                benchmark_client=client,
+            )
             sessions_a = synthetic_server_sessions(
                 root,
                 model=model,
@@ -6597,6 +7451,7 @@ def make_synthetic_root(root: Path) -> None:
                 "hardware_fingerprint": hardware_item["fingerprint"],
                 "model_revision": model["lanes"][backend]["revision"],
                 "model_files": locked_file_map(model, backend),
+                "collection": copy.deepcopy(collection),
                 "benchmark_client": client,
                 "server_identity": identity_a,
                 "sessions": sessions_a,
@@ -6606,6 +7461,7 @@ def make_synthetic_root(root: Path) -> None:
             }
             write_json(root / "external-baselines" / model_key / backend / "summary.json", external)
             perf = copy.deepcopy(base)
+            perf["collection"] = copy.deepcopy(collection)
             if blocked:
                 perf.update(
                     {
@@ -6675,6 +7531,10 @@ def make_synthetic_root(root: Path) -> None:
         if native_input:
             log_input = str(native_input).removeprefix("crates/ferrum-kernels/")
             log_lines.append(f"[self-test] cargo:rerun-if-changed={log_input}")
+            if name == "core-ptx":
+                log_lines.append(
+                    f"[self-test] [cuda-build-summary] artifact=core-ptx:{log_input} status=built reason=signature-changed"
+                )
         if name in {"native-tu", "clean-release"}:
             log_lines.extend(
                 [
@@ -7023,6 +7883,19 @@ def make_synthetic_root(root: Path) -> None:
 _ACTIVE_SELFTEST: dict[str, Any] | None = None
 
 
+def record_selftest_mutation_path(path: Path) -> None:
+    runtime = _ACTIVE_SELFTEST
+    if runtime is None:
+        return
+    root = Path(os.path.realpath(runtime["root"]))
+    absolute = Path(os.path.realpath(path))
+    try:
+        relative = absolute.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise AssertionError(f"self-test mutation escaped fixture root: {absolute}") from exc
+    runtime["touched_paths"].add(relative)
+
+
 def clone_tree(source: Path, destination: Path) -> None:
     shutil.rmtree(destination, ignore_errors=True)
     copied = subprocess.run(
@@ -7044,8 +7917,10 @@ class SelftestTreeRestorer:
         self.entries = self._tree_state(pristine)
 
     @staticmethod
-    def _tree_state(root: Path) -> dict[str, tuple[str, int, str | None]]:
-        states: dict[str, tuple[str, int, str | None]] = {}
+    def _tree_state(
+        root: Path,
+    ) -> dict[str, tuple[str, int, int | None, int | None, str | None]]:
+        states: dict[str, tuple[str, int, int | None, int | None, str | None]] = {}
         pending = [root]
         while pending:
             directory = pending.pop()
@@ -7056,14 +7931,20 @@ class SelftestTreeRestorer:
                     metadata = entry.stat(follow_symlinks=False)
                     mode = stat.S_IMODE(metadata.st_mode)
                     if stat.S_ISDIR(metadata.st_mode):
-                        states[rel] = ("directory", mode, None)
+                        states[rel] = ("directory", mode, None, None, None)
                         pending.append(path)
                     elif stat.S_ISREG(metadata.st_mode):
-                        states[rel] = ("file", mode, file_sha256(path))
+                        states[rel] = (
+                            "file",
+                            mode,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            None,
+                        )
                     elif stat.S_ISLNK(metadata.st_mode):
-                        states[rel] = ("symlink", mode, os.readlink(path))
+                        states[rel] = ("symlink", mode, None, None, os.readlink(path))
                     else:
-                        states[rel] = ("other", mode, None)
+                        states[rel] = ("other", mode, None, None, None)
         return states
 
     @staticmethod
@@ -7077,10 +7958,31 @@ class SelftestTreeRestorer:
         else:
             path.unlink()
 
-    def _restore_entry(self, rel: str, expected: tuple[str, int, str | None]) -> None:
+    @staticmethod
+    def _path_state(
+        path: Path,
+    ) -> tuple[str, int, int | None, int | None, str | None] | None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return None
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            return ("directory", mode, None, None, None)
+        if stat.S_ISREG(metadata.st_mode):
+            return ("file", mode, metadata.st_size, metadata.st_mtime_ns, None)
+        if stat.S_ISLNK(metadata.st_mode):
+            return ("symlink", mode, None, None, os.readlink(path))
+        return ("other", mode, None, None, None)
+
+    def _restore_entry(
+        self,
+        rel: str,
+        expected: tuple[str, int, int | None, int | None, str | None],
+    ) -> None:
         source = self.pristine / rel
         destination = self.root / rel
-        kind, mode, target = expected
+        kind, mode, _, _, target = expected
         destination.parent.mkdir(parents=True, exist_ok=True)
         if kind == "directory":
             destination.mkdir(exist_ok=True)
@@ -7093,28 +7995,36 @@ class SelftestTreeRestorer:
         else:
             raise AssertionError(f"unsupported pristine self-test entry type: {rel}: {kind}")
 
-    def restore(self) -> None:
-        current = self._tree_state(self.root)
-        changed = {
-            rel
-            for rel in current.keys() | self.entries.keys()
-            if current.get(rel) != self.entries.get(rel)
-        }
-        directory_mode_changes = {
-            rel
-            for rel in changed
-            if current.get(rel, (None,))[0] == "directory"
-            and self.entries.get(rel, (None,))[0] == "directory"
-        }
-        for rel in directory_mode_changes:
-            (self.root / rel).chmod(self.entries[rel][1])
-        changed -= directory_mode_changes
-        for rel in sorted(changed, key=lambda value: len(Path(value).parts), reverse=True):
+    def restore(self, touched_paths: set[str]) -> int:
+        require(touched_paths, "self-test mutation made no journaled filesystem change")
+        restored = set(touched_paths)
+        for rel in tuple(restored):
+            expected = self.entries.get(rel)
+            if expected is not None and expected[0] == "directory":
+                prefix = f"{rel}/"
+                restored.update(candidate for candidate in self.entries if candidate.startswith(prefix))
+        for rel in sorted(restored, key=lambda value: len(Path(value).parts), reverse=True):
             self._remove_path(self.root / rel)
-        for rel in sorted(changed, key=lambda value: len(Path(value).parts)):
+        for rel in sorted(restored, key=lambda value: len(Path(value).parts)):
             expected = self.entries.get(rel)
             if expected is not None:
                 self._restore_entry(rel, expected)
+        for rel in restored:
+            expected = self.entries.get(rel)
+            actual = self._path_state(self.root / rel)
+            require(actual == expected, f"self-test failed to restore pristine metadata: {rel}")
+        return len(restored)
+
+    def require_pristine_metadata(self) -> None:
+        current = self._tree_state(self.root)
+        if current == self.entries:
+            return
+        changed = sorted(
+            rel
+            for rel in current.keys() | self.entries.keys()
+            if current.get(rel) != self.entries.get(rel)
+        )
+        raise BaselineError(f"self-test mutation journal left non-pristine paths: {changed[:10]}")
 
 
 def selftest_mutation_scope(name: str) -> str:
@@ -7215,10 +8125,10 @@ def validate_selftest_mutation(root: Path, name: str, context: dict[str, Any]) -
 
 def expect_reject(root: Path, name: str, mutate: Callable[[Path], None], marker: str) -> None:
     runtime = _ACTIVE_SELFTEST
-    fast = runtime is not None and runtime["mode"] == "fast"
-    case = root if fast else root.parent / f"reject-{name}"
-    if not fast:
-        clone_tree(root, case)
+    require(runtime is not None, "self-test mutation executed without active runtime state")
+    fast = runtime["mode"] == "fast"
+    case = root
+    runtime["touched_paths"] = set()
     try:
         mutate(case)
         try:
@@ -7236,10 +8146,8 @@ def expect_reject(root: Path, name: str, mutate: Callable[[Path], None], marker:
             return
         raise AssertionError(f"{name} unexpectedly passed")
     finally:
-        if fast:
-            runtime["restorer"].restore()
-        else:
-            shutil.rmtree(case, ignore_errors=True)
+        restored_count = runtime["restorer"].restore(runtime["touched_paths"])
+        require(restored_count > 0, f"{name} mutation made no restorable filesystem change")
 
 
 def mutate_json(path: Path, update: Callable[[dict[str, Any]], None]) -> None:
@@ -7306,6 +8214,7 @@ def mutate_perf_resource_observations(
     observation_path = root / resource["observations"]
     rows = [json.loads(line) for line in observation_path.read_text(encoding="utf-8").splitlines()]
     update(rows)
+    record_selftest_mutation_path(observation_path)
     observation_path.write_text(
         "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
         encoding="utf-8",
@@ -7337,6 +8246,120 @@ def mutate_perf_server_probe(
     write_json(summary_path, summary)
 
 
+def mutate_perf_server_process_receipt(
+    root: Path,
+    update: Callable[[dict[str, Any]], None],
+) -> None:
+    summary_path = root / "performance/m3-qwen3-30b-a3b/cuda/summary.json"
+    summary = read_json(summary_path)
+    session = next(row for row in summary["sessions"] if row["implementation"] == "B")
+    evidence = session["process_receipt"]
+    receipt_path = root / evidence["path"]
+    mutate_json(receipt_path, update)
+    evidence["sha256"] = file_sha256(receipt_path)
+    write_json(summary_path, summary)
+
+
+def mutate_perf_server_argv(root: Path, update: Callable[[list[Any]], None]) -> None:
+    summary_path = root / "performance/m3-qwen3-30b-a3b/cuda/summary.json"
+    summary = read_json(summary_path)
+    session = next(row for row in summary["sessions"] if row["implementation"] == "B")
+    update(session["server_argv"])
+    evidence = session["process_receipt"]
+    receipt_path = root / evidence["path"]
+    receipt = read_json(receipt_path)
+    receipt["argv"] = session["server_argv"]
+    receipt["argv_sha256"] = canonical_json_sha256(receipt["argv"])
+    fields = receipt["ps_stdout"].split(maxsplit=3)
+    require(len(fields) == 4, "self-test process receipt ps_stdout is malformed")
+    receipt["ps_stdout"] = f"{fields[0]} {fields[1]} {fields[2]} {' '.join(receipt['argv'])}\n"
+    receipt["ps_stdout_sha256"] = hashlib.sha256(receipt["ps_stdout"].encode("utf-8")).hexdigest()
+    write_json(receipt_path, receipt)
+    evidence["sha256"] = file_sha256(receipt_path)
+    write_json(summary_path, summary)
+
+
+def mutate_run_argv(root: Path, update: Callable[[list[Any]], None]) -> None:
+    summary_path = root / "performance/m3-qwen3-30b-a3b/cuda/summary.json"
+    summary = read_json(summary_path)
+    sample = summary["run_legacy"]["samples"][0]
+    update(sample["argv"])
+    delimiter = sample["launcher_argv"].index("--")
+    sample["launcher_argv"] = [*sample["launcher_argv"][: delimiter + 1], *sample["argv"]]
+    evidence = sample["process_receipt"]
+    receipt_path = root / evidence["path"]
+    receipt = read_json(receipt_path)
+    receipt["argv"] = sample["argv"]
+    receipt["argv_sha256"] = canonical_json_sha256(receipt["argv"])
+    fields = receipt["ps_stdout"].split(maxsplit=3)
+    require(len(fields) == 4, "self-test run process receipt ps_stdout is malformed")
+    receipt["ps_stdout"] = f"{fields[0]} {fields[1]} {fields[2]} {' '.join(receipt['argv'])}\n"
+    receipt["ps_stdout_sha256"] = hashlib.sha256(receipt["ps_stdout"].encode("utf-8")).hexdigest()
+    write_json(receipt_path, receipt)
+    evidence["sha256"] = file_sha256(receipt_path)
+    write_json(summary_path, summary)
+
+
+def mutate_external_identity_probe(root: Path) -> None:
+    summary_path = root / "external-baselines/m3-qwen3-30b-a3b/cuda/summary.json"
+    summary = read_json(summary_path)
+    probe = summary["server_identity"]["identity_probes"]["version"]
+    stdout_path = root / probe["stdout"]
+    record_selftest_mutation_path(stdout_path)
+    stdout_path.write_text("different engine version\n", encoding="utf-8")
+    probe["stdout_sha256"] = file_sha256(stdout_path)
+    write_json(summary_path, summary)
+
+
+def remove_external_active_cap(root: Path) -> None:
+    mutate_external_server_argv(
+        root,
+        lambda argv: remove_option_with_value(argv, "--max-num-seqs"),
+    )
+
+
+def mutate_external_server_argv(root: Path, update: Callable[[list[Any]], None]) -> None:
+    summary_path = root / "external-baselines/m3-qwen3-30b-a3b/cuda/summary.json"
+    summary = read_json(summary_path)
+    session = summary["sessions"][0]
+    update(session["server_argv"])
+    evidence = session["process_receipt"]
+    receipt_path = root / evidence["path"]
+    receipt = read_json(receipt_path)
+    receipt["argv"] = session["server_argv"]
+    receipt["argv_sha256"] = canonical_json_sha256(receipt["argv"])
+    fields = receipt["ps_stdout"].split(maxsplit=3)
+    require(len(fields) == 4, "self-test process receipt ps_stdout is malformed")
+    receipt["ps_stdout"] = f"{fields[0]} {fields[1]} {fields[2]} {' '.join(receipt['argv'])}\n"
+    receipt["ps_stdout_sha256"] = hashlib.sha256(receipt["ps_stdout"].encode("utf-8")).hexdigest()
+    write_json(receipt_path, receipt)
+    evidence["sha256"] = file_sha256(receipt_path)
+    write_json(summary_path, summary)
+
+
+def mutate_performance_collection_config(root: Path) -> None:
+    plan_path = root / "collection/m3-qwen3-30b-a3b/cuda/plan.json"
+    plan = read_json(plan_path)
+    config_path = root / str(plan["config"])
+    mutate_json(
+        config_path,
+        lambda config: config.update(
+            {"typed_active_cap": int(config["typed_active_cap"]) + 1}
+        ),
+    )
+    plan["config_sha256"] = file_sha256(config_path)
+    write_json(plan_path, plan)
+    plan_sha = file_sha256(plan_path)
+    for relative in (
+        "external-baselines/m3-qwen3-30b-a3b/cuda/summary.json",
+        "performance/m3-qwen3-30b-a3b/cuda/summary.json",
+    ):
+        summary_path = root / relative
+        summary = read_json(summary_path)
+        summary["collection"]["plan_sha256"] = plan_sha
+        write_json(summary_path, summary)
+
+
 def mutate_benchmark_client(root: Path, update: Callable[[dict[str, Any]], None]) -> None:
     path = root / "external-baselines/m3-qwen3-30b-a3b/cuda/summary.json"
     mutate_json(path, lambda data: update(data["benchmark_client"]))
@@ -7353,6 +8376,17 @@ def mutate_perf_server_config(root: Path, update: Callable[[dict[str, Any]], Non
     for session in summary["sessions"]:
         if session["implementation"] == "B":
             session["effective_config_sha256"] = digest
+    write_json(summary_path, summary)
+
+
+def mutate_perf_request_alias(root: Path) -> None:
+    summary_path = root / "performance/m3-qwen3-30b-a3b/cuda/summary.json"
+    summary = read_json(summary_path)
+    identity = summary["implementations"]["B"]
+    config_path = root / identity["effective_config"]
+    mutate_json(config_path, lambda config: config.update({"request_model": "different-runtime-alias"}))
+    identity["request_model"] = "different-runtime-alias"
+    identity["effective_config_sha256"] = file_sha256(config_path)
     write_json(summary_path, summary)
 
 
@@ -7434,6 +8468,7 @@ def make_first_historical_mutation_identical(root: Path) -> None:
     reproducer = data["families"][0]["cases"][0]["reproducer"]
     input_path = artifact_path(root, reproducer["input_path"], "selftest.historical.input")
     mutation_path = artifact_path(root, reproducer["mutation_path"], "selftest.historical.mutation")
+    record_selftest_mutation_path(mutation_path)
     mutation_path.write_bytes(input_path.read_bytes())
     reproducer["mutation_sha256"] = file_sha256(mutation_path)
     write_json(path, data)
@@ -7722,24 +8757,111 @@ def mutate_build_cargo_messages(
     messages_path = artifact_path(root, messages_ref["path"], "selftest.build.cargo_messages")
     messages = [json.loads(line) for line in messages_path.read_text(encoding="utf-8").splitlines() if line]
     update(messages)
+    record_selftest_mutation_path(messages_path)
     messages_path.write_text("".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
     messages_ref["sha256"] = file_sha256(messages_path)
     if recompute_summary:
         record["cargo_summary"] = build_timing.parse_cargo_messages(messages_path)
     write_json(summary_path, summary)
+    refresh_build_repair_base_binding(root)
 
 
 def tamper_build_content_evidence(root: Path) -> None:
-    summary_path = root / "build-timings/summary.json"
+    repair_path = root / BUILD_TIMING_CORE_PTX_REPAIR_REL
+    summary_path = repair_path if repair_path.is_file() else root / "build-timings/summary.json"
     summary = read_json(summary_path)
-    scenario = next(row for row in summary["scenarios"] if row["name"] == "core-ptx")
+    scenario = summary["scenario"] if summary_path == repair_path else next(
+        row for row in summary["scenarios"] if row["name"] == "core-ptx"
+    )
     setup = scenario["samples"][0]["setup"]
     during_path = artifact_path(root, setup["during_input"]["path"], "selftest.build.during_input")
+    record_selftest_mutation_path(during_path)
     during_path.write_bytes(during_path.read_bytes() + b"forged")
     digest = file_sha256(during_path)
     setup["during_input"]["sha256"] = digest
     setup["during_sha256"] = digest
     write_json(summary_path, summary)
+
+
+def rewrite_artifact_path_prefix(value: Any, old_prefix: str, new_prefix: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "path" and isinstance(item, str) and item.startswith(old_prefix):
+                value[key] = new_prefix + item.removeprefix(old_prefix)
+            else:
+                rewrite_artifact_path_prefix(item, old_prefix, new_prefix)
+    elif isinstance(value, list):
+        for item in value:
+            rewrite_artifact_path_prefix(item, old_prefix, new_prefix)
+
+
+def convert_synthetic_build_to_core_ptx_repair(root: Path) -> None:
+    base_path = root / "build-timings/summary.json"
+    base = read_json(base_path)
+    core = next(row for row in base["scenarios"] if row["name"] == "core-ptx")
+    repaired_core = copy.deepcopy(core)
+    repair_dir = root / BUILD_TIMING_CORE_PTX_REPAIR_REL.parent
+    repair_samples = repair_dir / "samples"
+    shutil.copytree(root / "build-timings/core-ptx", repair_samples)
+    rewrite_artifact_path_prefix(
+        repaired_core,
+        "build-timings/core-ptx/",
+        "build-timing-repairs/core-ptx/samples/",
+    )
+
+    for sample in core["samples"]:
+        sample["setup"]["input_path"] = REJECTED_CORE_PTX_INPUT
+        messages_path = artifact_path(root, sample["cargo_messages"]["path"], "selftest.rejected-core-ptx.messages")
+        messages = [json.loads(line) for line in messages_path.read_text(encoding="utf-8").splitlines() if line]
+        for row in messages:
+            if row.get("reason") == "compiler-artifact":
+                row["fresh"] = True
+        messages_path.write_text("".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
+        sample["cargo_messages"]["sha256"] = file_sha256(messages_path)
+        sample["cargo_summary"] = build_timing.parse_cargo_messages(messages_path)
+    restore = core["restore_verification"]
+    restore["restored_input"]["input_path"] = REJECTED_CORE_PTX_INPUT
+    restore_messages = artifact_path(
+        root,
+        restore["cargo_messages"]["path"],
+        "selftest.rejected-core-ptx.restore.messages",
+    )
+    messages = [json.loads(line) for line in restore_messages.read_text(encoding="utf-8").splitlines() if line]
+    for row in messages:
+        if row.get("reason") == "compiler-artifact":
+            row["fresh"] = True
+    restore_messages.write_text("".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
+    restore["cargo_messages"]["sha256"] = file_sha256(restore_messages)
+    restore["cargo_summary"] = build_timing.parse_cargo_messages(restore_messages)
+    base["collector"]["sha256"] = REJECTED_BUILD_TIMING_COLLECTOR_SHA256
+    write_json(base_path, base)
+
+    write_json(
+        repair_dir / "summary.json",
+        {
+            "schema_version": 1,
+            "artifact_type": "runtime_vnext_build_timing_core_ptx_repair",
+            "source_git_sha": base["source_git_sha"],
+            "source_tree_sha": base["source_tree_sha"],
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "collector": {
+                "path": BUILD_TIMING_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(),
+                "sha256": file_sha256(BUILD_TIMING_COLLECTOR_PATH),
+            },
+            "hardware_id": base["hardware_id"],
+            "hardware_fingerprint": base["hardware_fingerprint"],
+            "base_summary": {
+                "path": "build-timings/summary.json",
+                "sha256": file_sha256(base_path),
+            },
+            "base_failure": "build-timings.core-ptx.samples[0] touch did not invalidate any Cargo artifact",
+            "rejected_collector_sha256": REJECTED_BUILD_TIMING_COLLECTOR_SHA256,
+            "rejected_input": REJECTED_CORE_PTX_INPUT,
+            "replacement_input": BUILD_SCENARIO_INPUTS["core-ptx"][1],
+            "canonical_binary_sha256": file_sha256(root / "binaries/cuda/ferrum"),
+            "scenario": repaired_core,
+        },
+    )
 
 
 def tamper_restore_binary(root: Path) -> None:
@@ -7748,9 +8870,28 @@ def tamper_restore_binary(root: Path) -> None:
     scenario = next(row for row in summary["scenarios"] if row["name"] == "rust-model-leaf")
     binary_ref = scenario["restore_verification"]["output_binary"]
     binary_path = artifact_path(root, binary_ref["path"], "selftest.build.restore_binary")
+    record_selftest_mutation_path(binary_path)
     binary_path.write_bytes(binary_path.read_bytes() + b"forged")
     binary_ref["sha256"] = file_sha256(binary_path)
     write_json(summary_path, summary)
+    refresh_build_repair_base_binding(root)
+
+
+def refresh_build_repair_base_binding(root: Path) -> None:
+    repair_path = root / BUILD_TIMING_CORE_PTX_REPAIR_REL
+    if not repair_path.is_file():
+        return
+    repair = read_json(repair_path)
+    repair["base_summary"]["sha256"] = file_sha256(root / "build-timings/summary.json")
+    write_json(repair_path, repair)
+
+
+def mutate_build_summary(root: Path, update: Callable[[dict[str, Any]], None]) -> None:
+    summary_path = root / "build-timings/summary.json"
+    summary = read_json(summary_path)
+    update(summary)
+    write_json(summary_path, summary)
+    refresh_build_repair_base_binding(root)
 
 
 def tamper_hardware_raw_output(root: Path) -> None:
@@ -7761,6 +8902,7 @@ def tamper_hardware_raw_output(root: Path) -> None:
     probe = read_json(probe_path)
     gpu_command = next(row for row in probe["commands"] if row["kind"] == "gpu")
     stdout_path = artifact_path(probe_path.parent, gpu_command["stdout"], "selftest.hardware.gpu.stdout")
+    record_selftest_mutation_path(stdout_path)
     stdout_path.write_text(
         stdout_path.read_text(encoding="utf-8").replace("24576", "24000"),
         encoding="utf-8",
@@ -7890,6 +9032,7 @@ def mutate_cross_lane_session_id_conflict(root: Path) -> None:
                     for line in observations_path.read_text(encoding="utf-8").splitlines()
                     if line
                 ]
+                record_selftest_mutation_path(observations_path)
                 observations_path.write_text(
                     "".join(
                         json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
@@ -7915,8 +9058,16 @@ def mutate_inventory_review_binding(root: Path) -> None:
     write_json(path, data)
 
 
+def add_artifact_index_empty_file(root: Path) -> None:
+    path = root / "artifact-index-selftest-empty"
+    record_selftest_mutation_path(path)
+    path.write_bytes(b"")
+
+
 def add_artifact_index_symlink(root: Path) -> None:
-    os.symlink("models.lock.json", root / "artifact-index-selftest-link")
+    path = root / "artifact-index-selftest-link"
+    record_selftest_mutation_path(path)
+    os.symlink("models.lock.json", path)
 
 
 def external_path_self_test() -> int:
@@ -8020,6 +9171,7 @@ def _run_self_test(mode: str) -> int:
         root = Path(tmp) / "valid"
         root.mkdir()
         make_synthetic_root(root)
+        convert_synthetic_build_to_core_ptx_repair(root)
         manifest = validate_root(root, allow_synthetic=True)
         require(manifest["status"] == "pass", "valid synthetic baseline did not pass")
         try:
@@ -8029,7 +9181,6 @@ def _run_self_test(mode: str) -> int:
             require("synthetic/self-test" in str(exc), f"synthetic fixture rejected for unexpected reason: {exc}")
 
         context: dict[str, Any] = {}
-        restorer: SelftestTreeRestorer | None = None
         if mode == "fast":
             models_lock, hardware, models = validate_models_lock(root, allow_synthetic=True)
             binaries = validate_legacy_binaries(root, hardware)
@@ -8039,7 +9190,7 @@ def _run_self_test(mode: str) -> int:
                 "models": models,
                 "binaries": binaries,
             }
-            restorer = SelftestTreeRestorer(root, Path(tmp) / "pristine")
+        restorer = SelftestTreeRestorer(root, Path(tmp) / "pristine")
         runtime = {
             "mode": mode,
             "root": root,
@@ -8353,6 +9504,12 @@ def _run_self_test(mode: str) -> int:
         )
         expect_reject(
             root,
+            "ab-request-model-alias",
+            mutate_perf_request_alias,
+            "A/B request model aliases must match",
+        )
+        expect_reject(
+            root,
             "duplicate-server-session",
             lambda case: mutate_json(
                 case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
@@ -8416,6 +9573,18 @@ def _run_self_test(mode: str) -> int:
         )
         expect_reject(
             root,
+            "server-process-receipt-env",
+            lambda case: mutate_perf_server_process_receipt(
+                case,
+                lambda receipt: (
+                    receipt["environment"].pop(next(iter(receipt["environment"]))),
+                    receipt.update({"environment_sha256": canonical_json_sha256(receipt["environment"])}),
+                ),
+            ),
+            "environment differs from the executed session",
+        )
+        expect_reject(
+            root,
             "ready-probe-returncode",
             lambda case: mutate_perf_probe_receipt(
                 case, "ready_probe", lambda receipt: receipt.update({"returncode": 1})
@@ -8431,6 +9600,51 @@ def _run_self_test(mode: str) -> int:
                 lambda body: body["data"][0].update({"id": "forged-model"}),
             ),
             "loaded model identity mismatch",
+        )
+        expect_reject(
+            root,
+            "external-identity-probe",
+            mutate_external_identity_probe,
+            "logs do not contain the declared engine identity",
+        )
+        expect_reject(
+            root,
+            "external-active-cap-argv",
+            remove_external_active_cap,
+            "--max-num-seqs",
+        )
+        expect_reject(
+            root,
+            "external-server-bind-argv",
+            lambda case: mutate_external_server_argv(
+                case,
+                lambda argv: remove_option_with_value(argv, "--port"),
+            ),
+            "--port",
+        )
+        expect_reject(
+            root,
+            "external-vllm-positional-model",
+            lambda case: mutate_external_server_argv(
+                case,
+                lambda argv: argv.__setitem__(2, "/models/forged"),
+            ),
+            "positional model origin mismatch",
+        )
+        expect_reject(
+            root,
+            "performance-collector-plan",
+            lambda case: mutate_json(
+                case / "external-baselines/m3-qwen3-30b-a3b/cuda/summary.json",
+                lambda data: data["collection"].update({"plan_sha256": "0" * 64}),
+            ),
+            "collection.plan SHA256 mismatch",
+        )
+        expect_reject(
+            root,
+            "performance-collector-config-fingerprint",
+            mutate_performance_collection_config,
+            "config_fingerprint is not derived from the frozen inputs",
         )
         expect_reject(
             root,
@@ -8451,12 +9665,9 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "server-effective-config-argv",
-            lambda case: mutate_json(
-                case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
-                lambda data: remove_option_with_value(
-                    next(row for row in data["sessions"] if row["implementation"] == "B")["server_argv"],
-                    "--effective-config-json",
-                ),
+            lambda case: mutate_perf_server_argv(
+                case,
+                lambda argv: remove_option_with_value(argv, "--effective-config-json"),
             ),
             "--effective-config-json",
         )
@@ -8487,6 +9698,18 @@ def _run_self_test(mode: str) -> int:
                 lambda data: data["cells"][0]["implementations"]["B"]["reports"][0]["bench_argv"].remove("--require-ci"),
             ),
             "missing canonical --require-ci",
+        )
+        expect_reject(
+            root,
+            "bench-http-connection-argv",
+            lambda case: mutate_json(
+                case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
+                lambda data: remove_option_with_value(
+                    data["cells"][0]["implementations"]["B"]["reports"][0]["bench_argv"],
+                    "--http-connection-mode",
+                ),
+            ),
+            "--http-connection-mode",
         )
         expect_reject(
             root,
@@ -8596,6 +9819,16 @@ def _run_self_test(mode: str) -> int:
                 ),
             ),
             "HTTP measurements cannot use process-alive",
+        )
+        expect_reject(
+            root,
+            "resource-http-exit-reason",
+            lambda case: mutate_perf_resource_observations(
+                case,
+                lambda rows: rows[-1].update({"exit_reason": "process-exit"}),
+                summary_update=lambda summary: summary.update({"exit_reason": "process-exit"}),
+            ),
+            "summary.exit_reason must be stop-file",
         )
         expect_reject(
             root,
@@ -8754,12 +9987,30 @@ def _run_self_test(mode: str) -> int:
         )
         expect_reject(
             root,
+            "bench-http-connection-env",
+            lambda case: mutate_perf_report(
+                case,
+                lambda data: data["env"].update({"http_connection_mode": "pooled"}),
+            ),
+            "env.http_connection_mode must be fresh",
+        )
+        expect_reject(
+            root,
             "run-real-command",
-            lambda case: mutate_json(
-                case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
-                lambda data: data["run_legacy"]["samples"][0]["argv"].remove("--disable-thinking"),
+            lambda case: mutate_run_argv(
+                case,
+                lambda argv: argv.remove("--disable-thinking"),
             ),
             "must explicitly disable thinking",
+        )
+        expect_reject(
+            root,
+            "run-process-receipt-missing",
+            lambda case: mutate_json(
+                case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
+                lambda data: data["run_legacy"]["samples"][0].pop("process_receipt"),
+            ),
+            "process_receipt must be a JSON object",
         )
         expect_reject(
             root,
@@ -8805,7 +10056,7 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "artifact-index-empty-file",
-            lambda case: (case / "artifact-index-selftest-empty").write_bytes(b""),
+            add_artifact_index_empty_file,
             "artifact file is empty",
         )
         expect_reject(
@@ -8817,8 +10068,8 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "build-real-command",
-            lambda case: mutate_json(
-                case / "build-timings/summary.json",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: data["scenarios"][0].update({"command": ["true"]}),
             ),
             "command is not canonical",
@@ -8826,8 +10077,8 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "build-raw-summary",
-            lambda case: mutate_json(
-                case / "build-timings/summary.json",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: data["scenarios"][0]["samples"][0]["cargo_summary"].update(
                     {"compiler_artifact_count": 99}
                 ),
@@ -8856,9 +10107,18 @@ def _run_self_test(mode: str) -> int:
         )
         expect_reject(
             root,
-            "build-native-log-derivation",
+            "build-repair-base-binding",
             lambda case: mutate_json(
-                case / "build-timings/summary.json",
+                case / BUILD_TIMING_CORE_PTX_REPAIR_REL,
+                lambda data: data["base_summary"].update({"sha256": "0" * 64}),
+            ),
+            "sha256 mismatch",
+        )
+        expect_reject(
+            root,
+            "build-native-log-derivation",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: data["scenarios"][next(
                     index for index, row in enumerate(data["scenarios"]) if row["name"] == "native-tu"
                 )]["samples"][0]["native_build"].update({"compiled_tu_count": 99}),
@@ -8888,8 +10148,8 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "build-restore-mtime",
-            lambda case: mutate_json(
-                case / "build-timings/summary.json",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: next(
                     row for row in data["scenarios"] if row["name"] == "rust-model-leaf"
                 )["restore_verification"]["restored_input"].update({"verification_mtime_ns": 100}),
@@ -8910,8 +10170,10 @@ def _run_self_test(mode: str) -> int:
             "self-test mutation names/order differ from the locked red-team matrix",
         )
         if mode == "fast":
+            restorer.require_pristine_metadata()
+        else:
             restored_manifest = validate_root(root, allow_synthetic=True)
-            require(restored_manifest["status"] == "pass", "fast self-test did not restore the valid fixture")
+            require(restored_manifest["status"] == "pass", "full self-test did not restore the valid fixture")
         _ACTIVE_SELFTEST = None
         summary = {
             "schema_version": 1,
@@ -8920,7 +10182,7 @@ def _run_self_test(mode: str) -> int:
             "expected_mutation_assertion_count": len(SELFTEST_MUTATION_NAMES),
             "mutation_names": runtime["mutations"],
             "validator_counts": dict(sorted(runtime["validator_counts"].items())),
-            "valid_fixture_assertion_count": 3 if mode == "fast" else 2,
+            "valid_fixture_assertion_count": 3,
         }
     print(f"{SELFTEST_SUMMARY_PREFIX} {json.dumps(summary, sort_keys=True, separators=(',', ':'))}")
     print(SELFTEST_FAST_PASS_LINE if mode == "fast" else SELFTEST_FULL_PASS_LINE)
@@ -8963,12 +10225,29 @@ def main() -> int:
         return 1
     if not args.require_full_self_test:
         parser.error("--require-full-self-test is required for real --out validation")
+    try:
+        validate_root(root)
+    except BaselineError as exc:
+        root.mkdir(parents=True, exist_ok=True)
+        write_json(
+            root / "manifest.json",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": "fail",
+                "source_git_sha": FROZEN_LEGACY_SHA,
+                "validated_at": now_iso(),
+                "artifact_dir": str(root),
+                "error": str(exc),
+                "pass_line": None,
+            },
+        )
+        print(f"FERRUM RUNTIME VNEXT G00 BASELINE FAIL: {root}: {exc}", file=sys.stderr)
+        return 1
     full_self_test()
     try:
         manifest = validate_root(root)
         write_json(root / "manifest.json", manifest)
     except BaselineError as exc:
-        root.mkdir(parents=True, exist_ok=True)
         write_json(
             root / "manifest.json",
             {

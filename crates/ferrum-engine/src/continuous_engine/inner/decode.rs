@@ -1,7 +1,315 @@
 use super::*;
 
+#[derive(Debug)]
+pub(in crate::continuous_engine) enum PlanRuntimeDecodeBatchOutcome {
+    Completed,
+    Deferred {
+        request_ids: Vec<RequestId>,
+        deferral: ExecutorExecutionCapacityDeferral,
+    },
+}
+
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
+
+    /// Executes one PlanRuntime decode cohort through the typed batch API.
+    /// Output cardinality and cache identity are validated before any request
+    /// publishes a sampled token or updated physical-resource handle.
+    pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<PlanRuntimeDecodeBatchOutcome> {
+        let mut rids = Vec::with_capacity(request_ids.len());
+        let mut inputs = Vec::with_capacity(request_ids.len());
+        {
+            let sequences = self.sequences.read();
+            for rid in request_ids {
+                let Some(sequence) = sequences.get(rid) else {
+                    continue;
+                };
+                let Some(resources) = sequence.ready_decode_resources(rid) else {
+                    continue;
+                };
+                let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
+                let input =
+                    ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
+                        .with_request_id(rid.clone())
+                        .with_metadata(sequence.model_decode_metadata())
+                        .with_logits_policy(sequence.model_decode_logits_policy());
+                inputs.push(if let Some(state) = resources.recurrent_state {
+                    input.with_recurrent_state(state)
+                } else {
+                    input
+                });
+                rids.push(rid.clone());
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(PlanRuntimeDecodeBatchOutcome::Completed);
+        }
+
+        let input_cache_ids = inputs
+            .iter()
+            .map(|input| input.kv_cache.cache_id())
+            .collect::<Vec<_>>();
+        let input_recurrent_states = inputs
+            .iter()
+            .map(|input| input.recurrent_state.clone())
+            .collect::<Vec<_>>();
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            rids.clone(),
+            "engine_plan_runtime_batch_decode_workspace",
+            "engine_plan_runtime_batch_decode_workspace_release",
+        );
+        let outputs = match self
+            .model_executor
+            .batch_decode_with_capacity(&inputs)
+            .await
+        {
+            Ok(ExecutorBatchDecodeOutcome::Completed(outputs)) => {
+                workspace_lease.release();
+                outputs
+            }
+            Ok(ExecutorBatchDecodeOutcome::Deferred(deferral)) => {
+                workspace_lease.release();
+                return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids: rids,
+                    deferral,
+                });
+            }
+            Err(error) => {
+                drop(workspace_lease);
+                return Err(error);
+            }
+        };
+        if outputs.len() != rids.len() {
+            return Err(FerrumError::internal(format!(
+                "PlanRuntime batch_decode returned {} outputs for {} requests",
+                outputs.len(),
+                rids.len()
+            )));
+        }
+        for (index, (output, expected_cache_id)) in outputs.iter().zip(&input_cache_ids).enumerate()
+        {
+            let actual_cache_id = output.kv_cache.cache_id();
+            if &actual_cache_id != expected_cache_id {
+                return Err(FerrumError::internal(format!(
+                    "PlanRuntime batch_decode output {index} returned cache `{actual_cache_id}`, expected `{expected_cache_id}`"
+                )));
+            }
+        }
+        let logits = outputs
+            .iter()
+            .map(|output| output.logits.to_vec_f32())
+            .collect::<Result<Vec<_>>>()?;
+
+        for (((rid, output), input_recurrent_state), mut logits) in rids
+            .iter()
+            .zip(outputs)
+            .zip(input_recurrent_states)
+            .zip(logits)
+        {
+            let next_token_result = {
+                let mut sequences = self.sequences.write();
+                sequences.get_mut(rid).map(|sequence| {
+                    let token = if logits.len() == 1 {
+                        let token = TokenId::new(logits[0] as u32);
+                        sequence.accept_model_greedy_argmax_token(
+                            Some(self.tokenizer.as_ref()),
+                            token,
+                        )?;
+                        token
+                    } else {
+                        sequence.sample_with_processors_with_tokenizer(
+                            &mut logits,
+                            Some(self.tokenizer.as_ref()),
+                        )?
+                    };
+                    sequence.generated_tokens.push(token);
+                    sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
+                    sequence.commit_decode_recurrent_state(
+                        output.recurrent_state.clone().or(input_recurrent_state),
+                    );
+                    Ok::<TokenId, FerrumError>(token)
+                })
+            };
+            let Some(next_token_result) = next_token_result else {
+                continue;
+            };
+            let next_token = match next_token_result {
+                Ok(token) => token,
+                Err(error) => {
+                    warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
+                    self.complete_request_with_error(rid, error).await?;
+                    continue;
+                }
+            };
+
+            let generated_count = self
+                .sequences
+                .read()
+                .get(rid)
+                .map(|sequence| sequence.generated_tokens.len())
+                .unwrap_or(0);
+            self.scheduler.update_decode_progress(rid, generated_count);
+            self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.decode_tokens_total").increment(1);
+
+            let stop_reason = self.stop_reason_for_request(rid);
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(rid, next_token).await;
+            }
+            if let Some(reason) = stop_reason {
+                self.complete_request(rid, reason).await?;
+            }
+        }
+        Ok(PlanRuntimeDecodeBatchOutcome::Completed)
+    }
+
+    pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode_adaptive(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<()> {
+        let mut stack = vec![self.decode_ready_request_ids(request_ids)];
+        while let Some(chunk) = stack.pop() {
+            let chunk = self.decode_ready_request_ids(&chunk);
+            if chunk.is_empty() {
+                continue;
+            }
+            let outcome = match self.run_plan_runtime_batch_decode(&chunk).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    warn!(
+                        "Plan-runtime adaptive decode failed for {} exact request(s): {}",
+                        chunk.len(),
+                        error
+                    );
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "engine_plan_runtime_decode_subcohort_failure",
+                        "request_ids": chunk,
+                        "error": error.to_string(),
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                    for request_id in &chunk {
+                        self.complete_request(request_id, FinishReason::Error)
+                            .await?;
+                    }
+                    continue;
+                }
+            };
+            match outcome {
+                PlanRuntimeDecodeBatchOutcome::Completed => {}
+                PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids,
+                    deferral,
+                } if request_ids.len() > 1 => {
+                    self.trace_executor_decode_capacity_decision(
+                        &request_ids,
+                        &deferral,
+                        "split_cohort",
+                        None,
+                    );
+                    self.scheduler
+                        .record_decode_capacity_pressure(request_ids.len(), None);
+                    let mid = request_ids.len() / 2;
+                    stack.push(request_ids[mid..].to_vec());
+                    stack.push(request_ids[..mid].to_vec());
+                }
+                PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids,
+                    deferral,
+                } => {
+                    let observed = deferral.observed();
+                    let scheduler_deferral = AdmissionDeferral::new(
+                        DeferredAction::WaitForRelease,
+                        AdmissionWakeEpochs::new(
+                            observed.coordinator_id,
+                            observed.release_epoch,
+                            observed.capacity_epoch,
+                            0,
+                        ),
+                        deferral.wait_condition().clone(),
+                    );
+                    let release_snapshot = self.execution_capacity_release_snapshot()?;
+                    match self.scheduler.defer_decode_for_execution_capacity(
+                        &request_ids,
+                        scheduler_deferral,
+                        &release_snapshot,
+                    )? {
+                        ExecutionCapacityAction::Deferred { count } => {
+                            if count != request_ids.len() {
+                                return Err(FerrumError::scheduler(format!(
+                                    "PlanRuntime decode deferral retained {count} of {} scheduler entries",
+                                    request_ids.len()
+                                )));
+                            }
+                            self.trace_executor_decode_capacity_decision(
+                                &request_ids,
+                                &deferral,
+                                "wait_for_release",
+                                None,
+                            );
+                            self.write_scheduler_trace_event(serde_json::json!({
+                                "event": "scheduler_execution_capacity_defer",
+                                "request_ids": request_ids,
+                                "stage": deferral.stage(),
+                                "observed": observed,
+                                "wait_condition": deferral.wait_condition(),
+                                "scheduler": self.scheduler.trace_snapshot(),
+                            }));
+                        }
+                        ExecutionCapacityAction::YieldPlanned { transaction } => {
+                            let victim_id = transaction.victim_request_id().clone();
+                            let progress_owner_id = transaction.progress_owner_id().clone();
+                            let progress_baseline = transaction.progress_baseline().get();
+                            self.trace_executor_decode_capacity_decision(
+                                &request_ids,
+                                &deferral,
+                                "pressure_yield_planned",
+                                Some(&transaction),
+                            );
+                            let progress_owner_resumable = self
+                                .execute_capacity_yield(
+                                    &transaction,
+                                    request_ids.len().max(1),
+                                    None,
+                                )
+                                .await?;
+                            self.write_scheduler_trace_event(serde_json::json!({
+                                "event": "scheduler_execution_capacity_yield_planned",
+                                "request_ids": &request_ids,
+                                "episode_id": transaction.episode_id().get(),
+                                "handoff_generation": transaction.handoff_generation(),
+                                "yield_kind": transaction.kind().as_str(),
+                                "planned_transition_ordinal": transaction.planned_ordinal().get(),
+                                "victim_request_id": victim_id,
+                                "progress_owner_id": progress_owner_id,
+                                "progress_baseline": progress_baseline,
+                                "stage": deferral.stage(),
+                                "observed": observed,
+                                "wait_condition": deferral.wait_condition(),
+                                "scheduler": self.scheduler.trace_snapshot(),
+                            }));
+                            // The yielded request no longer owns runnable physical
+                            // resources. Resume the frontier named by the completed
+                            // release transaction instead of retrying the victim.
+                            if progress_owner_resumable {
+                                stack.push(vec![progress_owner_id]);
+                            }
+                        }
+                        ExecutionCapacityAction::InvariantViolation { violation } => {
+                            return Err(FerrumError::internal(format!(
+                                "execution-capacity pressure episode {} violated {:?}",
+                                violation.episode_id().get(),
+                                violation.class()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
         self.run_batch_decode_adaptive_inner(request_ids, true)
@@ -199,7 +507,7 @@ impl EngineInner {
                 let cache_id = seq.decode_model_cache_id_or_request_id(rid);
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
-                seq.commit_decode_step_physical_resources(model_kv);
+                seq.commit_decode_step_physical_resources(model_kv)?;
                 // pos_offset is sourced from SequenceState bookkeeping
                 // (see process_batch_unified). The engine-side KV handle's
                 // sequence_length is not used for position tracking
@@ -211,7 +519,7 @@ impl EngineInner {
                 Ok(token) => token,
                 Err(e) => {
                     warn!("Batch decode post-process failed for {}: {}", rid, e);
-                    self.complete_request(rid, FinishReason::Error).await?;
+                    self.complete_request_with_error(rid, e).await?;
                     continue;
                 }
             };
@@ -287,7 +595,16 @@ impl EngineInner {
         // Speculative decoding path: when both a draft executor and
         // config are set, delegate to the runner and push the accepted
         // tokens onto the sequence in one shot.
-        if self.draft_executor.is_some() && self.spec_config.is_some() {
+        // The legacy speculative runner can express only raw greedy sampling.
+        // Any host processor, grammar, or token-validity mask must stay on the
+        // ordinary decode path so request semantics are never silently skipped.
+        let can_use_speculative_decode = self
+            .sequences
+            .read()
+            .get(request_id)
+            .is_some_and(SequenceState::supports_raw_speculative_decode);
+        if self.draft_executor.is_some() && self.spec_config.is_some() && can_use_speculative_decode
+        {
             return self.run_decode_step_speculative(request_id).await;
         }
 
@@ -302,6 +619,7 @@ impl EngineInner {
             let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
             let input =
                 ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
+                    .with_request_id(request_id.clone())
                     .with_metadata(seq.model_decode_metadata())
                     .with_logits_policy(seq.model_decode_logits_policy());
             if let Some(state) = resources.recurrent_state {
@@ -329,7 +647,7 @@ impl EngineInner {
         };
         let logits_vec = decode_output.logits.to_vec_f32()?;
 
-        let next_token = {
+        let next_token_result = (|| {
             let mut sequences = self.sequences.write();
             let seq = sequences
                 .get_mut(request_id)
@@ -346,14 +664,22 @@ impl EngineInner {
                 )?
             };
             seq.generated_tokens.push(token);
-            seq.commit_decode_step_physical_resources(decode_output.kv_cache.clone());
+            seq.commit_decode_step_physical_resources(decode_output.kv_cache.clone())?;
             seq.commit_decode_recurrent_state(
                 decode_output
                     .recurrent_state
                     .clone()
                     .or(input_recurrent_state),
             );
-            token
+            Ok::<TokenId, FerrumError>(token)
+        })();
+        let next_token = match next_token_result {
+            Ok(token) => token,
+            Err(error) => {
+                warn!("Decode post-process failed for {}: {}", request_id, error);
+                self.complete_request_with_error(request_id, error).await?;
+                return Ok(());
+            }
         };
 
         let generated_count = {
@@ -596,6 +922,7 @@ impl EngineInner {
                 let mut sequences = self.sequences.write();
                 if let Some(seq) = sequences.get_mut(request_id) {
                     seq.generated_tokens.push(tok);
+                    *seq.token_frequencies.entry(tok).or_insert(0) += 1;
                     seq.tokens_this_iteration += 1;
                 }
             }
@@ -620,7 +947,7 @@ impl EngineInner {
                 seq.commit_speculative_decode_physical_resources(
                     target_kv_aligned,
                     draft_kv_aligned,
-                );
+                )?;
             }
         }
         let _ = last_emitted;

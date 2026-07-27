@@ -8,6 +8,7 @@ use crate::{
         render_chat_prompt_with_model_template_options,
         render_chat_prompt_with_tools_and_model_template, ChatTemplateOptions, ModelChatTemplate,
     },
+    model_registry::{LoraAdapterModel, ServedModelKind, ServedModelRegistry},
     openai::*,
     traits::HttpServer,
     types::*,
@@ -22,17 +23,20 @@ use axum::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
-    FinishReason, InferenceRequest, InferenceResponse, ModelId, Priority, ProcessMemoryObservation,
-    ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
-    ProfileStatus, ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction,
-    ResourceTraceEvent, RuntimeConfigSnapshot, SamplingParams, TokenId, TokenUsage,
+    has_unclosed_thinking_block, parse_reasoning_response,
+    parse_reasoning_response_started_in_think, EngineMetrics, EngineStatus, FerrumConfigBuilder,
+    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceRequest, InferenceResponse,
+    ModelId, ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
+    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
+    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
+    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
     DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    error::Error as StdError,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -42,7 +46,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -51,15 +55,29 @@ use uuid::Uuid;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
-const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
+const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 4096;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
-const THINK_START_TAG: &str = "<think>";
-const THINK_END_TAG: &str = "</think>";
 const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
+const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"];
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
 static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static JSON_SCHEMA_VALIDATOR_CACHE: OnceLock<Mutex<HashMap<String, Arc<jsonschema::Validator>>>> =
+    OnceLock::new();
+
+/// Product defaults used when an OpenAI chat request omits sampling fields.
+/// The engine composition root consumes the same typed value so its resolved
+/// startup plan cannot describe different defaults from the HTTP endpoint.
+pub fn default_chat_sampling_params() -> SamplingParams {
+    SamplingParams {
+        max_tokens: DEFAULT_COMPLETION_MAX_TOKENS as usize,
+        temperature: DEFAULT_SAMPLING_TEMPERATURE,
+        top_p: DEFAULT_SAMPLING_TOP_P,
+        repetition_penalty: DEFAULT_CHAT_REPETITION_PENALTY,
+        ..SamplingParams::default()
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CachePolicy {
@@ -128,6 +146,53 @@ pub fn init_prometheus_recorder() {
 pub struct AxumServer {
     state: AppState,
     config: ServerConfig,
+    lifecycle: Arc<AxumServerLifecycle>,
+}
+
+#[derive(Default)]
+struct AxumServerLifecycle {
+    shutdown_requested: AtomicBool,
+    running: AtomicBool,
+    engines_stopped: AtomicBool,
+    shutdown_notify: Notify,
+    stopped_notify: Notify,
+    stop_lock: tokio::sync::Mutex<()>,
+}
+
+impl AxumServerLifecycle {
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    async fn wait_for_shutdown(&self) {
+        while !self.shutdown_requested.load(Ordering::Acquire) {
+            self.shutdown_notify.notified().await;
+        }
+    }
+
+    async fn wait_until_stopped(&self) {
+        while self.running.load(Ordering::Acquire) {
+            self.stopped_notify.notified().await;
+        }
+    }
+}
+
+struct AxumServerRunGuard {
+    lifecycle: Arc<AxumServerLifecycle>,
+}
+
+impl Drop for AxumServerRunGuard {
+    fn drop(&mut self) {
+        self.lifecycle.running.store(false, Ordering::Release);
+        self.lifecycle.stopped_notify.notify_waiters();
+    }
+}
+
+fn single_model_registry(engine_model_id: ModelId, kind: ServedModelKind) -> ServedModelRegistry {
+    let public_name = engine_model_id.to_string();
+    ServedModelRegistry::try_new(engine_model_id, kind, vec![public_name], vec![])
+        .expect("engine config must contain a valid model id")
 }
 
 impl AxumServer {
@@ -136,6 +201,7 @@ impl AxumServer {
         Self {
             state,
             config: ServerConfig::default(),
+            lifecycle: Arc::new(AxumServerLifecycle::default()),
         }
     }
 
@@ -175,14 +241,67 @@ impl AxumServer {
         self
     }
 
+    /// Install the public OpenAI model namespace used for request routing and
+    /// `/v1/models`. The registry keeps public aliases separate from the
+    /// engine's internal model id.
+    pub fn with_served_model_registry(mut self, registry: ServedModelRegistry) -> Self {
+        self.state = self.state.with_served_model_registry(registry);
+        self
+    }
+
     /// Attach startup-loaded LoRA adapter model ids.
     pub fn with_lora_adapters(
         mut self,
         base_model_id: impl Into<String>,
         adapters: Vec<LoraAdapterModel>,
-    ) -> Self {
-        self.state = self.state.with_lora_adapters(base_model_id, adapters);
-        self
+    ) -> ferrum_types::Result<Self> {
+        let base_model_id = base_model_id.into();
+        let registry = if self.state.served_model_registry.is_empty() {
+            ServedModelRegistry::try_new(
+                base_model_id.clone(),
+                ServedModelKind::Llm,
+                vec![base_model_id],
+                adapters,
+            )
+        } else {
+            self.state
+                .served_model_registry
+                .try_with_lora_adapters(&base_model_id, adapters)
+        }
+        .map_err(|error| Error::config(error.to_string()))?;
+        self.state = self.state.with_served_model_registry(registry);
+        Ok(self)
+    }
+
+    async fn shutdown_loaded_engines(&self) -> ferrum_types::Result<()> {
+        let mut first_error = None;
+        if let Some(engine) = &self.state.llm {
+            if let Err(error) = engine.shutdown().await {
+                first_error = Some(error);
+            }
+        }
+        if let Some(engine) = &self.state.embed {
+            if let Err(error) = engine.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(engine) = &self.state.transcribe {
+            if let Err(error) = engine.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(engine) = &self.state.tts {
+            if let Err(error) = engine.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Build the router with all routes
@@ -225,7 +344,7 @@ pub struct AppState {
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
-    pub lora_registry: Arc<LoraModelRegistry>,
+    pub served_model_registry: Arc<ServedModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
     pub memory_profile_jsonl: Option<Arc<PathBuf>>,
@@ -233,105 +352,44 @@ pub struct AppState {
     cache: Arc<CacheRuntimeState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoraAdapterModel {
-    pub name: String,
-    pub model_id: String,
-    pub path: String,
-}
-
-impl LoraAdapterModel {
-    pub fn new(
-        name: impl Into<String>,
-        model_id: impl Into<String>,
-        path: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            model_id: model_id.into(),
-            path: path.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LoraModelRegistry {
-    base_model_id: Option<String>,
-    adapters: Vec<LoraAdapterModel>,
-}
-
-#[derive(Clone, Debug)]
-struct LoraModelResolution {
-    base_model_id: String,
-    adapter: Option<LoraAdapterModel>,
-}
-
-impl LoraModelRegistry {
-    pub fn new(base_model_id: impl Into<String>, adapters: Vec<LoraAdapterModel>) -> Self {
-        Self {
-            base_model_id: Some(base_model_id.into()),
-            adapters,
-        }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        !self.adapters.is_empty()
-    }
-
-    fn adapter_models(&self) -> &[LoraAdapterModel] {
-        &self.adapters
-    }
-
-    fn resolve(
-        &self,
-        request_model: &str,
-        loaded_models: &[ModelId],
-    ) -> std::result::Result<Option<LoraModelResolution>, ServerError> {
-        if !self.is_enabled() {
-            return Ok(None);
-        }
-        let base = self
-            .base_model_id
-            .clone()
-            .or_else(|| loaded_models.first().map(ToString::to_string))
-            .unwrap_or_default();
-        if request_model == base || loaded_models.iter().any(|model| model.0 == request_model) {
-            return Ok(Some(LoraModelResolution {
-                base_model_id: request_model.to_string(),
-                adapter: None,
-            }));
-        }
-        if let Some(adapter) = self
-            .adapters
-            .iter()
-            .find(|adapter| adapter.model_id == request_model)
-        {
-            return Ok(Some(LoraModelResolution {
-                base_model_id: base,
-                adapter: Some(adapter.clone()),
-            }));
-        }
-        Err(ServerError::invalid_request(
-            format!("unknown LoRA adapter model: {request_model}"),
-            Some("model"),
-        ))
-    }
-}
-
 impl AppState {
     pub fn with_llm(mut self, engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Llm,
+            ));
+        }
         self.llm = Some(engine);
         self
     }
     pub fn with_embed(mut self, engine: Arc<dyn EmbedEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Embedding,
+            ));
+        }
         self.embed = Some(engine);
         self
     }
     pub fn with_transcribe(mut self, engine: Arc<dyn TranscribeEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Transcription,
+            ));
+        }
         self.transcribe = Some(engine);
         self
     }
     pub fn with_tts(mut self, engine: Arc<dyn TtsEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Speech,
+            ));
+        }
         self.tts = Some(engine);
         self
     }
@@ -346,12 +404,8 @@ impl AppState {
         self
     }
 
-    pub fn with_lora_adapters(
-        mut self,
-        base_model_id: impl Into<String>,
-        adapters: Vec<LoraAdapterModel>,
-    ) -> Self {
-        self.lora_registry = Arc::new(LoraModelRegistry::new(base_model_id, adapters));
+    pub fn with_served_model_registry(mut self, registry: ServedModelRegistry) -> Self {
+        self.served_model_registry = Arc::new(registry);
         self
     }
 
@@ -830,6 +884,18 @@ fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: us
 #[async_trait]
 impl HttpServer for AxumServer {
     async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
+        if self.lifecycle.shutdown_requested.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "cannot start Axum server after shutdown was requested",
+            ));
+        }
+        self.lifecycle
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::internal("Axum server is already running"))?;
+        let _run_guard = AxumServerRunGuard {
+            lifecycle: Arc::clone(&self.lifecycle),
+        };
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
@@ -846,22 +912,61 @@ impl HttpServer for AxumServer {
 
         info!("Server listening on {}", addr);
 
+        let lifecycle = Arc::clone(&self.lifecycle);
         axum::serve(listener, app)
+            .with_graceful_shutdown(async move { lifecycle.wait_for_shutdown().await })
             .await
             .map_err(|e| Error::internal(format!("Server error: {}", e)))?;
 
         Ok(())
     }
 
-    async fn stop(&self, _timeout: std::time::Duration) -> ferrum_types::Result<()> {
+    async fn stop(&self, timeout: std::time::Duration) -> ferrum_types::Result<()> {
+        let _stop_guard = self.lifecycle.stop_lock.lock().await;
         info!("Stopping Axum server");
-        // Axum doesn't have explicit stop - server stops when task is cancelled
-        Ok(())
+        self.lifecycle.request_shutdown();
+
+        let mut first_error = None;
+        if self.lifecycle.running.load(Ordering::Acquire) {
+            if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
+                .await
+                .is_err()
+            {
+                first_error = Some(Error::internal(format!(
+                    "Axum server did not drain within {} ms",
+                    timeout.as_millis()
+                )));
+            }
+        }
+
+        if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
+            match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
+                Ok(Ok(())) => {
+                    self.lifecycle
+                        .engines_stopped
+                        .store(true, Ordering::Release);
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(Error::internal(format!(
+                            "engine shutdown did not complete within {} ms",
+                            timeout.as_millis()
+                        )));
+                    }
+                }
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
     }
 
     fn is_running(&self) -> bool {
-        // For MVP, always return true when server object exists
-        true
+        self.lifecycle.running.load(Ordering::Acquire)
     }
 
     fn address(&self) -> Option<std::net::SocketAddr> {
@@ -914,8 +1019,14 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    let Json(mut request) = request.map_err(|e| {
-        ServerError::invalid_request(format!("invalid chat completions request: {e}"), None)
+    let Json(mut request) = request.map_err(|error| {
+        ServerError::invalid_request(
+            format!(
+                "invalid chat completions request: {}",
+                json_rejection_detail(&error)
+            ),
+            None,
+        )
     })?;
     let cache_policy = CachePolicy::current();
     let session_context =
@@ -935,24 +1046,20 @@ async fn chat_completions_handler(
     // OpenAI spec requires at least one message. Reject empty arrays at
     // the boundary rather than synthesising a fake prompt downstream.
     validate_chat_request(&request)?;
-    let loaded_models = state.status().await.loaded_models;
-    let lora_resolution = state
-        .lora_registry
-        .resolve(&request.model, &loaded_models)?;
+    let (engine_model_id, lora_adapter) = resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Llm,
+    )?;
 
     // Convert OpenAI request to internal format
-    let template_model_id = lora_resolution
-        .as_ref()
-        .map(|resolution| resolution.base_model_id.clone())
-        .or_else(|| loaded_models.first().map(ToString::to_string))
-        .unwrap_or_else(|| request.model.clone());
     let mut inference_request = convert_chat_request_with_template_model(
         &request,
-        &template_model_id,
+        &engine_model_id.0,
         state.prompt_template.as_deref(),
     )
     .map_err(server_error_from_ferrum_error)?;
-    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
+    apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
@@ -968,6 +1075,22 @@ async fn chat_completions_handler(
     } else {
         handle_chat_completions_sync(state, request, inference_request, session_context).await
     }
+}
+
+fn json_rejection_detail(rejection: &JsonRejection) -> String {
+    const MAX_DETAIL_CHARS: usize = 512;
+
+    let mut details = Vec::new();
+    let mut current: Option<&(dyn StdError + 'static)> = Some(rejection);
+    while let Some(error) = current {
+        let detail = error.to_string();
+        if !detail.is_empty() && details.last() != Some(&detail) {
+            details.push(detail);
+        }
+        current = error.source();
+    }
+
+    details.join(": ").chars().take(MAX_DETAIL_CHARS).collect()
 }
 
 fn write_chat_request_replay_bundle(
@@ -1982,11 +2105,22 @@ async fn handle_chat_completions_stream(
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
-    let buffer_json_object_stream = response_format_is_json_object(&openai_request);
-    let buffer_strict_json_schema_stream = strict_json_schema_string(&openai_request)?.is_some();
+    let output_contract = EffectiveChatOutputContract::resolve(&openai_request);
+    let buffer_json_object_stream = matches!(
+        output_contract,
+        EffectiveChatOutputContract::JsonObjectContent
+    );
+    let buffer_strict_json_schema_stream = matches!(
+        output_contract,
+        EffectiveChatOutputContract::StrictJsonSchemaContent
+    );
     let stream_api_request = match inference_request.api_request.as_ref() {
         Some(ferrum_types::ApiRequest::Chat(request)) => request.clone(),
-        _ => api_chat_request(&openai_request, openai_request.tool_choice.as_ref()),
+        _ => api_chat_request(
+            &openai_request,
+            openai_request.tool_choice.as_ref(),
+            ferrum_types::ApiToolCallProtocol::default(),
+        ),
     };
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
@@ -2045,14 +2179,7 @@ async fn handle_chat_completions_stream(
             ) {
                 warn!("failed to write chat stream failure diagnostics: {}", err);
             }
-            let _ = tx.send(Ok(openai_error_sse_event(
-                error_message,
-                "internal_server_error",
-                None,
-            )));
-            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-            return Ok(Sse::new(stream).into_response());
+            return Err(server_error_from_ferrum_error(e));
         }
     };
     let request_dump_dir = state.request_dump_dir.clone();
@@ -2070,7 +2197,15 @@ async fn handle_chat_completions_stream(
         let mut sent_reasoning_len = 0usize;
         let mut sent_content_len = 0usize;
 
-        while let Some(result) = stream.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                next = stream.next() => next,
+            };
+            let Some(result) = next else {
+                break;
+            };
             match result {
                 Ok(chunk) => {
                     if first_token_latency_us.is_none()
@@ -2145,19 +2280,6 @@ async fn handle_chat_completions_stream(
                             &openai_request,
                             &parsed_final.content,
                         );
-                        if let Err(e) = validate_strict_json_schema_response(
-                            &openai_request,
-                            &parsed_final.content,
-                        ) {
-                            let error_event = openai_error_sse_event(
-                                strict_stream_validation_error_message(e),
-                                "internal_server_error",
-                                Some("response_format.json_schema"),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
-                        }
                         let structured_chat_response = match chunk.api_response.as_ref() {
                             Some(ferrum_types::ApiResponse::Chat(response)) => {
                                 Some(response.clone())
@@ -2170,6 +2292,48 @@ async fn handle_chat_completions_stream(
                             }
                             _ => None,
                         };
+
+                        if let Some(chat_response) = structured_chat_response.as_ref() {
+                            if let Err(e) =
+                                validate_structured_tool_response(&openai_request, chat_response)
+                            {
+                                let error_event = openai_error_sse_event(
+                                    stream_validation_error_message(e),
+                                    "internal_server_error",
+                                    Some("tool_choice"),
+                                );
+                                let _ = tx.send(Ok(error_event));
+                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                                break;
+                            }
+                        } else if tool_choice_required(&openai_request) {
+                            log_required_tool_choice_failure(
+                                &openai_request,
+                                &parsed_final.content,
+                                parsed_final.reasoning.as_deref(),
+                            );
+                            let error_event = openai_error_sse_event(
+                                "model output did not satisfy required tool_choice",
+                                "invalid_request_error",
+                                Some("tool_choice"),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
+                        }
+                        if let Err(e) = validate_hard_structured_response(
+                            &openai_request,
+                            &parsed_final.content,
+                        ) {
+                            let error_event = openai_error_sse_event(
+                                stream_validation_error_message(e),
+                                "internal_server_error",
+                                structured_response_error_param(output_contract),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
+                        }
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             let mut delta = openai_chat_delta_from_api(&chat_response.message);
@@ -2196,20 +2360,6 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
-                        } else if tool_choice_required(&openai_request) {
-                            log_required_tool_choice_failure(
-                                &openai_request,
-                                &parsed_final.content,
-                                parsed_final.reasoning.as_deref(),
-                            );
-                            let error_event = openai_error_sse_event(
-                                "model output did not satisfy required tool_choice",
-                                "invalid_request_error",
-                                Some("tool_choice"),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
                         {
@@ -2444,25 +2594,11 @@ async fn handle_chat_completions_sync(
                 ..
             } = output;
 
-            // Post-process the completion text in two passes:
-            //   1. Strip a markdown fence when `response_format = json_object`
-            //      — JsonModeProcessor's soft biases don't hard-mask the
-            //      fence the model wants to emit. Strict json_schema does
-            //      not get this cleanup; success must come from hard masking
-            //      and final validation, not markdown repair.
-            //   2. Strip a trailing user-supplied `stop` sentinel — OpenAI
-            //      convention is that stop strings mark a boundary and are
-            //      NOT included in the returned completion.
-            // Order matters: fence-strip first reveals the actual JSON,
-            // then any stop sentinel inside that JSON gets trimmed.
-            let after_fence = match &openai_request.response_format {
-                Some(rf) if rf.format_type == "json_object" => {
-                    strip_markdown_json_fence(&output_text)
-                }
-                _ => output_text,
-            };
+            // OpenAI stop strings mark a boundary and are not included in the
+            // returned completion. Hard structured formats are never repaired
+            // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
-            let content = strip_after_stop(&after_fence, &stop_sequences);
+            let content = strip_after_stop(&output_text, &stop_sequences);
             let parsed = if started_in_think {
                 parse_reasoning_response_started_in_think(&content)
             } else {
@@ -2490,6 +2626,30 @@ async fn handle_chat_completions_sync(
                 },
             };
             if let Some(chat_response) = structured_chat_response.as_ref() {
+                if let Err(error) =
+                    validate_structured_tool_response(&openai_request, chat_response)
+                {
+                    if let Err(err) = write_chat_request_profile_event(
+                        &state,
+                        &replay_request_id,
+                        &profile_request_model,
+                        false,
+                        "chat_completions_sync_tool_contract",
+                        profile_started_at,
+                        None,
+                        tokens.len(),
+                        Some(&usage),
+                        Some("error"),
+                        Some(ProfileError {
+                            kind: "tool_contract_failure".to_string(),
+                            message: format!("{error:?}"),
+                            blocking: true,
+                        }),
+                    ) {
+                        warn!("failed to write chat tool-contract profile event: {}", err);
+                    }
+                    return Err(error);
+                }
                 message = openai_chat_message_from_api(&chat_response.message);
                 if message.reasoning.is_none() {
                     message.reasoning = parsed.reasoning.clone();
@@ -2527,22 +2687,21 @@ async fn handle_chat_completions_sync(
                     Some("tool_choice"),
                 ));
             }
-            if let Err(error) =
-                validate_strict_json_schema_response(&openai_request, &message.content)
+            if let Err(error) = validate_hard_structured_response(&openai_request, &message.content)
             {
                 if let Err(err) = write_chat_request_profile_event(
                     &state,
                     &replay_request_id,
                     &profile_request_model,
                     false,
-                    "chat_completions_sync_strict_schema",
+                    "chat_completions_sync_structured_output",
                     profile_started_at,
                     None,
                     tokens.len(),
                     Some(&usage),
                     Some("error"),
                     Some(ProfileError {
-                        kind: "strict_schema_failure".to_string(),
+                        kind: "structured_output_failure".to_string(),
                         message: format!("{error:?}"),
                         blocking: true,
                     }),
@@ -2652,6 +2811,70 @@ async fn handle_chat_completions_sync(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveChatOutputContract {
+    RequiredToolCall,
+    StrictJsonSchemaContent,
+    JsonObjectContent,
+    BestEffortJsonSchemaContent,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatOutputBudget {
+    AutoCeiling(u32),
+    Explicit(u32),
+}
+
+impl ChatOutputBudget {
+    fn resolve(request: &ChatCompletionsRequest) -> Self {
+        request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .map(Self::Explicit)
+            .unwrap_or(Self::AutoCeiling(DEFAULT_COMPLETION_MAX_TOKENS))
+    }
+
+    const fn ceiling(self) -> u32 {
+        match self {
+            Self::AutoCeiling(value) | Self::Explicit(value) => value,
+        }
+    }
+
+    const fn is_auto(self) -> bool {
+        matches!(self, Self::AutoCeiling(_))
+    }
+}
+
+impl EffectiveChatOutputContract {
+    fn resolve(request: &ChatCompletionsRequest) -> Self {
+        if tool_choice_required(request) {
+            return Self::RequiredToolCall;
+        }
+        let Some(format) = request.response_format.as_ref() else {
+            return Self::Text;
+        };
+        match format.format_type.as_str() {
+            "json_schema"
+                if format
+                    .json_schema
+                    .as_ref()
+                    .and_then(|schema| schema.strict)
+                    .unwrap_or(false) =>
+            {
+                Self::StrictJsonSchemaContent
+            }
+            "json_schema" => Self::BestEffortJsonSchemaContent,
+            "json_object" => Self::JsonObjectContent,
+            _ => Self::Text,
+        }
+    }
+
+    fn accepts_requested_response_format(self) -> bool {
+        !matches!(self, Self::RequiredToolCall)
+    }
+}
+
 /// Convert OpenAI chat request to internal inference request
 #[allow(dead_code)]
 fn convert_chat_request(
@@ -2684,10 +2907,17 @@ fn convert_chat_request_with_template_model(
         .as_ref()
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
+    let output_contract = EffectiveChatOutputContract::resolve(request);
+    let output_budget = ChatOutputBudget::resolve(request);
     let forced_response_format = forced_tool_choice_response_format(request);
-    let requested_response_format = requested_response_format_for_sampling(request)?;
+    let hard_tool_call_contract = forced_response_format.is_some();
+    let requested_response_format = output_contract
+        .accepts_requested_response_format()
+        .then(|| requested_response_format_for_sampling(request))
+        .transpose()?
+        .flatten();
     let render_messages =
-        render_messages_with_response_format_instruction(request, forced_response_format.as_ref());
+        render_messages_with_response_format_instruction(request, output_contract);
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
     let prompt = if tools.is_empty() && functions.is_empty() {
         render_chat_prompt_with_model_template_options(
@@ -2708,8 +2938,10 @@ fn convert_chat_request_with_template_model(
             request.function_call.as_ref(),
         )?
     };
-    let api_chat = api_chat_request(request, effective_tool_choice);
-    let may_emit_structured_call = ferrum_types::chat_api_may_emit_tool_or_function_call(&api_chat);
+    let tool_call_protocol = model_template
+        .map(|template| template.tool_call_protocol)
+        .unwrap_or_default();
+    let api_chat = api_chat_request(request, effective_tool_choice, tool_call_protocol);
     let mut metadata = HashMap::new();
     metadata.insert(
         "openai_messages".to_string(),
@@ -2739,7 +2971,7 @@ fn convert_chat_request_with_template_model(
     if request.ignore_eos.unwrap_or(false) {
         metadata.insert("ferrum_ignore_eos".to_string(), serde_json::json!(true));
     }
-    if request.max_completion_tokens.is_none() && request.max_tokens.is_none() {
+    if output_budget.is_auto() {
         metadata.insert(
             DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
             serde_json::json!(true),
@@ -2747,7 +2979,7 @@ fn convert_chat_request_with_template_model(
     }
     if !has_unclosed_thinking_block(&prompt) {
         let mut forbidden = vec![THINK_END_TAG.to_string()];
-        if may_emit_structured_call {
+        if hard_tool_call_contract {
             for token_text in INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS {
                 push_unique_forbidden_token_text(&mut forbidden, token_text);
             }
@@ -2768,30 +3000,42 @@ fn convert_chat_request_with_template_model(
             serde_json::json!(forbidden),
         );
     }
+    let response_format = forced_response_format
+        .or(requested_response_format)
+        .unwrap_or(ferrum_types::ResponseFormat::Text);
+    let structured_output_start = if matches!(response_format, ferrum_types::ResponseFormat::Text)
+        || !has_unclosed_thinking_block(&prompt)
+    {
+        StructuredOutputStart::Immediate
+    } else {
+        StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
+    };
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
         model_id: ModelId(request.model.clone()),
         prompt,
         sampling_params: SamplingParams {
-            max_tokens: chat_completion_max_tokens(request) as usize,
+            max_tokens: output_budget.ceiling() as usize,
             temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
             top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
-            top_k: None, // OpenAI doesn't use top-k
-            repetition_penalty: DEFAULT_CHAT_REPETITION_PENALTY,
+            top_k: request
+                .top_k
+                .filter(|value| *value > 0)
+                .and_then(|value| usize::try_from(value).ok()),
+            repetition_penalty: request
+                .repetition_penalty
+                .unwrap_or(DEFAULT_CHAT_REPETITION_PENALTY),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             stop_sequences: request.stop.clone().unwrap_or_default(),
             seed: request.seed,
-            min_p: None,
+            min_p: request.min_p.filter(|value| *value > 0.0),
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: forced_response_format
-                .clone()
-                .or(requested_response_format)
-                .or_else(|| inferred_auto_tool_response_format(request))
-                .unwrap_or(ferrum_types::ResponseFormat::Text),
+            response_format,
+            structured_output_start,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -2856,10 +3100,9 @@ fn chat_template_options_for_request(
 
 fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
-    forced_response_format: Option<&ferrum_types::ResponseFormat>,
+    output_contract: EffectiveChatOutputContract,
 ) -> Vec<ChatMessage> {
-    let Some(instruction) = response_format_prompt_instruction(request, forced_response_format)
-    else {
+    let Some(instruction) = response_format_prompt_instruction(request, output_contract) else {
         return request.messages.clone();
     };
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -2878,8 +3121,11 @@ fn render_messages_with_response_format_instruction(
 
 fn response_format_prompt_instruction(
     request: &ChatCompletionsRequest,
-    _forced_response_format: Option<&ferrum_types::ResponseFormat>,
+    output_contract: EffectiveChatOutputContract,
 ) -> Option<String> {
+    if !output_contract.accepts_requested_response_format() {
+        return None;
+    }
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
             "json_object" => Some(
@@ -2890,7 +3136,7 @@ fn response_format_prompt_instruction(
                 let schema = format.json_schema.as_ref()?.schema.as_ref()?;
                 let schema_text = serde_json::to_string(schema).ok()?;
                 Some(format!(
-                    "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+                    "The response_format requires a single valid JSON value satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
                 ))
             }
             _ => None,
@@ -2916,6 +3162,7 @@ fn requested_response_format_for_sampling(
         return Ok(None);
     };
     match format.format_type.as_str() {
+        "json_object" => Ok(Some(ferrum_types::ResponseFormat::JsonObject)),
         "json_schema" => {
             let Some(schema) = format.json_schema.as_ref() else {
                 return Err(Error::invalid_request(
@@ -2938,24 +3185,6 @@ fn requested_response_format_for_sampling(
     }
 }
 
-fn inferred_auto_tool_response_format(
-    request: &ChatCompletionsRequest,
-) -> Option<ferrum_types::ResponseFormat> {
-    if !tool_choice_auto_or_omitted(request.tool_choice.as_ref()) {
-        return None;
-    }
-    let tool = single_function_tool(request.tools.as_deref()?)?;
-    let prompt = latest_user_text(request)?;
-    if !text_mentions_tool(&prompt, &tool.function) {
-        return None;
-    }
-    let schema = serde_json::to_string(&guided_tool_arguments_schema(
-        tool.function.parameters.as_ref(),
-    )?)
-    .ok()?;
-    Some(ferrum_types::ResponseFormat::JsonSchema(schema))
-}
-
 fn selected_tool_for_forced_tool_choice(request: &ChatCompletionsRequest) -> Option<&ChatTool> {
     match request.tool_choice.as_ref()? {
         ToolChoice::Function {
@@ -2967,7 +3196,7 @@ fn selected_tool_for_forced_tool_choice(request: &ChatCompletionsRequest) -> Opt
             .iter()
             .find(|tool| tool.function.name == function.name),
         ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
-            request.tools.as_ref()?.first()
+            single_function_tool(request.tools.as_deref()?)
         }
         _ => None,
     }
@@ -3019,78 +3248,10 @@ fn bound_unconstrained_tool_argument_strings(value: &mut serde_json::Value, defa
     }
 }
 
-fn tool_choice_auto_or_omitted(choice: Option<&ToolChoice>) -> bool {
-    match choice {
-        None => true,
-        Some(ToolChoice::Mode(mode)) => mode.eq_ignore_ascii_case("auto"),
-        _ => false,
-    }
-}
-
 fn single_function_tool(tools: &[ChatTool]) -> Option<&ChatTool> {
     let mut function_tools = tools.iter().filter(|tool| tool.tool_type == "function");
     let tool = function_tools.next()?;
     function_tools.next().is_none().then_some(tool)
-}
-
-fn latest_user_text(request: &ChatCompletionsRequest) -> Option<String> {
-    request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.role, MessageRole::User))
-        .map(|message| message.content.clone())
-        .filter(|content| !content.trim().is_empty())
-}
-
-fn text_mentions_tool(text: &str, function: &ChatFunction) -> bool {
-    let text_lower = text.to_lowercase();
-    for word in ascii_words(&function.name) {
-        if text_lower.contains(&word) {
-            return true;
-        }
-    }
-    if let Some(description) = &function.description {
-        for word in ascii_words(description) {
-            if text_lower.contains(&word) {
-                return true;
-            }
-        }
-        for bigram in cjk_bigrams(description) {
-            if text.contains(&bigram) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn ascii_words(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter_map(|word| {
-            let word = word.to_ascii_lowercase();
-            (word.len() >= 3).then_some(word)
-        })
-        .collect()
-}
-
-fn cjk_bigrams(text: &str) -> Vec<String> {
-    let chars = text
-        .chars()
-        .filter(|ch| matches!(*ch as u32, 0x3400..=0x9fff | 0xf900..=0xfaff))
-        .collect::<Vec<_>>();
-    chars
-        .windows(2)
-        .map(|window| window.iter().collect::<String>())
-        .collect()
-}
-
-fn has_unclosed_thinking_block(prompt: &str) -> bool {
-    match (prompt.rfind(THINK_START_TAG), prompt.rfind(THINK_END_TAG)) {
-        (Some(start), Some(end)) => start > end,
-        (Some(_), None) => true,
-        _ => false,
-    }
 }
 
 fn should_defer_reasoning_stream_delta(text: &str) -> bool {
@@ -3109,76 +3270,6 @@ fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
     }
     *sent_len = text.len();
     String::new()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedReasoningResponse {
-    content: String,
-    reasoning: Option<String>,
-}
-
-/// Parse generated text whose think block was OPENED BY THE PROMPT —
-/// R1-distill-style templates append `<think>\n` to the rendered prompt,
-/// so the generation never contains the start tag. Without this, the
-/// in-flight thinking streams as content deltas until `</think>` arrives.
-fn parse_reasoning_response_started_in_think(text: &str) -> ParsedReasoningResponse {
-    if text.contains(THINK_START_TAG) {
-        // Model re-opened a think block itself — defer to the normal parse.
-        return parse_reasoning_response(text);
-    }
-    let Some(end) = text.find(THINK_END_TAG) else {
-        return ParsedReasoningResponse {
-            content: String::new(),
-            reasoning: (!text.is_empty()).then(|| text.to_string()),
-        };
-    };
-    let reasoning = text[..end].to_string();
-    let content = text[end + THINK_END_TAG.len()..]
-        .trim_start_matches(['\r', '\n'])
-        .to_string();
-    ParsedReasoningResponse {
-        content,
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-    }
-}
-
-fn parse_reasoning_response(text: &str) -> ParsedReasoningResponse {
-    let Some(start) = text.find(THINK_START_TAG) else {
-        if let Some(end) = text.find(THINK_END_TAG) {
-            let reasoning = text[..end].to_string();
-            let content = text[end + THINK_END_TAG.len()..]
-                .trim_start_matches(['\r', '\n'])
-                .to_string();
-            return ParsedReasoningResponse {
-                content,
-                reasoning: (!reasoning.is_empty()).then_some(reasoning),
-            };
-        }
-        return ParsedReasoningResponse {
-            content: text.to_string(),
-            reasoning: None,
-        };
-    };
-
-    let before = &text[..start];
-    let after_start = &text[start + THINK_START_TAG.len()..];
-    let Some(end) = after_start.find(THINK_END_TAG) else {
-        return ParsedReasoningResponse {
-            content: before.to_string(),
-            reasoning: Some(after_start.to_string()),
-        };
-    };
-
-    let reasoning = after_start[..end].to_string();
-    let after_end = &after_start[end + THINK_END_TAG.len()..];
-    let mut content = String::new();
-    content.push_str(before);
-    content.push_str(after_end.trim_start_matches(['\r', '\n']));
-
-    ParsedReasoningResponse {
-        content,
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-    }
 }
 
 fn chat_api_response_from_parsed_generated_text(
@@ -3223,31 +3314,16 @@ fn normalize_structured_response_content(
     request: &ChatCompletionsRequest,
     content: &str,
 ) -> String {
-    let Some(response_format) = request.response_format.as_ref() else {
-        return content.to_string();
-    };
-    match response_format.format_type.as_str() {
-        "json_object" => extract_json_object_text(content)
-            .unwrap_or_else(|| strip_markdown_json_fence(content).to_string()),
-        "json_schema"
-            if !response_format
-                .json_schema
-                .as_ref()
-                .and_then(|schema| schema.strict)
-                .unwrap_or(false) =>
-        {
+    match EffectiveChatOutputContract::resolve(request) {
+        EffectiveChatOutputContract::BestEffortJsonSchemaContent => {
             extract_json_object_text(content)
                 .unwrap_or_else(|| strip_markdown_json_fence(content).to_string())
         }
-        _ => content.to_string(),
+        EffectiveChatOutputContract::RequiredToolCall
+        | EffectiveChatOutputContract::StrictJsonSchemaContent
+        | EffectiveChatOutputContract::JsonObjectContent
+        | EffectiveChatOutputContract::Text => content.to_string(),
     }
-}
-
-fn response_format_is_json_object(request: &ChatCompletionsRequest) -> bool {
-    request
-        .response_format
-        .as_ref()
-        .is_some_and(|format| format.format_type == "json_object")
 }
 
 fn extract_json_object_text(text: &str) -> Option<String> {
@@ -3301,6 +3377,7 @@ fn extract_json_object_text(text: &str) -> Option<String> {
 fn api_chat_request(
     request: &ChatCompletionsRequest,
     effective_tool_choice: Option<&ToolChoice>,
+    tool_call_protocol: ferrum_types::ApiToolCallProtocol,
 ) -> ferrum_types::ApiChatRequest {
     ferrum_types::ApiChatRequest {
         messages: request.messages.iter().map(api_chat_message).collect(),
@@ -3312,6 +3389,7 @@ fn api_chat_request(
             .map(api_tool)
             .collect(),
         tool_choice: effective_tool_choice.map(api_tool_choice),
+        tool_call_protocol,
         legacy_functions: request
             .functions
             .as_deref()
@@ -3327,13 +3405,6 @@ fn api_chat_request(
             }
         }),
     }
-}
-
-fn chat_completion_max_tokens(request: &ChatCompletionsRequest) -> u32 {
-    request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or(DEFAULT_COMPLETION_MAX_TOKENS)
 }
 
 fn api_chat_message(message: &ChatMessage) -> ferrum_types::ApiChatMessage {
@@ -3548,6 +3619,47 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
         ));
     }
 
+    if let Some(top_k) = request.top_k {
+        if top_k < -1 {
+            return Err(ServerError::invalid_request(
+                "top_k must be -1, 0, or a positive integer",
+                Some("top_k"),
+            ));
+        }
+    }
+    if let Some(min_p) = request.min_p {
+        if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+            return Err(ServerError::invalid_request(
+                "min_p must be in range [0, 1]",
+                Some("min_p"),
+            ));
+        }
+    }
+    if let Some(repetition_penalty) = request.repetition_penalty {
+        if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
+            return Err(ServerError::invalid_request(
+                "repetition_penalty must be positive",
+                Some("repetition_penalty"),
+            ));
+        }
+    }
+    if let Some(presence_penalty) = request.presence_penalty {
+        if !presence_penalty.is_finite() || !(-2.0..=2.0).contains(&presence_penalty) {
+            return Err(ServerError::invalid_request(
+                "presence_penalty must be in range [-2, 2]",
+                Some("presence_penalty"),
+            ));
+        }
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        if !frequency_penalty.is_finite() || !(-2.0..=2.0).contains(&frequency_penalty) {
+            return Err(ServerError::invalid_request(
+                "frequency_penalty must be in range [-2, 2]",
+                Some("frequency_penalty"),
+            ));
+        }
+    }
+
     if request.stream_options.is_some() && !request.stream.unwrap_or(false) {
         return Err(ServerError::invalid_request(
             "stream_options is only valid when stream=true",
@@ -3682,21 +3794,26 @@ fn ensure_response_format_supported(
         match rf.format_type.as_str() {
             "text" | "json_object" => {}
             "json_schema" => {
-                let Some(schema_json) = strict_json_schema_string(request)? else {
-                    if rf.json_schema.is_none() {
-                        return Err(ServerError::invalid_request(
-                            "response_format.json_schema.schema is required",
-                            Some("response_format.json_schema"),
-                        ));
-                    }
-                    return Ok(());
-                };
-                ferrum_sampler::schema_to_regex::schema_to_regex(&schema_json).map_err(|e| {
-                    ServerError::unsupported_feature(
-                        format!("unsupported strict json_schema: {e}"),
+                let Some(schema_config) = rf.json_schema.as_ref() else {
+                    return Err(ServerError::invalid_request(
+                        "response_format.json_schema.schema is required",
                         Some("response_format.json_schema"),
-                    )
-                })?;
+                    ));
+                };
+                let Some(schema) = schema_config.schema.as_ref() else {
+                    return Err(ServerError::invalid_request(
+                        "response_format.json_schema.schema is required",
+                        Some("response_format.json_schema"),
+                    ));
+                };
+                if schema_config.strict.unwrap_or(false) {
+                    compiled_json_schema_validator(schema).map_err(|reason| {
+                        ServerError::invalid_request(
+                            format!("unsupported strict json_schema: {reason}"),
+                            Some("response_format.json_schema"),
+                        )
+                    })?;
+                }
             }
             _ => {
                 return Err(ServerError::invalid_request(
@@ -3738,35 +3855,175 @@ fn strict_json_schema_string(
     })
 }
 
-fn validate_strict_json_schema_response(
+fn validate_hard_structured_response(
     request: &ChatCompletionsRequest,
     content: &str,
 ) -> std::result::Result<(), ServerError> {
-    let Some(schema_json) = strict_json_schema_string(request)? else {
+    match EffectiveChatOutputContract::resolve(request) {
+        EffectiveChatOutputContract::JsonObjectContent => {
+            let value = serde_json::from_str::<serde_json::Value>(content).map_err(|error| {
+                ServerError::InternalError(format!(
+                    "model output did not satisfy response_format.json_object: invalid JSON: {error}"
+                ))
+            })?;
+            if !value.is_object() {
+                return Err(ServerError::InternalError(
+                    "model output did not satisfy response_format.json_object: root must be an object"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        EffectiveChatOutputContract::StrictJsonSchemaContent => {
+            let Some(schema_json) = strict_json_schema_string(request)? else {
+                return Ok(());
+            };
+            let schema: serde_json::Value = serde_json::from_str(&schema_json).map_err(|e| {
+                ServerError::InternalError(format!(
+                    "strict json_schema could not be reconstructed after request validation: {e}"
+                ))
+            })?;
+            validate_json_text_against_schema(&schema, content).map_err(|reason| {
+                ServerError::InternalError(format!(
+                    "model output did not satisfy response_format.json_schema.strict: {reason}"
+                ))
+            })
+        }
+        EffectiveChatOutputContract::RequiredToolCall
+        | EffectiveChatOutputContract::BestEffortJsonSchemaContent
+        | EffectiveChatOutputContract::Text => Ok(()),
+    }
+}
+
+fn structured_response_error_param(contract: EffectiveChatOutputContract) -> Option<&'static str> {
+    match contract {
+        EffectiveChatOutputContract::JsonObjectContent => Some("response_format"),
+        EffectiveChatOutputContract::StrictJsonSchemaContent => Some("response_format.json_schema"),
+        _ => None,
+    }
+}
+
+fn validate_structured_tool_response(
+    request: &ChatCompletionsRequest,
+    response: &ferrum_types::ApiChatResponse,
+) -> std::result::Result<(), ServerError> {
+    let required = tool_choice_required(request);
+    if response.message.tool_calls.is_empty() {
+        if required {
+            return Err(ServerError::invalid_request(
+                "model output did not satisfy required tool_choice",
+                Some("tool_choice"),
+            ));
+        }
         return Ok(());
-    };
-    let _parsed_json: serde_json::Value = serde_json::from_str(content).map_err(|e| {
-        ServerError::InternalError(format!(
-            "model output did not satisfy response_format.json_schema.strict: invalid JSON: {e}"
-        ))
-    })?;
-    let pattern = ferrum_sampler::schema_to_regex::schema_to_regex(&schema_json).map_err(|e| {
-        ServerError::InternalError(format!(
-            "strict json_schema translator failed after validation: {e}"
-        ))
-    })?;
-    let regex = regex_lite::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| {
-        ServerError::InternalError(format!("strict json_schema validator build failed: {e}"))
-    })?;
-    if !regex.is_match(content) {
-        return Err(ServerError::InternalError(
-            "model output did not satisfy response_format.json_schema.strict".to_string(),
-        ));
+    }
+
+    if required {
+        if !response.message.content.trim().is_empty() {
+            return Err(ServerError::InternalError(
+                "required tool response contained assistant content".to_string(),
+            ));
+        }
+        if response.finish_reason.as_deref() != Some("tool_calls") {
+            return Err(ServerError::InternalError(
+                "required tool response did not finish with tool_calls".to_string(),
+            ));
+        }
+    }
+
+    let tools = request.tools.as_deref().unwrap_or_default();
+    for call in &response.message.tool_calls {
+        if call.tool_type != "function" {
+            return Err(ServerError::InternalError(format!(
+                "model emitted unsupported tool call type '{}'",
+                call.tool_type
+            )));
+        }
+        let Some(tool) = tools
+            .iter()
+            .find(|tool| tool.tool_type == "function" && tool.function.name == call.function.name)
+        else {
+            return Err(ServerError::InternalError(format!(
+                "model emitted undeclared tool call '{}'",
+                call.function.name
+            )));
+        };
+        if let Some(ToolChoice::Function {
+            tool_type,
+            function,
+        }) = request.tool_choice.as_ref()
+        {
+            if tool_type != "function" || function.name != call.function.name {
+                return Err(ServerError::InternalError(format!(
+                    "model emitted tool '{}' instead of selected tool '{}'",
+                    call.function.name, function.name
+                )));
+            }
+        }
+
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.function.arguments).map_err(|e| {
+                ServerError::InternalError(format!(
+                    "model emitted invalid JSON arguments for tool '{}': {e}",
+                    call.function.name
+                ))
+            })?;
+        if !arguments.is_object() {
+            return Err(ServerError::InternalError(format!(
+                "model emitted non-object arguments for tool '{}'",
+                call.function.name
+            )));
+        }
+        if let Some(schema) = tool.function.parameters.as_ref() {
+            validate_json_text_against_schema(schema, &call.function.arguments).map_err(
+                |reason| {
+                    ServerError::InternalError(format!(
+                        "model arguments for tool '{}' did not satisfy its schema: {reason}",
+                        call.function.name
+                    ))
+                },
+            )?;
+        }
     }
     Ok(())
 }
 
-fn strict_stream_validation_error_message(error: ServerError) -> String {
+fn validate_json_text_against_schema(
+    schema: &serde_json::Value,
+    content: &str,
+) -> std::result::Result<(), String> {
+    let value = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|e| format!("invalid JSON: {e}"))?;
+    compiled_json_schema_validator(schema)?
+        .validate(&value)
+        .map_err(|error| error.to_string())
+}
+
+fn compiled_json_schema_validator(
+    schema: &serde_json::Value,
+) -> std::result::Result<Arc<jsonschema::Validator>, String> {
+    let cache_key = serde_json::to_string(schema)
+        .map_err(|error| format!("could not serialize JSON Schema: {error}"))?;
+    let cache = JSON_SCHEMA_VALIDATOR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut validators = cache
+        .lock()
+        .map_err(|_| "JSON Schema validator cache lock was poisoned".to_string())?;
+    if let Some(validator) = validators.get(&cache_key) {
+        return Ok(Arc::clone(validator));
+    }
+
+    let validator = Arc::new(
+        jsonschema::validator_for(schema)
+            .map_err(|error| format!("could not compile JSON Schema: {error}"))?,
+    );
+    if validators.len() >= MAX_CACHED_JSON_SCHEMA_VALIDATORS {
+        validators.clear();
+    }
+    validators.insert(cache_key, Arc::clone(&validator));
+    Ok(validator)
+}
+
+fn stream_validation_error_message(error: ServerError) -> String {
     match error {
         ServerError::InternalError(message)
         | ServerError::NotImplemented(message)
@@ -3833,6 +4090,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
             typical_p: None,
             mirostat: None,
             response_format: ferrum_types::ResponseFormat::Text,
+            structured_output_start: StructuredOutputStart::Immediate,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal,
@@ -3856,15 +4114,29 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
     }
 }
 
-fn apply_lora_resolution(
+fn resolve_request_model<'a>(
+    registry: &'a ServedModelRegistry,
+    request_model: &str,
+    required_kind: ServedModelKind,
+) -> std::result::Result<(ModelId, Option<&'a LoraAdapterModel>), ServerError> {
+    if registry.is_empty() {
+        return Ok((ModelId::new(request_model), None));
+    }
+    let entry = registry
+        .resolve(request_model, required_kind)
+        .ok_or_else(|| {
+            ServerError::invalid_request(format!("unknown model: {request_model}"), Some("model"))
+        })?;
+    Ok((entry.engine_model_id().clone(), entry.adapter()))
+}
+
+fn apply_served_model_resolution(
     inference_request: &mut InferenceRequest,
-    resolution: Option<&LoraModelResolution>,
+    engine_model_id: ModelId,
+    adapter: Option<&LoraAdapterModel>,
 ) {
-    let Some(resolution) = resolution else {
-        return;
-    };
-    if let Some(adapter) = &resolution.adapter {
-        inference_request.model_id = ModelId(resolution.base_model_id.clone());
+    inference_request.model_id = engine_model_id;
+    if let Some(adapter) = adapter {
         inference_request.metadata.insert(
             "ferrum_lora_adapter".to_string(),
             serde_json::json!(adapter.name),
@@ -4026,12 +4298,13 @@ async fn completions_handler(
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
     validate_completion_request(&request)?;
-    let loaded_models = state.status().await.loaded_models;
-    let lora_resolution = state
-        .lora_registry
-        .resolve(&request.model, &loaded_models)?;
+    let (engine_model_id, lora_adapter) = resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Llm,
+    )?;
     let mut inference_request = convert_completion_request(&request);
-    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
+    apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if request.stream.unwrap_or(false) {
         handle_completions_stream(state, request, inference_request).await
     } else {
@@ -4088,6 +4361,11 @@ async fn embeddings_handler(
     let _enter = span.enter();
 
     validate_embeddings_request(&request)?;
+    resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Embedding,
+    )?;
 
     // Flatten input into individual items
     let items: Vec<EmbeddingItem> = match request.input {
@@ -4255,6 +4533,11 @@ async fn speech_handler(
         .map_err(|e| ServerError::invalid_request(format!("invalid speech request: {e}"), None))?;
 
     let response_format = speech_output_format(&request)?;
+    resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Speech,
+    )?;
 
     let span = span!(Level::INFO, "speech");
     let _guard = span.enter();
@@ -4402,32 +4685,27 @@ fn pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
 async fn models_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
-    let status = state.status().await;
     let now = chrono::Utc::now().timestamp() as u64;
-    let mut data: Vec<_> = status
-        .loaded_models
-        .into_iter()
-        .map(|model_id| crate::openai::ModelInfo {
-            id: model_id.to_string(),
+    let data = state
+        .served_model_registry
+        .entries()
+        .iter()
+        .map(|entry| crate::openai::ModelInfo {
+            id: entry.public_name().to_string(),
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
+            modalities: entry
+                .kind()
+                .modalities()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             permission: vec![],
-            root: None,
-            parent: None,
+            root: entry.parent_public_name().map(ToString::to_string),
+            parent: entry.parent_public_name().map(ToString::to_string),
         })
         .collect();
-    data.extend(state.lora_registry.adapter_models().iter().map(|adapter| {
-        crate::openai::ModelInfo {
-            id: adapter.model_id.clone(),
-            object: "model".to_string(),
-            created: now,
-            owned_by: "ferrum".to_string(),
-            permission: vec![],
-            root: state.lora_registry.base_model_id.as_ref().cloned(),
-            parent: state.lora_registry.base_model_id.as_ref().cloned(),
-        }
-    }));
 
     let models = ModelListResponse {
         object: "list".to_string(),
@@ -4482,8 +4760,8 @@ async fn health_handler(
         "admission": admission,
         "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
         "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
-            "enabled": state.lora_registry.is_enabled(),
-            "adapter_count": state.lora_registry.adapter_models().len() as u64,
+            "enabled": state.served_model_registry.adapter_count() > 0,
+            "adapter_count": state.served_model_registry.adapter_count() as u64,
             "active_cache_bindings": 0u64,
             "projection_applications": 0u64,
             "position": "startup-routing",
@@ -4648,14 +4926,8 @@ fn strip_after_stop(text: &str, stops: &[String]) -> String {
     }
 }
 
-/// When `response_format = json_object` is set, the model is meant to
-/// emit valid JSON only. Qwen / Llama instruct models frequently wrap
-/// the JSON in markdown fences anyway (```` ```json ... ``` ````)
-/// because that's how they were trained. `JsonModeProcessor` only
-/// applies soft logit biases, not a hard mask, so the fence slips
-/// through. Strip a single outermost ` ```json ... ``` ` /
-/// ` ``` ... ``` ` wrapper. Preserves inner JSON exactly. Returns the
-/// input unchanged if no fence is present.
+/// Compatibility cleanup for explicitly best-effort structured output.
+/// Hard `json_object` and strict schema contracts never call this helper.
 fn strip_markdown_json_fence(text: &str) -> String {
     let trimmed = text.trim();
     // Try the most specific marker first.
@@ -4703,7 +4975,7 @@ mod tests {
     use std::{
         collections::HashMap,
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{atomic::AtomicUsize, Arc, Mutex},
     };
     use tower::ServiceExt;
 
@@ -4718,6 +4990,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stop_drains_running_server_and_shuts_down_loaded_engine_once() {
+        let engine = Arc::new(StubLlm::new("ok"));
+        let server = Arc::new(AxumServer::from_llm(engine.clone()));
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            ..ServerConfig::default()
+        };
+        let server_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.start(&config).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !server.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        server
+            .stop(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        server
+            .stop(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(engine.shutdown_count.load(Ordering::Acquire), 1);
+        assert!(!server.is_running());
+    }
+
     struct StubLlm {
         config: EngineConfig,
         text: String,
@@ -4726,6 +5033,8 @@ mod tests {
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
         lora_metrics: Option<Value>,
+        pending_stream_drop_notify: Option<Arc<Notify>>,
+        shutdown_count: AtomicUsize,
     }
 
     impl StubLlm {
@@ -4740,6 +5049,8 @@ mod tests {
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
                 lora_metrics: None,
+                pending_stream_drop_notify: None,
+                shutdown_count: AtomicUsize::new(0),
             }
         }
 
@@ -4779,6 +5090,34 @@ mod tests {
                 lora_metrics: Some(lora_metrics),
                 ..Self::new(text)
             }
+        }
+
+        fn with_pending_stream(drop_notify: Arc<Notify>) -> Self {
+            Self {
+                pending_stream_drop_notify: Some(drop_notify),
+                ..Self::new("")
+            }
+        }
+    }
+
+    struct PendingDropStream {
+        drop_notify: Arc<Notify>,
+    }
+
+    impl Stream for PendingDropStream {
+        type Item = ferrum_types::Result<StreamChunk>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            self.drop_notify.notify_one();
         }
     }
 
@@ -4883,6 +5222,10 @@ mod tests {
                 .clone()
                 .expect("request captured")
         }
+
+        fn has_captured_request(&self) -> bool {
+            self.last_request.lock().expect("capture lock").is_some()
+        }
     }
 
     #[async_trait]
@@ -4909,6 +5252,7 @@ mod tests {
         }
 
         async fn shutdown(&self) -> ferrum_types::Result<()> {
+            self.shutdown_count.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -5208,6 +5552,11 @@ mod tests {
         ) -> ferrum_types::Result<
             Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
         > {
+            if let Some(drop_notify) = self.pending_stream_drop_notify.as_ref() {
+                return Ok(Box::pin(PendingDropStream {
+                    drop_notify: Arc::clone(drop_notify),
+                }));
+            }
             if let Some(chunks) = &self.stream_chunks {
                 let request_id = request.id;
                 let mut stream_chunks = Vec::with_capacity(
@@ -5334,6 +5683,12 @@ mod tests {
         AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
     }
 
+    fn router_with_stub_and_template(text: &str, template: ModelChatTemplate) -> Router {
+        AxumServer::from_llm(Arc::new(StubLlm::new(text)))
+            .with_prompt_template(Some(template))
+            .build_router()
+    }
+
     fn router_with_stub_and_request_dump_dir(text: &str, request_dump_dir: PathBuf) -> Router {
         AxumServer::from_state(
             AppState::default()
@@ -5449,7 +5804,20 @@ mod tests {
 
     fn router_with_capturing_llm() -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec![
+                "qwen3".to_string(),
+                "stub-model".to_string(),
+                "served-alias".to_string(),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
+            .build_router();
         (router, engine)
     }
 
@@ -5603,7 +5971,15 @@ mod tests {
         template: ModelChatTemplate,
     ) -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
         let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
             .with_prompt_template(Some(template))
             .build_router();
         (router, engine)
@@ -5620,6 +5996,7 @@ mod tests {
                     "/tmp/sql-adapter",
                 )],
             )
+            .unwrap()
             .build_router();
         (router, engine)
     }
@@ -5837,6 +6214,7 @@ mod tests {
                 "/tmp/sql-adapter",
             )],
         )
+        .unwrap()
         .build_router();
         let response = get(router, "/health").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -5860,9 +6238,79 @@ mod tests {
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "ferrum");
         assert!(data[0]["created"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(data[0]["modalities"], json!(["text"]));
         assert!(data[0]["permission"].as_array().unwrap().is_empty());
         assert!(data[0]["root"].is_null());
         assert!(data[0]["parent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn route_chat_public_alias_maps_to_internal_model_and_is_echoed() {
+        let engine = Arc::new(CapturingLlm::new());
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string(), "secondary-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
+            .build_router();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "secondary-alias",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["model"], "secondary-alias");
+        assert_eq!(engine.last_request().model_id, ModelId::new("qwen3"));
+    }
+
+    #[tokio::test]
+    async fn route_models_lists_public_aliases_without_internal_model_id() {
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string(), "secondary-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(Arc::new(CapturingLlm::new()))
+            .with_served_model_registry(registry)
+            .build_router();
+        let body = response_json(get(router, "/v1/models").await).await;
+        let ids = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["served-alias", "secondary-alias"]);
+        assert!(!ids.contains(&"qwen3"));
+        assert!(body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["modalities"] == json!(["text"])));
+    }
+
+    #[tokio::test]
+    async fn route_models_lists_embedding_registry_capabilities() {
+        let body = response_json(get(router_with_stub_embed(), "/v1/models").await).await;
+        let data = body["data"].as_array().unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "stub-embed");
+        assert_eq!(data[0]["modalities"], json!(["text", "image"]));
     }
 
     #[tokio::test]
@@ -5876,6 +6324,7 @@ mod tests {
                     "/tmp/sql-adapter",
                 )],
             )
+            .unwrap()
             .build_router();
         let response = get(router, "/v1/models").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -5893,6 +6342,7 @@ mod tests {
             .expect("adapter model");
         assert_eq!(adapter["root"], "stub-model");
         assert_eq!(adapter["parent"], "stub-model");
+        assert_eq!(adapter["modalities"], json!(["text"]));
     }
 
     #[tokio::test]
@@ -5959,9 +6409,37 @@ mod tests {
             body["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("unknown LoRA adapter model"),
+                .contains("unknown model"),
             "body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_chat_unknown_served_model_returns_openai_model_error() {
+        let engine = Arc::new(CapturingLlm::new());
+        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "not-a-loaded-model",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown model"),
+            "body: {body}"
+        );
+        assert!(!engine.has_captured_request());
     }
 
     #[tokio::test]
@@ -6133,6 +6611,52 @@ mod tests {
         assert_eq!(
             body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"city\":\"北京\",\"unit\":\"c\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_uses_template_tool_protocol_for_function_parameter_xml() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{{ tools | tojson }}</tools>Use <tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}",
+            "function-parameter-xml-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(
+                "<tool_call>\n<function=get_weather>\n<parameter=city>\n北京\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+                template,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "请调用 get_weather 查询北京天气。"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"北京\",\"unit\":\"celsius\"}"
         );
     }
 
@@ -6384,6 +6908,133 @@ mod tests {
             body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"city\":\"Paris\"}"
         );
+    }
+
+    fn required_tool_with_strict_response_format_request(stream: bool) -> Value {
+        json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": "Use the weather tool."}],
+            "stream": stream,
+            "stream_options": stream.then_some(json!({"include_usage": true})),
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string", "const": "Paris"}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": "required",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "content_answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string", "const": "IGNORED"}},
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn route_chat_required_tool_takes_priority_over_strict_response_format() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(false),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_required_tool_rejects_arguments_that_violate_const_schema() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"London"}"#),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(false),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("did not satisfy its schema")),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_required_tool_takes_priority_over_strict_response_format() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(true),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "tool priority must finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""name":"weather""#)
+                && body.contains(r#""arguments":"{\"city\":\"Paris\"}""#),
+            "stream must carry the reconstructed tool call: {body}"
+        );
+        assert_eq!(
+            body.matches(r#""usage":{"#).count(),
+            1,
+            "stream must carry exactly one usage row: {body}"
+        );
+        assert!(
+            !body.contains("strict json_schema") && !body.contains("invalid JSON"),
+            "dormant content schema must not reject a required tool call: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_buffered_http_response_drops_the_engine_stream() {
+        let stream_dropped = Arc::new(Notify::new());
+        let response = post_json(
+            AxumServer::from_llm(Arc::new(StubLlm::with_pending_stream(Arc::clone(
+                &stream_dropped,
+            ))))
+            .build_router(),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(true),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream_dropped.notified())
+            .await
+            .expect("client disconnect must stop a buffered structured stream promptly");
     }
 
     #[tokio::test]
@@ -6942,28 +7593,83 @@ mod tests {
 
     #[tokio::test]
     async fn route_rejects_multimodal_content_with_400() {
+        for content in [
+            json!([{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]),
+            json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]),
+            json!([{"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}]),
+            json!([
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+            ]),
+        ] {
+            let response = post_json(
+                router_with_stub("unused"),
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": content}]
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("invalid chat completions request"));
+            assert!(
+                message.contains("unsupported message content part type"),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_rejects_non_object_stream_options() {
+        for stream_options in [json!([]), json!("yes"), json!(42), json!(true)] {
+            let response = post_json(
+                router_with_stub("unused"),
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": true,
+                    "stream_options": stream_options
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("stream_options must be a JSON object"),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_accepts_text_only_content_array() {
         let response = post_json(
-            router_with_stub("unused"),
+            router_with_stub("ok"),
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "describe this"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+                        {"type": "text", "text": "say"},
+                        {"type": "text", "text": "ok"}
                     ]
                 }]
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid chat completions request"));
+        assert_eq!(body["choices"][0]["message"]["content"], "ok");
     }
 
     #[tokio::test]
@@ -7137,6 +7843,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_omitted_output_budget_uses_auto_ceiling() {
+        let (router, engine) = router_with_capturing_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(request.sampling_params.max_tokens, 4096);
+        assert_eq!(
+            request.metadata.get(DEFAULT_MAX_TOKENS_METADATA_KEY),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
     async fn chat_accepts_stop_string_and_max_completion_tokens() {
         let (router, engine) = router_with_capturing_llm();
         let response = post_json(
@@ -7154,16 +7882,85 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
+        let defaults = default_chat_sampling_params();
         assert_eq!(request.sampling_params.max_tokens, 3);
-        assert_eq!(
-            request.sampling_params.temperature,
-            DEFAULT_SAMPLING_TEMPERATURE
-        );
+        assert!(!request
+            .metadata
+            .contains_key(DEFAULT_MAX_TOKENS_METADATA_KEY));
+        assert_eq!(request.sampling_params.temperature, defaults.temperature);
         assert_eq!(
             request.sampling_params.repetition_penalty,
-            DEFAULT_CHAT_REPETITION_PENALTY
+            defaults.repetition_penalty
         );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
+    }
+
+    #[tokio::test]
+    async fn chat_maps_vllm_sampling_extensions_without_hidden_defaults() {
+        let (router, engine) = router_with_capturing_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_k": 20,
+                "min_p": 0.05,
+                "repetition_penalty": 1.25
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(request.sampling_params.top_k, Some(20));
+        assert_eq!(request.sampling_params.min_p, Some(0.05));
+        assert_eq!(request.sampling_params.repetition_penalty, 1.25);
+    }
+
+    #[tokio::test]
+    async fn chat_normalizes_disabled_sampling_extensions_and_rejects_invalid_ranges() {
+        let (router, engine) = router_with_capturing_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_k": -1,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let request = engine.last_request();
+        assert_eq!(request.sampling_params.top_k, None);
+        assert_eq!(request.sampling_params.min_p, None);
+        assert_eq!(request.sampling_params.repetition_penalty, 1.0);
+
+        for (field, value) in [
+            ("top_k", json!(-2)),
+            ("min_p", json!(1.01)),
+            ("repetition_penalty", json!(0.0)),
+            ("presence_penalty", json!(2.01)),
+            ("frequency_penalty", json!(-2.01)),
+        ] {
+            let (router, _) = router_with_capturing_llm();
+            let response = post_json(
+                router,
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    (field): value
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST, "{field}");
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["param"], field);
+        }
     }
 
     #[tokio::test]
@@ -7174,7 +7971,7 @@ mod tests {
             router,
             "/v1/chat/completions",
             json!({
-                "model": "stub-model",
+                "model": "qwen3",
                 "messages": [{"role": "user", "content": "hello"}]
             }),
         )
@@ -7191,9 +7988,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_template_enable_thinking_default_is_template_controlled() {
+    async fn omitted_enable_thinking_preserves_model_template_default() {
         let template = ModelChatTemplate::new(
-            "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\n' ~ message.content ~ '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% endif %}{% endif %}",
+            "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\n' ~ message.content ~ '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% else %}{{ '<think>\n' }}{% endif %}{% endif %}",
             "test-template",
         );
         let (router, engine) = router_with_capturing_llm_and_template(template);
@@ -7209,21 +8006,16 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
-        assert!(request
-            .prompt
-            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
-        assert_eq!(
-            request
-                .metadata
-                .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
-            Some(&serde_json::json!([THINK_END_TAG, THINK_START_TAG]))
-        );
+        assert!(request.prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(!request
+            .metadata
+            .contains_key(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
     }
 
     #[tokio::test]
     async fn chat_template_enable_thinking_true_overrides_default() {
         let template = ModelChatTemplate::new(
-            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
             "test-template",
         );
         let (router, engine) = router_with_capturing_llm_and_template(template);
@@ -7240,7 +8032,39 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
-        assert_eq!(request.prompt, "<assistant>");
+        assert_eq!(request.prompt, "<assistant><think>\n");
+        assert!(!request
+            .metadata
+            .contains_key(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn chat_template_enable_thinking_false_is_a_hard_override() {
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
+            "test-template",
+        );
+        let (router, engine) = router_with_capturing_llm_and_template(template);
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": false}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(request.prompt, "<assistant><think>\n\n</think>\n\n");
+        assert_eq!(
+            request
+                .metadata
+                .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
+            Some(&serde_json::json!([THINK_END_TAG, THINK_START_TAG]))
+        );
     }
 
     #[tokio::test]
@@ -7837,9 +8661,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_text(response).await;
-        assert_openai_stream_error(&body, "stub stream failed");
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stub stream failed"));
     }
 
     #[tokio::test]
@@ -7855,9 +8683,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_text(response).await;
-        assert_openai_stream_error(&body, "stub stream failed");
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stub stream failed"));
         assert_chat_failure_replay_bundle(
             &root,
             "chat_completions_stream_start",
@@ -7970,6 +8802,38 @@ mod tests {
         assert_eq!(data[0]["embedding"][0].as_f64().unwrap(), 2.0);
         assert_eq!(data[1]["index"], 1);
         assert_eq!(data[1]["embedding"][0].as_f64().unwrap(), 5.0);
+    }
+
+    #[tokio::test]
+    async fn route_embeddings_public_alias_succeeds_and_unknown_alias_is_rejected() {
+        let registry = ServedModelRegistry::try_new(
+            "stub-embed",
+            ServedModelKind::Embedding,
+            vec!["public-embed".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let server =
+            AxumServer::from_embed(Arc::new(StubEmbed::new())).with_served_model_registry(registry);
+        let accepted = post_json(
+            server.build_router(),
+            "/v1/embeddings",
+            json!({"model": "public-embed", "input": "hello"}),
+        )
+        .await;
+        assert_eq!(accepted.status(), AxumStatusCode::OK);
+        assert_eq!(response_json(accepted).await["model"], "public-embed");
+
+        let rejected = post_json(
+            server.build_router(),
+            "/v1/embeddings",
+            json!({"model": "stub-embed", "input": "hello"}),
+        )
+        .await;
+        assert_eq!(rejected.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(rejected).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
     }
 
     #[tokio::test]
@@ -8365,6 +9229,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_completions_public_alias_maps_to_internal_model() {
+        let engine = Arc::new(CapturingLlm::new());
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
+            .build_router();
+        let response = post_json(
+            router,
+            "/v1/completions",
+            json!({"model": "served-alias", "prompt": "complete me"}),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(response_json(response).await["model"], "served-alias");
+        assert_eq!(engine.last_request().model_id, ModelId::new("qwen3"));
+    }
+
+    #[tokio::test]
     async fn route_completions_streaming_contract_uses_stub_engine() {
         let response = post_json(
             router_with_stub("done"),
@@ -8690,18 +9579,12 @@ mod tests {
         let initial_forbidden = internal.metadata[INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY]
             .as_array()
             .expect("initial forbidden token list");
-        for token in [
-            THINK_END_TAG,
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<|eot_id|>",
-            "</s>",
-        ] {
-            assert!(
-                initial_forbidden.iter().any(|value| value == token),
-                "missing initial forbidden token {token}: {initial_forbidden:?}"
-            );
-        }
+        assert_eq!(initial_forbidden, &[serde_json::json!(THINK_END_TAG)]);
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "auto tool choice must preserve native model selection instead of forcing arguments JSON",
+        );
         let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request.as_ref() else {
             panic!("expected structured chat api_request");
         };
@@ -8712,7 +9595,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_single_matching_tool_uses_tool_schema_response_format() {
+    fn omitted_tool_choice_uses_native_template_protocol_without_hard_schema() {
         let request: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "served-alias",
             "messages": [{"role": "user", "content": "北京现在天气怎么样?用摄氏度。"}],
@@ -8733,16 +9616,27 @@ mod tests {
             }]
         }))
         .expect("tool request parses");
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{{ tools | tojson }}</tools>Use <tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "function-parameter-xml-template",
+        );
 
         validate_chat_request(&request).expect("tool request validates");
-        let internal = convert_chat_request(&request).expect("convert");
+        let internal =
+            convert_chat_request_with_template_model(&request, "served-alias", Some(&template))
+                .expect("convert");
         assert_eq!(internal.metadata["openai_tool_choice"], "auto");
-        match internal.sampling_params.response_format {
-            ferrum_types::ResponseFormat::JsonSchema(ref schema) => {
-                assert!(schema.contains(r#""required":["city"]"#), "{schema}");
-            }
-            ref other => panic!("expected inferred tool json schema, got {other:?}"),
-        }
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+        );
+        let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request else {
+            panic!("expected chat API request");
+        };
+        assert_eq!(
+            api.tool_call_protocol,
+            ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+        );
     }
 
     #[test]
@@ -8841,6 +9735,72 @@ mod tests {
             }
             ref other => panic!("expected forced tool json schema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn required_tool_choice_suppresses_conflicting_response_format_instruction() {
+        let request: ChatCompletionsRequest =
+            serde_json::from_value(required_tool_with_strict_response_format_request(false))
+                .expect("request parses");
+
+        validate_chat_request(&request).expect("request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+
+        assert!(
+            !internal.prompt.contains("response_format requires"),
+            "required tool output must not receive a conflicting content-schema instruction: {}",
+            internal.prompt
+        );
+        let ferrum_types::ResponseFormat::JsonSchema(schema) =
+            internal.sampling_params.response_format
+        else {
+            panic!("single required tool must use its argument schema");
+        };
+        let schema: Value = serde_json::from_str(&schema).expect("tool schema JSON");
+        assert!(schema["properties"].get("city").is_some(), "{schema}");
+        assert!(schema["properties"].get("answer").is_none(), "{schema}");
+    }
+
+    #[test]
+    fn required_multiple_tools_do_not_force_the_first_tool_schema() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": "Use the appropriate tool."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calendar",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"date": {"type": "string"}},
+                            "required": ["date"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "required"
+        }))
+        .expect("request parses");
+
+        validate_chat_request(&request).expect("request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "required permits either declared tool, so guided decoding cannot bind the first tool's arguments"
+        );
     }
 
     #[test]
@@ -9228,25 +10188,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_object_strips_single_markdown_fence_as_best_effort_repair() {
+    async fn unknown_stream_option_is_rejected_instead_of_ignored() {
+        let response = post_json(
+            router_with_stub("unused"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "stream_options": {"continuous_usage_stats": true}
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid chat completions request"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_object_rejects_markdown_fence_instead_of_repairing() {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
         }));
-        let response = chat_completions_handler(
+        let err = chat_completions_handler(
             State(state_with_stub("```json\n{\"answer\":\"yes\"}\n```")),
             HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
-        .expect("json_object response");
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_json(response).await;
-        let content = body["choices"][0]["message"]["content"]
+        .expect_err("fenced json_object must fail");
+        let (status, body) = error_json(err).await;
+        assert_eq!(status, AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
             .as_str()
-            .expect("content string");
-        assert_eq!(content, "{\"answer\":\"yes\"}");
-        let parsed: serde_json::Value = serde_json::from_str(content).expect("parse json_object");
-        assert_eq!(parsed["answer"], "yes");
+            .unwrap_or_default()
+            .contains("response_format.json_object: invalid JSON"));
     }
 
     #[tokio::test]
@@ -9286,24 +10271,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_object_remains_best_effort_not_strict_validation() {
+    async fn json_object_rejects_non_json_model_output() {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
         }));
-        let response = chat_completions_handler(
+        let err = chat_completions_handler(
             State(state_with_stub("not json")),
             HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
-        .expect("json_object remains best-effort");
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["choices"][0]["message"]["content"], "not json");
+        .expect_err("invalid json_object must fail");
+        let (status, body) = error_json(err).await;
+        assert_eq!(status, AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("response_format.json_object"));
     }
 
-    #[tokio::test]
-    async fn unsupported_strict_json_schema_is_rejected_at_boundary() {
+    #[test]
+    fn one_of_strict_json_schema_reaches_hard_decoder() {
         let request = chat_request(json!({
             "response_format": {
                 "type": "json_schema",
@@ -9314,17 +10303,23 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(
-            State(state_with_stub("unused")),
-            HeaderMap::new(),
-            Ok(Json(request)),
-        )
-        .await
-        .expect_err("unsupported strict schema should reject");
-        let (status, body) = error_json(err).await;
-        assert_eq!(status, AxumStatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["param"], "response_format.json_schema");
-        assert_eq!(body["error"]["type"], "invalid_request_error");
+        validate_chat_request(&request).expect("oneOf strict schema should validate");
+        let internal = convert_chat_request(&request).expect("convert oneOf strict schema");
+        let ferrum_types::ResponseFormat::JsonSchema(schema) =
+            internal.sampling_params.response_format
+        else {
+            panic!("strict schema did not reach hard decoder");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&schema).unwrap()["oneOf"],
+            json!([{"type": "string"}, {"type": "integer"}])
+        );
+        let schema = serde_json::from_str::<serde_json::Value>(&schema).unwrap();
+        validate_json_text_against_schema(&schema, r#""answer""#)
+            .expect("oneOf string branch should pass final validation");
+        validate_json_text_against_schema(&schema, "7")
+            .expect("oneOf integer branch should pass final validation");
+        assert!(validate_json_text_against_schema(&schema, "true").is_err());
     }
 
     #[tokio::test]
@@ -9373,7 +10368,7 @@ mod tests {
         assert!(
             internal
                 .prompt
-                .contains("response_format requires a single valid JSON object"),
+                .contains("response_format requires a single valid JSON value"),
             "response_format instruction should reach the model prompt: {}",
             internal.prompt
         );
@@ -9420,8 +10415,33 @@ mod tests {
         );
         assert_eq!(
             internal.sampling_params.response_format,
-            ferrum_types::ResponseFormat::Text,
-            "json_object response_format should use prompt instruction and final JSON cleanup, not engine-wide JSON soft bias"
+            ferrum_types::ResponseFormat::JsonObject,
+            "json_object must reach the tokenizer-aware hard decoder"
+        );
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::Immediate
+        );
+    }
+
+    #[test]
+    fn json_object_thinking_template_activates_after_typed_end_delimiter() {
+        let request = chat_request(json!({
+            "response_format": {"type": "json_object"}
+        }));
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
+            "thinking-test-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert thinking json_object");
+
+        assert!(internal.prompt.ends_with("<assistant><think>\n"));
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
         );
     }
 
@@ -9446,7 +10466,7 @@ mod tests {
         assert!(
             internal
                 .prompt
-                .contains("response_format requires a single valid JSON object"),
+                .contains("response_format requires a single valid JSON value"),
             "response_format instruction should reach the model prompt: {}",
             internal.prompt
         );

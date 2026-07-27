@@ -1,21 +1,61 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{
-    classify_device_error, AllocationLifetime, BatchInvocationId, BatchStepId, BatchWorkShape,
-    BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
-    ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceId, DeviceRuntime,
-    ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, OperationId,
-    ParticipantNodeKey, PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
-    QuantizationFormatId, ResolvedModelPlan, ResourceId, SemanticValue,
-    TrustedActiveSequenceBinding, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId,
+    classify_device_error, AdmittedSequenceResources, AllocationLifetime, BatchInvocationId,
+    BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
+    BufferDescriptor, BufferUsage, CanonicalRational, CapabilityId, ClaimedSubmissionWaveBacking,
+    ContractVersion, DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm,
+    DeviceBufferRetention, DeviceCommandBatch, DeviceCommandLogicalWork, DeviceId,
+    DeviceReusableAddressScope, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
+    DynamicResourceDemand, DynamicResourceShape, EncodedDeviceOperation,
+    EncodedReusableExecutionBindings, ExecutablePlanView, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, HostTransferLayout,
+    InvocationResourceLease, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, LogicalBackingSliceAuthority,
+    MemoryPlan, NodeId, NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey,
+    PlanHash, PlanId, PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave,
+    ProgramBindingNodeBinding, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
+    ProviderWorkspaceReusePolicy, QuantizationFormatId, RequestIdentity, ResolvedWeightBinding,
+    ResourceId, ResourcePoolId, ResourceWorkShape, RunId, SemanticValue, SequenceBackingSnapshot,
+    SequenceSessionEpoch, SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment,
+    StepResourceLease, TransactionId, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence,
+    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
+    WeightMaterializerDescriptor, WeightMaterializerId, EXECUTION_IDENTITY_VERSION,
+    MAX_WEIGHT_MATERIALIZERS,
+};
+
+mod compiled_submission_wave;
+mod determinism;
+mod determinism_artifact;
+mod dispatch;
+
+pub use compiled_submission_wave::CompiledSubmissionWaveIdentity;
+use compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
+pub use determinism::{
+    SubmissionWaveDeterminismEvidence, SubmissionWaveDeterminismHandle,
+    SubmissionWaveDeterminismInitializationIdentity, SubmissionWaveDeterminismLogicalRange,
+    SubmissionWaveDeterminismPhysicalReadback, SubmissionWaveDeterminismReadbackPlan,
+    SubmissionWaveDeterminismReadbackTarget, SubmissionWaveDeterminismRestore,
+    SubmissionWaveDeterminismRestoreLayout, SubmissionWaveDeterminismWitnessReadback,
+};
+pub use determinism_artifact::{
+    SubmissionWaveDeterminismArtifactAttribution, SubmissionWaveDeterminismArtifactExecution,
+    SubmissionWaveDeterminismArtifactInitializationIdentity,
+    SubmissionWaveDeterminismArtifactLogicalCommand,
+    SubmissionWaveDeterminismArtifactPhysicalCommand,
+    SubmissionWaveDeterminismArtifactReplayedSegment, SubmissionWaveDeterminismArtifactWitness,
+};
+pub use dispatch::{
+    BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatch,
+    OperationDispatchError, ProfiledSubmissionHandle, SubmissionExecutionPolicy,
+    SubmissionScratchInitialization, SubmissionWaveDispatchError, SubmissionWaveDispatchStage,
+    SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -28,6 +68,133 @@ fn invalid_operation(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
+}
+
+fn operation_error_for_node(error: VNextError, node_id: &NodeId) -> VNextError {
+    match error {
+        VNextError::UnsupportedOperation {
+            node_id: None,
+            operation_id,
+            device_id,
+            reason,
+        } => VNextError::UnsupportedOperation {
+            node_id: Some(node_id.to_string()),
+            operation_id,
+            device_id,
+            reason,
+        },
+        VNextError::IncompatibleOperationVersion {
+            node_id: None,
+            operation_id,
+            required_major,
+            required_minor,
+            available_major,
+            available_minor,
+        } => VNextError::IncompatibleOperationVersion {
+            node_id: Some(node_id.to_string()),
+            operation_id,
+            required_major,
+            required_minor,
+            available_major,
+            available_minor,
+        },
+        error => error,
+    }
+}
+
+struct OperationFingerprintWriter<'a>(&'a mut Sha256);
+
+impl Write for OperationFingerprintWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_operation_fingerprint(
+    value: &impl Serialize,
+    failure_context: &'static str,
+) -> Result<String, VNextError> {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(OperationFingerprintWriter(&mut digest), value)
+        .map_err(|error| invalid_operation(format!("{failure_context}: {error}")))?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueBindingPhysicalCoverage {
+    CanonicalComponent,
+    RuntimeTokenView,
+}
+
+fn validate_value_binding_physical_coverage(
+    work: &NodeWorkContract,
+    binding: &ResolvedValueBinding,
+    component: &ResolvedStorageComponent,
+    descriptor: &BufferDescriptor,
+    dynamic_demand: Option<&DynamicResourceDemand>,
+    value_alignment_bytes: u64,
+) -> Result<ValueBindingPhysicalCoverage, VNextError> {
+    let required_end = component
+        .offset_bytes()
+        .checked_add(component.length_bytes())
+        .ok_or_else(|| invalid_operation("bound component range overflows u64"))?;
+    if descriptor.usage != binding.usage()
+        || descriptor.element_type != component.element_type()
+        || descriptor.alignment_bytes < value_alignment_bytes
+        || descriptor.alignment_bytes % value_alignment_bytes != 0
+        || component.offset_bytes() % value_alignment_bytes != 0
+    {
+        return Err(invalid_operation(format!(
+            "resource `{}` differs from its value binding",
+            component.resource_id()
+        )));
+    }
+
+    let Some(projection) = work.token_projection(binding.role(), binding.ordinal()) else {
+        if required_end > descriptor.size_bytes {
+            return Err(invalid_operation(format!(
+                "resource `{}` differs from its value binding",
+                component.resource_id()
+            )));
+        }
+        return Ok(ValueBindingPhysicalCoverage::CanonicalComponent);
+    };
+
+    let axis = usize::try_from(projection.axis())
+        .map_err(|_| invalid_operation("token projection axis exceeds usize"))?;
+    let canonical_extent = projection.canonical_extent();
+    let bytes_per_token = component
+        .length_bytes()
+        .checked_div(canonical_extent)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| invalid_operation("token projection has zero canonical extent"))?;
+    let demand_matches = matches!(
+        dynamic_demand,
+        Some(DynamicResourceDemand::Tokens {
+            bytes_per_token: planned_bytes_per_token,
+            ..
+        }) if *planned_bytes_per_token == bytes_per_token
+    );
+    if binding.usage() != BufferUsage::Activations
+        || component.offset_bytes() != 0
+        || component.length_bytes() % canonical_extent != 0
+        || usize::try_from(projection.rank()).ok() != Some(binding.tensor().dimensions().len())
+        || binding.tensor().dimensions().get(axis) != Some(&canonical_extent)
+        || !demand_matches
+        || descriptor.size_bytes < bytes_per_token
+    {
+        return Err(invalid_operation(format!(
+            "resource `{}` differs from its token-projected value binding",
+            component.resource_id()
+        )));
+    }
+
+    Ok(ValueBindingPhysicalCoverage::RuntimeTokenView)
 }
 
 fn canonical_sha256(value: &str) -> bool {
@@ -1115,6 +1282,7 @@ pub struct ResolvedValueBinding {
     access: TensorAccess,
     alias: AliasPolicy,
     usage: BufferUsage,
+    weight: Option<ResolvedWeightBinding>,
     storage: ResolvedValueStorage,
 }
 
@@ -1128,6 +1296,7 @@ struct ResolvedValueBindingWire {
     access: TensorAccess,
     alias: AliasPolicy,
     usage: BufferUsage,
+    weight: Option<ResolvedWeightBinding>,
     storage: ResolvedValueStorage,
 }
 
@@ -1145,6 +1314,7 @@ impl<'de> Deserialize<'de> for ResolvedValueBinding {
             wire.access,
             wire.alias,
             wire.usage,
+            wire.weight,
             wire.storage,
         )
         .map_err(serde::de::Error::custom)
@@ -1160,6 +1330,7 @@ impl ResolvedValueBinding {
         access: TensorAccess,
         alias: AliasPolicy,
         usage: BufferUsage,
+        weight: Option<ResolvedWeightBinding>,
         storage: ResolvedValueStorage,
     ) -> Result<Self, VNextError> {
         if (role == ResolvedValueRole::Input
@@ -1192,6 +1363,23 @@ impl ResolvedValueBinding {
                 "resolved value storage is smaller than its tensor span",
             ));
         }
+        match (usage, weight.as_ref()) {
+            (BufferUsage::Weights, Some(weight)) => {
+                weight.validate_logical(tensor.dimensions(), tensor.element_type())?;
+                validate_resolved_weight_storage(weight, &storage)?;
+            }
+            (BufferUsage::Weights, None) => {
+                return Err(invalid_operation(
+                    "weight value lacks its resolved physical layout contract",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(invalid_operation(
+                    "non-weight value carries a resolved weight layout contract",
+                ));
+            }
+            (_, None) => {}
+        }
         Ok(Self {
             value_id,
             role,
@@ -1200,6 +1388,7 @@ impl ResolvedValueBinding {
             access,
             alias,
             usage,
+            weight,
             storage,
         })
     }
@@ -1232,9 +1421,49 @@ impl ResolvedValueBinding {
         self.usage
     }
 
+    pub fn weight(&self) -> Option<&ResolvedWeightBinding> {
+        self.weight.as_ref()
+    }
+
     pub fn storage(&self) -> &ResolvedValueStorage {
         &self.storage
     }
+}
+
+fn validate_resolved_weight_storage(
+    weight: &ResolvedWeightBinding,
+    storage: &ResolvedValueStorage,
+) -> Result<(), VNextError> {
+    let expected = weight
+        .components()
+        .iter()
+        .map(|component| (component.component_id(), component))
+        .collect::<BTreeMap<_, _>>();
+    if storage.components().len() != expected.len() {
+        return Err(invalid_operation(
+            "resolved weight storage component count differs from its layout contract",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for stored in storage.components() {
+        let component_id = stored.component_id().ok_or_else(|| {
+            invalid_operation("resolved weight storage component lacks its physical identity")
+        })?;
+        let component = expected.get(component_id).ok_or_else(|| {
+            invalid_operation(format!(
+                "resolved weight storage contains unknown component `{component_id}`"
+            ))
+        })?;
+        if !seen.insert(component_id)
+            || stored.length_bytes() != component.physical_bytes()?
+            || stored.element_type() != component.physical_element_type()
+        {
+            return Err(invalid_operation(format!(
+                "resolved weight storage component `{component_id}` differs from its layout contract"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1262,6 +1491,9 @@ impl ResourcePresenceRequirement {
 pub struct ResourceRequirements {
     pub minimum_value_alignment_bytes: u64,
     pub scratch: ResourcePresenceRequirement,
+    /// Small request-shaped control workspace whose contents are written in
+    /// the wave binding preamble and consumed by reusable compute.
+    pub binding: ResourcePresenceRequirement,
     pub persistent: ResourcePresenceRequirement,
 }
 
@@ -1286,6 +1518,10 @@ pub enum OracleSpec {
 pub enum ProfilePhase {
     Load,
     Prepare,
+    /// Backend operation shared by prefill and decode. The exact request phase
+    /// is derived from the bound work shape rather than changing operation
+    /// identity or selecting another provider in the hot path.
+    Forward,
     Prefill,
     Decode,
     Transfer,
@@ -1390,6 +1626,14 @@ impl OperationDescriptor {
         if self.provider.minimum_version.major == 0 {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: format!("operation `{}` has a zero provider major version", self.id),
+            });
+        }
+        if self.provider.minimum_version.major != self.version.major {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "operation `{}` version {} and provider minimum version {} have incompatible major versions",
+                    self.id, self.version, self.provider.minimum_version
+                ),
             });
         }
         Ok(())
@@ -1672,12 +1916,231 @@ pub trait OperationContract: Send + Sync {
     ) -> Result<(), VNextError>;
 }
 
+pub const PROVIDER_EXECUTION_SEMANTICS_VERSION: ContractVersion = ContractVersion::new(1, 0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProviderExecutionContractFingerprint([u8; 32]);
+
+impl ProviderExecutionContractFingerprint {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderExecutionContractFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ProviderExecutionContractFingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderExecutionContractFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if !canonical_sha256(&value) {
+            return Err(serde::de::Error::custom(
+                "provider execution contract fingerprint must be a lowercase SHA256",
+            ));
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+/// Repeatability promised for one immutable plan/provider/runtime binding.
+///
+/// Bitwise equality covers every declared output and state effect when logical
+/// inputs, explicit RNG state, initial state, and initialized workspaces are
+/// identical. Approximation against an independent oracle is a separate
+/// operation contract and cannot weaken this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExecutionRepeatability {
+    BitwiseSameRuntime,
+}
+
+impl ProviderExecutionRepeatability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BitwiseSameRuntime => "bitwise_same_runtime",
+        }
+    }
+}
+
+/// Whether a provider authorizes reusable device execution for the same
+/// immutable eager operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReplayEquivalence {
+    Ineligible,
+    BitwiseEagerEquivalent,
+}
+
+impl ProviderReplayEquivalence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ineligible => "ineligible",
+            Self::BitwiseEagerEquivalent => "bitwise_eager_equivalent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProviderExecutionSemantics {
+    contract_version: ContractVersion,
+    contract_fingerprint: ProviderExecutionContractFingerprint,
+    repeatability: ProviderExecutionRepeatability,
+    replay_equivalence: ProviderReplayEquivalence,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderExecutionSemanticsWire {
+    contract_version: ContractVersion,
+    contract_fingerprint: ProviderExecutionContractFingerprint,
+    repeatability: ProviderExecutionRepeatability,
+    replay_equivalence: ProviderReplayEquivalence,
+}
+
+impl<'de> Deserialize<'de> for ProviderExecutionSemantics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProviderExecutionSemanticsWire::deserialize(deserializer)?;
+        let semantics = Self::new(
+            wire.contract_version,
+            wire.repeatability,
+            wire.replay_equivalence,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if semantics.contract_fingerprint != wire.contract_fingerprint {
+            return Err(serde::de::Error::custom(format!(
+                "provider execution contract fingerprint mismatch: expected `{}`, actual `{}`",
+                semantics.contract_fingerprint, wire.contract_fingerprint
+            )));
+        }
+        Ok(semantics)
+    }
+}
+
+impl ProviderExecutionSemantics {
+    fn new(
+        contract_version: ContractVersion,
+        repeatability: ProviderExecutionRepeatability,
+        replay_equivalence: ProviderReplayEquivalence,
+    ) -> Result<Self, VNextError> {
+        if contract_version != PROVIDER_EXECUTION_SEMANTICS_VERSION {
+            return Err(invalid_operation(format!(
+                "provider execution semantics version {contract_version} is unsupported"
+            )));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"ferrum.runtime-vnext.provider-execution-semantics.v1\0");
+        digest.update(contract_version.major.to_le_bytes());
+        digest.update(contract_version.minor.to_le_bytes());
+        digest.update([match repeatability {
+            ProviderExecutionRepeatability::BitwiseSameRuntime => 1,
+        }]);
+        digest.update([match replay_equivalence {
+            ProviderReplayEquivalence::Ineligible => 0,
+            ProviderReplayEquivalence::BitwiseEagerEquivalent => 1,
+        }]);
+        Ok(Self {
+            contract_version,
+            contract_fingerprint: ProviderExecutionContractFingerprint(digest.finalize().into()),
+            repeatability,
+            replay_equivalence,
+        })
+    }
+
+    pub fn bitwise_eager_only() -> Self {
+        Self::new(
+            PROVIDER_EXECUTION_SEMANTICS_VERSION,
+            ProviderExecutionRepeatability::BitwiseSameRuntime,
+            ProviderReplayEquivalence::Ineligible,
+        )
+        .expect("built-in eager execution semantics are valid")
+    }
+
+    pub fn bitwise_eager_and_replay() -> Self {
+        Self::new(
+            PROVIDER_EXECUTION_SEMANTICS_VERSION,
+            ProviderExecutionRepeatability::BitwiseSameRuntime,
+            ProviderReplayEquivalence::BitwiseEagerEquivalent,
+        )
+        .expect("built-in reusable execution semantics are valid")
+    }
+
+    pub const fn contract_version(self) -> ContractVersion {
+        self.contract_version
+    }
+
+    pub const fn contract_fingerprint(self) -> ProviderExecutionContractFingerprint {
+        self.contract_fingerprint
+    }
+
+    pub const fn repeatability(self) -> ProviderExecutionRepeatability {
+        self.repeatability
+    }
+
+    pub const fn replay_equivalence(self) -> ProviderReplayEquivalence {
+        self.replay_equivalence
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDeterminismRequirement {
+    BitwiseSameRuntime,
+    BitwiseSameRuntimeWithReplay,
+}
+
+impl ExecutionDeterminismRequirement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BitwiseSameRuntime => "bitwise_same_runtime",
+            Self::BitwiseSameRuntimeWithReplay => "bitwise_same_runtime_with_replay",
+        }
+    }
+
+    pub const fn requires_replay_equivalence(self) -> bool {
+        matches!(self, Self::BitwiseSameRuntimeWithReplay)
+    }
+
+    pub fn accepts(self, semantics: ProviderExecutionSemantics) -> bool {
+        semantics.repeatability == ProviderExecutionRepeatability::BitwiseSameRuntime
+            && (!self.requires_replay_equivalence()
+                || semantics.replay_equivalence
+                    == ProviderReplayEquivalence::BitwiseEagerEquivalent)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationProviderDescriptor {
     provider_id: ProviderId,
     operation_id: OperationId,
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
+    execution_semantics: ProviderExecutionSemantics,
     version: ContractVersion,
     device_id: DeviceId,
     capabilities: BTreeSet<CapabilityId>,
@@ -1696,6 +2159,7 @@ struct OperationProviderDescriptorWire {
     operation_id: OperationId,
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
+    execution_semantics: ProviderExecutionSemantics,
     version: ContractVersion,
     device_id: DeviceId,
     capabilities: BTreeSet<CapabilityId>,
@@ -1719,6 +2183,7 @@ impl<'de> Deserialize<'de> for OperationProviderDescriptor {
             wire.operation_id,
             wire.operation_fingerprint,
             wire.provider_implementation_fingerprint,
+            wire.execution_semantics,
             wire.version,
             wire.device_id,
             wire.capabilities,
@@ -1746,6 +2211,7 @@ impl OperationProviderDescriptor {
         operation_id: OperationId,
         operation_fingerprint: impl Into<String>,
         provider_implementation_fingerprint: impl Into<String>,
+        execution_semantics: ProviderExecutionSemantics,
         version: ContractVersion,
         device_id: DeviceId,
         capabilities: BTreeSet<CapabilityId>,
@@ -1786,6 +2252,7 @@ impl OperationProviderDescriptor {
             operation_id,
             operation_fingerprint,
             provider_implementation_fingerprint,
+            execution_semantics,
             version,
             device_id,
             capabilities,
@@ -1812,6 +2279,10 @@ impl OperationProviderDescriptor {
 
     pub fn provider_implementation_fingerprint(&self) -> &str {
         &self.provider_implementation_fingerprint
+    }
+
+    pub const fn execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.execution_semantics
     }
 
     pub fn version(&self) -> ContractVersion {
@@ -1949,6 +2420,7 @@ pub struct ProviderCompatibilityRequest {
     required_capabilities: BTreeSet<CapabilityId>,
     required_weight_formats: BTreeSet<WeightFormatId>,
     required_quantization_formats: BTreeSet<QuantizationFormatId>,
+    execution_determinism: ExecutionDeterminismRequirement,
 }
 
 #[derive(Deserialize)]
@@ -1959,6 +2431,7 @@ struct ProviderCompatibilityRequestWire {
     required_capabilities: BTreeSet<CapabilityId>,
     required_weight_formats: BTreeSet<WeightFormatId>,
     required_quantization_formats: BTreeSet<QuantizationFormatId>,
+    execution_determinism: ExecutionDeterminismRequirement,
 }
 
 impl<'de> Deserialize<'de> for ProviderCompatibilityRequest {
@@ -1973,6 +2446,7 @@ impl<'de> Deserialize<'de> for ProviderCompatibilityRequest {
             wire.required_capabilities,
             wire.required_weight_formats,
             wire.required_quantization_formats,
+            wire.execution_determinism,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -1985,6 +2459,7 @@ impl ProviderCompatibilityRequest {
         required_capabilities: BTreeSet<CapabilityId>,
         required_weight_formats: BTreeSet<WeightFormatId>,
         required_quantization_formats: BTreeSet<QuantizationFormatId>,
+        execution_determinism: ExecutionDeterminismRequirement,
     ) -> Result<Self, VNextError> {
         if required_version.major == 0 {
             return Err(invalid_operation(
@@ -1997,6 +2472,7 @@ impl ProviderCompatibilityRequest {
             required_capabilities,
             required_weight_formats,
             required_quantization_formats,
+            execution_determinism,
         })
     }
 
@@ -2019,6 +2495,10 @@ impl ProviderCompatibilityRequest {
     pub fn required_quantization_formats(&self) -> &BTreeSet<QuantizationFormatId> {
         &self.required_quantization_formats
     }
+
+    pub const fn execution_determinism(&self) -> ExecutionDeterminismRequirement {
+        self.execution_determinism
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2040,6 +2520,10 @@ pub enum ProviderCompatibilityRejectReason {
     },
     UnsupportedQuantizationFormats {
         formats: BTreeSet<QuantizationFormatId>,
+    },
+    InsufficientExecutionDeterminism {
+        required: ExecutionDeterminismRequirement,
+        available: ProviderExecutionSemantics,
     },
 }
 
@@ -2081,6 +2565,12 @@ impl<'de> Deserialize<'de> for ProviderCompatibilityReport {
 }
 
 impl ProviderCompatibilityReport {
+    fn rejection_summary(&self) -> String {
+        serde_json::to_string(&self.rejected)
+            .map(|rejected| format!("all providers were rejected: {rejected}"))
+            .unwrap_or_else(|_| "all providers were rejected".to_owned())
+    }
+
     fn validate_shape(&self) -> Result<(), VNextError> {
         let compatible = self.compatible_provider_ids.iter().collect::<BTreeSet<_>>();
         let rejected = self
@@ -2130,11 +2620,69 @@ impl ProviderCompatibilityReport {
                 node_id: None,
                 operation_id: self.request.operation_id.to_string(),
                 device_id: device_id.to_string(),
-                reason: "all providers were rejected; inspect the typed compatibility report"
-                    .to_owned(),
+                reason: self.rejection_summary(),
             });
         }
         Ok(())
+    }
+
+    /// Requires one compatible provider while retaining the plan node that
+    /// caused a missing capability or version failure.
+    pub fn require_compatible_for_node(
+        &self,
+        device_id: &DeviceId,
+        node_id: &NodeId,
+    ) -> Result<(), VNextError> {
+        if !self.compatible_provider_ids.is_empty() {
+            return Ok(());
+        }
+        let operation_version_mismatch = self
+            .rejected
+            .iter()
+            .flat_map(|rejection| &rejection.reasons)
+            .find_map(|reason| match reason {
+                ProviderCompatibilityRejectReason::OperationVersionMismatch {
+                    required,
+                    available,
+                } => Some((*required, *available)),
+                _ => None,
+            });
+        let provider_version_mismatch = self
+            .rejected
+            .iter()
+            .map(|rejection| {
+                rejection.reasons.iter().find_map(|reason| match reason {
+                    ProviderCompatibilityRejectReason::ProviderVersionMismatch {
+                        required,
+                        available,
+                    } => Some((*required, *available)),
+                    _ => None,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(|versions| {
+                versions
+                    .into_iter()
+                    .max_by_key(|(_, available)| (available.major, available.minor))
+            });
+        if let Some((required, available)) =
+            operation_version_mismatch.or(provider_version_mismatch)
+        {
+            return Err(VNextError::IncompatibleOperationVersion {
+                node_id: Some(node_id.to_string()),
+                operation_id: self.request.operation_id.to_string(),
+                required_major: required.major,
+                required_minor: required.minor,
+                available_major: available.major,
+                available_minor: available.minor,
+            });
+        }
+        Err(VNextError::UnsupportedOperation {
+            node_id: Some(node_id.to_string()),
+            operation_id: self.request.operation_id.to_string(),
+            device_id: device_id.to_string(),
+            reason: self.rejection_summary(),
+        })
     }
 }
 
@@ -2306,15 +2854,26 @@ pub enum OperationBufferStorageKind {
 }
 
 enum OperationBufferSource<'a, B> {
-    Static(LeasedBufferView<'a, B>),
+    Static {
+        view: LeasedBufferView<'a, B>,
+        retention: DeviceBufferRetention,
+    },
     Backing(LogicalBackingBufferView<'a, B>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationBufferCoverage {
+    Exact,
+    /// The operation sees an exact logical prefix while resource authority
+    /// retains wider physical capacity for a frontier or reusable bucket.
+    BackingPrefix,
+}
+
 enum OperationRegionSource<'a, B> {
     Contiguous {
         buffer: &'a B,
         physical_base_offset_bytes: u64,
+        retention: DeviceBufferRetention,
     },
     Paged {
         bindings: &'a [LogicalBackingSegmentBinding<B>],
@@ -2348,23 +2907,25 @@ impl<'a, B> OperationBufferRegions<'a, B> {
             .logical_offset_bytes
             .checked_add(self.logical_length_bytes)
             .expect("validated operation logical range does not overflow");
-        match self.source {
+        match &self.source {
             OperationRegionSource::Contiguous {
                 buffer,
                 physical_base_offset_bytes,
+                retention,
             } => OperationBufferRegionIter {
                 state: OperationBufferRegionIterState::Contiguous(Some(OperationPhysicalRegion {
-                    buffer,
+                    buffer: *buffer,
                     logical_offset_bytes: self.logical_offset_bytes,
                     physical_offset_bytes: physical_base_offset_bytes
                         .checked_add(self.logical_offset_bytes)
                         .expect("validated contiguous physical range does not overflow"),
                     length_bytes: self.logical_length_bytes,
+                    retention: retention.clone(),
                 })),
             },
             OperationRegionSource::Paged { bindings } => OperationBufferRegionIter {
                 state: OperationBufferRegionIterState::Paged {
-                    bindings,
+                    bindings: *bindings,
                     requested_start_bytes: self.logical_offset_bytes,
                     requested_end_bytes: logical_end_bytes,
                     next_segment: 0,
@@ -2382,6 +2943,7 @@ pub struct OperationPhysicalRegion<'a, B> {
     logical_offset_bytes: u64,
     physical_offset_bytes: u64,
     length_bytes: u64,
+    retention: DeviceBufferRetention,
 }
 
 impl<'a, B> OperationPhysicalRegion<'a, B> {
@@ -2393,7 +2955,9 @@ impl<'a, B> OperationPhysicalRegion<'a, B> {
         self.length_bytes
     }
 
-    pub fn buffer_and_physical_range(&self) -> (&'a B, std::ops::Range<u64>) {
+    pub fn buffer_and_physical_range(
+        &self,
+    ) -> (&'a B, std::ops::Range<u64>, DeviceBufferRetention) {
         (
             self.buffer,
             self.physical_offset_bytes
@@ -2401,6 +2965,7 @@ impl<'a, B> OperationPhysicalRegion<'a, B> {
                     .physical_offset_bytes
                     .checked_add(self.length_bytes)
                     .expect("validated physical region does not overflow"),
+            self.retention.clone(),
         )
     }
 }
@@ -2437,6 +3002,7 @@ impl<'a, B> Iterator for OperationBufferRegionIter<'a, B> {
                     *next_segment += 1;
                     let (segment_logical_end, region) = translate_paged_segment(
                         binding.buffer(),
+                        binding.retention(),
                         binding.segment().offset_bytes(),
                         binding.segment().length_bytes(),
                         *next_segment_logical_offset_bytes,
@@ -2456,6 +3022,7 @@ impl<'a, B> Iterator for OperationBufferRegionIter<'a, B> {
 
 fn translate_paged_segment<'a, B>(
     buffer: &'a B,
+    retention: DeviceBufferRetention,
     physical_offset_bytes: u64,
     length_bytes: u64,
     logical_start_bytes: u64,
@@ -2474,6 +3041,7 @@ fn translate_paged_segment<'a, B>(
             .checked_add(translated_start - logical_start_bytes)
             .expect("validated paged physical range does not overflow"),
         length_bytes: translated_end - translated_start,
+        retention,
     });
     (logical_end_bytes, region)
 }
@@ -2489,6 +3057,7 @@ fn validate_dynamic_binding_layout(
     storage_kind: OperationBufferStorageKind,
     logical_size_bytes: u64,
     mut binding_lengths: impl ExactSizeIterator<Item = u64>,
+    coverage: OperationBufferCoverage,
 ) -> Result<(), VNextError> {
     let binding_count = binding_lengths.len();
     if storage_kind == OperationBufferStorageKind::StaticContiguous {
@@ -2511,17 +3080,39 @@ fn validate_dynamic_binding_layout(
             .checked_add(length_bytes)
             .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
     })?;
-    if covered != logical_size_bytes {
+    if covered < logical_size_bytes
+        || (coverage == OperationBufferCoverage::Exact && covered != logical_size_bytes)
+    {
         return Err(invalid_operation(
-            "dynamic backing segments do not exactly cover the logical resource",
+            "dynamic backing segments do not cover the operation's exact logical view",
         ));
     }
     Ok(())
 }
 
+fn sequence_execution_shape(
+    committed: DynamicResourceShape,
+    source_end_tokens: u64,
+) -> Result<DynamicResourceShape, VNextError> {
+    if committed.sequences() != 1
+        || source_end_tokens == 0
+        || source_end_tokens > committed.tokens()
+    {
+        return Err(invalid_operation(
+            "sequence operation frontier is empty or exceeds committed backing",
+        ));
+    }
+    Ok(DynamicResourceShape::from_validated(
+        1,
+        source_end_tokens,
+        committed.pages(),
+    ))
+}
+
 pub struct OperationBufferView<'a, B> {
     descriptor: super::BufferDescriptor,
     source: OperationBufferSource<'a, B>,
+    coverage: OperationBufferCoverage,
 }
 
 impl<'a, B> OperationBufferView<'a, B> {
@@ -2535,7 +3126,7 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     pub fn storage_kind(&self) -> OperationBufferStorageKind {
         match &self.source {
-            OperationBufferSource::Static(_) => OperationBufferStorageKind::StaticContiguous,
+            OperationBufferSource::Static { .. } => OperationBufferStorageKind::StaticContiguous,
             OperationBufferSource::Backing(view) => {
                 operation_storage_kind(view.storage_profile().view())
             }
@@ -2556,25 +3147,24 @@ impl<'a, B> OperationBufferView<'a, B> {
             ));
         }
         match &self.source {
-            OperationBufferSource::Static(view) => Ok(OperationBufferRegions {
+            OperationBufferSource::Static { view, retention } => Ok(OperationBufferRegions {
                 storage_kind: OperationBufferStorageKind::StaticContiguous,
                 logical_offset_bytes,
                 logical_length_bytes,
                 source: OperationRegionSource::Contiguous {
                     buffer: view.buffer(),
                     physical_base_offset_bytes: 0,
+                    retention: retention.clone(),
                 },
             }),
             OperationBufferSource::Backing(view) => {
                 let bindings = view.segment_bindings();
-                let evidence_segments = view.slice().segments();
-                if bindings.len() != evidence_segments.len()
-                    || bindings
-                        .iter()
-                        .zip(evidence_segments)
-                        .any(|(binding, segment)| {
+                if bindings.len() != view.committed_evidence_segments().count()
+                    || bindings.iter().zip(view.committed_evidence_segments()).any(
+                        |(binding, segment)| {
                             binding.segment() != segment || binding.chunk() != segment.chunk()
-                        })
+                        },
+                    )
                 {
                     return Err(invalid_operation(
                         "dynamic backing bindings differ from committed segment evidence",
@@ -2587,6 +3177,7 @@ impl<'a, B> OperationBufferView<'a, B> {
                     bindings
                         .iter()
                         .map(|binding| binding.segment().length_bytes()),
+                    self.coverage,
                 )?;
                 let source = match storage_kind {
                     OperationBufferStorageKind::DynamicContiguous => {
@@ -2594,6 +3185,7 @@ impl<'a, B> OperationBufferView<'a, B> {
                         OperationRegionSource::Contiguous {
                             buffer: binding.buffer(),
                             physical_base_offset_bytes: binding.segment().offset_bytes(),
+                            retention: binding.retention(),
                         }
                     }
                     OperationBufferStorageKind::DynamicPaged => {
@@ -2617,6 +3209,89 @@ impl<'a, B> OperationBufferView<'a, B> {
 #[cfg(test)]
 mod operation_buffer_region_tests {
     use super::*;
+
+    #[test]
+    fn token_projection_validates_runtime_view_instead_of_canonical_extent() {
+        let resource_id = ResourceId::new("resource.activation.token-ids").unwrap();
+        let binding = ResolvedValueBinding::new(
+            ProgramValueId::new("value.input.token-ids").unwrap(),
+            ResolvedValueRole::Input,
+            0,
+            ResolvedTensorSpec::new(
+                vec![128],
+                ElementType::U32,
+                ResolvedTensorLayout::Contiguous,
+            )
+            .unwrap(),
+            TensorAccess::Read,
+            AliasPolicy::NoAlias,
+            BufferUsage::Activations,
+            None,
+            ResolvedValueStorage::single(resource_id.clone(), 0, 512, ElementType::U32).unwrap(),
+        )
+        .unwrap();
+        let work: NodeWorkContract = serde_json::from_value(serde_json::json!({
+            "tokens": {
+                "source": {
+                    "value_id": "value.input.token-ids",
+                    "role": "input",
+                    "ordinal": 0,
+                    "axis": 0,
+                    "rank": 1,
+                    "canonical_extent": 128
+                },
+                "projections": [{
+                    "value_id": "value.input.token-ids",
+                    "role": "input",
+                    "ordinal": 0,
+                    "axis": 0,
+                    "rank": 1,
+                    "canonical_extent": 128
+                }]
+            }
+        }))
+        .unwrap();
+        let descriptor = BufferDescriptor {
+            resource_id,
+            size_bytes: 160,
+            alignment_bytes: 16,
+            usage: BufferUsage::Activations,
+            element_type: ElementType::U32,
+        };
+        let component = &binding.storage().components()[0];
+        let demand = DynamicResourceDemand::tokens(4, 128).unwrap();
+
+        assert_eq!(
+            validate_value_binding_physical_coverage(
+                &work,
+                &binding,
+                component,
+                &descriptor,
+                Some(&demand),
+                16,
+            )
+            .unwrap(),
+            ValueBindingPhysicalCoverage::RuntimeTokenView
+        );
+        assert!(validate_value_binding_physical_coverage(
+            &NodeWorkContract::Fixed,
+            &binding,
+            component,
+            &descriptor,
+            Some(&demand),
+            16,
+        )
+        .is_err());
+        assert!(validate_value_binding_physical_coverage(
+            &work,
+            &binding,
+            component,
+            &descriptor,
+            Some(&DynamicResourceDemand::tokens(8, 128).unwrap()),
+            16,
+        )
+        .is_err());
+    }
 
     #[test]
     fn paged_translation_uses_each_chunks_exact_buffer() {
@@ -2646,6 +3321,7 @@ mod operation_buffer_region_tests {
             .filter_map(|binding| {
                 let (logical_end, region) = translate_paged_segment(
                     binding.buffer,
+                    DeviceBufferRetention::plan(Arc::new(())),
                     binding.physical_offset_bytes,
                     binding.length_bytes,
                     next_logical_offset,
@@ -2658,11 +3334,12 @@ mod operation_buffer_region_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(translated.len(), 2);
-        let (first, first_physical) = translated[0].buffer_and_physical_range();
+        let (first, first_physical, _first_retention) = translated[0].buffer_and_physical_range();
         assert!(std::ptr::eq(first, &first_buffer));
         assert_eq!(translated[0].logical_offset_bytes(), 6);
         assert_eq!(first_physical, 70..72);
-        let (second, second_physical) = translated[1].buffer_and_physical_range();
+        let (second, second_physical, _second_retention) =
+            translated[1].buffer_and_physical_range();
         assert!(std::ptr::eq(second, &second_buffer));
         assert_eq!(translated[1].logical_offset_bytes(), 8);
         assert_eq!(second_physical, 200..208);
@@ -2678,12 +3355,61 @@ mod operation_buffer_region_tests {
             OperationBufferStorageKind::DynamicContiguous,
             20,
             bindings.iter().map(|(_, length_bytes)| *length_bytes),
+            OperationBufferCoverage::Exact,
         )
         .unwrap_err();
 
         assert!(error
             .to_string()
             .contains("contiguous dynamic storage requires one physical segment binding"));
+    }
+
+    #[test]
+    fn operation_prefix_view_retains_wider_backing_coverage() {
+        validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicPaged,
+            64,
+            [64_u64, 64].into_iter(),
+            OperationBufferCoverage::BackingPrefix,
+        )
+        .unwrap();
+        validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicContiguous,
+            64,
+            [128_u64].into_iter(),
+            OperationBufferCoverage::BackingPrefix,
+        )
+        .unwrap();
+
+        assert!(validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicPaged,
+            64,
+            [64_u64, 64].into_iter(),
+            OperationBufferCoverage::Exact,
+        )
+        .is_err());
+        assert!(validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicPaged,
+            128,
+            [64_u64].into_iter(),
+            OperationBufferCoverage::BackingPrefix,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sequence_execution_shape_uses_the_executed_source_frontier() {
+        let committed = DynamicResourceShape::from_validated(1, 8, 3);
+        let projected = sequence_execution_shape(committed, 4).unwrap();
+
+        assert_eq!(projected.sequences(), 1);
+        assert_eq!(projected.tokens(), 4);
+        assert_eq!(projected.pages(), 3);
+        assert!(sequence_execution_shape(committed, 0).is_err());
+        assert!(sequence_execution_shape(committed, 9).is_err());
+        assert!(
+            sequence_execution_shape(DynamicResourceShape::from_validated(2, 8, 3), 4).is_err()
+        );
     }
 
     #[test]
@@ -2696,179 +3422,190 @@ mod operation_buffer_region_tests {
             source: OperationRegionSource::Contiguous {
                 buffer: &buffer,
                 physical_base_offset_bytes: 4096,
+                retention: DeviceBufferRetention::plan(Arc::new(())),
             },
         };
 
         let translated = regions.iter().collect::<Vec<_>>();
         assert_eq!(translated.len(), 1);
-        let (actual, physical) = translated[0].buffer_and_physical_range();
+        let (actual, physical, _retention) = translated[0].buffer_and_physical_range();
         assert_eq!(*actual, buffer);
         assert_eq!(translated[0].logical_offset_bytes(), 16);
         assert_eq!(physical, 4112..4144);
     }
+
+    #[test]
+    fn physical_region_retains_opaque_owner_after_translation_source_drops() {
+        struct DropOwner(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropOwner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let buffer = 9_u8;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner = Arc::new(DropOwner(Arc::clone(&dropped)));
+        let regions = OperationBufferRegions {
+            storage_kind: OperationBufferStorageKind::DynamicContiguous,
+            logical_offset_bytes: 0,
+            logical_length_bytes: 8,
+            source: OperationRegionSource::Contiguous {
+                buffer: &buffer,
+                physical_base_offset_bytes: 64,
+                retention: DeviceBufferRetention::plan(Arc::clone(&owner)),
+            },
+        };
+        drop(owner);
+
+        let translated = regions.iter().collect::<Vec<_>>();
+        drop(regions);
+        assert!(!dropped.load(Ordering::Acquire));
+        let (_, physical, retention) = translated[0].buffer_and_physical_range();
+        assert_eq!(physical, 64..72);
+        drop(translated);
+        assert!(!dropped.load(Ordering::Acquire));
+
+        drop(retention);
+        assert!(dropped.load(Ordering::Acquire));
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BatchOperationParticipantIdentity {
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct BatchOperationParticipantIdentityData {
     participant_index: u32,
     node_key: ParticipantNodeKey,
     identity: ExecutionIdentityEnvelope,
 }
 
-impl BatchOperationParticipantIdentity {
-    pub const fn participant_index(&self) -> u32 {
-        self.participant_index
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchOperationParticipantIdentity {
+    data: Arc<BatchOperationParticipantIdentityData>,
+}
 
-    pub fn node_key(&self) -> &ParticipantNodeKey {
-        &self.node_key
-    }
-
-    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        &self.identity
+impl Serialize for BatchOperationParticipantIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
     }
 }
 
-/// One physical batch attempt identity. Participant request identities remain
-/// explicit projections; no canonical leader can stand in for the batch.
+impl BatchOperationParticipantIdentity {
+    fn new(
+        participant_index: u32,
+        node_key: ParticipantNodeKey,
+        identity: ExecutionIdentityEnvelope,
+    ) -> Self {
+        Self {
+            data: Arc::new(BatchOperationParticipantIdentityData {
+                participant_index,
+                node_key,
+                identity,
+            }),
+        }
+    }
+
+    pub fn participant_index(&self) -> u32 {
+        self.data.participant_index
+    }
+
+    pub fn node_key(&self) -> &ParticipantNodeKey {
+        &self.data.node_key
+    }
+
+    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
+        &self.data.identity
+    }
+}
+
+/// One immutable-plan node inside a physical command batch. Participant
+/// identities stay node-local even when several nodes share one submission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BatchOperationIdentity {
-    batch_step_id: BatchStepId,
-    batch_invocation_id: BatchInvocationId,
-    plan_id: PlanId,
-    plan_hash: PlanHash,
+pub struct BatchOperationNodeIdentity {
+    node_index: u32,
     node_id: NodeId,
     operation_id: OperationId,
     provider_id: ProviderId,
-    device_id: DeviceId,
-    runtime_implementation_fingerprint: String,
-    lane_id: ExecutionLaneId,
+    provider_execution_semantics: ProviderExecutionSemantics,
     work_shape_fingerprint: String,
-    claimed_backing_fingerprint: String,
     participants: Vec<BatchOperationParticipantIdentity>,
     fingerprint: String,
 }
 
-impl BatchOperationIdentity {
-    #[allow(clippy::too_many_arguments)]
+impl BatchOperationNodeIdentity {
     fn from_validated(
-        batch_step_id: BatchStepId,
-        batch_invocation_id: BatchInvocationId,
-        plan_id: PlanId,
-        plan_hash: PlanHash,
+        node_index: u32,
         node_id: NodeId,
         operation_id: OperationId,
         provider_id: ProviderId,
-        device_id: DeviceId,
-        runtime_implementation_fingerprint: String,
-        lane_id: ExecutionLaneId,
+        provider_execution_semantics: ProviderExecutionSemantics,
         work_shape_fingerprint: String,
-        claimed_backing_fingerprint: String,
         participants: Vec<BatchOperationParticipantIdentity>,
     ) -> Result<Self, VNextError> {
+        let participant_start = participants
+            .first()
+            .map(BatchOperationParticipantIdentity::participant_index);
         if participants.is_empty()
             || participants.iter().enumerate().any(|(index, participant)| {
-                participant.participant_index as usize != index
-                    || participant.node_key.node_id() != &node_id
-                    || participant.identity.parts().frame_id
-                        != Some(participant.node_key.frame_id())
-                    || participant.identity.parts().node_id.as_ref() != Some(&node_id)
-                    || participant.identity.parts().operation_id.as_ref() != Some(&operation_id)
-                    || participant.identity.parts().provider_id.as_ref() != Some(&provider_id)
-                    || participant.identity.parts().plan_id.as_ref() != Some(&plan_id)
-                    || participant.identity.parts().plan_hash.as_ref() != Some(&plan_hash)
-                    || participant.identity.parts().device_id.as_ref() != Some(&device_id)
-                    || participant
-                        .identity
-                        .parts()
-                        .runtime_implementation_fingerprint
-                        .as_deref()
-                        != Some(runtime_implementation_fingerprint.as_str())
+                participant_start.and_then(|start| start.checked_add(index as u32))
+                    != Some(participant.participant_index())
+                    || participant.node_key().node_id() != &node_id
+                    || participant.identity().parts().frame_id
+                        != Some(participant.node_key().frame_id())
+                    || participant.identity().parts().node_id.as_ref() != Some(&node_id)
+                    || participant.identity().parts().operation_id.as_ref() != Some(&operation_id)
+                    || participant.identity().parts().provider_id.as_ref() != Some(&provider_id)
             })
             || participants
                 .windows(2)
-                .any(|pair| pair[0].node_key >= pair[1].node_key)
-            || !canonical_sha256(&runtime_implementation_fingerprint)
+                .any(|pair| pair[0].node_key() >= pair[1].node_key())
             || !canonical_sha256(&work_shape_fingerprint)
-            || !canonical_sha256(&claimed_backing_fingerprint)
         {
             return Err(invalid_operation(
-                "batch operation identity is empty, non-canonical, or differs from its participant projections",
+                "batch node identity is empty, non-canonical, or differs from its participant projections",
             ));
         }
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
-            batch_step_id: BatchStepId,
-            batch_invocation_id: BatchInvocationId,
-            plan_id: &'a PlanId,
-            plan_hash: &'a PlanHash,
+            node_index: u32,
             node_id: &'a NodeId,
             operation_id: &'a OperationId,
             provider_id: &'a ProviderId,
-            device_id: &'a DeviceId,
-            runtime_implementation_fingerprint: &'a str,
-            lane_id: ExecutionLaneId,
+            provider_execution_semantics: ProviderExecutionSemantics,
             work_shape_fingerprint: &'a str,
-            claimed_backing_fingerprint: &'a str,
             participants: &'a [BatchOperationParticipantIdentity],
         }
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&FingerprintInput {
-                    domain: "ferrum.runtime-vnext.batch-operation-identity.v1",
-                    batch_step_id,
-                    batch_invocation_id,
-                    plan_id: &plan_id,
-                    plan_hash: &plan_hash,
-                    node_id: &node_id,
-                    operation_id: &operation_id,
-                    provider_id: &provider_id,
-                    device_id: &device_id,
-                    runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
-                    lane_id,
-                    work_shape_fingerprint: &work_shape_fingerprint,
-                    claimed_backing_fingerprint: &claimed_backing_fingerprint,
-                    participants: &participants,
-                })
-                .map_err(|error| invalid_operation(format!(
-                    "batch operation identity encode failed: {error}"
-                )))?
-            )
-        );
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.batch-operation-node-identity.v1",
+                node_index,
+                node_id: &node_id,
+                operation_id: &operation_id,
+                provider_id: &provider_id,
+                provider_execution_semantics,
+                work_shape_fingerprint: &work_shape_fingerprint,
+                participants: &participants,
+            },
+            "batch node identity encode failed",
+        )?;
         Ok(Self {
-            batch_step_id,
-            batch_invocation_id,
-            plan_id,
-            plan_hash,
+            node_index,
             node_id,
             operation_id,
             provider_id,
-            device_id,
-            runtime_implementation_fingerprint,
-            lane_id,
+            provider_execution_semantics,
             work_shape_fingerprint,
-            claimed_backing_fingerprint,
             participants,
             fingerprint,
         })
     }
 
-    pub const fn batch_step_id(&self) -> BatchStepId {
-        self.batch_step_id
-    }
-
-    pub const fn batch_invocation_id(&self) -> BatchInvocationId {
-        self.batch_invocation_id
-    }
-
-    pub fn plan_id(&self) -> &PlanId {
-        &self.plan_id
-    }
-
-    pub fn plan_hash(&self) -> &PlanHash {
-        &self.plan_hash
+    pub const fn node_index(&self) -> u32 {
+        self.node_index
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -2883,24 +3620,12 @@ impl BatchOperationIdentity {
         &self.provider_id
     }
 
-    pub fn device_id(&self) -> &DeviceId {
-        &self.device_id
-    }
-
-    pub fn runtime_implementation_fingerprint(&self) -> &str {
-        &self.runtime_implementation_fingerprint
-    }
-
-    pub const fn lane_id(&self) -> ExecutionLaneId {
-        self.lane_id
+    pub const fn provider_execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.provider_execution_semantics
     }
 
     pub fn work_shape_fingerprint(&self) -> &str {
         &self.work_shape_fingerprint
-    }
-
-    pub fn claimed_backing_fingerprint(&self) -> &str {
-        &self.claimed_backing_fingerprint
     }
 
     pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
@@ -2918,6 +3643,903 @@ impl BatchOperationIdentity {
     }
 }
 
+/// One physical command-batch attempt identity. It may contain one operation
+/// or the entire immutable-plan wave, but it always maps to one submit/fence.
+#[derive(Debug)]
+struct BatchOperationIdentityData {
+    batch_step_id: BatchStepId,
+    batch_invocation_id: BatchInvocationId,
+    plan_id: PlanId,
+    plan_hash: PlanHash,
+    device_id: DeviceId,
+    runtime_implementation_fingerprint: String,
+    lane_id: ExecutionLaneId,
+    claimed_backing_fingerprint: String,
+    nodes: OnceLock<Vec<BatchOperationNodeIdentity>>,
+    participants: OnceLock<Vec<BatchOperationParticipantIdentity>>,
+    deferred_recipe: Option<DeferredBatchOperationIdentityRecipe>,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchOperationIdentity {
+    data: Arc<BatchOperationIdentityData>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BatchOperationIdentityMaterializationSnapshot {
+    logical_nodes: u32,
+    materialized_nodes: u32,
+    full_participant_projection: bool,
+}
+
+impl BatchOperationIdentityMaterializationSnapshot {
+    pub const fn logical_nodes(self) -> u32 {
+        self.logical_nodes
+    }
+
+    pub const fn materialized_nodes(self) -> u32 {
+        self.materialized_nodes
+    }
+
+    pub const fn full_participant_projection(self) -> bool {
+        self.full_participant_projection
+    }
+}
+
+impl PartialEq for BatchOperationIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.batch_step_id == other.data.batch_step_id
+            && self.data.batch_invocation_id == other.data.batch_invocation_id
+            && self.data.plan_id == other.data.plan_id
+            && self.data.plan_hash == other.data.plan_hash
+            && self.data.device_id == other.data.device_id
+            && self.data.runtime_implementation_fingerprint
+                == other.data.runtime_implementation_fingerprint
+            && self.data.lane_id == other.data.lane_id
+            && self.data.claimed_backing_fingerprint == other.data.claimed_backing_fingerprint
+            && self.data.fingerprint == other.data.fingerprint
+    }
+}
+
+impl Eq for BatchOperationIdentity {}
+
+impl Serialize for BatchOperationIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            plan_id: &'a PlanId,
+            plan_hash: &'a PlanHash,
+            device_id: &'a DeviceId,
+            runtime_implementation_fingerprint: &'a str,
+            lane_id: ExecutionLaneId,
+            claimed_backing_fingerprint: &'a str,
+            nodes: &'a [BatchOperationNodeIdentity],
+            participants: &'a [BatchOperationParticipantIdentity],
+            fingerprint: &'a str,
+        }
+
+        Wire {
+            batch_step_id: self.data.batch_step_id,
+            batch_invocation_id: self.data.batch_invocation_id,
+            plan_id: &self.data.plan_id,
+            plan_hash: &self.data.plan_hash,
+            device_id: &self.data.device_id,
+            runtime_implementation_fingerprint: &self.data.runtime_implementation_fingerprint,
+            lane_id: self.data.lane_id,
+            claimed_backing_fingerprint: &self.data.claimed_backing_fingerprint,
+            nodes: self.nodes(),
+            participants: self.participants(),
+            fingerprint: &self.data.fingerprint,
+        }
+        .serialize(serializer)
+    }
+}
+
+struct BatchOperationNodeFingerprints<'a>(&'a [BatchOperationNodeIdentity]);
+
+impl Serialize for BatchOperationNodeFingerprints<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for node in self.0 {
+            sequence.serialize_element(node.fingerprint())?;
+        }
+        sequence.end()
+    }
+}
+
+impl BatchOperationIdentity {
+    #[allow(clippy::too_many_arguments)]
+    fn from_validated(
+        batch_step_id: BatchStepId,
+        batch_invocation_id: BatchInvocationId,
+        plan_id: PlanId,
+        plan_hash: PlanHash,
+        device_id: DeviceId,
+        runtime_implementation_fingerprint: String,
+        lane_id: ExecutionLaneId,
+        claimed_backing_fingerprint: String,
+        nodes: Vec<BatchOperationNodeIdentity>,
+    ) -> Result<Self, VNextError> {
+        if nodes.is_empty()
+            || nodes.iter().enumerate().any(|(index, node)| {
+                node.node_index as usize != index
+                    || node.participants.iter().any(|participant| {
+                        participant.identity().parts().plan_id.as_ref() != Some(&plan_id)
+                            || participant.identity().parts().plan_hash.as_ref() != Some(&plan_hash)
+                            || participant.identity().parts().device_id.as_ref() != Some(&device_id)
+                            || participant
+                                .identity()
+                                .parts()
+                                .runtime_implementation_fingerprint
+                                .as_deref()
+                                != Some(runtime_implementation_fingerprint.as_str())
+                    })
+            })
+            || nodes
+                .iter()
+                .map(BatchOperationNodeIdentity::node_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != nodes.len()
+            || !canonical_sha256(&runtime_implementation_fingerprint)
+            || !canonical_sha256(&claimed_backing_fingerprint)
+        {
+            return Err(invalid_operation(
+                "physical batch identity is empty, non-canonical, or differs from its plan/runtime projections",
+            ));
+        }
+        let participants = nodes
+            .iter()
+            .flat_map(|node| node.participants.iter().cloned())
+            .collect::<Vec<_>>();
+        if participants
+            .iter()
+            .enumerate()
+            .any(|(index, participant)| participant.participant_index() as usize != index)
+        {
+            return Err(invalid_operation(
+                "physical batch participant indices are not globally contiguous",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            plan_id: &'a PlanId,
+            plan_hash: &'a PlanHash,
+            device_id: &'a DeviceId,
+            runtime_implementation_fingerprint: &'a str,
+            lane_id: ExecutionLaneId,
+            claimed_backing_fingerprint: &'a str,
+            node_fingerprints: BatchOperationNodeFingerprints<'a>,
+        }
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.physical-command-batch-identity.v2",
+                batch_step_id,
+                batch_invocation_id,
+                plan_id: &plan_id,
+                plan_hash: &plan_hash,
+                device_id: &device_id,
+                runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint: &claimed_backing_fingerprint,
+                node_fingerprints: BatchOperationNodeFingerprints(&nodes),
+            },
+            "physical batch identity encode failed",
+        )?;
+        Ok(Self {
+            data: Arc::new(BatchOperationIdentityData {
+                batch_step_id,
+                batch_invocation_id,
+                plan_id,
+                plan_hash,
+                device_id,
+                runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint,
+                nodes: OnceLock::from(nodes),
+                participants: OnceLock::from(participants),
+                deferred_recipe: None,
+                fingerprint,
+            }),
+        })
+    }
+
+    pub fn batch_step_id(&self) -> BatchStepId {
+        self.data.batch_step_id
+    }
+
+    pub fn batch_invocation_id(&self) -> BatchInvocationId {
+        self.data.batch_invocation_id
+    }
+
+    pub fn plan_id(&self) -> &PlanId {
+        &self.data.plan_id
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.data.plan_hash
+    }
+
+    pub fn device_id(&self) -> &DeviceId {
+        &self.data.device_id
+    }
+
+    pub fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.data.runtime_implementation_fingerprint
+    }
+
+    pub fn lane_id(&self) -> ExecutionLaneId {
+        self.data.lane_id
+    }
+
+    pub fn claimed_backing_fingerprint(&self) -> &str {
+        &self.data.claimed_backing_fingerprint
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.data.nodes.get().map_or_else(
+            || {
+                self.data
+                    .deferred_recipe
+                    .as_ref()
+                    .map_or(0, |recipe| recipe.topology.node_count())
+            },
+            Vec::len,
+        )
+    }
+
+    fn materialized_node_count(&self) -> usize {
+        self.data.nodes.get().map_or_else(
+            || {
+                self.data.deferred_recipe.as_ref().map_or(0, |recipe| {
+                    recipe
+                        .node_identities
+                        .iter()
+                        .filter(|identity| identity.get().is_some())
+                        .count()
+                })
+            },
+            Vec::len,
+        )
+    }
+
+    pub fn materialization_snapshot(&self) -> BatchOperationIdentityMaterializationSnapshot {
+        BatchOperationIdentityMaterializationSnapshot {
+            logical_nodes: u32::try_from(self.node_count())
+                .expect("validated physical batch node count fits u32"),
+            materialized_nodes: u32::try_from(self.materialized_node_count())
+                .expect("materialized physical batch node count fits u32"),
+            full_participant_projection: self.data.participants.get().is_some(),
+        }
+    }
+
+    pub fn node_participant_count(&self, node_index: usize) -> Option<usize> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.get(node_index).map(|node| node.participants().len());
+        }
+        let recipe = self.data.deferred_recipe.as_ref()?;
+        (node_index < recipe.topology.node_count()).then_some(recipe.participant_seeds.len())
+    }
+
+    pub fn node_id_at(&self, node_index: usize) -> Option<&NodeId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::node_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .node_id_at(node_index)
+    }
+
+    pub fn operation_id_at(&self, node_index: usize) -> Option<&OperationId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::operation_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .operation_id_at(node_index)
+    }
+
+    pub fn provider_id_at(&self, node_index: usize) -> Option<&ProviderId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::provider_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .provider_id_at(node_index)
+    }
+
+    pub fn work_shape_fingerprint_at(&self, node_index: usize) -> Option<&str> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::work_shape_fingerprint);
+        }
+        let recipe = self.data.deferred_recipe.as_ref()?;
+        (node_index < recipe.topology.node_count()).then_some(recipe.work_shape_fingerprint())
+    }
+
+    pub fn node_index(&self, node_id: &NodeId) -> Option<usize> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.iter().position(|node| node.node_id() == node_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .node_index(node_id)
+    }
+
+    pub(crate) fn materialize_node(
+        &self,
+        node_index: usize,
+    ) -> Result<&BatchOperationNodeIdentity, VNextError> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .ok_or_else(|| invalid_operation("physical batch node index is out of bounds"));
+        }
+        let recipe = self.data.deferred_recipe.as_ref().ok_or_else(|| {
+            invalid_operation("physical batch has neither materialized nodes nor a compiled recipe")
+        })?;
+        let slot = recipe.node_identities.get(node_index).ok_or_else(|| {
+            invalid_operation("compiled physical batch node index is out of bounds")
+        })?;
+        if let Some(identity) = slot.get() {
+            return Ok(identity);
+        }
+        let identity = recipe.materialize_node(node_index)?;
+        let _ = slot.set(identity);
+        slot.get().ok_or_else(|| {
+            invalid_operation("compiled physical batch node identity publication failed")
+        })
+    }
+
+    pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
+        self.data.nodes.get_or_init(|| {
+            (0..self.node_count())
+                .map(|node_index| {
+                    self.materialize_node(node_index)
+                        .expect("validated compiled physical batch node must materialize")
+                        .clone()
+                })
+                .collect()
+        })
+    }
+
+    pub fn single_node(&self) -> Option<&BatchOperationNodeIdentity> {
+        (self.node_count() == 1).then(|| {
+            self.materialize_node(0)
+                .expect("validated single-node physical batch must materialize")
+        })
+    }
+
+    pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
+        self.data.participants.get_or_init(|| {
+            self.nodes()
+                .iter()
+                .flat_map(|node| node.participants().iter().cloned())
+                .collect()
+        })
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.data.fingerprint
+    }
+
+    fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.participants()
+            .iter()
+            .any(|participant| participant.identity() == identity)
+    }
+}
+
+#[cfg(test)]
+mod batch_operation_identity_fingerprint_tests {
+    use super::*;
+
+    fn fingerprint_node(index: u32, marker: char) -> BatchOperationNodeIdentity {
+        BatchOperationNodeIdentity {
+            node_index: index,
+            node_id: NodeId::new(format!("node.{index}")).unwrap(),
+            operation_id: OperationId::new(format!("operation.{index}")).unwrap(),
+            provider_id: ProviderId::new(format!("provider.{index}")).unwrap(),
+            provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            work_shape_fingerprint: std::iter::repeat_n(marker, 64).collect(),
+            participants: Vec::new(),
+            fingerprint: std::iter::repeat_n(marker, 64).collect(),
+        }
+    }
+
+    #[test]
+    fn streaming_fingerprint_matches_canonical_json_digest() {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            domain: &'static str,
+            value: &'a str,
+        }
+
+        let input = Input {
+            domain: "ferrum.runtime-vnext.test",
+            value: "evidence",
+        };
+        let expected = format!("{:x}", Sha256::digest(serde_json::to_vec(&input).unwrap()));
+
+        assert_eq!(
+            canonical_operation_fingerprint(&input, "test fingerprint").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn batch_fingerprint_projection_contains_only_validated_node_digests() {
+        let first = std::iter::repeat_n('a', 64).collect::<String>();
+        let second = std::iter::repeat_n('b', 64).collect::<String>();
+        let nodes = [fingerprint_node(0, 'a'), fingerprint_node(1, 'b')];
+
+        let encoded = serde_json::to_string(&BatchOperationNodeFingerprints(&nodes)).unwrap();
+
+        assert_eq!(encoded, format!("[\"{first}\",\"{second}\"]"));
+        assert!(!encoded.contains("node.0"));
+        assert!(!encoded.contains("operation.0"));
+        assert!(!encoded.contains("participants"));
+    }
+}
+
+enum OperationInvocationResources<'a, R: DeviceRuntime> {
+    Invocation(&'a InvocationResourceLease<R>),
+    Wave {
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+    },
+}
+
+impl<R: DeviceRuntime> Copy for OperationInvocationResources<'_, R> {}
+
+impl<R: DeviceRuntime> Clone for OperationInvocationResources<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
+    fn wave_node(self) -> Result<&'a PreparedStepSubmissionNode<R>, VNextError> {
+        match self {
+            Self::Wave { wave, node_index } => wave
+                .nodes()
+                .get(node_index)
+                .ok_or_else(|| invalid_operation("submission wave node index is out of bounds")),
+            Self::Invocation(_) => Err(invalid_operation(
+                "single-operation resources do not contain a wave node",
+            )),
+        }
+    }
+
+    fn node_id(self) -> Result<&'a NodeId, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.node_id()),
+            Self::Wave { .. } => Ok(self.wave_node()?.node_id()),
+        }
+    }
+
+    fn program_binding_node(self) -> Option<ProgramBindingNodeBinding> {
+        match self {
+            Self::Invocation(_) => None,
+            Self::Wave { wave, node_index } => wave.nodes().get(node_index).and_then(|node| {
+                wave.claimed_backing()
+                    .program_binding_node(node.plan_node_index())
+            }),
+        }
+    }
+
+    fn participant_count(self) -> Result<usize, VNextError> {
+        match self {
+            Self::Invocation(invocation) => usize::try_from(invocation.participant_count())
+                .map_err(|_| invalid_operation("operation participant count exceeds usize")),
+            Self::Wave { .. } => usize::try_from(self.wave_node()?.participant_count())
+                .map_err(|_| invalid_operation("wave participant count exceeds usize")),
+        }
+    }
+
+    fn prepared_participant_count(self) -> Result<usize, VNextError> {
+        match self {
+            Self::Invocation(invocation) => {
+                usize::try_from(invocation.prepared_participant_count()).map_err(|_| {
+                    invalid_operation("prepared operation participant count exceeds usize")
+                })
+            }
+            Self::Wave { .. } => Ok(self.wave_node()?.participant_session_identities().len()),
+        }
+    }
+
+    fn participant(
+        self,
+        index: usize,
+    ) -> Result<&'a Arc<AdmittedSequenceResources<R>>, VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation
+                .participants()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("operation participant index is out of range")),
+            Self::Wave { .. } => self
+                .wave_node()?
+                .participants()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("wave participant index is out of range")),
+        }
+    }
+
+    fn participant_backing_snapshot(
+        self,
+        index: usize,
+    ) -> Result<&'a Arc<SequenceBackingSnapshot<R>>, VNextError> {
+        let participant = self.participant(index)?;
+        self.step_resources()
+            .participant_backing_snapshot(BatchParticipantAuthority::new(
+                participant.sequence_authority(),
+                participant.request_authority(),
+            ))
+    }
+
+    fn participant_backing_view(
+        self,
+        index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'a, R::Buffer>, VNextError> {
+        let participant = self.participant(index)?;
+        self.step_resources().participant_backing_view(
+            BatchParticipantAuthority::new(
+                participant.sequence_authority(),
+                participant.request_authority(),
+            ),
+            resource_id,
+        )
+    }
+
+    fn participant_frames(self) -> Result<&'a [StepParticipantFrameAssignment], VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.participant_frames()),
+            Self::Wave { .. } => Ok(self.wave_node()?.participant_frames()),
+        }
+    }
+
+    fn participant_session_identity(
+        self,
+        index: usize,
+    ) -> Result<(SequenceSessionEpoch, &'a SequenceSessionFingerprint), VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation
+                .participant_session_identities()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("operation participant session is missing")),
+            Self::Wave { .. } => self
+                .wave_node()?
+                .participant_session_identities()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("wave participant session is missing")),
+        }
+    }
+
+    fn batch_step_id(self) -> BatchStepId {
+        match self {
+            Self::Invocation(invocation) => invocation.batch_step_id(),
+            Self::Wave { wave, .. } => wave.batch_step_id(),
+        }
+    }
+
+    fn batch_invocation_id(self) -> BatchInvocationId {
+        match self {
+            Self::Invocation(invocation) => invocation.batch_invocation_id(),
+            Self::Wave { wave, .. } => wave.batch_invocation_id(),
+        }
+    }
+
+    fn coordinator_id(self) -> Result<LogicalAdmissionCoordinatorId, VNextError> {
+        Ok(self.participant(0)?.coordinator_id())
+    }
+
+    fn work_shape(self) -> Result<&'a BatchWorkShape, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.work_shape()),
+            Self::Wave { .. } => Ok(self.wave_node()?.work_shape()),
+        }
+    }
+
+    fn step_resources(self) -> &'a Arc<StepResourceLease<R>> {
+        match self {
+            Self::Invocation(invocation) => invocation.step_resources(),
+            Self::Wave { wave, .. } => wave.step_resources(),
+        }
+    }
+
+    fn runtime(self) -> &'a Arc<R> {
+        match self {
+            Self::Invocation(invocation) => invocation.runtime(),
+            Self::Wave { wave, .. } => wave.runtime(),
+        }
+    }
+
+    fn plan_identity_matches(
+        self,
+        plan_id: &PlanId,
+        plan_hash: &PlanHash,
+        device_id: &DeviceId,
+    ) -> Result<bool, VNextError> {
+        match self {
+            Self::Invocation(invocation) => {
+                let evidence = invocation.plan_evidence();
+                Ok(evidence.plan_id() == plan_id
+                    && evidence.plan_hash() == plan_hash
+                    && evidence.device_id() == device_id)
+            }
+            Self::Wave { .. } => {
+                let evidence = self.wave_node()?.plan_evidence_ref();
+                Ok(evidence.plan_id() == plan_id
+                    && evidence.plan_hash() == plan_hash
+                    && evidence.device_id() == device_id)
+            }
+        }
+    }
+
+    fn plan_evidence_matches(
+        self,
+        expected: &TrustedPlanRuntimeEvidence,
+    ) -> Result<bool, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.plan_evidence() == *expected),
+            Self::Wave { .. } => Ok(self.wave_node()?.plan_evidence_ref() == expected),
+        }
+    }
+
+    fn backing_fingerprint(self) -> &'a str {
+        match self {
+            Self::Invocation(invocation) => invocation.claimed_backing().fingerprint(),
+            Self::Wave { wave, .. } => wave.fingerprint(),
+        }
+    }
+
+    fn backing_view(
+        self,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'a, R::Buffer>, VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation.backing_view(resource_id),
+            Self::Wave { wave, node_index } => wave.backing_view(node_index, resource_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedOperationResourceSource {
+    PlanStatic { slot_index: usize },
+    Dynamic { descriptor_index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedOperationResource {
+    resource_id: ResourceId,
+    source: PreparedOperationResourceSource,
+}
+
+/// Immutable per-node recipe compiled while the runtime registry is bound to
+/// an exact plan. Static catalog, operation, provider, and resource-shape
+/// proofs terminate here; dispatch retains only live authority and buffer
+/// validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedOperationDispatchBinding {
+    node_index: usize,
+    resources: Vec<PreparedOperationResource>,
+    binding_component_views: Vec<Vec<usize>>,
+    scratch_view: Option<usize>,
+    binding_view: Option<usize>,
+    persistent_view: Option<usize>,
+}
+
+impl PreparedOperationDispatchBinding {
+    fn prepare(
+        resolved: &dyn ExecutablePlanView,
+        provider: &OperationProviderDescriptor,
+        node_id: &NodeId,
+    ) -> Result<Self, VNextError> {
+        let plan = resolved.execution_plan();
+        let (node_index, node) = plan
+            .payload()
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.id() == node_id)
+            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        let operation = resolved.capabilities().operation(node.operation_id())?;
+        let registered = resolved
+            .capabilities()
+            .providers_for(node.operation_id())?
+            .iter()
+            .find(|candidate| candidate.provider_id() == provider.provider_id())
+            .ok_or_else(|| invalid_operation("operation provider is absent from the catalog"))?;
+        if registered != provider
+            || provider.provider_id() != node.selection().selected_provider()
+            || provider.operation_id() != node.operation_id()
+            || provider.operation_fingerprint() != node.operation_fingerprint()
+            || provider.provider_implementation_fingerprint()
+                != node.provider_implementation_fingerprint()
+            || provider.execution_semantics() != node.provider_execution_semantics()
+            || provider.device_id() != plan.payload().device_id()
+            || !provider.version().satisfies(node.operation_version())
+        {
+            return Err(invalid_operation(
+                "operation provider is not the exact catalog entry selected by the plan",
+            ));
+        }
+        operation.validate_attributes(node.attributes())?;
+        operation.validate_resolved_bindings(node.values())?;
+
+        let provider_resources = node.provider_resources();
+        if provider_resources.provider_id() != provider.provider_id()
+            || provider_resources.estimator_id() != provider.resource_estimator_id()
+            || provider_resources.estimator_version() != provider.resource_estimator_version()
+            || provider_resources.estimator_implementation_fingerprint()
+                != provider.resource_estimator_implementation_fingerprint()
+            || provider_resources.value_alignment_bytes()
+                < operation.resources.minimum_value_alignment_bytes
+            || provider_resources.value_alignment_bytes()
+                % operation.resources.minimum_value_alignment_bytes
+                != 0
+            || !operation
+                .resources
+                .scratch
+                .accepts(provider_resources.scratch().is_some())
+            || !operation
+                .resources
+                .binding
+                .accepts(provider_resources.binding().is_some())
+            || !operation
+                .resources
+                .persistent
+                .accepts(provider_resources.persistent().is_some())
+        {
+            return Err(invalid_operation(
+                "plan provider resource estimate is not bound to the selected provider and operation contract",
+            ));
+        }
+        let scratch_resource = select_workspace_resource(
+            provider_resources.scratch(),
+            node.scratch_resource(),
+            "scratch",
+        )?;
+        let binding_resource = select_workspace_resource(
+            provider_resources.binding(),
+            node.binding_resource(),
+            "binding",
+        )?;
+        let persistent_resource = select_workspace_resource(
+            provider_resources.persistent(),
+            node.persistent_resource(),
+            "persistent",
+        )?;
+
+        let memory = plan.payload().memory();
+        let mut required_resources = node
+            .values()
+            .iter()
+            .flat_map(|binding| binding.storage().components())
+            .map(|component| component.resource_id().clone())
+            .collect::<BTreeSet<_>>();
+        required_resources.extend(scratch_resource.iter().map(|resource| (*resource).clone()));
+        required_resources.extend(binding_resource.iter().map(|resource| (*resource).clone()));
+        required_resources.extend(
+            persistent_resource
+                .iter()
+                .map(|resource| (*resource).clone()),
+        );
+        let resources = required_resources
+            .into_iter()
+            .map(|resource_id| {
+                let static_index = memory
+                    .static_allocations()
+                    .binary_search_by(|allocation| allocation.resource_id().cmp(&resource_id));
+                let dynamic_index = memory
+                    .dynamic_descriptors()
+                    .binary_search_by(|descriptor| descriptor.base_resource_id().cmp(&resource_id));
+                let source = match (static_index, dynamic_index) {
+                    (Ok(slot_index), Err(_)) => {
+                        PreparedOperationResourceSource::PlanStatic { slot_index }
+                    }
+                    (Err(_), Ok(descriptor_index)) => {
+                        PreparedOperationResourceSource::Dynamic { descriptor_index }
+                    }
+                    (Ok(_), Ok(_)) => {
+                        return Err(invalid_operation(format!(
+                            "plan resource `{resource_id}` is both static and dynamic"
+                        )))
+                    }
+                    (Err(_), Err(_)) => {
+                        return Err(invalid_operation(format!(
+                            "plan has no static allocation or dynamic descriptor for `{resource_id}`"
+                        )));
+                    }
+                };
+                Ok(PreparedOperationResource {
+                    resource_id,
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        let view_index_for = |resource_id: &ResourceId, kind: &str| {
+            resources
+                .binary_search_by(|resource| resource.resource_id.cmp(resource_id))
+                .map_err(|_| invalid_operation(format!("{kind} resource view is missing")))
+        };
+        let binding_component_views = node
+            .values()
+            .iter()
+            .map(|binding| {
+                binding
+                    .storage()
+                    .components()
+                    .iter()
+                    .map(|component| view_index_for(component.resource_id(), "value binding"))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let scratch_view = scratch_resource
+            .map(|resource| view_index_for(resource, "scratch"))
+            .transpose()?;
+        let binding_view = binding_resource
+            .map(|resource| view_index_for(resource, "binding"))
+            .transpose()?;
+        let persistent_view = persistent_resource
+            .map(|resource| view_index_for(resource, "persistent"))
+            .transpose()?;
+        Ok(Self {
+            node_index,
+            resources,
+            binding_component_views,
+            scratch_view,
+            binding_view,
+            persistent_view,
+        })
+    }
+
+    fn node<'plan>(
+        &self,
+        resolved: &'plan dyn ExecutablePlanView,
+        node_id: &NodeId,
+    ) -> Result<&'plan PlanNode, VNextError> {
+        resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .get(self.node_index)
+            .filter(|node| node.id() == node_id)
+            .ok_or_else(|| {
+                invalid_operation("prepared operation binding differs from its plan node")
+            })
+    }
+}
+
 /// One participant projection inside a plan-selected physical batch. It has
 /// no public constructor and does not own submission authority.
 pub struct OperationInvocation<'a, B> {
@@ -2926,9 +4548,11 @@ pub struct OperationInvocation<'a, B> {
     node_id: &'a NodeId,
     provider_id: &'a ProviderId,
     views: Vec<OperationBufferView<'a, B>>,
-    bindings: Vec<ResolvedValueBinding>,
+    bindings: &'a [ResolvedValueBinding],
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+    work: &'a NodeWorkContract,
     scratch_view: Option<usize>,
+    binding_view: Option<usize>,
     persistent_view: Option<usize>,
     work_shape: &'a BatchWorkShape,
     claimed_backing_fingerprint: &'a str,
@@ -2936,13 +4560,15 @@ pub struct OperationInvocation<'a, B> {
 
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
-    fn from_resolved<R>(
+    fn from_prepared<R>(
         runtime: &R,
-        resolved: &'a ResolvedModelPlan,
-        provider: &'a OperationProviderDescriptor,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        node: &'a PlanNode,
+        operation: &'a OperationDescriptor,
         identity: &'a ExecutionIdentityEnvelope,
         node_id: &'a NodeId,
-        resources: &'a InvocationResourceLease<R>,
+        resources: OperationInvocationResources<'a, R>,
         active_binding: &TrustedActiveSequenceBinding,
         participant_index: usize,
     ) -> Result<Self, VNextError>
@@ -2950,52 +4576,32 @@ impl<'a, B> OperationInvocation<'a, B> {
         R: DeviceRuntime<Buffer = B>,
     {
         let plan = resolved.execution_plan();
-        let node = plan
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == node_id)
-            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
-        let operation = resolved
-            .parts()
-            .capabilities
-            .operation(node.operation_id())?;
         let parts = identity.parts();
-        let participant = resources
-            .participants()
-            .nth(participant_index)
-            .ok_or_else(|| invalid_operation("operation participant index is out of range"))?;
+        let participant = resources.participant(participant_index)?;
+        let participant_backing = resources.participant_backing_snapshot(participant_index)?;
         let participant_frame = resources
-            .participant_frames()
+            .participant_frames()?
             .get(participant_index)
             .ok_or_else(|| invalid_operation("operation participant frame is missing"))?;
-        let participant_session = resources
-            .participant_session_identities()
-            .nth(participant_index)
-            .ok_or_else(|| invalid_operation("operation participant session is missing"))?;
+        let participant_session = resources.participant_session_identity(participant_index)?;
         let static_lease = participant.static_provisioning();
         let lease_identity = static_lease.map(|lease| lease.identity());
         let admission = active_binding.plan().static_provisioning_binding();
-        let pool_fingerprint = active_binding.static_pool_identity_fingerprint();
+        let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
         let memory = plan.payload().memory();
-        let participant_backing_matches = active_binding.backing_slices().iter().eq(participant
-            .backing_slices()
-            .iter()
-            .map(|slice| slice.evidence()));
-        if resources.participant_count() != resources.prepared_participant_count()
-            || resources.node_id() != node_id
+        if resources.participant_count()? != resources.prepared_participant_count()?
+            || resources.node_id()? != node_id
             || participant_frame.sequence_authority() != participant.sequence_authority()
             || participant_frame.request_authority() != participant.request_authority()
-            || resources.plan_evidence() != *active_binding.plan()
-            || resources.coordinator_id() != active_binding.coordinator_id()
+            || !resources.plan_evidence_matches(active_binding.plan())?
+            || resources.coordinator_id()? != active_binding.coordinator_id()
             || participant.sequence_authority() != active_binding.sequence_authority()
             || participant.run_id() != active_binding.run_id()
             || participant.request_id() != active_binding.request_id()
             || !active_binding
                 .matches_sequence_session(participant_session.0, participant_session.1)
-            || !participant_backing_matches
-            || runtime.descriptor() != &resolved.parts().device
-            || runtime.descriptor() != resolved.parts().capabilities.device()
+            || runtime.descriptor() != resolved.device()
+            || runtime.descriptor() != resolved.capabilities().device()
             || runtime.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
             || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
@@ -3011,7 +4617,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             || parts.transaction_id.as_ref()
                 != lease_identity.map(|identity| identity.transaction_id())
             || parts.resource_pool_id != active_binding.static_pool_id()
-            || parts.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint.as_deref()
+            || parts.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint
             || parts.provisioning_run_id.as_ref()
                 != lease_identity.map(|identity| identity.run_id())
             || parts.provisioning_request_id.as_ref()
@@ -3047,179 +4653,122 @@ impl<'a, B> OperationInvocation<'a, B> {
                 "operation invocation does not close over the runtime device, selected plan, node, provider, request, and lease transaction",
             ));
         }
-        let registered = resolved
-            .parts()
-            .capabilities
-            .providers_for(node.operation_id())?
-            .iter()
-            .find(|candidate| candidate.provider_id() == provider.provider_id())
-            .ok_or_else(|| invalid_operation("operation provider is absent from the catalog"))?;
-        if registered != provider
-            || provider.provider_id() != node.selection().selected_provider()
-            || provider.operation_id() != node.operation_id()
-            || provider.operation_fingerprint() != node.operation_fingerprint()
-            || provider.provider_implementation_fingerprint()
-                != node.provider_implementation_fingerprint()
-            || provider.device_id() != plan.payload().device_id()
-            || !provider.version().satisfies(node.operation_version())
-        {
-            return Err(invalid_operation(
-                "operation provider is not the exact catalog entry selected by the plan",
-            ));
-        }
-        operation.validate_attributes(node.attributes())?;
-        operation.validate_resolved_bindings(node.values())?;
-
         let provider_resources = node.provider_resources();
-        if provider_resources.provider_id() != provider.provider_id()
-            || provider_resources.estimator_id() != provider.resource_estimator_id()
-            || provider_resources.estimator_version() != provider.resource_estimator_version()
-            || provider_resources.estimator_implementation_fingerprint()
-                != provider.resource_estimator_implementation_fingerprint()
-            || provider_resources.value_alignment_bytes()
-                < operation.resources.minimum_value_alignment_bytes
-            || provider_resources.value_alignment_bytes()
-                % operation.resources.minimum_value_alignment_bytes
-                != 0
-            || !operation
-                .resources
-                .scratch
-                .accepts(provider_resources.scratch().is_some())
-            || !operation
-                .resources
-                .persistent
-                .accepts(provider_resources.persistent().is_some())
-        {
-            return Err(invalid_operation(
-                "plan provider resource estimate is not bound to the selected provider and operation contract",
-            ));
-        }
-        let scratch_resource = select_workspace_resource(
-            provider_resources.scratch(),
-            node.scratch_resource(),
-            "scratch",
-        )?;
-        let persistent_resource = select_workspace_resource(
-            provider_resources.persistent(),
-            node.persistent_resource(),
-            "persistent",
-        )?;
-
-        let allocations = plan
-            .payload()
-            .memory()
-            .static_allocations()
-            .iter()
-            .map(|allocation| (allocation.resource_id(), allocation))
-            .collect::<BTreeMap<_, _>>();
-        let dynamic_descriptors = memory
-            .dynamic_descriptors()
-            .iter()
-            .map(|descriptor| (descriptor.base_resource_id(), descriptor))
-            .collect::<BTreeMap<_, _>>();
-        let bindings = node.values().to_vec();
-        operation.validate_resolved_bindings(&bindings)?;
-
-        let mut required_resources = bindings
-            .iter()
-            .flat_map(|binding| binding.storage().components())
-            .map(|component| component.resource_id().clone())
-            .collect::<BTreeSet<_>>();
-        required_resources.extend(scratch_resource.iter().map(|resource| (*resource).clone()));
-        required_resources.extend(
-            persistent_resource
-                .iter()
-                .map(|resource| (*resource).clone()),
-        );
-        let lease_entries = static_lease
-            .map(|lease| {
-                lease
-                    .plan_static_entries()
-                    .map(|entry| (entry.resource_id(), entry))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let mut views = Vec::with_capacity(required_resources.len());
-        for resource_id in &required_resources {
-            if let Some(allocation) = allocations.get(resource_id) {
-                let lease = static_lease.ok_or_else(|| {
-                    invalid_operation(format!(
-                        "plan-static resource `{resource_id}` lacks static provisioning"
-                    ))
-                })?;
-                let entry = lease_entries.get(resource_id).ok_or_else(|| {
-                    invalid_operation(format!(
-                        "static lease does not own plan resource `{resource_id}`"
-                    ))
-                })?;
-                if entry.size_bytes() != allocation.size_bytes()
-                    || entry.alignment_bytes() != allocation.alignment_bytes()
-                    || entry.usage() != allocation.usage()
-                    || entry.element_type() != allocation.element_type()
-                {
-                    return Err(invalid_operation(format!(
-                        "static lease metadata differs from plan allocation `{resource_id}`"
-                    )));
+        let mut views = Vec::with_capacity(prepared.resources.len());
+        for resource in &prepared.resources {
+            let resource_id = &resource.resource_id;
+            match resource.source {
+                PreparedOperationResourceSource::PlanStatic { slot_index } => {
+                    let allocation = memory
+                        .static_allocations()
+                        .get(slot_index)
+                        .filter(|allocation| allocation.resource_id() == resource_id)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "prepared static resource index differs from the memory plan",
+                            )
+                        })?;
+                    let lease = static_lease.ok_or_else(|| {
+                        invalid_operation(format!(
+                            "plan-static resource `{resource_id}` lacks static provisioning"
+                        ))
+                    })?;
+                    let leased = lease.plan_static_view(slot_index, allocation)?;
+                    views.push(OperationBufferView {
+                        descriptor: leased.committed_descriptor().clone(),
+                        source: OperationBufferSource::Static {
+                            view: leased,
+                            retention: participant.device_buffer_retention(),
+                        },
+                        coverage: OperationBufferCoverage::Exact,
+                    });
                 }
-                let leased = lease.view(resource_id, entry.generation())?;
-                views.push(OperationBufferView {
-                    descriptor: leased.committed_descriptor().clone(),
-                    source: OperationBufferSource::Static(leased),
-                });
-            } else if let Some(descriptor) = dynamic_descriptors.get(resource_id) {
-                let backing = resources
-                    .backing_view(resource_id)
-                    .or_else(|_| participant.backing_view(resource_id))?;
-                let evidence = backing.slice();
-                let expected_bytes = match descriptor.lifetime() {
-                    AllocationLifetime::Invocation => descriptor.evaluate_request_bytes_for_shape(
-                        resources.work_shape().immediate_shape(),
-                    )?,
-                    AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
-                        resources.step_resources().work_shape().immediate_shape(),
-                    )?,
-                    AllocationLifetime::Sequence => {
-                        descriptor.evaluate_request_bytes(participant.work_shape())?
-                    }
-                    AllocationLifetime::Request => descriptor
-                        .evaluate_request_bytes(participant.request_resources().work_shape())?,
-                    AllocationLifetime::Plan => {
+                PreparedOperationResourceSource::Dynamic { descriptor_index } => {
+                    let descriptor = memory
+                        .dynamic_descriptors()
+                        .get(descriptor_index)
+                        .filter(|descriptor| descriptor.base_resource_id() == resource_id)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "prepared dynamic resource index differs from the memory plan",
+                            )
+                        })?;
+                    let backing = resources.backing_view(resource_id).or_else(|_| {
+                        resources.participant_backing_view(participant_index, resource_id)
+                    })?;
+                    let expected_bytes = match descriptor.lifetime() {
+                        AllocationLifetime::Invocation => descriptor
+                            .evaluate_request_bytes_for_shape(
+                                resources.work_shape()?.immediate_shape(),
+                            )?,
+                        AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
+                            resources.step_resources().work_shape().immediate_shape(),
+                        )?,
+                        AllocationLifetime::Sequence => {
+                            let participant_token_range = resources
+                                .work_shape()?
+                                .participant_token_ranges()
+                                .get(participant_index)
+                                .ok_or_else(|| {
+                                    invalid_operation(
+                                        "operation participant token range is missing",
+                                    )
+                                })?;
+                            let execution_shape = sequence_execution_shape(
+                                participant_backing.committed_shape(),
+                                participant_token_range.source_token_range().end,
+                            )?;
+                            descriptor.evaluate_request_bytes_for_shape(execution_shape)?
+                        }
+                        AllocationLifetime::Request => descriptor.evaluate_fit_request_bytes(
+                            participant.request_resources().work_shape(),
+                        )?,
+                        AllocationLifetime::Plan => {
+                            return Err(invalid_operation(format!(
+                                "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
+                            )))
+                        }
+                    };
+                    let size_matches = match descriptor.lifetime() {
+                        AllocationLifetime::Sequence => backing.size_bytes() >= expected_bytes,
+                        _ => backing.size_bytes() == expected_bytes,
+                    };
+                    if !size_matches
+                        || backing.capacity_size_bytes() < backing.size_bytes()
+                        || backing.alignment_bytes() != descriptor.alignment_bytes()
+                        || backing.usage() != descriptor.usage()
+                        || backing.element_type() != descriptor.element_type()
+                        || backing.storage_profile() != descriptor.storage().profile()
+                    {
                         return Err(invalid_operation(format!(
-                            "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
-                        )))
+                            "logical backing extent differs from plan descriptor `{resource_id}`"
+                        )));
                     }
-                };
-                if evidence.size_bytes() != expected_bytes
-                    || evidence.alignment_bytes() != descriptor.alignment_bytes()
-                    || evidence.usage() != descriptor.usage()
-                    || evidence.element_type() != descriptor.element_type()
-                    || backing.storage_profile() != descriptor.storage().profile()
-                {
-                    return Err(invalid_operation(format!(
-                        "logical backing extent differs from plan descriptor `{resource_id}`"
-                    )));
+                    let coverage = if backing.capacity_size_bytes() > expected_bytes {
+                        OperationBufferCoverage::BackingPrefix
+                    } else {
+                        OperationBufferCoverage::Exact
+                    };
+                    views.push(OperationBufferView {
+                        descriptor: super::BufferDescriptor {
+                            resource_id: resource_id.clone(),
+                            size_bytes: expected_bytes,
+                            alignment_bytes: backing.alignment_bytes(),
+                            usage: backing.usage(),
+                            element_type: backing.element_type(),
+                        },
+                        source: OperationBufferSource::Backing(backing),
+                        coverage,
+                    });
                 }
-                views.push(OperationBufferView {
-                    descriptor: super::BufferDescriptor {
-                        resource_id: resource_id.clone(),
-                        size_bytes: evidence.size_bytes(),
-                        alignment_bytes: evidence.alignment_bytes(),
-                        usage: evidence.usage(),
-                        element_type: evidence.element_type(),
-                    },
-                    source: OperationBufferSource::Backing(backing),
-                });
-            } else {
-                return Err(invalid_operation(format!(
-                    "plan has no static allocation or dynamic descriptor for `{resource_id}`"
-                )));
             }
         }
 
-        let mut descriptors = BTreeMap::new();
         for view in &views {
             match &view.source {
-                OperationBufferSource::Static(static_view) => {
+                OperationBufferSource::Static {
+                    view: static_view, ..
+                } => {
                     let actual = runtime.buffer_descriptor(static_view.buffer());
                     if Some(static_view.identity()) != lease_identity
                         || &actual != static_view.committed_descriptor()
@@ -3234,9 +4783,11 @@ impl<'a, B> OperationInvocation<'a, B> {
                 OperationBufferSource::Backing(backing_view) => {
                     let bindings = backing_view.segment_bindings();
                     if bindings.is_empty()
-                        || bindings.len() != backing_view.slice().segments().len()
-                        || bindings.iter().zip(backing_view.slice().segments()).any(
-                            |(binding, evidence)| {
+                        || bindings.len() != backing_view.committed_evidence_segments().count()
+                        || bindings
+                            .iter()
+                            .zip(backing_view.committed_evidence_segments())
+                            .any(|(binding, evidence)| {
                                 let actual = runtime.buffer_descriptor(binding.buffer());
                                 binding.segment() != evidence
                                     || binding.chunk() != evidence.chunk()
@@ -3246,8 +4797,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                                         .offset_bytes()
                                         .checked_add(binding.segment().length_bytes())
                                         .is_none_or(|end| end > binding.descriptor().size_bytes)
-                            },
-                        )
+                            })
                     {
                         return Err(invalid_operation(format!(
                             "runtime descriptor differs from a committed backing chunk for `{}`",
@@ -3268,74 +4818,99 @@ impl<'a, B> OperationInvocation<'a, B> {
                     view.resource_id()
                 )));
             }
-            if descriptors
-                .insert(view.resource_id().clone(), view.descriptor.clone())
-                .is_some()
-            {
-                return Err(invalid_operation(format!(
-                    "operation resource `{}` is duplicated",
-                    view.resource_id()
-                )));
-            }
         }
-        for binding in &bindings {
-            for component in binding.storage().components() {
-                let descriptor = descriptors.get(component.resource_id()).ok_or_else(|| {
+        if node.values().len() != prepared.binding_component_views.len() {
+            return Err(invalid_operation(
+                "prepared value-binding recipe differs from its plan node",
+            ));
+        }
+        for (binding, component_views) in
+            node.values().iter().zip(&prepared.binding_component_views)
+        {
+            if binding.storage().components().len() != component_views.len() {
+                return Err(invalid_operation(
+                    "prepared component recipe differs from its value binding",
+                ));
+            }
+            for (component, view_index) in
+                binding.storage().components().iter().zip(component_views)
+            {
+                let view = views.get(*view_index).ok_or_else(|| {
                     invalid_operation("value binding lacks a committed resource view")
                 })?;
-                let required_end = component
-                    .offset_bytes()
-                    .checked_add(component.length_bytes())
-                    .ok_or_else(|| invalid_operation("bound component range overflows u64"))?;
-                if required_end > descriptor.size_bytes
-                    || descriptor.usage != binding.usage()
-                    || descriptor.element_type != component.element_type()
-                    || descriptor.alignment_bytes < provider_resources.value_alignment_bytes()
-                    || descriptor.alignment_bytes % provider_resources.value_alignment_bytes() != 0
-                    || component.offset_bytes() % provider_resources.value_alignment_bytes() != 0
-                {
-                    return Err(invalid_operation(format!(
-                        "resource `{}` differs from its value binding",
-                        component.resource_id()
-                    )));
+                if view.resource_id() != component.resource_id() {
+                    return Err(invalid_operation(
+                        "prepared value-binding view differs from its resource",
+                    ));
                 }
-                let view = views
-                    .iter()
-                    .find(|view| view.resource_id() == component.resource_id())
-                    .ok_or_else(|| {
-                        invalid_operation("value binding lacks a physical region translator")
+                let dynamic_demand = match prepared
+                    .resources
+                    .get(*view_index)
+                    .map(|resource| resource.source)
+                {
+                    Some(PreparedOperationResourceSource::PlanStatic { .. }) => None,
+                    Some(PreparedOperationResourceSource::Dynamic { descriptor_index }) => Some(
+                        memory
+                            .dynamic_descriptors()
+                            .get(descriptor_index)
+                            .filter(|descriptor| {
+                                descriptor.base_resource_id() == component.resource_id()
+                            })
+                            .ok_or_else(|| {
+                                invalid_operation(
+                                    "prepared component descriptor differs from the memory plan",
+                                )
+                            })?
+                            .demand(),
+                    ),
+                    None => {
+                        return Err(invalid_operation(
+                            "prepared component view index is out of range",
+                        ))
+                    }
+                };
+                let coverage = validate_value_binding_physical_coverage(
+                    node.work(),
+                    binding,
+                    component,
+                    view.descriptor(),
+                    dynamic_demand,
+                    provider_resources.value_alignment_bytes(),
+                )?;
+                if coverage == ValueBindingPhysicalCoverage::CanonicalComponent {
+                    let translated =
+                        view.translate(component.offset_bytes(), component.length_bytes())?;
+                    let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
+                        total.checked_add(region.length_bytes()).ok_or_else(|| {
+                            invalid_operation("translated value-binding regions overflow u64")
+                        })
                     })?;
-                let translated =
-                    view.translate(component.offset_bytes(), component.length_bytes())?;
-                let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
-                    total.checked_add(region.length_bytes()).ok_or_else(|| {
-                        invalid_operation("translated value-binding regions overflow u64")
-                    })
-                })?;
-                if translated_bytes != component.length_bytes() {
-                    return Err(invalid_operation(format!(
-                        "resource `{}` does not physically cover its value binding",
-                        component.resource_id()
-                    )));
+                    if translated_bytes != component.length_bytes() {
+                        return Err(invalid_operation(format!(
+                            "resource `{}` does not physically cover its value binding",
+                            component.resource_id()
+                        )));
+                    }
                 }
             }
         }
-        let scratch_view = scratch_resource
-            .map(|resource| view_index(&views, resource, "scratch"))
-            .transpose()?;
-        let persistent_view = persistent_resource
-            .map(|resource| view_index(&views, resource, "persistent"))
-            .transpose()?;
         validate_workspace(
             &views,
-            scratch_view,
+            prepared.scratch_view,
             BufferUsage::Scratch,
             provider_resources.scratch(),
             "scratch",
         )?;
         validate_workspace(
             &views,
-            persistent_view,
+            prepared.binding_view,
+            BufferUsage::Binding,
+            provider_resources.binding(),
+            "binding",
+        )?;
+        validate_workspace(
+            &views,
+            prepared.persistent_view,
             BufferUsage::Persistent,
             provider_resources.persistent(),
             "persistent",
@@ -3344,14 +4919,16 @@ impl<'a, B> OperationInvocation<'a, B> {
             identity,
             operation,
             node_id,
-            provider_id: provider.provider_id(),
+            provider_id: node.selection().selected_provider(),
             views,
-            bindings,
+            bindings: node.values(),
             attributes: node.attributes(),
-            scratch_view,
-            persistent_view,
-            work_shape: resources.work_shape(),
-            claimed_backing_fingerprint: resources.claimed_backing().fingerprint(),
+            work: node.work(),
+            scratch_view: prepared.scratch_view,
+            binding_view: prepared.binding_view,
+            persistent_view: prepared.persistent_view,
+            work_shape: resources.work_shape()?,
+            claimed_backing_fingerprint: resources.backing_fingerprint(),
         })
     }
 
@@ -3376,15 +4953,23 @@ impl<'a, B> OperationInvocation<'a, B> {
     }
 
     pub fn bindings(&self) -> &[ResolvedValueBinding] {
-        &self.bindings
+        self.bindings
     }
 
     pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
         self.attributes
     }
 
+    pub fn work(&self) -> &NodeWorkContract {
+        self.work
+    }
+
     pub fn scratch_view(&self) -> Option<&OperationBufferView<'a, B>> {
         self.scratch_view.map(|index| &self.views[index])
+    }
+
+    pub fn binding_view(&self) -> Option<&OperationBufferView<'a, B>> {
+        self.binding_view.map(|index| &self.views[index])
     }
 
     pub fn persistent_view(&self) -> Option<&OperationBufferView<'a, B>> {
@@ -3405,14 +4990,16 @@ impl<'a, B> OperationInvocation<'a, B> {
 /// may be shared by every projection.
 pub struct BatchedOperationInvocation<'a, B> {
     batch_identity: &'a BatchOperationIdentity,
+    node_identity: &'a BatchOperationNodeIdentity,
     participants: Vec<OperationInvocation<'a, B>>,
+    program_binding: Option<ProgramBindingNodeBinding>,
 }
 
 impl<'a, B> BatchedOperationInvocation<'a, B> {
     fn from_resolved<R>(
         runtime: &R,
-        resolved: &'a ResolvedModelPlan,
-        provider: &'a OperationProviderDescriptor,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
         batch_identity: &'a BatchOperationIdentity,
         resources: &'a InvocationResourceLease<R>,
         active_bindings: &'a [TrustedActiveSequenceBinding],
@@ -3420,50 +5007,115 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     where
         R: DeviceRuntime<Buffer = B>,
     {
-        let participant_count = usize::try_from(resources.participant_count())
-            .map_err(|_| invalid_operation("operation participant count exceeds usize"))?;
-        let resource_keys = resources.participant_node_keys();
+        let node_identity = batch_identity.single_node().ok_or_else(|| {
+            invalid_operation("single-operation invocation received a multi-node batch identity")
+        })?;
+        Self::from_resources(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Invocation(resources),
+            active_bindings.iter(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_wave_node<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::from_resources(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resources<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_bindings: I,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        let participant_count = resources.participant_count()?;
+        let participant_frames = resources.participant_frames()?;
         if participant_count == 0
             || participant_count != active_bindings.len()
-            || participant_count != batch_identity.participants().len()
-            || participant_count != resource_keys.len()
+            || participant_count != node_identity.participants().len()
+            || participant_count != participant_frames.len()
             || batch_identity.batch_step_id() != resources.batch_step_id()
             || batch_identity.batch_invocation_id() != resources.batch_invocation_id()
-            || batch_identity.node_id() != resources.node_id()
-            || batch_identity.work_shape_fingerprint() != resources.work_shape().fingerprint()
-            || batch_identity.claimed_backing_fingerprint()
-                != resources.claimed_backing().fingerprint()
-            || batch_identity
+            || node_identity.node_id() != resources.node_id()?
+            || node_identity.work_shape_fingerprint() != resources.work_shape()?.fingerprint()
+            || batch_identity.claimed_backing_fingerprint() != resources.backing_fingerprint()
+            || node_identity
                 .participants()
                 .iter()
-                .zip(&resource_keys)
-                .any(|(participant, key)| participant.node_key() != key)
+                .zip(participant_frames)
+                .any(|(participant, frame)| {
+                    let key = participant.node_key();
+                    key.sequence_authority() != frame.sequence_authority()
+                        || key.request_authority() != frame.request_authority()
+                        || key.frame_id() != frame.frame_id()
+                        || key.node_id() != node_identity.node_id()
+                })
         {
             return Err(invalid_operation(
                 "batched operation identity differs from its exact invocation resources",
             ));
         }
-        let participants = batch_identity
+        let node = prepared.node(resolved, node_identity.node_id())?;
+        let operation = resolved.capabilities().operation(node.operation_id())?;
+        let participants = node_identity
             .participants()
             .iter()
             .zip(active_bindings)
             .enumerate()
             .map(|(index, (participant, active_binding))| {
-                OperationInvocation::from_resolved(
+                OperationInvocation::from_prepared(
                     runtime,
                     resolved,
-                    provider,
+                    prepared,
+                    node,
+                    operation,
                     participant.identity(),
-                    batch_identity.node_id(),
+                    node_identity.node_id(),
                     resources,
                     active_binding,
                     index,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let program_binding = resources.program_binding_node();
         Ok(Self {
             batch_identity,
+            node_identity,
             participants,
+            program_binding,
         })
     }
 
@@ -3480,15 +5132,27 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     }
 
     pub fn node_id(&self) -> &NodeId {
-        self.batch_identity.node_id()
+        self.node_identity.node_id()
     }
 
     pub fn provider_id(&self) -> &ProviderId {
-        self.batch_identity.provider_id()
+        self.node_identity.provider_id()
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
         self.participants[0].work_shape()
+    }
+
+    pub fn work_contract(&self) -> &NodeWorkContract {
+        self.participants[0].work()
+    }
+
+    pub fn program_binding(&self) -> Option<&ProgramBindingNodeBinding> {
+        self.program_binding.as_ref()
+    }
+
+    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
+        self.work_shape().participant_token_ranges()
     }
 }
 
@@ -3511,17 +5175,6 @@ fn select_workspace_resource<'a>(
             requirement.scope()
         ))
     })
-}
-
-fn view_index<B>(
-    views: &[OperationBufferView<'_, B>],
-    resource_id: &ResourceId,
-    kind: &str,
-) -> Result<usize, VNextError> {
-    views
-        .iter()
-        .position(|view| view.resource_id() == resource_id)
-        .ok_or_else(|| invalid_operation(format!("{kind} resource view is missing")))
 }
 
 fn validate_workspace<B>(
@@ -3565,337 +5218,254 @@ fn validate_workspace<B>(
     }
 }
 
-pub enum OperationDispatchError<R>
+fn encode_provider_workspace_initialization<R, Retry>(
+    runtime: &R,
+    node_index: u32,
+    node_identity: &BatchOperationNodeIdentity,
+    requirement: &ProviderWorkspaceRequirement,
+    work: &ResourceWorkShape,
+    view: &OperationBufferView<'_, R::Buffer>,
+    initialization: SubmissionScratchInitialization,
+    commands: &mut DeviceCommandBatch<R::Command>,
+) -> Result<usize, OperationDispatchError<R, Retry>>
 where
     R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
 {
-    Contract(VNextError),
-    Provider(OperationFailure),
-    DefinitelyNotSubmitted {
-        failures: Vec<IdentifiedFailure>,
-        retry: DefinitelyNotSubmittedRetryAuthority<R>,
-    },
-    SubmissionIndeterminate {
-        recovery: IndeterminateSubmissionHandle<R>,
-    },
-    PostSubmitContract {
-        error: VNextError,
-        completion: CompletionHandle<R>,
-    },
-}
-
-impl<R> fmt::Debug for OperationDispatchError<R>
-where
-    R: DeviceRuntime,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Contract(error) => formatter.debug_tuple("Contract").field(error).finish(),
-            Self::Provider(error) => formatter.debug_tuple("Provider").field(error).finish(),
-            Self::DefinitelyNotSubmitted { failures, retry } => formatter
-                .debug_struct("DefinitelyNotSubmitted")
-                .field("failures", failures)
-                .field("retry", retry)
-                .finish(),
-            Self::SubmissionIndeterminate { recovery } => formatter
-                .debug_struct("SubmissionIndeterminate")
-                .field("recovery", recovery)
-                .finish(),
-            Self::PostSubmitContract { error, completion } => formatter
-                .debug_struct("PostSubmitContract")
-                .field("error", error)
-                .field("completion", completion)
-                .finish(),
-        }
+    if requirement.reuse_policy() == ProviderWorkspaceReusePolicy::Preserve {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace cannot preserve bytes across invocations",
+        )));
     }
-}
-
-impl<R> fmt::Display for OperationDispatchError<R>
-where
-    R: DeviceRuntime,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Contract(error) => {
-                write!(formatter, "operation dispatch contract failed: {error}")
-            }
-            Self::Provider(error) => write!(
-                formatter,
-                "operation provider failed with {}: {}",
-                error.code(),
-                error.message()
-            ),
-            Self::DefinitelyNotSubmitted { failures, retry } => write!(
-                formatter,
-                "operation attempt {} with {} participants was definitely not submitted: {}",
-                retry.prior_attempt(),
-                failures.len(),
-                failures
-                    .first()
-                    .map(|failure| failure.failure().message())
-                    .unwrap_or("missing classified participant failure")
-            ),
-            Self::SubmissionIndeterminate { recovery } => write!(
-                formatter,
-                "operation submission may have reached the device; completion slot {} retains ownership",
-                recovery.slot_id().get()
-            ),
-            Self::PostSubmitContract { error, completion } => write!(
-                formatter,
-                "operation submission reached the device but slot {} observed a contract failure: {error}",
-                completion.slot_id().get()
-            ),
-        }
-    }
-}
-
-impl<R> std::error::Error for OperationDispatchError<R> where R: DeviceRuntime {}
-
-/// The only public path from a resolved plan to an operation kernel.
-pub struct OperationDispatch;
-
-impl OperationDispatch {
-    #[allow(clippy::too_many_arguments)]
-    pub fn bind_batch_identity<R>(
-        resolved: &ResolvedModelPlan,
-        participant_identities: Vec<ExecutionIdentityEnvelope>,
-        active_bindings: &[TrustedActiveSequenceBinding],
-        invocation_resources: &InvocationResourceLease<R>,
-        lane: &Arc<ExecutionLane<R>>,
-    ) -> Result<BatchOperationIdentity, VNextError>
-    where
-        R: DeviceRuntime,
+    if initialization == SubmissionScratchInitialization::ProviderContract
+        && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse
     {
-        let plan = resolved.execution_plan();
-        let node_id = invocation_resources.node_id();
-        let node = plan
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == node_id)
-            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
-        let participants = invocation_resources.participants().collect::<Vec<_>>();
-        let frames = invocation_resources.participant_frames();
-        let sessions = invocation_resources
-            .participant_session_identities()
-            .collect::<Vec<_>>();
-        let node_keys = invocation_resources.participant_node_keys();
-        if participant_identities.is_empty()
-            || participant_identities.len() != participants.len()
-            || participant_identities.len() != frames.len()
-            || participant_identities.len() != sessions.len()
-            || participant_identities.len() != node_keys.len()
-            || participant_identities.len() != active_bindings.len()
-            || invocation_resources.prepared_participant_count()
-                != invocation_resources.participant_count()
-            || invocation_resources.plan_evidence().plan_id() != plan.payload().plan_id()
-            || invocation_resources.plan_evidence().plan_hash() != plan.plan_hash()
-            || invocation_resources.plan_evidence().device_id() != plan.payload().device_id()
-            || !Arc::ptr_eq(invocation_resources.runtime(), lane.runtime_arc())
-            || lane.descriptor() != &resolved.parts().device
-            || lane.descriptor() != resolved.parts().capabilities.device()
-            || lane.descriptor().runtime_implementation_fingerprint
-                != plan.payload().device_runtime_implementation_fingerprint()
-        {
-            return Err(invalid_operation(
-                "batch identity inputs differ from invocation resources, plan, or lane",
-            ));
-        }
-        let mut participant_projections = Vec::with_capacity(participant_identities.len());
-        for (index, identity) in participant_identities.into_iter().enumerate() {
-            let participant = participants[index];
-            let frame = frames[index];
-            let active = &active_bindings[index];
-            let session = sessions[index];
-            let key = &node_keys[index];
-            let parts = identity.parts();
-            if key.sequence_authority() != participant.sequence_authority()
-                || key.request_authority() != participant.request_authority()
-                || key.frame_id() != frame.frame_id()
-                || active.sequence_authority() != participant.sequence_authority()
-                || active.coordinator_id() != invocation_resources.coordinator_id()
-                || active.run_id() != participant.run_id()
-                || active.request_id() != participant.request_id()
-                || !active.matches_sequence_session(session.0, session.1)
-                || active.plan().plan_id() != plan.payload().plan_id()
-                || active.plan().plan_hash() != plan.plan_hash()
-                || active.plan().device_id() != plan.payload().device_id()
-                || active.runtime_implementation_fingerprint()
-                    != plan.payload().device_runtime_implementation_fingerprint()
-                || parts.run_id != *active.run_id()
-                || parts.request_id != *active.request_id()
-                || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
-                || parts.plan_hash.as_ref() != Some(plan.plan_hash())
-                || parts.frame_id != Some(frame.frame_id())
-                || parts.node_invocation_id.is_none()
-                || parts.node_id.as_ref() != Some(node.id())
-                || parts.operation_id.as_ref() != Some(node.operation_id())
-                || parts.provider_id.as_ref() != Some(node.selection().selected_provider())
-                || parts.device_id.as_ref() != Some(plan.payload().device_id())
-                || parts.active_sequence_slot != Some(active.sequence_authority().sparse_id())
-                || parts.admission_generation != Some(active.sequence_authority().generation())
-                || parts.activation_epoch != Some(active.activation_epoch())
-                || parts.runtime_implementation_fingerprint.as_deref()
-                    != Some(active.runtime_implementation_fingerprint())
-                || parts.active_sequence_fingerprint.as_deref() != Some(active.fingerprint())
-                || parts.completed_sequence_fingerprint.is_some()
-                || parts.aborted_sequence_fingerprint.is_some()
-                || parts.resource_id.is_some()
-                || parts.resource_generation.is_some()
-                || parts.resource_batch_fingerprint.is_some()
-            {
-                return Err(invalid_operation(format!(
-                    "batch participant {index} differs from its exact resource, frame, session, or plan identity"
-                )));
-            }
-            participant_projections.push(BatchOperationParticipantIdentity {
-                participant_index: u32::try_from(index)
-                    .map_err(|_| invalid_operation("batch participant index exceeds u32"))?,
-                node_key: key.clone(),
-                identity,
-            });
-        }
-        BatchOperationIdentity::from_validated(
-            invocation_resources.batch_step_id(),
-            invocation_resources.batch_invocation_id(),
-            plan.payload().plan_id().clone(),
-            plan.plan_hash().clone(),
-            node.id().clone(),
-            node.operation_id().clone(),
-            node.selection().selected_provider().clone(),
-            plan.payload().device_id().clone(),
-            plan.payload()
-                .device_runtime_implementation_fingerprint()
-                .to_owned(),
-            lane.id(),
-            invocation_resources.work_shape().fingerprint().to_owned(),
-            invocation_resources
-                .claimed_backing()
-                .fingerprint()
-                .to_owned(),
-            participant_projections,
-        )
+        return Ok(0);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn encode_and_submit<R>(
-        provider: &BoundOperationProvider<'_, R>,
-        resolved: &ResolvedModelPlan,
-        batch_identity: &BatchOperationIdentity,
-        active_bindings: &[TrustedActiveSequenceBinding],
-        mut invocation_resources: InvocationResourceLease<R>,
-        lane: &Arc<ExecutionLane<R>>,
-        reaper: &Arc<CompletionReaper<R>>,
-    ) -> Result<CompletionHandle<R>, OperationDispatchError<R>>
-    where
-        R: DeviceRuntime,
+    let required_bytes = requirement
+        .evaluate_bytes(work)
+        .map_err(OperationDispatchError::Contract)?;
+    let descriptor = view.descriptor();
+    if descriptor.usage != BufferUsage::Scratch
+        || descriptor.element_type != super::ElementType::U8
+        || descriptor.size_bytes != required_bytes
+        || descriptor.alignment_bytes < requirement.alignment_bytes()
+        || descriptor.alignment_bytes % requirement.alignment_bytes() != 0
     {
-        provider
-            .validate_binding(resolved, batch_identity.node_id())
-            .map_err(OperationDispatchError::Contract)?;
-        if active_bindings.is_empty()
-            || active_bindings.len() != batch_identity.participants().len()
-            || lane.id() != batch_identity.lane_id()
-            || lane.descriptor().id != *batch_identity.device_id()
-            || lane.descriptor().runtime_implementation_fingerprint
-                != batch_identity.runtime_implementation_fingerprint()
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace zero range differs from its provider requirement",
+        )));
+    }
+    let regions = view
+        .translate(0, required_bytes)
+        .map_err(OperationDispatchError::Contract)?;
+    let participant = node_identity.participants().first().ok_or_else(|| {
+        OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace initialization has no participant identity",
+        ))
+    })?;
+    let participant_count = u32::try_from(node_identity.participants().len()).map_err(|_| {
+        OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace participant count exceeds u32",
+        ))
+    })?;
+    if participant_count != work.immediate_sequences() {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace logical participants differ from its resource work",
+        )));
+    }
+    let logical_work = DeviceCommandLogicalWork::new(
+        DeviceBatchingForm::Packed,
+        participant_count,
+        work.immediate_tokens(),
+    )
+    .map_err(OperationDispatchError::Contract)?;
+    let identity = participant.identity().clone();
+    let mut encoded_bytes = 0_u64;
+    let mut command_count = 0_usize;
+    for region in regions.iter() {
+        let (buffer, physical_range, _retention) = region.buffer_and_physical_range();
+        let actual = runtime.buffer_descriptor(buffer);
+        if actual.usage != BufferUsage::Scratch
+            || actual.element_type != super::ElementType::U8
+            || physical_range.end > actual.size_bytes
+            || physical_range.start >= physical_range.end
         {
             return Err(OperationDispatchError::Contract(invalid_operation(
-                "operation execution lane or participant set differs from batch identity",
+                "scratch workspace physical zero range drifted",
             )));
         }
-        invocation_resources
-            .begin_dispatch()
-            .map_err(OperationDispatchError::Contract)?;
-        let mut completion = CompletionReaper::reserve(
-            reaper,
-            invocation_resources,
-            Arc::clone(lane),
-            batch_identity.clone(),
-        )
-        .map_err(OperationDispatchError::Contract)?;
-        let runtime = lane.runtime();
-        if !lane.current_descriptor_matches_snapshot() {
-            return Err(OperationDispatchError::Contract(invalid_operation(
-                "operation encode runtime differs from its execution lane snapshot",
-            )));
-        }
-        let invocation = BatchedOperationInvocation::from_resolved(
-            runtime,
-            resolved,
-            provider.provider.descriptor(),
-            batch_identity,
-            completion.invocation(),
-            active_bindings,
-        )
-        .map_err(OperationDispatchError::Contract)?;
-        let expected_phase = invocation.operation().profile_phase;
-        let command = match provider.provider.encode_selected(invocation) {
-            Ok(command) => command,
-            Err(failure)
-                if batch_identity.contains_identity(failure.identity())
-                    && failure.phase() == expected_phase =>
-            {
-                return Err(OperationDispatchError::Provider(failure));
+        let length_bytes = physical_range.end - physical_range.start;
+        match initialization {
+            SubmissionScratchInitialization::ProviderContract
+            | SubmissionScratchInitialization::FillByte(0) => {
+                let command = runtime
+                    .encode_zero(buffer, physical_range.start, length_bytes)
+                    .map_err(|error| {
+                        classify_device_error(runtime, identity.clone(), &error)
+                            .map(OperationDispatchError::Initialization)
+                            .unwrap_or_else(OperationDispatchError::Contract)
+                    })?;
+                commands.push_node_initialization(node_index, logical_work, command);
+                command_count = command_count.checked_add(1).ok_or_else(|| {
+                    OperationDispatchError::Contract(invalid_operation(
+                        "scratch workspace initialization command count overflows usize",
+                    ))
+                })?;
             }
-            Err(_) => {
-                return Err(OperationDispatchError::Contract(invalid_operation(
-                    "operation provider returned a failure for a different execution identity or profile phase",
-                )));
-            }
-        };
-        if !lane.current_descriptor_matches_snapshot() {
-            return Err(OperationDispatchError::Contract(invalid_operation(
-                "operation encode completion runtime drifted",
-            )));
-        }
-        let mut lane_reservation = lane
-            .reserve_enqueue()
-            .map_err(OperationDispatchError::Contract)?;
-        completion.mark_submission_started();
-        match lane_reservation.submit(command) {
-            LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
-                drop(lane_reservation);
-                let retry = completion
-                    .definitely_not_submitted()
-                    .map_err(OperationDispatchError::Contract)?;
-                let failures = batch_identity
-                    .participants()
-                    .iter()
-                    .map(|participant| {
-                        classify_device_error(runtime, participant.identity().clone(), &error)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(OperationDispatchError::Contract)?;
-                Err(OperationDispatchError::DefinitelyNotSubmitted { failures, retry })
-            }
-            LaneSubmitOutcome::PossiblySubmittedPanic => {
-                drop(lane_reservation);
-                let recovery = completion.submission_indeterminate();
-                Err(OperationDispatchError::SubmissionIndeterminate { recovery })
-            }
-            LaneSubmitOutcome::Submitted(fence) => {
-                drop(lane_reservation);
-                let completion = match completion.arm(fence) {
-                    Ok(completion) => completion,
-                    Err((error, completion)) => {
-                        return Err(OperationDispatchError::PostSubmitContract {
-                            error,
-                            completion,
-                        });
-                    }
-                };
-                if !lane.current_descriptor_matches_snapshot() {
-                    lane.fail_closed();
-                    return Err(OperationDispatchError::PostSubmitContract {
-                        error: invalid_operation("operation submit completion runtime drifted"),
-                        completion,
-                    });
+            SubmissionScratchInitialization::FillByte(value) => {
+                const FILL_CHUNK_BYTES: u64 = 1024 * 1024;
+                let chunk_len =
+                    usize::try_from(length_bytes.min(FILL_CHUNK_BYTES)).map_err(|_| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace fill chunk exceeds host address space",
+                        ))
+                    })?;
+                let fill = vec![value; chunk_len];
+                let mut offset = physical_range.start;
+                let end = physical_range.end;
+                while offset < end {
+                    let piece_bytes = (end - offset).min(FILL_CHUNK_BYTES);
+                    let piece_len = usize::try_from(piece_bytes).map_err(|_| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace fill piece exceeds host address space",
+                        ))
+                    })?;
+                    let layout = HostTransferLayout::new(ElementType::U8, piece_bytes)
+                        .map_err(OperationDispatchError::Contract)?;
+                    let command = runtime
+                        .encode_upload(&fill[..piece_len], layout, buffer, offset)
+                        .map_err(|error| {
+                            classify_device_error(runtime, identity.clone(), &error)
+                                .map(OperationDispatchError::Initialization)
+                                .unwrap_or_else(OperationDispatchError::Contract)
+                        })?;
+                    commands.push_node_initialization(node_index, logical_work, command);
+                    command_count = command_count.checked_add(1).ok_or_else(|| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace initialization command count overflows usize",
+                        ))
+                    })?;
+                    offset = offset.checked_add(piece_bytes).ok_or_else(|| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace fill offset overflows u64",
+                        ))
+                    })?;
                 }
-                Ok(completion)
             }
         }
+        encoded_bytes = encoded_bytes.checked_add(length_bytes).ok_or_else(|| {
+            OperationDispatchError::Contract(invalid_operation(
+                "scratch workspace initialization byte count overflows u64",
+            ))
+        })?;
     }
+    if encoded_bytes != required_bytes {
+        return Err(OperationDispatchError::Contract(invalid_operation(
+            "scratch workspace initialization commands do not cover the logical workspace",
+        )));
+    }
+    Ok(command_count)
+}
+
+fn encode_submission_wave_workspace_initializations<R>(
+    runtime: &R,
+    resolved: &dyn ExecutablePlanView,
+    batch_identity: &BatchOperationIdentity,
+    scratch_initialization: SubmissionScratchInitialization,
+    completion: &super::CompletionReservation<R>,
+    commands: &mut DeviceCommandBatch<R::Command>,
+) -> Result<usize, SubmissionWaveDispatchError<R>>
+where
+    R: DeviceRuntime,
+{
+    let plan_nodes = resolved.execution_plan().payload().nodes();
+    if batch_identity.node_count() != completion.wave().nodes().len() {
+        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+            "workspace initialization topology differs from the prepared wave",
+        )));
+    }
+    let mut command_count = 0_usize;
+    for (node_index, prepared_node) in completion.wave().nodes().iter().enumerate() {
+        let plan_node = plan_nodes
+            .iter()
+            .find(|node| node.id() == prepared_node.node_id())
+            .ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "workspace initialization node is absent from the immutable plan",
+                ))
+            })?;
+        let node_identity = batch_identity.nodes().get(node_index).ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization node has no batch identity",
+            ))
+        })?;
+        if plan_node.id() != prepared_node.node_id()
+            || node_identity.node_id() != prepared_node.node_id()
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization node differs from the prepared wave",
+            )));
+        }
+        let Some(requirement) = plan_node.provider_resources().scratch() else {
+            continue;
+        };
+        if scratch_initialization == SubmissionScratchInitialization::ProviderContract
+            && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse
+        {
+            continue;
+        }
+        let resource_id = plan_node.scratch_resource().ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "scratch workspace initialization has no base resource",
+            ))
+        })?;
+        let backing = completion
+            .wave()
+            .backing_view(node_index, resource_id)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        let coverage = if backing.capacity_size_bytes() > backing.size_bytes() {
+            OperationBufferCoverage::BackingPrefix
+        } else {
+            OperationBufferCoverage::Exact
+        };
+        let view = OperationBufferView {
+            descriptor: BufferDescriptor {
+                resource_id: resource_id.clone(),
+                size_bytes: backing.size_bytes(),
+                alignment_bytes: backing.alignment_bytes(),
+                usage: backing.usage(),
+                element_type: backing.element_type(),
+            },
+            source: OperationBufferSource::Backing(backing),
+            coverage,
+        };
+        let node_index = u32::try_from(node_index).map_err(|_| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization node index exceeds u32",
+            ))
+        })?;
+        let encoded = encode_provider_workspace_initialization::<
+            R,
+            DefinitelyNotSubmittedWaveRetryAuthority<R>,
+        >(
+            runtime,
+            node_index,
+            node_identity,
+            requirement,
+            prepared_node.work_shape().resource_work(),
+            &view,
+            scratch_initialization,
+            commands,
+        )?;
+        command_count = command_count.checked_add(encoded).ok_or_else(|| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "workspace initialization command count overflows usize",
+            ))
+        })?;
+    }
+    Ok(command_count)
 }
 
 /// Exact semantic input presented to a selected provider's resource estimator.
@@ -3909,6 +5479,160 @@ pub struct OperationResourceEstimateRequest<'a> {
     values: &'a [ResolvedValueBinding],
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
     input_fingerprint: &'a str,
+}
+
+/// Lightweight provider view used to bind dynamic compute topology into a
+/// reusable program identity before catalog lookup.
+///
+/// It deliberately exposes no buffers, request identity, or submission
+/// authority. Providers may derive only an opaque fixed-size topology
+/// fingerprint from immutable plan semantics, typed reusable-address
+/// authority, and the current batch work shape.
+pub struct ReusableExecutionTopologyRequest<'a> {
+    node_id: &'a NodeId,
+    operation_id: &'a OperationId,
+    attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+    bindings: &'a [ResolvedValueBinding],
+    memory: &'a MemoryPlan,
+    work_shape: &'a BatchWorkShape,
+    claimed_backing: &'a ClaimedSubmissionWaveBacking,
+    step_backing: &'a [LogicalBackingSliceAuthority],
+}
+
+impl<'a> ReusableExecutionTopologyRequest<'a> {
+    fn new(
+        node_id: &'a NodeId,
+        operation_id: &'a OperationId,
+        attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+        bindings: &'a [ResolvedValueBinding],
+        memory: &'a MemoryPlan,
+        work_shape: &'a BatchWorkShape,
+        claimed_backing: &'a ClaimedSubmissionWaveBacking,
+        step_backing: &'a [LogicalBackingSliceAuthority],
+    ) -> Result<Self, VNextError> {
+        if work_shape.participants().is_empty() {
+            return Err(invalid_operation(
+                "reusable execution topology request has no participants",
+            ));
+        }
+        Ok(Self {
+            node_id,
+            operation_id,
+            attributes,
+            bindings,
+            memory,
+            work_shape,
+            claimed_backing,
+            step_backing,
+        })
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        self.node_id
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        self.operation_id
+    }
+
+    pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
+        self.attributes
+    }
+
+    pub fn bindings(&self) -> &[ResolvedValueBinding] {
+        self.bindings
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.work_shape
+    }
+
+    /// Returns the reusable address authority shared by every physical
+    /// component of one resolved value. `None` means at least one component is
+    /// submission-scoped and the backend must exclude commands that capture it
+    /// from resident reusable segments.
+    pub fn binding_reusable_address_scope(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.role() == role && binding.ordinal() == ordinal)
+            .ok_or_else(|| {
+                invalid_operation("reusable topology requested an unknown value binding")
+            })?;
+        let mut aggregate = DeviceReusableAddressScope::Plan;
+        for component in binding.storage().components() {
+            let resource_id = component.resource_id();
+            let component_scope = if self
+                .memory
+                .static_allocations()
+                .binary_search_by(|allocation| allocation.resource_id().cmp(resource_id))
+                .is_ok()
+            {
+                Some(DeviceReusableAddressScope::Plan)
+            } else {
+                let mut component_scope = None;
+                for backing_slices in [self.claimed_backing.backing_slices(), self.step_backing] {
+                    let authority_start = backing_slices
+                        .partition_point(|authority| authority.resource_id() < resource_id);
+                    let authority_end = authority_start
+                        + backing_slices[authority_start..]
+                            .partition_point(|authority| authority.resource_id() == resource_id);
+                    for authority in &backing_slices[authority_start..authority_end] {
+                        let Some(authority_scope) = authority.reusable_address_scope() else {
+                            return Ok(None);
+                        };
+                        component_scope = Some(merge_reusable_address_scope(
+                            component_scope.unwrap_or(DeviceReusableAddressScope::Plan),
+                            authority_scope,
+                        )?);
+                    }
+                }
+                if component_scope.is_none() {
+                    if self
+                        .memory
+                        .dynamic_descriptors()
+                        .binary_search_by(|descriptor| {
+                            descriptor.base_resource_id().cmp(resource_id)
+                        })
+                        .is_ok()
+                    {
+                        return Ok(None);
+                    }
+                    return Err(invalid_operation(
+                        "reusable topology value references an unknown memory resource",
+                    ));
+                }
+                component_scope
+            };
+            aggregate = merge_reusable_address_scope(
+                aggregate,
+                component_scope.expect("component scope is present after early return"),
+            )?;
+        }
+        Ok(Some(aggregate))
+    }
+}
+
+fn merge_reusable_address_scope(
+    left: DeviceReusableAddressScope,
+    right: DeviceReusableAddressScope,
+) -> Result<DeviceReusableAddressScope, VNextError> {
+    match (left, right) {
+        (DeviceReusableAddressScope::Plan, scope) | (scope, DeviceReusableAddressScope::Plan) => {
+            Ok(scope)
+        }
+        (
+            DeviceReusableAddressScope::ExecutionLane(left),
+            DeviceReusableAddressScope::ExecutionLane(right),
+        ) if left == right => Ok(DeviceReusableAddressScope::ExecutionLane(left)),
+        _ => Err(invalid_operation(
+            "reusable topology value spans different execution lanes",
+        )),
+    }
 }
 
 impl<'a> OperationResourceEstimateRequest<'a> {
@@ -3968,6 +5692,7 @@ pub struct OperationResourceEstimate {
     claimed_input_fingerprint: String,
     value_alignment_bytes: u64,
     scratch: Option<ProviderWorkspaceRequirement>,
+    binding: Option<ProviderWorkspaceRequirement>,
     persistent: Option<ProviderWorkspaceRequirement>,
 }
 
@@ -3989,8 +5714,14 @@ impl OperationResourceEstimate {
             claimed_input_fingerprint: claimed_input_fingerprint.into(),
             value_alignment_bytes,
             scratch,
+            binding: None,
             persistent,
         }
+    }
+
+    pub fn with_binding(mut self, binding: ProviderWorkspaceRequirement) -> Self {
+        self.binding = Some(binding);
+        self
     }
 
     pub fn estimator_id(&self) -> &str {
@@ -4015,6 +5746,10 @@ impl OperationResourceEstimate {
 
     pub fn scratch(&self) -> Option<&ProviderWorkspaceRequirement> {
         self.scratch.as_ref()
+    }
+
+    pub fn binding(&self) -> Option<&ProviderWorkspaceRequirement> {
+        self.binding.as_ref()
     }
 
     pub fn persistent(&self) -> Option<&ProviderWorkspaceRequirement> {
@@ -4085,13 +5820,55 @@ impl OperationPlanningRegistry for OperationPlanningHandle<'_> {
     }
 }
 
+/// A provider declaration for the compute topology captured by a resident
+/// reusable program.
+///
+/// `Static` means every captured choice and address is already bound by the
+/// immutable plan and lane identity. `Dynamic` contributes an opaque
+/// provider-owned fingerprint. `Ineligible` means at least one captured
+/// boundary lacks reusable address authority, so core must use normal encoding
+/// for the complete wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusableExecutionTopology {
+    Static,
+    Dynamic(DeviceReusableExecutionTopologyFingerprint),
+    Ineligible,
+}
+
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    /// Publishes the provider-private compute topology that must match a
+    /// resident reusable program. Static topology and capture ineligibility are
+    /// intentionally distinct states: a provider may never silently turn a
+    /// submission-scoped address into resident state.
+    ///
+    /// This declaration is intentionally required. A new provider cannot
+    /// silently inherit a static topology after adding shape-dependent kernel
+    /// selection.
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<ReusableExecutionTopology, VNextError>;
+
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, R::Buffer>,
-    ) -> Result<R::Command, OperationFailure>;
+    ) -> Result<EncodedDeviceOperation<R::Command>, OperationFailure>;
+
+    /// Encodes only the request-varying boundaries around a compute segment
+    /// that was already prepared as a reusable backend executable.
+    ///
+    /// The default deliberately reuses the exact provider implementation and
+    /// discards its compute command. Providers may override this cold-selected
+    /// boundary to avoid rebuilding static launch metadata.
+    fn encode_reusable_execution_bindings(
+        &self,
+        invocation: BatchedOperationInvocation<'_, R::Buffer>,
+    ) -> Result<EncodedReusableExecutionBindings<R::Command>, OperationFailure> {
+        self.encode_selected(invocation)
+            .map(EncodedReusableExecutionBindings::from_operation)
+    }
 }
 
 /// Composition-root registry that owns the exact provider objects used for
@@ -4103,7 +5880,7 @@ where
 {
     authority: OperationRegistryAuthority,
     contracts: BTreeMap<OperationId, Box<dyn OperationContract>>,
-    providers: BTreeMap<ProviderId, Box<dyn OperationProvider<R>>>,
+    providers: BTreeMap<ProviderId, Arc<dyn OperationProvider<R>>>,
 }
 
 impl<R> OperationRuntimeRegistry<R>
@@ -4133,7 +5910,7 @@ where
                 )));
             }
         }
-        let mut provider_map = BTreeMap::new();
+        let mut provider_map: BTreeMap<ProviderId, Arc<dyn OperationProvider<R>>> = BTreeMap::new();
         for provider in providers {
             let descriptor = provider.descriptor();
             let contract = contract_map.get(descriptor.operation_id()).ok_or_else(|| {
@@ -4149,7 +5926,10 @@ where
                 )));
             }
             let provider_id = descriptor.provider_id().clone();
-            if provider_map.insert(provider_id.clone(), provider).is_some() {
+            if provider_map
+                .insert(provider_id.clone(), Arc::from(provider))
+                .is_some()
+            {
                 return Err(invalid_operation(format!(
                     "operation runtime registry has duplicate or byte-identical provider `{provider_id}`"
                 )));
@@ -4162,6 +5942,38 @@ where
         })
     }
 
+    /// Derives the planning catalog from the exact contract/provider objects
+    /// retained for dispatch, preventing descriptor drift between two
+    /// independently assembled registries.
+    pub fn capability_catalog(
+        &self,
+        device: super::DeviceDescriptor,
+        engine_providers: Vec<EngineProviderDescriptor>,
+    ) -> Result<CapabilityCatalog, VNextError> {
+        let operations = self
+            .contracts
+            .values()
+            .map(|contract| contract.descriptor().clone())
+            .collect::<Vec<_>>();
+        let mut providers = self
+            .contracts
+            .keys()
+            .cloned()
+            .map(|operation_id| (operation_id, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        for provider in self.providers.values() {
+            providers
+                .get_mut(provider.descriptor().operation_id())
+                .ok_or_else(|| {
+                    invalid_operation(
+                        "runtime provider operation is absent while deriving its catalog",
+                    )
+                })?
+                .push(provider.descriptor().clone());
+        }
+        CapabilityCatalog::new(device, operations, providers, engine_providers)
+    }
+
     pub fn planning(&self) -> OperationPlanningHandle<'_> {
         OperationPlanningHandle {
             registry: self,
@@ -4171,9 +5983,66 @@ where
 
     pub fn bind<'registry>(
         &'registry self,
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         node_id: &NodeId,
     ) -> Result<BoundOperationProvider<'registry, R>, VNextError> {
+        let provider = self.selected_provider(resolved, node_id)?;
+        let plan = resolved.execution_plan();
+        let dispatch =
+            PreparedOperationDispatchBinding::prepare(resolved, provider.descriptor(), node_id)?;
+        Ok(BoundOperationProvider {
+            provider: BoundOperationProviderSource::Borrowed(provider.as_ref()),
+            plan_id: plan.payload().plan_id().clone(),
+            plan_hash: plan.plan_hash().clone(),
+            node_id: node_id.clone(),
+            dispatch,
+        })
+    }
+
+    /// Binds every selected provider once in immutable plan-node order.
+    ///
+    /// The returned handles own their provider objects, so execution can drop
+    /// the composition registry and cannot re-enter provider lookup from the
+    /// token loop.
+    pub fn bind_plan(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+    ) -> Result<BoundOperationProviderSet<R>, VNextError> {
+        let providers = resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| {
+                let provider = self.selected_provider(resolved, node.id())?;
+                let plan = resolved.execution_plan();
+                let dispatch = PreparedOperationDispatchBinding::prepare(
+                    resolved,
+                    provider.descriptor(),
+                    node.id(),
+                )?;
+                Ok(BoundOperationProvider {
+                    provider: BoundOperationProviderSource::Owned(Arc::clone(provider)),
+                    plan_id: plan.payload().plan_id().clone(),
+                    plan_hash: plan.plan_hash().clone(),
+                    node_id: node.id().clone(),
+                    dispatch,
+                })
+            })
+            .collect::<Result<Vec<BoundOperationProvider<'static, R>>, _>>()?;
+        if providers.is_empty() {
+            return Err(invalid_operation(
+                "executable plan cannot bind an empty provider set",
+            ));
+        }
+        Ok(BoundOperationProviderSet { providers })
+    }
+
+    fn selected_provider(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        node_id: &NodeId,
+    ) -> Result<&Arc<dyn OperationProvider<R>>, VNextError> {
         let plan = resolved.execution_plan();
         if plan.operation_registry_authority() != &self.authority {
             return Err(invalid_operation(
@@ -4196,8 +6065,7 @@ where
                 ))
             })?;
         let catalog_provider = resolved
-            .parts()
-            .capabilities
+            .capabilities()
             .providers_for(node.operation_id())?
             .iter()
             .find(|candidate| candidate.provider_id() == provider.descriptor().provider_id())
@@ -4211,12 +6079,7 @@ where
                 "runtime provider is not the exact registry object selected by the resolved plan",
             ));
         }
-        Ok(BoundOperationProvider {
-            provider: provider.as_ref(),
-            plan_id: plan.payload().plan_id().clone(),
-            plan_hash: plan.plan_hash().clone(),
-            node_id: node_id.clone(),
-        })
+        Ok(provider)
     }
 }
 
@@ -4239,25 +6102,51 @@ where
     }
 }
 
+enum BoundOperationProviderSource<'registry, R>
+where
+    R: DeviceRuntime,
+{
+    Borrowed(&'registry dyn OperationProvider<R>),
+    Owned(Arc<dyn OperationProvider<R>>),
+}
+
+impl<R> BoundOperationProviderSource<'_, R>
+where
+    R: DeviceRuntime,
+{
+    fn provider(&self) -> &dyn OperationProvider<R> {
+        match self {
+            Self::Borrowed(provider) => *provider,
+            Self::Owned(provider) => provider.as_ref(),
+        }
+    }
+}
+
 /// Unforgeable per-node provider authority. Its provider object and plan/node
-/// binding are private and remain borrowed from one composition-root registry.
+/// binding are private. Normal bindings borrow the composition registry;
+/// immutable plan bindings own the same selected provider object.
 pub struct BoundOperationProvider<'registry, R>
 where
     R: DeviceRuntime,
 {
-    provider: &'registry dyn OperationProvider<R>,
+    provider: BoundOperationProviderSource<'registry, R>,
     plan_id: PlanId,
     plan_hash: PlanHash,
     node_id: NodeId,
+    dispatch: PreparedOperationDispatchBinding,
 }
 
 impl<R> BoundOperationProvider<'_, R>
 where
     R: DeviceRuntime,
 {
+    fn provider(&self) -> &dyn OperationProvider<R> {
+        self.provider.provider()
+    }
+
     fn validate_binding(
         &self,
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         node_id: &NodeId,
     ) -> Result<(), VNextError> {
         let plan = resolved.execution_plan();
@@ -4269,11 +6158,45 @@ where
                 "bound operation provider belongs to a different plan or node",
             ));
         }
+        self.dispatch.node(resolved, node_id)?;
         Ok(())
     }
 
+    fn dispatch(&self) -> &PreparedOperationDispatchBinding {
+        &self.dispatch
+    }
+
     pub fn descriptor(&self) -> &OperationProviderDescriptor {
-        self.provider.descriptor()
+        self.provider().descriptor()
+    }
+}
+
+/// Immutable provider selection for every node in one executable plan.
+///
+/// Construction is restricted to [`OperationRuntimeRegistry::bind_plan`],
+/// which checks registry authority, catalog identity, provider fingerprint,
+/// and node order before the runtime begins executing requests.
+pub struct BoundOperationProviderSet<R>
+where
+    R: DeviceRuntime,
+{
+    providers: Vec<BoundOperationProvider<'static, R>>,
+}
+
+impl<R> BoundOperationProviderSet<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn providers(&self) -> &[BoundOperationProvider<'static, R>] {
+        &self.providers
+    }
+
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
     }
 }
 
@@ -4284,6 +6207,7 @@ pub struct CapabilityCatalog {
     operations: BTreeMap<OperationId, OperationDescriptor>,
     providers: BTreeMap<OperationId, Vec<OperationProviderDescriptor>>,
     engine_providers: BTreeMap<ProviderId, EngineProviderDescriptor>,
+    weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
 }
 
 #[derive(Deserialize)]
@@ -4293,6 +6217,8 @@ struct CapabilityCatalogWire {
     operations: BTreeMap<OperationId, OperationDescriptor>,
     providers: BTreeMap<OperationId, Vec<OperationProviderDescriptor>>,
     engine_providers: BTreeMap<ProviderId, EngineProviderDescriptor>,
+    #[serde(default = "identity_weight_materializer_descriptors")]
+    weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
 }
 
 impl<'de> Deserialize<'de> for CapabilityCatalog {
@@ -4306,6 +6232,7 @@ impl<'de> Deserialize<'de> for CapabilityCatalog {
             wire.operations,
             wire.providers,
             wire.engine_providers,
+            wire.weight_materializers,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -4339,7 +6266,14 @@ impl CapabilityCatalog {
                 )));
             }
         }
-        Self::from_maps(device, operation_map, providers, engine_map)
+        let weight_materializers = identity_weight_materializer_descriptors();
+        Self::from_maps(
+            device,
+            operation_map,
+            providers,
+            engine_map,
+            weight_materializers,
+        )
     }
 
     fn from_maps(
@@ -4347,8 +6281,10 @@ impl CapabilityCatalog {
         operations: BTreeMap<OperationId, OperationDescriptor>,
         mut providers: BTreeMap<OperationId, Vec<OperationProviderDescriptor>>,
         engine_providers: BTreeMap<ProviderId, EngineProviderDescriptor>,
+        weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
     ) -> Result<Self, VNextError> {
         device.validate()?;
+        validate_weight_materializer_descriptors(&device, &weight_materializers)?;
         let provider_row_count = providers.values().try_fold(0_usize, |total, entries| {
             total.checked_add(entries.len()).ok_or_else(|| {
                 invalid_operation("capability catalog provider row count overflows usize")
@@ -4500,7 +6436,17 @@ impl CapabilityCatalog {
             operations,
             providers,
             engine_providers,
+            weight_materializers,
         })
+    }
+
+    pub(crate) fn with_weight_materializer_descriptors(
+        mut self,
+        weight_materializers: BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
+    ) -> Result<Self, VNextError> {
+        validate_weight_materializer_descriptors(&self.device, &weight_materializers)?;
+        self.weight_materializers = weight_materializers;
+        Ok(self)
     }
 
     pub fn device(&self) -> &super::DeviceDescriptor {
@@ -4522,6 +6468,16 @@ impl CapabilityCatalog {
             })
     }
 
+    /// Resolves providers with the requesting plan node attached to failures.
+    pub fn providers_for_node(
+        &self,
+        node_id: &NodeId,
+        operation_id: &OperationId,
+    ) -> Result<&[OperationProviderDescriptor], VNextError> {
+        self.providers_for(operation_id)
+            .map_err(|error| operation_error_for_node(error, node_id))
+    }
+
     pub fn operation(
         &self,
         operation_id: &OperationId,
@@ -4534,6 +6490,16 @@ impl CapabilityCatalog {
                 device_id: self.device.id.to_string(),
                 reason: "operation descriptor is not registered".to_owned(),
             })
+    }
+
+    /// Resolves an operation with the requesting plan node attached to failures.
+    pub fn operation_for_node(
+        &self,
+        node_id: &NodeId,
+        operation_id: &OperationId,
+    ) -> Result<&OperationDescriptor, VNextError> {
+        self.operation(operation_id)
+            .map_err(|error| operation_error_for_node(error, node_id))
     }
 
     pub fn provider_compatibility(
@@ -4596,6 +6562,17 @@ impl CapabilityCatalog {
                     },
                 );
             }
+            if !request
+                .execution_determinism
+                .accepts(provider.execution_semantics)
+            {
+                reasons.push(
+                    ProviderCompatibilityRejectReason::InsufficientExecutionDeterminism {
+                        required: request.execution_determinism,
+                        available: provider.execution_semantics,
+                    },
+                );
+            }
             if reasons.is_empty() {
                 compatible_provider_ids.push(provider.provider_id.clone());
             } else {
@@ -4626,6 +6603,25 @@ impl CapabilityCatalog {
         &self.engine_providers
     }
 
+    pub fn weight_materializers(
+        &self,
+    ) -> &BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor> {
+        &self.weight_materializers
+    }
+
+    pub fn weight_materializer(
+        &self,
+        materializer_id: &WeightMaterializerId,
+    ) -> Result<&WeightMaterializerDescriptor, VNextError> {
+        self.weight_materializers
+            .get(materializer_id)
+            .ok_or_else(|| {
+                invalid_operation(format!(
+                    "weight materializer `{materializer_id}` is absent from the capability catalog"
+                ))
+            })
+    }
+
     pub fn engine_provider(
         &self,
         provider_id: &ProviderId,
@@ -4650,6 +6646,40 @@ impl CapabilityCatalog {
         })?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
+}
+
+fn validate_weight_materializer_descriptors(
+    device: &super::DeviceDescriptor,
+    descriptors: &BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor>,
+) -> Result<(), VNextError> {
+    if descriptors.is_empty() || descriptors.len() > MAX_WEIGHT_MATERIALIZERS {
+        return Err(invalid_operation(
+            "capability catalog weight materializers are empty or exceed their row budget",
+        ));
+    }
+    for (id, descriptor) in descriptors {
+        if id != descriptor.id() {
+            return Err(invalid_operation(format!(
+                "weight materializer `{}` is stored under `{id}`",
+                descriptor.id()
+            )));
+        }
+        descriptor.validate_for_device(device)?;
+    }
+    let identity = WeightMaterializerDescriptor::identity()?;
+    if descriptors.get(identity.id()) != Some(&identity) {
+        return Err(invalid_operation(
+            "capability catalog lacks the canonical identity weight materializer",
+        ));
+    }
+    Ok(())
+}
+
+fn identity_weight_materializer_descriptors(
+) -> BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor> {
+    let identity = WeightMaterializerDescriptor::identity()
+        .expect("the built-in identity weight materializer descriptor is valid");
+    BTreeMap::from([(identity.id().clone(), identity)])
 }
 
 fn validate_reference_oracle_graph(

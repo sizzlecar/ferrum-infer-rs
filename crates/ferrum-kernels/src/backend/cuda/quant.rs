@@ -148,20 +148,6 @@ fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
     CONFIG.get_or_init(CudaQuantRuntimeConfig::from_env)
 }
 
-fn reject_dense_vllm_marlin_if_requested(config: &CudaQuantRuntimeConfig) -> Result<()> {
-    if config.vllm_marlin {
-        return Err(FerrumError::unsupported(
-            "FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ: the vendored \
-             dense vLLM Marlin dispatcher currently compiles with \
-             kernel_selector.h disabled for the CUDA hidden-symbol workaround, \
-             so it cannot select a real GEMM kernel safely. Use the default \
-             dense Marlin path; vLLM Marlin MoE remains wired through \
-             FERRUM_VLLM_MOE for stacked MoE weights.",
-        ));
-    }
-    Ok(())
-}
-
 fn marlin_qzeros_are_symmetric_code7(qzeros: &[i32]) -> bool {
     !qzeros.is_empty()
         && qzeros.iter().all(|&word| {
@@ -674,8 +660,6 @@ impl BackendQuantMarlin for CudaBackend {
         }
 
         reject_unsupported_marlin_qzeros("CUDA GPTQ Marlin", qzeros)?;
-        reject_dense_vllm_marlin_if_requested(cuda_quant_runtime_config())?;
-
         // Detect desc_act=true (act-order GPTQ): g_idx is non-trivial.
         // AutoGPTQ writes g_idx[k] = k/group_size for desc_act=false; any
         // deviation = act-order. Build perm = argsort(g_idx) and permute
@@ -796,9 +780,9 @@ impl BackendQuantMarlin for CudaBackend {
             .iter()
             .any(|qz| !marlin_qzeros_are_symmetric_code7(qz));
 
-        // vLLM marlin_moe_wna16 path: stacked weight in vLLM Marlin tile
-        // format (NOT IST-DASLab). Run gptq_marlin_repack per expert,
-        // permute scales with the same _scale_perm IST-DASLab uses.
+        // vLLM marlin_moe_wna16 path: stacked weight in the shared
+        // IST-DASLab/vLLM Marlin INT4 tile ABI. Run the device repack per
+        // expert and permute scales with the same _scale_perm.
         // Non-symmetric GPTQ qzeros require this path because the standard
         // IST-DASLab Marlin wrapper only handles the symmetric uint4b8
         // zero-point bias. FERRUM_VLLM_MOE=1 remains an opt-in for
@@ -1190,8 +1174,7 @@ impl BackendQuantGguf for CudaBackend {}
 #[cfg(test)]
 mod tests {
     use super::{
-        marlin_qzeros_are_symmetric_code7, reject_dense_vllm_marlin_if_requested,
-        reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
+        marlin_qzeros_are_symmetric_code7, reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
     };
 
     #[test]
@@ -1233,20 +1216,6 @@ mod tests {
         assert!(!config.vllm_fp32_reduce);
         assert!(config.moe_fused);
         assert_eq!(config.moe_streams, 4);
-    }
-
-    #[test]
-    fn dense_vllm_marlin_env_is_rejected() {
-        let config = CudaQuantRuntimeConfig::from_env_vars([("FERRUM_VLLM_MARLIN", "1")]);
-        let err = reject_dense_vllm_marlin_if_requested(&config).unwrap_err();
-
-        let message = err.to_string();
-        assert!(message.contains("FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ"));
-        assert!(message.contains("kernel_selector.h disabled"));
-        assert!(message.contains("FERRUM_VLLM_MOE"));
-
-        let default_config = CudaQuantRuntimeConfig::from_env_vars([] as [(&str, &str); 0]);
-        reject_dense_vllm_marlin_if_requested(&default_config).unwrap();
     }
 
     #[test]

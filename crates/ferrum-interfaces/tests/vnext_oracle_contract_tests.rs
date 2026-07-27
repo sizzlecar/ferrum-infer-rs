@@ -48,6 +48,7 @@ fn operation(
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
             scratch: ResourcePresenceRequirement::Forbidden,
+            binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle,
@@ -73,6 +74,7 @@ fn catalog(operations: &[OperationDescriptor]) -> CapabilityCatalog {
                     operation.id.clone(),
                     operation.fingerprint().unwrap(),
                     sha('d'),
+                    ProviderExecutionSemantics::bitwise_eager_and_replay(),
                     ContractVersion::new(1, 0),
                     device_id.clone(),
                     capabilities.clone(),

@@ -117,16 +117,143 @@ REQUIRED_UNIT_TESTS = {
     "unknown_inputs_fail_closed",
     "weight_schema_order_is_normalized_before_fingerprinting",
 }
-REQUIRED_RESOURCE_TESTS = {
-    "closing_root_rejects_every_parent_to_child_derivation",
-    "plan_runtime_close_recovery_is_ownership_safe",
-    "poisoned_bound_stream_retains_sequence_until_stream_drop",
-    "resource_capacity_concurrency_is_bounded",
-    "resource_transaction_abandon_panic_child",
-    "resource_transaction_contract_is_exhaustive",
-    "sequence_owner_drop_defers_blocking_backend_recovery",
+REQUIRED_CORE_TESTS_BY_TARGET = {
+    "vnext_planning_resource_contract_tests": {
+        "operation_resource_contract_requires_explicit_presence_and_alignment",
+        "execution_memory_is_core_owned_and_exact",
+        "minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak",
+        "runtime_capacity_reserve_and_concurrency_are_typed_planning_inputs",
+        "maximum_active_sequence_ceiling_is_nonzero_and_o_graph",
+        "theoretical_ceiling_over_u64_is_canonical_evidence_not_capacity_policy",
+        "state_capacity_demand_is_explicit_checked_and_wire_closed",
+        "provider_workspace_formulas_are_actual_shape_checked_and_wire_closed",
+    },
+    "vnext_plan_wire_contract_tests": {
+        "dynamic_descriptor_and_memory_plan_standalone_wire_are_checked",
+        "execution_plan_is_deterministic_100_of_100",
+        "execution_plan_schema_round_trip_100_of_100",
+        "breaking_schema_versions_are_rejected_100_of_100",
+        "forged_self_hashed_plan_is_rejected_by_semantic_rebuild",
+        "externally_trusted_node_resolution_cannot_be_replaced_by_wire_data",
+        "self_consistent_wire_resource_estimate_and_memory_mutation_is_rejected",
+        "self_consistent_wire_provider_selection_is_rejected",
+        "typed_planning_registry_invokes_real_contract_and_estimator_once",
+    },
+    "vnext_provider_selection_contract_tests": {
+        "provider_implementation_fingerprint_is_plan_hashed_and_revalidated",
+        "planning_registry_missing_duplicate_and_mismatched_entries_fail_before_plan",
+        "provider_raw_estimate_identity_input_and_output_are_revalidated_by_core",
+        "preferred_provider_is_only_a_core_validated_preference",
+        "storage_incompatible_preference_falls_back_with_canonical_evidence",
+    },
+    "vnext_weight_layout_contract_tests": {
+        "physical_weight_layout_tree_accepts_dense_fixture",
+        "physical_weight_layout_tree_accepts_grouped_quantized_axis_index_fixture",
+        "physical_weight_layout_tree_accepts_recursive_quantized_expert_stack_fixture",
+        "weight_schema_order_is_normalized_before_fingerprinting",
+        "blocked_weight_layout_requires_explicit_exact_or_zero_fill_padding",
+        "physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_limits",
+        "blocked_tensor_storage_requires_explicit_exact_or_zero_fill_padding",
+        "model_program_rejects_duplicate_declared_outputs",
+    },
+    "vnext_resolution_contract_tests": {
+        "resolved_model_plan_closes_all_contract_links",
+        "resolved_model_plan_initial_construction_requires_verified_evidence_context",
+        "resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering",
+        "resolved_source_parser_identity_and_determinism_are_enforced",
+        "resolved_external_device_catalog_runtime_and_node_resolution_are_exact",
+        "resolved_model_family_identity_is_unique_and_fail_closed",
+        "resolution_source_matrix_rejects_forbidden_binding_before_plan",
+        "unknown_inputs_fail_closed",
+        "provider_catalog_and_reference_oracle_fail_closed",
+        "prepared_family_wire_requires_typed_registry_reconstruction",
+        "mandatory_object_safe_contracts_accept_trait_objects",
+    },
+    "vnext_execution_graph_contract_tests": {
+        "execution_alias_must_alias_builds_exact_equivalence_and_single_allocation",
+        "execution_alias_may_alias_supports_distinct_or_exact_storage",
+        "execution_alias_rejects_partial_and_wrong_input_overlap",
+        "execution_alias_rejects_overwrite_before_last_consumer",
+        "execution_state_effect_graph_orders_raw_war_waw",
+        "execution_state_read_only_nodes_remain_independent",
+        "execution_alias_effect_wire_mutations_are_rejected",
+    },
+    "vnext_source_audit_contract_tests": {
+        "generic_contracts_have_zero_architecture_names",
+        "silent_success_defaults_are_absent",
+        "failure_envelope_wire_limit_precedes_deserialization",
+    },
 }
-REQUIRED_EVENT_TESTS = {"vnext_event_replay_v5_contract"}
+REQUIRED_RESOURCE_TESTS_BY_TARGET = {
+    "vnext_resource_capacity_contract_tests": {
+        "resource_capacity_concurrency_is_bounded",
+        "runtime_implementation_authority_is_exact",
+    },
+    "vnext_resource_transaction_lifecycle_tests": {
+        "transaction_lifecycle_contracts_are_exhaustive",
+    },
+    "vnext_resource_transaction_evidence_tests": {
+        "resource_transaction_abandon_panic_child",
+        "transaction_evidence_contracts_are_exhaustive",
+    },
+    "vnext_resource_sequence_activation_tests": {
+        "sequence_activation_contracts_are_exhaustive",
+    },
+    "vnext_resource_sequence_recovery_tests": {
+        "sequence_recovery_contracts_are_exhaustive",
+    },
+    "vnext_resource_recovery_authority_tests": {
+        "recovery_authority_contracts_are_exhaustive",
+    },
+    "vnext_resource_runtime_close_tests": {
+        "closing_root_rejects_every_parent_to_child_derivation",
+        "plan_runtime_close_recovery_is_ownership_safe",
+        "poisoned_bound_stream_retains_sequence_until_stream_drop",
+        "sequence_owner_drop_defers_blocking_backend_recovery",
+    },
+}
+RESOURCE_PANIC_ISOLATION_TARGET = "vnext_resource_transaction_evidence_tests"
+RESOURCE_PROOF_LINES = {
+    "vnext_resource_capacity_contract_tests": (
+        ("VNEXT RUNTIME IMPLEMENTATION AUTHORITY PASS", 13),
+        ("VNEXT RESOURCE CAPACITY THREAD BOUND PASS", 20),
+    ),
+    "vnext_resource_transaction_lifecycle_tests": (
+        ("VNEXT TRANSACTION LIFECYCLE PASS", 70),
+    ),
+    "vnext_resource_transaction_evidence_tests": (
+        ("VNEXT TRANSACTION EVIDENCE PASS", 69),
+    ),
+    "vnext_resource_sequence_activation_tests": (
+        ("VNEXT SEQUENCE ACTIVATION PASS", 53),
+    ),
+    "vnext_resource_sequence_recovery_tests": (
+        ("VNEXT SEQUENCE RECOVERY PASS", 48),
+    ),
+    "vnext_resource_recovery_authority_tests": (
+        ("VNEXT RECOVERY AUTHORITY PASS", 38),
+    ),
+    "vnext_resource_runtime_close_tests": (),
+}
+REQUIRED_EVENT_TESTS_BY_TARGET = {
+    "vnext_event_execution_contract_tests": {"vnext_event_execution_contract"},
+    "vnext_event_sink_contract_tests": {"vnext_event_sink_contract"},
+    "vnext_event_resource_pool_contract_tests": {
+        "vnext_event_resource_pool_contract"
+    },
+    "vnext_event_recovery_contract_tests": {"vnext_event_recovery_contract"},
+    "vnext_event_replay_contract_tests": {"vnext_event_replay_contract"},
+}
+EVENT_PROOF_LINES = {
+    "vnext_event_execution_contract_tests": ("VNEXT EVENT EXECUTION PASS", 54),
+    "vnext_event_sink_contract_tests": ("VNEXT EVENT SINK PASS", 16),
+    "vnext_event_resource_pool_contract_tests": (
+        "VNEXT EVENT RESOURCE POOL PASS",
+        27,
+    ),
+    "vnext_event_recovery_contract_tests": ("VNEXT EVENT RECOVERY PASS", 20),
+    "vnext_event_replay_contract_tests": ("VNEXT EVENT REPLAY PASS", 47),
+}
 REQUIRED_RESOLUTION_LIMITS_TESTS = {
     "field_path_count_and_total_bytes_are_bounded_before_parser",
     "json_parser_checks_source_bytes_when_called_directly",
@@ -141,9 +268,41 @@ REQUIRED_RESOLUTION_LIMITS_TESTS = {
     "resolved_wire_limit_accepts_max_and_rejects_max_plus_one_before_serde",
     "source_byte_limit_accepts_max_and_rejects_max_plus_one_before_parser",
 }
-REQUIRED_DEVICE_OPERATION_TESTS = {
-    "completion_reaper_drop_defers_blocking_backend_recovery",
-    "device_and_operation_contract_is_exhaustive",
+REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET = {
+    "vnext_device_operation_batch_contract_tests": {
+        "thirty_two_participant_dispatch_is_one_physical_submission"
+    },
+    "vnext_device_operation_cancel_contract_tests": {
+        "device_operation_cancel_contract_is_exhaustive"
+    },
+    "vnext_device_operation_completion_contract_tests": {
+        "completion_reaper_drop_defers_blocking_backend_recovery",
+        "device_operation_completion_contract_is_exhaustive",
+    },
+    "vnext_device_operation_dispatch_contract_tests": {
+        "device_operation_dispatch_contract_is_exhaustive"
+    },
+    "vnext_device_operation_legacy_authority_contract_tests": {
+        "device_operation_legacy_authority_contract_is_exhaustive"
+    },
+}
+DEVICE_OPERATION_PROOF_LINES = {
+    "vnext_device_operation_cancel_contract_tests": (
+        "VNEXT DEVICE OPERATION CANCEL PASS",
+        16,
+    ),
+    "vnext_device_operation_completion_contract_tests": (
+        "VNEXT DEVICE OPERATION COMPLETION PASS",
+        200,
+    ),
+    "vnext_device_operation_dispatch_contract_tests": (
+        "VNEXT DEVICE OPERATION DISPATCH PASS",
+        70,
+    ),
+    "vnext_device_operation_legacy_authority_contract_tests": (
+        "VNEXT DEVICE OPERATION LEGACY AUTHORITY PASS",
+        13,
+    ),
 }
 REQUIRED_ORACLE_TESTS = {
     "descriptor_and_request_result_wire_require_explicit_revalidation",
@@ -167,11 +326,11 @@ REQUIRED_MODEL_WIRE_TESTS = {
 REQUIRED_COMPILE_TESTS = {"vnext_compile"}
 REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"}
 REQUIRED_TESTS_BY_TARGET = {
-    "vnext_contract_tests": REQUIRED_UNIT_TESTS,
-    "vnext_resource_contract_tests": REQUIRED_RESOURCE_TESTS,
-    "vnext_event_contract_tests": REQUIRED_EVENT_TESTS,
+    **REQUIRED_CORE_TESTS_BY_TARGET,
+    **REQUIRED_RESOURCE_TESTS_BY_TARGET,
+    **REQUIRED_EVENT_TESTS_BY_TARGET,
     "vnext_resolution_limits_contract_tests": REQUIRED_RESOLUTION_LIMITS_TESTS,
-    "vnext_device_operation_contract_tests": REQUIRED_DEVICE_OPERATION_TESTS,
+    **REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET,
     "vnext_oracle_contract_tests": REQUIRED_ORACLE_TESTS,
     "vnext_model_wire_contract_tests": REQUIRED_MODEL_WIRE_TESTS,
     "vnext_compile": REQUIRED_COMPILE_TESTS,
@@ -224,8 +383,8 @@ REQUIRED_TEST_DRIVERS = {
     for target in REQUIRED_TESTS_BY_TARGET
 }
 EXPECTED_RESOURCE_CASES = 311
-EXPECTED_FAIL_CLOSED_CASES = 62
-EXPECTED_EVENT_REPLAY_V5_CASES = 161
+EXPECTED_FAIL_CLOSED_CASES = 63
+EXPECTED_EVENT_REPLAY_V5_CASES = 164
 EXPECTED_DEVICE_OPERATION_CASES = 299
 EXPECTED_ORACLE_CASES = 26
 EXPECTED_MODEL_WIRE_CASES = 24
@@ -235,7 +394,7 @@ EXPECTED_TRYBUILD_PASS_CASES = 2
 EXPECTED_TRYBUILD_FAIL_CASES = 78
 TEST_THREADS_ARG = "--test-threads=1"
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-BOUNDED_TEST_COMMAND_COUNT = 20
+BOUNDED_TEST_COMMAND_COUNT = 60
 BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -1638,7 +1797,7 @@ def bounded_profile_for_command(command: list[str] | tuple[str, ...]) -> str:
         target_index = command.index("--test") + 1
         require(target_index < len(command), "bounded cargo test target is missing")
         target = command[target_index]
-        if target == "vnext_resource_contract_tests":
+        if target in REQUIRED_RESOURCE_TESTS_BY_TARGET:
             return "resource"
         if target == "vnext_compile":
             return "trybuild"
@@ -1880,7 +2039,7 @@ def summarize_bounded_execution(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     require(
         profile_counts
-        == {"regular": 14, "admission": 2, "resource": 2, "trybuild": 2},
+        == {"regular": 14, "admission": 2, "resource": 14, "trybuild": 2},
         f"G01A bounded profile command counts mismatch: {profile_counts}",
     )
     return {
@@ -2185,7 +2344,7 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
         target: [line.strip() for line in stdout.splitlines()]
         for target, stdout in target_stdout.items()
     }
-    contract_lines = lines_by_target["vnext_contract_tests"]
+    contract_lines = lines_by_target["vnext_plan_wire_contract_tests"]
     exact_contract = {
         "deterministic_plan_cases": "VNEXT PLAN DETERMINISM PASS: 100/100",
         "schema_round_trip_cases": "VNEXT PLAN ROUNDTRIP PASS: 100/100",
@@ -2193,31 +2352,94 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
     }
     for label, line in exact_contract.items():
         require(contract_lines.count(line) == 1, f"missing or duplicate machine proof line for {label}: {line}")
+    resource_total = 0
+    for target, proofs in RESOURCE_PROOF_LINES.items():
+        for prefix, expected in proofs:
+            pattern = re.compile(
+                rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+            )
+            matches = [
+                match
+                for line in lines_by_target[target]
+                if (match := pattern.fullmatch(line))
+            ]
+            require(
+                len(matches) == 1,
+                f"missing or duplicate resource machine proof line: {target} {prefix}",
+            )
+            passed, total = (int(value) for value in matches[0].groups())
+            require(
+                passed == total == expected,
+                f"resource machine proof count changed: {target} {prefix} "
+                f"expected={expected}/{expected} actual={passed}/{total}",
+            )
+            resource_total += total
+    require(
+        resource_total == EXPECTED_RESOURCE_CASES,
+        f"resource machine proof total changed: expected={EXPECTED_RESOURCE_CASES} actual={resource_total}",
+    )
+    event_total = 0
+    for target, (prefix, expected) in EVENT_PROOF_LINES.items():
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        matches = [
+            match
+            for line in lines_by_target[target]
+            if (match := pattern.fullmatch(line))
+        ]
+        require(
+            len(matches) == 1,
+            f"missing or duplicate event machine proof line: {target} {prefix}",
+        )
+        passed, total = (int(value) for value in matches[0].groups())
+        require(
+            passed == total == expected,
+            f"event machine proof count changed: {target} {prefix} "
+            f"expected={expected}/{expected} actual={passed}/{total}",
+        )
+        event_total += total
+    require(
+        event_total == EXPECTED_EVENT_REPLAY_V5_CASES,
+        "event machine proof total changed: "
+        f"expected={EXPECTED_EVENT_REPLAY_V5_CASES} actual={event_total}",
+    )
+    device_operation_total = 0
+    for target, (prefix, expected) in DEVICE_OPERATION_PROOF_LINES.items():
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        matches = [
+            match
+            for line in lines_by_target[target]
+            if (match := pattern.fullmatch(line))
+        ]
+        require(
+            len(matches) == 1,
+            f"missing or duplicate device operation machine proof line: {target} {prefix}",
+        )
+        passed, total = (int(value) for value in matches[0].groups())
+        require(
+            passed == total == expected,
+            f"device operation machine proof count changed: {target} {prefix} "
+            f"expected={expected}/{expected} actual={passed}/{total}",
+        )
+        device_operation_total += total
+    require(
+        device_operation_total == EXPECTED_DEVICE_OPERATION_CASES,
+        "device operation machine proof total changed: "
+        f"expected={EXPECTED_DEVICE_OPERATION_CASES} actual={device_operation_total}",
+    )
     ratio_proofs = {
-        "resource_transaction_cases": (
-            "vnext_resource_contract_tests",
-            "VNEXT RESOURCE TRANSACTION PASS",
-            EXPECTED_RESOURCE_CASES,
-        ),
         "fail_closed_cases": (
-            "vnext_contract_tests",
+            "vnext_resolution_contract_tests",
             "VNEXT FAIL CLOSED PASS",
             EXPECTED_FAIL_CLOSED_CASES,
         ),
         "model_identity_cases": (
-            "vnext_contract_tests",
+            "vnext_resolution_contract_tests",
             "VNEXT MODEL IDENTITY PASS",
             EXPECTED_MODEL_IDENTITY_CASES,
-        ),
-        "event_replay_v5_contract_cases": (
-            "vnext_event_contract_tests",
-            "VNEXT EVENT/REPLAY V5 PASS",
-            EXPECTED_EVENT_REPLAY_V5_CASES,
-        ),
-        "device_operation_contract_cases": (
-            "vnext_device_operation_contract_tests",
-            "VNEXT DEVICE OPERATION PASS",
-            EXPECTED_DEVICE_OPERATION_CASES,
         ),
         "operation_oracle_contract_cases": (
             "vnext_oracle_contract_tests",
@@ -2235,7 +2457,11 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
             82,
         ),
     }
-    ratios: dict[str, int] = {}
+    ratios: dict[str, int] = {
+        "resource_transaction_cases": resource_total,
+        "event_replay_v5_contract_cases": event_total,
+        "device_operation_contract_cases": device_operation_total,
+    }
     for label, (target, prefix, expected) in ratio_proofs.items():
         pattern = re.compile(
             rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
@@ -2282,7 +2508,7 @@ def collect_compile_evidence(
         )
         tests_by_target[target] = listed
         run_row = rows_by_command[test_command(target, "--nocapture")]
-        if target == "vnext_resource_contract_tests":
+        if target == RESOURCE_PANIC_ISOLATION_TARGET:
             validate_resource_test_run(
                 run_row, f"{target} tests", len(expected_tests)
             )
@@ -3006,11 +3232,15 @@ impl OperationDispatch {
     validate_adr(valid_adr)
     expect_rejected("ADR topic", lambda: validate_adr(valid_adr.replace(b"object safety", b"object semantics")), "object-safety")
 
-    contract_proofs = "\n".join(
+    plan_proofs = "\n".join(
         [
             "VNEXT PLAN DETERMINISM PASS: 100/100",
             "VNEXT PLAN ROUNDTRIP PASS: 100/100",
             "VNEXT BREAKING VERSION REJECT PASS: 100/100",
+        ]
+    )
+    resolution_proofs = "\n".join(
+        [
             f"VNEXT FAIL CLOSED PASS: {EXPECTED_FAIL_CLOSED_CASES}/{EXPECTED_FAIL_CLOSED_CASES}",
             f"VNEXT MODEL IDENTITY PASS: {EXPECTED_MODEL_IDENTITY_CASES}/{EXPECTED_MODEL_IDENTITY_CASES}",
         ]
@@ -3018,19 +3248,8 @@ impl OperationDispatch {
     proof_stdout = {target: "" for target in REQUIRED_TESTS_BY_TARGET}
     proof_stdout.update(
         {
-            "vnext_contract_tests": contract_proofs,
-            "vnext_resource_contract_tests": (
-                f"VNEXT RESOURCE TRANSACTION PASS: "
-                f"{EXPECTED_RESOURCE_CASES}/{EXPECTED_RESOURCE_CASES}\n"
-            ),
-            "vnext_event_contract_tests": (
-                f"VNEXT EVENT/REPLAY V5 PASS: "
-                f"{EXPECTED_EVENT_REPLAY_V5_CASES}/{EXPECTED_EVENT_REPLAY_V5_CASES}\n"
-            ),
-            "vnext_device_operation_contract_tests": (
-                f"VNEXT DEVICE OPERATION PASS: "
-                f"{EXPECTED_DEVICE_OPERATION_CASES}/{EXPECTED_DEVICE_OPERATION_CASES}\n"
-            ),
+            "vnext_plan_wire_contract_tests": plan_proofs,
+            "vnext_resolution_contract_tests": resolution_proofs,
             "vnext_oracle_contract_tests": (
                 f"VNEXT OPERATION ORACLE PASS: {EXPECTED_ORACLE_CASES}/{EXPECTED_ORACLE_CASES}\n"
             ),
@@ -3041,6 +3260,14 @@ impl OperationDispatch {
             "vnext_legacy_map": "VNEXT LEGACY MAP PASS: 82/82\n",
         }
     )
+    for target, resource_proofs in RESOURCE_PROOF_LINES.items():
+        proof_stdout[target] = "".join(
+            f"{prefix}: {count}/{count}\n" for prefix, count in resource_proofs
+        )
+    for target, (prefix, count) in EVENT_PROOF_LINES.items():
+        proof_stdout[target] = f"{prefix}: {count}/{count}\n"
+    for target, (prefix, count) in DEVICE_OPERATION_PROOF_LINES.items():
+        proof_stdout[target] = f"{prefix}: {count}/{count}\n"
     proofs = parse_machine_proofs(proof_stdout)
     require(
         proofs["resource_transaction_cases"] == EXPECTED_RESOURCE_CASES
@@ -3055,8 +3282,8 @@ impl OperationDispatch {
         "self-test machine proof parse mismatch",
     )
     missing_roundtrip = copy.deepcopy(proof_stdout)
-    missing_roundtrip["vnext_contract_tests"] = missing_roundtrip[
-        "vnext_contract_tests"
+    missing_roundtrip["vnext_plan_wire_contract_tests"] = missing_roundtrip[
+        "vnext_plan_wire_contract_tests"
     ].replace("VNEXT PLAN ROUNDTRIP PASS: 100/100\n", "")
     expect_rejected(
         "missing proof line",
@@ -3071,28 +3298,29 @@ impl OperationDispatch {
         "legacy_backend_methods_mapped",
     )
     resource_drift = copy.deepcopy(proof_stdout)
-    resource_drift["vnext_resource_contract_tests"] = resource_drift[
-        "vnext_resource_contract_tests"
+    resource_drift["vnext_resource_transaction_lifecycle_tests"] = resource_drift[
+        "vnext_resource_transaction_lifecycle_tests"
     ].replace(
-        f"{EXPECTED_RESOURCE_CASES}/{EXPECTED_RESOURCE_CASES}",
-        f"{EXPECTED_RESOURCE_CASES - 1}/{EXPECTED_RESOURCE_CASES - 1}",
+        "70/70",
+        "69/69",
     )
     expect_rejected(
         "resource proof count drift",
         lambda: parse_machine_proofs(resource_drift),
-        "machine proof count changed for resource_transaction_cases",
+        "resource machine proof count changed",
     )
     missing_event = copy.deepcopy(proof_stdout)
-    missing_event["vnext_event_contract_tests"] = ""
+    missing_event["vnext_event_replay_contract_tests"] = ""
     expect_rejected(
         "event proof missing",
         lambda: parse_machine_proofs(missing_event),
-        "event_replay_v5_contract_cases",
+        "missing or duplicate event machine proof line",
     )
     commands = evidence_command_matrix()
     require(
-        len(commands) == 23 and len({tuple(command) for command in commands}) == 23,
-        "self-test G01A command matrix must contain 23 unique commands",
+        len(commands) == len(QUALITY_COMMANDS) + BOUNDED_TEST_COMMAND_COUNT
+        and len({tuple(command) for command in commands}) == len(commands),
+        "self-test G01A command matrix must contain the exact unique command set",
     )
     cargo_test_commands = [
         command for command in commands if tuple(command[:2]) == ("cargo", "test")
@@ -3100,7 +3328,7 @@ impl OperationDispatch {
     require(
         len(cargo_test_commands) == BOUNDED_TEST_COMMAND_COUNT
         and all(command.count(TEST_THREADS_ARG) == 1 for command in cargo_test_commands),
-        "self-test G01A command matrix must contain 20 single-threaded cargo tests",
+        f"self-test G01A command matrix must contain {BOUNDED_TEST_COMMAND_COUNT} single-threaded cargo tests",
     )
     require(
         bounded_profile_for_command(admission_test_command("--list")) == "admission"
@@ -3113,19 +3341,19 @@ impl OperationDispatch {
             [
                 "test resource_transaction_abandon_panic_child ... ok",
                 "test resource_transaction_abandon_panic_child ... ok",
-                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;",
-                "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;",
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
             ]
         )
     }
     validate_resource_test_run(
         resource_summary_row,
         "self-test resource child summary",
-        len(REQUIRED_RESOURCE_TESTS),
+        len(REQUIRED_RESOURCE_TESTS_BY_TARGET[RESOURCE_PANIC_ISOLATION_TARGET]),
     )
     missing_resource_child = copy.deepcopy(resource_summary_row)
     missing_resource_child["stdout"] = missing_resource_child["stdout"].replace(
-        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;\n",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;\n",
         "",
     )
     expect_rejected(
@@ -3133,12 +3361,12 @@ impl OperationDispatch {
         lambda: validate_resource_test_run(
             missing_resource_child,
             "self-test missing resource child summary",
-            len(REQUIRED_RESOURCE_TESTS),
+            len(REQUIRED_RESOURCE_TESTS_BY_TARGET[RESOURCE_PANIC_ISOLATION_TARGET]),
         ),
         "must contain one exact panic-isolation child summary",
     )
     bounded_row = selftest_bounded_row(
-        list(test_command("vnext_resource_contract_tests", "--nocapture"))
+        list(test_command(RESOURCE_PANIC_ISOLATION_TARGET, "--nocapture"))
     )
     validate_command_execution(bounded_row, "self-test valid bounded row")
 

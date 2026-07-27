@@ -1,0 +1,19 @@
+{
+  "result": "REJECT",
+  "failure_class": "cuda_provider_compile_not_reached",
+  "attempts": 2,
+  "follow_up_validations": 2,
+  "cuda_compile_attempted": false,
+  "cuda_provider_compile_reached": false,
+  "paid_instances_remaining": 0,
+  "git_sha": "d9316acb67e2b378092a5895fc43abba30d5382a",
+  "latest_source_git_sha": "f2a7ea82",
+  "dirty_source": true,
+  "completed_at": "2026-07-15T04:51:40+08:00",
+  "blockers": [
+    "two Vast instances never exposed SSH and were destroyed",
+    "GitHub CI CUDA type-check stopped in ferrum-interfaces because RUSTFLAGS=-D warnings promoted 20 existing dead-code warnings",
+    "GitHub CUDA release workflow stopped before build because its CUDA container has no python3"
+  ],
+  "next_action": "continue source-level CUDA providers; do not claim CUDA compilation until a lane reaches ferrum-kernels"
+}

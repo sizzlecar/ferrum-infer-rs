@@ -156,6 +156,7 @@ fn make_engine() -> ContinuousBatchEngine {
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_request(prompt: &str, schema_json: &str, max_tokens: usize) -> InferenceRequest {

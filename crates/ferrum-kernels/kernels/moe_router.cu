@@ -29,17 +29,25 @@
 
 #define WARP_SIZE 32
 
-extern "C" __global__ void moe_router_topk_softmax_f16(
+template <bool emit_single_token_marlin_blocks>
+__device__ __forceinline__ void moe_router_topk_softmax_f16_impl(
     const __half* __restrict__ logits,      // [batch, num_experts]
     int32_t*      __restrict__ out_ids,      // [batch, top_k]
     float*        __restrict__ out_weights,  // [batch, top_k]
+    int32_t*      __restrict__ sorted_token_ids,
+    int32_t*      __restrict__ expert_block_ids,
+    int32_t*      __restrict__ total_tokens_post_pad,
     int batch,
     int num_experts,
     int top_k,
-    int norm_topk_prob   // 0 / 1
+    int norm_topk_prob,  // 0 / 1
+    int moe_block_size
 ) {
     int row = blockIdx.x;
     if (row >= batch) return;
+    if constexpr (emit_single_token_marlin_blocks) {
+        if (batch != 1 || moe_block_size <= 0) return;
+    }
 
     int tid = threadIdx.x;  // 0..31
 
@@ -137,4 +145,82 @@ extern "C" __global__ void moe_router_topk_softmax_f16(
             }
         }
     }
+
+    if constexpr (emit_single_token_marlin_blocks) {
+        // A single token's top-K expert ids are unique, so every selected
+        // expert owns exactly one Marlin block. Rank the selected experts by
+        // id so the effective metadata matches generic align byte-for-byte,
+        // then pad only the rows Marlin will read. This avoids the generic
+        // expert histogram, prefix scan, and full-capacity clear.
+        int padded_pair_count = top_k * moe_block_size;
+        if (tid < top_k) {
+            int expert = out_ids[tid];
+            int expert_rank = 0;
+            for (int k = 0; k < top_k; ++k) {
+                int other = out_ids[k];
+                expert_rank += other < expert || (other == expert && k < tid);
+            }
+            expert_block_ids[expert_rank] = expert;
+            int block_start = expert_rank * moe_block_size;
+            sorted_token_ids[block_start] = tid;
+            for (int offset = 1; offset < moe_block_size; ++offset) {
+                sorted_token_ids[block_start + offset] = top_k;
+            }
+        }
+        if (tid == 0) {
+            total_tokens_post_pad[0] = padded_pair_count;
+        }
+    }
+}
+
+extern "C" __global__ void moe_router_topk_softmax_f16(
+    const __half* __restrict__ logits,
+    int32_t* __restrict__ out_ids,
+    float* __restrict__ out_weights,
+    int batch,
+    int num_experts,
+    int top_k,
+    int norm_topk_prob
+) {
+    moe_router_topk_softmax_f16_impl<false>(
+        logits,
+        out_ids,
+        out_weights,
+        nullptr,
+        nullptr,
+        nullptr,
+        batch,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+        0
+    );
+}
+
+extern "C" __global__ void moe_router_topk_softmax_f16_single_token_marlin(
+    const __half* __restrict__ logits,
+    int32_t* __restrict__ out_ids,
+    float* __restrict__ out_weights,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_block_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int batch,
+    int num_experts,
+    int top_k,
+    int norm_topk_prob,
+    int moe_block_size
+) {
+    moe_router_topk_softmax_f16_impl<true>(
+        logits,
+        out_ids,
+        out_weights,
+        sorted_token_ids,
+        expert_block_ids,
+        total_tokens_post_pad,
+        batch,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+        moe_block_size
+    );
 }

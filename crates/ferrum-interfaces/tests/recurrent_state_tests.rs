@@ -338,10 +338,9 @@ fn recurrent_spec(request_id: RequestId) -> RecurrentStateSpec {
         request_id,
         num_layers: 2,
         tensors: vec![
-            RecurrentStateTensorSpec::new(0, "delta_state", vec![8, 16]),
-            RecurrentStateTensorSpec::new(1, "delta_state", vec![8, 16]),
+            RecurrentStateTensorSpec::new(0, "delta_state", vec![8, 16], DataType::BF16),
+            RecurrentStateTensorSpec::new(1, "delta_state", vec![8, 16], DataType::BF16),
         ],
-        dtype: DataType::BF16,
         device: Device::CPU,
         max_batch_slots: 1,
     }
@@ -352,6 +351,14 @@ fn recurrent_state_spec_estimates_state_bytes() {
     let spec = recurrent_spec(RequestId::new());
 
     assert_eq!(spec.estimated_memory_bytes(), 2 * 8 * 16 * 2);
+}
+
+#[test]
+fn recurrent_state_spec_accounts_for_each_tensor_dtype() {
+    let mut spec = recurrent_spec(RequestId::new());
+    spec.tensors[1].dtype = DataType::FP32;
+
+    assert_eq!(spec.estimated_memory_bytes(), 8 * 16 * 2 + 8 * 16 * 4);
 }
 
 #[tokio::test]

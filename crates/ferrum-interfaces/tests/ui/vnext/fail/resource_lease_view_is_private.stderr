@@ -4,7 +4,7 @@ error[E0624]: method `view` is private
 4 |       let _ = lease.view(id, generation);
   |                     ^^^^ private method
   |
- ::: src/vnext/resource.rs
+ ::: src/vnext/resource/static_lease.rs
   |
   | /     pub(crate) fn view(
   | |         &self,

@@ -2,10 +2,62 @@
 
 use crate::{
     parse_bool_env_value, parse_path_env_value, parse_usize_env_value, DataType, Device, ModelId,
-    ModelInfo, ProfileEntrypoint, RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RuntimeConfigSnapshot,
+    SamplingParams, SamplingPresets,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
+
+/// Product policy for proving that a sequence fits before prefill admission.
+///
+/// This is a non-reserving fit gate: it does not claim future KV blocks. The
+/// execution runtime still acquires exact live-frontier resources transactionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SequenceFitPolicy {
+    FullInputMustFit,
+    ImmediateOnly,
+}
+
+impl SequenceFitPolicy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::FullInputMustFit => "full-input-must-fit",
+            Self::ImmediateOnly => "immediate-only",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "full-input-must-fit" => Ok(Self::FullInputMustFit),
+            "immediate-only" => Ok(Self::ImmediateOnly),
+            _ => Err(format!(
+                "expected full-input-must-fit or immediate-only; got {raw:?}"
+            )),
+        }
+    }
+}
+
+impl Default for SequenceFitPolicy {
+    fn default() -> Self {
+        Self::ImmediateOnly
+    }
+}
+
+/// Explicit diagnostic capture of semantic vNext activations. Product paths
+/// leave this unset; release tooling must supply a dedicated empty directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VNextCheckpointCaptureConfig {
+    pub output_dir: PathBuf,
+    pub value_ids: Vec<String>,
+    pub maximum_prefill_waves: usize,
+    #[serde(default)]
+    pub maximum_decode_waves: usize,
+    /// Persist the product output that the executor already reads back. Unlike
+    /// `value_ids`, this does not retain an activation or alter memory planning.
+    #[serde(default)]
+    pub capture_product_output: bool,
+}
 
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
 /// runtime-config snapshot. The continuous engine reads these from the typed
@@ -19,15 +71,15 @@ pub struct RuntimeKnobs {
     pub batch_decode_prof: bool,
     pub next_batch_prof: bool,
     pub rbd_prof: bool,
+    #[serde(default)]
+    pub profile_jsonl: Option<PathBuf>,
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
+    pub profile_detail: ObservabilityProfileDetail,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
-    /// Legacy Qwen3.5-specific alias retained for existing configs. New
-    /// product/runtime code should use `recurrent_state_max_slots`.
-    pub qwen35_linear_state_max_slots: Option<usize>,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -41,6 +93,8 @@ pub struct RuntimeKnobs {
     pub dtype: Option<String>,
     pub metal_dtype: Option<String>,
     pub tp: Option<usize>,
+    #[serde(default)]
+    pub vnext_checkpoint_capture: Option<VNextCheckpointCaptureConfig>,
 }
 
 /// Engine configuration
@@ -76,6 +130,18 @@ impl EngineConfig {
             self.scheduler.max_running_requests =
                 parse_required_positive_usize("FERRUM_PAGED_MAX_SEQS", value)?;
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES") {
+            self.memory.usable_capacity_bytes = Some(parse_required_positive_usize(
+                "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+                value,
+            )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_BATCHED_GRAPH") {
+            self.backend.enable_cuda_graphs = parse_presence_bool(value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION") {
+            self.backend.enable_reusable_execution = parse_presence_bool(value)?;
+        }
         // Engine runtime knobs (previously read by the engine from env). The
         // CLI/autosizer resolves these into the snapshot; the engine reads the
         // typed `runtime` field instead of `std::env::vars()`.
@@ -95,15 +161,6 @@ impl EngineConfig {
                 value,
             )?);
         }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
-        {
-            let parsed =
-                parse_required_positive_usize("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", value)?;
-            self.runtime.qwen35_linear_state_max_slots = Some(parsed);
-            if self.runtime.recurrent_state_max_slots.is_none() {
-                self.runtime.recurrent_state_max_slots = Some(parsed);
-            }
-        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =
                 parse_usize_env_value(value).ok().filter(|&v| v > 0);
@@ -113,6 +170,9 @@ impl EngineConfig {
         self.runtime.next_batch_prof |=
             runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
         self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_JSONL") {
+            self.runtime.profile_jsonl = Some(parse_path_env_value(value)?);
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHEDULER_TRACE_JSONL") {
             self.runtime.scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
         }
@@ -124,6 +184,14 @@ impl EngineConfig {
                 "FERRUM_PROFILE_ENTRYPOINT",
                 value,
             )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_DETAIL") {
+            self.runtime.profile_detail =
+                ObservabilityProfileDetail::parse(value).ok_or_else(|| {
+                    format!(
+                    "FERRUM_PROFILE_DETAIL: expected one of off, basic, debug, replay, full; got {value:?}"
+                    )
+                })?;
         }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
@@ -172,6 +240,11 @@ pub struct EngineModelConfig {
     pub model_id: ModelId,
     pub model_info: Option<ModelInfo>,
     pub tokenizer: TokenizerConfig,
+    /// Typed identity of the source requested by the product entrypoint.
+    /// The resolved local path remains a runtime/backend concern, while this
+    /// value preserves repository/revision provenance for product composition.
+    #[serde(default)]
+    pub source: Option<crate::ModelSource>,
 }
 
 impl Default for EngineModelConfig {
@@ -180,6 +253,7 @@ impl Default for EngineModelConfig {
             model_id: ModelId::new("default"),
             model_info: None,
             tokenizer: TokenizerConfig::default(),
+            source: None,
         }
     }
 }
@@ -207,7 +281,9 @@ pub struct SchedulerConfig {
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
-    /// Cap per-request prefill chunks at the scheduler token-budget layer.
+    /// Optional hard cap for per-request prefill chunks. `None` spends the
+    /// live per-step token budget and lets capacity feedback narrow or regrow
+    /// each request independently.
     #[serde(default)]
     pub prefill_step_chunk: Option<usize>,
     /// Cap prefill admission chunks only while decode requests are already active.
@@ -216,6 +292,9 @@ pub struct SchedulerConfig {
     /// Emit diagnostic scheduler None/SOME decisions.
     #[serde(default)]
     pub scheduler_none_prof: bool,
+    /// Non-reserving sequence fit gate used before prefill admission.
+    #[serde(default)]
+    pub sequence_fit_policy: SequenceFitPolicy,
 }
 
 impl Default for SchedulerConfig {
@@ -233,6 +312,7 @@ impl Default for SchedulerConfig {
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
+            sequence_fit_policy: SequenceFitPolicy::default(),
         }
     }
 }
@@ -267,6 +347,10 @@ impl SchedulerConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
             self.scheduler_none_prof = parse_presence_bool(value)
                 .map_err(|reason| format!("FERRUM_SCHED_NONE_PROF: {reason}"))?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SEQUENCE_FIT_POLICY") {
+            self.sequence_fit_policy = SequenceFitPolicy::parse_runtime_value(value)
+                .map_err(|reason| format!("FERRUM_SEQUENCE_FIT_POLICY: {reason}"))?;
         }
         Ok(())
     }
@@ -444,6 +528,11 @@ impl KvCacheDtype {
 pub struct MemoryConfig {
     /// Memory pool size in bytes
     pub pool_size: Option<usize>,
+    /// Exact device-wide usable runtime budget in bytes. When present this
+    /// overrides the pressure-threshold calculation without changing the raw
+    /// device or pool capacity.
+    #[serde(default)]
+    pub usable_capacity_bytes: Option<usize>,
     /// Enable memory pooling
     pub enable_pooling: bool,
     /// Memory alignment in bytes
@@ -460,10 +549,66 @@ pub struct MemoryConfig {
     pub pressure_critical_threshold: f32,
 }
 
+/// Resolved device-wide memory budget consumed by runtime planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCapacityBudget {
+    pub capacity_bytes: u64,
+    pub usable_capacity_bytes: u64,
+    pub reserve_bytes: u64,
+}
+
+impl MemoryConfig {
+    pub fn resolve_capacity_budget(
+        &self,
+        device_capacity_bytes: u64,
+    ) -> std::result::Result<MemoryCapacityBudget, String> {
+        if device_capacity_bytes == 0 {
+            return Err("runtime device memory capacity must be greater than zero".to_string());
+        }
+        let capacity_bytes = self
+            .pool_size
+            .map(|bytes| bytes as u64)
+            .unwrap_or(device_capacity_bytes)
+            .min(device_capacity_bytes);
+        if capacity_bytes == 0 {
+            return Err("runtime memory capacity must be greater than zero".to_string());
+        }
+
+        let usable_capacity_bytes = if let Some(bytes) = self.usable_capacity_bytes {
+            let bytes = bytes as u64;
+            if bytes == 0 || bytes > capacity_bytes {
+                return Err(format!(
+                    "memory.usable_capacity_bytes must be in 1..={capacity_bytes}, got {bytes}"
+                ));
+            }
+            bytes
+        } else {
+            let critical = self.pressure_critical_threshold;
+            if !critical.is_finite() || critical <= 0.0 || critical > 1.0 {
+                return Err(format!(
+                    "memory.pressure_critical_threshold must be in (0, 1], got {critical}"
+                ));
+            }
+            let threshold_bytes = ((capacity_bytes as f64) * f64::from(critical)).floor() as u64;
+            capacity_bytes.saturating_sub(
+                capacity_bytes
+                    .saturating_sub(threshold_bytes)
+                    .min(capacity_bytes - 1),
+            )
+        };
+        Ok(MemoryCapacityBudget {
+            capacity_bytes,
+            usable_capacity_bytes,
+            reserve_bytes: capacity_bytes - usable_capacity_bytes,
+        })
+    }
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             pool_size: None,
+            usable_capacity_bytes: None,
             enable_pooling: true,
             alignment: 256,
             enable_defragmentation: false,
@@ -490,6 +635,9 @@ pub struct BackendConfig {
     pub optimization_level: u8,
     /// Enable CUDA graphs
     pub enable_cuda_graphs: bool,
+    /// Prepare backend-owned reusable device programs when supported.
+    #[serde(default = "default_enable_reusable_execution")]
+    pub enable_reusable_execution: bool,
     /// Enable kernel fusion
     pub enable_kernel_fusion: bool,
     /// Custom backend-specific options
@@ -505,10 +653,15 @@ impl Default for BackendConfig {
             enable_optimizations: true,
             optimization_level: 2,
             enable_cuda_graphs: false,
+            enable_reusable_execution: default_enable_reusable_execution(),
             enable_kernel_fusion: true,
             backend_options: HashMap::new(),
         }
     }
+}
+
+const fn default_enable_reusable_execution() -> bool {
+    true
 }
 
 /// Supported backend types
@@ -712,6 +865,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scheduler_keeps_immediate_fit_default_until_full_input_policy_is_gated() {
+        assert_eq!(
+            SchedulerConfig::default().sequence_fit_policy,
+            SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn sequence_fit_policy_uses_canonical_product_values() {
+        assert_eq!(
+            serde_json::to_string(&SequenceFitPolicy::FullInputMustFit).unwrap(),
+            "\"full-input-must-fit\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SequenceFitPolicy>("\"immediate-only\"").unwrap(),
+            SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn scheduler_deserialization_without_fit_policy_keeps_legacy_default() {
+        let mut serialized = serde_json::to_value(SchedulerConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("sequence_fit_policy");
+
+        let scheduler: SchedulerConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(
+            scheduler.sequence_fit_policy,
+            SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn checkpoint_capture_deserialization_keeps_decode_capture_disabled_by_default() {
+        let capture: VNextCheckpointCaptureConfig = serde_json::from_value(serde_json::json!({
+            "output_dir": "capture",
+            "value_ids": ["value.output.logits"],
+            "maximum_prefill_waves": 1
+        }))
+        .unwrap();
+
+        assert_eq!(capture.maximum_decode_waves, 0);
+        assert!(!capture.capture_product_output);
+    }
+
+    #[test]
+    fn engine_config_applies_typed_sequence_fit_policy() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_SEQUENCE_FIT_POLICY",
+            "full-input-must-fit",
+        )]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.scheduler.sequence_fit_policy,
+            SequenceFitPolicy::FullInputMustFit
+        );
+    }
+
+    #[test]
+    fn engine_config_rejects_unknown_sequence_fit_policy() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_SEQUENCE_FIT_POLICY",
+            "reserve-everything",
+        )]);
+
+        let error = config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect_err("unknown fit policy must fail closed");
+
+        assert!(error.contains("FERRUM_SEQUENCE_FIT_POLICY"));
+    }
+
+    #[test]
     fn engine_config_applies_recurrent_state_max_slots_runtime_key() {
         let mut config = EngineConfig::default();
         let snapshot =
@@ -722,11 +957,10 @@ mod tests {
             .expect("runtime config should apply");
 
         assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
-        assert_eq!(config.runtime.qwen35_linear_state_max_slots, None);
     }
 
     #[test]
-    fn engine_config_accepts_legacy_qwen35_linear_state_max_slots_alias() {
+    fn engine_config_does_not_apply_removed_qwen35_slot_alias() {
         let mut config = EngineConfig::default();
         let snapshot =
             RuntimeConfigSnapshot::from_env_vars([("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16")]);
@@ -735,12 +969,11 @@ mod tests {
             .apply_runtime_config_snapshot(&snapshot)
             .expect("runtime config should apply");
 
-        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
-        assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
+        assert_eq!(config.runtime.recurrent_state_max_slots, None);
     }
 
     #[test]
-    fn engine_config_prefers_generic_recurrent_state_slots_over_legacy_alias() {
+    fn engine_config_uses_generic_recurrent_state_slots_when_removed_alias_is_present() {
         let mut config = EngineConfig::default();
         let snapshot = RuntimeConfigSnapshot::from_env_vars([
             ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "8"),
@@ -752,7 +985,6 @@ mod tests {
             .expect("runtime config should apply");
 
         assert_eq!(config.runtime.recurrent_state_max_slots, Some(8));
-        assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
     }
 
     #[test]
@@ -768,5 +1000,79 @@ mod tests {
             config.runtime.profile_entrypoint,
             Some(ProfileEntrypoint::Run)
         );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_profile_detail_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "full")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Full
+        );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_replay_profile_detail_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "replay")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Replay
+        );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_verification_profile_detail_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "verify")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Verify
+        );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_profile_jsonl_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_JSONL", "/tmp/profile.jsonl")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_jsonl.as_deref(),
+            Some(std::path::Path::new("/tmp/profile.jsonl"))
+        );
+    }
+
+    #[test]
+    fn engine_config_rejects_unknown_profile_detail() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "everything")]);
+
+        let error = config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect_err("unknown profile detail must fail closed");
+
+        assert!(error.contains("FERRUM_PROFILE_DETAIL"));
     }
 }

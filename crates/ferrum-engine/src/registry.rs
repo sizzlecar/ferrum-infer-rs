@@ -14,11 +14,14 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_types::{DataType, Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
+use ferrum_models::vnext::{PreparedProductionModel, ProductionModelSourceBundle};
+use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
+
+pub use ferrum_interfaces::sampler::GreedySampler;
 
 // ============================================================================
 // Core Types
@@ -43,15 +46,38 @@ pub struct ComponentConfig {
     pub device: Device,
     /// Additional component-specific options
     pub component_options: HashMap<String, serde_json::Value>,
+    /// Immutable role-specific product sources. This is deliberately absent
+    /// from serialized EngineConfig and shared by tokenizer and executor.
+    pub model_sources: Option<Arc<ProductionModelSourceBundle>>,
+    /// Prepared typed model derived from `model_sources`, when the composition
+    /// root has already resolved a migrated family.
+    pub prepared_model: Option<Arc<PreparedProductionModel>>,
 }
 
 impl ComponentConfig {
     /// Create from engine config
     pub fn from_engine_config(config: &EngineConfig) -> Self {
+        Self::from_engine_config_and_product_model(config, None, None)
+    }
+
+    pub fn from_engine_config_and_sources(
+        config: &EngineConfig,
+        model_sources: Option<Arc<ProductionModelSourceBundle>>,
+    ) -> Self {
+        Self::from_engine_config_and_product_model(config, model_sources, None)
+    }
+
+    pub fn from_engine_config_and_product_model(
+        config: &EngineConfig,
+        model_sources: Option<Arc<ProductionModelSourceBundle>>,
+        prepared_model: Option<Arc<PreparedProductionModel>>,
+    ) -> Self {
         Self {
             engine_config: config.clone(),
             device: config.backend.device.clone(),
             component_options: config.backend.backend_options.clone(),
+            model_sources,
+            prepared_model,
         }
     }
 
@@ -532,6 +558,21 @@ pub struct HuggingFaceTokenizerFactory;
 #[async_trait]
 impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizerFactory {
     async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Tokenizer + Send + Sync>> {
+        if let Some(sources) = config.model_sources.as_ref() {
+            let tokenizer =
+                ferrum_tokenizer::implementations::HuggingFaceTokenizer::from_source_bytes(
+                    sources.tokenizer_json(),
+                    sources.tokenizer_config_json(),
+                    sources.generation_config_json(),
+                )
+                .await?;
+            info!(
+                tokenizer_root = %sources.tokenizer_root().display(),
+                "Loaded HuggingFace tokenizer from typed product sources"
+            );
+            return Ok(Arc::new(tokenizer));
+        }
+
         // Try to find tokenizer path from config or environment
         let tokenizer_path = config
             .get_string_option("tokenizer_path")
@@ -674,33 +715,6 @@ impl ComponentFactory<Arc<dyn Sampler + Send + Sync>> for GreedySamplerFactory {
             supported_devices: vec![Device::CPU],
             capabilities: vec!["deterministic".to_string()],
         }
-    }
-}
-
-/// Greedy sampler implementation
-pub struct GreedySampler;
-
-impl Sampler for GreedySampler {
-    fn sample(
-        &self,
-        logits: &[f32],
-        _rng: &mut dyn rand::RngCore,
-    ) -> Result<ferrum_types::TokenId> {
-        let (max_idx, _) = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| FerrumError::internal("Empty logits"))?;
-
-        Ok(ferrum_types::TokenId::new(max_idx as u32))
-    }
-
-    fn name(&self) -> &str {
-        "greedy"
-    }
-
-    fn is_deterministic(&self) -> bool {
-        true
     }
 }
 
@@ -1111,6 +1125,212 @@ where
     }
 }
 
+fn validate_registered_vnext_backend(
+    kind: ferrum_models::vnext::ProductionExecutionKind,
+    device: &Device,
+    external_metadata_id: &ferrum_interfaces::vnext::ExternalModelMetadataId,
+) -> Result<()> {
+    use ferrum_models::vnext::ProductionExecutionKind;
+
+    match (kind, device) {
+        (ProductionExecutionKind::CausalLanguage, Device::CUDA(_)) => {
+            #[cfg(feature = "cuda")]
+            return Ok(());
+            #[cfg(not(feature = "cuda"))]
+            Err(FerrumError::device(
+                "registered vNext CUDA composition requires the 'cuda' feature",
+            ))
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        (ProductionExecutionKind::CausalLanguage, Device::Metal) => {
+            #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+            return Ok(());
+            #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+            Err(FerrumError::device(
+                "registered vNext Metal composition requires the 'metal' feature on an Apple platform",
+            ))
+        }
+        (kind, device) => Err(FerrumError::unsupported(format!(
+            "registered vNext model metadata {external_metadata_id} requires a {kind:?} backend composition, but {device} is not registered"
+        ))),
+    }
+}
+
+fn create_registered_vnext_executor(
+    config: &ComponentConfig,
+    model_path: &std::path::Path,
+    sources: Option<Arc<ProductionModelSourceBundle>>,
+    prepared_model: Option<Arc<PreparedProductionModel>>,
+    registration: ferrum_models::vnext::RegisteredProductionModel,
+) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+    use ferrum_models::vnext::ProductionExecutionKind;
+
+    validate_registered_vnext_backend(
+        registration.execution_kind(),
+        &config.device,
+        registration.external_metadata_id(),
+    )?;
+
+    let _prepared_model_reused = prepared_model.is_some();
+    if let (Some(prepared), Some(sources)) = (prepared_model.as_ref(), sources.as_ref()) {
+        if !Arc::ptr_eq(prepared.sources(), sources) {
+            return Err(FerrumError::model(
+                "prepared product model and component sources do not share one source lease",
+            ));
+        }
+    }
+    let prepared = match prepared_model {
+        Some(prepared) => {
+            if prepared.family().external_metadata_id() != registration.external_metadata_id() {
+                return Err(FerrumError::model(format!(
+                    "prepared product metadata {} differs from registered metadata {}",
+                    prepared.family().external_metadata_id(),
+                    registration.external_metadata_id()
+                )));
+            }
+            prepared
+        }
+        None => Arc::new(match sources {
+            Some(sources) => registration.prepare_from_sources(sources)?,
+            None => registration.prepare(model_path)?,
+        }),
+    };
+
+    match (registration.execution_kind(), &config.device) {
+        (ProductionExecutionKind::CausalLanguage, Device::CUDA(ordinal)) => {
+            #[cfg(feature = "cuda")]
+            {
+                let model_info = prepared.model_info(
+                    config.engine_config.model.model_id.clone(),
+                    config.device.clone(),
+                );
+                let family = prepared.family();
+                let family_fingerprint = family
+                    .fingerprint()
+                    .map_err(|error| FerrumError::model(error.to_string()))?;
+                let program_fingerprint = family
+                    .program()
+                    .fingerprint()
+                    .map_err(|error| FerrumError::model(error.to_string()))?;
+                info!(
+                    external_metadata_id = %registration.external_metadata_id(),
+                    family_id = %family.family_id(),
+                    family_fingerprint,
+                    program_fingerprint,
+                    prepared_model_reused = _prepared_model_reused,
+                    backend = "cuda",
+                    "Building registered model from a typed vNext execution plan"
+                );
+                let device_id = ferrum_interfaces::vnext::DeviceId::new(format!(
+                    "device.cuda.{ordinal}"
+                ))
+                .map_err(|error| FerrumError::device(error.to_string()))?;
+                let composition =
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
+                        *ordinal, device_id,
+                    )
+                    .map_err(|error| {
+                        FerrumError::device(format!("create vNext CUDA runtime: {error}"))
+                    })?;
+                let (
+                    runtime,
+                    operation_registry,
+                    weight_materializers,
+                    weight_materializer_id,
+                    catalog,
+                ) = composition.into_parts();
+                let executor = crate::product_composition::create_vnext_executor(
+                    &config.engine_config,
+                    prepared.as_ref(),
+                    model_info,
+                    runtime,
+                    operation_registry,
+                    weight_materializers,
+                    weight_materializer_id,
+                    catalog,
+                )?;
+                info!(
+                    resolved_plan_fingerprint = executor
+                        .resolved_model_plan()
+                        .map(|plan| plan.fingerprint())
+                        .unwrap_or("missing"),
+                    "Resolved product model plan is authoritative for vNext execution"
+                );
+                Ok(Arc::new(executor))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (ordinal, model_path, prepared);
+                Err(FerrumError::device(
+                    "registered vNext CUDA composition requires the 'cuda' feature",
+                ))
+            }
+        }
+        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+        (ProductionExecutionKind::CausalLanguage, Device::Metal) => {
+            let model_info = prepared.model_info(
+                config.engine_config.model.model_id.clone(),
+                config.device.clone(),
+            );
+            let family = prepared.family();
+            let family_fingerprint = family
+                .fingerprint()
+                .map_err(|error| FerrumError::model(error.to_string()))?;
+            let program_fingerprint = family
+                .program()
+                .fingerprint()
+                .map_err(|error| FerrumError::model(error.to_string()))?;
+            info!(
+                external_metadata_id = %registration.external_metadata_id(),
+                family_id = %family.family_id(),
+                family_fingerprint,
+                program_fingerprint,
+                prepared_model_reused = _prepared_model_reused,
+                backend = "metal",
+                "Building registered model from a typed vNext execution plan"
+            );
+            let device_id = ferrum_interfaces::vnext::DeviceId::new("device.metal.0")
+                .map_err(|error| FerrumError::device(error.to_string()))?;
+            let composition =
+                ferrum_kernels::backend::metal::vnext_ops::MetalVNextComposition::create(
+                    device_id,
+                )
+                .map_err(|error| {
+                    FerrumError::device(format!("create vNext Metal runtime: {error}"))
+                })?;
+            let (
+                runtime,
+                operation_registry,
+                weight_materializers,
+                weight_materializer_id,
+                catalog,
+            ) = composition.into_parts();
+            let executor = crate::product_composition::create_vnext_executor(
+                &config.engine_config,
+                prepared.as_ref(),
+                model_info,
+                runtime,
+                operation_registry,
+                weight_materializers,
+                weight_materializer_id,
+                catalog,
+            )?;
+            info!(
+                resolved_plan_fingerprint = executor
+                    .resolved_model_plan()
+                    .map(|plan| plan.fingerprint())
+                    .unwrap_or("missing"),
+                "Resolved product model plan is authoritative for vNext execution"
+            );
+            Ok(Arc::new(executor))
+        }
+        (kind, device) => Err(FerrumError::unsupported(format!(
+            "registered vNext model metadata {} requires a {kind:?} backend composition, but {device} is not registered",
+            registration.external_metadata_id()
+        ))),
+    }
+}
+
 /// Back-compat alias; retained so external test fixtures referencing
 /// the old name continue to compile while we sweep call sites.
 #[deprecated(note = "use `LlmExecutorFactory` (renamed PR A — Dim 1/3 cleanup)")]
@@ -1126,13 +1346,27 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use ferrum_models::weight_format::WeightFormat;
 
         // Try to load model from path
-        let model_path = config
-            .get_string_option("model_path")
+        let checkpoint_capture_enabled = config
+            .engine_config
+            .runtime
+            .vnext_checkpoint_capture
+            .is_some();
+        let model_sources = config.model_sources.clone();
+        let prepared_model = config.prepared_model.clone();
+        let model_path = model_sources
+            .as_ref()
+            .map(|sources| sources.weights().path().display().to_string())
+            .or_else(|| config.get_string_option("model_path"))
             .or_else(|| config.engine_config.runtime.model_path.clone());
 
         let model_path = match model_path {
             Some(path) => path,
             None => {
+                if checkpoint_capture_enabled {
+                    return Err(FerrumError::unsupported(
+                        "vNext checkpoint capture requires a registered model source",
+                    ));
+                }
                 info!("No model path found, falling back to stub executor");
                 return StubExecutorFactory.create(config).await;
             }
@@ -1149,12 +1383,60 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             weight_fmt.label()
         );
 
+        // Registered vNext packages resolve from immutable external metadata
+        // before every legacy weight-format loader. A typed GGUF source carries
+        // its semantic metadata separately, so routing it through the generic
+        // GGUF loader first would silently bypass the registered vNext package.
+        // Direct GGUF paths with colocated semantic/tokenizer metadata can
+        // carry the same typed bundle. Migrated architectures without that
+        // metadata fail closed during product source resolution; only explicit
+        // legacy registry rows may continue through the generic GGUF loader.
+        let production_registration = match model_sources.as_ref() {
+            Some(sources) => Some(ferrum_models::vnext::resolve_registered_model_from_sources(
+                sources,
+            )?),
+            None if !matches!(weight_fmt, WeightFormat::Gguf { .. }) => {
+                Some(ferrum_models::vnext::resolve_registered_model_from_dir(
+                    std::path::Path::new(&model_path),
+                )?)
+            }
+            None => None,
+        };
+        if let Some(production_registration) = production_registration {
+            match production_registration {
+                ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => {
+                    return create_registered_vnext_executor(
+                        config,
+                        std::path::Path::new(&model_path),
+                        model_sources,
+                        prepared_model,
+                        registration,
+                    );
+                }
+                ferrum_models::vnext::ProductionModelRegistration::LegacyRegistered {
+                    external_metadata_id,
+                } => {
+                    if checkpoint_capture_enabled {
+                        return Err(FerrumError::unsupported(format!(
+                            "vNext checkpoint capture requires a migrated model; metadata {external_metadata_id} is still legacy"
+                        )));
+                    }
+                    info!(
+                        %external_metadata_id,
+                        "Entering the explicitly registered legacy model path"
+                    );
+                }
+            }
+        }
+        if checkpoint_capture_enabled {
+            return Err(FerrumError::unsupported(
+                "vNext checkpoint capture requires a registered vNext model package",
+            ));
+        }
+
         if let WeightFormat::Gguf { ref path } = weight_fmt {
-            // GGUF goes through its own loader — single-file format with
-            // architecture + tokenizer baked in, no separate config.json
-            // step. Output is a `Box<dyn DecoderOnlyLLM>` that plugs into
-            // the same LlmExecutor as the safetensors path, so the rest of
-            // the engine is unchanged.
+            // Legacy or direct-path GGUF packages still use the monolithic
+            // loader. Registered typed packages have already returned above.
             let (llm, model_info) = ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
                 path,
                 &config.device,
@@ -1163,9 +1445,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
         }
 
-        // Safetensors path — re-use ConfigManager to extract Architecture
-        // + dims from `config.json`, then dispatch over Dim 1 (arch) +
-        // Dim 4 (device) below.
+        // Explicitly registered legacy safetensors and the diagnostic CPU
+        // reference path continue through the old registry until each family
+        // migration deletes its legacy row and architecture branch together.
         let mut config_manager = ferrum_models::ConfigManager::new();
         let model_def = config_manager
             .load_from_path(std::path::Path::new(&model_path))
@@ -1441,75 +1723,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 )?;
                 Ok(Arc::new(executor))
             }
-            ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
-                let reference_enabled = config
-                    .get_option::<bool>("qwen35_reference")
-                    .unwrap_or(false);
-                if !reference_enabled {
-                    if !matches!(config.device, Device::CUDA(_)) {
-                        return Err(FerrumError::unsupported(
-                            "Qwen3.5/Qwen3.6 product execution is CUDA-only in the W3 path. \
-                             CPU is available only through explicit --qwen35-reference for \
-                             correctness bring-up; CPU product execution is not wired yet.",
-                        ));
-                    }
-                    #[cfg(feature = "cuda")]
-                    {
-                        info!("Using Qwen3.5/Qwen3.6 CUDA backend executor");
-                        let model_dir = std::path::Path::new(&model_path);
-                        let llm = ferrum_models::models::Qwen35BackendModel::<
-                            ferrum_kernels::backend::cuda::CudaBackend,
-                        >::from_definition_with_native_safetensors(
-                            &model_def, model_dir
-                        )?;
-                        let mut model_info = model_def
-                            .to_model_info(config.engine_config.model.model_id.to_string());
-                        model_info.dtype = DataType::FP16;
-                        model_info.device = config.device.clone();
-                        return Ok(Arc::new(ferrum_models::LlmExecutor::new(
-                            Box::new(llm),
-                            model_info,
-                        )));
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        return Err(FerrumError::device(
-                            "CUDA requested but 'cuda' feature not enabled",
-                        ));
-                    }
-                }
-                if config.device != Device::CPU || dtype != DType::F32 {
-                    return Err(FerrumError::unsupported(
-                        "Qwen3.5/Qwen3.6 reference execution requires --backend cpu and FP32; \
-                         CUDA/Metal release execution is not wired yet.",
-                    ));
-                }
-                info!("Using Qwen3.5/Qwen3.6 explicit CPU/FP32 reference executor");
-                let model_dir = std::path::Path::new(&model_path);
-                let model_id = config.engine_config.model.model_id.to_string();
-                let executor = match model_def.architecture {
-                    ferrum_models::Architecture::Qwen35 => {
-                        ferrum_models::Qwen35W3Executor::from_definition_with_dense_reference_cpu_safetensors(
-                            model_id,
-                            &model_def,
-                            model_dir,
-                            DataType::FP32,
-                            Device::CPU,
-                        )?
-                    }
-                    ferrum_models::Architecture::Qwen35Moe => {
-                        ferrum_models::Qwen35W3Executor::from_definition_with_sparse_moe_reference_cpu_safetensors(
-                            model_id,
-                            &model_def,
-                            model_dir,
-                            DataType::FP32,
-                            Device::CPU,
-                        )?
-                    }
-                    _ => unreachable!("matched Qwen35 architectures above"),
-                };
-                Ok(Arc::new(executor))
-            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
@@ -1661,8 +1874,6 @@ pub fn set_global_registry(registry: Arc<ComponentRegistry>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::model_executor::PrefillInput;
-    use ferrum_testkit::MockTensor;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use std::path::{Path, PathBuf};
 
@@ -1680,7 +1891,7 @@ mod tests {
         dir
     }
 
-    fn write_qwen35_reference_config(dir: &Path) {
+    fn write_qwen35_fixture_config(dir: &Path) {
         let config = serde_json::json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "model_type": "qwen3_5",
@@ -1700,9 +1911,12 @@ mod tests {
                 "linear_key_head_dim": 1,
                 "linear_value_head_dim": 1,
                 "linear_conv_kernel_dim": 1,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 2,
                 "num_attention_heads": 1,
                 "num_key_value_heads": 1,
+                "vocab_size": 3,
+                "max_position_embeddings": 16,
                 "tie_word_embeddings": false
             }
         });
@@ -1713,7 +1927,7 @@ mod tests {
         .unwrap();
     }
 
-    fn write_qwen35_reference_safetensors(dir: &Path) {
+    fn write_qwen35_fixture_safetensors(dir: &Path) {
         let tensors: Vec<(String, Vec<f32>)> = vec![
             (
                 "model.embed_tokens.weight".to_string(),
@@ -1842,59 +2056,118 @@ mod tests {
         .unwrap();
     }
 
-    fn write_qwen35_reference_model_dir() -> PathBuf {
-        let dir = unique_test_dir("qwen35-reference");
-        write_qwen35_reference_config(&dir);
-        write_qwen35_reference_safetensors(&dir);
+    fn write_qwen35_fixture_model_dir() -> PathBuf {
+        let dir = unique_test_dir("qwen35-vnext-route");
+        write_qwen35_fixture_config(&dir);
+        write_qwen35_fixture_safetensors(&dir);
         dir
     }
 
-    fn qwen35_reference_component_config(model_dir: &Path, enabled: bool) -> ComponentConfig {
+    fn qwen35_fixture_component_config(model_dir: &Path) -> ComponentConfig {
         let mut engine_config = EngineConfig::default();
         engine_config.backend.device = Device::CPU;
         engine_config.backend.backend_options.insert(
             "model_path".to_string(),
             serde_json::Value::String(model_dir.to_string_lossy().to_string()),
         );
-        if enabled {
-            engine_config
-                .backend
-                .backend_options
-                .insert("qwen35_reference".to_string(), serde_json::json!(true));
-        }
         ComponentConfig::from_engine_config(&engine_config)
     }
 
+    fn enable_checkpoint_capture(config: &mut ComponentConfig, output_dir: PathBuf) {
+        config.engine_config.runtime.vnext_checkpoint_capture =
+            Some(ferrum_types::VNextCheckpointCaptureConfig {
+                output_dir,
+                value_ids: vec!["value.output.logits".to_owned()],
+                maximum_prefill_waves: 1,
+                maximum_decode_waves: 0,
+                capture_product_output: false,
+            });
+    }
+
     #[test]
-    fn qwen35_registry_requires_explicit_reference_option() {
-        let dir = write_qwen35_reference_model_dir();
-        let config = qwen35_reference_component_config(&dir, false);
+    fn checkpoint_capture_rejects_stub_fallback() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        enable_checkpoint_capture(&mut config, PathBuf::from("capture"));
+
+        let error = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
+            Ok(_) => panic!("checkpoint capture unexpectedly entered the stub executor"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("requires a registered model source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qwen35_registry_routes_registered_package_before_legacy_loading() {
+        let dir = write_qwen35_fixture_model_dir();
+        std::fs::remove_file(dir.join("model.safetensors")).unwrap();
+        let config = qwen35_fixture_component_config(&dir);
 
         let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("Qwen3.5 product loading must remain opt-in"),
+            Ok(_) => panic!("registered Qwen3.5 package unexpectedly accepted CPU execution"),
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("--qwen35-reference"), "{err}");
-        assert!(err.contains("not wired yet"), "{err}");
+        assert!(
+            err.contains(ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID),
+            "{err}"
+        );
+        assert!(err.contains("but cpu is not registered"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn qwen35_registry_loads_explicit_cpu_reference_executor() {
-        let dir = write_qwen35_reference_model_dir();
-        let config = qwen35_reference_component_config(&dir, true);
+    fn qwen35_typed_gguf_routes_registered_package_before_legacy_gguf_loading() {
+        let dir = unique_test_dir("qwen35-typed-gguf-route");
+        write_qwen35_fixture_config(&dir);
+        std::fs::write(dir.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture"}"#,
+        )
+        .unwrap();
+        let gguf = dir.join("model.gguf");
+        std::fs::write(&gguf, b"not-a-real-gguf").unwrap();
+        let original = ferrum_interfaces::vnext::OriginalModelSource {
+            kind: ferrum_interfaces::vnext::ModelSourceKind::LocalDirectory,
+            location: dir.display().to_string(),
+            requested_revision: None,
+        };
+        let sources = Arc::new(
+            ProductionModelSourceBundle::open(
+                &dir,
+                &dir,
+                ferrum_models::vnext::ProductionWeightArtifact::gguf_file(&gguf),
+                ferrum_interfaces::vnext::OriginalModelSources {
+                    semantic: original.clone(),
+                    tokenizer: original.clone(),
+                    weights: ferrum_interfaces::vnext::OriginalModelSource {
+                        kind: ferrum_interfaces::vnext::ModelSourceKind::LocalFile,
+                        location: gguf.display().to_string(),
+                        requested_revision: None,
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        let mut engine = EngineConfig::default();
+        engine.backend.device = Device::CPU;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.model_sources = Some(sources);
 
-        let executor = tokio_test::block_on(LlmExecutorFactory.create(&config))
-            .expect("explicit Qwen3.5 reference path should load toy safetensors");
-        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
-        let output = tokio_test::block_on(executor.prefill(&input))
-            .expect("explicit Qwen3.5 reference path should prefill");
+        let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
+            Ok(_) => panic!("registered Qwen3.5 GGUF unexpectedly accepted CPU execution"),
+            Err(err) => err.to_string(),
+        };
 
-        assert_eq!(output.logits.shape(), &[1, 1, 3]);
-        assert_eq!(output.kv_cache.block_table().sequence_length, 2);
-        let status = executor.status();
-        assert!(status.is_ready, "{status:?}");
+        assert!(
+            err.contains(ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID),
+            "{err}"
+        );
+        assert!(err.contains("but cpu is not registered"), "{err}");
+        assert!(!err.contains("GGUF"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1923,6 +2196,8 @@ mod tests {
             engine_config: EngineConfig::default(),
             device: Device::CPU,
             component_options: options,
+            model_sources: None,
+            prepared_model: None,
         };
 
         assert_eq!(

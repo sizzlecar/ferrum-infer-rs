@@ -1,0 +1,16 @@
+{
+  "id": 44916820,
+  "label": "ferrum-vnext-embedding-compile-retry-20260714",
+  "cur_state": "running",
+  "actual_status": null,
+  "intended_status": "running",
+  "next_state": "running",
+  "status_msg": null,
+  "ssh_host": "ssh2.vast.ai",
+  "ssh_port": 36820,
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "dph_total": 0.15555555555555556,
+  "disk_space": 80.0,
+  "start_date": 1784059925.3384464
+}

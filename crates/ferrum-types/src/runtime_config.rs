@@ -232,7 +232,9 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
         || key.contains("BATCHED_TOKENS")
         || key.contains("PAGED_MAX_SEQS")
         || key.contains("MODEL_LEN")
+        || key.contains("FIT_POLICY")
         || key.contains("STATE_MAX_SLOTS")
+        || key.contains("REUSABLE_EXECUTION")
         || key.contains("MEMORY")
     {
         effects.push(RuntimeConfigEffect::Memory);
@@ -241,11 +243,14 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
     if key.contains("PREFIX_CACHE")
         || key.contains("MODEL_PATH")
         || key.contains("MODEL_LEN")
+        || key.contains("FIT_POLICY")
+        || key.contains("RUNTIME_MEMORY_BUDGET")
         || key.contains("NATIVE")
         || key.contains("ARTIFACT")
         || key.contains("SPEC_")
         || key.contains("REF_")
         || key.contains("DTYPE")
+        || key.contains("REUSABLE_EXECUTION")
     {
         effects.push(RuntimeConfigEffect::Correctness);
     }
@@ -263,6 +268,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
         || key.contains("CUDA")
         || key.contains("TRITON")
         || key.contains("GREEDY")
+        || key.contains("REUSABLE_EXECUTION")
         || key.contains("FA")
     {
         effects.push(RuntimeConfigEffect::Performance);
@@ -324,6 +330,7 @@ mod tests {
             ("FERRUM_FA2_NATIVE_ARTIFACT", "/tmp/libferrum_native_fa2.a"),
             ("FERRUM_PREFIX_CACHE", "1"),
             ("FERRUM_MOE_GRAPH", "1"),
+            ("FERRUM_REUSABLE_EXECUTION", "1"),
         ]);
         let keys: Vec<_> = snapshot
             .entries
@@ -335,7 +342,8 @@ mod tests {
             vec![
                 "FERRUM_FA2_NATIVE_ARTIFACT",
                 "FERRUM_MOE_GRAPH",
-                "FERRUM_PREFIX_CACHE"
+                "FERRUM_PREFIX_CACHE",
+                "FERRUM_REUSABLE_EXECUTION"
             ]
         );
         assert_eq!(snapshot.entries[0].source, RuntimeConfigSource::Env);
@@ -351,6 +359,13 @@ mod tests {
         assert!(snapshot.entries[2]
             .affects
             .contains(&RuntimeConfigEffect::Correctness));
+        for effect in [
+            RuntimeConfigEffect::Correctness,
+            RuntimeConfigEffect::Performance,
+            RuntimeConfigEffect::Memory,
+        ] {
+            assert!(snapshot.entries[3].affects.contains(&effect));
+        }
     }
 
     #[test]

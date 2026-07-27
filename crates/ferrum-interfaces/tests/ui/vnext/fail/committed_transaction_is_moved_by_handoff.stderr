@@ -10,7 +10,7 @@ error[E0382]: use of moved value: `transaction`
    |                     ^^^^^^^^^^^ value used here after move
    |
 note: `ResourceTransaction::<D, TransactionCommitted>::into_plan_runtime` takes ownership of the receiver `self`, which moves `transaction`
-  --> src/vnext/resource.rs
+  --> src/vnext/resource/transaction.rs
    |
    |         mut self,
    |             ^^^^

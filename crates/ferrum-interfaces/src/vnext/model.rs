@@ -17,11 +17,50 @@ pub enum QuantizationPacking {
     Tiled,
 }
 
+/// How values are partitioned along a quantized layout's `group_axis`.
+///
+/// `WholeAxis` is shape-relative by design: all values on the group axis
+/// share one scale. This represents channelwise quantization without making a
+/// matrix dimension part of the otherwise stable quantization-format ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuantizationGrouping {
+    Fixed { size: u32 },
+    WholeAxis,
+}
+
+impl QuantizationGrouping {
+    pub const fn fixed(size: u32) -> Self {
+        Self::Fixed { size }
+    }
+
+    pub const fn fixed_size(self) -> Option<u32> {
+        match self {
+            Self::Fixed { size } => Some(size),
+            Self::WholeAxis => None,
+        }
+    }
+
+    pub const fn resolved_size(self, axis_extent: u64) -> u64 {
+        match self {
+            Self::Fixed { size } => size as u64,
+            Self::WholeAxis => axis_extent,
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        match self {
+            Self::Fixed { size } => size != 0 && size.is_power_of_two(),
+            Self::WholeAxis => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationSpec {
     pub format_id: super::QuantizationFormatId,
     pub bits_per_weight: u8,
-    pub group_size: u32,
+    pub grouping: QuantizationGrouping,
     pub packing: QuantizationPacking,
     pub scale_type: ElementType,
     pub zero_point_type: Option<ElementType>,
@@ -30,8 +69,7 @@ pub struct QuantizationSpec {
 impl QuantizationSpec {
     pub fn validate(&self) -> Result<(), VNextError> {
         if !(1..=8).contains(&self.bits_per_weight)
-            || self.group_size == 0
-            || !self.group_size.is_power_of_two()
+            || !self.grouping.is_valid()
             || !matches!(
                 self.scale_type,
                 ElementType::F16 | ElementType::Bf16 | ElementType::F32
@@ -51,17 +89,68 @@ impl QuantizationSpec {
     }
 }
 
+/// Self-contained fixed-size quantization blocks such as GGML/GGUF Q4_K and
+/// Q6_K. Per-block scales, minima, and packed values are part of the opaque
+/// block ABI identified by `format_id`; providers must not reinterpret these
+/// bytes as the separate-scale [`QuantizationSpec`] representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockQuantizationSpec {
+    pub format_id: super::QuantizationFormatId,
+    pub logical_values_per_block: u32,
+    pub bytes_per_block: u32,
+}
+
+impl BlockQuantizationSpec {
+    pub fn validate(&self) -> Result<(), VNextError> {
+        if self.logical_values_per_block == 0 || self.bytes_per_block == 0 {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!("invalid block quantization format `{}`", self.format_id),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeightEncoding {
-    Dense { element_type: ElementType },
+    Dense {
+        element_type: ElementType,
+    },
+    /// Dense floating-point values materialized after applying
+    /// `logical = physical * scale + bias` element-wise. This keeps checkpoint
+    /// representation semantics in the typed weight schema rather than in a
+    /// backend provider or model-name branch.
+    DenseAffine {
+        element_type: ElementType,
+        scale: CanonicalRational,
+        bias: CanonicalRational,
+    },
     Quantized(QuantizationSpec),
+    BlockQuantized(BlockQuantizationSpec),
+}
+
+impl WeightEncoding {
+    pub const fn dense_element_type(&self) -> Option<ElementType> {
+        match self {
+            Self::Dense { element_type } | Self::DenseAffine { element_type, .. } => {
+                Some(*element_type)
+            }
+            Self::Quantized(_) | Self::BlockQuantized(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightComponentSpec {
     pub id: WeightId,
     pub role: WeightComponentRole,
+    /// Ordered checkpoint tensors forming this physical component. Dense
+    /// multi-source components use `[source_count, source_shape...]` and stack
+    /// tensors in this exact order. Format adapters may instead define a typed
+    /// source recipe (for example values plus quantization sidecars), but must
+    /// validate every source identity, order, shape, and resulting byte count.
+    /// Aliases are resolved before the model family constructs this schema.
     pub external_names: Vec<String>,
     pub dimensions: Vec<u64>,
     pub encoding: WeightEncoding,
@@ -69,29 +158,40 @@ pub struct WeightComponentSpec {
 }
 
 impl WeightComponentSpec {
-    /// Exact bytes occupied by this physical component. Quantized component
-    /// dimensions are byte dimensions; logical element counts live on
-    /// `WeightTensorSpec` and are checked against the packing contract.
+    /// Exact bytes occupied by this physical component. Separate-component
+    /// quantized dimensions are byte dimensions. Block-quantized dimensions
+    /// are block-grid dimensions and are multiplied by the block ABI size.
+    /// Logical element counts live on `WeightTensorSpec` and are checked
+    /// against the corresponding physical layout contract.
     pub fn physical_bytes(&self) -> Result<u64, VNextError> {
         let elements =
             checked_elements(&self.dimensions).ok_or_else(|| VNextError::InvalidExecutionPlan {
                 reason: format!("physical component `{}` size overflows u64", self.id),
             })?;
         match &self.encoding {
-            WeightEncoding::Dense { element_type } => elements
+            WeightEncoding::Dense { element_type }
+            | WeightEncoding::DenseAffine { element_type, .. } => elements
                 .checked_mul(element_type.size_bytes())
                 .ok_or_else(|| VNextError::InvalidExecutionPlan {
                     reason: format!("physical component `{}` byte size overflows u64", self.id),
                 }),
             WeightEncoding::Quantized(_) => Ok(elements),
+            WeightEncoding::BlockQuantized(spec) => {
+                spec.validate()?;
+                elements
+                    .checked_mul(u64::from(spec.bytes_per_block))
+                    .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                        reason: format!(
+                            "physical block component `{}` byte size overflows u64",
+                            self.id
+                        ),
+                    })
+            }
         }
     }
 
     pub fn dense_element_type(&self) -> Option<ElementType> {
-        match &self.encoding {
-            WeightEncoding::Dense { element_type } => Some(*element_type),
-            WeightEncoding::Quantized(_) => None,
-        }
+        self.encoding.dense_element_type()
     }
 
     pub fn physical_element_type(&self) -> ElementType {
@@ -134,10 +234,11 @@ pub enum PhysicalWeightPadding {
 }
 
 /// Storage geometry for one physical component binding. Strides are measured
-/// in the component's storage unit: elements for dense encodings and bytes for
-/// packed encodings. The component's declared dimensions describe its raw
-/// stored span, while this geometry maps the semantic component shape onto that
-/// span without inference or hidden padding.
+/// in the component's schema storage unit: elements for dense encodings,
+/// bytes for separate-component packing, and blocks for block quantization.
+/// The component's declared dimensions describe its raw stored span, while
+/// this geometry maps the semantic component shape onto that span without
+/// inference or hidden padding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalStorageLayout {
@@ -234,6 +335,28 @@ pub enum PhysicalWeightLayout {
         group_axis: u32,
         group_padding: PhysicalWeightPadding,
     },
+    /// One opaque, self-contained quantization block represents a fixed
+    /// number of logical values along `block_axis`. The bound component shape
+    /// is the padded logical shape with that axis divided by the block width.
+    BlockQuantized {
+        blocks: PhysicalWeightComponentBinding,
+        block_axis: u32,
+        block_padding: PhysicalWeightPadding,
+    },
+    /// A contiguous logical subrange on one axis is stored by reshaping that
+    /// subrange and permuting the reshape axes. This captures checkpoint
+    /// layouts such as grouped-to-tiled head order without a model flag,
+    /// synthetic index tensor, or eager repack.
+    AxisReshapePermutation {
+        values: Box<PhysicalWeightLayout>,
+        axis: u32,
+        logical_offset: u64,
+        extent: u64,
+        reshape: Vec<u64>,
+        /// Stored axis position -> reshaped logical axis, matching an
+        /// n-dimensional transpose/permute order.
+        stored_axis_order: Vec<u32>,
+    },
     Indexed {
         indices: AxisWeightComponent,
         values: Box<PhysicalWeightLayout>,
@@ -261,7 +384,9 @@ impl PhysicalWeightLayout {
                         .then_with(|| left.extents.cmp(&right.extents))
                 });
             }
-            Self::Indexed { values, .. } => values.normalize(),
+            Self::AxisReshapePermutation { values, .. } | Self::Indexed { values, .. } => {
+                values.normalize()
+            }
             Self::ExpertStack { experts, .. } => {
                 // Expert vector position is the expert index and is therefore
                 // semantic. Normalize descendants without sorting the vector.
@@ -269,7 +394,10 @@ impl PhysicalWeightLayout {
                     expert.normalize();
                 }
             }
-            Self::Dense { .. } | Self::Stored { .. } | Self::Quantized { .. } => {}
+            Self::Dense { .. }
+            | Self::Stored { .. }
+            | Self::Quantized { .. }
+            | Self::BlockQuantized { .. } => {}
         }
     }
 }
@@ -301,6 +429,251 @@ impl WeightTensorSpec {
     }
 }
 
+/// Provider-visible physical identity for one component of a resolved weight.
+/// Source file names are intentionally excluded: source provenance belongs to
+/// the prepared family fingerprint, while providers need shape, role, and ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedWeightComponentLayout {
+    component_id: WeightId,
+    role: WeightComponentRole,
+    physical_dimensions: Vec<u64>,
+    encoding: WeightEncoding,
+}
+
+impl ResolvedWeightComponentLayout {
+    fn from_component(component: &WeightComponentSpec) -> Self {
+        Self {
+            component_id: component.id.clone(),
+            role: component.role,
+            physical_dimensions: component.dimensions.clone(),
+            encoding: component.encoding.clone(),
+        }
+    }
+
+    fn as_component_spec(&self) -> WeightComponentSpec {
+        WeightComponentSpec {
+            id: self.component_id.clone(),
+            role: self.role,
+            external_names: vec![format!("resolved.{}", self.component_id)],
+            dimensions: self.physical_dimensions.clone(),
+            encoding: self.encoding.clone(),
+            required: true,
+        }
+    }
+
+    pub fn component_id(&self) -> &WeightId {
+        &self.component_id
+    }
+
+    pub const fn role(&self) -> WeightComponentRole {
+        self.role
+    }
+
+    pub fn physical_dimensions(&self) -> &[u64] {
+        &self.physical_dimensions
+    }
+
+    pub fn encoding(&self) -> &WeightEncoding {
+        &self.encoding
+    }
+
+    pub fn physical_bytes(&self) -> Result<u64, VNextError> {
+        self.as_component_spec().physical_bytes()
+    }
+
+    pub fn physical_element_type(&self) -> ElementType {
+        self.encoding
+            .dense_element_type()
+            .unwrap_or(ElementType::U8)
+    }
+}
+
+/// Immutable physical weight contract carried by an execution-plan binding.
+/// This prevents the provider boundary from collapsing a quantized/composite
+/// layout into only resource ranges and a synthetic `u8` dtype.
+///
+/// `schema_format_id` identifies the enclosing source or materialized schema.
+/// It is a planning compatibility key, not the physical ABI of every component
+/// referenced by this binding. Providers must decode components from
+/// `physical_layout` and `components`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedWeightBinding {
+    weight_id: WeightId,
+    #[serde(rename = "format_id")]
+    schema_format_id: WeightFormatId,
+    layout_id: WeightLayoutId,
+    schema_version: ContractVersion,
+    physical_layout: PhysicalWeightLayout,
+    components: Vec<ResolvedWeightComponentLayout>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedWeightBindingWire {
+    weight_id: WeightId,
+    format_id: WeightFormatId,
+    layout_id: WeightLayoutId,
+    schema_version: ContractVersion,
+    physical_layout: PhysicalWeightLayout,
+    components: Vec<ResolvedWeightComponentLayout>,
+}
+
+impl<'de> Deserialize<'de> for ResolvedWeightBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ResolvedWeightBindingWire::deserialize(deserializer)?;
+        let binding = Self {
+            weight_id: wire.weight_id,
+            schema_format_id: wire.format_id,
+            layout_id: wire.layout_id,
+            schema_version: wire.schema_version,
+            physical_layout: wire.physical_layout,
+            components: wire.components,
+        };
+        binding
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(binding)
+    }
+}
+
+impl ResolvedWeightBinding {
+    pub fn from_schema(schema: &WeightSchema, weight_id: &WeightId) -> Result<Self, VNextError> {
+        let tensor = schema
+            .tensor(weight_id)
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: format!("unknown logical weight `{weight_id}`"),
+            })?;
+        let mut components = schema
+            .physical_component_refs(weight_id)?
+            .into_iter()
+            .map(ResolvedWeightComponentLayout::from_component)
+            .collect::<Vec<_>>();
+        components.sort_by(|left, right| left.component_id.cmp(&right.component_id));
+        let binding = Self {
+            weight_id: weight_id.clone(),
+            schema_format_id: schema.format_id.clone(),
+            layout_id: schema.layout_id.clone(),
+            schema_version: schema.version,
+            physical_layout: tensor.physical_layout.clone(),
+            components,
+        };
+        binding.validate_structure()?;
+        binding.validate_logical(&tensor.dimensions, tensor.logical_element_type)?;
+        Ok(binding)
+    }
+
+    fn validate_structure(&self) -> Result<(), VNextError> {
+        validate_physical_layout_budget(&self.physical_layout).map_err(|reason| {
+            VNextError::InvalidExecutionPlan {
+                reason: format!("resolved weight `{}` layout: {reason}", self.weight_id),
+            }
+        })?;
+        let referenced = physical_component_ids(&self.physical_layout).map_err(|reason| {
+            VNextError::InvalidExecutionPlan {
+                reason: format!("resolved weight `{}` layout: {reason}", self.weight_id),
+            }
+        })?;
+        let component_ids = self
+            .components
+            .iter()
+            .map(|component| component.component_id.clone())
+            .collect::<BTreeSet<_>>();
+        let canonical_components = self
+            .components
+            .windows(2)
+            .all(|pair| pair[0].component_id < pair[1].component_id);
+        if self.schema_version.major == 0
+            || self.components.is_empty()
+            || !canonical_components
+            || component_ids.len() != self.components.len()
+            || component_ids != referenced
+            || self.components.iter().any(|component| {
+                component.physical_dimensions.is_empty()
+                    || component
+                        .physical_dimensions
+                        .iter()
+                        .any(|extent| *extent == 0)
+                    || component.physical_bytes().is_err()
+            })
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "resolved weight `{}` physical identity is invalid or non-canonical",
+                    self.weight_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_logical(
+        &self,
+        logical_dimensions: &[u64],
+        logical_element_type: ElementType,
+    ) -> Result<(), VNextError> {
+        self.validate_structure()?;
+        let schema = WeightSchema {
+            format_id: self.schema_format_id.clone(),
+            layout_id: self.layout_id.clone(),
+            version: self.schema_version,
+            components: self
+                .components
+                .iter()
+                .map(ResolvedWeightComponentLayout::as_component_spec)
+                .collect(),
+            tensors: vec![WeightTensorSpec {
+                id: self.weight_id.clone(),
+                dimensions: logical_dimensions.to_vec(),
+                logical_element_type,
+                physical_layout: self.physical_layout.clone(),
+                required: true,
+            }],
+        };
+        schema.validate(&ModelFamilyId::new("family.resolved-weight-binding")?)
+    }
+
+    pub fn weight_id(&self) -> &WeightId {
+        &self.weight_id
+    }
+
+    /// Enclosing schema/container identity used by provider selection.
+    ///
+    /// This must not be used to infer a bound component's physical encoding.
+    pub(crate) fn schema_format_id(&self) -> &WeightFormatId {
+        &self.schema_format_id
+    }
+
+    pub fn layout_id(&self) -> &WeightLayoutId {
+        &self.layout_id
+    }
+
+    pub const fn schema_version(&self) -> ContractVersion {
+        self.schema_version
+    }
+
+    pub fn physical_layout(&self) -> &PhysicalWeightLayout {
+        &self.physical_layout
+    }
+
+    pub fn components(&self) -> &[ResolvedWeightComponentLayout] {
+        &self.components
+    }
+
+    pub fn quantization_formats(&self) -> BTreeSet<super::QuantizationFormatId> {
+        self.components
+            .iter()
+            .filter_map(|component| match &component.encoding {
+                WeightEncoding::Quantized(spec) => Some(spec.format_id.clone()),
+                WeightEncoding::BlockQuantized(spec) => Some(spec.format_id.clone()),
+                WeightEncoding::Dense { .. } | WeightEncoding::DenseAffine { .. } => None,
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightSchema {
     pub format_id: WeightFormatId,
@@ -311,10 +684,7 @@ pub struct WeightSchema {
 }
 
 impl WeightSchema {
-    fn normalize(&mut self) {
-        for component in &mut self.components {
-            component.external_names.sort();
-        }
+    pub(crate) fn normalize(&mut self) {
         self.components
             .sort_by(|left, right| left.id.cmp(&right.id));
         for tensor in &mut self.tensors {
@@ -342,6 +712,7 @@ impl WeightSchema {
         let mut component_ids = BTreeSet::new();
         let mut names = BTreeSet::new();
         let mut components = BTreeMap::new();
+        let mut quantization_abis = BTreeMap::new();
         for component in &self.components {
             if !component_ids.insert(component.id.clone())
                 || component.external_names.is_empty()
@@ -361,6 +732,46 @@ impl WeightSchema {
             }
             if let WeightEncoding::Quantized(quantization) = &component.encoding {
                 quantization.validate()?;
+            }
+            if let WeightEncoding::BlockQuantized(quantization) = &component.encoding {
+                quantization.validate()?;
+            }
+            let quantization_format = match &component.encoding {
+                WeightEncoding::Quantized(spec) => Some(&spec.format_id),
+                WeightEncoding::BlockQuantized(spec) => Some(&spec.format_id),
+                WeightEncoding::Dense { .. } | WeightEncoding::DenseAffine { .. } => None,
+            };
+            if let Some(format_id) = quantization_format {
+                if let Some(existing) = quantization_abis.get(format_id) {
+                    if existing != &component.encoding {
+                        return Err(VNextError::InvalidModelConfig {
+                            family_id: family_id.to_string(),
+                            field: "weight_schema.components.encoding".to_owned(),
+                            reason: format!(
+                                "quantization format `{format_id}` maps to conflicting physical ABIs"
+                            ),
+                        });
+                    }
+                } else {
+                    quantization_abis.insert(format_id.clone(), component.encoding.clone());
+                }
+            }
+            if let WeightEncoding::DenseAffine { element_type, .. } = &component.encoding {
+                if component.role != WeightComponentRole::Values
+                    || !matches!(
+                        element_type,
+                        ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                    )
+                {
+                    return Err(VNextError::InvalidModelConfig {
+                        family_id: family_id.to_string(),
+                        field: "weight_schema.components.encoding".to_owned(),
+                        reason: format!(
+                            "affine dense component `{}` must be a floating-point value component",
+                            component.id
+                        ),
+                    });
+                }
             }
             component
                 .physical_bytes()
@@ -388,7 +799,10 @@ impl WeightSchema {
                     }
                 ),
                 WeightComponentRole::PackedValues => {
-                    matches!(component.encoding, WeightEncoding::Quantized(_))
+                    matches!(
+                        component.encoding,
+                        WeightEncoding::Quantized(_) | WeightEncoding::BlockQuantized(_)
+                    )
                 }
                 _ => true,
             };
@@ -443,12 +857,21 @@ impl WeightSchema {
         Ok(())
     }
 
+    pub fn fingerprint(&self) -> Result<String, VNextError> {
+        let bytes = serde_json::to_vec(self).map_err(|error| VNextError::Serialization {
+            context: "fingerprint weight schema",
+            message: error.to_string(),
+        })?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
     pub fn quantization_formats(&self) -> BTreeSet<super::QuantizationFormatId> {
         self.components
             .iter()
             .filter_map(|component| match &component.encoding {
                 WeightEncoding::Quantized(spec) => Some(spec.format_id.clone()),
-                WeightEncoding::Dense { .. } => None,
+                WeightEncoding::BlockQuantized(spec) => Some(spec.format_id.clone()),
+                WeightEncoding::Dense { .. } | WeightEncoding::DenseAffine { .. } => None,
             })
             .collect()
     }
@@ -582,6 +1005,8 @@ fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> Result<(), 
                     + usize::from(permutation.is_some())
                     + usize::from(codebook.is_some())
             }
+            PhysicalWeightLayout::BlockQuantized { .. } => 1,
+            PhysicalWeightLayout::AxisReshapePermutation { .. } => 0,
             PhysicalWeightLayout::Indexed { .. } => 1,
             PhysicalWeightLayout::Composite { .. } | PhysicalWeightLayout::ExpertStack { .. } => 0,
         };
@@ -602,7 +1027,8 @@ fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> Result<(), 
                     push_physical_layout_child(&mut stack, &part.layout, child_depth, visited)?;
                 }
             }
-            PhysicalWeightLayout::Indexed { values, .. } => {
+            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            | PhysicalWeightLayout::Indexed { values, .. } => {
                 push_physical_layout_child(&mut stack, values, child_depth, visited)?;
             }
             PhysicalWeightLayout::ExpertStack { experts, .. } => {
@@ -612,7 +1038,8 @@ fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> Result<(), 
             }
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
-            | PhysicalWeightLayout::Quantized { .. } => {}
+            | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }
     Ok(())
@@ -658,6 +1085,8 @@ fn physical_component_ids(layout: &PhysicalWeightLayout) -> Result<BTreeSet<Weig
                     insert_binding(binding);
                 }
             }
+            PhysicalWeightLayout::BlockQuantized { blocks, .. } => insert_binding(blocks),
+            PhysicalWeightLayout::AxisReshapePermutation { values, .. } => stack.push(values),
             PhysicalWeightLayout::Indexed {
                 indices, values, ..
             } => {
@@ -1153,12 +1582,11 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                     };
                     spec.clone()
                 };
-                let grouped_dimensions = self.grouped_dimensions(
-                    semantic_dimensions,
-                    group_padding,
-                    axis,
-                    u64::from(quantization.group_size),
-                )?;
+                let group_size = quantization
+                    .grouping
+                    .resolved_size(semantic_dimensions[axis]);
+                let grouped_dimensions =
+                    self.grouped_dimensions(semantic_dimensions, group_padding, axis, group_size)?;
                 let packed_bytes = checked_elements(&grouped_dimensions)
                     .and_then(|elements| {
                         elements.checked_mul(u64::from(quantization.bits_per_weight))
@@ -1186,7 +1614,7 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                 }
 
                 let mut group_shape = grouped_dimensions;
-                group_shape[axis] /= u64::from(quantization.group_size);
+                group_shape[axis] /= group_size;
                 let scales_component =
                     self.bind_component(scales, &group_shape, WeightComponentRole::Scales, depth)?;
                 if scales_component.dense_element_type() != Some(quantization.scale_type) {
@@ -1251,6 +1679,94 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                         );
                     }
                 }
+            }
+            PhysicalWeightLayout::BlockQuantized {
+                blocks,
+                block_axis,
+                block_padding,
+            } => {
+                if !matches!(
+                    logical_element_type,
+                    ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                ) {
+                    return Err(
+                        self.invalid("block-quantized logical weight dtype must be floating point")
+                    );
+                }
+                let axis = *block_axis as usize;
+                if axis >= semantic_dimensions.len() {
+                    return Err(self.invalid("block quantization axis is out of range"));
+                }
+                let quantization = {
+                    let component = self.component(&blocks.component_id)?;
+                    let WeightEncoding::BlockQuantized(spec) = &component.encoding else {
+                        return Err(self
+                            .invalid("block component does not carry a block quantization spec"));
+                    };
+                    spec.clone()
+                };
+                let mut block_dimensions = self.grouped_dimensions(
+                    semantic_dimensions,
+                    block_padding,
+                    axis,
+                    u64::from(quantization.logical_values_per_block),
+                )?;
+                block_dimensions[axis] /= u64::from(quantization.logical_values_per_block);
+                let component = self.bind_component(
+                    blocks,
+                    &block_dimensions,
+                    WeightComponentRole::PackedValues,
+                    depth,
+                )?;
+                if component.encoding != WeightEncoding::BlockQuantized(quantization) {
+                    return Err(
+                        self.invalid("block encoding changed while validating the physical layout")
+                    );
+                }
+            }
+            PhysicalWeightLayout::AxisReshapePermutation {
+                values,
+                axis,
+                logical_offset,
+                extent,
+                reshape,
+                stored_axis_order,
+            } => {
+                let axis = *axis as usize;
+                let end = logical_offset.checked_add(*extent);
+                let reshape_rank = reshape.len();
+                let order_is_permutation = stored_axis_order.len() == reshape_rank
+                    && stored_axis_order
+                        .iter()
+                        .all(|axis| (*axis as usize) < reshape_rank)
+                    && stored_axis_order
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == reshape_rank;
+                let order_is_identity = stored_axis_order
+                    .iter()
+                    .filter(|stored| reshape[**stored as usize] > 1)
+                    .copied()
+                    .eq(reshape
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(axis, extent)| (*extent > 1).then_some(axis as u32)));
+                if axis >= semantic_dimensions.len()
+                    || *extent == 0
+                    || end.is_none_or(|end| end > semantic_dimensions[axis])
+                    || reshape_rank < 2
+                    || reshape.iter().any(|dimension| *dimension == 0)
+                    || checked_elements(reshape) != Some(*extent)
+                    || !order_is_permutation
+                    || order_is_identity
+                {
+                    return Err(self.invalid(
+                        "axis reshape permutation has invalid range, shape, or stored axis order",
+                    ));
+                }
+                self.validate_layout(values, semantic_dimensions, logical_element_type, depth + 1)?;
             }
             PhysicalWeightLayout::Indexed {
                 indices,
@@ -1371,6 +1887,9 @@ pub struct StateSpec {
     pub tensor: ProgramTensorSpec,
     pub lifetime: StateLifetime,
     pub capacity_demand: StateCapacityDemand,
+    /// Initial contents required when a new logical state scope acquires
+    /// physical backing. This is semantic model state, not an allocator hint.
+    pub initialization: StateInitialization,
 }
 
 #[derive(Deserialize)]
@@ -1381,6 +1900,7 @@ struct StateSpecWire {
     tensor: ProgramTensorSpec,
     lifetime: StateLifetime,
     capacity_demand: StateCapacityDemand,
+    initialization: StateInitialization,
 }
 
 impl<'de> Deserialize<'de> for StateSpec {
@@ -1399,8 +1919,21 @@ impl<'de> Deserialize<'de> for StateSpec {
             tensor: wire.tensor,
             lifetime: wire.lifetime,
             capacity_demand: wire.capacity_demand,
+            initialization: wire.initialization,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateInitialization {
+    /// Core does not initialize the backing. The first consumer must fully
+    /// define every byte before it is read.
+    None,
+    /// Core zeroes each exact Sequence backing acquisition before its first
+    /// state consumer in the same ordered submission. Request-scope zeroing is
+    /// reserved until initialization dependencies can defer sibling sequences.
+    Zero,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1545,12 +2078,82 @@ impl CanonicalRational {
         })
     }
 
+    /// Parses a finite base-10 decimal or scientific-notation value without
+    /// routing through binary floating point.
+    pub fn from_decimal_str(raw: &str) -> Result<Self, VNextError> {
+        let normalized = raw.to_ascii_lowercase();
+        let (mantissa, exponent) = match normalized.split_once('e') {
+            Some((mantissa, exponent)) => (
+                mantissa,
+                exponent.parse::<i32>().map_err(|error| {
+                    invalid_decimal_rational(format!("invalid decimal exponent: {error}"))
+                })?,
+            ),
+            None => (normalized.as_str(), 0),
+        };
+        let (negative, mantissa) = if let Some(unsigned) = mantissa.strip_prefix('-') {
+            (true, unsigned)
+        } else {
+            (false, mantissa.strip_prefix('+').unwrap_or(mantissa))
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_decimal_rational(format!(
+                "invalid decimal rational {raw:?}"
+            )));
+        }
+
+        let digits = format!("{whole}{fraction}");
+        let mut magnitude = digits.parse::<u128>().map_err(|error| {
+            invalid_decimal_rational(format!("decimal numerator overflows: {error}"))
+        })?;
+        let fractional_digits = i32::try_from(fraction.len()).map_err(|_| {
+            invalid_decimal_rational("decimal rational has too many fractional digits")
+        })?;
+        let scale = fractional_digits
+            .checked_sub(exponent)
+            .ok_or_else(|| invalid_decimal_rational("decimal rational exponent overflows"))?;
+        let denominator = if scale >= 0 {
+            10_u128
+                .checked_pow(scale as u32)
+                .ok_or_else(|| invalid_decimal_rational("decimal rational denominator overflows"))?
+        } else {
+            magnitude = magnitude
+                .checked_mul(10_u128.checked_pow(scale.unsigned_abs()).ok_or_else(|| {
+                    invalid_decimal_rational("decimal rational numerator scale overflows")
+                })?)
+                .ok_or_else(|| invalid_decimal_rational("decimal rational numerator overflows"))?;
+            1
+        };
+        let signed = if negative {
+            -(i128::try_from(magnitude)
+                .map_err(|_| invalid_decimal_rational("decimal rational numerator exceeds i128"))?)
+        } else {
+            i128::try_from(magnitude)
+                .map_err(|_| invalid_decimal_rational("decimal rational numerator exceeds i128"))?
+        };
+        let numerator = i64::try_from(signed)
+            .map_err(|_| invalid_decimal_rational("decimal rational numerator exceeds i64"))?;
+        let denominator = u64::try_from(denominator)
+            .map_err(|_| invalid_decimal_rational("decimal rational denominator exceeds u64"))?;
+        Self::new(numerator, denominator)
+    }
+
     pub const fn numerator(self) -> i64 {
         self.numerator
     }
 
     pub const fn denominator(self) -> u64 {
         self.denominator
+    }
+}
+
+fn invalid_decimal_rational(reason: impl Into<String>) -> VNextError {
+    VNextError::InvalidExecutionPlan {
+        reason: reason.into(),
     }
 }
 
@@ -1600,10 +2203,24 @@ impl SemanticValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramNodeWorkSpec {
+    Fixed,
+    Tokens { value_id: ProgramValueId, axis: u32 },
+}
+
+impl ProgramNodeWorkSpec {
+    pub fn tokens(value_id: ProgramValueId, axis: u32) -> Self {
+        Self::Tokens { value_id, axis }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramNode {
     pub id: NodeId,
     pub operation_id: OperationId,
     pub required_version: ContractVersion,
+    pub work: ProgramNodeWorkSpec,
     pub inputs: Vec<ProgramValueId>,
     pub outputs: Vec<ProgramValueId>,
     pub attributes: BTreeMap<AttributeId, SemanticValue>,
@@ -1742,6 +2359,26 @@ impl ModelProgram {
                         field: "program.nodes.id".to_owned(),
                         reason: format!("duplicate node `{}`", node.id),
                     });
+                }
+                if let ProgramNodeWorkSpec::Tokens { value_id, .. } = &node.work {
+                    let source_count = node
+                        .inputs
+                        .iter()
+                        .chain(&node.outputs)
+                        .filter(|candidate| *candidate == value_id)
+                        .count();
+                    let is_state_or_weight = states.iter().any(|state| state.value_id == *value_id)
+                        || weights.iter().any(|weight| weight.value_id == *value_id);
+                    if source_count != 1 || is_state_or_weight {
+                        return Err(VNextError::InvalidModelConfig {
+                            family_id: family_id.to_string(),
+                            field: "program.nodes.work".to_owned(),
+                            reason: format!(
+                                "node `{}` token work source must identify one activation binding",
+                                node.id
+                            ),
+                        });
+                    }
                 }
                 if node
                     .inputs

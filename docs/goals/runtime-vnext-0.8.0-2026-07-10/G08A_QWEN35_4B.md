@@ -2,7 +2,7 @@
 
 ## 依赖与目标
 
-- 依赖：G03-G07
+- 依赖：S1/S2 已有 M1 CUDA live G01/G03/G04/G05/G06 slice；S3 补齐 M1 Metal；不等待全量 G03-G07
 - 下游：G08B
 - 目标：用 M1 完成第一个主模型 CUDA -> Metal vNext 产品纵切。
 

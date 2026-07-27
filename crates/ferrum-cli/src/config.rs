@@ -2,7 +2,7 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource};
+use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource, SequenceFitPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -190,12 +190,6 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub recurrent_state_max_slots: Option<usize>,
 
-    /// Legacy Qwen3.5 linear recurrent-state slot-pool size, equivalent to
-    /// `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS`. Prefer
-    /// `recurrent_state_max_slots` for new configs.
-    #[serde(default)]
-    pub qwen35_linear_state_max_slots: Option<usize>,
-
     /// Scheduler/model max batched-token budget, equivalent to
     /// `FERRUM_MAX_BATCHED_TOKENS`.
     #[serde(default)]
@@ -228,6 +222,11 @@ pub struct RuntimeCliConfig {
     /// equivalent to `FERRUM_BATCHED_GRAPH`.
     #[serde(default)]
     pub batched_graph: Option<bool>,
+
+    /// vNext reusable device-program policy override, equivalent to
+    /// `FERRUM_REUSABLE_EXECUTION`.
+    #[serde(default)]
+    pub reusable_execution: Option<bool>,
 
     /// Unified Llama/Gemma decode CUDA graph policy override,
     /// equivalent to `FERRUM_UNIFIED_GRAPH`.
@@ -361,6 +360,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub max_model_len: Option<usize>,
 
+    /// Sequence fit gate used before prefill admission.
+    #[serde(default)]
+    pub sequence_fit_policy: Option<SequenceFitPolicy>,
+
     /// Minimum MoE batch size for the batched expert path, equivalent to
     /// `FERRUM_MOE_BATCH_THRESHOLD`.
     #[serde(default)]
@@ -378,11 +381,6 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_RECURRENT_STATE_MAX_SLOTS",
             self.recurrent_state_max_slots,
-        );
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
-            self.qwen35_linear_state_max_slots,
         );
         push_usize_entry(
             &mut entries,
@@ -407,6 +405,11 @@ impl RuntimeCliConfig {
         );
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_REUSABLE_EXECUTION",
+            self.reusable_execution,
+        );
         push_bool_entry(&mut entries, "FERRUM_UNIFIED_GRAPH", self.unified_graph);
         push_bool_entry(
             &mut entries,
@@ -506,6 +509,12 @@ impl RuntimeCliConfig {
             self.fa2_native_inputs_sha256.as_deref(),
         );
         push_usize_entry(&mut entries, "FERRUM_MAX_MODEL_LEN", self.max_model_len);
+        push_string_entry(
+            &mut entries,
+            "FERRUM_SEQUENCE_FIT_POLICY",
+            self.sequence_fit_policy
+                .map(SequenceFitPolicy::as_runtime_value),
+        );
         push_usize_entry(
             &mut entries,
             "FERRUM_MOE_BATCH_THRESHOLD",
@@ -749,6 +758,7 @@ mod tests {
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
             batched_graph: Some(true),
+            reusable_execution: Some(false),
             unified_graph: Some(true),
             unified_graph_layers_only: Some(true),
             unified_graph_lm_head_eager: Some(true),
@@ -780,11 +790,12 @@ mod tests {
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             ),
             max_model_len: Some(4096),
+            sequence_fit_policy: Some(SequenceFitPolicy::FullInputMustFit),
             moe_batch_threshold: Some(4),
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 40);
+        assert_eq!(entries.len(), 42);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -825,6 +836,7 @@ mod tests {
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,
@@ -885,6 +897,10 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(
+            entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
+            "full-input-must-fit"
+        );
         assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
     }
 

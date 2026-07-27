@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,20 +34,106 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from runtime_vnext_active_timeline import ActiveTimelineError, derive_active_timeline
+except ModuleNotFoundError:
+    from scripts.release.runtime_vnext_active_timeline import (
+        ActiveTimelineError,
+        derive_active_timeline,
+    )
+
+try:
+    from jsonl_product_session import JsonlProductSession, JsonlSessionError, SessionCase
+except ModuleNotFoundError:
+    from scripts.release.jsonl_product_session import (
+        JsonlProductSession,
+        JsonlSessionError,
+        SessionCase,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = Path(__file__).resolve()
 RUNNER_REPO_PATH = RUNNER_PATH.relative_to(REPO_ROOT).as_posix()
+ACTIVE_TIMELINE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_active_timeline.py"
+ACTIVE_TIMELINE_REPO_PATH = ACTIVE_TIMELINE_PATH.relative_to(REPO_ROOT).as_posix()
+JSONL_SESSION_PATH = REPO_ROOT / "scripts/release/jsonl_product_session.py"
+JSONL_SESSION_REPO_PATH = JSONL_SESSION_PATH.relative_to(REPO_ROOT).as_posix()
 EXPECTATIONS_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json"
 EXPECTATIONS_REPO_PATH = EXPECTATIONS_PATH.relative_to(REPO_ROOT).as_posix()
 FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
+C20_REMOTE_MEDIA_URL = (
+    "https://raw.githubusercontent.com/sizzlecar/ferrum-infer-rs/"
+    f"{FROZEN_LEGACY_SHA}/docs/bench/framework-validation-2026-05-25/m3_layerwise.png"
+)
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G00 SCENARIOS PASS"
+CANDIDATE_PASS_PREFIX = "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS"
+C09_DIAGNOSTIC_KEEP_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC KEEP"
+C09_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC REJECT"
+FOCUSED_DIAGNOSTIC_KEEP_PREFIX = "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP"
+FOCUSED_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC REJECT"
 SCHEMA_VERSION = 1
+LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
+G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
+EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
+CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
+CANDIDATE_BUILD_COMMANDS = {
+    "cuda": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--jobs",
+        "4",
+        "-p",
+        "ferrum-cli",
+        "--bin",
+        "ferrum",
+        "--features",
+        "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
+    ],
+    "metal": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--jobs",
+        "4",
+        "-p",
+        "ferrum-cli",
+        "--bin",
+        "ferrum",
+        "--features",
+        "metal",
+    ],
+}
+CANDIDATE_BUILD_PROBES = {
+    "cuda": {"cargo", "rustc", "nvcc", "nvidia_smi"},
+    "metal": {"cargo", "rustc", "xcodebuild", "system_profiler"},
+}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+CASE_ID_RE = re.compile(r"^c(?:0[1-9]|1[0-9]|2[01])-[0-9]{3}$")
 SCENARIO_IDS = tuple(f"C{index:02d}" for index in range(1, 22))
+SERVE_ISOLATION_BOUNDARIES = frozenset({"C09"})
+EXPECTATION_SELECTOR_FIELDS = ("scenario_id", "variant", "preset", "entrypoint", "case_id")
 EXPECTED_STATUSES = {"pass", "known-fail", "blocked", "discovery-required"}
+C03_CONTRACT_ID = "c03-exact-identifier-v2"
+C09_NOT_ADMITTED_SAFE = "not_admitted_safe"
+C09_ADMITTED_RELEASED = "admitted_released"
+C09_TERMINAL_OUTCOMES = frozenset(
+    {C09_NOT_ADMITTED_SAFE, C09_ADMITTED_RELEASED}
+)
+C09_ADMISSION_TIMEOUT_SEC = 5.0
+C09_NOT_ADMITTED_OBSERVATION_SEC = 0.25
+C09_TRACE_TIMEOUT_SEC = 5.0
+C09_DIAGNOSTIC_VARIANTS = ("cancel", "timeout", "disconnect")
+C17_MARKERS = {
+    "chinese": "中文正确",
+    "emoji": "🙂🚀",
+    "combining": "x\u0301",
+}
 BLOCKED_LANE_FAILURE_CLASSES = {
     "m1-qwen35-4b/metal": "legacy-model-backend-unsupported",
     "m2-qwen35-35b-a3b/metal": "legacy-model-backend-unsupported",
@@ -63,6 +150,20 @@ BLOCKER_MARKERS = (
     "<unk>",
     "[pad",
 )
+C18_PANIC_RE = re.compile(
+    r"(?:thread .{0,120} panicked|panicked at|fatal runtime error:|panic!\s*\()",
+    re.IGNORECASE,
+)
+C18_OOM_RE = re.compile(
+    r"(?:out[ -]of[ -]memory|\bcuda\s+oom\b|\bmetal\s+oom\b|"
+    r"memory allocation (?:failed|failure)|allocator exhaustion)",
+    re.IGNORECASE,
+)
+C18_TRACE_SCOPE_SELFTEST_PASS_LINE = (
+    "FERRUM RUNTIME VNEXT C18 TRACE SCOPE SELFTEST PASS"
+)
+C18_PRODUCT_REQUEST_PREFIX = "request.product."
+C18_FIXTURE_TRACE_START_UNIX_NS = 1_700_000_000_000_000_000
 CHILD_ENV_ALLOWLIST = frozenset(
     {
         "CUDA_HOME",
@@ -97,6 +198,14 @@ EXPECTED_ARCHITECTURES = {
     "m2-qwen35-35b-a3b": {"qwen3_5_moe", "qwen3_5_moe_text"},
     "m3-qwen3-30b-a3b": {"qwen3", "qwen3_moe"},
 }
+REQUIRED_ACTIVE_FLOORS = {
+    ("m1-qwen35-4b", "cuda"): 32,
+    ("m1-qwen35-4b", "metal"): 16,
+    ("m2-qwen35-35b-a3b", "cuda"): 16,
+    ("m2-qwen35-35b-a3b", "metal"): 4,
+    ("m3-qwen3-30b-a3b", "cuda"): 32,
+    ("m3-qwen3-30b-a3b", "metal"): 16,
+}
 
 
 class ScenarioError(RuntimeError):
@@ -127,6 +236,19 @@ def require_count(value: Any, label: str, *, minimum: int = 0) -> int:
     require(isinstance(value, int) and not isinstance(value, bool), f"{label} must be an integer")
     require(value >= minimum, f"{label} must be >= {minimum}")
     return value
+
+
+def validate_c17_markers() -> None:
+    require(set(C17_MARKERS) == {"chinese", "emoji", "combining"}, "C17 marker classes drifted")
+    combining = C17_MARKERS["combining"]
+    require(
+        unicodedata.normalize("NFC", combining) == combining,
+        "C17 combining marker must be stable under tokenizer NFC normalization",
+    )
+    require(
+        any(unicodedata.combining(character) > 0 for character in combining),
+        "C17 combining marker must contain a combining scalar",
+    )
 
 
 def require_sha256(value: Any, label: str) -> str:
@@ -317,13 +439,95 @@ def frozen_tree_sha() -> str:
     return tree
 
 
-def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
+def execution_contract(data: dict[str, Any], label: str) -> str:
+    contract = data.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+    require(contract in EXECUTION_CONTRACTS, f"{label}.execution_contract is invalid")
+    return str(contract)
+
+
+def pass_prefix_for_contract(contract: str) -> str:
+    require(contract in EXECUTION_CONTRACTS, "execution contract is invalid")
+    return CANDIDATE_PASS_PREFIX if contract == G08_EXECUTION_CONTRACT else PASS_PREFIX
+
+
+def candidate_expectations_catalog(source_git_sha: str) -> dict[str, Any]:
+    require_git_sha(source_git_sha, "candidate expectations source_git_sha")
+    goals = {
+        "m1-qwen35-4b": "G08A",
+        "m2-qwen35-35b-a3b": "G08B",
+        "m3-qwen3-30b-a3b": "G08C",
+    }
+    lanes: dict[str, Any] = {}
+    for model_key, goal in goals.items():
+        for backend in ("cuda", "metal"):
+            lanes[f"{model_key}/{backend}"] = {
+                "rules": [
+                    {
+                        "selector": {
+                            "scenario_id": "*",
+                            "variant": "*",
+                            "preset": "*",
+                            "entrypoint": "*",
+                            "case_id": "*",
+                        },
+                        "expected_status": "pass",
+                        "failure_class": None,
+                        "downstream_goal": goal,
+                        "owner": "runtime-vnext-model-matrix",
+                        "evidence_basis": "G08 candidate execution requires every C01-C21 case to pass.",
+                        "next_action": "Reject the candidate on the first failed product-path case.",
+                    }
+                ]
+            }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "execution_contract": G08_EXECUTION_CONTRACT,
+        "catalog_id": "runtime-vnext-g08-model-matrix",
+        "source_git_sha": source_git_sha,
+        "status_vocabulary": {
+            "pass": "Candidate behavior satisfies the case oracle.",
+            "known-fail": "Forbidden for G08 candidate evidence.",
+            "blocked": "Forbidden for G08 candidate evidence.",
+            "discovery-required": "Forbidden for G08 candidate evidence.",
+        },
+        "resolution_policy": {
+            "wildcard": "*",
+            "selector_order": list(EXPECTATION_SELECTOR_FIELDS),
+        },
+        "blocked_lane_policy": {
+            "allowed_lane_failure_classes": BLOCKED_LANE_FAILURE_CLASSES,
+            "forbidden_lanes": [
+                "m1-qwen35-4b/cuda",
+                "m2-qwen35-35b-a3b/cuda",
+                "m3-qwen3-30b-a3b/cuda",
+                "m3-qwen3-30b-a3b/metal",
+            ],
+        },
+        "lanes": lanes,
+    }
+
+
+def validate_expectations_catalog(
+    catalog: dict[str, Any],
+    *,
+    expected_contract: str | None = None,
+) -> dict[str, Any]:
+    contract = execution_contract(catalog, "expectations catalog")
+    if expected_contract is not None:
+        require(contract == expected_contract, "expectations catalog execution contract mismatch")
     require(catalog.get("schema_version") == SCHEMA_VERSION, "legacy expectations schema_version mismatch")
-    require(catalog.get("source_git_sha") == FROZEN_LEGACY_SHA, "legacy expectations source SHA mismatch")
+    if contract == LEGACY_EXECUTION_CONTRACT:
+        require(catalog.get("source_git_sha") == FROZEN_LEGACY_SHA, "legacy expectations source SHA mismatch")
+    else:
+        require_git_sha(catalog.get("source_git_sha"), "candidate expectations source SHA")
     vocabulary = require_object(catalog.get("status_vocabulary"), "legacy expectations status_vocabulary")
     require(set(vocabulary) == EXPECTED_STATUSES, "legacy expectations status vocabulary mismatch")
     policy = require_object(catalog.get("resolution_policy"), "legacy expectations resolution_policy")
     require(policy.get("wildcard") == "*", "legacy expectations wildcard must be '*'")
+    require(
+        policy.get("selector_order") == list(EXPECTATION_SELECTOR_FIELDS),
+        "legacy expectations selector order mismatch",
+    )
     blocked_policy = require_object(catalog.get("blocked_lane_policy"), "legacy expectations blocked_lane_policy")
     require(
         blocked_policy.get("allowed_lane_failure_classes") == BLOCKED_LANE_FAILURE_CLASSES,
@@ -358,14 +562,22 @@ def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
                 f"{label} fields mismatch",
             )
             selector = require_object(rule.get("selector"), f"{label}.selector")
-            require(set(selector) == {"scenario_id", "variant", "preset"}, f"{label}.selector fields mismatch")
+            require(set(selector) == set(EXPECTATION_SELECTOR_FIELDS), f"{label}.selector fields mismatch")
             scenario = selector.get("scenario_id")
             require(scenario == "*" or scenario in SCENARIO_IDS, f"{label} scenario selector invalid")
             require(isinstance(selector.get("variant"), str) and selector["variant"], f"{label} variant selector invalid")
             preset = selector.get("preset")
             require(preset in {"*", "none", "P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"}, f"{label} preset selector invalid")
+            entrypoint = selector.get("entrypoint")
+            require(entrypoint in {"*", "run", "serve"}, f"{label} entrypoint selector invalid")
+            case_id = selector.get("case_id")
+            require(case_id == "*" or (isinstance(case_id, str) and CASE_ID_RE.fullmatch(case_id) is not None), f"{label} case_id selector invalid")
+            if case_id != "*" and scenario != "*":
+                require(case_id[:3].upper() == scenario, f"{label} case_id selector does not belong to its scenario")
             status = rule.get("expected_status")
             require(status in EXPECTED_STATUSES, f"{label} expected_status invalid")
+            if contract == G08_EXECUTION_CONTRACT:
+                require(status == "pass", f"{label} G08 candidate expectation must declare pass")
             if status == "blocked":
                 require(
                     BLOCKED_LANE_FAILURE_CLASSES.get(lane_key) == rule.get("failure_class"),
@@ -390,6 +602,8 @@ def resolve_expectation(
     scenario_id: str,
     variant: str,
     preset: str | None,
+    entrypoint: str,
+    case_id: str,
 ) -> dict[str, Any]:
     lane_key = f"{model_key}/{backend}"
     lane = require_object(require_object(catalog["lanes"], "legacy expectations lanes").get(lane_key), f"legacy expectation lane {lane_key}")
@@ -398,21 +612,37 @@ def resolve_expectation(
     for rule_raw in require_list(lane.get("rules"), f"legacy expectation lane {lane_key}.rules"):
         rule = require_object(rule_raw, f"legacy expectation lane {lane_key} rule")
         selector = require_object(rule.get("selector"), "legacy expectation selector")
-        values = ((selector["scenario_id"], scenario_id), (selector["variant"], variant), (selector["preset"], preset_key))
+        values = (
+            (selector["scenario_id"], scenario_id),
+            (selector["variant"], variant),
+            (selector["preset"], preset_key),
+            (selector["entrypoint"], entrypoint),
+            (selector["case_id"], case_id),
+        )
         if all(selected == "*" or selected == actual for selected, actual in values):
             matches.append((sum(selected != "*" for selected, _ in values), rule))
-    require(matches, f"legacy expectations do not cover {lane_key}/{scenario_id}/{variant}/{preset_key}")
+    case_label = f"{lane_key}/{scenario_id}/{variant}/{preset_key}/{entrypoint}/{case_id}"
+    require(matches, f"legacy expectations do not cover {case_label}")
     specificity = max(score for score, _ in matches)
     winners = [rule for score, rule in matches if score == specificity]
-    require(len(winners) == 1, f"legacy expectations are ambiguous for {lane_key}/{scenario_id}/{variant}/{preset_key}")
+    require(len(winners) == 1, f"legacy expectations are ambiguous for {case_label}")
     return winners[0]
 
 
 def canonical_expectations_sha256() -> str:
-    validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
+    validate_expectations_catalog(
+        read_json(EXPECTATIONS_PATH),
+        expected_contract=LEGACY_EXECUTION_CONTRACT,
+    )
     checked_in = git_bytes(["show", f"HEAD:{EXPECTATIONS_REPO_PATH}"])
     require(checked_in == EXPECTATIONS_PATH.read_bytes(), "legacy expectations differ from checked-in blob")
     return hashlib.sha256(checked_in).hexdigest()
+
+
+def candidate_expectations_bytes(source_git_sha: str) -> bytes:
+    catalog = candidate_expectations_catalog(source_git_sha)
+    validate_expectations_catalog(catalog, expected_contract=G08_EXECUTION_CONTRACT)
+    return (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def canonical_runner_identity() -> dict[str, Any]:
@@ -423,12 +653,36 @@ def canonical_runner_identity() -> dict[str, Any]:
     blob_sha = require_git_sha(git_text(["rev-parse", f"HEAD:{RUNNER_REPO_PATH}"]), "runner.git_blob_sha")
     checked_in = git_bytes(["show", f"HEAD:{RUNNER_REPO_PATH}"])
     require(checked_in == RUNNER_PATH.read_bytes(), "scenario runner differs from its checked-in blob")
+    dependencies = []
+    for index, (path, repo_path) in enumerate(
+        (
+            (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
+            (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
+        )
+    ):
+        dependency_blob_sha = require_git_sha(
+            git_text(["rev-parse", f"HEAD:{repo_path}"]),
+            f"runner.dependencies[{index}].git_blob_sha",
+        )
+        dependency_checked_in = git_bytes(["show", f"HEAD:{repo_path}"])
+        require(
+            dependency_checked_in == path.read_bytes(),
+            f"runner dependency {repo_path} differs from its checked-in blob",
+        )
+        dependencies.append(
+            {
+                "path": repo_path,
+                "git_blob_sha": dependency_blob_sha,
+                "sha256": hashlib.sha256(dependency_checked_in).hexdigest(),
+            }
+        )
     return {
         "path": RUNNER_REPO_PATH,
         "git_sha": git_sha,
         "source_tree_sha": tree_sha,
         "git_blob_sha": blob_sha,
         "sha256": hashlib.sha256(checked_in).hexdigest(),
+        "dependencies": dependencies,
         "dirty_status": {"is_dirty": False, "status_short": []},
     }
 
@@ -440,6 +694,17 @@ def internal_fixture_runner_identity() -> dict[str, Any]:
         "source_tree_sha": frozen_tree_sha(),
         "git_blob_sha": "0" * 40,
         "sha256": file_sha256(RUNNER_PATH),
+        "dependencies": [
+            {
+                "path": path,
+                "git_blob_sha": "0" * 40,
+                "sha256": file_sha256(file_path),
+            }
+            for file_path, path in (
+                (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
+                (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
+            )
+        ],
         "dirty_status": {"is_dirty": False, "status_short": []},
         "internal_fixture": True,
     }
@@ -477,6 +742,7 @@ def validate_artifact_ref(
     label: str,
     *,
     allowed_kinds: set[str] | None = None,
+    allow_empty: bool = False,
 ) -> tuple[Path, str, Any | None]:
     ref = require_object(raw, label)
     kind = require_string(ref.get("kind"), f"{label}.kind")
@@ -484,7 +750,7 @@ def validate_artifact_ref(
         require(kind in allowed_kinds, f"{label}.kind {kind!r} is not allowed")
     path = artifact_path(root, ref.get("path"), f"{label}.path")
     require(path.is_file(), f"{label} missing artifact: {path}")
-    require(path.stat().st_size > 0, f"{label} artifact is empty: {path}")
+    require(allow_empty or path.stat().st_size > 0, f"{label} artifact is empty: {path}")
     expected = require_sha256(ref.get("sha256"), f"{label}.sha256")
     require(file_sha256(path) == expected, f"{label} artifact SHA256 mismatch")
     parsed: Any | None = None
@@ -495,18 +761,236 @@ def validate_artifact_ref(
             raise ScenarioError(f"{label} does not contain valid UTF-8 JSON: {exc}") from exc
         require(isinstance(parsed, (dict, list)) and bool(parsed), f"{label} JSON must be a non-empty object or array")
     elif kind in LOG_KINDS:
-        require(path.stat().st_size >= 16, f"{label} log is too small to be credible evidence")
+        require(allow_empty or path.stat().st_size >= 16, f"{label} log is too small to be credible evidence")
         text = path.read_text(encoding="utf-8", errors="replace").lower()
         require(not any(marker in text for marker in BLOCKER_MARKERS), f"{label} log contains a release blocker")
     return path, kind, parsed
 
 
-def validate_source_identity(data: dict[str, Any], label: str) -> None:
-    require(data.get("source_git_sha") == FROZEN_LEGACY_SHA, f"{label}.source_git_sha is not the frozen legacy SHA")
-    require(data.get("source_tree_sha") == frozen_tree_sha(), f"{label}.source_tree_sha mismatch")
+def validate_source_identity(
+    data: dict[str, Any],
+    label: str,
+    *,
+    allow_internal_fixture: bool = False,
+) -> str:
+    contract = execution_contract(data, label)
+    source_git_sha = require_git_sha(data.get("source_git_sha"), f"{label}.source_git_sha")
+    source_tree_sha = require_git_sha(data.get("source_tree_sha"), f"{label}.source_tree_sha")
+    if contract == LEGACY_EXECUTION_CONTRACT:
+        require(source_git_sha == FROZEN_LEGACY_SHA, f"{label}.source_git_sha is not the frozen legacy SHA")
+        require(source_tree_sha == frozen_tree_sha(), f"{label}.source_tree_sha mismatch")
+    else:
+        expected_tree = require_git_sha(
+            git_text(["rev-parse", f"{source_git_sha}^{{tree}}"]),
+            f"{label}.source_tree_sha",
+        )
+        require(source_tree_sha == expected_tree, f"{label}.source_tree_sha mismatch")
+        if not allow_internal_fixture:
+            current_sha = require_git_sha(git_text(["rev-parse", "HEAD"]), f"{label}.current_git_sha")
+            require(source_git_sha == current_sha, f"{label}.source_git_sha is not the current candidate SHA")
+            require(
+                not git_text(["status", "--short", "--untracked-files=all"]),
+                f"{label} candidate worktree must be clean",
+            )
     dirty = require_object(data.get("dirty_status"), f"{label}.dirty_status")
-    require(dirty.get("is_dirty") is False, f"{label} dirty legacy source is forbidden")
+    require(dirty.get("is_dirty") is False, f"{label} dirty source is forbidden")
     require(dirty.get("status_short") == [], f"{label}.dirty_status.status_short must be empty")
+    return contract
+
+
+def validate_candidate_build_receipt(
+    root: Path,
+    raw: Any,
+    *,
+    expected: dict[str, Any],
+    allow_internal_fixture: bool,
+) -> tuple[dict[str, Any], Path, str, Path]:
+    receipt_path, _, parsed = validate_artifact_ref(
+        root,
+        raw,
+        "candidate binary build receipt",
+        allowed_kinds={"raw-json"},
+    )
+    receipt = require_object(parsed, "candidate binary build receipt JSON")
+    require(receipt.get("schema_version") == SCHEMA_VERSION, "candidate build receipt schema_version mismatch")
+    require(receipt.get("artifact_type") == CANDIDATE_BUILD_RECEIPT_TYPE, "candidate build receipt artifact_type mismatch")
+    require(receipt.get("status") == "pass", "candidate build receipt status must be pass")
+    require(
+        validate_source_identity(
+            receipt,
+            "candidate binary build receipt",
+            allow_internal_fixture=allow_internal_fixture,
+        )
+        == G08_EXECUTION_CONTRACT,
+        "candidate build receipt execution contract mismatch",
+    )
+    for key in ("source_git_sha", "source_tree_sha", "hardware_id"):
+        require(receipt.get(key) == expected.get(key), f"candidate build receipt {key} mismatch")
+    backend = require_string(expected.get("backend"), "candidate build expected backend")
+    require(backend in CANDIDATE_BUILD_COMMANDS, "candidate build expected backend is unsupported")
+    require(receipt.get("backend") == backend, "candidate build receipt backend mismatch")
+    build_command = CANDIDATE_BUILD_COMMANDS[backend]
+    require(receipt.get("command") == build_command, "candidate build command is not canonical")
+    require(receipt.get("returncode") == 0, "candidate build returncode must be 0")
+    recorded_artifact_root = Path(
+        require_string(receipt.get("artifact_root"), "candidate build artifact_root")
+    )
+    recorded_repository_root = Path(
+        require_string(receipt.get("repository_root"), "candidate build repository_root")
+    )
+    require(recorded_artifact_root.is_absolute(), "candidate build artifact_root must be absolute")
+    require(recorded_repository_root.is_absolute(), "candidate build repository_root must be absolute")
+    source_observations = require_object(
+        receipt.get("source_observations"),
+        "candidate build source_observations",
+    )
+    require(set(source_observations) == {"before", "after"}, "candidate build source observations must contain before/after")
+    for phase in ("before", "after"):
+        observation = require_object(
+            source_observations.get(phase),
+            f"candidate build source_observations.{phase}",
+        )
+        require(
+            observation
+            == {
+                "source_git_sha": receipt["source_git_sha"],
+                "source_tree_sha": receipt["source_tree_sha"],
+                "dirty_status": {"is_dirty": False, "status_short": []},
+            },
+            f"candidate build source observation {phase} is not the bound clean source",
+        )
+    started = parse_timestamp(receipt.get("started_at"), "candidate build started_at")
+    finished = parse_timestamp(receipt.get("finished_at"), "candidate build finished_at")
+    require(finished > started, "candidate build time window is not positive")
+    duration = receipt.get("duration_sec")
+    actual_duration = (finished - started).total_seconds()
+    require(
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and math.isfinite(float(duration))
+        and float(duration) > 0
+        and abs(float(duration) - actual_duration) <= max(0.1, actual_duration * 0.01),
+        "candidate build duration does not match timestamps",
+    )
+    binary_path, _, _ = validate_artifact_ref(
+        root,
+        receipt.get("binary_artifact"),
+        "candidate build binary",
+        allowed_kinds={"binary"},
+    )
+    binary_sha = require_sha256(receipt.get("binary_sha256"), "candidate build binary_sha256")
+    require(file_sha256(binary_path) == binary_sha, "candidate build binary SHA mismatch")
+    require(binary_sha == expected.get("binary_sha256"), "candidate build binary differs from execution manifest")
+    if "binary_path" in expected:
+        require(binary_path == expected["binary_path"], "candidate build binary path differs from execution manifest")
+
+    bounded_path, _, bounded_raw = validate_artifact_ref(
+        root,
+        receipt.get("bounded_receipt"),
+        "candidate build bounded receipt",
+        allowed_kinds={"raw-json"},
+    )
+    bounded = require_object(bounded_raw, "candidate build bounded receipt JSON")
+    require(bounded.get("schema") == "ferrum.bounded-command-receipt.v1", "candidate build bounded receipt schema mismatch")
+    require(bounded.get("command") == build_command, "candidate bounded build command mismatch")
+    require(
+        Path(require_string(bounded.get("cwd"), "candidate bounded build cwd"))
+        == recorded_repository_root,
+        "candidate bounded build cwd differs from the recorded repository root",
+    )
+    require(bounded.get("status") == "pass" and bounded.get("rc") == 0, "candidate bounded build did not pass")
+    require(bounded.get("reason") == "command_completed", "candidate bounded build completion reason mismatch")
+    require(bounded.get("sampling_error_count") == 0 and bounded.get("sampling_errors") == [], "candidate bounded build contains sampling errors")
+    require(bounded.get("violation") is None, "candidate bounded build records a resource violation")
+    termination = require_object(bounded.get("termination"), "candidate bounded build termination")
+    require(
+        termination.get("signals") == [] and termination.get("errors") == [],
+        "candidate bounded build required termination or cleanup recovery",
+    )
+    require_count(bounded.get("pid"), "candidate bounded build pid", minimum=1)
+    require_count(bounded.get("pgid"), "candidate bounded build pgid", minimum=1)
+    bounded_started = parse_timestamp(bounded.get("started_at"), "candidate bounded build started_at")
+    bounded_finished = parse_timestamp(bounded.get("ended_at"), "candidate bounded build ended_at")
+    require(bounded_started == started and bounded_finished == finished, "candidate build and bounded receipt windows differ")
+    bounded_duration = bounded.get("duration_seconds")
+    require(
+        isinstance(bounded_duration, (int, float))
+        and not isinstance(bounded_duration, bool)
+        and math.isfinite(float(bounded_duration))
+        and abs(float(bounded_duration) - actual_duration) <= max(0.1, actual_duration * 0.01),
+        "candidate bounded build duration does not match timestamps",
+    )
+    cleanup = require_object(bounded.get("cleanup"), "candidate bounded build cleanup")
+    require(cleanup.get("process_group_gone") is True, "candidate bounded build process group was not cleaned up")
+    limits = require_object(bounded.get("limits"), "candidate bounded build limits")
+    wall_timeout = limits.get("wall_timeout_seconds")
+    require(
+        isinstance(wall_timeout, (int, float))
+        and not isinstance(wall_timeout, bool)
+        and math.isfinite(float(wall_timeout))
+        and 0 < float(wall_timeout) <= 2700,
+        "candidate build wall timeout exceeds 45 minutes",
+    )
+    require(
+        require_count(limits.get("max_processes"), "candidate build max_processes", minimum=1) <= 64
+        and require_count(limits.get("max_group_threads"), "candidate build max_group_threads", minimum=1) <= 256
+        and require_count(limits.get("max_per_process_threads"), "candidate build max_per_process_threads", minimum=1) <= 64,
+        "candidate build process/thread limit is unsafe",
+    )
+    require_count(bounded.get("successful_samples"), "candidate bounded build successful_samples", minimum=1)
+    peaks = require_object(bounded.get("peaks"), "candidate bounded build peaks")
+    require(
+        require_count(peaks.get("processes"), "candidate build peak processes")
+        <= limits["max_processes"]
+        and require_count(peaks.get("group_threads"), "candidate build peak group threads")
+        <= limits["max_group_threads"]
+        and require_count(peaks.get("per_process_threads"), "candidate build peak per-process threads")
+        <= limits["max_per_process_threads"],
+        "candidate bounded build peaks exceed its limits",
+    )
+    build_log_bytes = 0
+    for name in ("stdout", "stderr"):
+        log_path, _, _ = validate_artifact_ref(
+            root,
+            receipt.get(name),
+            f"candidate build {name}",
+            allowed_kinds={f"{name}-log"},
+            allow_empty=True,
+        )
+        build_log_bytes += log_path.stat().st_size
+        bounded_identity = require_object(bounded.get(name), f"candidate bounded build {name}")
+        recorded_log_path = Path(
+            require_string(
+                bounded_identity.get("path"),
+                f"candidate bounded build {name}.path",
+            )
+        )
+        require(recorded_log_path.is_absolute(), f"candidate bounded build {name} path must be absolute")
+        try:
+            recorded_relative = recorded_log_path.relative_to(recorded_artifact_root)
+        except ValueError as exc:
+            raise ScenarioError(
+                f"candidate bounded build {name} path escapes the recorded artifact root"
+            ) from exc
+        require(
+            recorded_relative.as_posix()
+            == require_string(receipt[name].get("path"), f"candidate build {name}.path"),
+            f"candidate bounded build {name} relative path mismatch",
+        )
+        require(bounded_identity.get("sha256") == file_sha256(log_path), f"candidate bounded build {name} SHA mismatch")
+        require(bounded_identity.get("size_bytes") == log_path.stat().st_size, f"candidate bounded build {name} size mismatch")
+    require(build_log_bytes >= 16, "candidate bounded build stdout/stderr are both empty")
+    probes = require_object(receipt.get("probe_artifacts"), "candidate build probe_artifacts")
+    require(set(probes) == CANDIDATE_BUILD_PROBES[backend], "candidate build probe artifact set mismatch")
+    for name, ref in probes.items():
+        probe_path, _, _ = validate_artifact_ref(
+            root,
+            ref,
+            f"candidate build probe {name}",
+            allowed_kinds={"runtime-log"},
+        )
+        require(probe_path.read_text(encoding="utf-8", errors="strict").strip(), f"candidate build probe {name} is empty")
+    return receipt, receipt_path, file_sha256(receipt_path), binary_path
 
 
 def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[str, Any]:
@@ -531,6 +1015,44 @@ def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[
     expected_sha256 = hashlib.sha256(checked_in).hexdigest()
     require(runner.get("sha256") == expected_sha256, "scenario_report runner SHA256 mismatch")
     require(file_sha256(RUNNER_PATH) == expected_sha256, "scenario_report runner does not match the current gate contract")
+    dependencies = require_list(runner.get("dependencies"), "scenario_report.runner.dependencies")
+    expected_dependencies = (
+        (ACTIVE_TIMELINE_REPO_PATH, ACTIVE_TIMELINE_PATH),
+        (JSONL_SESSION_REPO_PATH, JSONL_SESSION_PATH),
+    )
+    require(
+        len(dependencies) == len(expected_dependencies),
+        "scenario_report runner dependency count mismatch",
+    )
+    for index, ((repo_path, local_path), dependency_raw) in enumerate(
+        zip(expected_dependencies, dependencies, strict=True)
+    ):
+        dependency = require_object(
+            dependency_raw,
+            f"scenario_report.runner.dependencies[{index}]",
+        )
+        require(
+            dependency.get("path") == repo_path,
+            f"scenario_report runner dependency {index} path mismatch",
+        )
+        dependency_blob = require_git_sha(
+            git_text(["rev-parse", f"{runner_git_sha}:{repo_path}"]),
+            f"scenario_report.runner.dependencies[{index}].git_blob_sha",
+        )
+        require(
+            dependency.get("git_blob_sha") == dependency_blob,
+            f"scenario_report runner dependency {index} git blob mismatch",
+        )
+        dependency_checked_in = git_bytes(["show", f"{runner_git_sha}:{repo_path}"])
+        dependency_sha256 = hashlib.sha256(dependency_checked_in).hexdigest()
+        require(
+            dependency.get("sha256") == dependency_sha256,
+            f"scenario_report runner dependency {index} SHA256 mismatch",
+        )
+        require(
+            file_sha256(local_path) == dependency_sha256,
+            f"scenario_report runner dependency {index} does not match current gate contract",
+        )
     return runner
 
 
@@ -543,7 +1065,15 @@ def validate_effective_config(
     path, _, parsed = validate_artifact_ref(root, raw, "scenario_report.effective_config", allowed_kinds={"raw-json"})
     config = require_object(parsed, "scenario_report.effective_config JSON")
     require(config.get("schema_version") == SCHEMA_VERSION, "effective config schema_version mismatch")
-    validate_source_identity(config, "effective_config")
+    config_contract = validate_source_identity(
+        config,
+        "effective_config",
+        allow_internal_fixture=bool(expected.get("allow_internal_fixture")),
+    )
+    require(
+        config_contract == expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT),
+        "effective_config.execution_contract mismatch",
+    )
     for key in (
         "models_lock_sha256",
         "binary_sha256",
@@ -576,6 +1106,38 @@ def validate_command(
     require(len(argv) >= 3 and all(isinstance(part, str) and part for part in argv), f"{label}.argv must include ferrum, entrypoint, and model/config args")
     require(Path(argv[0]).name == "ferrum", f"{label}.argv must execute ferrum")
     require(argv[1] == entrypoint, f"{label}.argv must have exact ferrum {entrypoint} command shape")
+    execution_mode = command.get("execution_mode")
+    resident_mode = entrypoint == "run" and execution_mode == "resident-jsonl"
+    if expected.get("execution_contract") == G08_EXECUTION_CONTRACT and entrypoint == "run":
+        require(resident_mode, f"{label} G08 run command must use resident-jsonl")
+    if resident_mode:
+        group_key = require_list(command.get("group_key"), f"{label}.group_key")
+        require(all(isinstance(value, str) and value for value in group_key), f"{label}.group_key must contain non-empty strings")
+        case_count = require_count(command.get("case_count"), f"{label}.case_count", minimum=1)
+        case_ids = require_list(command.get("case_ids"), f"{label}.case_ids")
+        require(
+            len(case_ids) == case_count
+            and len(set(case_ids)) == case_count
+            and all(isinstance(value, str) and CASE_ID_RE.fullmatch(value) for value in case_ids),
+            f"{label}.case_ids must be unique canonical case ids",
+        )
+        preset_aliases = require_list(command.get("preset_aliases"), f"{label}.preset_aliases")
+        require(
+            preset_aliases == sorted(set(preset_aliases))
+            and all(value in {"<none>", "P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"} for value in preset_aliases),
+            f"{label}.preset_aliases invalid",
+        )
+        validate_artifact_ref(
+            root,
+            command.get("wire_receipt"),
+            f"{label}.wire_receipt",
+            allowed_kinds={"raw-json"},
+        )
+    else:
+        require(
+            not ({"group_key", "case_count", "case_ids", "preset_aliases", "wire_receipt"} & set(command)),
+            f"{label} non-resident command contains resident metadata",
+        )
     if "binary_path" in expected:
         require(Path(argv[0]).resolve() == expected["binary_path"], f"{label}.argv binary is not the bound binary artifact")
         require(argv[2] == expected.get("model_path"), f"{label}.argv model path is not the bound execution model")
@@ -735,10 +1297,11 @@ def validate_assertions(scenario_id: str, raw: Any, *, case_count: int) -> None:
         require(assertions.get("conversation_count") == 6, "C07 must execute six isolated conversations")
         require(assertions.get("history_turn_count") == 30, "C07 must execute thirty history-carrying turns")
     elif scenario_id == "C09":
-        require(assertions.get("released_count") == case_count, "C09 cancel/timeout/disconnect release coverage incomplete")
+        require(assertions.get("admitted_released_count") == case_count, "C09 admitted cancel/timeout/disconnect release coverage incomplete")
+        require(assertions.get("not_admitted_safe_count") == 0, "C09 contains safe but unexercised pre-admission aborts")
         require(assertions.get("post_capacity_success_count") == case_count, "C09 post-cancel capacity recovery incomplete")
-        ticks = assertions.get("max_scheduler_ticks_to_release")
-        wall = assertions.get("max_wall_sec_to_release")
+        ticks = assertions.get("max_scheduler_ticks_to_terminal")
+        wall = assertions.get("max_wall_sec_to_terminal")
         require(isinstance(ticks, int) and not isinstance(ticks, bool) and 0 <= ticks <= 2, "C09 release must occur within 2 scheduler ticks")
         require(isinstance(wall, (int, float)) and not isinstance(wall, bool) and 0 <= wall <= 5, "C09 release must occur within 5 seconds")
     elif scenario_id in {"C10", "C11", "C12", "C13"}:
@@ -763,7 +1326,14 @@ def validate_assertions(scenario_id: str, raw: Any, *, case_count: int) -> None:
         require(assertions.get("serve_stream_count") == 4 and assertions.get("strict_schema_count") == 4 and assertions.get("json_object_count") == 4, "C21 serve subgroup coverage incomplete")
 
 
-def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, require_pass: bool = True) -> None:
+def validate_concurrency_cells(
+    backend: str,
+    raw: Any,
+    *,
+    case_count: int,
+    require_pass: bool = True,
+    require_resource_balance: bool = False,
+) -> None:
     cells = require_list(raw, "C18.concurrency_cells")
     expected = {1, 4, 16, 32} if backend == "cuda" else {1, 4, 16}
     seen: set[int] = set()
@@ -774,16 +1344,87 @@ def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, requi
         require(requested in expected and requested not in seen, f"C18 invalid or duplicate concurrency cell {requested}")
         seen.add(requested)
         count = require_count(cell.get("case_count"), f"C18.c{requested}.case_count", minimum=1)
+        rate = cell.get("completion_rate")
+        require(
+            isinstance(rate, (int, float))
+            and not isinstance(rate, bool)
+            and math.isfinite(rate)
+            and 0 <= rate <= 1,
+            f"C18.c{requested} completion_rate invalid",
+        )
         if require_pass:
             require(cell.get("passed_count") == count, f"C18.c{requested} must pass every case")
-            require(cell.get("completion_rate") == 1.0, f"C18.c{requested} completion_rate must be 1.0")
+            request_count = require_count(
+                cell.get("request_count"),
+                f"C18.c{requested}.request_count",
+                minimum=1,
+            )
+            completed_request_count = require_count(
+                cell.get("completed_request_count"),
+                f"C18.c{requested}.completed_request_count",
+            )
+            require(request_count == requested, f"C18.c{requested} request_count mismatch")
+            require(
+                completed_request_count <= request_count,
+                f"C18.c{requested} completed request count exceeds request count",
+            )
+            require(
+                abs(float(rate) - completed_request_count / request_count) <= 1e-12,
+                f"C18.c{requested} completion_rate is not derived from requests",
+            )
+            require(
+                completed_request_count == request_count and rate == 1.0,
+                f"C18.c{requested} must complete every request",
+            )
         else:
             require_count(cell.get("passed_count"), f"C18.c{requested}.passed_count")
-            rate = cell.get("completion_rate")
-            require(isinstance(rate, (int, float)) and not isinstance(rate, bool) and 0 <= rate <= 1, f"C18.c{requested} completion_rate invalid")
         cap = require_count(cell.get("typed_admission_cap"), f"C18.c{requested}.typed_admission_cap", minimum=1)
-        active = require_count(cell.get("observed_max_active"), f"C18.c{requested}.observed_max_active", minimum=1)
+        active = require_count(
+            cell.get("observed_max_active"),
+            f"C18.c{requested}.observed_max_active",
+            minimum=1 if require_pass else 0,
+        )
         require(active <= min(requested, cap), f"C18.c{requested} observed max-active exceeds requested/cap")
+        if require_pass:
+            floor = require_count(
+                cell.get("active_floor"),
+                f"C18.c{requested}.active_floor",
+                minimum=1,
+            )
+            require(floor <= min(requested, cap), f"C18.c{requested} active floor exceeds requested/cap")
+            timeline = require_object(cell.get("active_timeline"), f"C18.c{requested}.active_timeline")
+            require(timeline.get("requested_concurrency") == requested, f"C18.c{requested} timeline request binding mismatch")
+            require(timeline.get("typed_active_cap") == cap, f"C18.c{requested} timeline cap binding mismatch")
+            require(timeline.get("active_floor") == floor, f"C18.c{requested} timeline floor binding mismatch")
+            require(timeline.get("observed_max_active") == active, f"C18.c{requested} timeline max-active mismatch")
+            eligible_ns = require_count(timeline.get("eligible_duration_ns"), f"C18.c{requested}.eligible_duration_ns", minimum=1)
+            active_ns = require_count(timeline.get("active_at_or_above_floor_duration_ns"), f"C18.c{requested}.active_duration_ns")
+            duty = timeline.get("active_duty_cycle")
+            require(isinstance(duty, (int, float)) and not isinstance(duty, bool) and math.isfinite(duty) and 0 <= duty <= 1, f"C18.c{requested} active duty-cycle invalid")
+            require(abs(float(duty) - active_ns / eligible_ns) <= 1e-12, f"C18.c{requested} active duty-cycle is not derived from durations")
+            coverage = require_object(timeline.get("request_transition_coverage"), f"C18.c{requested}.request_transition_coverage")
+            require(coverage == {"expected": requested, "open": requested, "close": requested, "active_count": requested * 2}, f"C18.c{requested} request transition coverage incomplete")
+            require_count(timeline.get("activity_observation_count"), f"C18.c{requested}.activity_observation_count", minimum=1)
+            if require_resource_balance:
+                validate_c18_resource_balance_summary(
+                    cell.get("resource_balance"),
+                    expected_request_count=requested,
+                    label=f"C18.c{requested}.resource_balance",
+                )
+            if requested == max(expected):
+                require(active >= floor, f"C18.c{requested} max-active is below floor")
+                require(duty >= 0.80, f"C18.c{requested} active duty-cycle is below 0.80")
+                if cap == floor:
+                    require(active == cap, f"C18.c{requested} max-active must equal typed cap")
+        else:
+            floor = cell.get("active_floor")
+            if floor is not None:
+                require_count(floor, f"C18.c{requested}.active_floor")
+            timeline = cell.get("active_timeline")
+            require(timeline is None or isinstance(timeline, dict), f"C18.c{requested}.active_timeline invalid")
+        if not require_resource_balance:
+            resource_balance = cell.get("resource_balance")
+            require(resource_balance is None or isinstance(resource_balance, dict), f"C18.c{requested}.resource_balance invalid")
         for field in ("error_count", "bad_output_count", "crosstalk_count", "bad_checksum_count", "server_500_count", "panic_count", "oom_count"):
             value = require_count(cell.get(field), f"C18.c{requested}.{field}")
             if require_pass:
@@ -818,6 +1459,43 @@ def response_message(response: dict[str, Any], label: str) -> tuple[dict[str, An
     return message, content or ""
 
 
+def validate_completion_usage(raw: Any, label: str) -> dict[str, Any]:
+    usage = require_object(raw, label)
+    prompt_tokens = require_count(
+        usage.get("prompt_tokens"), f"{label}.prompt_tokens", minimum=1
+    )
+    completion_tokens = require_count(
+        usage.get("completion_tokens"),
+        f"{label}.completion_tokens",
+        minimum=1,
+    )
+    total_tokens = require_count(
+        usage.get("total_tokens"), f"{label}.total_tokens", minimum=2
+    )
+    require(
+        total_tokens == prompt_tokens + completion_tokens,
+        f"{label}.total_tokens is not prompt_tokens + completion_tokens",
+    )
+    return usage
+
+
+def history_response_message(exchange: dict[str, Any], label: str, errors: list[dict[str, Any]]) -> dict[str, Any] | None:
+    raw_response = exchange.get("response")
+    try:
+        response = require_object(raw_response, f"{label}.response")
+        message, _ = response_message(response, label)
+        return message
+    except ScenarioError as exc:
+        errors.append(
+            {
+                "label": label,
+                "error": str(exc),
+                "response_sha256": canonical_json_sha256(raw_response),
+            }
+        )
+        return None
+
+
 def validate_case_output(
     scenario_id: str,
     variant: str,
@@ -830,6 +1508,7 @@ def validate_case_output(
     input_document: dict[str, Any] | None = None,
     actual_config: dict[str, Any] | None = None,
     artifact_root: Path | None = None,
+    require_c18_resource_balance: bool = False,
 ) -> None:
     stdout_text = stdout_path.read_text(encoding="utf-8")
     require(not any(marker in stdout_text.lower() for marker in BLOCKER_MARKERS), f"{label} stdout contains bad output")
@@ -845,9 +1524,21 @@ def validate_case_output(
         if scenario_id == "C02":
             require(assistants[-1].get("finish_reason") in {"stop", "eos"}, f"{label} did not end naturally")
         if scenario_id == "C03":
-            require(len(assistants) >= 3, f"{label} must contain three assistant turns")
+            require(len(assistants) == 3, f"{label} must contain exactly three assistant turns")
+            users = [row for row in rows if row.get("event") == "user"]
+            require(len(users) == 3, f"{label} must contain exactly three user turns")
+            require([row.get("turn") for row in users] == [0, 1, 2], f"{label} user turn sequence mismatch")
+            require([row.get("turn") for row in assistants] == [0, 1, 2], f"{label} assistant turn sequence mismatch")
             marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
-            require(marker in str(assistants[-1].get("content")), f"{label} did not recall its marker")
+            require(observed.get("contract_id") == C03_CONTRACT_ID, f"{label} C03 contract id mismatch")
+            require(
+                [row.get("content") for row in users] == c03_user_turns(marker),
+                f"{label} C03 user turns differ from the versioned contract",
+            )
+            require(
+                [row.get("content") for row in assistants] == c03_expected_assistant_turns(marker),
+                f"{label} C03 assistant turns differ from the versioned contract",
+            )
         if scenario_id == "C04":
             require(sum(require_count(row.get("n_tokens"), f"{label}.n_tokens", minimum=1) for row in assistants) >= 512, f"{label} long output is shorter than 512 tokens")
             require(any(require_count(row.get("chunk_count"), f"{label}.chunk_count", minimum=1) > 1 for row in assistants), f"{label} long output was not incremental")
@@ -871,17 +1562,38 @@ def validate_case_output(
                 )
             ready = [row for row in rows if row.get("event") == "ready"]
             require(len(ready) == 1, f"{label} C01 must record exactly one runtime model-resolution event")
-            require(ready[0].get("model") == observed.get("requested_model"), f"{label} runtime resolved a different model argument")
+            expected_identity = require_object(
+                require_object(input_document.get("resolution_probe"), f"{label}.resolution_probe").get("expected_source_identity"),
+                f"{label}.resolution_probe.expected_source_identity",
+            )
+            require(ready[0].get("requested_model") == observed.get("requested_model"), f"{label} ready event lost the raw requested model")
+            require(ready[0].get("resolved_model") == expected_identity.get("resolved_model"), f"{label} ready event resolved model differs from the locked public identity")
+            require(ready[0].get("model") == ready[0].get("resolved_model"), f"{label} ready event exposed a machine-local request path as its public model")
         if scenario_id == "C19":
             require(len(assistants) == 2, f"{label} thinking run must carry a two-turn history")
             users = [row for row in rows if row.get("event") == "user"]
-            require(len(users) == 2 and [row.get("turn") for row in users] == [1, 2], f"{label} thinking run history turns are incomplete")
+            require(len(users) == 2 and [row.get("turn") for row in users] == [0, 1], f"{label} thinking run history turns are incomplete")
+            require([row.get("turn") for row in assistants] == [0, 1], f"{label} thinking assistant turn sequence is incomplete")
             reasoning_expected = bool(observed.get("reasoning_expected"))
+            expected_marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
             for index, assistant in enumerate(assistants):
                 reasoning = assistant.get("reasoning")
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} assistant[{index}] reasoning mode mismatch")
                 require("<think>" not in str(assistant.get("content")) and "</think>" not in str(assistant.get("content")), f"{label} reasoning leaked into final content")
-            require(assistants[1].get("history_turns_seen") == 1, f"{label} second thinking turn did not carry prior assistant history")
+                require(assistant.get("content") == c19_expected_final(expected_marker, index + 1), f"{label} assistant[{index}] final answer mismatch")
+            for record_label, record, expected_messages, expected_turns in (
+                ("first user", users[0], 0, 0),
+                ("first assistant", assistants[0], 0, 0),
+                ("second user", users[1], 2, 1),
+                ("second assistant", assistants[1], 2, 1),
+            ):
+                history = require_object(record.get("history_before"), f"{label}.{record_label}.history_before")
+                require(
+                    history.get("message_count") == expected_messages
+                    and history.get("turn_count") == expected_turns,
+                    f"{label} {record_label} did not carry the real product history contract",
+                )
+                require_sha256(history.get("sha256"), f"{label}.{record_label}.history_before.sha256")
         if scenario_id == "C17":
             expected_text = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
             require(assistants[-1].get("content") == expected_text, f"{label} Unicode run content mismatch")
@@ -896,7 +1608,7 @@ def validate_case_output(
     require(transcript.get("case_id") == observed.get("case_id"), f"{label} transcript case id mismatch")
     exchanges = require_list(transcript.get("exchanges"), f"{label}.transcript.exchanges")
     require(exchanges, f"{label} HTTP transcript has no exchanges")
-    if input_document is not None:
+    if input_document is not None and scenario_id != "C18":
         bound_exchange = exchanges[-1] if (scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream")) else exchanges[0]
         require(require_object(bound_exchange, f"{label}.bound_exchange").get("request") == input_document, f"{label} HTTP transcript is not bound to the persisted input request")
     statuses: list[int] = []
@@ -943,6 +1655,74 @@ def validate_case_output(
         return
     if scenario_id == "C09":
         require(statuses[0] == 499 and statuses[-1] == 200, f"{label} must record client abort followed by successful recovery")
+        require(
+            exchanges[0].get("status_source") == "runner_client_abort",
+            f"{label} synthetic client-abort status source is missing",
+        )
+        abort_response = require_object(exchanges[0].get("response"), f"{label}.abort.response")
+        require(
+            abort_response.get("client_abort") == variant
+            and abort_response.get("admission_observed") is True
+            and isinstance(abort_response.get("admission_request_id"), str),
+            f"{label} client abort did not reach runtime admission",
+        )
+        require(
+            abort_response.get("admission_request_id")
+            == observed.get("cancel_request_id"),
+            f"{label} admission barrier is not bound to the cancelled request",
+        )
+        expected_trigger = {
+            "cancel": "socket_shutdown",
+            "timeout": "client_deadline_expired",
+            "disconnect": "tcp_reset",
+        }[variant]
+        require(
+            abort_response.get("abort_trigger") == expected_trigger,
+            f"{label} did not exercise the requested {variant} transport trigger",
+        )
+        recovery_request = require_object(exchanges[-1].get("request"), f"{label}.recovery.request")
+        recovery_metadata = require_object(
+            recovery_request.get("metadata"), f"{label}.recovery.metadata"
+        )
+        require(
+            recovery_request.get("max_tokens")
+            == require_object(exchanges[0].get("request"), f"{label}.abort.request").get("max_tokens"),
+            f"{label} recovery request changed the declared capacity budget",
+        )
+        require(
+            recovery_request.get("messages")
+            == [
+                {
+                    "role": "user",
+                    "content": f"Return the exact marker {observed.get('expected_marker')} and no other text.",
+                }
+            ]
+            and recovery_metadata.get("g00_recovery") is True
+            and "ignore_eos" not in recovery_request
+            and "stop" not in recovery_request
+            and "stream" not in recovery_request
+            and "stream_options" not in recovery_request,
+            f"{label} recovery request is not the canonical known-answer probe",
+        )
+        recovery_response = require_object(exchanges[-1].get("response"), f"{label}.recovery.response")
+        recovery_message, recovery_content = response_message(recovery_response, f"{label}.recovery")
+        recovery_choice = require_object(
+            require_list(recovery_response.get("choices"), f"{label}.recovery.choices")[0],
+            f"{label}.recovery.choice",
+        )
+        recovery_usage = require_object(recovery_response.get("usage"), f"{label}.recovery.usage")
+        require(
+            recovery_content == observed.get("expected_marker")
+            and recovery_choice.get("finish_reason") in {"stop", "eos"}
+            and require_count(
+                recovery_usage.get("completion_tokens"),
+                f"{label}.recovery.usage.completion_tokens",
+                minimum=1,
+            )
+            > 0
+            and recovery_message.get("role") == "assistant",
+            f"{label} recovery request did not complete with the expected output",
+        )
     else:
         require(all(status == 200 for status in statuses), f"{label} expected HTTP 200")
     if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
@@ -969,20 +1749,76 @@ def validate_case_output(
         reference_response = require_object(exchanges[0].get("response"), f"{label}.reference.response")
         reference_message, reference_content = response_message(reference_response, f"{label}.reference")
         reference_choice = require_object(require_list(reference_response.get("choices"), f"{label}.reference.choices")[0], f"{label}.reference.choice")
-        require(reconstruction.get("finish_reason") == reference_choice.get("finish_reason"), f"{label} stream finish_reason differs from non-stream")
-        require(reconstruction.get("usage") == reference_response.get("usage"), f"{label} stream usage differs from non-stream")
+        reference_usage = validate_completion_usage(
+            reference_response.get("usage"), f"{label}.reference.usage"
+        )
+        stream_usage = validate_completion_usage(
+            reconstruction.get("usage"), f"{label}.stream.usage"
+        )
         reference_reasoning = reference_message.get("reasoning", reference_message.get("reasoning_content")) or ""
-        require(reconstruction.get("reasoning", "") == reference_reasoning, f"{label} stream reasoning differs from non-stream")
-        if scenario_id in {"C06", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
+        streamed_reasoning = reconstruction.get("reasoning", "")
+        require(
+            isinstance(reference_reasoning, str)
+            and isinstance(streamed_reasoning, str),
+            f"{label} reasoning fields must be strings",
+        )
+        if scenario_id in {"C06", "C17"}:
+            require(reconstruction.get("finish_reason") == reference_choice.get("finish_reason"), f"{label} stream finish_reason differs from non-stream")
+            require(stream_usage == reference_usage, f"{label} stream usage differs from non-stream")
+            require(streamed_reasoning == reference_reasoning, f"{label} stream reasoning differs from non-stream")
             require(reconstruction.get("content") == reference_content, f"{label} stream content differs from non-stream")
             require(reference_content == observed.get("expected_marker"), f"{label} paired reference returned unexpected content")
         if scenario_id == "C12":
+            require(
+                reference_choice.get("finish_reason") == "tool_calls"
+                and reconstruction.get("finish_reason") == "tool_calls",
+                f"{label} C11/C12 pair must finish with tool_calls",
+            )
+            require(
+                reference_usage.get("prompt_tokens")
+                == stream_usage.get("prompt_tokens"),
+                f"{label} C11/C12 prompt token counts differ",
+            )
+            require(
+                reference_content == "" and reconstruction.get("content") == "",
+                f"{label} C11/C12 tool response fabricated content",
+            )
             reference_calls = require_list(reference_message.get("tool_calls"), f"{label}.reference.tool_calls")
             streamed_calls = require_list(reconstruction.get("tool_calls"), f"{label}.stream.tool_calls")
+            require(
+                len(reference_calls) == len(streamed_calls) == 1,
+                f"{label} C11/C12 pair must contain exactly one tool call",
+            )
             require(streamed_calls == reference_calls, f"{label} streamed tool call differs from matching C11 non-stream call")
             function = require_object(require_object(streamed_calls[0], f"{label}.stream.tool_calls[0]").get("function"), f"{label}.stream.function")
             arguments = json.loads(require_string(function.get("arguments"), f"{label}.stream.arguments"))
             require(arguments == {"city": "Paris"}, f"{label} reconstructed tool arguments are invalid")
+        if scenario_id == "C21" and variant == "serve-stream":
+            marker = require_string(
+                observed.get("expected_marker"),
+                f"{label}.observed.expected_marker",
+            )
+            require(
+                reference_choice.get("finish_reason") in {"stop", "eos"}
+                and reconstruction.get("finish_reason") in {"stop", "eos"},
+                f"{label} official sampling stream did not terminate naturally",
+            )
+            require(
+                reference_usage.get("prompt_tokens")
+                == stream_usage.get("prompt_tokens"),
+                f"{label} official sampling prompt token counts differ",
+            )
+            streamed_content = reconstruction.get("content")
+            require(
+                isinstance(streamed_content, str)
+                and reference_content.strip()
+                and streamed_content.strip(),
+                f"{label} official sampling stream returned empty content",
+            )
+            require(
+                marker in reference_content and marker in streamed_content,
+                f"{label} official sampling stream lost its expected marker",
+            )
         if scenario_id == "C17":
             wire = require_object(transcript.get("utf8_wire_evidence"), f"{label}.utf8_wire_evidence")
             chunks = [base64.b64decode(require_string(value, f"{label}.wire_chunk"), validate=True) for value in require_list(wire.get("chunks_base64"), f"{label}.chunks_base64")]
@@ -1026,16 +1862,102 @@ def validate_case_output(
             require(choice.get("finish_reason") in {"stop", "eos"} and 0 < completion_tokens < 64, f"{label} natural EOS case did not end before its cap")
         return
     if scenario_id == "C09":
-        require_count(observed.get("scheduler_ticks_to_release"), f"{label}.scheduler_ticks_to_release") <= 2
-        wall = observed.get("wall_sec_to_release")
+        require(
+            observed.get("cancel_resource_outcome") == C09_ADMITTED_RELEASED
+            and observed.get("cancel_safety") == "safe"
+            and observed.get("cancel_coverage") == "exercised",
+            f"{label} did not exercise an admitted cancellation with terminal release",
+        )
+        require(observed.get("trace_visibility_proven") is True, f"{label} trace visibility was not proven")
+        require(observed.get("trace_contract_error") is None, f"{label} trace contract is invalid")
+        require_count(observed.get("scheduler_ticks_to_terminal"), f"{label}.scheduler_ticks_to_terminal") <= 2
+        wall = observed.get("wall_sec_to_terminal")
         require(isinstance(wall, (int, float)) and not isinstance(wall, bool) and 0 <= wall <= 5, f"{label} release wall time exceeds 5s")
+        for balance_field in ("cancel_resource_balance", "recovery_resource_balance"):
+            balance = require_object(observed.get(balance_field), f"{label}.{balance_field}")
+            require(
+                balance.get("leaked_resource_count") == 0
+                and balance.get("underflow_count") == 0,
+                f"{label} {balance_field} is not balanced",
+            )
         require(observed.get("post_capacity_success") is True, f"{label} capacity was not recovered")
     if scenario_id == "C18":
         requested = require_count(observed.get("requested_concurrency"), f"{label}.requested_concurrency", minimum=1)
         require(len(exchanges) == requested, f"{label} concurrency transcript count mismatch")
         cap = require_count(observed.get("typed_admission_cap"), f"{label}.typed_admission_cap", minimum=1)
+        floor = require_count(observed.get("active_floor"), f"{label}.active_floor", minimum=1)
         active = require_count(observed.get("observed_max_active"), f"{label}.observed_max_active", minimum=1)
         require(active <= min(requested, cap), f"{label} observed max-active exceeds requested/cap")
+        require(input_document is not None, f"{label} C18 input evidence is missing")
+        identities = c18_request_identities(observed["case_id"], requested)
+        require(
+            transcript.get("concurrency_request_identities") == identities,
+            f"{label} C18 transcript identities are not deterministic",
+        )
+        require(observed.get("request_identities") == identities, f"{label} C18 observed identities mismatch")
+        for index, (exchange, identity) in enumerate(zip(exchanges, identities, strict=True)):
+            require(
+                require_object(exchange, f"{label}.exchange[{index}]").get("request")
+                == c18_request_payload(input_document, identity),
+                f"{label} C18 request {index} is not bound to its unique marker/checksum",
+            )
+            require(exchange.get("status") == 200, f"{label} C18 request {index} did not return HTTP 200")
+            response = require_object(exchange.get("response"), f"{label}.exchange[{index}].response")
+            require_string(response.get("id"), f"{label}.exchange[{index}].id")
+            require(response.get("object") == "chat.completion", f"{label}.exchange[{index}] response object mismatch")
+            usage = require_object(response.get("usage"), f"{label}.exchange[{index}].usage")
+            prompt_tokens = require_count(usage.get("prompt_tokens"), f"{label}.exchange[{index}].prompt_tokens", minimum=1)
+            completion_tokens = require_count(usage.get("completion_tokens"), f"{label}.exchange[{index}].completion_tokens", minimum=1)
+            require(usage.get("total_tokens") == prompt_tokens + completion_tokens, f"{label}.exchange[{index}] usage mismatch")
+            _, content = response_message(response, f"{label}.exchange[{index}]")
+            require(content == identity["marker"], f"{label} C18 request {index} output marker/checksum mismatch")
+        isolation = c18_isolation_summary(exchanges, identities)
+        completion = c18_completion_summary(exchanges)
+        runtime_failures = c18_runtime_failure_summary(transcript.get("runtime_log_evidence"))
+        for field, value in completion.items():
+            require(observed.get(field) == value, f"{label} C18 {field} is not derived from requests")
+        require(completion["completion_rate"] == 1.0, f"{label} C18 request completion is below 100%")
+        for field, value in {**isolation, **runtime_failures}.items():
+            require(observed.get(field) == value, f"{label} C18 {field} is not derived from evidence")
+            require(value == 0, f"{label} C18 {field} must be zero")
+        require(observed.get("active_timeline_error") is None, f"{label} C18 active timeline is incomplete")
+        trace_rows = require_list(
+            transcript.get("scheduler_trace_rows"),
+            f"{label}.scheduler_trace_rows",
+        )
+        trace_rows = c18_scoped_trace_rows(
+            trace_rows,
+            transcript.get("scheduler_trace_scope"),
+            expected_request_count=requested,
+            label=label,
+        )
+        try:
+            timeline = derive_active_timeline(
+                trace_rows,
+                requested_concurrency=requested,
+                typed_active_cap=cap,
+                active_floor=floor,
+                expected_request_count=requested,
+            )
+        except ActiveTimelineError as exc:
+            raise ScenarioError(f"{label} C18 active timeline is invalid: {exc}") from exc
+        require(observed.get("active_timeline") == timeline, f"{label} C18 active timeline summary is not replayable")
+        require(active == timeline["observed_max_active"], f"{label} C18 max-active differs from timeline")
+        if require_c18_resource_balance:
+            resource_balance = c18_resource_balance(
+                trace_rows,
+                expected_request_count=requested,
+            )
+            require(
+                observed.get("resource_balance") == resource_balance,
+                f"{label} C18 resource balance is not replayable",
+            )
+            validate_c18_resource_balance_summary(
+                resource_balance,
+                expected_request_count=requested,
+                label=f"{label}.resource_balance",
+            )
+        return
     if responses:
         final_response = responses[-1]
         require_string(final_response.get("id"), f"{label}.id")
@@ -1085,20 +2007,24 @@ def validate_case_output(
                 reasoning = response_message_value.get("reasoning")
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} {response_label} reasoning mode mismatch")
                 require("<think>" not in response_content and "</think>" not in response_content, f"{label} reasoning tags leaked into final content")
-            require(first_content != content, f"{label} second turn did not produce a distinct history-aware response")
+            expected_marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
+            require(first_content == c19_expected_final(expected_marker, 1), f"{label} first final answer mismatch")
+            require(content == c19_expected_final(expected_marker, 2), f"{label} second final answer mismatch")
             first_request = require_object(exchanges[0].get("request"), f"{label}.first.request")
             kwargs = first_request.get("chat_template_kwargs")
-            if variant == "hard-thinking":
+            hard_thinking = c19_hard_thinking_override(variant)
+            if hard_thinking is True:
                 require(kwargs == {"enable_thinking": True}, f"{label} hard thinking toggle was not sent")
-            elif variant == "hard-no-thinking":
+            elif hard_thinking is False:
                 require(kwargs == {"enable_thinking": False}, f"{label} hard no-thinking toggle was not sent")
             else:
                 require(kwargs is None, f"{label} soft/default mode incorrectly sent a hard toggle")
             prompt = str(require_object(require_list(first_request.get("messages"), f"{label}.first.messages")[0], f"{label}.first.user").get("content"))
+            second_prompt = str(require_object(second_messages[-1], f"{label}.second.user").get("content"))
             if variant in {"soft-think", "soft-think-misuse"}:
-                require(prompt.endswith("/think"), f"{label} soft think probe missing")
+                require(prompt.endswith("/think") and second_prompt.endswith("/think"), f"{label} soft think probe missing")
             if variant in {"soft-no-think", "soft-no-think-misuse"}:
-                require(prompt.endswith("/no_think"), f"{label} soft no-think probe missing")
+                require(prompt.endswith("/no_think") and second_prompt.endswith("/no_think"), f"{label} soft no-think probe missing")
         elif scenario_id == "C20":
             require(observed.get("declared_modalities") == ["text"], f"{label} model declared non-text modality")
         elif scenario_id == "C21":
@@ -1111,7 +2037,151 @@ def validate_case_output(
             elif variant == "json-object":
                 require(request.get("response_format") == {"type": "json_object"}, f"{label} json_object request contract mismatch")
                 parsed = json.loads(content)
-                require(parsed == {"result": marker}, f"{label} json_object result mismatch")
+            require(parsed == {"result": marker}, f"{label} json_object result mismatch")
+
+
+def capture_case_output_error(check: Callable[[], Any]) -> Exception | None:
+    try:
+        check()
+    except (ScenarioError, json.JSONDecodeError) as exc:
+        return exc
+    return None
+
+
+def scheduler_trace_rows_for_status(raw: Any, *, case_status: str, label: str) -> list[Any]:
+    rows = require_list(raw, f"{label}.scheduler_trace_rows")
+    require(rows or case_status == "known-fail", f"{label} scheduler trace evidence is empty")
+    return rows
+
+
+def scheduler_success_derivation_required(case_status: str) -> bool:
+    return case_status == "pass"
+
+
+def validate_resident_case_receipt(
+    root: Path,
+    raw_ref: Any,
+    *,
+    case: dict[str, Any],
+    command_id: str,
+    argv: list[str],
+    input_path: Path,
+    stdout_path: Path,
+) -> dict[str, Any]:
+    case_id = require_string(case.get("case_id"), "resident case id")
+    _, _, parsed = validate_artifact_ref(
+        root,
+        raw_ref,
+        f"case {case_id}.resident_case_receipt",
+        allowed_kinds={"raw-json"},
+    )
+    receipt = require_object(parsed, f"case {case_id}.resident_case_receipt JSON")
+    require(receipt.get("schema_version") == SCHEMA_VERSION, f"case {case_id} resident receipt schema mismatch")
+    require(receipt.get("transport") == "resident-jsonl-v1", f"case {case_id} resident transport mismatch")
+    require(receipt.get("case_id") == case_id, f"case {case_id} resident receipt binding mismatch")
+    require(receipt.get("command_id") == command_id, f"case {case_id} resident command binding mismatch")
+    require(receipt.get("argv_sha256") == canonical_json_sha256(argv), f"case {case_id} resident argv binding mismatch")
+    prompt_descriptor = {
+        "case_id": case_id,
+        "scenario_id": case["scenario_id"],
+        "ordinal": case["ordinal"],
+        "variant": case["variant"],
+        "preset": case.get("preset"),
+        "model_key": case["model_identity"]["model_key"],
+    }
+    prompts = run_case_prompts(prompt_descriptor)
+    require(receipt.get("prompts") == prompts, f"case {case_id} resident prompts mismatch")
+    require(receipt.get("prompts_sha256") == canonical_json_sha256(prompts), f"case {case_id} resident prompt SHA mismatch")
+    require(receipt.get("stdout_sha256") == file_sha256(stdout_path), f"case {case_id} resident stdout SHA mismatch")
+    require(receipt.get("input_sha256") == file_sha256(input_path), f"case {case_id} resident input SHA mismatch")
+    ready_receipt = require_object(receipt.get("ready_event"), f"case {case_id}.resident.ready_event")
+    require(ready_receipt.get("event") == "ready", f"case {case_id} resident ready event missing")
+    session_id = require_string(ready_receipt.get("session_id"), f"case {case_id}.resident.session_id")
+    require(ready_receipt.get("history_epoch") == 0, f"case {case_id} resident ready epoch mismatch")
+    case_receipt = require_object(receipt.get("case"), f"case {case_id}.resident.case")
+    started_ns = require_count(case_receipt.get("started_monotonic_ns"), f"case {case_id}.resident.started", minimum=1)
+    finished_ns = require_count(case_receipt.get("finished_monotonic_ns"), f"case {case_id}.resident.finished", minimum=1)
+    require(finished_ns > started_ns, f"case {case_id} resident monotonic window invalid")
+    duration = case_receipt.get("duration_sec")
+    require(
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration > 0
+        and abs(float(duration) - (finished_ns - started_ns) / 1e9) <= max(0.05, float(duration) * 0.05),
+        f"case {case_id} resident duration mismatch",
+    )
+    read_start = require_count(case_receipt.get("wire_read_start"), f"case {case_id}.resident.wire_read_start")
+    read_end = require_count(case_receipt.get("wire_read_end"), f"case {case_id}.resident.wire_read_end")
+    require(read_end >= read_start, f"case {case_id} resident wire read range invalid")
+    event_receipts = [
+        require_object(value, f"case {case_id}.resident.events[{index}]")
+        for index, value in enumerate(require_list(case_receipt.get("events"), f"case {case_id}.resident.events"))
+    ]
+    require(event_receipts, f"case {case_id} resident case has no events")
+    raw_lines = stdout_path.read_bytes().splitlines(keepends=True)
+    require(len(raw_lines) == len(event_receipts) + 1, f"case {case_id} resident stdout/event count mismatch")
+    all_receipts = [ready_receipt, *event_receipts]
+    rows: list[dict[str, Any]] = []
+    for index, (line, event_receipt) in enumerate(zip(raw_lines, all_receipts, strict=True)):
+        require(line.endswith(b"\n"), f"case {case_id} resident stdout line {index} is not newline terminated")
+        require(event_receipt.get("raw_line_bytes") == len(line), f"case {case_id} resident line {index} byte count mismatch")
+        require(event_receipt.get("raw_line_sha256") == hashlib.sha256(line).hexdigest(), f"case {case_id} resident line {index} SHA mismatch")
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ScenarioError(f"case {case_id} resident stdout line {index} is invalid UTF-8 JSON: {exc}") from exc
+        row = require_object(row, f"case {case_id}.resident.stdout[{index}]")
+        for field in ("event", "session_id", "history_epoch", "request_id", "turn"):
+            require(row.get(field) == event_receipt.get(field), f"case {case_id} resident line {index} {field} receipt mismatch")
+        rows.append(row)
+    require(rows[0].get("event") == "ready" and rows[0].get("session_id") == session_id, f"case {case_id} resident stdout lacks bound ready event")
+    events = rows[1:]
+    require(events[0].get("event") == "history_reset", f"case {case_id} resident case must begin with one reset")
+    require(sum(row.get("event") == "history_reset" for row in events) == 1, f"case {case_id} resident reset count mismatch")
+    epochs = {row.get("history_epoch") for row in events}
+    require(len(epochs) == 1, f"case {case_id} resident events cross history epochs")
+    epoch = next(iter(epochs))
+    require(isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0, f"case {case_id} resident history epoch invalid")
+    require(all(row.get("session_id") == session_id for row in events), f"case {case_id} resident session identity drift")
+    reset_after = require_object(events[0].get("history_after"), f"case {case_id}.resident.history_after")
+    require(reset_after.get("message_count") == 0 and reset_after.get("turn_count") == 0, f"case {case_id} resident reset did not clear history")
+    cursor = 1
+    request_ids: list[str] = []
+    for turn, prompt in enumerate(prompts):
+        require(cursor < len(events), f"case {case_id} resident turn {turn} lacks user event")
+        user = events[cursor]
+        cursor += 1
+        require(user.get("event") == "user" and user.get("turn") == turn and user.get("content") == prompt, f"case {case_id} resident user turn {turn} mismatch")
+        request_id = require_string(user.get("request_id"), f"case {case_id}.resident.turn[{turn}].request_id")
+        require(request_id not in request_ids, f"case {case_id} resident request id reused")
+        request_ids.append(request_id)
+        delta_index = 0
+        while cursor < len(events) and events[cursor].get("event") == "assistant_delta":
+            delta = events[cursor]
+            require(delta.get("request_id") == request_id and delta.get("turn") == turn, f"case {case_id} resident delta binding mismatch")
+            require(delta.get("index") == delta_index, f"case {case_id} resident delta index is not contiguous")
+            delta_index += 1
+            cursor += 1
+        require(cursor < len(events), f"case {case_id} resident turn {turn} lacks terminal assistant")
+        assistant = events[cursor]
+        cursor += 1
+        require(assistant.get("event") == "assistant" and assistant.get("request_id") == request_id and assistant.get("turn") == turn, f"case {case_id} resident assistant turn {turn} mismatch")
+    require(cursor == len(events), f"case {case_id} resident case has unowned trailing events")
+    require(case_receipt.get("request_ids") == request_ids, f"case {case_id} resident request id summary mismatch")
+    require(case_receipt.get("history_epochs") == [epoch], f"case {case_id} resident epoch summary mismatch")
+    event_indexes = [require_count(value.get("event_index"), f"case {case_id}.resident.event_index") for value in event_receipts]
+    require(event_indexes == list(range(event_indexes[0], event_indexes[-1] + 1)), f"case {case_id} resident event indexes are not contiguous")
+    return {
+        "case_id": case_id,
+        "command_id": command_id,
+        "session_id": session_id,
+        "history_epoch": epoch,
+        "wire_read_start": read_start,
+        "wire_read_end": read_end,
+        "events": event_receipts,
+        "started_monotonic_ns": started_ns,
+        "finished_monotonic_ns": finished_ns,
+    }
 
 
 def validate_case_evidence(
@@ -1124,6 +2194,7 @@ def validate_case_evidence(
     used_case_ids: set[str],
     used_case_artifacts: set[Path],
     used_argv: set[tuple[str, ...]],
+    commands: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     raw_path, _, parsed = validate_artifact_ref(root, raw_ref, f"scenario {scenario_id}.cases[{ordinal}]", allowed_kinds={"raw-json"})
     require(raw_path not in used_case_artifacts, f"scenario {scenario_id} reuses case evidence {raw_path}")
@@ -1155,6 +2226,11 @@ def validate_case_evidence(
         require(case.get(key) == expected.get(key), f"case {case_id} {key} binding mismatch")
     entrypoint = require_string(case.get("entrypoint"), f"case {case_id}.entrypoint")
     require(entrypoint in required_entrypoints(scenario_id), f"case {case_id} uses forbidden entrypoint")
+    command_id = require_string(case.get("command_id"), f"case {case_id}.command_id")
+    require(command_id in commands, f"case {case_id} references unknown command {command_id}")
+    require(commands[command_id]["entrypoint"] == entrypoint, f"case {case_id} command {command_id} entrypoint mismatch")
+    command_raw = commands[command_id]["raw"]
+    resident_mode = entrypoint == "run" and command_raw.get("execution_mode") == "resident-jsonl"
     variant = require_string(case.get("variant"), f"case {case_id}.variant")
     preset = case.get("preset")
     require(preset is None or preset in {"P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"}, f"case {case_id} preset invalid")
@@ -1163,8 +2239,11 @@ def validate_case_evidence(
     argv_raw = require_list(execution.get("argv"), f"case {case_id}.execution.argv")
     require(len(argv_raw) >= 3 and all(isinstance(part, str) and part for part in argv_raw), f"case {case_id} argv invalid")
     argv = tuple(argv_raw)
-    require(argv not in used_argv, f"case {case_id} argv is not unique")
-    used_argv.add(argv)
+    if resident_mode:
+        require(argv_raw == command_raw.get("argv"), f"case {case_id} resident argv differs from command {command_id}")
+    else:
+        require(argv not in used_argv, f"case {case_id} argv is not unique")
+        used_argv.add(argv)
     if entrypoint == "run":
         require(Path(argv[0]).name == "ferrum" and argv[1] == "run", f"case {case_id} must execute ferrum run")
     else:
@@ -1186,6 +2265,8 @@ def validate_case_evidence(
         scenario_id=scenario_id,
         variant=variant,
         preset=preset,
+        entrypoint=entrypoint,
+        case_id=case_id,
     )
     expected_outcome = require_object(case.get("expected_outcome"), f"case {case_id}.expected_outcome")
     for key in ("expected_status", "failure_class", "downstream_goal", "owner", "evidence_basis", "next_action"):
@@ -1219,6 +2300,8 @@ def validate_case_evidence(
     required_artifacts = {"input", "stdout", "stderr", "effective_config"}
     if entrypoint == "serve":
         required_artifacts.add("http_transcript")
+    if resident_mode:
+        required_artifacts.add("resident_case_receipt")
     require(set(artifacts) == required_artifacts, f"case {case_id} artifact set mismatch")
     resolved: dict[str, tuple[Path, Any | None]] = {}
     for name, ref in artifacts.items():
@@ -1228,6 +2311,7 @@ def validate_case_evidence(
             "stderr": {"stderr-log", "checker-log"},
             "effective_config": {"raw-json"},
             "http_transcript": {"http-transcript", "raw-json"},
+            "resident_case_receipt": {"raw-json"},
         }[name]
         path, _, artifact_parsed = validate_artifact_ref(root, ref, f"case {case_id}.artifacts.{name}", allowed_kinds=allowed)
         if name != "effective_config":
@@ -1248,6 +2332,25 @@ def validate_case_evidence(
             expected["model_key"],
         )
         require(input_document == expected_payload, f"case {case_id} persisted input differs from generated scenario contract")
+    elif scenario_id == "C03":
+        marker = expected_case_text({"scenario_id": scenario_id, "case_id": case_id})
+        require(
+            input_document == c03_input_document(case_id, marker, list(argv)),
+            f"case {case_id} persisted input differs from the versioned C03 contract",
+        )
+    resident_validation = (
+        validate_resident_case_receipt(
+            root,
+            artifacts["resident_case_receipt"],
+            case=case,
+            command_id=command_id,
+            argv=list(argv),
+            input_path=resolved["input"][0],
+            stdout_path=resolved["stdout"][0],
+        )
+        if resident_mode
+        else None
+    )
     require(file_sha256(resolved["effective_config"][0]) == expected["effective_config_sha256"], f"case {case_id} effective config mismatch")
     actual_config: dict[str, Any] | None = None
     envelope_ref = case.get("execution_envelope")
@@ -1257,6 +2360,7 @@ def validate_case_evidence(
         used_case_artifacts.add(envelope_path)
         envelope_document = require_object(envelope_parsed, f"case {case_id} execution envelope JSON")
         require(envelope_document.get("schema_version") == SCHEMA_VERSION and envelope_document.get("case_id") == case_id, f"case {case_id} execution envelope binding mismatch")
+        require(envelope_document.get("command_id") == command_id, f"case {case_id} execution envelope command binding mismatch")
         command_spec_path, _, command_spec_parsed = validate_artifact_ref(root, envelope_document.get("command_spec"), f"case {case_id}.command_spec", allowed_kinds={"raw-json"})
         require(command_spec_path not in used_case_artifacts, f"case {case_id} reuses command spec {command_spec_path}")
         used_case_artifacts.add(command_spec_path)
@@ -1271,7 +2375,7 @@ def validate_case_evidence(
         require(envelope_document.get("child_environment_sha256") == child_environment_sha, f"case {case_id} child environment SHA mismatch")
         require(command_spec.get("child_environment_sha256") == child_environment_sha, f"case {case_id} command spec environment binding mismatch")
         spawn = require_object(envelope_document.get("spawn"), f"case {case_id}.spawn")
-        expected_mode = "subprocess" if entrypoint == "run" else "in-process-http"
+        expected_mode = "resident-jsonl" if resident_mode else "subprocess" if entrypoint == "run" else "in-process-http"
         require(spawn.get("mode") == expected_mode and command_spec.get("execution_mode") == expected_mode, f"case {case_id} execution mode mismatch")
         for key in ("id", "argv", "started_at", "finished_at", "duration_sec", "returncode"):
             require(spawn.get(key) == execution.get(key), f"case {case_id} spawn.{key} mismatch")
@@ -1288,16 +2392,21 @@ def validate_case_evidence(
         product_process = require_object(envelope_document.get("product_process"), f"case {case_id}.product_process")
         require_count(product_process.get("pid"), f"case {case_id}.product_process.pid", minimum=1)
         require_count(product_process.get("pgid"), f"case {case_id}.product_process.pgid", minimum=1)
+        require(
+            spawn["pgid"] == expected["invocation_pgid"]
+            and product_process["pgid"] == expected["invocation_pgid"],
+            f"case {case_id} product escaped the bounded executor process group",
+        )
         execution_receipt = validate_process_receipt(
             root,
             envelope_document.get("execution_process_receipt"),
             label=f"case {case_id}.execution_process_receipt",
             pid=spawn["pid"],
             pgid=spawn["pgid"],
-            argv=expected["invocation_argv"] if entrypoint == "serve" else list(argv),
-            role="scenario-executor" if entrypoint == "serve" else "ferrum-run",
-            expected_ppid=None if entrypoint == "serve" else expected["invocation_pid"],
-            expected_environment=None if entrypoint == "serve" else child_environment,
+            argv=expected["invocation_argv"] if entrypoint == "serve" or resident_mode else list(argv),
+            role="scenario-executor" if entrypoint == "serve" or resident_mode else "ferrum-run",
+            expected_ppid=None if entrypoint == "serve" or resident_mode else expected["invocation_pid"],
+            expected_environment=None if entrypoint == "serve" or resident_mode else child_environment,
         )
         product_receipt = validate_process_receipt(
             root,
@@ -1310,6 +2419,20 @@ def validate_case_evidence(
             expected_ppid=expected["invocation_pid"],
             expected_environment=child_environment,
         )
+        if entrypoint == "serve" or resident_mode:
+            command_receipt_path, _, _ = validate_artifact_ref(
+                root,
+                commands[command_id]["raw"].get("process_receipt"),
+                f"case {case_id}.command_process_receipt",
+                allowed_kinds={"raw-json"},
+            )
+            product_receipt_path, _, _ = validate_artifact_ref(
+                root,
+                envelope_document.get("product_process_receipt"),
+                f"case {case_id}.product_process_receipt_binding",
+                allowed_kinds={"raw-json"},
+            )
+            require(product_receipt_path == command_receipt_path, f"case {case_id} is not bound to command {command_id} process receipt")
         for receipt in (execution_receipt, product_receipt):
             captured = parse_timestamp(receipt["captured_at"], f"case {case_id}.receipt.captured_at")
             require(expected["invocation_started_at"] <= captured <= expected["invocation_finished_at"], f"case {case_id} process receipt is outside invocation window")
@@ -1331,8 +2454,26 @@ def validate_case_evidence(
             require(product_process.get("argv") == product_argv and product_process.get("state_during_case") == "running", f"case {case_id} serve product process binding mismatch")
             ready_at = parse_timestamp(product_process.get("ready_at"), f"case {case_id}.product_process.ready_at")
             require(product_started <= ready_at <= started and finished >= started, f"case {case_id} request window is outside server ready window")
+        elif resident_mode:
+            require(envelope_document.get("http_transcript") is None, f"case {case_id} resident run envelope contains HTTP transcript")
+            require(envelope_document.get("product_argv") == list(argv), f"case {case_id} resident run product argv mismatch")
+            require(product_process.get("argv") == list(argv), f"case {case_id} resident product process argv mismatch")
+            require(product_process.get("state_during_case") == "running", f"case {case_id} resident product was not running")
+            ready_at = parse_timestamp(product_process.get("ready_at"), f"case {case_id}.product_process.ready_at")
+            require(product_started <= ready_at <= started < finished, f"case {case_id} resident case is outside product ready window")
+            envelope_resident_path, _, _ = validate_artifact_ref(
+                root,
+                envelope_document.get("resident_case_receipt"),
+                f"case {case_id}.envelope.resident_case_receipt",
+                allowed_kinds={"raw-json"},
+            )
+            require(
+                envelope_resident_path == resolved["resident_case_receipt"][0],
+                f"case {case_id} resident receipt differs from envelope",
+            )
         else:
             require(envelope_document.get("http_transcript") is None, f"case {case_id} run envelope contains HTTP transcript")
+            require(envelope_document.get("resident_case_receipt") is None, f"case {case_id} subprocess run envelope contains resident receipt")
             require(envelope_document.get("product_argv") == list(argv), f"case {case_id} run product argv mismatch")
             require(product_process.get("argv") == list(argv), f"case {case_id} run product process argv mismatch")
             product_finished = parse_timestamp(product_process.get("finished_at"), f"case {case_id}.product_process.finished_at")
@@ -1343,6 +2484,12 @@ def validate_case_evidence(
             expected_backend=expected["backend"],
             expected_model_key=expected["model_key"],
             label=f"case {case_id}.actual_effective_config JSON",
+            allow_unknown_architecture=allow_c01_known_failure_unknown_architecture(
+                scenario_id,
+                case["status"],
+                observed_outcome.get("failure_class"),
+            )
+            or allow_frozen_unknown_architecture(expected["model_key"], expected["backend"]),
         )
         require(
             command_spec.get("actual_effective_config_sha256") == file_sha256(actual_config_path),
@@ -1367,31 +2514,106 @@ def validate_case_evidence(
     transcript = resolved.get("http_transcript", (Path(), None))[1]
     if scenario_id in {"C09", "C18"} and (not expected["allow_internal_fixture"] or envelope_ref is not None):
         transcript_object = require_object(transcript, f"case {case_id}.http_transcript")
-        trace_rows = require_list(transcript_object.get("scheduler_trace_rows"), f"case {case_id}.scheduler_trace_rows")
-        require(trace_rows, f"case {case_id} scheduler trace evidence is empty")
+        trace_rows = scheduler_trace_rows_for_status(
+            transcript_object.get("scheduler_trace_rows"),
+            case_status=case["status"],
+            label=f"case {case_id}",
+        )
         for index, trace_raw in enumerate(trace_rows):
             trace = require_object(trace_raw, f"case {case_id}.scheduler_trace_rows[{index}]")
             raw_trace = require_object(trace.get("raw"), f"case {case_id}.scheduler_trace_rows[{index}].raw")
             require(trace.get("raw_sha256") == canonical_json_sha256(raw_trace), f"case {case_id} scheduler trace raw SHA mismatch")
+            if scenario_id == "C09":
+                require(
+                    trace.get("collection_phase") in {"abort_window", "recovery_window"},
+                    f"case {case_id} scheduler trace collection phase is invalid",
+                )
             observed_ns = require_count(trace.get("collector_observed_monotonic_ns"), f"case {case_id}.scheduler_trace_rows[{index}].collector_observed_monotonic_ns", minimum=1)
             require(spawn["started_monotonic_ns"] <= observed_ns <= spawn["finished_monotonic_ns"], f"case {case_id} scheduler trace observation is outside case window")
-        if scenario_id == "C09":
-            released, derived_ticks, release_ns = trace_released(trace_rows)
-            require(released and release_ns is not None, f"case {case_id} scheduler trace never proves release")
-            exchanges = require_list(transcript_object.get("exchanges"), f"case {case_id}.exchanges")
-            abort_start_ns = require_count(require_object(exchanges[0], f"case {case_id}.exchange[0]").get("started_monotonic_ns"), f"case {case_id}.abort_start_ns", minimum=1)
-            derived_wall = (release_ns - abort_start_ns) / 1e9
-            require(observed.get("scheduler_ticks_to_release") == derived_ticks, f"case {case_id} release tick count is not derived from trace")
-            wall = observed.get("wall_sec_to_release")
-            require(isinstance(wall, (int, float)) and abs(float(wall) - derived_wall) <= 0.02, f"case {case_id} release wall time is not derived from trace")
-        else:
-            derived_active = observed_max_active(trace_rows)
-            require(derived_active > 0 and observed.get("observed_max_active") == derived_active, f"case {case_id} observed max-active is not derived from trace")
-            derived_cap = typed_admission_cap_value(actual_config)
-            require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
-    output_error: ScenarioError | None = None
-    try:
-        validate_case_output(
+        if scheduler_success_derivation_required(case["status"]):
+            if scenario_id == "C09":
+                exchanges = require_list(transcript_object.get("exchanges"), f"case {case_id}.exchanges")
+                require(len(exchanges) == 2, f"case {case_id} must contain abort and recovery exchanges")
+                derived = c09_terminal_outcome(
+                    trace_rows,
+                    require_object(exchanges[0], f"case {case_id}.exchange[0]"),
+                    require_object(exchanges[1], f"case {case_id}.exchange[1]"),
+                )
+                for field, expected_value in derived.items():
+                    require(
+                        observed.get(field) == expected_value,
+                        f"case {case_id} {field} is not derived from typed trace evidence",
+                    )
+                require(
+                    derived["cancel_resource_outcome"] == C09_ADMITTED_RELEASED
+                    and observed.get("trace_contract_error") is None,
+                    f"case {case_id} did not prove admitted cancellation release",
+                )
+            else:
+                requested = require_count(
+                    observed.get("requested_concurrency"),
+                    f"case {case_id}.requested_concurrency",
+                    minimum=1,
+                )
+                trace_rows = c18_scoped_trace_rows(
+                    trace_rows,
+                    transcript_object.get("scheduler_trace_scope"),
+                    expected_request_count=requested,
+                    label=f"case {case_id}",
+                )
+                if not expected["allow_internal_fixture"]:
+                    scope_started_unix_ns = require_count(
+                        require_object(
+                            transcript_object.get("scheduler_trace_scope"),
+                            f"case {case_id}.scheduler_trace_scope",
+                        ).get("started_unix_ns"),
+                        f"case {case_id}.scheduler_trace_scope.started_unix_ns",
+                        minimum=1,
+                    )
+                    execution_started_unix_ns = int(started.timestamp() * 1_000_000_000)
+                    execution_finished_unix_ns = int(finished.timestamp() * 1_000_000_000)
+                    require(
+                        execution_started_unix_ns
+                        <= scope_started_unix_ns
+                        <= execution_finished_unix_ns,
+                        f"case {case_id} C18 scheduler trace scope is outside the case window",
+                    )
+                derived_cap = typed_admission_cap_value(actual_config)
+                require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
+                floor = required_active_floor(expected["model_key"], expected["backend"], requested)
+                require(observed.get("active_floor") == floor, f"case {case_id} active floor mismatch")
+                try:
+                    timeline = derive_active_timeline(
+                        trace_rows,
+                        requested_concurrency=requested,
+                        typed_active_cap=derived_cap,
+                        active_floor=floor,
+                        expected_request_count=requested,
+                    )
+                except ActiveTimelineError as exc:
+                    raise ScenarioError(f"case {case_id} active timeline is invalid: {exc}") from exc
+                require(observed.get("active_timeline_error") is None, f"case {case_id} active timeline records an error")
+                require(observed.get("active_timeline") == timeline, f"case {case_id} active timeline is not derived from trace")
+                require(observed.get("observed_max_active") == timeline["observed_max_active"], f"case {case_id} observed max-active is not derived from timeline")
+                if expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT) == G08_EXECUTION_CONTRACT:
+                    resource_balance = c18_resource_balance(
+                        trace_rows,
+                        expected_request_count=requested,
+                    )
+                    require(
+                        observed.get("resource_balance") == resource_balance,
+                        f"case {case_id} resource balance is not derived from trace",
+                    )
+                required_client = 32 if expected["backend"] == "cuda" else 16
+                if requested == required_client:
+                    lane_floor = REQUIRED_ACTIVE_FLOORS[(expected["model_key"], expected["backend"])]
+                    require(derived_cap >= lane_floor, f"case {case_id} typed admission cap is below lane floor")
+                    require(timeline["observed_max_active"] >= lane_floor, f"case {case_id} observed max-active is below lane floor")
+                    require(timeline["active_duty_cycle"] >= 0.80, f"case {case_id} active duty-cycle is below 0.80")
+                    if derived_cap == lane_floor:
+                        require(timeline["observed_max_active"] == derived_cap, f"case {case_id} max-active must equal typed cap")
+    output_error = capture_case_output_error(
+        lambda: validate_case_output(
             scenario_id,
             variant,
             entrypoint,
@@ -1402,9 +2624,12 @@ def validate_case_evidence(
             input_document=input_document,
             actual_config=actual_config,
             artifact_root=root,
+            require_c18_resource_balance=(
+                expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+                == G08_EXECUTION_CONTRACT
+            ),
         )
-    except ScenarioError as exc:
-        output_error = exc
+    )
     if case["status"] == "pass":
         require(output_error is None, f"case {case_id} expected pass but checker failed: {output_error}")
     elif case["status"] == "known-fail":
@@ -1413,6 +2638,7 @@ def validate_case_evidence(
         require(output_error is not None or returncode != 0, f"case {case_id} blocked outcome lacks failure evidence")
     return {
         "case_id": case_id,
+        "scenario_id": scenario_id,
         "entrypoint": entrypoint,
         "variant": variant,
         "preset": preset,
@@ -1420,7 +2646,11 @@ def validate_case_evidence(
         "observed": observed,
         "input_document": input_document,
         "input_sha256": file_sha256(resolved["input"][0]),
+        "command_id": command_id,
         "ordinal": ordinal,
+        "started_at": started,
+        "finished_at": finished,
+        "resident": resident_validation,
     }
 
 
@@ -1430,7 +2660,7 @@ def validate_scenario(
     *,
     expected_id: str,
     expected: dict[str, Any],
-    commands: dict[str, str],
+    commands: dict[str, dict[str, Any]],
     used_artifacts: set[Path],
     used_case_ids: set[str],
     used_case_artifacts: set[Path],
@@ -1471,7 +2701,7 @@ def validate_scenario(
     referenced_entrypoints: set[str] = set()
     for command_id in command_ids:
         require(command_id in commands, f"scenario {expected_id} references unknown command {command_id}")
-        referenced_entrypoints.add(commands[command_id])
+        referenced_entrypoints.add(commands[command_id]["entrypoint"])
     require(entrypoints <= referenced_entrypoints, f"scenario {expected_id} command records do not cover its entrypoints")
     variants = require_object(scenario.get("variants"), f"scenario {expected_id}.variants")
     for name, value in variants.items():
@@ -1490,7 +2720,16 @@ def validate_scenario(
     elif expected_id == "C07":
         require(dimensions.get("requests") >= 6 and dimensions.get("rounds_per_request") >= 5, "C07 must cover 6 requests x 5 rounds")
     if expected_id == "C18":
-        validate_concurrency_cells(expected["backend"], scenario.get("concurrency_cells"), case_count=count, require_pass=scenario["status"] == "pass")
+        validate_concurrency_cells(
+            expected["backend"],
+            scenario.get("concurrency_cells"),
+            case_count=count,
+            require_pass=scenario["status"] == "pass",
+            require_resource_balance=(
+                expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+                == G08_EXECUTION_CONTRACT
+            ),
+        )
     else:
         require("concurrency_cells" not in scenario, f"scenario {expected_id} must not fabricate concurrency cells")
     if scenario["status"] == "pass":
@@ -1560,11 +2799,14 @@ def validate_scenario(
             used_case_ids=used_case_ids,
             used_case_artifacts=used_case_artifacts,
             used_argv=used_argv,
+            commands=commands,
         )
         for index, case_ref in enumerate(case_refs, start=1)
     ]
     derived_entrypoints = sorted({row["entrypoint"] for row in case_rows})
     require(derived_entrypoints == sorted(scenario["entrypoints"]), f"scenario {expected_id} entrypoints are not derived from cases")
+    derived_command_ids = {row["command_id"] for row in case_rows}
+    require(derived_command_ids == set(command_ids), f"scenario {expected_id} command ids are not derived from cases")
     derived_variants: dict[str, int] = {}
     derived_presets: dict[str, int] = {}
     derived_unpreset = 0
@@ -1577,6 +2819,41 @@ def validate_scenario(
     require(derived_variants == scenario["variants"], f"scenario {expected_id} variants are not derived from cases")
     require(derived_presets == scenario["presets"], f"scenario {expected_id} presets are not derived from cases")
     require(derived_unpreset == scenario["unpreset_count"], f"scenario {expected_id} unpreset count is not derived from cases")
+    if expected_id == "C18" and scenario["status"] == "pass":
+        derived_cells = []
+        for row in case_rows:
+            derived_cell = {
+                "requested_concurrency": row["observed"]["requested_concurrency"],
+                "case_count": 1,
+                "passed_count": 1,
+                "request_count": row["observed"]["request_count"],
+                "completed_request_count": row["observed"]["completed_request_count"],
+                "completion_rate": row["observed"]["completion_rate"],
+                "typed_admission_cap": row["observed"]["typed_admission_cap"],
+                "active_floor": row["observed"]["active_floor"],
+                "observed_max_active": row["observed"]["observed_max_active"],
+                "active_timeline": row["observed"]["active_timeline"],
+                "active_timeline_error": row["observed"]["active_timeline_error"],
+                **{
+                    field: row["observed"][field]
+                    for field in (
+                        "error_count",
+                        "bad_output_count",
+                        "crosstalk_count",
+                        "bad_checksum_count",
+                        "server_500_count",
+                        "panic_count",
+                        "oom_count",
+                    )
+                },
+            }
+            if expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT) == G08_EXECUTION_CONTRACT:
+                derived_cell["resource_balance"] = row["observed"]["resource_balance"]
+            derived_cells.append(derived_cell)
+        require(
+            scenario["concurrency_cells"] == derived_cells,
+            "scenario C18 concurrency cells are not derived from case evidence",
+        )
     if expected_id == "C01":
         require(set(derived_variants.values()) == {5} and len(derived_variants) == 4, "C01 must execute four exact five-case groups")
     elif expected_id == "C07":
@@ -1732,6 +3009,128 @@ def attach_pair_registry(report: dict[str, Any], root: Path) -> None:
     report["pair_registry"] = existing_artifact_ref(root, path, "raw-json")
 
 
+def validate_resident_run_commands(
+    root: Path,
+    commands: dict[str, dict[str, Any]],
+    case_rows_by_scenario: dict[str, list[dict[str, Any]]],
+    *,
+    model_key: str,
+) -> None:
+    expected_run_ids = [f"actual-run-{index:02d}" for index in range(1, 6)]
+    run_commands = [commands[command_id]["raw"] for command_id in expected_run_ids]
+    run_cases = [
+        case
+        for rows in case_rows_by_scenario.values()
+        for case in rows
+        if case["entrypoint"] == "run"
+    ]
+    require(len(run_cases) == 97, f"G08 resident run corpus must contain 97 cases, got {len(run_cases)}")
+    cases_by_id = {case["case_id"]: case for case in run_cases}
+    require(len(cases_by_id) == len(run_cases), "G08 resident run case ids are not unique")
+    covered_case_ids: list[str] = []
+    session_ids: set[str] = set()
+    pids: set[int] = set()
+    previous_finished_at: datetime | None = None
+    for command_index, (command_id, command) in enumerate(zip(expected_run_ids, run_commands, strict=True), start=1):
+        require(command.get("execution_mode") == "resident-jsonl", f"{command_id} is not resident-jsonl")
+        case_ids = require_list(command.get("case_ids"), f"{command_id}.case_ids")
+        command_cases = [cases_by_id.get(case_id) for case_id in case_ids]
+        require(all(case is not None for case in command_cases), f"{command_id} references a non-run case")
+        typed_cases = [require_object(case, f"{command_id}.case") for case in command_cases]
+        require(command.get("case_count") == len(typed_cases), f"{command_id} case count mismatch")
+        covered_case_ids.extend(case_ids)
+        derived_aliases = sorted({case.get("preset") or "<none>" for case in typed_cases})
+        require(command.get("preset_aliases") == derived_aliases, f"{command_id} preset aliases are not derived from cases")
+        derived_keys = {
+            resident_run_group_key(
+                {
+                    "model_key": model_key,
+                    "scenario_id": case["scenario_id"],
+                    "variant": case["variant"],
+                    "preset": case.get("preset"),
+                }
+            )
+            for case in typed_cases
+        }
+        require(len(derived_keys) == 1, f"{command_id} mixes resident option groups")
+        derived_key = next(iter(derived_keys))
+        require(command.get("group_key") == list(derived_key), f"{command_id} group key is not derived from cases")
+        require(all(case.get("resident") is not None for case in typed_cases), f"{command_id} contains a non-resident case")
+        _, _, wire_raw = validate_artifact_ref(
+            root,
+            command.get("wire_receipt"),
+            f"{command_id}.wire_receipt",
+            allowed_kinds={"raw-json"},
+        )
+        wire_receipt = require_object(wire_raw, f"{command_id}.wire_receipt JSON")
+        require(wire_receipt.get("schema_version") == SCHEMA_VERSION, f"{command_id} wire receipt schema mismatch")
+        require(wire_receipt.get("transport") == "resident-jsonl-v1", f"{command_id} wire transport mismatch")
+        require(wire_receipt.get("command_id") == command_id, f"{command_id} wire command binding mismatch")
+        require(wire_receipt.get("argv_sha256") == canonical_json_sha256(command["argv"]), f"{command_id} wire argv mismatch")
+        require(wire_receipt.get("group_key") == list(derived_key), f"{command_id} wire group key mismatch")
+        require(wire_receipt.get("case_count") == len(typed_cases), f"{command_id} wire case count mismatch")
+        require(wire_receipt.get("case_ids") == case_ids, f"{command_id} wire case order mismatch")
+        require(wire_receipt.get("preset_aliases") == derived_aliases, f"{command_id} wire preset aliases mismatch")
+        require(wire_receipt.get("controlled_stop") is True, f"{command_id} was not stopped through /bye")
+        pid = require_count(wire_receipt.get("pid"), f"{command_id}.pid", minimum=1)
+        pids.add(pid)
+        ready = require_object(wire_receipt.get("ready_event"), f"{command_id}.ready_event")
+        exit_event = require_object(wire_receipt.get("exit_event"), f"{command_id}.exit_event")
+        require(ready.get("event") == "ready" and exit_event.get("event") == "exit", f"{command_id} ready/exit boundary mismatch")
+        session_id = require_string(ready.get("session_id"), f"{command_id}.session_id")
+        require(exit_event.get("session_id") == session_id, f"{command_id} exit session id drift")
+        session_ids.add(session_id)
+        wire = require_object(wire_receipt.get("wire"), f"{command_id}.wire")
+        reads = [require_object(value, f"{command_id}.wire.reads[{index}]") for index, value in enumerate(require_list(wire.get("reads"), f"{command_id}.wire.reads"))]
+        require(wire.get("read_count") == len(reads), f"{command_id} wire read count mismatch")
+        require([read.get("read_index") for read in reads] == list(range(len(reads))), f"{command_id} wire read indexes are not contiguous")
+        events = [require_object(value, f"{command_id}.wire.events[{index}]") for index, value in enumerate(require_list(wire.get("events"), f"{command_id}.wire.events"))]
+        require(wire.get("event_count") == len(events), f"{command_id} wire event count mismatch")
+        require([event.get("event_index") for event in events] == list(range(len(events))), f"{command_id} wire event indexes are not contiguous")
+        combined_case_events = [
+            event
+            for case in typed_cases
+            for event in require_object(case["resident"], f"{command_id}.resident") ["events"]
+        ]
+        require(events == [ready, *combined_case_events, exit_event], f"{command_id} wire contains missing, duplicate, or unowned events")
+        epochs = [require_object(case["resident"], f"{command_id}.resident")["history_epoch"] for case in typed_cases]
+        require(epochs == list(range(1, len(typed_cases) + 1)), f"{command_id} history epochs are not strictly monotonic")
+        ranges = [
+            (
+                require_object(case["resident"], f"{command_id}.resident")["wire_read_start"],
+                require_object(case["resident"], f"{command_id}.resident")["wire_read_end"],
+            )
+            for case in typed_cases
+        ]
+        require(all(0 <= start <= end <= len(reads) for start, end in ranges), f"{command_id} case wire range exceeds command reads")
+        require(all(left[1] <= right[0] for left, right in zip(ranges, ranges[1:])), f"{command_id} case wire ranges overlap")
+        command_stdout_path, _, _ = validate_artifact_ref(root, command.get("stdout"), f"{command_id}.stdout", allowed_kinds={"stdout-log"})
+        command_lines = command_stdout_path.read_bytes().splitlines(keepends=True)
+        require(len(command_lines) == len(events), f"{command_id} command stdout/event count mismatch")
+        require(
+            all(
+                event.get("raw_line_bytes") == len(line)
+                and event.get("raw_line_sha256") == hashlib.sha256(line).hexdigest()
+                for line, event in zip(command_lines, events, strict=True)
+            ),
+            f"{command_id} command stdout differs from wire receipts",
+        )
+        command_started_at = parse_timestamp(command.get("started_at"), f"{command_id}.started_at")
+        command_finished_at = parse_timestamp(command.get("finished_at"), f"{command_id}.finished_at")
+        require(
+            all(command_started_at <= case["started_at"] < case["finished_at"] <= command_finished_at for case in typed_cases),
+            f"{command_id} case window escapes resident command",
+        )
+        if previous_finished_at is not None:
+            require(previous_finished_at <= command_started_at, f"{command_id} overlaps the previous resident run command")
+        previous_finished_at = command_finished_at
+        require(command_index == int(command_id.rsplit("-", 1)[1]), f"{command_id} generation order mismatch")
+    require(covered_case_ids == [case_id for command in run_commands for case_id in command["case_ids"]], "resident command case order drift")
+    require(set(covered_case_ids) == set(cases_by_id) and len(covered_case_ids) == len(cases_by_id), "resident commands do not partition the run corpus")
+    require(len(session_ids) == 5, "G08 resident commands reused a product session identity")
+    require(len(pids) == 5, "G08 resident commands did not use five distinct product processes")
+
+
 def validate_report_document(
     report: dict[str, Any],
     root: Path,
@@ -1743,7 +3142,11 @@ def validate_report_document(
     require(report.get("schema_version") == SCHEMA_VERSION, "scenario_report.schema_version mismatch")
     require(report.get("status") == "pass", "scenario_report.status must be pass")
     reject_forbidden_markers(report, "scenario_report", allow_internal_fixture=allow_internal_fixture)
-    validate_source_identity(report, "scenario_report")
+    contract = validate_source_identity(
+        report,
+        "scenario_report",
+        allow_internal_fixture=allow_internal_fixture,
+    )
     model_key = require_string(report.get("model_key"), "scenario_report.model_key")
     require(model_key in {"m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}, "scenario_report.model_key is not primary")
     backend = require_string(report.get("backend"), "scenario_report.backend")
@@ -1774,6 +3177,8 @@ def validate_report_document(
             "hardware_id",
         )
     }
+    expected["execution_contract"] = contract
+    expected["allow_internal_fixture"] = allow_internal_fixture
     if "model_path" in report:
         expected["model_path"] = report["model_path"]
     _, effective_config_sha256 = validate_effective_config(root, report.get("effective_config"), expected=expected)
@@ -1784,23 +3189,55 @@ def validate_report_document(
         "scenario_report.expectations_catalog",
         allowed_kinds={"raw-json"},
     )
-    expectations_catalog = validate_expectations_catalog(require_object(expectations_parsed, "scenario_report expectations catalog JSON"))
+    expectations_catalog = validate_expectations_catalog(
+        require_object(expectations_parsed, "scenario_report expectations catalog JSON"),
+        expected_contract=contract,
+    )
     require(file_sha256(expectations_path) == report["expectations_catalog_sha256"], "scenario_report expectations catalog binding mismatch")
     if not allow_internal_fixture:
-        require(report["expectations_catalog_sha256"] == canonical_expectations_sha256(), "scenario_report expectations catalog is not the checked-in contract")
+        expected_expectations_sha = (
+            hashlib.sha256(candidate_expectations_bytes(report["source_git_sha"])).hexdigest()
+            if contract == G08_EXECUTION_CONTRACT
+            else canonical_expectations_sha256()
+        )
+        require(
+            report["expectations_catalog_sha256"] == expected_expectations_sha,
+            "scenario_report expectations catalog is not the canonical execution contract",
+        )
     expected["expectations_catalog"] = expectations_catalog
     expected["expectations_catalog_sha256"] = report["expectations_catalog_sha256"]
     binary_path, _, _ = validate_artifact_ref(root, report.get("binary_artifact"), "scenario_report.binary_artifact", allowed_kinds={"binary"})
     require(file_sha256(binary_path) == report["binary_sha256"], "scenario_report binary artifact binding mismatch")
+    if contract == G08_EXECUTION_CONTRACT:
+        validate_candidate_build_receipt(
+            root,
+            report.get("binary_build_receipt"),
+            expected={
+                **expected,
+                "binary_path": binary_path,
+            },
+            allow_internal_fixture=allow_internal_fixture,
+        )
+    else:
+        require(
+            "binary_build_receipt" not in report,
+            "legacy scenario report must not contain a candidate build receipt",
+        )
     models_lock_path, _, _ = validate_artifact_ref(root, report.get("models_lock"), "scenario_report.models_lock", allowed_kinds={"raw-json"})
     require(file_sha256(models_lock_path) == report["models_lock_sha256"], "scenario_report models.lock binding mismatch")
-    validate_runner_identity(report.get("runner"), allow_internal_fixture=allow_internal_fixture)
+    runner_identity = validate_runner_identity(report.get("runner"), allow_internal_fixture=allow_internal_fixture)
+    if contract == G08_EXECUTION_CONTRACT and not allow_internal_fixture:
+        require(
+            runner_identity["git_sha"] == report["source_git_sha"],
+            "G08 candidate source SHA differs from its runner SHA",
+        )
     invocation_ref = report.get("executor_invocation")
     if not allow_internal_fixture or invocation_ref is not None:
         _, _, invocation_parsed = validate_artifact_ref(root, invocation_ref, "scenario_report.executor_invocation", allowed_kinds={"raw-json"})
         invocation = require_object(invocation_parsed, "scenario_report executor invocation JSON")
         require(invocation.get("runner_path") == RUNNER_REPO_PATH, "executor invocation runner path mismatch")
         require(invocation.get("runner_sha256") == report["runner"]["sha256"], "executor invocation runner SHA mismatch")
+        require(invocation.get("execution_contract", LEGACY_EXECUTION_CONTRACT) == contract, "executor invocation execution contract mismatch")
         require(invocation.get("mode") == "canonical", "canonical report was not produced by canonical executor mode")
         invocation_argv = require_list(invocation.get("argv"), "executor invocation argv")
         require(str(RUNNER_PATH) in invocation_argv and "--manifest" in invocation_argv and "--artifact-root" in invocation_argv and "--out" in invocation_argv, "executor invocation argv incomplete")
@@ -1834,9 +3271,24 @@ def validate_report_document(
         require(start_ns <= receipt_ns <= finish_ns, "executor invocation receipt monotonic time is outside invocation window")
         manifest_snapshot, _, _ = validate_artifact_ref(root, invocation.get("manifest_snapshot"), "executor invocation manifest snapshot", allowed_kinds={"raw-json"})
         require(file_sha256(manifest_snapshot) == invocation.get("manifest_sha256"), "executor invocation manifest SHA mismatch")
-        snapshot = validate_execution_manifest(require_object(read_json(manifest_snapshot), "executor invocation manifest snapshot"), root)
+        snapshot_document = require_object(
+            read_json(manifest_snapshot),
+            "executor invocation manifest snapshot",
+        )
+        snapshot = validate_execution_manifest(
+            snapshot_document,
+            root,
+            allow_internal_fixture=allow_internal_fixture,
+        )
+        require(snapshot["execution_contract"] == contract, "executor invocation manifest execution contract differs from report")
         for key in ("source_git_sha", "source_tree_sha", "models_lock_sha256", "binary_sha256", "model_key", "backend", "model_revision", "model_files", "hardware_id"):
-            require(read_json(manifest_snapshot).get(key) == report.get(key), f"executor invocation manifest {key} differs from report")
+            require(snapshot_document.get(key) == report.get(key), f"executor invocation manifest {key} differs from report")
+        if contract == G08_EXECUTION_CONTRACT:
+            require(
+                snapshot_document.get("binary_build_receipt")
+                == report.get("binary_build_receipt"),
+                "executor invocation manifest build receipt differs from report",
+            )
         require(snapshot["execution"]["model_arg"] == report.get("model_path"), "executor invocation manifest model path differs from report")
         expected.update(
             {
@@ -1846,11 +3298,12 @@ def validate_report_document(
                 "invocation_started_monotonic_ns": start_ns,
                 "invocation_finished_monotonic_ns": finish_ns,
                 "invocation_pid": invocation["pid"],
+                "invocation_pgid": invocation["pgid"],
                 "binary_path": snapshot["binary_path"],
             }
         )
     commands_raw = require_list(report.get("commands"), "scenario_report.commands")
-    commands: dict[str, str] = {}
+    commands: dict[str, dict[str, Any]] = {}
     for index, command_raw in enumerate(commands_raw):
         command_id, entrypoint = validate_command(
             root,
@@ -1860,8 +3313,8 @@ def validate_report_document(
             effective_config_sha256=effective_config_sha256,
         )
         require(command_id not in commands, f"duplicate scenario command id {command_id}")
-        commands[command_id] = entrypoint
-    require(set(commands.values()) == {"run", "serve"}, "scenario report must contain real ferrum run and serve commands")
+        commands[command_id] = {"entrypoint": entrypoint, "raw": require_object(command_raw, f"scenario_report.commands[{index}]")}
+    require({command["entrypoint"] for command in commands.values()} == {"run", "serve"}, "scenario report must contain real ferrum run and serve commands")
     scenarios_raw = require_list(report.get("scenarios"), "scenario_report.scenarios")
     require(len(scenarios_raw) == len(SCENARIO_IDS), "scenario report must contain exactly C01-C21")
     used_artifacts: set[Path] = set()
@@ -1881,14 +3334,66 @@ def validate_report_document(
             used_case_artifacts=used_case_artifacts,
             used_argv=used_argv,
         )
+    if invocation_ref is not None:
+        expected_run_ids = (
+            {f"actual-run-{index:02d}" for index in range(1, 6)}
+            if contract == G08_EXECUTION_CONTRACT
+            else {"actual-run"}
+        )
+        require(
+            set(commands) == expected_run_ids | {"actual-serve-01", "actual-serve-02"},
+            "canonical report command topology mismatch",
+        )
+        if contract == G08_EXECUTION_CONTRACT:
+            validate_resident_run_commands(
+                root,
+                commands,
+                case_rows_by_scenario,
+                model_key=model_key,
+            )
+        first_serve = commands["actual-serve-01"]["raw"]
+        second_serve = commands["actual-serve-02"]["raw"]
+        first_finished_at = parse_timestamp(first_serve.get("finished_at"), "first isolated serve command finished_at")
+        second_started_at = parse_timestamp(second_serve.get("started_at"), "second isolated serve command started_at")
+        require(first_finished_at <= second_started_at, "post-C09 serve session started before the first session stopped")
+        _, _, first_receipt_raw = validate_artifact_ref(root, first_serve.get("process_receipt"), "first isolated serve receipt", allowed_kinds={"raw-json"})
+        _, _, second_receipt_raw = validate_artifact_ref(root, second_serve.get("process_receipt"), "second isolated serve receipt", allowed_kinds={"raw-json"})
+        first_receipt = require_object(first_receipt_raw, "first isolated serve receipt JSON")
+        second_receipt = require_object(second_receipt_raw, "second isolated serve receipt JSON")
+        require(first_receipt.get("pid") != second_receipt.get("pid"), "C09 isolation reused the same serve process")
+        for scenario_id, scenario_raw in zip(SCENARIO_IDS, scenarios_raw):
+            scenario = require_object(scenario_raw, f"scenario {scenario_id}")
+            expected_command_ids = {
+                case["command_id"]
+                for case in case_rows_by_scenario[scenario_id]
+                if case["entrypoint"] == "run"
+            }
+            if contract == LEGACY_EXECUTION_CONTRACT and "run" in required_entrypoints(scenario_id):
+                require(expected_command_ids == {"actual-run"}, f"scenario {scenario_id} legacy run command drift")
+            if "serve" in required_entrypoints(scenario_id):
+                expected_command_ids.add("actual-serve-01" if int(scenario_id[1:]) <= 9 else "actual-serve-02")
+            require(
+                set(require_list(scenario.get("command_ids"), f"scenario {scenario_id}.command_ids")) == expected_command_ids,
+                f"scenario {scenario_id} violates the C09 serve isolation boundary",
+            )
+        serve_started_at = parse_timestamp(first_serve.get("started_at"), "scenario_report serve command started_at")
+        if contract == G08_EXECUTION_CONTRACT:
+            last_run_finished_at = max(
+                parse_timestamp(commands[command_id]["raw"].get("finished_at"), f"{command_id}.finished_at")
+                for command_id in expected_run_ids
+            )
+            require(last_run_finished_at <= serve_started_at, "serve started before all resident run sessions stopped")
+        for case in (case for rows in case_rows_by_scenario.values() for case in rows if case.get("entrypoint") == "run"):
+            require(case["finished_at"] <= serve_started_at, f"case {case.get('case_id')} overlapped the resident serve model")
     _, _, pair_registry_raw = validate_artifact_ref(root, report.get("pair_registry"), "scenario_report.pair_registry", allowed_kinds={"raw-json"})
     expected_pair_registry = build_pair_registry(case_rows_by_scenario, model_key=model_key, backend=backend)
     require(pair_registry_raw == expected_pair_registry, "scenario_report pair registry is not derived from persisted paired inputs")
-    expected_pass_prefix = f"{PASS_PREFIX}: "
+    pass_prefix = pass_prefix_for_contract(contract)
+    expected_pass_prefix = f"{pass_prefix}: "
     pass_line = require_string(report.get("pass_line"), "scenario_report.pass_line")
     require(pass_line.startswith(expected_pass_prefix), f"scenario_report.pass_line must start with {expected_pass_prefix}")
     collected_path = require_string(report.get("artifact_path"), "scenario_report.artifact_path")
-    require(pass_line == f"{PASS_PREFIX}: {collected_path}", "scenario_report.pass_line does not match collected artifact path")
+    require(pass_line == f"{pass_prefix}: {collected_path}", "scenario_report.pass_line does not match collected artifact path")
     if require_current_output_path:
         require(report_path is not None, "current output path validation requires report_path")
         require(collected_path == str(report_path.resolve()), "scenario_report.artifact_path does not match current output path")
@@ -1913,9 +3418,11 @@ def collect_manifest(
     )
     report["schema_version"] = SCHEMA_VERSION
     report["status"] = "pass"
+    contract = execution_contract(report, "scenario report")
+    report["execution_contract"] = contract
     report["runner"] = internal_fixture_runner_identity() if allow_internal_fixture else canonical_runner_identity()
     report["artifact_path"] = str(out)
-    report["pass_line"] = f"{PASS_PREFIX}: {out}"
+    report["pass_line"] = f"{pass_prefix_for_contract(contract)}: {out}"
     attach_pair_registry(report, root)
     validate_report_document(
         report,
@@ -1934,10 +3441,19 @@ def artifact_ref(root: Path, rel: str, kind: str, text: str) -> dict[str, str]:
     return {"kind": kind, "path": rel, "sha256": file_sha256(path)}
 
 
-def existing_artifact_ref(root: Path, path: Path, kind: str) -> dict[str, str]:
+def existing_artifact_ref(
+    root: Path,
+    path: Path,
+    kind: str,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, str]:
     resolved = path.resolve()
     rel = resolved.relative_to(root.resolve()).as_posix()
-    require(resolved.is_file() and resolved.stat().st_size > 0, f"cannot reference empty artifact {resolved}")
+    require(
+        resolved.is_file() and (allow_empty or resolved.stat().st_size > 0),
+        f"cannot reference empty artifact {resolved}",
+    )
     return {"kind": kind, "path": rel, "sha256": file_sha256(resolved)}
 
 
@@ -1947,6 +3463,8 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
         shape = selftest_scenario_shape(scenario_id, model_key, backend)
         entrypoints = sorted(required_entrypoints(scenario_id))
         for index, (variant, preset) in enumerate(planned_variant_presets(scenario_id, shape), start=1):
+            case_id = f"{scenario_id.lower()}-{index:03d}"
+            entrypoint = planned_entrypoint(scenario_id, variant, index, entrypoints)
             expectation = resolve_expectation(
                 catalog,
                 model_key=model_key,
@@ -1954,15 +3472,17 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
                 scenario_id=scenario_id,
                 variant=variant,
                 preset=preset,
+                entrypoint=entrypoint,
+                case_id=case_id,
             )
             rows.append(
                 {
-                    "case_id": f"{scenario_id.lower()}-{index:03d}",
+                    "case_id": case_id,
                     "scenario_id": scenario_id,
                     "ordinal": index,
                     "variant": variant,
                     "preset": preset,
-                    "entrypoint": planned_entrypoint(scenario_id, variant, index, entrypoints),
+                    "entrypoint": entrypoint,
                     "expectation": expectation,
                     "shape": shape,
                     "concurrency_cell": shape.get("concurrency_cells", [None] * shape["case_count"])[index - 1]
@@ -1971,6 +3491,62 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
                 }
             )
     return rows
+
+
+def select_c09_diagnostic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for variant in C09_DIAGNOSTIC_VARIANTS:
+        matches = [
+            row
+            for row in rows
+            if row["scenario_id"] == "C09" and row["variant"] == variant
+        ]
+        require(len(matches) == 20, f"C09 {variant} partition must contain exactly 20 cases")
+        selected.append(matches[0])
+    require(
+        [row["case_id"] for row in selected] == ["c09-001", "c09-021", "c09-041"],
+        "C09 diagnostic sentinel case ids drifted",
+    )
+    require(
+        all(row["entrypoint"] == "serve" for row in selected),
+        "C09 diagnostic must use the serve product entrypoint",
+    )
+    return selected
+
+
+def select_focused_rows(
+    rows: list[dict[str, Any]],
+    *,
+    case_ids: list[str],
+    scenario_ids: list[str],
+) -> list[dict[str, Any]]:
+    requested_cases = set(case_ids)
+    requested_scenarios = set(scenario_ids)
+    require(
+        len(requested_cases) == len(case_ids),
+        "--focus-case contains duplicate case ids",
+    )
+    require(
+        len(requested_scenarios) == len(scenario_ids),
+        "--focus-scenario contains duplicate scenario ids",
+    )
+    available_cases = {str(row["case_id"]) for row in rows}
+    available_scenarios = {str(row["scenario_id"]) for row in rows}
+    missing_cases = sorted(requested_cases - available_cases)
+    missing_scenarios = sorted(requested_scenarios - available_scenarios)
+    require(not missing_cases, f"--focus-case did not match canonical cases: {missing_cases}")
+    require(
+        not missing_scenarios,
+        f"--focus-scenario did not match canonical scenarios: {missing_scenarios}",
+    )
+    selected = [
+        row
+        for row in rows
+        if row["case_id"] in requested_cases
+        or row["scenario_id"] in requested_scenarios
+    ]
+    require(selected, "focused execution selected zero cases")
+    return selected
 
 
 def preset_values(model_key: str, preset: str | None) -> dict[str, Any]:
@@ -1984,16 +3560,77 @@ def preset_values(model_key: str, preset: str | None) -> dict[str, Any]:
     return copy.deepcopy(require_object(presets.get(preset), f"generation preset {model_key}.{preset}"))
 
 
+DETERMINISTIC_PARITY_SAMPLING_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "seed",
+    "stop",
+)
+
+
+def apply_deterministic_parity_sampling(
+    payload: dict[str, Any],
+    model_key: str,
+) -> None:
+    deterministic = preset_values(model_key, "P_DETERMINISTIC")
+    for key in DETERMINISTIC_PARITY_SAMPLING_KEYS:
+        if key in deterministic:
+            payload[key] = copy.deepcopy(deterministic[key])
+        else:
+            payload.pop(key, None)
+
+
 def case_marker(case_id: str) -> str:
     return f"G00-{case_id}-OK"
 
 
 def expected_case_text(case: dict[str, Any]) -> str:
     if case["scenario_id"] == "C17":
-        return {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "e\u0301"}[case["variant"]]
+        validate_c17_markers()
+        return C17_MARKERS[case["variant"]]
     if case["scenario_id"] == "C06":
         return case_marker(f"c05-{int(case['ordinal']):03d}")
     return case_marker(case["case_id"])
+
+
+def c03_user_turns(marker: str) -> list[str]:
+    return [
+        f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
+        "Reply with exactly CONTINUE.",
+        "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
+    ]
+
+
+def c03_expected_assistant_turns(marker: str) -> list[str]:
+    return ["ACKNOWLEDGED", "CONTINUE", marker]
+
+
+def c03_input_document(case_id: str, marker: str, argv: list[str]) -> dict[str, Any]:
+    user_turns = c03_user_turns(marker)
+    return {
+        "case_id": case_id,
+        "contract_id": C03_CONTRACT_ID,
+        "user_turns": user_turns,
+        "stdin": "\n".join(user_turns) + "\n",
+        "argv": argv,
+    }
+
+
+def allow_c01_known_failure_unknown_architecture(
+    scenario_id: str,
+    status: str,
+    failure_class: Any,
+) -> bool:
+    return scenario_id == "C01" and status == "known-fail" and failure_class == "c01-contract-violation"
+
+
+def allow_frozen_unknown_architecture(model_key: str, backend: str) -> bool:
+    return model_key == "m3-qwen3-30b-a3b" and backend == "metal"
 
 
 def model_file_digest(model_files: dict[str, str], source_path: Path) -> str | None:
@@ -2049,6 +3686,7 @@ def build_c01_resolution_probe(
         template_text = require_string(template_value, "C01 selected chat template")
     token_source = tokenizer if tokenizer is not None else semantic
     token_root = tokenizer_root if tokenizer is not None else semantic_root
+    tokenizer_path = token_root / "tokenizer.json"
     tokenizer_config_path = token_root / "tokenizer_config.json"
     tokenizer_config = read_json(tokenizer_config_path)
     eos_ids = config_model.get("eos_token_id") if isinstance(config_model, dict) else None
@@ -2061,17 +3699,12 @@ def build_c01_resolution_probe(
     }
     core_fields = {"architectures", "model_type", "text_config", "torch_dtype", "transformers_version"}
     unknown_fields = sorted(str(key) for key in config_document if key not in core_fields)
-    runtime_binding = {
-        "semantic_repo": semantic["repo"],
-        "semantic_revision": semantic["revision"],
-        "config_container_sha256": semantic["files"]["config.json"],
-        "template_source": chat["source"],
-        "template_repo": selected_source["repo"],
-        "template_revision": selected_source["revision"],
-        "template_path": chat["path"],
-        "template_container_sha256": chat["container_sha256"],
-        "template_content_sha256": chat["content_sha256"],
-    }
+    expected_source_identity = build_expected_product_source_identity(
+        model_arg=model_arg,
+        sources=sources,
+        semantic_root=semantic_root,
+        tokenizer_root=tokenizer_root,
+    )
     return {
         "available": True,
         "requested_model": model_arg,
@@ -2099,13 +3732,166 @@ def build_c01_resolution_probe(
         },
         "special_tokens": {
             "source": ("tokenizer_source" if tokenizer is not None else "semantic_source") + "/tokenizer_config.json",
+            "tokenizer_sha256": file_sha256(tokenizer_path),
+            "locked_tokenizer_sha256": token_source["files"]["tokenizer.json"],
             "container_sha256": file_sha256(tokenizer_config_path),
             "locked_container_sha256": token_source["files"]["tokenizer_config.json"],
             "tokens": special_tokens,
             "eos_token_ids": eos_ids,
         },
-        "runtime_binding": runtime_binding,
+        "expected_source_identity": expected_source_identity,
         "expected_runtime_architectures": sorted(EXPECTED_ARCHITECTURES[model_key]),
+    }
+
+
+def selected_product_source_files(
+    root: Path,
+    locked_files: dict[str, str],
+    selected_paths: list[str],
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for relative_path in sorted(selected_paths):
+        require(relative_path in locked_files, f"{label} selected file is absent from models.lock: {relative_path}")
+        path = root / relative_path
+        require(path.is_file(), f"{label} selected file is absent: {relative_path}")
+        require(file_sha256(path) == locked_files[relative_path], f"{label} selected file SHA differs from models.lock: {relative_path}")
+        rows.append(
+            {
+                "relative_path": relative_path,
+                "size_bytes": path.stat().st_size,
+                "sha256": locked_files[relative_path],
+            }
+        )
+    require(rows, f"{label} selected no source files")
+    return rows
+
+
+def build_expected_product_source_identity(
+    *,
+    model_arg: str,
+    sources: dict[str, Any],
+    semantic_root: Path,
+    tokenizer_root: Path,
+) -> dict[str, Any]:
+    semantic = require_object(sources.get("semantic_source"), "C01 semantic source")
+    tokenizer = sources.get("tokenizer_source")
+    token_source = semantic if tokenizer is None else require_object(tokenizer, "C01 tokenizer source")
+    chat = require_object(sources.get("chat_template"), "C01 chat template")
+    weight_repo = require_string(sources.get("weight_repo"), "C01 weight repo")
+    weight_revision = require_git_sha(sources.get("weight_revision"), "C01 weight revision")
+    weight_files = require_object(sources.get("weight_files"), "C01 weight files")
+    model_path = Path(model_arg).expanduser().absolute()
+    weight_root = model_path if model_path.is_dir() else model_path.parent
+    tokenizer_names = [
+        name
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "special_tokens_map.json",
+            "chat_template.json",
+            "chat_template.jinja",
+        )
+        if name in token_source["files"] and (tokenizer_root / name).is_file()
+    ]
+    weight_names = [
+        name
+        for name in weight_files
+        if name.endswith((".safetensors", ".gguf"))
+        or name in {"model.safetensors.index.json", "config.json"}
+    ]
+    semantic_files = selected_product_source_files(
+        semantic_root,
+        semantic["files"],
+        ["config.json"],
+        label="C01 semantic identity",
+    )
+    tokenizer_files = selected_product_source_files(
+        tokenizer_root,
+        token_source["files"],
+        tokenizer_names,
+        label="C01 tokenizer identity",
+    )
+    resolved_weight_files = selected_product_source_files(
+        weight_root,
+        weight_files,
+        weight_names,
+        label="C01 weight identity",
+    )
+    template_path = require_string(chat.get("path"), "C01 chat template path")
+    template_container_sha256 = require_sha256(chat.get("container_sha256"), "C01 chat template container SHA")
+    template_content_sha256 = require_sha256(chat.get("content_sha256"), "C01 chat template content SHA")
+    weight_config = next(
+        (row for row in resolved_weight_files if row["relative_path"] == "config.json"),
+        None,
+    )
+    return {
+        "schema_version": 1,
+        "requested_model": model_arg,
+        "resolved_model": weight_repo,
+        "original_sources": {
+            "semantic": {
+                "kind": "local_directory",
+                "location": str(semantic_root),
+                "requested_revision": None,
+            },
+            "tokenizer": {
+                "kind": "local_directory",
+                "location": str(tokenizer_root),
+                "requested_revision": None,
+            },
+            "weights": {
+                "kind": "local_directory" if model_path.is_dir() else "local_file",
+                "location": model_arg,
+                "requested_revision": None,
+            },
+        },
+        "resolved_sources": {
+            "semantic": {
+                "canonical_location": semantic["repo"],
+                "resolved_revision": semantic["revision"],
+                "files": semantic_files,
+            },
+            "tokenizer": {
+                "canonical_location": token_source["repo"],
+                "resolved_revision": token_source["revision"],
+                "files": tokenizer_files,
+            },
+            "weights": {
+                "canonical_location": weight_repo,
+                "resolved_revision": weight_revision,
+                "files": resolved_weight_files,
+            },
+        },
+        "semantic_config": {
+            "role": "semantic",
+            "source_file": "config.json",
+            "container_sha256": semantic["files"]["config.json"],
+        },
+        "tokenizer": {
+            "role": "tokenizer",
+            "source_file": "tokenizer.json",
+            "container_sha256": token_source["files"]["tokenizer.json"],
+        },
+        "template": {
+            "role": "tokenizer",
+            "source_file": template_path,
+            "container_sha256": template_container_sha256,
+            "content_sha256": template_content_sha256,
+        },
+        **(
+            {
+                "weight_config": {
+                    "role": "weights",
+                    "source_file": "config.json",
+                    "container_sha256": weight_config["sha256"],
+                }
+            }
+            if weight_config is not None
+            else {}
+        ),
     }
 
 
@@ -2137,6 +3923,7 @@ def validate_c01_resolution_probe(
     require(probe.get("expected_runtime_architectures") == sorted(EXPECTED_ARCHITECTURES[model_key]), f"{label} expected architecture set drift")
     if variant == "special-token-eos":
         special = require_object(probe.get("special_tokens"), f"{label}.resolution_probe.special_tokens")
+        require(special.get("tokenizer_sha256") == special.get("locked_tokenizer_sha256"), f"{label} tokenizer.json is not locked")
         require(special.get("container_sha256") == special.get("locked_container_sha256"), f"{label} tokenizer_config is not locked")
         tokens = require_object(special.get("tokens"), f"{label}.resolution_probe.special_tokens.tokens")
         require(tokens.get("eos_token") is not None, f"{label} official EOS token is absent")
@@ -2149,9 +3936,9 @@ def validate_c01_resolution_probe(
         runtime_architecture = require_string(runtime.get("architecture"), f"{label}.actual_config.model_capabilities.architecture")
         require(runtime_architecture in EXPECTED_ARCHITECTURES[model_key], f"{label} runtime architecture did not preserve the resolved model family")
         require("llama" not in runtime_architecture.lower(), f"{label} runtime silently fell back to Llama")
-        runtime_binding = require_object(probe.get("runtime_binding"), f"{label}.resolution_probe.runtime_binding")
-        actual_binding = require_object(actual_config.get("resolution_evidence"), f"{label}.actual_config.resolution_evidence")
-        require(actual_binding == runtime_binding, f"{label} runtime did not expose the selected config/template source identities")
+        expected_identity = require_object(probe.get("expected_source_identity"), f"{label}.resolution_probe.expected_source_identity")
+        actual_identity = require_object(actual_config.get("resolution_evidence"), f"{label}.actual_config.resolution_evidence")
+        require(actual_identity == expected_identity, f"{label} runtime product source identity differs from the locked role-specific sources")
 
 
 def validate_c01_negative_probe(
@@ -2172,7 +3959,7 @@ def validate_c01_negative_probe(
     require(probe.get("environment_sha256") == canonical_json_sha256(environment), f"{label} negative probe environment SHA mismatch")
     artifacts = require_object(probe.get("artifacts"), f"{label}.negative_probe.artifacts")
     require(
-        set(artifacts) == {"config", "tokenizer_config", "dummy_weight_marker", "named_weight", "stdout", "stderr", "process_receipt"},
+        set(artifacts) == {"config", "tokenizer", "tokenizer_config", "dummy_weight_marker", "named_weight", "stdout", "stderr", "process_receipt"},
         f"{label} negative probe artifact set mismatch",
     )
     require(probe.get("fixture_manifest_sha256") == canonical_json_sha256(artifacts), f"{label} negative fixture manifest SHA mismatch")
@@ -2184,6 +3971,9 @@ def validate_c01_negative_probe(
     require(target.get("model_type") == f"g00_unsupported_layout_{ordinal:03d}", f"{label} negative config layout mismatch")
     marker = require_object(config.get("g00_negative_fixture"), f"{label}.negative.config.g00_negative_fixture")
     require(marker == {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}, f"{label} negative config marker mismatch")
+    tokenizer_path, _, _ = validate_artifact_ref(root, artifacts["tokenizer"], f"{label}.negative.tokenizer", allowed_kinds={"raw-json"})
+    special_tokens = require_object(resolution_probe.get("special_tokens"), f"{label}.resolution_probe.special_tokens")
+    require(file_sha256(tokenizer_path) == special_tokens.get("locked_tokenizer_sha256"), f"{label} negative tokenizer differs from the locked source")
     validate_artifact_ref(root, artifacts["tokenizer_config"], f"{label}.negative.tokenizer_config", allowed_kinds={"raw-json"})
     dummy_path, _, _ = validate_artifact_ref(root, artifacts["dummy_weight_marker"], f"{label}.negative.dummy", allowed_kinds={"runtime-log"})
     require("must reject" in dummy_path.read_text(encoding="utf-8").lower(), f"{label} negative dummy marker contract missing")
@@ -2317,11 +4107,41 @@ def strict_schema_case(case: dict[str, Any]) -> tuple[str, dict[str, Any], dict[
 
 
 def thinking_reasoning_expected(model_key: str, variant: str) -> bool:
-    if variant == "hard-no-thinking":
+    if variant in {"hard-no-thinking", "soft-think-misuse"}:
         return False
     if model_key == "m3-qwen3-30b-a3b" and variant == "soft-no-think":
         return False
     return True
+
+
+def c19_hard_thinking_override(variant: str) -> bool | str:
+    if variant in {"hard-thinking", "soft-no-think-misuse"}:
+        return True
+    if variant in {"hard-no-thinking", "soft-think-misuse"}:
+        return False
+    return "model-default"
+
+
+def c19_expected_final(marker: str, turn: int) -> str:
+    require(turn in {1, 2}, f"C19 turn must be 1 or 2, got {turn}")
+    return f"{marker}-H{turn}"
+
+
+def c19_turn_prompt(marker: str, turn: int, variant: str) -> str:
+    final = c19_expected_final(marker, turn)
+    if turn == 1:
+        task = "Solve (37 * 19) + 11 and verify whether it equals 714."
+    else:
+        task = "Using the arithmetic result from our prior exchange, subtract 29 and verify whether the result is 685."
+    prompt = (
+        f'{task} Do the calculation before answering, but keep it out of the final answer. '
+        f'Your final answer must be exactly "{final}" and contain nothing else.'
+    )
+    if variant in {"soft-think", "soft-think-misuse"}:
+        return f"{prompt} /think"
+    if variant in {"soft-no-think", "soft-no-think-misuse"}:
+        return f"{prompt} /no_think"
+    return prompt
 
 
 def validate_strict_schema_instance(instance: Any, schema: dict[str, Any], label: str) -> None:
@@ -2391,11 +4211,30 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
         },
     }
     values = preset_values(model_key, case["preset"])
-    for key in ("temperature", "top_p", "top_k", "seed", "max_tokens", "stop"):
+    for key in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "seed",
+        "max_tokens",
+        "stop",
+    ):
         if key in values:
+            if key == "max_tokens" and values.get("output_budget_mode") == "auto-ceiling":
+                continue
             payload[key] = values[key]
     if isinstance(values.get("template_kwargs"), dict) and values["template_kwargs"]:
         payload["chat_template_kwargs"] = values["template_kwargs"]
+    if scenario_id in {"C11", "C12"}:
+        # C11/C12 retain the selected thinking mode and output budget, while
+        # their exact stream-parity comparison uses the goal's deterministic
+        # sampling vector. Official stochastic sampling remains covered by C21.
+        apply_deterministic_parity_sampling(payload, model_key)
+        payload["metadata"]["g00_sampling_contract"] = "deterministic-stream-parity"
     if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
         payload.update({"stream": True, "stream_options": {"include_usage": True}})
     if scenario_id == "C06":
@@ -2416,6 +4255,22 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
             payload.update({"max_tokens": 8, "stop": [], "ignore_eos": True})
         else:
             payload["max_tokens"] = 64
+    if scenario_id == "C09":
+        payload["messages"] = [
+            {
+                "role": "user",
+                "content": "Write 512 numbered one-word items without stopping early.",
+            }
+        ]
+        payload.update(
+            {
+                "max_tokens": 512,
+                "ignore_eos": True,
+                "stop": [],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        )
     if scenario_id in {"C10", "C11", "C12"}:
         payload["messages"] = [{"role": "user", "content": "Use lookup_weather for Paris."}]
         payload["tools"] = [
@@ -2473,22 +4328,20 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
         else:
             payload["max_tokens"] = 10**9
     elif scenario_id == "C19":
-        if variant == "hard-thinking":
+        payload["messages"] = [{"role": "user", "content": c19_turn_prompt(marker, 1, variant)}]
+        hard_thinking = c19_hard_thinking_override(variant)
+        if hard_thinking is True:
             payload["chat_template_kwargs"] = {"enable_thinking": True}
-        elif variant == "hard-no-thinking":
+        elif hard_thinking is False:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
             payload.pop("chat_template_kwargs", None)
-            if variant in {"soft-think", "soft-think-misuse"}:
-                payload["messages"][0]["content"] += " /think"
-            elif variant in {"soft-no-think", "soft-no-think-misuse"}:
-                payload["messages"][0]["content"] += " /no_think"
     elif scenario_id == "C20":
         if variant == "text-array":
             payload["messages"] = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         else:
             media_type = "video_url" if variant == "video-url" else "image_url"
-            url = "data:image/png;base64,iVBORw0KGgo=" if variant == "data-url" else "https://example.invalid/media.png"
+            url = "data:image/png;base64,iVBORw0KGgo=" if variant == "data-url" else C20_REMOTE_MEDIA_URL
             content: list[dict[str, Any]] = [{"type": media_type, media_type: {"url": url}}]
             if variant == "mixed-text-media":
                 content.insert(0, {"type": "text", "text": prompt})
@@ -2696,21 +4549,62 @@ def parse_sse_evidence(body: str) -> dict[str, Any]:
     }
 
 
+def complete_jsonl_offset(path: Path) -> int:
+    """Return the byte immediately after the last complete JSONL record."""
+    if not path.is_file():
+        return 0
+    with path.open("rb") as handle:
+        end = handle.seek(0, os.SEEK_END)
+        cursor = end
+        while cursor > 0:
+            start = max(0, cursor - 64 * 1024)
+            handle.seek(start)
+            chunk = handle.read(cursor - start)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                return start + newline + 1
+            cursor = start
+    return 0
+
+
 def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
     if not path.is_file():
         return [], offset
     with path.open("rb") as handle:
         handle.seek(offset)
         payload = handle.read()
-        new_offset = handle.tell()
+    last_newline = payload.rfind(b"\n")
+    if last_newline < 0:
+        return [], offset
+    complete_payload = payload[: last_newline + 1]
+    new_offset = offset + last_newline + 1
+    try:
+        text = complete_payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ScenarioError(
+            f"scheduler trace contains invalid UTF-8 at byte {offset + exc.start}"
+        ) from exc
     rows: list[dict[str, Any]] = []
-    for line in payload.decode("utf-8", "replace").splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
+    consumed = offset
+    for line_number, line in enumerate(text.splitlines(keepends=True), start=1):
+        encoded = line.encode("utf-8")
+        line_offset = consumed
+        consumed += len(encoded)
+        stripped = line.rstrip("\r\n")
+        if not stripped:
             continue
-        if isinstance(value, dict):
-            rows.append(value)
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ScenarioError(
+                f"scheduler trace contains invalid JSONL at byte {line_offset} "
+                f"(chunk line {line_number})"
+            ) from exc
+        require(
+            isinstance(value, dict),
+            f"scheduler trace row at byte {line_offset} must be a JSON object",
+        )
+        rows.append(value)
     return rows, new_offset
 
 
@@ -2737,22 +4631,898 @@ def observed_max_active(rows: list[dict[str, Any]]) -> int:
     return max(values, default=0)
 
 
-def trace_released(rows: list[dict[str, Any]]) -> tuple[bool, int, int | None]:
-    active_seen = False
-    ticks = 0
-    for row in rows:
-        values = nested_activity_values(row)
-        if not values:
+def required_active_floor(model_key: str, backend: str, requested_concurrency: int) -> int:
+    floor = REQUIRED_ACTIVE_FLOORS.get((model_key, backend))
+    require(floor is not None, f"active floor is undefined for {model_key}/{backend}")
+    return min(requested_concurrency, floor)
+
+
+def c18_request_identities(case_id: str, requested_concurrency: int) -> list[dict[str, Any]]:
+    identities: list[dict[str, Any]] = []
+    for index in range(requested_concurrency):
+        checksum = hashlib.sha256(f"{case_id}:{index}".encode("utf-8")).hexdigest()[:16]
+        identities.append(
+            {
+                "request_index": index,
+                "checksum": checksum,
+                "marker": f"G00-{case_id}-R{index:03d}-{checksum}-OK",
+            }
+        )
+    return identities
+
+
+def c18_request_payload(base: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(base)
+    marker = require_string(identity.get("marker"), "C18 request marker")
+    messages = require_list(payload.get("messages"), "C18 request messages")
+    require(messages, "C18 request has no messages")
+    message = require_object(messages[-1], "C18 final request message")
+    require(message.get("role") == "user", "C18 final request message must be user-owned")
+    message["content"] = f"Return {marker} exactly."
+    payload["metadata"] = {
+        **require_object(payload.get("metadata", {}), "C18 request metadata"),
+        "g00_concurrency_request_index": identity["request_index"],
+        "g00_concurrency_checksum": identity["checksum"],
+    }
+    return payload
+
+
+def c18_isolation_summary(
+    exchanges: list[dict[str, Any]],
+    identities: list[dict[str, Any]],
+) -> dict[str, int]:
+    all_markers = {identity["marker"] for identity in identities}
+    all_checksums = {identity["checksum"] for identity in identities}
+    counts = {
+        "error_count": 0,
+        "bad_output_count": 0,
+        "crosstalk_count": 0,
+        "bad_checksum_count": 0,
+        "server_500_count": 0,
+    }
+    for exchange, identity in zip(exchanges, identities):
+        status = exchange.get("status")
+        if not isinstance(status, int) or status != 200:
+            counts["error_count"] += 1
+        if isinstance(status, int) and status >= 500:
+            counts["server_500_count"] += 1
+        content = ""
+        try:
+            _, content = response_message(
+                require_object(exchange.get("response"), "C18 exchange response"),
+                f"C18 request {identity['request_index']}",
+            )
+        except ScenarioError:
+            counts["bad_output_count"] += 1
+            counts["bad_checksum_count"] += 1
             continue
-        current = max(values)
-        if current > 0:
-            active_seen = True
-            ticks = 0
-        elif active_seen:
-            ticks += 1
-            observed_ns = row.get("collector_observed_monotonic_ns")
-            return True, ticks, observed_ns if isinstance(observed_ns, int) else None
-    return False, ticks, None
+        expected_marker = identity["marker"]
+        expected_checksum = identity["checksum"]
+        if content != expected_marker:
+            counts["bad_output_count"] += 1
+        if any(marker in content for marker in all_markers - {expected_marker}):
+            counts["crosstalk_count"] += 1
+        observed_checksums = {checksum for checksum in all_checksums if checksum in content}
+        if observed_checksums != {expected_checksum}:
+            counts["bad_checksum_count"] += 1
+    return counts
+
+
+def c18_completion_summary(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
+    request_count = len(exchanges)
+    require(request_count > 0, "C18 completion summary requires at least one request")
+    completed_request_count = sum(exchange.get("status") == 200 for exchange in exchanges)
+    return {
+        "request_count": request_count,
+        "completed_request_count": completed_request_count,
+        "completion_rate": completed_request_count / request_count,
+    }
+
+
+def validate_c18_resource_balance_summary(
+    raw: Any,
+    *,
+    expected_request_count: int,
+    label: str,
+    require_non_request_resources: bool = True,
+) -> dict[str, Any]:
+    summary = require_object(raw, label)
+    require(summary.get("schema_version") == SCHEMA_VERSION, f"{label}.schema_version mismatch")
+    require_count(summary.get("resource_event_count"), f"{label}.resource_event_count", minimum=1)
+    require(
+        require_count(summary.get("request_lifecycle_count"), f"{label}.request_lifecycle_count")
+        == expected_request_count,
+        f"{label}.request_lifecycle_count mismatch",
+    )
+    require_count(
+        summary.get("balanced_owner_resource_count"),
+        f"{label}.balanced_owner_resource_count",
+        minimum=expected_request_count * (2 if require_non_request_resources else 1),
+    )
+    require_count(summary.get("defer_count"), f"{label}.defer_count")
+    for field in ("reject_count", "leaked_resource_count", "underflow_count"):
+        require(summary.get(field) == 0, f"{label}.{field} must be 0")
+    triplets = require_object(summary.get("resource_triplets"), f"{label}.resource_triplets")
+    require("request_slot" in triplets, f"{label} lacks request_slot accounting")
+    if require_non_request_resources:
+        require(len(triplets) >= 2, f"{label} lacks non-request resource accounting")
+    for resource_kind, raw_counts in triplets.items():
+        counts = require_object(raw_counts, f"{label}.resource_triplets.{resource_kind}")
+        require(
+            set(counts) == {"reserve", "commit", "release", "rollback"},
+            f"{label}.resource_triplets.{resource_kind} fields mismatch",
+        )
+        for action, value in counts.items():
+            require_count(value, f"{label}.resource_triplets.{resource_kind}.{action}")
+        require(
+            counts["reserve"] == counts["release"] + counts["rollback"],
+            f"{label}.{resource_kind} reservation terminal balance mismatch",
+        )
+        require(
+            counts["commit"] == counts["release"],
+            f"{label}.{resource_kind} commit terminal balance mismatch",
+        )
+    request_slot = require_object(triplets["request_slot"], f"{label}.resource_triplets.request_slot")
+    require(
+        request_slot
+        == {
+            "reserve": expected_request_count,
+            "commit": expected_request_count,
+            "release": expected_request_count,
+            "rollback": 0,
+        },
+        f"{label}.request_slot does not cover every request exactly once",
+    )
+    return summary
+
+
+def c18_resource_balance(
+    trace_rows: list[dict[str, Any]],
+    *,
+    expected_request_count: int,
+    require_non_request_resources: bool = True,
+    label: str = "C18 resource balance",
+) -> dict[str, Any]:
+    lifecycle_actions = {"reserve", "commit", "release", "rollback"}
+    states: dict[tuple[str, str, str], dict[str, int]] = {}
+    request_actions: dict[str, dict[str, int]] = {}
+    resource_summary: dict[str, dict[str, int]] = {}
+    resource_event_count = 0
+    defer_count = 0
+    reject_count = 0
+
+    def reserved_balance(state: dict[str, int]) -> int:
+        return state["reserved"] - state["released"] - state["rolled_back"]
+
+    def committed_balance(state: dict[str, int]) -> int:
+        return state["committed"] - state["released"]
+
+    for index, row in enumerate(trace_rows):
+        raw = require_object(row.get("raw", row), f"C18 resource trace[{index}].raw")
+        resource = raw.get("resource")
+        if not isinstance(resource, dict):
+            continue
+        resource_event_count += 1
+        require(raw.get("status") in {None, "ok"}, f"C18 resource trace[{index}] status is not ok")
+        require(raw.get("error") is None, f"C18 resource trace[{index}] contains an error")
+        request_id = require_string(raw.get("request_id"), f"C18 resource trace[{index}].request_id")
+        owner_kind = require_string(resource.get("owner_kind"), f"C18 resource trace[{index}].owner_kind")
+        owner_id = require_string(resource.get("owner_id"), f"C18 resource trace[{index}].owner_id")
+        resource_kind = require_string(resource.get("resource_kind"), f"C18 resource trace[{index}].resource_kind")
+        action = require_string(resource.get("action"), f"C18 resource trace[{index}].action")
+        require(
+            action
+            in {
+                "request_open",
+                "request_close",
+                "reserve",
+                "commit",
+                "release",
+                "rollback",
+                "defer",
+                "reject",
+                "capacity_snapshot",
+            },
+            f"C18 resource trace[{index}] action is invalid",
+        )
+        require(
+            resource.get("underflow_amount") in {None, 0}
+            and resource.get("error_kind") is None
+            and resource.get("resource_error_kind") is None,
+            f"C18 resource trace[{index}] contains underflow/error evidence",
+        )
+        if action in {"request_open", "request_close"}:
+            require(
+                owner_kind == "request" and owner_id == request_id and resource_kind == "request_slot",
+                f"C18 resource trace[{index}] request lifecycle identity mismatch",
+            )
+            counts = request_actions.setdefault(request_id, {"request_open": 0, "request_close": 0})
+            counts[action] += 1
+            if action == "request_close":
+                for (state_owner_kind, state_owner_id, state_resource_kind), state in states.items():
+                    if state_owner_kind == owner_kind and state_owner_id == owner_id:
+                        require(
+                            reserved_balance(state) == 0
+                            and committed_balance(state) == 0,
+                            f"C18 request {request_id} closed with outstanding {state_resource_kind}",
+                        )
+            continue
+        if action == "defer":
+            defer_count += 1
+            continue
+        if action == "reject":
+            reject_count += 1
+            continue
+        if action == "capacity_snapshot":
+            require_count(resource.get("capacity"), f"C18 resource trace[{index}].capacity", minimum=1)
+            continue
+        require(action in lifecycle_actions, f"C18 resource trace[{index}] lifecycle action invalid")
+        amount = require_count(resource.get("amount"), f"C18 resource trace[{index}].amount", minimum=1)
+        before = require_count(resource.get("before"), f"C18 resource trace[{index}].before")
+        after = require_count(resource.get("after"), f"C18 resource trace[{index}].after")
+        key = (owner_kind, owner_id, resource_kind)
+        state = states.setdefault(
+            key,
+            {"reserved": 0, "committed": 0, "released": 0, "rolled_back": 0},
+        )
+        if action == "reserve":
+            expected_before = reserved_balance(state)
+            state["reserved"] += amount
+            expected_after = reserved_balance(state)
+        elif action == "commit":
+            expected_before = committed_balance(state)
+            state["committed"] += amount
+            expected_after = committed_balance(state)
+            require(
+                committed_balance(state) <= reserved_balance(state),
+                f"C18 commit exceeds live reserve for {key}",
+            )
+        elif action == "release":
+            expected_before = committed_balance(state)
+            require(amount <= expected_before, f"C18 release underflow for {key}")
+            require(amount <= reserved_balance(state), f"C18 release exceeds live reserve for {key}")
+            state["released"] += amount
+            expected_after = committed_balance(state)
+        else:
+            expected_before = reserved_balance(state)
+            require(
+                amount <= expected_before - committed_balance(state),
+                f"C18 rollback exceeds uncommitted reserve for {key}",
+            )
+            state["rolled_back"] += amount
+            expected_after = reserved_balance(state)
+        require(
+            before == expected_before and after == expected_after,
+            f"C18 resource transition mismatch for {key}: expected {expected_before}->{expected_after}, got {before}->{after}",
+        )
+        capacity = resource.get("capacity")
+        if capacity is not None:
+            capacity = require_count(capacity, f"C18 resource trace[{index}].capacity", minimum=1)
+            global_outstanding = sum(
+                max(reserved_balance(candidate), 0)
+                for candidate_key, candidate in states.items()
+                if candidate_key[2] == resource_kind
+            )
+            require(global_outstanding <= capacity, f"C18 {resource_kind} exceeds typed capacity")
+        bucket = resource_summary.setdefault(
+            resource_kind,
+            {"reserve": 0, "commit": 0, "release": 0, "rollback": 0},
+        )
+        bucket[action] += amount
+
+    require(resource_event_count > 0, "C18 scheduler trace contains no resource events")
+    require(
+        len(request_actions) == expected_request_count
+        and all(counts == {"request_open": 1, "request_close": 1} for counts in request_actions.values()),
+        "C18 request resource lifecycle coverage is incomplete",
+    )
+    require(reject_count == 0, "C18 resource trace contains a rejected request")
+    require("request_slot" in resource_summary, "C18 resource trace lacks request-slot accounting")
+    if require_non_request_resources:
+        require(len(resource_summary) >= 2, "C18 resource trace lacks non-request resource accounting")
+    for key, state in states.items():
+        require(
+            reserved_balance(state) == 0 and committed_balance(state) == 0,
+            f"C18 resource trace ended with outstanding resources for {key}",
+        )
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "resource_event_count": resource_event_count,
+        "request_lifecycle_count": len(request_actions),
+        "balanced_owner_resource_count": len(states),
+        "defer_count": defer_count,
+        "reject_count": reject_count,
+        "leaked_resource_count": 0,
+        "underflow_count": 0,
+        "resource_triplets": dict(sorted(resource_summary.items())),
+    }
+    return validate_c18_resource_balance_summary(
+        summary,
+        expected_request_count=expected_request_count,
+        label=label,
+        require_non_request_resources=require_non_request_resources,
+    )
+
+
+def c18_runtime_failure_summary(evidence: Any) -> dict[str, int]:
+    item = require_object(evidence, "C18 runtime log evidence")
+    text = item.get("text")
+    require(isinstance(text, str), "C18 runtime log text must be a string")
+    encoded = text.encode("utf-8")
+    require(item.get("sha256") == hashlib.sha256(encoded).hexdigest(), "C18 runtime log SHA mismatch")
+    start = require_count(item.get("start_offset"), "C18 runtime log start offset")
+    end = require_count(item.get("end_offset"), "C18 runtime log end offset")
+    require(end >= start and end - start == len(encoded), "C18 runtime log byte range mismatch")
+    return {
+        "panic_count": len(C18_PANIC_RE.findall(text)),
+        "oom_count": len(C18_OOM_RE.findall(text)),
+    }
+
+
+def c18_trace_scope_summary(
+    rows: list[dict[str, Any]],
+    *,
+    started_unix_ns: int,
+    expected_request_count: int,
+) -> dict[str, Any]:
+    """Bind a C18 trace window to the request identities opened by this case."""
+
+    started_unix_ns = require_count(
+        started_unix_ns,
+        "C18 trace scope started_unix_ns",
+        minimum=1,
+    )
+    expected_request_count = require_count(
+        expected_request_count,
+        "C18 trace scope expected_request_count",
+        minimum=1,
+    )
+    open_counts: dict[str, int] = {}
+    close_counts: dict[str, int] = {}
+    open_positions: dict[str, int] = {}
+    close_positions: dict[str, list[int]] = {}
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("raw", row)
+        if not isinstance(raw, dict):
+            continue
+        phase = raw.get("phase")
+        if phase not in {"engine_request_open", "engine_request_close"}:
+            continue
+        request_id = require_string(
+            raw.get("request_id"),
+            f"C18 trace scope row[{index}].request_id",
+        )
+        if phase == "engine_request_open":
+            event_unix_ns = require_count(
+                raw.get("ts_unix_nanos"),
+                f"C18 trace scope row[{index}].ts_unix_nanos",
+                minimum=1,
+            )
+            if event_unix_ns < started_unix_ns:
+                continue
+            open_counts[request_id] = open_counts.get(request_id, 0) + 1
+            open_positions.setdefault(request_id, index)
+        else:
+            close_counts[request_id] = close_counts.get(request_id, 0) + 1
+            close_positions.setdefault(request_id, []).append(index)
+
+    request_ids = list(open_counts)
+    selected_close_counts = {
+        request_id: close_counts.get(request_id, 0) for request_id in request_ids
+    }
+    duplicate_open_count = sum(max(0, count - 1) for count in open_counts.values())
+    duplicate_close_count = sum(
+        max(0, count - 1) for count in selected_close_counts.values()
+    )
+    out_of_order_close_count = sum(
+        1
+        for request_id in request_ids
+        for close_position in close_positions.get(request_id, [])
+        if close_position < open_positions[request_id]
+    )
+    closed_request_ids = [
+        request_id
+        for request_id in request_ids
+        if selected_close_counts[request_id] == 1
+        and close_positions[request_id][0] > open_positions[request_id]
+    ]
+    complete = (
+        len(request_ids) == expected_request_count
+        and duplicate_open_count == 0
+        and duplicate_close_count == 0
+        and out_of_order_close_count == 0
+        and len(closed_request_ids) == expected_request_count
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "started_unix_ns": started_unix_ns,
+        "expected_request_count": expected_request_count,
+        "request_ids": request_ids,
+        "closed_request_ids": closed_request_ids,
+        "open_event_count": sum(open_counts.values()),
+        "close_event_count": sum(selected_close_counts.values()),
+        "duplicate_open_count": duplicate_open_count,
+        "duplicate_close_count": duplicate_close_count,
+        "out_of_order_close_count": out_of_order_close_count,
+        "complete": complete,
+    }
+
+
+def c18_scoped_trace_rows(
+    rows: list[dict[str, Any]],
+    scope: Any,
+    *,
+    expected_request_count: int,
+    label: str,
+) -> list[dict[str, Any]]:
+    scope_document = require_object(scope, f"{label}.scheduler_trace_scope")
+    started_unix_ns = require_count(
+        scope_document.get("started_unix_ns"),
+        f"{label}.scheduler_trace_scope.started_unix_ns",
+        minimum=1,
+    )
+    derived = c18_trace_scope_summary(
+        rows,
+        started_unix_ns=started_unix_ns,
+        expected_request_count=expected_request_count,
+    )
+    require(
+        scope_document == derived,
+        f"{label} C18 scheduler trace scope is not replayable",
+    )
+    require(
+        derived["complete"] is True,
+        f"{label} C18 scheduler trace scope did not close the same request identities",
+    )
+    scoped = c18_trace_rows_for_request_ids(
+        rows,
+        derived["request_ids"],
+        label=label,
+    )
+    require(scoped, f"{label} C18 scheduler trace scope is empty")
+    return scoped
+
+
+def c18_trace_rows_for_request_ids(
+    rows: list[dict[str, Any]],
+    request_id_values: list[str],
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    request_ids = {
+        require_string(request_id, f"{label}.request_id")
+        for request_id in request_id_values
+    }
+    product_request_ids = {
+        f"{C18_PRODUCT_REQUEST_PREFIX}{request_id}" for request_id in request_ids
+    }
+    scoped = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance((raw := row.get("raw", row)), dict)
+        and raw.get("request_id") in request_ids | product_request_ids
+        ]
+    return scoped
+
+
+def c18_fixture_trace_rows(
+    case_id: str,
+    requested_concurrency: int,
+    typed_active_cap: int,
+) -> list[dict[str, Any]]:
+    """Build deterministic paired transitions for validator-only fixtures."""
+
+    rows: list[dict[str, Any]] = []
+    timestamp = 1_000_000_000
+
+    def append_event(
+        request_index: int,
+        phase: str,
+        active: int,
+        resource: dict[str, Any],
+    ) -> None:
+        nonlocal timestamp
+        request_id = f"{case_id}-request-{request_index:03d}"
+        event = {
+            "ts_unix_nanos": C18_FIXTURE_TRACE_START_UNIX_NS + timestamp,
+            "event_id": f"fixture-{phase}-{request_id}",
+            "phase": phase,
+            "request_id": request_id,
+            "status": "ok",
+            "error": None,
+            "resource": {
+                "owner_kind": "request",
+                "owner_id": request_id,
+                **resource,
+            },
+            "attributes": {
+                "monotonic_nanos": timestamp,
+                "active_sequence_count": active,
+                "scheduler_snapshot": {"active_len": active},
+            },
+        }
+        rows.append(
+            {
+                "raw": event,
+                "collector_observed_monotonic_ns": timestamp,
+                "raw_sha256": canonical_json_sha256(event),
+            }
+        )
+        timestamp += 1_000
+
+    for request_index in range(requested_concurrency):
+        active = min(request_index + 1, typed_active_cap)
+        append_event(
+            request_index,
+            "engine_request_open",
+            active,
+            {"resource_kind": "request_slot", "action": "request_open"},
+        )
+        append_event(
+            request_index,
+            "engine_request_slot_reserve",
+            active,
+            {"resource_kind": "request_slot", "action": "reserve", "amount": 1, "before": 0, "after": 1},
+        )
+        append_event(
+            request_index,
+            "engine_request_slot_commit",
+            active,
+            {"resource_kind": "request_slot", "action": "commit", "amount": 1, "before": 0, "after": 1},
+        )
+        append_event(
+            request_index,
+            "plan_runtime_workspace_reserve",
+            active,
+            {"resource_kind": "backend_workspace", "action": "reserve", "amount": 1, "before": 0, "after": 1, "capacity": typed_active_cap},
+        )
+        append_event(
+            request_index,
+            "plan_runtime_workspace_commit",
+            active,
+            {"resource_kind": "backend_workspace", "action": "commit", "amount": 1, "before": 0, "after": 1, "capacity": typed_active_cap},
+        )
+        append_event(
+            request_index,
+            "plan_runtime_workspace_release",
+            active,
+            {"resource_kind": "backend_workspace", "action": "release", "amount": 1, "before": 1, "after": 0, "capacity": typed_active_cap},
+        )
+    timestamp += 1_000_000
+    for request_index in range(requested_concurrency):
+        active = min(requested_concurrency - request_index, typed_active_cap)
+        append_event(
+            request_index,
+            "engine_request_slot_release",
+            active,
+            {"resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0},
+        )
+        append_event(
+            request_index,
+            "engine_request_close",
+            min(requested_concurrency - request_index - 1, typed_active_cap),
+            {"resource_kind": "request_slot", "action": "request_close"},
+        )
+    return rows
+
+
+def c09_terminal_outcome(
+    rows: list[dict[str, Any]],
+    abort_exchange: dict[str, Any],
+    recovery_exchange: dict[str, Any],
+) -> dict[str, Any]:
+    abort_response = require_object(
+        abort_exchange.get("response"), "C09 abort.response"
+    )
+    admission_observed = abort_response.get("admission_observed")
+    require(
+        isinstance(admission_observed, bool),
+        "C09 abort admission_observed must be boolean",
+    )
+    admitted_request_id = abort_response.get("admission_request_id")
+    if admission_observed:
+        admitted_request_id = require_string(
+            admitted_request_id, "C09 abort.admission_request_id"
+        )
+    else:
+        require(
+            admitted_request_id is None,
+            "C09 non-admitted abort must not claim an admission request id",
+        )
+    abort_start_ns = require_count(
+        abort_exchange.get("started_monotonic_ns"),
+        "C09 abort.started_monotonic_ns",
+        minimum=1,
+    )
+    abort_finish_ns = require_count(
+        abort_exchange.get("finished_monotonic_ns"),
+        "C09 abort.finished_monotonic_ns",
+        minimum=abort_start_ns,
+    )
+    recovery_start_ns = require_count(
+        recovery_exchange.get("started_monotonic_ns"),
+        "C09 recovery.started_monotonic_ns",
+        minimum=abort_finish_ns,
+    )
+
+    by_collection_phase: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {
+        "abort_window": [],
+        "recovery_window": [],
+    }
+    for index, row_raw in enumerate(rows):
+        row = require_object(row_raw, f"C09 trace[{index}]")
+        collection_phase = row.get("collection_phase")
+        require(
+            collection_phase in by_collection_phase,
+            f"C09 trace[{index}] collection phase is invalid",
+        )
+        raw = require_object(row.get("raw"), f"C09 trace[{index}].raw")
+        observed_ns = require_count(
+            row.get("collector_observed_monotonic_ns"),
+            f"C09 trace[{index}].collector_observed_monotonic_ns",
+            minimum=abort_start_ns,
+        )
+        if collection_phase == "abort_window":
+            require(
+                observed_ns <= recovery_start_ns,
+                f"C09 trace[{index}] abort row was observed after recovery started",
+            )
+        else:
+            require(
+                observed_ns >= recovery_start_ns,
+                f"C09 trace[{index}] recovery row predates recovery start",
+            )
+        by_collection_phase[collection_phase].append((row, raw))
+
+    def lifecycle_rows(
+        collection_phase: str,
+    ) -> tuple[dict[str, list[tuple[dict[str, Any], dict[str, Any]]]], set[str]]:
+        lifecycles: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        resource_request_ids: set[str] = set()
+        for row, raw in by_collection_phase[collection_phase]:
+            request_id = raw.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            phase = raw.get("phase")
+            if phase in {
+                "engine_request_open",
+                "engine_request_close",
+                "engine_client_disconnect_detected",
+                "engine_client_disconnect_released",
+                "engine_client_disconnect_release_failed",
+            }:
+                lifecycles.setdefault(request_id, []).append((row, raw))
+            resource = raw.get("resource")
+            if (
+                isinstance(resource, dict)
+                and resource.get("owner_kind") == "request"
+                and resource.get("action")
+                in {
+                    "request_open",
+                    "reserve",
+                    "commit",
+                    "release",
+                    "rollback",
+                    "reject",
+                    "request_close",
+                }
+            ):
+                resource_request_ids.add(request_id)
+        return lifecycles, resource_request_ids
+
+    def phase_rows(
+        lifecycle: list[tuple[dict[str, Any], dict[str, Any]]], phase: str
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        return [item for item in lifecycle if item[1].get("phase") == phase]
+
+    def require_clean_close(
+        request_id: str,
+        lifecycle: list[tuple[dict[str, Any], dict[str, Any]]],
+        request_rows: list[dict[str, Any]],
+        label: str,
+    ) -> dict[str, Any]:
+        opens = phase_rows(lifecycle, "engine_request_open")
+        closes = phase_rows(lifecycle, "engine_request_close")
+        require(len(opens) == 1, f"{label} must contain exactly one request_open")
+        require(len(closes) == 1, f"{label} must contain exactly one request_close")
+        close = closes[0][1]
+        attributes = require_object(close.get("attributes"), f"{label}.request_close.attributes")
+        outstanding_kinds = attributes.get("resource_owner_outstanding_kinds")
+        require(
+            close.get("status") == "ok"
+            and close.get("error") is None
+            and attributes.get("resource_owner_outstanding_count") == 0
+            and (outstanding_kinds is None or outstanding_kinds == []),
+            f"{label} closed with outstanding resources",
+        )
+        resource = require_object(close.get("resource"), f"{label}.request_close.resource")
+        require(
+            resource.get("owner_id") == request_id
+            and resource.get("action") == "request_close",
+            f"{label} request_close owner binding mismatch",
+        )
+        return c18_resource_balance(
+            request_rows,
+            expected_request_count=1,
+            require_non_request_resources=False,
+            label=f"{label} resource balance",
+        )
+
+    def rows_for_request(collection_phase: str, request_id: str) -> list[dict[str, Any]]:
+        return [
+            row
+            for row, raw in by_collection_phase[collection_phase]
+            if raw.get("request_id") == request_id
+        ]
+
+    def event_monotonic_ns(
+        event: tuple[dict[str, Any], dict[str, Any]], label: str
+    ) -> int:
+        attributes = require_object(event[1].get("attributes"), f"{label}.attributes")
+        return require_count(
+            attributes.get("monotonic_nanos"), f"{label}.monotonic_nanos", minimum=1
+        )
+
+    abort_lifecycles, abort_resource_ids = lifecycle_rows("abort_window")
+    recovery_lifecycles, recovery_resource_ids = lifecycle_rows("recovery_window")
+    abort_opened_ids = {
+        request_id
+        for request_id, lifecycle in abort_lifecycles.items()
+        if phase_rows(lifecycle, "engine_request_open")
+    }
+    recovery_opened_ids = {
+        request_id
+        for request_id, lifecycle in recovery_lifecycles.items()
+        if phase_rows(lifecycle, "engine_request_open")
+    }
+    require(
+        len(recovery_opened_ids) == 1,
+        "C09 recovery trace must contain exactly one request lifecycle",
+    )
+    recovery_request_id = next(iter(recovery_opened_ids))
+    require(
+        recovery_request_id in recovery_resource_ids,
+        "C09 recovery resource events are not bound to its request lifecycle",
+    )
+    recovery_resource_balance = require_clean_close(
+        recovery_request_id,
+        recovery_lifecycles[recovery_request_id],
+        rows_for_request("recovery_window", recovery_request_id),
+        "C09 recovery",
+    )
+
+    if admitted_request_id is None:
+        require(
+            not abort_opened_ids,
+            "C09 trace observed an admission missing from the transport binding",
+        )
+        return {
+            "cancel_resource_outcome": C09_NOT_ADMITTED_SAFE,
+            "cancel_safety": "safe",
+            "cancel_coverage": "not_exercised",
+            "cancel_request_id": None,
+            "recovery_request_id": recovery_request_id,
+            "scheduler_ticks_to_terminal": None,
+            "wall_sec_to_terminal": None,
+            "trace_visibility_proven": True,
+            "cancel_resource_balance": None,
+            "recovery_resource_balance": recovery_resource_balance,
+        }
+
+    require(
+        abort_opened_ids == {admitted_request_id}
+        and admitted_request_id in abort_lifecycles
+        and admitted_request_id in abort_resource_ids,
+        "C09 admitted request lifecycle is missing from the abort trace",
+    )
+    cancel_request_id = admitted_request_id
+    lifecycle = abort_lifecycles[cancel_request_id]
+    require(
+        cancel_request_id != recovery_request_id,
+        "C09 cancel and recovery reused one request id",
+    )
+    cancel_resource_balance = require_clean_close(
+        cancel_request_id,
+        lifecycle,
+        rows_for_request("abort_window", cancel_request_id),
+        "C09 admitted cancel",
+    )
+    detected = phase_rows(lifecycle, "engine_client_disconnect_detected")
+    released = phase_rows(lifecycle, "engine_client_disconnect_released")
+    failed = phase_rows(lifecycle, "engine_client_disconnect_release_failed")
+    require(
+        len(detected) == 1 and len(released) == 1 and not failed,
+        "C09 admitted cancel lacks one detected/released disconnect pair",
+    )
+    detected_raw = detected[0][1]
+    release_row, release_raw = released[0]
+    detected_attributes = require_object(
+        detected_raw.get("attributes"), "C09 disconnect detected.attributes"
+    )
+    release_attributes = require_object(
+        release_raw.get("attributes"), "C09 disconnect release.attributes"
+    )
+    require(
+        detected_raw.get("status") == "ok"
+        and detected_raw.get("error") is None
+        and detected_raw.get("correlation_id") == cancel_request_id
+        and detected_attributes.get("terminal_state") == "pending_release",
+        "C09 disconnect detection event is invalid",
+    )
+    require(
+        release_raw.get("status") == "ok"
+        and release_raw.get("error") is None
+        and release_raw.get("correlation_id") == cancel_request_id
+        and release_attributes.get("terminal_state") == "released"
+        and release_attributes.get("scheduler_cancel_result") == "cancelled",
+        "C09 disconnect release event is not a successful terminal release",
+    )
+    detected_shape = require_object(
+        detected_raw.get("shape"), "C09 disconnect detected.shape"
+    )
+    shape = require_object(release_raw.get("shape"), "C09 disconnect release.shape")
+    detected_iteration = require_count(
+        detected_shape.get("scheduler_iteration"),
+        "C09 disconnect detected.scheduler_iteration",
+    )
+    require(
+        shape.get("detected_scheduler_iteration") == detected_iteration,
+        "C09 disconnect release detected iteration mismatch",
+    )
+    terminal_iteration = require_count(
+        shape.get("terminal_scheduler_iteration"),
+        "C09 disconnect release.terminal_scheduler_iteration",
+        minimum=detected_iteration,
+    )
+    ticks = require_count(
+        shape.get("scheduler_tick_delta"),
+        "C09 disconnect release.scheduler_tick_delta",
+    )
+    require(
+        terminal_iteration - detected_iteration == ticks and ticks <= 2,
+        "C09 disconnect release exceeded or misreported scheduler ticks",
+    )
+    detected_ns = event_monotonic_ns(detected[0], "C09 disconnect detected")
+    close_event = phase_rows(lifecycle, "engine_request_close")[0]
+    close_ns = event_monotonic_ns(close_event, "C09 request close")
+    released_ns = event_monotonic_ns(released[0], "C09 disconnect release")
+    require(
+        detected_ns <= close_ns <= released_ns,
+        "C09 disconnect terminal event does not follow resource close",
+    )
+    detected_wall_ns = require_count(
+        detected_raw.get("ts_unix_nanos"), "C09 disconnect detected.ts_unix_nanos", minimum=1
+    )
+    released_wall_ns = require_count(
+        release_raw.get("ts_unix_nanos"), "C09 disconnect release.ts_unix_nanos", minimum=detected_wall_ns
+    )
+    wall_sec = (released_wall_ns - detected_wall_ns) / 1e9
+    require(wall_sec <= 5, "C09 disconnect release exceeded five seconds")
+    release_observed_ns = require_count(
+        release_row.get("collector_observed_monotonic_ns"),
+        "C09 disconnect release.collector_observed_monotonic_ns",
+        minimum=abort_finish_ns,
+    )
+    require(
+        release_observed_ns <= recovery_start_ns,
+        "C09 admitted cancel was not released before the recovery request",
+    )
+    return {
+        "cancel_resource_outcome": C09_ADMITTED_RELEASED,
+        "cancel_safety": "safe",
+        "cancel_coverage": "exercised",
+        "cancel_request_id": cancel_request_id,
+        "recovery_request_id": recovery_request_id,
+        "scheduler_ticks_to_terminal": ticks,
+        "wall_sec_to_terminal": wall_sec,
+        "trace_visibility_proven": True,
+        "cancel_resource_balance": cancel_resource_balance,
+        "recovery_resource_balance": recovery_resource_balance,
+    }
 
 
 def typed_admission_cap(config_path: Path) -> int:
@@ -2764,27 +5534,110 @@ def typed_admission_cap(config_path: Path) -> int:
 
 
 def typed_admission_cap_value(data: Any) -> int:
-    candidates: list[int] = []
+    config = require_object(data, "typed admission config")
 
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                lowered = str(key).lower()
-                if isinstance(child, int) and not isinstance(child, bool) and child > 0 and lowered in {
-                    "max_sequences",
-                    "max_num_seqs",
-                    "max_active",
-                    "admission_cap",
-                    "target_concurrency",
-                }:
-                    candidates.append(child)
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
+    def positive(value: Any, label: str) -> int | None:
+        if value is None:
+            return None
+        return require_count(value, label, minimum=1)
 
-    visit(data)
-    return min(candidates) if candidates else 0
+    admission = config.get("admission")
+    admission_document = (
+        require_object(admission, "typed admission config.admission")
+        if admission is not None
+        else {}
+    )
+    selected_max_sequences = positive(
+        config.get("selected_max_sequences"),
+        "typed admission config.selected_max_sequences",
+    )
+    selected_recurrent_slots = positive(
+        config.get("selected_recurrent_state_max_slots"),
+        "typed admission config.selected_recurrent_state_max_slots",
+    )
+    admission_max_sequences = positive(
+        admission_document.get("max_sequences"),
+        "typed admission config.admission.max_sequences",
+    )
+    admission_recurrent_slots = positive(
+        admission_document.get("recurrent_state_max_slots"),
+        "typed admission config.admission.recurrent_state_max_slots",
+    )
+
+    authoritative: list[tuple[str, int]] = []
+
+    def add_authoritative(label: str, value: int | None) -> None:
+        if value is not None:
+            authoritative.append((label, value))
+
+    def effective_limit(
+        max_sequences: int | None,
+        recurrent_slots: int | None,
+    ) -> int | None:
+        candidates = [
+            value for value in (max_sequences, recurrent_slots) if value is not None
+        ]
+        return min(candidates) if candidates else None
+
+    add_authoritative(
+        "selected_admission_limit",
+        positive(
+            config.get("selected_admission_limit"),
+            "typed admission config.selected_admission_limit",
+        ),
+    )
+    add_authoritative(
+        "admission.effective_max_concurrent",
+        positive(
+            admission_document.get("effective_max_concurrent"),
+            "typed admission config.admission.effective_max_concurrent",
+        ),
+    )
+    add_authoritative(
+        "selected capacity",
+        effective_limit(selected_max_sequences, selected_recurrent_slots),
+    )
+    add_authoritative(
+        "admission capacity",
+        effective_limit(admission_max_sequences, admission_recurrent_slots),
+    )
+    if authoritative:
+        distinct = {value for _, value in authoritative}
+        require(
+            len(distinct) == 1,
+            "typed admission config has conflicting authoritative caps: "
+            + ", ".join(f"{label}={value}" for label, value in authoritative),
+        )
+        return authoritative[0][1]
+
+    legacy_effective: list[int] = []
+    legacy_capacity: list[int] = []
+
+    def collect_legacy(container: Any, label: str) -> None:
+        if not isinstance(container, dict):
+            return
+        for key in ("admission_cap", "max_active", "effective_max_concurrent"):
+            value = positive(container.get(key), f"{label}.{key}")
+            if value is not None:
+                legacy_effective.append(value)
+        for key in ("max_sequences", "max_num_seqs", "recurrent_state_max_slots"):
+            value = positive(container.get(key), f"{label}.{key}")
+            if value is not None:
+                legacy_capacity.append(value)
+
+    collect_legacy(config, "typed admission config")
+    collect_legacy(config.get("scheduler"), "typed admission config.scheduler")
+    runtime = config.get("runtime")
+    if isinstance(runtime, dict):
+        collect_legacy(runtime.get("scheduler"), "typed admission config.runtime.scheduler")
+        collect_legacy(runtime.get("admission"), "typed admission config.runtime.admission")
+    if legacy_effective:
+        require(
+            len(set(legacy_effective)) == 1,
+            "typed admission config has conflicting legacy effective caps",
+        )
+        return legacy_effective[0]
+    return min(legacy_capacity) if legacy_capacity else 0
 
 
 def validate_actual_effective_config(
@@ -2793,6 +5646,7 @@ def validate_actual_effective_config(
     expected_backend: str,
     expected_model_key: str,
     label: str,
+    allow_unknown_architecture: bool = False,
 ) -> dict[str, Any]:
     config = require_object(raw, label)
     require(config.get("missing") is not True, f"{label} declares missing product evidence")
@@ -2806,23 +5660,37 @@ def validate_actual_effective_config(
     model_capabilities = require_object(config.get("model_capabilities"), f"{label}.model_capabilities")
     require(model_capabilities, f"{label}.model_capabilities empty")
     architecture = require_string(model_capabilities.get("architecture"), f"{label}.model_capabilities.architecture")
-    expected_architectures = {
-        "m1-qwen35-4b": {"qwen3_5", "qwen3_5_text"},
-        "m2-qwen35-35b-a3b": {"qwen3_5_moe", "qwen3_5_moe_text"},
-        "m3-qwen3-30b-a3b": {"qwen3", "qwen3_moe"},
-    }
-    require(architecture in expected_architectures[expected_model_key], f"{label} architecture differs from lane model")
+    if architecture not in EXPECTED_ARCHITECTURES[expected_model_key]:
+        require(
+            allow_unknown_architecture and architecture == "unknown",
+            f"{label} architecture differs from lane model",
+        )
     workload = require_object(config.get("workload_profile"), f"{label}.workload_profile")
     require(workload, f"{label}.workload_profile empty")
     require_string(workload.get("serving_mode"), f"{label}.workload_profile.serving_mode")
     require_count(workload.get("target_concurrency"), f"{label}.workload_profile.target_concurrency", minimum=1)
     require_list(config.get("decisions"), f"{label}.decisions")
+    top_level_backend = config.get("backend")
+    if top_level_backend is not None:
+        require(top_level_backend == expected_backend, f"{label} top-level backend differs from lane")
     backend_entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("key") == "FERRUM_BACKEND"]
-    require(len(backend_entries) == 1 and backend_entries[0].get("effective_value") == expected_backend, f"{label} typed backend entry mismatch")
+    require(
+        len(backend_entries) <= 1
+        and (not backend_entries or backend_entries[0].get("effective_value") == expected_backend),
+        f"{label} typed backend entry mismatch",
+    )
+    require(top_level_backend == expected_backend or len(backend_entries) == 1, f"{label} typed backend evidence missing")
     return config
 
 
-def aborted_http_exchange(base_url: str, payload: dict[str, Any], variant: str) -> dict[str, Any]:
+def aborted_http_exchange(
+    base_url: str,
+    payload: dict[str, Any],
+    variant: str,
+    *,
+    scheduler_trace_path: Path,
+    trace_offset: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     parsed = urllib.parse.urlsplit(base_url)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = (
@@ -2831,27 +5699,152 @@ def aborted_http_exchange(base_url: str, payload: dict[str, Any], variant: str) 
     ).encode("ascii") + body
     started_at = iso_now()
     started_ns = time.monotonic_ns()
-    with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 80), timeout=2) as sock:
+    trace_rows: list[dict[str, Any]] = []
+    admitted_request_id: str | None = None
+    abort_trigger = "not_admitted"
+    sock = socket.create_connection(
+        (parsed.hostname or "127.0.0.1", parsed.port or 80), timeout=2
+    )
+    try:
         sock.sendall(request)
+        deadline = time.monotonic() + C09_ADMISSION_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
+            observed_ns = time.monotonic_ns()
+            trace_rows.extend(
+                {
+                    "raw": row,
+                    "collection_phase": "abort_window",
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
+                for row in fresh
+            )
+            opened = {
+                row["raw"].get("request_id")
+                for row in trace_rows
+                if row["raw"].get("phase") == "engine_request_open"
+                and isinstance(row["raw"].get("request_id"), str)
+            }
+            require(len(opened) <= 1, "C09 admission window contains multiple requests")
+            if opened:
+                admitted_request_id = next(iter(opened))
+                break
+            time.sleep(0.01)
         if variant == "timeout":
-            sock.settimeout(0.01)
-            try:
-                sock.recv(1)
-            except (TimeoutError, socket.timeout):
-                pass
+            time.sleep(0.01)
+            abort_trigger = "client_deadline_expired"
         elif variant == "cancel":
-            sock.shutdown(socket.SHUT_WR)
-    return {
+            abort_trigger = "socket_shutdown"
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                abort_trigger = "peer_closed"
+        else:
+            require(variant == "disconnect", f"unsupported C09 abort variant {variant!r}")
+            abort_trigger = "tcp_reset"
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        sock.close()
+    finished_ns = time.monotonic_ns()
+    exchange = {
         "request": payload,
         "status": 499,
+        "status_source": "runner_client_abort",
         "response_headers": {},
-        "response": {"client_abort": variant},
+        "response": {
+            "client_abort": variant,
+            "abort_trigger": abort_trigger,
+            "admission_observed": admitted_request_id is not None,
+            "admission_request_id": admitted_request_id,
+        },
         "response_raw": "",
         "started_at": started_at,
         "finished_at": iso_now(),
         "started_monotonic_ns": started_ns,
-        "finished_monotonic_ns": time.monotonic_ns(),
+        "finished_monotonic_ns": finished_ns,
     }
+    return exchange, trace_rows, trace_offset
+
+
+def run_case_prompts(case: dict[str, Any]) -> list[str]:
+    marker = expected_case_text(case)
+    if case["scenario_id"] == "C03":
+        return c03_user_turns(marker)
+    if case["scenario_id"] == "C19":
+        return [
+            c19_turn_prompt(marker, 1, case["variant"]),
+            c19_turn_prompt(marker, 2, case["variant"]),
+        ]
+    return [
+        "Write at least 512 numbered one-word items, then end naturally."
+        if case["scenario_id"] == "C04"
+        else f"Return the exact marker {marker} and no other text."
+    ]
+
+
+def run_case_option_args(case: dict[str, Any]) -> tuple[list[str], bool | str | None]:
+    values = preset_values(case["model_key"], case["preset"])
+    argv: list[str] = []
+    for flag, key in (
+        ("--temperature", "temperature"),
+        ("--top-p", "top_p"),
+        ("--top-k", "top_k"),
+        ("--min-p", "min_p"),
+        ("--presence-penalty", "presence_penalty"),
+        ("--seed", "seed"),
+        ("--max-tokens", "max_tokens"),
+        ("--repeat-penalty", "repetition_penalty"),
+    ):
+        if key in values:
+            argv.extend([flag, str(values[key])])
+    thinking: bool | str | None = values.get("enable_thinking")
+    if case["scenario_id"] == "C19":
+        thinking = c19_hard_thinking_override(case["variant"])
+    if thinking is True:
+        argv.append("--enable-thinking")
+    elif thinking is False:
+        argv.append("--disable-thinking")
+    return argv, thinking
+
+
+def run_product_argv(
+    case: dict[str, Any],
+    *,
+    binary_path: Path,
+    model_arg: str,
+    backend: str,
+    semantic_root: Path,
+    tokenizer_root: Path,
+    actual_config: Path,
+    run_extra_args: list[str],
+    resident: bool,
+) -> tuple[list[str], list[str], bool | str | None]:
+    prompts = run_case_prompts(case)
+    argv = [
+        str(binary_path),
+        "run",
+        model_arg,
+        "--backend",
+        backend,
+        "--output-format",
+        "jsonl",
+        "--semantic-source",
+        str(semantic_root),
+        "--tokenizer-source",
+        str(tokenizer_root),
+    ]
+    if not resident and len(prompts) == 1:
+        argv.extend(["--prompt", prompts[0]])
+    option_args, thinking = run_case_option_args(case)
+    argv.extend(option_args)
+    argv.extend(["--effective-config-json", str(actual_config), *run_extra_args])
+    return argv, prompts, thinking
+
+
+def resident_run_group_key(case: dict[str, Any]) -> tuple[str, ...]:
+    option_args, _ = run_case_option_args(case)
+    return tuple(option_args)
 
 
 class ProductServer:
@@ -2880,7 +5873,7 @@ class ProductServer:
             stdout=self.stdout_handle,
             stderr=self.stderr_handle,
             env=self.child_environment,
-            start_new_session=True,
+            start_new_session=False,
         )
         self.pid = self.proc.pid
         self.pgid = os.getpgid(self.proc.pid)
@@ -2948,6 +5941,167 @@ class ProductServer:
         }
 
 
+class ProductRunSession:
+    def __init__(
+        self,
+        *,
+        command_id: str,
+        argv: list[str],
+        stdout_path: Path,
+        stderr_path: Path,
+        artifact_root: Path,
+        receipt_path: Path,
+        wire_receipt_path: Path,
+        timeout_sec: float,
+        actual_config_path: Path,
+        group_key: tuple[str, ...],
+    ) -> None:
+        self.command_id = command_id
+        self.argv = argv
+        self.stdout_path = stdout_path
+        self.stderr_path = stderr_path
+        self.wire_receipt_path = wire_receipt_path
+        self.actual_config_path = actual_config_path
+        self.group_key = group_key
+        self.child_environment = sanitized_child_environment()
+        self.started_at = iso_now()
+        self.started_monotonic_ns = time.monotonic_ns()
+        self.case_count = 0
+        self.case_ids: list[str] = []
+        self.preset_aliases: set[str] = set()
+        self.stopped = False
+        try:
+            self.session = JsonlProductSession(
+                argv=argv,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_sec=timeout_sec,
+                env=self.child_environment,
+            )
+        except JsonlSessionError as exc:
+            raise ScenarioError(f"{command_id} failed to become ready: {exc}") from exc
+        self.ready_at = iso_now()
+        self.ready_monotonic_ns = self.session.ready_event.received_monotonic_ns
+        self.pid = self.session.proc.pid
+        self.pgid = os.getpgid(self.pid)
+        self.process_receipt = capture_process_receipt(
+            artifact_root,
+            receipt_path,
+            pid=self.pid,
+            pgid=self.pgid,
+            argv=argv,
+            role="ferrum-run",
+            environment=self.child_environment,
+        )
+        require(
+            actual_config_path.is_file() and actual_config_path.stat().st_size > 0,
+            f"{command_id} did not emit its actual effective config before ready",
+        )
+
+    def run_case(
+        self,
+        prompts: list[str],
+        *,
+        case_id: str,
+        preset: str | None,
+    ) -> SessionCase:
+        if self.stopped:
+            raise ScenarioError(f"{self.command_id} cannot execute after stop")
+        require(case_id not in self.case_ids, f"{self.command_id} duplicate resident case {case_id}")
+        try:
+            result = self.session.run_case(prompts)
+        except JsonlSessionError as exc:
+            self.abort()
+            raise ScenarioError(f"{self.command_id} resident case failed: {exc}") from exc
+        self.case_count += 1
+        self.case_ids.append(case_id)
+        self.preset_aliases.add(preset or "<none>")
+        return result
+
+    def abort(self) -> None:
+        if self.stopped:
+            return
+        self.session.terminate()
+        self.finished_monotonic_ns = time.monotonic_ns()
+        self.finished_at = iso_now()
+        self.process_returncode = self.session.proc.returncode
+        self.stopped = True
+        self._persist_wire_receipt(exit_event=None, controlled=False)
+        self._ensure_logs()
+
+    def stop(self) -> None:
+        if self.stopped:
+            return
+        try:
+            exit_event = self.session.stop()
+        except JsonlSessionError as exc:
+            self.abort()
+            raise ScenarioError(f"{self.command_id} controlled stop failed: {exc}") from exc
+        self.finished_monotonic_ns = time.monotonic_ns()
+        self.finished_at = iso_now()
+        self.process_returncode = self.session.proc.returncode
+        self.stopped = True
+        self._persist_wire_receipt(exit_event=exit_event.receipt(), controlled=True)
+        self._ensure_logs()
+        require(self.process_returncode == 0, f"{self.command_id} exited nonzero")
+
+    def _persist_wire_receipt(
+        self,
+        *,
+        exit_event: dict[str, Any] | None,
+        controlled: bool,
+    ) -> None:
+        write_json(
+            self.wire_receipt_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "transport": "resident-jsonl-v1",
+                "command_id": self.command_id,
+                "argv_sha256": canonical_json_sha256(self.argv),
+                "group_key": list(self.group_key),
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "ready_event": self.session.ready_event.receipt(),
+                "exit_event": exit_event,
+                "controlled_stop": controlled,
+                "case_count": self.case_count,
+                "case_ids": self.case_ids,
+                "preset_aliases": sorted(self.preset_aliases),
+                "wire": self.session.wire_receipt(),
+            },
+        )
+
+    def _ensure_logs(self) -> None:
+        for path, label in ((self.stdout_path, "stdout"), (self.stderr_path, "stderr")):
+            if not path.exists() or path.stat().st_size == 0:
+                path.write_text(
+                    f"ferrum resident run {label} capture was empty; collector observed controlled shutdown\n",
+                    encoding="utf-8",
+                )
+
+    def envelope(self) -> dict[str, Any]:
+        require(self.stopped, f"{self.command_id} envelope requested before stop")
+        return {
+            "argv": self.argv,
+            "pid": self.pid,
+            "pgid": self.pgid,
+            "started_at": self.started_at,
+            "ready_at": self.ready_at,
+            "finished_at": self.finished_at,
+            "started_monotonic_ns": self.started_monotonic_ns,
+            "ready_monotonic_ns": self.ready_monotonic_ns,
+            "finished_monotonic_ns": self.finished_monotonic_ns,
+            "process_returncode": self.process_returncode,
+            "execution_mode": "resident-jsonl",
+            "group_key": list(self.group_key),
+            "case_count": self.case_count,
+            "case_ids": list(self.case_ids),
+            "preset_aliases": sorted(self.preset_aliases),
+            "child_environment": self.child_environment,
+            "child_environment_sha256": canonical_json_sha256(self.child_environment),
+        }
+
+
 def minimal_unknown_gguf(architecture: str) -> bytes:
     def gguf_string(value: str) -> bytes:
         encoded = value.encode("utf-8")
@@ -2987,6 +6141,9 @@ def execute_c01_unknown_fixture(
     config["g00_negative_fixture"] = {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}
     fixture_config = fixture_root / "config.json"
     write_json(fixture_config, config)
+    source_tokenizer = tokenizer_root / "tokenizer.json"
+    fixture_tokenizer = fixture_root / "tokenizer.json"
+    shutil.copy2(source_tokenizer, fixture_tokenizer)
     source_tokenizer_config = tokenizer_root / "tokenizer_config.json"
     fixture_tokenizer_config = fixture_root / "tokenizer_config.json"
     shutil.copy2(source_tokenizer_config, fixture_tokenizer_config)
@@ -3026,6 +6183,10 @@ def execute_c01_unknown_fixture(
         str(binary_path),
         "run",
         str(invocation_model),
+        "--semantic-source",
+        str(fixture_root),
+        "--tokenizer-source",
+        str(fixture_root),
         "--backend",
         backend,
         "--output-format",
@@ -3044,7 +6205,7 @@ def execute_c01_unknown_fixture(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_environment,
-        start_new_session=True,
+        start_new_session=False,
     )
     pid = proc.pid
     pgid = os.getpgid(pid)
@@ -3076,6 +6237,7 @@ def execute_c01_unknown_fixture(
     dummy_path = fixture_root / "DUMMY_WEIGHT_NOT_FOR_LOADING"
     artifacts = {
         "config": existing_artifact_ref(root, fixture_config, "raw-json"),
+        "tokenizer": existing_artifact_ref(root, fixture_tokenizer, "raw-json"),
         "tokenizer_config": existing_artifact_ref(root, fixture_tokenizer_config, "raw-json"),
         "dummy_weight_marker": existing_artifact_ref(root, dummy_path, "runtime-log"),
         "named_weight": existing_artifact_ref(root, named_weight, "binary"),
@@ -3129,65 +6291,36 @@ def run_case_command(
     locked_sources: dict[str, Any],
     semantic_root: Path,
     tokenizer_root: Path,
+    prepared_c01_resolution_probe: dict[str, Any] | None,
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
     marker = expected_case_text(case)
     actual_config = case_root / "actual-effective-config.json"
-    values = preset_values(case["model_key"], case["preset"])
-    argv = [str(binary_path), "run", model_arg, "--backend", backend, "--output-format", "jsonl"]
-    if case["scenario_id"] == "C03":
-        stdin_text = "\n".join(
-            [
-                f"Remember the exact secret {marker}.",
-                "Reply with the word acknowledged.",
-                "What exact secret did I ask you to remember?",
-            ]
-        ) + "\n"
-    elif case["scenario_id"] == "C19":
-        soft_suffix = ""
-        if case["variant"] in {"soft-think", "soft-think-misuse"}:
-            soft_suffix = " /think"
-        elif case["variant"] in {"soft-no-think", "soft-no-think-misuse"}:
-            soft_suffix = " /no_think"
-        stdin_text = "\n".join(
-            [
-                f"Return the exact marker {marker}-H1.{soft_suffix}",
-                f"Using our prior exchange, return the exact marker {marker}-H2.",
-            ]
-        ) + "\n"
-    else:
-        prompt = (
-            "Write at least 512 numbered one-word items, then end naturally."
-            if case["scenario_id"] == "C04"
-            else f"Return the exact marker {marker} and no other text."
-        )
-        argv.extend(["--prompt", prompt])
-        stdin_text = ""
-    for flag, key in (("--temperature", "temperature"), ("--top-p", "top_p"), ("--top-k", "top_k"), ("--seed", "seed"), ("--max-tokens", "max_tokens"), ("--repeat-penalty", "repetition_penalty")):
-        if key in values:
-            argv.extend([flag, str(values[key])])
-    thinking = values.get("enable_thinking")
-    if case["scenario_id"] == "C19":
-        if case["variant"] == "hard-thinking":
-            thinking = True
-        elif case["variant"] == "hard-no-thinking":
-            thinking = False
-        else:
-            thinking = "model-default"
-    if thinking is True:
-        argv.append("--enable-thinking")
-    elif thinking is False:
-        argv.append("--disable-thinking")
-    argv.extend(["--effective-config-json", str(actual_config), *run_extra_args])
+    argv, prompts, thinking = run_product_argv(
+        case,
+        binary_path=binary_path,
+        model_arg=model_arg,
+        backend=backend,
+        semantic_root=semantic_root,
+        tokenizer_root=tokenizer_root,
+        actual_config=actual_config,
+        run_extra_args=run_extra_args,
+        resident=False,
+    )
+    stdin_text = "\n".join(prompts) + "\n" if len(prompts) > 1 else ""
     input_path = case_root / "input.json"
-    input_document: dict[str, Any] = {"case_id": case_id, "stdin": stdin_text, "argv": argv}
+    input_document: dict[str, Any] = (
+        c03_input_document(case_id, marker, argv)
+        if case["scenario_id"] == "C03"
+        else {"case_id": case_id, "stdin": stdin_text, "argv": argv}
+    )
     if case["scenario_id"] == "C01":
-        input_document["resolution_probe"] = build_c01_resolution_probe(
-            model_arg,
-            case["model_key"],
-            sources=locked_sources,
-            semantic_root=semantic_root,
-            tokenizer_root=tokenizer_root,
+        require(
+            prepared_c01_resolution_probe is not None,
+            "C01 prepared resolution probe is missing",
+        )
+        input_document["resolution_probe"] = copy.deepcopy(
+            prepared_c01_resolution_probe
         )
     write_json(input_path, input_document)
     stdout_path = case_root / "stdout.log"
@@ -3202,7 +6335,7 @@ def run_case_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_environment,
-        start_new_session=True,
+        start_new_session=False,
     )
     pid = proc.pid
     pgid = os.getpgid(proc.pid)
@@ -3266,6 +6399,8 @@ def run_case_command(
         "child_environment_sha256": canonical_json_sha256(child_environment),
     }
     observed = {"case_id": case_id, "expected_marker": marker}
+    if case["scenario_id"] == "C03":
+        observed["contract_id"] = C03_CONTRACT_ID
     if case["scenario_id"] == "C01":
         observed.update(
             {
@@ -3292,6 +6427,134 @@ def run_case_command(
     }
 
 
+def run_case_resident(
+    root: Path,
+    case: dict[str, Any],
+    *,
+    session: ProductRunSession,
+    case_root: Path,
+    locked_sources: dict[str, Any],
+    semantic_root: Path,
+    tokenizer_root: Path,
+    timeout_sec: float,
+    prepared_c01_resolution_probe: dict[str, Any] | None,
+) -> tuple[list[str], dict[str, Any], Path, Path, Path, dict[str, Any]]:
+    case_id = case["case_id"]
+    marker = expected_case_text(case)
+    prompts = run_case_prompts(case)
+    argv = list(session.argv)
+    input_path = case_root / "input.json"
+    input_document: dict[str, Any] = (
+        c03_input_document(case_id, marker, argv)
+        if case["scenario_id"] == "C03"
+        else {
+            "case_id": case_id,
+            "stdin": "\n".join(prompts) + "\n",
+            "argv": argv,
+        }
+    )
+    if case["scenario_id"] == "C01":
+        require(
+            prepared_c01_resolution_probe is not None,
+            "C01 prepared resolution probe is missing",
+        )
+        input_document["resolution_probe"] = copy.deepcopy(
+            prepared_c01_resolution_probe
+        )
+    write_json(input_path, input_document)
+    started_at = iso_now()
+    result = session.run_case(
+        prompts,
+        case_id=case_id,
+        preset=case.get("preset"),
+    )
+    finished_at = iso_now()
+    stdout_path = case_root / "stdout.log"
+    stderr_path = case_root / "stderr.log"
+    stdout_path.write_bytes(result.jsonl_bytes(session.session.ready_event))
+    stderr_path.write_text(
+        f"case {case_id} executed in controlled resident command {session.command_id}; shared stderr is bound by the command receipt\n",
+        encoding="utf-8",
+    )
+    if case["scenario_id"] == "C01" and case["variant"] == "unknown-fail-closed":
+        input_document["negative_probe"] = execute_c01_unknown_fixture(
+            root,
+            case,
+            binary_path=Path(argv[0]),
+            backend=require_string(case.get("backend"), f"case {case_id}.backend"),
+            semantic_root=semantic_root,
+            tokenizer_root=tokenizer_root,
+            weight_format=require_string(locked_sources.get("weight_format"), "C01 locked weight format"),
+            child_environment=session.child_environment,
+            timeout_sec=timeout_sec,
+            case_root=case_root,
+        )
+        write_json(input_path, input_document)
+    case_receipt_path = case_root / "resident-case-receipt.json"
+    result_receipt = result.receipt()
+    write_json(
+        case_receipt_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "transport": "resident-jsonl-v1",
+            "case_id": case_id,
+            "command_id": session.command_id,
+            "argv_sha256": canonical_json_sha256(argv),
+            "prompts": prompts,
+            "prompts_sha256": canonical_json_sha256(prompts),
+            "ready_event": session.session.ready_event.receipt(),
+            "case": result_receipt,
+            "stdout_sha256": file_sha256(stdout_path),
+            "input_sha256": file_sha256(input_path),
+        },
+    )
+    envelope = {
+        "id": f"exec-{case_id}",
+        "mode": "resident-jsonl",
+        "argv": argv,
+        "pid": os.getpid(),
+        "pgid": os.getpgid(0),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "started_monotonic_ns": result.started_monotonic_ns,
+        "finished_monotonic_ns": result.finished_monotonic_ns,
+        "duration_sec": (result.finished_monotonic_ns - result.started_monotonic_ns) / 1_000_000_000,
+        "returncode": 0,
+        "timed_out": False,
+        "child_environment": session.child_environment,
+        "child_environment_sha256": canonical_json_sha256(session.child_environment),
+    }
+    observed = {"case_id": case_id, "expected_marker": marker}
+    if case["scenario_id"] == "C03":
+        observed["contract_id"] = C03_CONTRACT_ID
+    if case["scenario_id"] == "C01":
+        observed.update(
+            {
+                "model_key": case["model_key"],
+                "model_files": case["model_files"],
+                "requested_model": argv[2],
+                "ordinal": int(case["ordinal"]),
+            }
+        )
+    if case["scenario_id"] == "C19":
+        _, thinking = run_case_option_args(case)
+        observed.update(
+            {
+                "thinking_mode": case["variant"],
+                "model_key": case["model_key"],
+                "reasoning_expected": thinking_reasoning_expected(case["model_key"], case["variant"]),
+                "history_turn_count": 2,
+            }
+        )
+    return argv, envelope, input_path, stdout_path, stderr_path, {
+        "actual_config": session.actual_config_path,
+        "observed": observed,
+        "process_receipt": session.process_receipt,
+        "child_environment": session.child_environment,
+        "resident_case_receipt": existing_artifact_ref(root, case_receipt_path, "raw-json"),
+    }
+
+
 def serve_case_request(
     root: Path,
     case: dict[str, Any],
@@ -3302,47 +6565,134 @@ def serve_case_request(
     server: ProductServer,
     scheduler_trace_path: Path,
     effective_config_path: Path,
+    require_c18_resource_balance: bool,
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
     payload = case_http_payload(case, case["model_key"])
+    recovery_payload: dict[str, Any] | None = None
+    if case["scenario_id"] == "C09":
+        recovery_payload = copy.deepcopy(payload)
+        recovery_payload["messages"] = [
+            {
+                "role": "user",
+                "content": f"Return the exact marker {expected_case_text(case)} and no other text.",
+            }
+        ]
+        recovery_payload.pop("ignore_eos", None)
+        recovery_payload.pop("stop", None)
+        recovery_payload.pop("stream", None)
+        recovery_payload.pop("stream_options", None)
+        recovery_payload["metadata"] = {
+            **recovery_payload.get("metadata", {}),
+            "g00_recovery": True,
+        }
     input_path = case_root / "input.json"
     write_json(input_path, payload)
     requested = int(case["concurrency_cell"]["requested_concurrency"]) if case["concurrency_cell"] else 1
     started_at = iso_now()
     started_ns = time.monotonic_ns()
-    trace_offset = scheduler_trace_path.stat().st_size if scheduler_trace_path.is_file() else 0
+    trace_offset = complete_jsonl_offset(scheduler_trace_path)
+    trace_started_unix_ns = time.time_ns()
+    runtime_log_start_offset = server.stderr_path.stat().st_size if server.stderr_path.is_file() else 0
     trace_rows: list[dict[str, Any]] = []
-    release_ticks = 0
-    released = False
-    release_observed_ns: int | None = None
-    release_wall = 0.0
+    c18_trace_scope: dict[str, Any] | None = None
+    c09_outcome: dict[str, Any] | None = None
+    c09_trace_contract_error: str | None = None
+    history_construction_errors: list[dict[str, Any]] = []
+    concurrency_identities: list[dict[str, Any]] = []
     if case["scenario_id"] == "C09":
-        abort_started = time.monotonic()
-        aborted = aborted_http_exchange(base_url, copy.deepcopy(payload), case["variant"])
-        deadline = abort_started + 5.0
+        aborted, trace_rows, trace_offset = aborted_http_exchange(
+            base_url,
+            copy.deepcopy(payload),
+            case["variant"],
+            scheduler_trace_path=scheduler_trace_path,
+            trace_offset=trace_offset,
+        )
+        abort_response = require_object(aborted.get("response"), f"case {case_id}.abort.response")
+        admitted_request_id = abort_response.get("admission_request_id")
+        deadline = time.monotonic() + (
+            C09_TRACE_TIMEOUT_SEC
+            if isinstance(admitted_request_id, str)
+            else C09_NOT_ADMITTED_OBSERVATION_SEC
+        )
         while time.monotonic() < deadline:
             fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
             observed_ns = time.monotonic_ns()
             trace_rows.extend(
-                {"raw": row, "collector_observed_monotonic_ns": observed_ns, "raw_sha256": canonical_json_sha256(row)}
+                {
+                    "raw": row,
+                    "collection_phase": "abort_window",
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
                 for row in fresh
             )
-            released, release_ticks, release_observed_ns = trace_released(trace_rows)
-            if released:
+            terminal_phases = {
+                row["raw"].get("phase")
+                for row in trace_rows
+                if row["raw"].get("request_id") == admitted_request_id
+            }
+            disconnect_terminal = bool(
+                {
+                    "engine_client_disconnect_released",
+                    "engine_client_disconnect_release_failed",
+                }
+                & terminal_phases
+            )
+            if (
+                isinstance(admitted_request_id, str)
+                and "engine_request_close" in terminal_phases
+                and disconnect_terminal
+            ):
                 break
             time.sleep(0.02)
-        release_wall = (
-            (release_observed_ns - aborted["started_monotonic_ns"]) / 1e9
-            if released and release_observed_ns is not None
-            else time.monotonic() - abort_started
-        )
-        recovery_payload = copy.deepcopy(payload)
-        recovery_payload["metadata"] = {**recovery_payload.get("metadata", {}), "g00_recovery": True}
+        require(recovery_payload is not None, "C09 recovery payload is missing")
         recovery, _ = http_exchange(base_url, recovery_payload, timeout_sec)
         results = [(aborted, {}), (recovery, {})]
+        recovery_deadline = time.monotonic() + C09_TRACE_TIMEOUT_SEC
+        while time.monotonic() < recovery_deadline:
+            fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
+            observed_ns = time.monotonic_ns()
+            trace_rows.extend(
+                {
+                    "raw": row,
+                    "collection_phase": "recovery_window",
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
+                for row in fresh
+            )
+            try:
+                c09_outcome = c09_terminal_outcome(trace_rows, aborted, recovery)
+            except ScenarioError as exc:
+                c09_trace_contract_error = str(exc)
+            else:
+                c09_trace_contract_error = None
+                break
+            time.sleep(0.02)
+        if c09_outcome is None:
+            c09_outcome = {
+                "cancel_resource_outcome": "unproven",
+                "cancel_safety": "unproven",
+                "cancel_coverage": "invalid",
+                "cancel_request_id": admitted_request_id,
+                "recovery_request_id": None,
+                "scheduler_ticks_to_terminal": None,
+                "wall_sec_to_terminal": None,
+                "trace_visibility_proven": False,
+                "cancel_resource_balance": None,
+                "recovery_resource_balance": None,
+            }
     elif case["scenario_id"] == "C18":
+        concurrency_identities = c18_request_identities(case_id, requested)
+        concurrent_payloads = [
+            c18_request_payload(payload, identity) for identity in concurrency_identities
+        ]
         with concurrent.futures.ThreadPoolExecutor(max_workers=requested) as pool:
-            futures = [pool.submit(http_exchange, base_url, copy.deepcopy(payload), timeout_sec) for _ in range(requested)]
+            futures = [
+                pool.submit(http_exchange, base_url, concurrent_payload, timeout_sec)
+                for concurrent_payload in concurrent_payloads
+            ]
             results = [future.result() for future in futures]
     elif case["scenario_id"] == "C07":
         results = []
@@ -3358,9 +6708,10 @@ def serve_case_request(
             turn_payload["metadata"] = {**turn_payload["metadata"], "g00_turn": turn}
             result = http_exchange(base_url, turn_payload, timeout_sec)
             results.append(result)
-            response = require_object(result[0].get("response"), f"case {case_id}.turn[{turn}].response")
-            assistant, _ = response_message(response, f"case {case_id}.turn[{turn}]")
-            history.extend([user_message, {"role": "assistant", "content": assistant.get("content")}])
+            history.append(user_message)
+            assistant = history_response_message(result[0], f"case {case_id}.turn[{turn}]", history_construction_errors)
+            if assistant is not None:
+                history.append({"role": "assistant", "content": assistant.get("content")})
     elif case["scenario_id"] in {"C06", "C12", "C17"} or (case["scenario_id"] == "C21" and case["variant"] == "serve-stream"):
         reference_payload = copy.deepcopy(payload)
         reference_payload.pop("stream", None)
@@ -3375,14 +6726,14 @@ def serve_case_request(
         results = [reference, stream]
     elif case["scenario_id"] == "C19":
         first = http_exchange(base_url, copy.deepcopy(payload), timeout_sec)
-        first_response = require_object(first[0].get("response"), f"case {case_id}.first.response")
-        first_message, _ = response_message(first_response, f"case {case_id}.first")
+        first_message = history_response_message(first[0], f"case {case_id}.first", history_construction_errors)
         second_payload = copy.deepcopy(payload)
-        second_payload["messages"] = [
-            copy.deepcopy(payload["messages"][0]),
-            copy.deepcopy(first_message),
-            {"role": "user", "content": f"Using that reasoning history, return {case_marker(case_id)}-H2 exactly."},
-        ]
+        second_payload["messages"] = [copy.deepcopy(payload["messages"][0])]
+        if first_message is not None:
+            second_payload["messages"].append(copy.deepcopy(first_message))
+        second_payload["messages"].append(
+            {"role": "user", "content": c19_turn_prompt(case_marker(case_id), 2, case["variant"])}
+        )
         second_payload["metadata"] = {**second_payload["metadata"], "g00_history_turn": 2}
         second = http_exchange(base_url, second_payload, timeout_sec)
         results = [first, second]
@@ -3391,13 +6742,57 @@ def serve_case_request(
     else:
         results = [http_exchange(base_url, copy.deepcopy(payload), timeout_sec)]
     exchanges = [item[0] for item in results]
-    if case["scenario_id"] != "C09":
-        fresh, _ = read_jsonl_since(scheduler_trace_path, trace_offset)
-        observed_ns = time.monotonic_ns()
-        trace_rows.extend(
-            {"raw": row, "collector_observed_monotonic_ns": observed_ns, "raw_sha256": canonical_json_sha256(row)}
-            for row in fresh
+    if case["scenario_id"] == "C18":
+        deadline = time.monotonic() + min(5.0, timeout_sec)
+        while True:
+            fresh, trace_offset = read_jsonl_since(scheduler_trace_path, trace_offset)
+            observed_ns = time.monotonic_ns()
+            trace_rows.extend(
+                {
+                    "raw": row,
+                    "collector_observed_monotonic_ns": observed_ns,
+                    "raw_sha256": canonical_json_sha256(row),
+                }
+                for row in fresh
+            )
+            c18_trace_scope = c18_trace_scope_summary(
+                trace_rows,
+                started_unix_ns=trace_started_unix_ns,
+                expected_request_count=requested,
+            )
+            if (
+                c18_trace_scope["complete"]
+                or len(c18_trace_scope["request_ids"]) > requested
+                or c18_trace_scope["duplicate_open_count"] > 0
+                or c18_trace_scope["duplicate_close_count"] > 0
+                or c18_trace_scope["out_of_order_close_count"] > 0
+            ):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        require(c18_trace_scope is not None, "C18 scheduler trace scope was not collected")
+        trace_rows = c18_trace_rows_for_request_ids(
+            trace_rows,
+            c18_trace_scope["request_ids"],
+            label=f"case {case_id}",
         )
+    # C09 and C18 consume request-scoped scheduler transitions as correctness
+    # evidence. Other scenarios retain the command-level trace without copying
+    # thousands of unrelated rows into every HTTP transcript.
+    runtime_log_evidence: dict[str, Any] | None = None
+    if case["scenario_id"] == "C18":
+        with server.stderr_path.open("rb") as handle:
+            handle.seek(runtime_log_start_offset)
+            runtime_log_payload = handle.read()
+            runtime_log_end_offset = handle.tell()
+        runtime_log_text = runtime_log_payload.decode("utf-8")
+        runtime_log_evidence = {
+            "start_offset": runtime_log_start_offset,
+            "end_offset": runtime_log_end_offset,
+            "sha256": hashlib.sha256(runtime_log_payload).hexdigest(),
+            "text": runtime_log_text,
+        }
     sse: dict[str, Any] = {"done_count": 0, "usage_count": 0, "delta_count": 0}
     utf8_wire_evidence: dict[str, Any] | None = None
     if case["scenario_id"] in {"C06", "C12", "C17"} or (case["scenario_id"] == "C21" and case["variant"] == "serve-stream"):
@@ -3420,13 +6815,17 @@ def serve_case_request(
     models_response: dict[str, Any] | None = None
     if case["scenario_id"] == "C20":
         models_status, models_response = http_get_json(base_url.rstrip("/") + "/v1/models", timeout_sec)
-        require(models_status == 200, f"case {case_id} /v1/models returned {models_status}")
     transcript = {
         "case_id": case_id,
         "exchanges": exchanges,
         "scheduler_trace_rows": trace_rows,
+        "scheduler_trace_scope": c18_trace_scope,
         "models_response": models_response,
+        "models_status": models_status if case["scenario_id"] == "C20" else None,
+        "history_construction_errors": history_construction_errors,
         "utf8_wire_evidence": utf8_wire_evidence,
+        "concurrency_request_identities": concurrency_identities or None,
+        "runtime_log_evidence": runtime_log_evidence,
         **sse,
     }
     transcript_path = case_root / "http-transcript.json"
@@ -3476,19 +6875,52 @@ def serve_case_request(
             }
         )
     if case["scenario_id"] == "C09":
+        require(c09_outcome is not None, "C09 terminal outcome was not collected")
         observed.update(
             {
-                "scheduler_ticks_to_release": release_ticks if released else 999,
-                "wall_sec_to_release": release_wall,
+                **c09_outcome,
+                "trace_contract_error": c09_trace_contract_error,
                 "post_capacity_success": len(exchanges) == 2 and exchanges[-1]["status"] == 200,
             }
         )
     if case["scenario_id"] == "C18":
+        typed_cap = typed_admission_cap(effective_config_path)
+        active_floor = required_active_floor(case["model_key"], case["backend"], requested)
+        isolation = c18_isolation_summary(exchanges, concurrency_identities)
+        completion = c18_completion_summary(exchanges)
+        runtime_failures = c18_runtime_failure_summary(runtime_log_evidence)
+        active_timeline: dict[str, Any] | None = None
+        active_timeline_error: str | None = None
+        try:
+            active_timeline = derive_active_timeline(
+                trace_rows,
+                requested_concurrency=requested,
+                typed_active_cap=typed_cap,
+                active_floor=active_floor,
+                expected_request_count=requested,
+            )
+        except ActiveTimelineError as exc:
+            active_timeline_error = str(exc)
+        resource_balance = (
+            c18_resource_balance(trace_rows, expected_request_count=requested)
+            if require_c18_resource_balance
+            else None
+        )
         observed.update(
             {
                 "requested_concurrency": requested,
-                "typed_admission_cap": typed_admission_cap(effective_config_path),
-                "observed_max_active": observed_max_active(trace_rows),
+                "typed_admission_cap": typed_cap,
+                "active_floor": active_floor,
+                "observed_max_active": (
+                    active_timeline["observed_max_active"] if active_timeline else 0
+                ),
+                "active_timeline": active_timeline,
+                "active_timeline_error": active_timeline_error,
+                "request_identities": concurrency_identities,
+                **({"resource_balance": resource_balance} if require_c18_resource_balance else {}),
+                **completion,
+                **isolation,
+                **runtime_failures,
             }
         )
     if case["scenario_id"] == "C20":
@@ -3508,6 +6940,7 @@ def classify_execution_outcome(
     input_path: Path,
     actual_config_path: Path,
     artifact_root: Path,
+    require_c18_resource_balance: bool,
 ) -> tuple[str, str | None, str | None]:
     if returncode != 0:
         stderr_text = (stdout_path.parent / "stderr.log").read_text(encoding="utf-8", errors="replace").lower()
@@ -3515,8 +6948,8 @@ def classify_execution_outcome(
             return "blocked", "legacy-model-backend-unsupported", "product command reported unsupported model/backend"
         return "blocked", "product-command-failed", f"product command returned {returncode}"
     transcript = read_json(transcript_path) if transcript_path is not None else None
-    try:
-        validate_case_output(
+    output_error = capture_case_output_error(
+        lambda: validate_case_output(
             case["scenario_id"],
             case["variant"],
             case["entrypoint"],
@@ -3527,9 +6960,11 @@ def classify_execution_outcome(
             input_document=read_json(input_path),
             actual_config=read_json(actual_config_path),
             artifact_root=artifact_root,
+            require_c18_resource_balance=require_c18_resource_balance,
         )
-    except (ScenarioError, json.JSONDecodeError) as exc:
-        return "known-fail", f"{case['scenario_id'].lower()}-contract-violation", str(exc)
+    )
+    if output_error is not None:
+        return "known-fail", f"{case['scenario_id'].lower()}-contract-violation", str(output_error)
     return "pass", None, None
 
 
@@ -3550,6 +6985,7 @@ def locked_execution_sources(models_lock: dict[str, Any], model_key: str, backen
     matching = [require_object(row, "models.lock model") for row in models if isinstance(row, dict) and row.get("key") == model_key]
     require(len(matching) == 1, f"models.lock must contain exactly one {model_key} entry")
     lane = require_object(require_object(matching[0].get("lanes"), f"models.lock.{model_key}.lanes").get(backend), f"models.lock.{model_key}.{backend}")
+    weight_repo = require_string(lane.get("repo"), f"models.lock.{model_key}.{backend}.repo")
     weight_revision = require_git_sha(lane.get("revision"), f"models.lock.{model_key}.{backend}.revision")
     weight_files = normalized_source_files(lane.get("files"), f"models.lock.{model_key}.{backend}.files")
     semantic = require_object(lane.get("semantic_source"), f"models.lock.{model_key}.{backend}.semantic_source")
@@ -3586,6 +7022,7 @@ def locked_execution_sources(models_lock: dict[str, Any], model_key: str, backen
     require(selected["files"].get(chat_normalized["path"]) == chat_normalized["container_sha256"], "models.lock chat template container is not bound to selected source")
     return {
         "weight_format": require_string(lane.get("format"), f"models.lock.{model_key}.{backend}.format"),
+        "weight_repo": weight_repo,
         "weight_revision": weight_revision,
         "weight_files": weight_files,
         "semantic_source": semantic_normalized,
@@ -3598,18 +7035,48 @@ def validate_local_source_root(raw: Any, source: dict[str, Any], label: str) -> 
     root = Path(require_string(raw, label)).expanduser().resolve()
     require(root.is_dir(), f"{label} is not a local directory")
     for rel, digest in source["files"].items():
-        path = (root / rel).resolve()
+        path = root / rel
         try:
-            path.relative_to(root)
+            path.absolute().relative_to(root)
         except ValueError as exc:
             raise ScenarioError(f"{label} file escapes its root: {rel}") from exc
         require(path.is_file() and file_sha256(path) == digest, f"{label} locked file missing or SHA mismatch: {rel}")
     return root
 
 
-def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
+def validate_local_model_arg(raw: Any, weight_files: dict[str, str], label: str) -> Path:
+    supplied = Path(require_string(raw, label)).expanduser().absolute()
+    require(supplied.exists(), f"{label} does not exist")
+    if supplied.is_file():
+        require(len(weight_files) == 1, f"{label} is a file, but the locked model has {len(weight_files)} files")
+        rel, digest = next(iter(weight_files.items()))
+        require(supplied.name == Path(rel).name, f"{label} filename differs from the locked model file: {rel}")
+        require(file_sha256(supplied) == digest, f"{label} locked weight SHA mismatch: {rel}")
+        return supplied
+    require(supplied.is_dir(), f"{label} is neither a model file nor directory")
+    root = supplied.resolve()
+    for rel, digest in weight_files.items():
+        path = root / rel
+        try:
+            path.absolute().relative_to(root)
+        except ValueError as exc:
+            raise ScenarioError(f"{label} weight escapes its root: {rel}") from exc
+        require(path.is_file() and file_sha256(path) == digest, f"{label} locked weight missing or SHA mismatch: {rel}")
+    return supplied
+
+
+def validate_execution_manifest(
+    manifest: dict[str, Any],
+    root: Path,
+    *,
+    allow_internal_fixture: bool = False,
+) -> dict[str, Any]:
     require(not ({"runner", "commands", "scenarios", "pass_line", "status", "artifact_path"} & set(manifest)), "execution manifest must not contain prebuilt report fields")
-    validate_source_identity(manifest, "execution_manifest")
+    contract = validate_source_identity(
+        manifest,
+        "execution_manifest",
+        allow_internal_fixture=allow_internal_fixture,
+    )
     for key in ("model_key", "backend", "model_revision", "hardware_id"):
         require_string(manifest.get(key), f"execution_manifest.{key}")
     require(manifest["model_key"] in {"m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}, "execution manifest model_key invalid")
@@ -3622,10 +7089,39 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
         require_sha256(digest, f"execution_manifest.model_files[{path}]")
     binary_path, _, _ = validate_artifact_ref(root, manifest.get("binary_artifact"), "execution_manifest.binary_artifact", allowed_kinds={"binary"})
     models_lock_path, _, models_lock_document = validate_artifact_ref(root, manifest.get("models_lock"), "execution_manifest.models_lock", allowed_kinds={"raw-json"})
-    require(file_sha256(binary_path) == require_sha256(manifest.get("binary_sha256"), "execution_manifest.binary_sha256"), "execution manifest binary SHA mismatch")
-    require(file_sha256(models_lock_path) == require_sha256(manifest.get("models_lock_sha256"), "execution_manifest.models_lock_sha256"), "execution manifest models.lock SHA mismatch")
+    binary_sha256 = require_sha256(manifest.get("binary_sha256"), "execution_manifest.binary_sha256")
+    models_lock_sha256 = require_sha256(manifest.get("models_lock_sha256"), "execution_manifest.models_lock_sha256")
+    require(file_sha256(binary_path) == binary_sha256, "execution manifest binary SHA mismatch")
+    require(file_sha256(models_lock_path) == models_lock_sha256, "execution manifest models.lock SHA mismatch")
+    build_receipt_path: Path | None = None
+    build_receipt_sha256: str | None = None
+    if contract == G08_EXECUTION_CONTRACT:
+        _, build_receipt_path, build_receipt_sha256, _ = validate_candidate_build_receipt(
+            root,
+            manifest.get("binary_build_receipt"),
+            expected={
+                "source_git_sha": manifest["source_git_sha"],
+                "source_tree_sha": manifest["source_tree_sha"],
+                "hardware_id": manifest["hardware_id"],
+                "backend": manifest["backend"],
+                "binary_sha256": binary_sha256,
+                "binary_path": binary_path,
+            },
+            allow_internal_fixture=allow_internal_fixture,
+        )
+    else:
+        require(
+            "binary_build_receipt" not in manifest,
+            "legacy execution manifest must not contain a candidate build receipt",
+        )
     effective_path, _, effective = validate_artifact_ref(root, manifest.get("effective_config"), "execution_manifest.effective_config", allowed_kinds={"raw-json"})
-    require_object(effective, "execution_manifest effective config")
+    effective_document = require_object(effective, "execution_manifest effective config")
+    effective_contract = validate_source_identity(
+        effective_document,
+        "execution_manifest effective config",
+        allow_internal_fixture=allow_internal_fixture,
+    )
+    require(effective_contract == contract, "execution manifest effective config contract mismatch")
     execution = require_object(manifest.get("execution"), "execution_manifest.execution")
     require(set(execution) >= {"model_arg", "semantic_source_root", "host", "port", "startup_timeout_sec", "case_timeout_sec", "run_extra_args", "serve_extra_args"}, "execution manifest execution fields incomplete")
     require_string(execution.get("model_arg"), "execution_manifest.execution.model_arg")
@@ -3641,6 +7137,7 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
     sources = locked_execution_sources(require_object(models_lock_document, "execution_manifest models.lock JSON"), manifest["model_key"], manifest["backend"])
     require(manifest["model_revision"] == sources["weight_revision"], "execution manifest model_revision differs from models.lock weight revision")
     require(manifest["model_files"] == sources["weight_files"], "execution manifest model_files must contain exactly the selected weight lock")
+    model_path = validate_local_model_arg(execution.get("model_arg"), sources["weight_files"], "execution_manifest.execution.model_arg")
     semantic_root = validate_local_source_root(execution.get("semantic_source_root"), sources["semantic_source"], "execution_manifest.execution.semantic_source_root")
     if sources["tokenizer_source"] is None:
         require(execution.get("tokenizer_source_root") in {None, str(semantic_root)}, "execution manifest has an undeclared tokenizer source root")
@@ -3648,11 +7145,15 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
     else:
         tokenizer_root = validate_local_source_root(execution.get("tokenizer_source_root"), sources["tokenizer_source"], "execution_manifest.execution.tokenizer_source_root")
     return {
+        "execution_contract": contract,
         "binary_path": binary_path,
+        "build_receipt_path": build_receipt_path,
+        "build_receipt_sha256": build_receipt_sha256,
         "models_lock_path": models_lock_path,
         "effective_path": effective_path,
         "execution": execution,
         "sources": sources,
+        "model_path": model_path,
         "semantic_root": semantic_root,
         "tokenizer_root": tokenizer_root,
     }
@@ -3664,28 +7165,115 @@ def execute_manifest(
     out: Path,
     *,
     discover: bool,
+    discovery_scenario: str | None = None,
+    diagnose_c09: bool = False,
+    focus_case_ids: list[str] | None = None,
+    focus_scenario_ids: list[str] | None = None,
     allow_internal_fixture: bool = False,
 ) -> dict[str, Any]:
+    focus_case_ids = list(focus_case_ids or [])
+    focus_scenario_ids = list(focus_scenario_ids or [])
+    focused = bool(focus_case_ids or focus_scenario_ids)
+    require(discovery_scenario is None or discover, "scenario-scoped execution is allowed only in discovery mode")
+    require(discovery_scenario in {None, "C03"}, "only the versioned C03 contract supports scoped discovery")
+    require(not (diagnose_c09 and discover), "C09 diagnostic and discovery modes are mutually exclusive")
+    require(
+        not (focused and (diagnose_c09 or discover)),
+        "focused execution, C09 diagnostic, and discovery modes are mutually exclusive",
+    )
     root = root.resolve()
     out = out.resolve()
-    validated = validate_execution_manifest(manifest, root)
-    catalog = internal_expectations_catalog() if allow_internal_fixture else validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
-    catalog_bytes = (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8") if allow_internal_fixture else EXPECTATIONS_PATH.read_bytes()
-    expectations_path = root / "legacy-correctness-expectations.json"
+    validated = validate_execution_manifest(
+        manifest,
+        root,
+        allow_internal_fixture=allow_internal_fixture,
+    )
+    contract = validated["execution_contract"]
+    require(
+        contract == LEGACY_EXECUTION_CONTRACT or not discover,
+        "G08 candidate execution does not support discovery mode",
+    )
+    lane_root = root / "correctness" / manifest["model_key"] / manifest["backend"]
+    executor_root = lane_root / "commands"
+    if contract == G08_EXECUTION_CONTRACT:
+        catalog_bytes = candidate_expectations_bytes(manifest["source_git_sha"])
+        catalog = validate_expectations_catalog(
+            require_object(json.loads(catalog_bytes), "candidate expectations catalog"),
+            expected_contract=contract,
+        )
+        expectations_name = "g08-model-matrix-expectations.json"
+    elif allow_internal_fixture:
+        catalog = internal_expectations_catalog()
+        catalog_bytes = (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        expectations_name = "legacy-correctness-expectations.json"
+    else:
+        catalog = validate_expectations_catalog(
+            read_json(EXPECTATIONS_PATH),
+            expected_contract=contract,
+        )
+        catalog_bytes = EXPECTATIONS_PATH.read_bytes()
+        expectations_name = "legacy-correctness-expectations.json"
+    expectations_path = root / expectations_name
     expectations_path.write_bytes(catalog_bytes)
     expectations_sha = file_sha256(expectations_path)
-    if not allow_internal_fixture:
+    if not allow_internal_fixture and contract == LEGACY_EXECUTION_CONTRACT:
         require(expectations_sha == canonical_expectations_sha256(), "execution used a non-canonical expectations catalog")
     rows = planned_case_rows(manifest["model_key"], manifest["backend"], catalog)
+    if discovery_scenario is not None:
+        rows = [row for row in rows if row["scenario_id"] == discovery_scenario]
+        require(len(rows) == 10, "scoped C03 discovery must execute the complete 10-case contract")
+    elif diagnose_c09:
+        rows = select_c09_diagnostic_rows(rows)
+    elif focused:
+        rows = select_focused_rows(
+            rows,
+            case_ids=focus_case_ids,
+            scenario_ids=focus_scenario_ids,
+        )
     unresolved = [row for row in rows if row["expectation"]["expected_status"] == "discovery-required"]
     if unresolved and not discover:
         raise ScenarioError(f"canonical collection refused: {len(unresolved)} cases remain discovery-required; run --discover first")
+    # The manifest has already bound and hashed every selected source file. C01
+    # cases carry independent copies of one immutable probe instead of rereading
+    # the complete weight snapshot for every case.
+    prepared_c01_resolution_probe = (
+        build_c01_resolution_probe(
+            validated["execution"]["model_arg"],
+            manifest["model_key"],
+            sources=validated["sources"],
+            semantic_root=validated["semantic_root"],
+            tokenizer_root=validated["tokenizer_root"],
+        )
+        if any(row["scenario_id"] == "C01" for row in rows)
+        else None
+    )
     invocation_started = iso_now()
     invocation_start_ns = time.monotonic_ns()
-    input_manifest_path = root / "scenario-execution-manifest.snapshot.json"
+    input_manifest_path = executor_root / "scenario-execution-manifest.snapshot.json"
     write_json(input_manifest_path, manifest)
     invocation_argv = (
-        [str(RUNNER_PATH), "--manifest", str(input_manifest_path), "--artifact-root", str(root), "--out", str(out), *(["--discover"] if discover else [])]
+        [
+            str(RUNNER_PATH),
+            "--manifest",
+            str(input_manifest_path),
+            "--artifact-root",
+            str(root),
+            "--out",
+            str(out),
+            *(["--discover"] if discover else []),
+            *(["--discover-scenario", discovery_scenario] if discovery_scenario is not None else []),
+            *(["--diagnose-c09"] if diagnose_c09 else []),
+            *[
+                item
+                for case_id in focus_case_ids
+                for item in ("--focus-case", case_id)
+            ],
+            *[
+                item
+                for scenario_id in focus_scenario_ids
+                for item in ("--focus-scenario", scenario_id)
+            ],
+        ]
         if allow_internal_fixture
         else [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
     )
@@ -3693,15 +7281,20 @@ def execute_manifest(
         require(Path(invocation_argv[0]).resolve() == RUNNER_PATH, "canonical executor must be entered through the checked-in runner main")
         require("--manifest" in invocation_argv and "--artifact-root" in invocation_argv and "--out" in invocation_argv, "canonical executor invocation argv incomplete")
         require(("--discover" in invocation_argv) is discover, "canonical executor mode differs from actual invocation argv")
+        require(("--discover-scenario" in invocation_argv) is (discovery_scenario is not None), "canonical executor discovery scope differs from actual invocation argv")
+        require(("--diagnose-c09" in invocation_argv) is diagnose_c09, "canonical executor C09 diagnostic scope differs from actual invocation argv")
+        require(("--focus-case" in invocation_argv) is bool(focus_case_ids), "canonical executor case focus differs from actual invocation argv")
+        require(("--focus-scenario" in invocation_argv) is bool(focus_scenario_ids), "canonical executor scenario focus differs from actual invocation argv")
     invocation_process_receipt = capture_process_receipt(
         root,
-        root / "scenario-executor-process-receipt.json",
+        executor_root / "scenario-executor-process-receipt.json",
         pid=os.getpid(),
         pgid=os.getpgid(0),
         argv=invocation_argv,
         role="scenario-executor",
     )
     invocation = {
+        "execution_contract": contract,
         "runner_path": RUNNER_REPO_PATH,
         "runner_sha256": file_sha256(RUNNER_PATH),
         "argv": invocation_argv,
@@ -3712,75 +7305,246 @@ def execute_manifest(
         "pid": os.getpid(),
         "pgid": os.getpgid(0),
         "process_receipt": invocation_process_receipt,
-        "mode": "discover" if discover else "canonical",
+        "mode": (
+            "c09-diagnostic"
+            if diagnose_c09
+            else "focused-diagnostic"
+            if focused
+            else "discover"
+            if discover
+            else "canonical"
+        ),
     }
     execution = validated["execution"]
     binary_path = validated["binary_path"]
     base_url = f"http://{execution['host']}:{execution['port']}"
-    lane_root = root / "correctness" / manifest["model_key"] / manifest["backend"]
-    serve_stdout = lane_root / "commands/serve.stdout.log"
-    serve_stderr = lane_root / "commands/serve.stderr.log"
-    serve_config = lane_root / "commands/serve.actual-effective-config.json"
-    scheduler_trace = lane_root / "commands/serve.scheduler-trace.jsonl"
-    serve_argv = [
-        str(binary_path),
-        "serve",
-        execution["model_arg"],
-        "--backend",
-        manifest["backend"],
-        "--host",
-        execution["host"],
-        "--port",
-        str(execution["port"]),
-        "--effective-config-json",
-        str(serve_config),
-        "--scheduler-trace-jsonl",
-        str(scheduler_trace),
-        *execution["serve_extra_args"],
-    ]
     server: ProductServer | None = None
+    active_serve_session: dict[str, Any] | None = None
+    serve_sessions: list[dict[str, Any]] = []
     server_error: str | None = None
-    try:
-        server = ProductServer(
-            argv=serve_argv,
-            stdout_path=serve_stdout,
-            stderr_path=serve_stderr,
-            artifact_root=root,
-            receipt_path=lane_root / "commands/serve.process-receipt.json",
-            base_url=base_url,
-            startup_timeout_sec=float(execution["startup_timeout_sec"]),
+    active_run_session: ProductRunSession | None = None
+    active_run_group_key: tuple[str, ...] | None = None
+    run_sessions: list[dict[str, Any]] = []
+
+    def run_session_spec(
+        generation: int,
+        row: dict[str, Any],
+        group_key: tuple[str, ...],
+    ) -> dict[str, Any]:
+        stem = f"run-{generation:02d}"
+        actual_config = lane_root / f"commands/{stem}.actual-effective-config.json"
+        argv, _, _ = run_product_argv(
+            row,
+            binary_path=binary_path,
+            model_arg=execution["model_arg"],
+            backend=manifest["backend"],
+            semantic_root=validated["semantic_root"],
+            tokenizer_root=validated["tokenizer_root"],
+            actual_config=actual_config,
+            run_extra_args=execution["run_extra_args"],
+            resident=True,
         )
-    except ScenarioError as exc:
-        server_error = str(exc)
+        require(
+            resident_run_group_key(row) == group_key,
+            f"resident run group {generation} option key drift",
+        )
+        return {
+            "command_id": f"actual-run-{generation:02d}",
+            "generation": generation,
+            "group_key": group_key,
+            "argv": argv,
+            "stdout": lane_root / f"commands/{stem}.stdout.log",
+            "stderr": lane_root / f"commands/{stem}.stderr.log",
+            "config": actual_config,
+            "receipt": lane_root / f"commands/{stem}.process-receipt.json",
+            "wire_receipt": lane_root / f"commands/{stem}.wire-receipt.json",
+        }
+
+    def start_run_session(
+        row: dict[str, Any],
+        group_key: tuple[str, ...],
+    ) -> ProductRunSession:
+        session_spec = run_session_spec(len(run_sessions) + 1, row, group_key)
+        session = ProductRunSession(
+            command_id=session_spec["command_id"],
+            argv=session_spec["argv"],
+            stdout_path=session_spec["stdout"],
+            stderr_path=session_spec["stderr"],
+            artifact_root=root,
+            receipt_path=session_spec["receipt"],
+            wire_receipt_path=session_spec["wire_receipt"],
+            timeout_sec=float(execution["case_timeout_sec"]),
+            actual_config_path=session_spec["config"],
+            group_key=group_key,
+        )
+        session_spec["session"] = session
+        run_sessions.append(session_spec)
+        return session
+
+    def serve_session_spec(generation: int) -> dict[str, Any]:
+        stem = f"serve-{generation:02d}"
+        serve_config = lane_root / f"commands/{stem}.actual-effective-config.json"
+        scheduler_trace = lane_root / f"commands/{stem}.scheduler-trace.jsonl"
+        serve_argv = [
+            str(binary_path),
+            "serve",
+            execution["model_arg"],
+            "--backend",
+            manifest["backend"],
+            "--host",
+            execution["host"],
+            "--port",
+            str(execution["port"]),
+            "--effective-config-json",
+            str(serve_config),
+            "--scheduler-trace-jsonl",
+            str(scheduler_trace),
+            "--semantic-source",
+            str(validated["semantic_root"]),
+            "--tokenizer-source",
+            str(validated["tokenizer_root"]),
+            *execution["serve_extra_args"],
+        ]
+        return {
+            "command_id": f"actual-serve-{generation:02d}",
+            "generation": generation,
+            "argv": serve_argv,
+            "stdout": lane_root / f"commands/{stem}.stdout.log",
+            "stderr": lane_root / f"commands/{stem}.stderr.log",
+            "config": serve_config,
+            "scheduler_trace": scheduler_trace,
+            "receipt": lane_root / f"commands/{stem}.process-receipt.json",
+            "scenario_ids": set(),
+        }
+
+    def ensure_server() -> None:
+        nonlocal server, active_serve_session, server_error
+        if server is not None or server_error is not None:
+            return
+        session = serve_session_spec(len(serve_sessions) + 1)
+        active_serve_session = session
+        try:
+            server = ProductServer(
+                argv=session["argv"],
+                stdout_path=session["stdout"],
+                stderr_path=session["stderr"],
+                artifact_root=root,
+                receipt_path=session["receipt"],
+                base_url=base_url,
+                startup_timeout_sec=float(execution["startup_timeout_sec"]),
+            )
+            session["server"] = server
+            serve_sessions.append(session)
+        except ScenarioError as exc:
+            server_error = str(exc)
+
     case_refs_by_scenario: dict[str, list[dict[str, str]]] = {scenario_id: [] for scenario_id in SCENARIO_IDS}
     case_results: dict[str, list[dict[str, Any]]] = {scenario_id: [] for scenario_id in SCENARIO_IDS}
     first_run_record: dict[str, Any] | None = None
+    last_serve_scenario: str | None = None
     try:
-        for row in rows:
-            row = {**row, "model_key": manifest["model_key"], "model_files": manifest["model_files"]}
+        bound_rows = [
+            {
+                **row,
+                "model_key": manifest["model_key"],
+                "model_files": manifest["model_files"],
+                "backend": manifest["backend"],
+            }
+            for row in rows
+        ]
+        if contract == G08_EXECUTION_CONTRACT and not diagnose_c09 and not focused:
+            grouped_run_rows: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+            serve_rows: list[dict[str, Any]] = []
+            for row in bound_rows:
+                if row["entrypoint"] == "run":
+                    grouped_run_rows.setdefault(resident_run_group_key(row), []).append(row)
+                else:
+                    serve_rows.append(row)
+            require(
+                len(grouped_run_rows) == 5,
+                f"G08 candidate run corpus must resolve to exactly five resident option groups, got {len(grouped_run_rows)}",
+            )
+            execution_rows = [
+                row
+                for group_rows in grouped_run_rows.values()
+                for row in group_rows
+            ] + serve_rows
+        else:
+            execution_rows = sorted(
+                bound_rows,
+                key=lambda row: 0 if row["entrypoint"] == "run" else 1,
+            )
+        for row in execution_rows:
             case_root = lane_root / "scenarios" / row["scenario_id"] / "cases" / row["case_id"]
             case_root.mkdir(parents=True, exist_ok=True)
             transcript_path: Path | None = None
             if row["entrypoint"] == "run":
-                argv, envelope, input_path, stdout_path, stderr_path, extra = run_case_command(
-                    root,
-                    row,
-                    binary_path=binary_path,
-                    model_arg=execution["model_arg"],
-                    backend=manifest["backend"],
-                    run_extra_args=execution["run_extra_args"],
-                    timeout_sec=float(execution["case_timeout_sec"]),
-                    case_root=case_root,
-                    locked_sources=validated["sources"],
-                    semantic_root=validated["semantic_root"],
-                    tokenizer_root=validated["tokenizer_root"],
-                )
+                if contract == G08_EXECUTION_CONTRACT:
+                    group_key = resident_run_group_key(row)
+                    if active_run_group_key != group_key:
+                        if active_run_session is not None:
+                            active_run_session.stop()
+                        active_run_session = start_run_session(row, group_key)
+                        active_run_group_key = group_key
+                    require(active_run_session is not None, "resident run session was not started")
+                    argv, envelope, input_path, stdout_path, stderr_path, extra = run_case_resident(
+                        root,
+                        row,
+                        session=active_run_session,
+                        case_root=case_root,
+                        locked_sources=validated["sources"],
+                        semantic_root=validated["semantic_root"],
+                        tokenizer_root=validated["tokenizer_root"],
+                        timeout_sec=float(execution["case_timeout_sec"]),
+                        prepared_c01_resolution_probe=prepared_c01_resolution_probe,
+                    )
+                    execution_process_receipt = invocation_process_receipt
+                    product_process_receipt = active_run_session.process_receipt
+                    command_id = active_run_session.command_id
+                    product_argv = active_run_session.argv
+                    product_process = {
+                        "argv": active_run_session.argv,
+                        "pid": active_run_session.pid,
+                        "pgid": active_run_session.pgid,
+                        "started_at": active_run_session.started_at,
+                        "ready_at": active_run_session.ready_at,
+                        "started_monotonic_ns": active_run_session.started_monotonic_ns,
+                        "ready_monotonic_ns": active_run_session.ready_monotonic_ns,
+                        "state_during_case": "running",
+                    }
+                else:
+                    argv, envelope, input_path, stdout_path, stderr_path, extra = run_case_command(
+                        root,
+                        row,
+                        binary_path=binary_path,
+                        model_arg=execution["model_arg"],
+                        backend=manifest["backend"],
+                        run_extra_args=execution["run_extra_args"],
+                        timeout_sec=float(execution["case_timeout_sec"]),
+                        case_root=case_root,
+                        locked_sources=validated["sources"],
+                        semantic_root=validated["semantic_root"],
+                        tokenizer_root=validated["tokenizer_root"],
+                        prepared_c01_resolution_probe=prepared_c01_resolution_probe,
+                    )
+                    execution_process_receipt = extra["process_receipt"]
+                    product_process_receipt = extra["process_receipt"]
+                    command_id = "actual-run"
+                    product_argv = argv
+                    product_process = {
+                        "argv": argv,
+                        "pid": envelope["pid"],
+                        "pgid": envelope["pgid"],
+                        "started_at": envelope["started_at"],
+                        "finished_at": envelope["finished_at"],
+                        "started_monotonic_ns": envelope["started_monotonic_ns"],
+                        "finished_monotonic_ns": envelope["finished_monotonic_ns"],
+                        "returncode": envelope["returncode"],
+                    }
                 observed = extra["observed"]
                 actual_config = extra["actual_config"]
-                execution_process_receipt = extra["process_receipt"]
-                product_process_receipt = extra["process_receipt"]
                 child_environment = extra["child_environment"]
-                if first_run_record is None:
+                if contract == LEGACY_EXECUTION_CONTRACT and first_run_record is None:
                     first_run_record = {
                         "argv": argv,
                         "envelope": envelope,
@@ -3788,7 +7552,24 @@ def execute_manifest(
                         "stderr": stderr_path,
                         "process_receipt": extra["process_receipt"],
                     }
-            elif server is not None:
+            else:
+                if active_run_session is not None:
+                    active_run_session.stop()
+                    active_run_session = None
+                    active_run_group_key = None
+                if (
+                    server is not None
+                    and last_serve_scenario in SERVE_ISOLATION_BOUNDARIES
+                    and row["scenario_id"] != last_serve_scenario
+                ):
+                    server.stop()
+                    server = None
+                    active_serve_session = None
+                    server_error = None
+                ensure_server()
+            if row["entrypoint"] == "serve" and server is not None:
+                require(active_serve_session is not None, "active serve session metadata missing")
+                active_serve_session["scenario_ids"].add(row["scenario_id"])
                 argv, envelope, input_path, stdout_path, stderr_path, transcript_path, observed = serve_case_request(
                     root,
                     row,
@@ -3796,14 +7577,29 @@ def execute_manifest(
                     timeout_sec=float(execution["case_timeout_sec"]),
                     case_root=case_root,
                     server=server,
-                    scheduler_trace_path=scheduler_trace,
-                    effective_config_path=serve_config,
+                    scheduler_trace_path=active_serve_session["scheduler_trace"],
+                    effective_config_path=active_serve_session["config"],
+                    require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
                 )
-                actual_config = serve_config
+                actual_config = active_serve_session["config"]
                 execution_process_receipt = invocation_process_receipt
                 product_process_receipt = server.process_receipt
                 child_environment = server.child_environment
-            else:
+                command_id = active_serve_session["command_id"]
+                product_argv = active_serve_session["argv"]
+                product_process = {
+                    "argv": active_serve_session["argv"],
+                    "pid": server.pid,
+                    "pgid": server.pgid,
+                    "started_at": server.started_at,
+                    "ready_at": server.ready_at,
+                    "started_monotonic_ns": server.started_monotonic_ns,
+                    "ready_monotonic_ns": server.ready_monotonic_ns,
+                    "state_during_case": "running",
+                }
+                last_serve_scenario = row["scenario_id"]
+            elif row["entrypoint"] == "serve":
+                require(active_serve_session is not None, "failed serve session metadata missing")
                 input_path = case_root / "input.json"
                 write_json(input_path, case_http_payload(row, manifest["model_key"]))
                 stdout_path = case_root / "stdout.log"
@@ -3820,6 +7616,14 @@ def execute_manifest(
                 execution_process_receipt = invocation_process_receipt
                 product_process_receipt = None
                 child_environment = sanitized_child_environment()
+                command_id = active_serve_session["command_id"]
+                product_argv = active_serve_session["argv"]
+                product_process = {
+                    "argv": active_serve_session["argv"],
+                    "state_during_case": "startup-failed",
+                    "failure": server_error,
+                }
+                last_serve_scenario = row["scenario_id"]
             status, failure_class, checker_error = classify_execution_outcome(
                 row,
                 returncode=int(envelope["returncode"]),
@@ -3829,11 +7633,24 @@ def execute_manifest(
                 input_path=input_path,
                 actual_config_path=actual_config,
                 artifact_root=root,
+                require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
             )
             expectation = row["expectation"]
+            expectation_error: str | None = None
             if not discover:
-                require(status == expectation["expected_status"], f"case {row['case_id']} unexpected status: expected {expectation['expected_status']}, observed {status}")
-                require(failure_class == expectation["failure_class"], f"case {row['case_id']} failure class drift: expected {expectation['failure_class']}, observed {failure_class}")
+                expectation_failures: list[str] = []
+                if status != expectation["expected_status"]:
+                    expectation_failures.append(
+                        f"unexpected status: expected {expectation['expected_status']}, observed {status}"
+                    )
+                if failure_class != expectation["failure_class"]:
+                    expectation_failures.append(
+                        f"failure class drift: expected {expectation['failure_class']}, observed {failure_class}"
+                    )
+                if expectation_failures:
+                    if checker_error:
+                        expectation_failures.append(f"checker: {checker_error}")
+                    expectation_error = f"case {row['case_id']} " + "; ".join(expectation_failures)
             command_spec_path = case_root / "command-spec.json"
             write_json(
                 command_spec_path,
@@ -3852,43 +7669,23 @@ def execute_manifest(
             )
             checker_path = case_root / "checker.log"
             checker_path.write_text(
-                f"case={row['case_id']} observed_status={status} failure_class={failure_class or 'none'} checker_error={checker_error or 'none'}\n",
+                f"case={row['case_id']} observed_status={status} failure_class={failure_class or 'none'} checker_error={checker_error or 'none'} expectation_error={expectation_error or 'none'}\n",
                 encoding="utf-8",
             )
             envelope_path = case_root / "execution-envelope.json"
             envelope_document = {
                 "schema_version": SCHEMA_VERSION,
                 "case_id": row["case_id"],
+                "command_id": command_id,
                 "command_spec": existing_artifact_ref(root, command_spec_path, "raw-json"),
                 "spawn": envelope,
                 "execution_process_receipt": execution_process_receipt,
                 "product_process_receipt": product_process_receipt,
                 "child_environment": child_environment,
                 "child_environment_sha256": canonical_json_sha256(child_environment),
-                "product_argv": argv if row["entrypoint"] == "run" else serve_argv,
-                "product_process": (
-                    {
-                        "argv": argv,
-                        "pid": envelope["pid"],
-                        "pgid": envelope["pgid"],
-                        "started_at": envelope["started_at"],
-                        "finished_at": envelope["finished_at"],
-                        "started_monotonic_ns": envelope["started_monotonic_ns"],
-                        "finished_monotonic_ns": envelope["finished_monotonic_ns"],
-                        "returncode": envelope["returncode"],
-                    }
-                    if row["entrypoint"] == "run"
-                    else ({
-                        "argv": serve_argv,
-                        "pid": server.pid,
-                        "pgid": server.pgid,
-                        "started_at": server.started_at,
-                        "ready_at": server.ready_at,
-                        "started_monotonic_ns": server.started_monotonic_ns,
-                        "ready_monotonic_ns": server.ready_monotonic_ns,
-                        "state_during_case": "running",
-                    } if server is not None else {"argv": serve_argv, "state_during_case": "startup-failed", "failure": server_error})
-                ),
+                "product_argv": product_argv,
+                "product_process": product_process,
+                "resident_case_receipt": extra.get("resident_case_receipt") if row["entrypoint"] == "run" else None,
                 "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
                 "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
                 "http_transcript": existing_artifact_ref(root, transcript_path, "http-transcript") if transcript_path else None,
@@ -3919,6 +7716,7 @@ def execute_manifest(
                 "effective_config_sha256": file_sha256(validated["effective_path"]),
                 "expectations_catalog_sha256": expectations_sha,
                 "entrypoint": row["entrypoint"],
+                "command_id": command_id,
                 "variant": row["variant"],
                 "preset": row["preset"],
                 "model_identity": {
@@ -3934,10 +7732,20 @@ def execute_manifest(
                     "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
                     "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
                     "effective_config": manifest["effective_config"],
+                    **(
+                        {"resident_case_receipt": extra["resident_case_receipt"]}
+                        if row["entrypoint"] == "run" and envelope["mode"] == "resident-jsonl"
+                        else {}
+                    ),
                     **({"http_transcript": existing_artifact_ref(root, transcript_path, "http-transcript")} if transcript_path else {}),
                 },
                 "observed": observed,
-                "checks": {"execution_envelope": True, "model_binding": True, "scenario_oracle": status == "pass"},
+                "checks": {
+                    "execution_envelope": True,
+                    "model_binding": True,
+                    "scenario_oracle": status == "pass",
+                    "expectation_match": expectation_error is None,
+                },
             }
             if status != "pass":
                 case_document["checks"]["scenario_oracle"] = False
@@ -3946,14 +7754,125 @@ def execute_manifest(
             ref = existing_artifact_ref(root, case_path, "raw-json")
             case_refs_by_scenario[row["scenario_id"]].append(ref)
             case_results[row["scenario_id"]].append(case_document)
+            if expectation_error is not None:
+                raise ScenarioError(expectation_error)
     finally:
+        if active_run_session is not None:
+            active_run_session.stop()
         if server is not None:
             server.stop()
+    for scenario_id in SCENARIO_IDS:
+        ordered = sorted(
+            zip(case_results[scenario_id], case_refs_by_scenario[scenario_id], strict=True),
+            key=lambda pair: int(pair[0]["ordinal"]),
+        )
+        case_results[scenario_id] = [case for case, _ in ordered]
+        case_refs_by_scenario[scenario_id] = [ref for _, ref in ordered]
     invocation["finished_at"] = iso_now()
     invocation["finished_monotonic_ns"] = time.monotonic_ns()
     invocation["duration_sec"] = (invocation["finished_monotonic_ns"] - invocation_start_ns) / 1e9
-    invocation_path = root / "scenario-executor-invocation.json"
+    invocation_path = executor_root / "scenario-executor-invocation.json"
     write_json(invocation_path, invocation)
+    if diagnose_c09:
+        cases = case_results["C09"]
+        require(len(cases) == len(C09_DIAGNOSTIC_VARIANTS), "C09 diagnostic did not execute exactly three cases")
+        require(
+            [case["variant"] for case in cases] == list(C09_DIAGNOSTIC_VARIANTS),
+            "C09 diagnostic variant order drifted",
+        )
+        require(all(case["status"] == "pass" for case in cases), "C09 diagnostic contains a non-passing case")
+        require(len(serve_sessions) == 1, "C09 diagnostic must use exactly one serve session")
+        serve_session = serve_sessions[0]
+        serve_process = serve_session["server"]
+        observed_rows = [require_object(case.get("observed"), f"{case['case_id']}.observed") for case in cases]
+        diagnostic = {
+            **{
+                key: manifest[key]
+                for key in (
+                    "source_git_sha",
+                    "source_tree_sha",
+                    "dirty_status",
+                    "models_lock_sha256",
+                    "binary_sha256",
+                    "model_key",
+                    "backend",
+                    "model_revision",
+                    "model_files",
+                    "hardware_id",
+                    "binary_artifact",
+                    "models_lock",
+                    "effective_config",
+                )
+            },
+            "schema_version": SCHEMA_VERSION,
+            "artifact_kind": "runtime-vnext-c09-three-variant-diagnostic",
+            "execution_contract": contract,
+            "status": "pass",
+            "decision": "KEEP",
+            "formal_pass_allowed": False,
+            "model_path": execution["model_arg"],
+            "runner": internal_fixture_runner_identity() if allow_internal_fixture else canonical_runner_identity(),
+            "executor_invocation": existing_artifact_ref(root, invocation_path, "raw-json"),
+            "scope": {
+                "scenario_id": "C09",
+                "variants": list(C09_DIAGNOSTIC_VARIANTS),
+                "case_ids": [case["case_id"] for case in cases],
+                "case_count": len(cases),
+                "canonical_case_count": minimum_case_count("C09", manifest["model_key"]),
+            },
+            "metrics": {
+                "admitted_released_count": sum(
+                    observed["cancel_resource_outcome"] == C09_ADMITTED_RELEASED
+                    for observed in observed_rows
+                ),
+                "post_capacity_success_count": sum(
+                    observed["post_capacity_success"] is True for observed in observed_rows
+                ),
+                "max_scheduler_ticks_to_terminal": max(
+                    require_count(observed["scheduler_ticks_to_terminal"], "C09 diagnostic scheduler ticks")
+                    for observed in observed_rows
+                ),
+                "max_wall_sec_to_terminal": max(float(observed["wall_sec_to_terminal"]) for observed in observed_rows),
+                "leaked_resource_count": sum(
+                    require_count(
+                        require_object(observed[balance], f"C09 diagnostic {balance}")["leaked_resource_count"],
+                        f"C09 diagnostic {balance}.leaked_resource_count",
+                    )
+                    for observed in observed_rows
+                    for balance in ("cancel_resource_balance", "recovery_resource_balance")
+                ),
+                "underflow_count": sum(
+                    require_count(
+                        require_object(observed[balance], f"C09 diagnostic {balance}")["underflow_count"],
+                        f"C09 diagnostic {balance}.underflow_count",
+                    )
+                    for observed in observed_rows
+                    for balance in ("cancel_resource_balance", "recovery_resource_balance")
+                ),
+            },
+            "serve": {
+                "command_id": serve_session["command_id"],
+                "envelope": serve_process.envelope(),
+                "process_receipt": serve_process.process_receipt,
+                "stdout": existing_artifact_ref(root, serve_session["stdout"], "stdout-log"),
+                "stderr": existing_artifact_ref(root, serve_session["stderr"], "stderr-log"),
+                "scheduler_trace": existing_artifact_ref(root, serve_session["scheduler_trace"], "runtime-log"),
+                "actual_effective_config": existing_artifact_ref(root, serve_session["config"], "raw-json"),
+            },
+            "cases": case_refs_by_scenario["C09"],
+            "artifact_path": str(out),
+            "pass_line": f"{C09_DIAGNOSTIC_KEEP_PREFIX}: {out}",
+        }
+        if contract == G08_EXECUTION_CONTRACT:
+            diagnostic["binary_build_receipt"] = manifest["binary_build_receipt"]
+        metrics = diagnostic["metrics"]
+        require(metrics["admitted_released_count"] == 3, "C09 diagnostic admission release coverage is incomplete")
+        require(metrics["post_capacity_success_count"] == 3, "C09 diagnostic capacity recovery coverage is incomplete")
+        require(metrics["leaked_resource_count"] == 0, "C09 diagnostic contains leaked resources")
+        require(metrics["underflow_count"] == 0, "C09 diagnostic contains resource underflow")
+        require(diagnostic["metrics"]["max_scheduler_ticks_to_terminal"] <= 2, "C09 diagnostic release exceeded two scheduler ticks")
+        require(diagnostic["metrics"]["max_wall_sec_to_terminal"] <= 5, "C09 diagnostic release exceeded five seconds")
+        return diagnostic
     if discover:
         discovery = {
             "schema_version": SCHEMA_VERSION,
@@ -3967,16 +7886,181 @@ def execute_manifest(
             "observations": [existing_artifact_ref(root, root / ref["path"], "raw-json") for refs in case_refs_by_scenario.values() for ref in refs],
             "artifact_path": str(out),
             "formal_pass_allowed": False,
+            **(
+                {
+                    "scope": {
+                        "kind": "scenario-contract",
+                        "scenario_id": "C03",
+                        "contract_id": C03_CONTRACT_ID,
+                        "expected_case_count": 10,
+                    }
+                }
+                if discovery_scenario is not None
+                else {}
+            ),
         }
         return discovery
-    require(server is not None, f"canonical serve session unavailable: {server_error}")
-    require(first_run_record is not None, "canonical run produced no execution record")
+    if focused:
+        selected_cases = [
+            case
+            for scenario_id in SCENARIO_IDS
+            for case in case_results[scenario_id]
+        ]
+        require(
+            len(selected_cases) == len(rows),
+            "focused execution did not persist exactly one result per selected case",
+        )
+        status_counts: dict[str, int] = {}
+        for case in selected_cases:
+            status = require_string(
+                require_object(
+                    case.get("observed_outcome"),
+                    f"{case['case_id']}.observed_outcome",
+                ).get("status"),
+                f"{case['case_id']}.observed_outcome.status",
+            )
+            status_counts[status] = status_counts.get(status, 0) + 1
+        diagnostic = {
+            **{
+                key: manifest[key]
+                for key in (
+                    "source_git_sha",
+                    "source_tree_sha",
+                    "dirty_status",
+                    "models_lock_sha256",
+                    "binary_sha256",
+                    "model_key",
+                    "backend",
+                    "model_revision",
+                    "model_files",
+                    "hardware_id",
+                    "binary_artifact",
+                    "models_lock",
+                    "effective_config",
+                )
+            },
+            "schema_version": SCHEMA_VERSION,
+            "artifact_kind": "runtime-vnext-focused-diagnostic",
+            "execution_contract": contract,
+            "status": "pass",
+            "decision": "KEEP",
+            "formal_pass_allowed": False,
+            "model_path": execution["model_arg"],
+            "runner": (
+                internal_fixture_runner_identity()
+                if allow_internal_fixture
+                else canonical_runner_identity()
+            ),
+            "expectations_catalog_sha256": expectations_sha,
+            "expectations_catalog": existing_artifact_ref(
+                root,
+                expectations_path,
+                "raw-json",
+            ),
+            "executor_invocation": existing_artifact_ref(
+                root,
+                invocation_path,
+                "raw-json",
+            ),
+            "scope": {
+                "kind": "focused-diagnostic",
+                "requested_case_ids": focus_case_ids,
+                "requested_scenario_ids": focus_scenario_ids,
+                "selected_case_ids": [case["case_id"] for case in selected_cases],
+                "selected_scenario_ids": sorted(
+                    {case["scenario_id"] for case in selected_cases}
+                ),
+                "case_count": len(selected_cases),
+                "canonical_case_count": len(
+                    planned_case_rows(
+                        manifest["model_key"],
+                        manifest["backend"],
+                        catalog,
+                    )
+                ),
+            },
+            "observed_status_counts": dict(sorted(status_counts.items())),
+            "cases": [
+                ref
+                for scenario_id in SCENARIO_IDS
+                for ref in case_refs_by_scenario[scenario_id]
+            ],
+            "artifact_path": str(out),
+            "pass_line": f"{FOCUSED_DIAGNOSTIC_KEEP_PREFIX}: {out}",
+        }
+        if contract == G08_EXECUTION_CONTRACT:
+            diagnostic["binary_build_receipt"] = manifest["binary_build_receipt"]
+        return diagnostic
+    require(serve_sessions, f"canonical serve session unavailable: {server_error}")
+    require(len(serve_sessions) == 2, "canonical serve collection must isolate post-C09 scenarios in a second server session")
+    if contract == G08_EXECUTION_CONTRACT:
+        require(len(run_sessions) == 5, "G08 candidate must persist exactly five resident run sessions")
+        require(
+            all(session_spec["session"].stopped for session_spec in run_sessions),
+            "G08 candidate resident run session remained active",
+        )
+    else:
+        require(first_run_record is not None, "canonical run produced no execution record")
     effective_sha = file_sha256(validated["effective_path"])
     commands = []
-    for command_id, entrypoint, argv, times, stdout_path, stderr_path, process_receipt in (
-        ("actual-run", "run", first_run_record["argv"], first_run_record["envelope"], first_run_record["stdout"], first_run_record["stderr"], first_run_record["process_receipt"]),
-        ("actual-serve", "serve", serve_argv, server.envelope(), serve_stdout, serve_stderr, server.process_receipt),
-    ):
+    command_sources: list[dict[str, Any]] = []
+    if contract == G08_EXECUTION_CONTRACT:
+        for session_spec in run_sessions:
+            run_session = session_spec["session"]
+            command_sources.append(
+                {
+                    "id": session_spec["command_id"],
+                    "entrypoint": "run",
+                    "argv": session_spec["argv"],
+                    "times": run_session.envelope(),
+                    "stdout": session_spec["stdout"],
+                    "stderr": session_spec["stderr"],
+                    "process_receipt": run_session.process_receipt,
+                    "extra": {
+                        "execution_mode": "resident-jsonl",
+                        "group_key": list(session_spec["group_key"]),
+                        "case_count": run_session.case_count,
+                        "case_ids": list(run_session.case_ids),
+                        "preset_aliases": sorted(run_session.preset_aliases),
+                        "wire_receipt": existing_artifact_ref(
+                            root,
+                            session_spec["wire_receipt"],
+                            "raw-json",
+                        ),
+                    },
+                }
+            )
+    else:
+        command_sources.append(
+            {
+                "id": "actual-run",
+                "entrypoint": "run",
+                "argv": first_run_record["argv"],
+                "times": first_run_record["envelope"],
+                "stdout": first_run_record["stdout"],
+                "stderr": first_run_record["stderr"],
+                "process_receipt": first_run_record["process_receipt"],
+                "extra": {},
+            }
+        )
+    command_sources.extend(
+        {
+            "id": session["command_id"],
+            "entrypoint": "serve",
+            "argv": session["argv"],
+            "times": session["server"].envelope(),
+            "stdout": session["stdout"],
+            "stderr": session["stderr"],
+            "process_receipt": session["server"].process_receipt,
+            "extra": {},
+        }
+        for session in serve_sessions
+    )
+    for source in command_sources:
+        command_id = source["id"]
+        entrypoint = source["entrypoint"]
+        argv = source["argv"]
+        times = source["times"]
         duration = (parse_timestamp(times["finished_at"], "command finished") - parse_timestamp(times["started_at"], "command started")).total_seconds()
         commands.append(
             {
@@ -3993,10 +8077,11 @@ def execute_manifest(
                 "duration_sec": max(duration, 1e-6),
                 "env": times["child_environment"],
                 "env_sha256": times["child_environment_sha256"],
-                "process_receipt": process_receipt,
+                "process_receipt": source["process_receipt"],
                 "returncode": 0,
-                "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
-                "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
+                "stdout": existing_artifact_ref(root, source["stdout"], "stdout-log"),
+                "stderr": existing_artifact_ref(root, source["stderr"], "stderr-log"),
+                **source["extra"],
             }
         )
     scenarios = []
@@ -4008,22 +8093,67 @@ def execute_manifest(
         blocked = sum(case["status"] == "blocked" for case in results)
         status = "blocked" if blocked else "known-fail" if known else "pass"
         assertions = selftest_assertions(scenario_id, len(results)) if status == "pass" else {"expected_failure_count": known + blocked, "unexpected_count": 0}
+        if scenario_id == "C09" and status == "pass":
+            assertions.update(
+                {
+                    "admitted_released_count": sum(
+                        case["observed"].get("cancel_resource_outcome")
+                        == C09_ADMITTED_RELEASED
+                        for case in results
+                    ),
+                    "not_admitted_safe_count": sum(
+                        case["observed"].get("cancel_resource_outcome")
+                        == C09_NOT_ADMITTED_SAFE
+                        for case in results
+                    ),
+                    "post_capacity_success_count": sum(
+                        case["observed"].get("post_capacity_success") is True
+                        for case in results
+                    ),
+                    "max_scheduler_ticks_to_terminal": max(
+                        require_count(
+                            case["observed"].get("scheduler_ticks_to_terminal"),
+                            f"{case['case_id']}.scheduler_ticks_to_terminal",
+                        )
+                        for case in results
+                    ),
+                    "max_wall_sec_to_terminal": max(
+                        float(case["observed"]["wall_sec_to_terminal"])
+                        for case in results
+                    ),
+                }
+            )
         if scenario_id == "C18":
             shape["concurrency_cells"] = [
                 {
                     "requested_concurrency": case["observed"]["requested_concurrency"],
                     "case_count": 1,
                     "passed_count": 1 if case["status"] == "pass" else 0,
-                    "completion_rate": 1.0 if case["status"] == "pass" else 0.0,
+                    "request_count": case["observed"]["request_count"],
+                    "completed_request_count": case["observed"]["completed_request_count"],
+                    "completion_rate": case["observed"]["completion_rate"],
                     "typed_admission_cap": case["observed"]["typed_admission_cap"],
+                    "active_floor": case["observed"]["active_floor"],
                     "observed_max_active": case["observed"]["observed_max_active"],
-                    "error_count": 0 if case["status"] == "pass" else 1,
-                    "bad_output_count": 0,
-                    "crosstalk_count": 0,
-                    "bad_checksum_count": 0,
-                    "server_500_count": 0,
-                    "panic_count": 0,
-                    "oom_count": 0,
+                    "active_timeline": case["observed"]["active_timeline"],
+                    "active_timeline_error": case["observed"]["active_timeline_error"],
+                    **(
+                        {"resource_balance": case["observed"]["resource_balance"]}
+                        if contract == G08_EXECUTION_CONTRACT
+                        else {}
+                    ),
+                    **{
+                        field: case["observed"][field]
+                        for field in (
+                            "error_count",
+                            "bad_output_count",
+                            "crosstalk_count",
+                            "bad_checksum_count",
+                            "server_500_count",
+                            "panic_count",
+                            "oom_count",
+                        )
+                    },
                 }
                 for case in results
             ]
@@ -4036,7 +8166,7 @@ def execute_manifest(
             "failed_count": known,
             "error_count": 0,
             "unexpected_count": 0,
-            "command_ids": ["actual-run" if entrypoint == "run" else "actual-serve" for entrypoint in shape["entrypoints"]],
+            "command_ids": list(dict.fromkeys(case["command_id"] for case in results)),
             "assertions": assertions,
         }
         raw = {
@@ -4058,6 +8188,7 @@ def execute_manifest(
     report = {
         **{key: manifest[key] for key in ("source_git_sha", "source_tree_sha", "dirty_status", "models_lock_sha256", "binary_sha256", "model_key", "backend", "model_revision", "model_files", "hardware_id", "binary_artifact", "models_lock", "effective_config")},
         "schema_version": SCHEMA_VERSION,
+        "execution_contract": contract,
         "status": "pass",
         "model_path": execution["model_arg"],
         "runner": internal_fixture_runner_identity() if allow_internal_fixture else canonical_runner_identity(),
@@ -4067,8 +8198,10 @@ def execute_manifest(
         "commands": commands,
         "scenarios": scenarios,
         "artifact_path": str(out),
-        "pass_line": f"{PASS_PREFIX}: {out}",
+        "pass_line": f"{pass_prefix_for_contract(contract)}: {out}",
     }
+    if contract == G08_EXECUTION_CONTRACT:
+        report["binary_build_receipt"] = manifest["binary_build_receipt"]
     attach_pair_registry(report, root)
     validate_report_document(report, root, report_path=out, allow_internal_fixture=allow_internal_fixture, require_current_output_path=True)
     return report
@@ -4084,7 +8217,15 @@ def selftest_assertions(scenario_id: str, case_count: int) -> dict[str, Any]:
     elif scenario_id == "C07":
         values.update({"conversation_count": 6, "history_turn_count": 30})
     elif scenario_id == "C09":
-        values.update({"released_count": case_count, "post_capacity_success_count": case_count, "max_scheduler_ticks_to_release": 2, "max_wall_sec_to_release": 5.0})
+        values.update(
+            {
+                "admitted_released_count": case_count,
+                "not_admitted_safe_count": 0,
+                "post_capacity_success_count": case_count,
+                "max_scheduler_ticks_to_terminal": 2,
+                "max_wall_sec_to_terminal": 5.0,
+            }
+        )
     elif scenario_id in {"C10", "C11", "C12", "C13"}:
         values["tool_success_count"] = case_count
         if scenario_id == "C12":
@@ -4152,15 +8293,33 @@ def selftest_scenario_shape(scenario_id: str, model_key: str, backend: str) -> d
     if scenario_id == "C18":
         concurrencies = [1, 4, 16, 32] if backend == "cuda" else [1, 4, 16]
         cells = []
-        for requested in concurrencies:
+        typed_cap = max(
+            16 if backend == "cuda" else 8,
+            REQUIRED_ACTIVE_FLOORS[(model_key, backend)],
+        )
+        for ordinal, requested in enumerate(concurrencies, start=1):
+            case_id = f"c18-{ordinal:03d}"
+            active_floor = required_active_floor(model_key, backend, requested)
+            active_timeline = derive_active_timeline(
+                c18_fixture_trace_rows(case_id, requested, typed_cap),
+                requested_concurrency=requested,
+                typed_active_cap=typed_cap,
+                active_floor=active_floor,
+                expected_request_count=requested,
+            )
             cells.append(
                 {
                     "requested_concurrency": requested,
                     "case_count": 1,
                     "passed_count": 1,
+                    "request_count": requested,
+                    "completed_request_count": requested,
                     "completion_rate": 1.0,
-                    "typed_admission_cap": 16 if backend == "cuda" else 8,
-                    "observed_max_active": min(requested, 16 if backend == "cuda" else 8),
+                    "typed_admission_cap": typed_cap,
+                    "active_floor": active_floor,
+                    "observed_max_active": active_timeline["observed_max_active"],
+                    "active_timeline": active_timeline,
+                    "active_timeline_error": None,
                     "error_count": 0,
                     "bad_output_count": 0,
                     "crosstalk_count": 0,
@@ -4227,16 +8386,23 @@ def make_case_fixture(
         "model_key": base["model_key"],
     }
     marker = expected_case_text(case_spec)
+    run_argv = [binary_argv0, "run", base["model_key"], "--output-format", "jsonl"]
+    if scenario_id == "C03":
+        run_argv.extend(["--effective-config-json", f"{case_root}/actual-effective-config.json"])
+    else:
+        run_argv.extend(["--prompt", case_id])
     input_value: dict[str, Any]
     if entrypoint == "serve":
         input_value = case_http_payload(case_spec, base["model_key"])
+    elif scenario_id == "C03":
+        input_value = c03_input_document(case_id, marker, run_argv)
     else:
         input_value = {
             "case_id": case_id,
             "scenario_id": scenario_id,
             "variant": variant,
             "preset": preset,
-            "prompt": f"Return the exact marker {marker}.",
+            "prompt": run_case_prompts(case_spec)[0] if scenario_id == "C19" else f"Return the exact marker {marker}.",
         }
         if scenario_id == "C01":
             fixture_config = {
@@ -4245,6 +8411,10 @@ def make_case_fixture(
                 "eos_token_id": [1],
                 "fixture_unknown_official_field": {"preserved": True},
             }
+            fixture_tokenizer = {"model": {"type": "BPE", "vocab": {"<s>": 0, "</s>": 1}}}
+            fixture_tokenizer_path = root / case_root / "tokenizer.json"
+            write_json(fixture_tokenizer_path, fixture_tokenizer)
+            tokenizer_digest = file_sha256(fixture_tokenizer_path)
             fixture_template = "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}{% endfor %}"
             config_digest = canonical_json_sha256(fixture_config)
             template_digest = hashlib.sha256(fixture_template.encode("utf-8")).hexdigest()
@@ -4273,21 +8443,22 @@ def make_case_fixture(
                 },
                 "special_tokens": {
                     "source": "semantic_source/tokenizer_config.json",
+                    "tokenizer_sha256": tokenizer_digest,
+                    "locked_tokenizer_sha256": tokenizer_digest,
                     "container_sha256": template_digest,
                     "locked_container_sha256": template_digest,
                     "tokens": {"bos_token": "<s>", "eos_token": "</s>"},
                     "eos_token_ids": [1],
                 },
-                "runtime_binding": {
-                    "semantic_repo": "internal/fixture",
-                    "semantic_revision": "1" * 40,
-                    "config_container_sha256": config_digest,
-                    "template_source": "semantic_source",
-                    "template_repo": "internal/fixture",
-                    "template_revision": "1" * 40,
-                    "template_path": "tokenizer_config.json",
-                    "template_container_sha256": template_digest,
-                    "template_content_sha256": template_digest,
+                "expected_source_identity": {
+                    "schema_version": 1,
+                    "requested_model": base["model_path"],
+                    "resolved_model": base["model_key"],
+                    "original_sources": {},
+                    "resolved_sources": {},
+                    "semantic_config": {},
+                    "tokenizer": {},
+                    "template": {},
                 },
                 "expected_runtime_architectures": sorted(EXPECTED_ARCHITECTURES[base["model_key"]]),
             }
@@ -4299,11 +8470,13 @@ def make_case_fixture(
                 negative_config["model_type"] = f"g00_unsupported_layout_{ordinal:03d}"
                 negative_config["g00_negative_fixture"] = {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}
                 negative_config_path = negative_root / "config.json"
+                negative_tokenizer_json_path = negative_root / "tokenizer.json"
                 negative_tokenizer_path = negative_root / "tokenizer_config.json"
                 dummy_path = negative_root / "DUMMY_WEIGHT_NOT_FOR_LOADING"
                 negative_stdout = negative_root / "stdout.log"
                 negative_stderr = negative_root / "stderr.log"
                 write_json(negative_config_path, negative_config)
+                shutil.copy2(fixture_tokenizer_path, negative_tokenizer_json_path)
                 write_json(negative_tokenizer_path, {"chat_template": fixture_template, "bos_token": "<s>", "eos_token": "</s>"})
                 dummy_path.write_text("Architecture dispatch must reject this fixture before any weight or kernel load.\n", encoding="utf-8")
                 if base["backend"] == "metal":
@@ -4344,6 +8517,7 @@ def make_case_fixture(
                 finished = iso_now()
                 negative_artifacts = {
                     "config": existing_artifact_ref(root, negative_config_path, "raw-json"),
+                    "tokenizer": existing_artifact_ref(root, negative_tokenizer_json_path, "raw-json"),
                     "tokenizer_config": existing_artifact_ref(root, negative_tokenizer_path, "raw-json"),
                     "dummy_weight_marker": existing_artifact_ref(root, dummy_path, "runtime-log"),
                     "named_weight": existing_artifact_ref(root, negative_named_weight, "binary"),
@@ -4389,18 +8563,42 @@ def make_case_fixture(
     write_json(root / input_rel, input_value)
     if entrypoint == "run":
         assistant_count = 3 if scenario_id == "C03" else 2 if scenario_id == "C19" else 1
-        rows: list[dict[str, Any]] = [{"event": "ready", "model": base["model_key"], "backend": base["backend"]}]
-        for turn in range(1, assistant_count + 1):
-            content = (
-                f"{marker}-H{turn}"
-                if scenario_id == "C19"
-                else marker if turn == assistant_count else f"turn-{turn}-ack"
-            )
-            rows.append({"event": "user", "turn": turn, "content": input_value["prompt"]})
+        session_id = f"fixture-session-{case_id}"
+        rows: list[dict[str, Any]] = [
+            {
+                "event": "ready",
+                "session_id": session_id,
+                "history_epoch": 0,
+                "model": base["model_key"],
+                "requested_model": base["model_path"],
+                "resolved_model": base["model_key"],
+                "backend": base["backend"],
+            }
+        ]
+        turn_indices = range(assistant_count)
+        history: list[list[str]] = []
+        for turn in turn_indices:
+            if scenario_id == "C03":
+                content = c03_expected_assistant_turns(marker)[turn]
+                user_content = c03_user_turns(marker)[turn]
+            else:
+                content = f"{marker}-H{turn + 1}" if scenario_id == "C19" else marker
+                user_content = run_case_prompts(case_spec)[turn] if scenario_id == "C19" else input_value["prompt"]
+            history_before = {
+                "message_count": len(history),
+                "turn_count": sum(role == "user" for role, _ in history),
+                "sha256": hashlib.sha256(json.dumps(history, separators=(",", ":")).encode()).hexdigest(),
+            }
+            request_id = f"{session_id}-request-{turn + 1:04d}"
+            rows.append({"event": "user", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": user_content, "history_before": history_before})
             assistant_row = {
                     "event": "assistant",
+                    "session_id": session_id,
+                    "history_epoch": 0,
+                    "request_id": request_id,
                     "turn": turn,
                     "content": content,
+                    "history_before": history_before,
                     "finish_reason": "eos",
                     "n_tokens": 512 if scenario_id == "C04" else 4,
                     "chunk_count": 512 if scenario_id == "C04" else 2,
@@ -4409,13 +8607,15 @@ def make_case_fixture(
             if scenario_id == "C19":
                 if thinking_reasoning_expected(base["model_key"], variant):
                     assistant_row["reasoning"] = f"fixture reasoning turn {turn}"
-                assistant_row["history_turns_seen"] = turn - 1
             rows.append(assistant_row)
-        rows.append({"event": "exit", "reason": "complete"})
+            history.extend([["user", user_content], ["assistant", content]])
+        rows.append({"event": "exit", "session_id": session_id, "history_epoch": 0, "reason": "complete"})
         stdout_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
         transcript_ref = None
-        argv = [binary_argv0, "run", base["model_key"], "--output-format", "jsonl", "--prompt", case_id]
+        argv = run_argv
         observed: dict[str, Any] = {"case_id": case_id, "expected_marker": marker}
+        if scenario_id == "C03":
+            observed["contract_id"] = C03_CONTRACT_ID
         if scenario_id == "C01":
             observed.update(
                 {
@@ -4498,7 +8698,38 @@ def make_case_fixture(
                 "usage": {"prompt_tokens": 8, "completion_tokens": completion_tokens, "total_tokens": 8 + completion_tokens},
             }
         requested = int(concurrency_cell["requested_concurrency"]) if concurrency_cell else 1
-        exchanges = [{"request": input_value, "status": status, "response": response} for _ in range(requested)]
+        concurrency_identities: list[dict[str, Any]] | None = None
+        scheduler_trace_rows: list[dict[str, Any]] = []
+        scheduler_trace_scope: dict[str, Any] | None = None
+        runtime_log_evidence: dict[str, Any] | None = None
+        if scenario_id == "C18":
+            require(concurrency_cell is not None, "C18 fixture requires a concurrency cell")
+            concurrency_identities = c18_request_identities(case_id, requested)
+            exchanges = []
+            for identity in concurrency_identities:
+                request = c18_request_payload(input_value, identity)
+                request_response = copy.deepcopy(response)
+                request_response["id"] = f"chatcmpl-{case_id}-{identity['request_index']:03d}"
+                request_response["choices"][0]["message"]["content"] = identity["marker"]
+                exchanges.append({"request": request, "status": status, "response": request_response})
+            scheduler_trace_rows = c18_fixture_trace_rows(
+                case_id,
+                requested,
+                concurrency_cell["typed_admission_cap"],
+            )
+            scheduler_trace_scope = c18_trace_scope_summary(
+                scheduler_trace_rows,
+                started_unix_ns=C18_FIXTURE_TRACE_START_UNIX_NS,
+                expected_request_count=requested,
+            )
+            runtime_log_evidence = {
+                "start_offset": 0,
+                "end_offset": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+                "text": "",
+            }
+        else:
+            exchanges = [{"request": input_value, "status": status, "response": response} for _ in range(requested)]
         stream_reconstruction: dict[str, Any] | None = None
         utf8_wire_evidence: dict[str, Any] | None = None
         if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
@@ -4588,7 +8819,7 @@ def make_case_fixture(
             second_request["messages"] = [
                 copy.deepcopy(input_value["messages"][0]),
                 copy.deepcopy(first_message),
-                {"role": "user", "content": f"Using that reasoning history, return {marker}-H2 exactly."},
+                {"role": "user", "content": c19_turn_prompt(marker, 2, variant)},
             ]
             second_message = copy.deepcopy(first_message)
             second_message["content"] = f"{marker}-H2"
@@ -4602,13 +8833,46 @@ def make_case_fixture(
         elif scenario_id == "C21" and variant == "required-tool":
             exchanges = [{"request": input_value, "status": 200, "response": copy.deepcopy(response)} for _ in range(2)]
         if scenario_id == "C09":
+            recovery_request = copy.deepcopy(input_value)
+            recovery_request["messages"] = [
+                {
+                    "role": "user",
+                    "content": f"Return the exact marker {marker} and no other text.",
+                }
+            ]
+            recovery_request.pop("ignore_eos", None)
+            recovery_request.pop("stop", None)
+            recovery_request.pop("stream", None)
+            recovery_request.pop("stream_options", None)
+            recovery_request["metadata"] = {
+                **recovery_request.get("metadata", {}),
+                "g00_recovery": True,
+            }
             exchanges = [
-                {"request": input_value, "status": 499, "response": {"client_abort": variant}},
-                {"request": input_value, "status": 200, "response": response},
+                {
+                    "request": input_value,
+                    "status": 499,
+                    "status_source": "runner_client_abort",
+                    "response": {
+                        "client_abort": variant,
+                        "abort_trigger": {
+                            "cancel": "socket_shutdown",
+                            "timeout": "client_deadline_expired",
+                            "disconnect": "tcp_reset",
+                        }[variant],
+                        "admission_observed": True,
+                        "admission_request_id": f"{case_id}-cancel",
+                    },
+                },
+                {"request": recovery_request, "status": 200, "response": response},
             ]
         transcript = {
             "case_id": case_id,
             "exchanges": exchanges,
+            "scheduler_trace_rows": scheduler_trace_rows,
+            "scheduler_trace_scope": scheduler_trace_scope,
+            "concurrency_request_identities": concurrency_identities,
+            "runtime_log_evidence": runtime_log_evidence,
             "models_response": {"object": "list", "data": [{"id": base["model_key"], "modalities": ["text"]}]} if scenario_id == "C20" else None,
             "done_count": stream_reconstruction["done_count"] if stream_reconstruction else 0,
             "usage_count": stream_reconstruction["usage_count"] if stream_reconstruction else 0,
@@ -4637,14 +8901,51 @@ def make_case_fixture(
                 }
             )
         if scenario_id == "C09":
-            observed.update({"scheduler_ticks_to_release": 2, "wall_sec_to_release": 0.25, "post_capacity_success": True})
+            observed.update(
+                {
+                    "cancel_resource_outcome": C09_ADMITTED_RELEASED,
+                    "cancel_safety": "safe",
+                    "cancel_coverage": "exercised",
+                    "cancel_request_id": f"{case_id}-cancel",
+                    "recovery_request_id": f"{case_id}-recovery",
+                    "scheduler_ticks_to_terminal": 1,
+                    "wall_sec_to_terminal": 0.001,
+                    "trace_visibility_proven": True,
+                    "trace_contract_error": None,
+                    "cancel_resource_balance": {
+                        "leaked_resource_count": 0,
+                        "underflow_count": 0,
+                    },
+                    "recovery_resource_balance": {
+                        "leaked_resource_count": 0,
+                        "underflow_count": 0,
+                    },
+                    "post_capacity_success": True,
+                }
+            )
         if scenario_id == "C18":
             require(concurrency_cell is not None, "C18 fixture requires a concurrency cell")
+            require(concurrency_identities is not None, "C18 fixture request identities are missing")
+            active_floor = required_active_floor(base["model_key"], base["backend"], requested)
+            active_timeline = derive_active_timeline(
+                scheduler_trace_rows,
+                requested_concurrency=requested,
+                typed_active_cap=concurrency_cell["typed_admission_cap"],
+                active_floor=active_floor,
+                expected_request_count=requested,
+            )
             observed.update(
                 {
                     "requested_concurrency": requested,
                     "typed_admission_cap": concurrency_cell["typed_admission_cap"],
-                    "observed_max_active": concurrency_cell["observed_max_active"],
+                    "active_floor": active_floor,
+                    "observed_max_active": active_timeline["observed_max_active"],
+                    "active_timeline": active_timeline,
+                    "active_timeline_error": None,
+                    "request_identities": concurrency_identities,
+                    **c18_completion_summary(exchanges),
+                    **c18_isolation_summary(exchanges, concurrency_identities),
+                    **c18_runtime_failure_summary(runtime_log_evidence),
                 }
             )
         if scenario_id == "C20":
@@ -4673,6 +8974,7 @@ def make_case_fixture(
         "status": "pass",
         **base,
         "entrypoint": entrypoint,
+        "command_id": f"fixture-{entrypoint}",
         "variant": variant,
         "preset": preset,
         "model_identity": {
@@ -4716,7 +9018,13 @@ def internal_expectations_catalog() -> dict[str, Any]:
             lanes[f"{model_key}/{backend}"] = {
                 "rules": [
                     {
-                        "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+                        "selector": {
+                            "scenario_id": "*",
+                            "variant": "*",
+                            "preset": "*",
+                            "entrypoint": "*",
+                            "case_id": "*",
+                        },
                         "expected_status": "pass",
                         "failure_class": None,
                         "downstream_goal": goal,
@@ -4736,7 +9044,7 @@ def internal_expectations_catalog() -> dict[str, Any]:
             "blocked": "fixture",
             "discovery-required": "fixture",
         },
-        "resolution_policy": {"wildcard": "*"},
+        "resolution_policy": {"wildcard": "*", "selector_order": list(EXPECTATION_SELECTOR_FIELDS)},
         "blocked_lane_policy": {
             "allowed_lane_failure_classes": BLOCKED_LANE_FAILURE_CLASSES,
             "forbidden_lanes": [
@@ -4900,6 +9208,7 @@ def expect_reject(report: dict[str, Any], root: Path, name: str, mutate: Callabl
 def write_fake_ferrum(path: Path) -> None:
     source = r'''#!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -4910,8 +9219,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+C17_MARKERS = {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "x\u0301"}
+
+
 def value_after(argv, name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
+
+
+def product_identity(argv):
+    model_path = Path(argv[1])
+    identity_path = (model_path if model_path.is_dir() else model_path.parent) / "g00-resolution-identity.json"
+    if identity_path.is_file():
+        return json.loads(identity_path.read_text())
+    return {
+        "requested_model": argv[1],
+        "resolved_model": argv[1],
+    }
 
 
 def write_config(argv, entrypoint):
@@ -4920,8 +9243,7 @@ def write_config(argv, entrypoint):
         path = Path(raw)
         path.parent.mkdir(parents=True, exist_ok=True)
         backend = value_after(argv, "--backend", "auto")
-        identity_path = Path(argv[1]) / "g00-resolution-identity.json"
-        resolution_evidence = json.loads(identity_path.read_text()) if identity_path.is_file() else None
+        resolution_evidence = product_identity(argv)
         path.write_text(json.dumps({
             "schema_version": 1,
             "entrypoint": entrypoint,
@@ -4933,6 +9255,122 @@ def write_config(argv, entrypoint):
             "max_sequences": 32,
             "resolution_evidence": resolution_evidence
         }) + "\n")
+
+
+def history_evidence(history):
+    encoded = json.dumps(history, ensure_ascii=False, separators=(",", ":")).encode()
+    return {
+        "message_count": len(history),
+        "turn_count": sum(role == "user" for role, _ in history),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def reasoning_enabled(argv, prompt):
+    if "--disable-thinking" in argv:
+        return False
+    if "--enable-thinking" in argv:
+        return True
+    if prompt.rstrip().endswith("/no_think"):
+        return False
+    case_match = re.search(r"G00-c19-(\d{3})-OK", prompt)
+    if case_match and int(case_match.group(1)) >= 17:
+        return False
+    return True
+
+
+def response_for_prompt(prompt, history, remembered_marker):
+    if "Remember this identifier for later:" in prompt:
+        remembered = re.search(r"(G00-c03-\d{3}-OK)", prompt).group(1)
+        return "ACKNOWLEDGED", remembered
+    if prompt == "Reply with exactly CONTINUE.":
+        return "CONTINUE", remembered_marker
+    if prompt.startswith("What identifier did I ask"):
+        return remembered_marker, remembered_marker
+    marker_match = re.search(r"(G00-c\d\d-\d{3}-OK)(?:-H([12]))?", prompt)
+    if marker_match:
+        marker = marker_match.group(1)
+        history_suffix = marker_match.group(2)
+        return (f"{marker}-H{history_suffix}" if history_suffix else marker), remembered_marker
+    if "512 numbered one-word items" in prompt:
+        return " ".join(f"{index}.item" for index in range(1, 513)), remembered_marker
+    for marker in C17_MARKERS.values():
+        if marker in prompt:
+            return marker, remembered_marker
+    return "fixture-output", remembered_marker
+
+
+def emit_session_turn(argv, session_id, history_epoch, turn, prompt, history, remembered_marker, request_index):
+    request_id = f"{session_id}-request-{request_index:04d}"
+    evidence = history_evidence(history)
+    print(json.dumps({
+        "schema_version": 1, "event": "user", "session_id": session_id,
+        "history_epoch": history_epoch, "request_id": request_id, "turn": turn,
+        "content": prompt, "history_before": evidence,
+    }, ensure_ascii=False), flush=True)
+    content, remembered_marker = response_for_prompt(prompt, history, remembered_marker)
+    print(json.dumps({
+        "schema_version": 1, "event": "assistant_delta", "session_id": session_id,
+        "history_epoch": history_epoch, "request_id": request_id, "turn": turn,
+        "index": 0, "raw_text_delta": content, "utf8_bytes": len(content.encode()), "token_id": 1,
+    }, ensure_ascii=False), flush=True)
+    is_long = "512 numbered one-word items" in prompt
+    row = {
+        "schema_version": 1, "event": "assistant", "session_id": session_id,
+        "history_epoch": history_epoch, "request_id": request_id, "turn": turn,
+        "content": content, "reasoning": None, "history_before": evidence,
+        "finish_reason": "eos", "usage": None,
+        "n_tokens": 512 if is_long else 4, "chunk_count": 512 if is_long else 2,
+        "raw_text_sha256": hashlib.sha256(content.encode()).hexdigest(), "ms": 1.0,
+    }
+    if "G00-c19-" in prompt and reasoning_enabled(argv, prompt):
+        row["reasoning"] = f"fixture reasoning turn {turn}"
+    print(json.dumps(row, ensure_ascii=False), flush=True)
+    history.extend([["user", prompt], ["assistant", content]])
+    return remembered_marker
+
+
+def resident_run_mode(argv):
+    session_id = f"fixture-session-{os.getpid()}"
+    history_epoch = 0
+    history = []
+    turn = 0
+    request_index = 0
+    remembered_marker = None
+    identity = product_identity(argv)
+    print(json.dumps({
+        "schema_version": 1, "event": "ready", "session_id": session_id,
+        "history_epoch": 0, "model": identity["resolved_model"],
+        "requested_model": identity["requested_model"],
+        "resolved_model": identity["resolved_model"], "backend": value_after(argv, "--backend", "auto"),
+    }), flush=True)
+    for raw in sys.stdin:
+        prompt = raw.rstrip("\r\n")
+        if prompt == "/clear":
+            before = history_evidence(history)
+            history.clear()
+            history_epoch += 1
+            turn = 0
+            remembered_marker = None
+            print(json.dumps({
+                "schema_version": 1, "event": "history_reset", "session_id": session_id,
+                "history_epoch": history_epoch, "turn": 0,
+                "history_before": before, "history_after": history_evidence(history),
+            }), flush=True)
+            continue
+        if prompt == "/bye":
+            print(json.dumps({
+                "schema_version": 1, "event": "exit", "session_id": session_id,
+                "history_epoch": history_epoch, "reason": "bye",
+            }), flush=True)
+            return 0
+        request_index += 1
+        remembered_marker = emit_session_turn(
+            argv, session_id, history_epoch, turn, prompt, history,
+            remembered_marker, request_index,
+        )
+        turn += 1
+    return 1
 
 
 def run_mode(argv):
@@ -4948,24 +9386,41 @@ def run_mode(argv):
     write_config(argv, "run")
     config = value_after(argv, "--effective-config-json", "")
     match = re.search(r"/(c\d\d-\d{3})/actual-effective-config", config)
-    case_id = match.group(1) if match else "c02-001"
+    if match is None:
+        return resident_run_mode(argv)
+    case_id = match.group(1)
     scenario = case_id[:3].upper()
     ordinal = int(case_id.rsplit("-", 1)[1])
-    marker = "中文正确" if scenario == "C17" and ordinal <= 20 else "🙂🚀" if scenario == "C17" and ordinal <= 40 else "e\u0301" if scenario == "C17" else f"G00-{case_id}-OK"
+    marker = (
+        C17_MARKERS[("chinese" if ordinal <= 20 else "emoji" if ordinal <= 40 else "combining")]
+        if scenario == "C17"
+        else f"G00-{case_id}-OK"
+    )
     if scenario == "C06":
         marker = f"G00-c05-{ordinal:03d}-OK"
     turns = 3 if scenario == "C03" else 2 if scenario == "C19" else 1
-    print(json.dumps({"event": "ready", "model": argv[1], "backend": value_after(argv, "--backend", "auto")}))
-    for turn in range(1, turns + 1):
-        print(json.dumps({"event": "user", "turn": turn, "content": "fixture input"}))
-        content = f"{marker}-H{turn}" if scenario == "C19" else marker if turn == turns else f"turn-{turn}-ack"
-        row = {"event": "assistant", "turn": turn, "content": content, "finish_reason": "eos", "n_tokens": 512 if scenario == "C04" else 4, "chunk_count": 512 if scenario == "C04" else 2, "ms": 1.0}
-        if scenario == "C19":
-            if "--disable-thinking" not in argv and not (scenario == "C19" and ordinal >= 17):
-                row["reasoning"] = f"fixture reasoning turn {turn}"
-            row["history_turns_seen"] = turn - 1
-        print(json.dumps(row))
-    print(json.dumps({"event": "exit", "reason": "complete"}))
+    prompts = [
+        f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
+        "Reply with exactly CONTINUE.",
+        "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
+    ] if scenario == "C03" else [f"Return the exact marker {marker}-H{turn + 1}." for turn in range(turns)] if scenario == "C19" else ["fixture input"]
+    session_id = f"fixture-session-{os.getpid()}"
+    identity = product_identity(argv)
+    print(json.dumps({"schema_version": 1, "event": "ready", "session_id": session_id, "history_epoch": 0, "model": identity["resolved_model"], "requested_model": identity["requested_model"], "resolved_model": identity["resolved_model"], "backend": value_after(argv, "--backend", "auto")}))
+    history = []
+    remembered_marker = None
+    for turn, prompt in enumerate(prompts):
+        if scenario not in {"C03", "C19"}:
+            content = marker
+            request_id = f"{session_id}-request-{turn + 1:04d}"
+            evidence = history_evidence(history)
+            print(json.dumps({"schema_version": 1, "event": "user", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": prompt, "history_before": evidence}))
+            row = {"schema_version": 1, "event": "assistant", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": content, "reasoning": None, "history_before": evidence, "finish_reason": "eos", "n_tokens": 512 if scenario == "C04" else 4, "chunk_count": 512 if scenario == "C04" else 2, "ms": 1.0}
+            print(json.dumps(row, ensure_ascii=False))
+            history.extend([["user", prompt], ["assistant", content]])
+        else:
+            remembered_marker = emit_session_turn(argv, session_id, 0, turn, prompt, history, remembered_marker, turn + 1)
+    print(json.dumps({"schema_version": 1, "event": "exit", "session_id": session_id, "history_epoch": 0, "reason": "complete"}))
     return 0
 
 
@@ -4980,15 +9435,24 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         finally:
             if getattr(self, "g00_traced", False):
-                self.server.request_finished(self.g00_case_id)
+                self.server.request_finished(
+                    self.g00_trace_request_id,
+                    disconnected=getattr(self, "g00_disconnected", False),
+                )
 
     def send_json(self, status, value):
         body = json.dumps(value, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            if getattr(self, "g00_abort_expected", False):
+                self.g00_disconnected = True
+            raise
 
     def do_GET(self):
         if self.path == "/health":
@@ -5005,12 +9469,25 @@ class Handler(BaseHTTPRequestHandler):
         case_id = metadata.get("g00_case_id", "c05-001")
         scenario = metadata.get("g00_scenario_id", "C05")
         variant = metadata.get("g00_variant", "known-answer")
-        marker = {"chinese": "中文正确", "emoji": "🙂🚀", "combining": "e\u0301"}.get(variant, f"G00-{case_id}-OK") if scenario == "C17" else f"G00-{case_id}-OK"
+        marker = C17_MARKERS.get(variant, f"G00-{case_id}-OK") if scenario == "C17" else f"G00-{case_id}-OK"
         if scenario == "C06":
             marker = f"G00-c05-{int(metadata.get('g00_ordinal', 1)):03d}-OK"
+        request_index = int(metadata.get("g00_concurrency_request_index", 0))
+        if scenario == "C18":
+            checksum = str(metadata.get("g00_concurrency_checksum", ""))
+            marker = f"G00-{case_id}-R{request_index:03d}-{checksum}-OK"
         self.g00_case_id = case_id
+        if scenario == "C18":
+            self.g00_trace_request_id = f"{case_id}-request-{request_index:03d}"
+        elif scenario == "C09":
+            suffix = "recovery" if metadata.get("g00_recovery") else "cancel"
+            self.g00_trace_request_id = f"{case_id}-{suffix}"
+        else:
+            self.g00_trace_request_id = case_id
+        self.g00_abort_expected = scenario == "C09" and not metadata.get("g00_recovery")
+        self.g00_disconnected = False
         self.g00_traced = True
-        self.server.request_started(case_id)
+        self.server.request_started(self.g00_trace_request_id)
         if scenario in {"C09", "C18"}:
             time.sleep(0.05)
         if scenario == "C16" or (scenario == "C20" and variant != "text-array"):
@@ -5032,11 +9509,23 @@ class Handler(BaseHTTPRequestHandler):
             chunks.append({"id": f"chatcmpl-{case_id}", "choices": [], "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}})
             body = "".join("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
             raw = body.encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "text/event-stream")
-            self.send_header("content-length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                if scenario == "C09":
+                    for offset in range(0, len(raw), 32):
+                        self.wfile.write(raw[offset : offset + 32])
+                        self.wfile.flush()
+                        time.sleep(0.005)
+                else:
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                if self.g00_abort_expected:
+                    self.g00_disconnected = True
+                raise
             return
         message = {"role": "assistant", "content": marker}
         finish = "stop"
@@ -5065,7 +9554,8 @@ class Handler(BaseHTTPRequestHandler):
             message["content"] = f"G00-{case_id}-OK-H{history_turn}"
             kwargs = payload.get("chat_template_kwargs") or {}
             prompt = str(payload.get("messages", [{}])[0].get("content", ""))
-            reasoning_enabled = kwargs.get("enable_thinking") is not False and not prompt.endswith("/no_think")
+            hard_thinking = kwargs.get("enable_thinking")
+            reasoning_enabled = hard_thinking if isinstance(hard_thinking, bool) else not prompt.endswith("/no_think")
             if reasoning_enabled:
                 message["reasoning"] = f"fixture reasoning turn {history_turn}"
         elif scenario == "C21" and variant == "required-tool":
@@ -5088,22 +9578,88 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         return
 
-    def trace(self, case_id, phase):
+    def trace(self, request_id, phase, resource=None, *, shape=None, attributes=None):
         if self.trace_path is None:
             return
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        monotonic_nanos = time.monotonic_ns()
+        event = {
+            "ts_unix_nanos": time.time_ns(),
+            "event_id": f"fixture-{phase}-{request_id}-{monotonic_nanos}",
+            "phase": phase,
+            "request_id": request_id,
+            "correlation_id": request_id,
+            "status": "ok",
+            "error": None,
+            "resource": (
+                {
+                    "owner_kind": "request",
+                    "owner_id": request_id,
+                    **resource,
+                }
+                if resource is not None
+                else None
+            ),
+            "shape": shape or {},
+            "attributes": {
+                "monotonic_nanos": monotonic_nanos,
+                "active_sequence_count": self.active,
+                "scheduler_snapshot": {"active_len": self.active},
+                **(attributes or {}),
+            },
+        }
         with self.trace_path.open("a") as handle:
-            handle.write(json.dumps({"case_id": case_id, "phase": phase, "active": self.active}) + "\n")
+            handle.write(json.dumps(event) + "\n")
 
-    def request_started(self, case_id):
+    def request_started(self, request_id):
         with self.trace_lock:
             self.active += 1
-            self.trace(case_id, "scheduled")
+            self.trace(request_id, "engine_request_open", {"resource_kind": "request_slot", "action": "request_open"})
+            self.trace(request_id, "engine_request_slot_reserve", {"resource_kind": "request_slot", "action": "reserve", "amount": 1, "before": 0, "after": 1})
+            self.trace(request_id, "engine_request_slot_commit", {"resource_kind": "request_slot", "action": "commit", "amount": 1, "before": 0, "after": 1})
+            self.trace(request_id, "plan_runtime_workspace_reserve", {"resource_kind": "backend_workspace", "action": "reserve", "amount": 1, "before": 0, "after": 1, "capacity": 32})
+            self.trace(request_id, "plan_runtime_workspace_commit", {"resource_kind": "backend_workspace", "action": "commit", "amount": 1, "before": 0, "after": 1, "capacity": 32})
 
-    def request_finished(self, case_id):
+    def request_finished(self, request_id, *, disconnected=False):
         with self.trace_lock:
+            if disconnected:
+                self.trace(
+                    request_id,
+                    "engine_client_disconnect_detected",
+                    shape={"scheduler_iteration": 10},
+                    attributes={
+                        "disconnect_reason": "client_receiver_closed",
+                        "terminal_state": "pending_release",
+                    },
+                )
+            self.trace(request_id, "plan_runtime_workspace_release", {"resource_kind": "backend_workspace", "action": "release", "amount": 1, "before": 1, "after": 0, "capacity": 32})
+            self.trace(request_id, "engine_request_slot_release", {"resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0})
             self.active = max(0, self.active - 1)
-            self.trace(case_id, "released")
+            self.trace(
+                request_id,
+                "engine_request_close",
+                {"resource_kind": "request_slot", "action": "request_close"},
+                attributes={
+                    "resource_owner_outstanding_count": 0,
+                    "resource_owner_outstanding_kinds": [],
+                    "resource_owner_close_summary": [],
+                },
+            )
+            if disconnected:
+                self.trace(
+                    request_id,
+                    "engine_client_disconnect_released",
+                    shape={
+                        "detected_scheduler_iteration": 10,
+                        "terminal_scheduler_iteration": 11,
+                        "scheduler_tick_delta": 1,
+                    },
+                    attributes={
+                        "disconnect_reason": "client_receiver_closed",
+                        "scheduler_cancel_result": "cancelled",
+                        "terminal_state": "released",
+                    },
+                )
 
 
 def serve_mode(argv):
@@ -5149,7 +9705,9 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
     models_lock = root / "models.lock.json"
     model_dir = root / "models/fixture-model"
     config_path = model_dir / "config.json"
+    tokenizer_json_path = model_dir / "tokenizer.json"
     tokenizer_path = model_dir / "tokenizer_config.json"
+    weight_path = model_dir / "weights.gguf"
     write_json(
         config_path,
         {
@@ -5157,6 +9715,13 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
             "model_type": "qwen3",
             "eos_token_id": [1],
             "fixture_unknown_official_field": {"preserved": True},
+        },
+    )
+    write_json(
+        tokenizer_json_path,
+        {
+            "model": {"type": "BPE", "vocab": {"<s>": 0, "</s>": 1}},
+            "added_tokens": [],
         },
     )
     write_json(
@@ -5168,21 +9733,89 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
             "fixture_tokenizer_extension": True,
         },
     )
+    weight_path.write_bytes(b"GGUF fixture weight bytes\n")
+    weight_sha = file_sha256(weight_path)
     semantic_repo = "internal/fixture-semantic"
     semantic_revision = "3" * 40
+    weight_repo = "internal/fixture-weights"
+    weight_revision = "1" * 40
     template_text = read_json(tokenizer_path)["chat_template"]
-    runtime_binding = {
-        "semantic_repo": semantic_repo,
-        "semantic_revision": semantic_revision,
-        "config_container_sha256": file_sha256(config_path),
-        "template_source": "semantic_source",
-        "template_repo": semantic_repo,
-        "template_revision": semantic_revision,
-        "template_path": "tokenizer_config.json",
-        "template_container_sha256": file_sha256(tokenizer_path),
-        "template_content_sha256": hashlib.sha256(template_text.encode("utf-8")).hexdigest(),
+    template_content_sha256 = hashlib.sha256(template_text.encode("utf-8")).hexdigest()
+    runtime_identity = {
+        "schema_version": 1,
+        "requested_model": str(model_dir),
+        "resolved_model": weight_repo,
+        "original_sources": {
+            "semantic": {
+                "kind": "local_directory",
+                "location": str(model_dir.resolve()),
+                "requested_revision": None,
+            },
+            "tokenizer": {
+                "kind": "local_directory",
+                "location": str(model_dir.resolve()),
+                "requested_revision": None,
+            },
+            "weights": {
+                "kind": "local_directory",
+                "location": str(model_dir),
+                "requested_revision": None,
+            },
+        },
+        "resolved_sources": {
+            "semantic": {
+                "canonical_location": semantic_repo,
+                "resolved_revision": semantic_revision,
+                "files": [
+                    {
+                        "relative_path": "config.json",
+                        "size_bytes": config_path.stat().st_size,
+                        "sha256": file_sha256(config_path),
+                    }
+                ],
+            },
+            "tokenizer": {
+                "canonical_location": semantic_repo,
+                "resolved_revision": semantic_revision,
+                "files": [
+                    {
+                        "relative_path": path.name,
+                        "size_bytes": path.stat().st_size,
+                        "sha256": file_sha256(path),
+                    }
+                    for path in (tokenizer_json_path, tokenizer_path)
+                ],
+            },
+            "weights": {
+                "canonical_location": weight_repo,
+                "resolved_revision": weight_revision,
+                "files": [
+                    {
+                        "relative_path": weight_path.name,
+                        "size_bytes": weight_path.stat().st_size,
+                        "sha256": weight_sha,
+                    }
+                ],
+            },
+        },
+        "semantic_config": {
+            "role": "semantic",
+            "source_file": "config.json",
+            "container_sha256": file_sha256(config_path),
+        },
+        "tokenizer": {
+            "role": "tokenizer",
+            "source_file": "tokenizer.json",
+            "container_sha256": file_sha256(tokenizer_json_path),
+        },
+        "template": {
+            "role": "tokenizer",
+            "source_file": "tokenizer_config.json",
+            "container_sha256": file_sha256(tokenizer_path),
+            "content_sha256": template_content_sha256,
+        },
     }
-    write_json(model_dir / "g00-resolution-identity.json", runtime_binding)
+    write_json(model_dir / "g00-resolution-identity.json", runtime_identity)
     write_json(
         models_lock,
         {
@@ -5192,14 +9825,16 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
                     "key": "m3-qwen3-30b-a3b",
                     "lanes": {
                         "cuda": {
-                            "revision": "1" * 40,
+                            "repo": weight_repo,
+                            "revision": weight_revision,
                             "format": "gptq_int4",
-                            "files": [{"path": "weights.gguf", "sha256": "2" * 64}],
+                            "files": [{"path": "weights.gguf", "sha256": weight_sha}],
                             "semantic_source": {
                                 "repo": semantic_repo,
                                 "revision": semantic_revision,
                                 "files": [
                                     {"path": "config.json", "sha256": file_sha256(config_path)},
+                                    {"path": "tokenizer.json", "sha256": file_sha256(tokenizer_json_path)},
                                     {"path": "tokenizer_config.json", "sha256": file_sha256(tokenizer_path)},
                                 ],
                             },
@@ -5210,7 +9845,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
                                 "path": "tokenizer_config.json",
                                 "json_pointer": "/chat_template",
                                 "container_sha256": file_sha256(tokenizer_path),
-                                "content_sha256": runtime_binding["template_content_sha256"],
+                                "content_sha256": template_content_sha256,
                             },
                         }
                     },
@@ -5230,7 +9865,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
         "model_key": "m3-qwen3-30b-a3b",
         "backend": "cuda",
         "model_revision": "1" * 40,
-        "model_files": {"weights.gguf": "2" * 64},
+        "model_files": {"weights.gguf": weight_sha},
         "hardware_id": "cuda-fixture",
     }
     write_json(
@@ -5257,6 +9892,133 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
             "serve_extra_args": [],
         },
     }
+
+
+def make_candidate_build_receipt_fixture(
+    root: Path,
+    manifest: dict[str, Any],
+) -> dict[str, str]:
+    backend = require_string(manifest.get("backend"), "candidate build fixture backend")
+    build_root = root / "build/candidate"
+    stdout_path = build_root / "stdout.log"
+    stderr_path = build_root / "stderr.log"
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.write_bytes(b"")
+    stderr_path.write_text(
+        "candidate fixture build diagnostic stream remained clean\n",
+        encoding="utf-8",
+    )
+    stdout_ref = existing_artifact_ref(
+        root,
+        stdout_path,
+        "stdout-log",
+        allow_empty=True,
+    )
+    stderr_ref = existing_artifact_ref(root, stderr_path, "stderr-log")
+    probe_text = {
+        "cargo": "cargo fixture version 1.0.0\n",
+        "rustc": "rustc fixture version 1.0.0\n",
+        "nvcc": "nvcc fixture release 12.4\n",
+        "nvidia_smi": "NVIDIA RTX 4090 fixture inventory\n",
+        "xcodebuild": "Xcode fixture version 16.0\n",
+        "system_profiler": "Apple GPU fixture inventory\n",
+    }
+    probes = {
+        name: artifact_ref(
+            root,
+            f"build/candidate/{name}.log",
+            "runtime-log",
+            probe_text[name],
+        )
+        for name in sorted(CANDIDATE_BUILD_PROBES[backend])
+    }
+    started_at = "2026-01-01T00:00:00Z"
+    ended_at = "2026-01-01T00:00:05Z"
+    bounded_path = build_root / "bounded-command-receipt.json"
+    write_json(
+        bounded_path,
+        {
+            "schema": "ferrum.bounded-command-receipt.v1",
+            "command": CANDIDATE_BUILD_COMMANDS[backend],
+            "cwd": str(REPO_ROOT),
+            "pid": 4242,
+            "pgid": 4242,
+            "limits": {
+                "wall_timeout_seconds": 2700.0,
+                "max_processes": 64,
+                "max_group_threads": 256,
+                "max_per_process_threads": 64,
+                "sample_interval_seconds": 0.05,
+                "max_sampling_errors": 3,
+                "term_grace_seconds": 1.0,
+            },
+            "peaks": {
+                "processes": 4,
+                "group_threads": 12,
+                "per_process_threads": 4,
+                "per_process_threads_pid": 4242,
+            },
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_seconds": 5.0,
+            "reason": "command_completed",
+            "rc": 0,
+            "status": "pass",
+            "successful_samples": 5,
+            "sampling_error_count": 0,
+            "sampling_errors": [],
+            "violation": None,
+            "termination": {"signals": [], "errors": []},
+            "cleanup": {"process_group_gone": True},
+            "stdout": {
+                "path": str(stdout_path.resolve()),
+                "sha256": stdout_ref["sha256"],
+                "size_bytes": stdout_path.stat().st_size,
+            },
+            "stderr": {
+                "path": str(stderr_path.resolve()),
+                "sha256": stderr_ref["sha256"],
+                "size_bytes": stderr_path.stat().st_size,
+            },
+        },
+    )
+    receipt_path = build_root / "candidate-build-receipt.json"
+    write_json(
+        receipt_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "artifact_type": CANDIDATE_BUILD_RECEIPT_TYPE,
+            "status": "pass",
+            "execution_contract": G08_EXECUTION_CONTRACT,
+            "source_git_sha": manifest["source_git_sha"],
+            "source_tree_sha": manifest["source_tree_sha"],
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "hardware_id": manifest["hardware_id"],
+            "backend": backend,
+            "artifact_root": str(root.resolve()),
+            "repository_root": str(REPO_ROOT),
+            "source_observations": {
+                phase: {
+                    "source_git_sha": manifest["source_git_sha"],
+                    "source_tree_sha": manifest["source_tree_sha"],
+                    "dirty_status": {"is_dirty": False, "status_short": []},
+                }
+                for phase in ("before", "after")
+            },
+            "command": CANDIDATE_BUILD_COMMANDS[backend],
+            "returncode": 0,
+            "started_at": started_at,
+            "finished_at": ended_at,
+            "duration_sec": 5.0,
+            "binary_artifact": manifest["binary_artifact"],
+            "binary_sha256": manifest["binary_sha256"],
+            "bounded_receipt": existing_artifact_ref(root, bounded_path, "raw-json"),
+            "stdout": stdout_ref,
+            "stderr": stderr_ref,
+            "probe_artifacts": probes,
+        },
+    )
+    return existing_artifact_ref(root, receipt_path, "raw-json")
 
 
 @contextmanager
@@ -5360,6 +10122,14 @@ def persist_input_mutation(
     command_spec["input_sha256"] = file_sha256(input_path)
     write_json(command_spec_path, command_spec)
     update_ref_sha(envelope["command_spec"], root)
+    resident_ref = case["artifacts"].get("resident_case_receipt")
+    if resident_ref is not None:
+        resident_path = root / resident_ref["path"]
+        resident = read_json(resident_path)
+        resident["input_sha256"] = file_sha256(input_path)
+        write_json(resident_path, resident)
+        update_ref_sha(resident_ref, root)
+        update_ref_sha(envelope["resident_case_receipt"], root)
     persist_execution_case_mutation(root, scenario, raw_path, raw, case_path, case, envelope_path=envelope_path, envelope=envelope)
 
 
@@ -5372,7 +10142,1077 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
     raise AssertionError(f"execution report mutation unexpectedly passed; expected {marker}")
 
 
+def self_test_c18_trace_scope() -> int:
+    boundary = 1_800_000_000_000_000_000
+    typed_config = {
+        "selected_max_sequences": 16,
+        "selected_recurrent_state_max_slots": None,
+        "selected_admission_limit": 16,
+        "workload_profile": {"target_concurrency": 4},
+        "admission": {
+            "effective_max_concurrent": 16,
+            "max_sequences": 16,
+            "recurrent_state_max_slots": None,
+        },
+    }
+    require(
+        typed_admission_cap_value(typed_config) == 16,
+        "C18 typed cap used workload target instead of authoritative admission fields",
+    )
+    require(
+        typed_admission_cap_value(
+            {
+                **typed_config,
+                "selected_recurrent_state_max_slots": 8,
+                "selected_admission_limit": 8,
+                "admission": {
+                    **typed_config["admission"],
+                    "effective_max_concurrent": 8,
+                    "recurrent_state_max_slots": 8,
+                },
+            }
+        )
+        == 8,
+        "C18 typed cap did not apply the recurrent-state capacity limit",
+    )
+    require(
+        typed_admission_cap_value({"max_sequences": 32}) == 32,
+        "C18 typed cap lost legacy fixture compatibility",
+    )
+    conflicting_config = copy.deepcopy(typed_config)
+    conflicting_config["admission"]["effective_max_concurrent"] = 8
+    try:
+        typed_admission_cap_value(conflicting_config)
+    except ScenarioError as exc:
+        require(
+            "conflicting authoritative caps" in str(exc),
+            f"C18 typed cap conflict used unexpected rejection: {exc}",
+        )
+    else:
+        raise AssertionError("C18 typed cap accepted conflicting authoritative fields")
+
+    def row(
+        phase: str,
+        request_id: str,
+        event_unix_ns: int,
+    ) -> dict[str, Any]:
+        raw = {
+            "ts_unix_nanos": event_unix_ns,
+            "event_id": f"{phase}-{request_id}-{event_unix_ns}",
+            "phase": phase,
+            "request_id": request_id,
+            "status": "ok",
+            "error": None,
+        }
+        return {"raw": raw, "raw_sha256": canonical_json_sha256(raw)}
+
+    stale_request_id = "stale-before-c18"
+    current_request_ids = ["c18-request-a", "c18-request-b"]
+    contaminated = [
+        row("engine_request_close", stale_request_id, boundary - 10),
+        row("engine_request_open", current_request_ids[0], boundary + 10),
+        row("engine_request_open", current_request_ids[1], boundary + 20),
+        row("engine_request_close", current_request_ids[0], boundary + 30),
+    ]
+    legacy_open_count = sum(
+        item["raw"]["phase"] == "engine_request_open" for item in contaminated
+    )
+    legacy_close_count = sum(
+        item["raw"]["phase"] == "engine_request_close" for item in contaminated
+    )
+    require(
+        legacy_open_count == 2 and legacy_close_count == 2,
+        "C18 trace-scope self-test did not reproduce aggregate-count false completion",
+    )
+    incomplete = c18_trace_scope_summary(
+        contaminated,
+        started_unix_ns=boundary,
+        expected_request_count=2,
+    )
+    require(
+        incomplete["request_ids"] == current_request_ids
+        and incomplete["closed_request_ids"] == [current_request_ids[0]]
+        and incomplete["complete"] is False,
+        "C18 trace scope accepted a stale close as the current request close",
+    )
+
+    complete_rows = [
+        *contaminated,
+        row(
+            "vnext.request_completed",
+            f"{C18_PRODUCT_REQUEST_PREFIX}{stale_request_id}",
+            boundary - 5,
+        ),
+        row(
+            "vnext.request_completed",
+            f"{C18_PRODUCT_REQUEST_PREFIX}{current_request_ids[0]}",
+            boundary + 35,
+        ),
+        row("engine_request_close", current_request_ids[1], boundary + 40),
+    ]
+    complete = c18_trace_scope_summary(
+        complete_rows,
+        started_unix_ns=boundary,
+        expected_request_count=2,
+    )
+    require(
+        complete["complete"] is True
+        and complete["closed_request_ids"] == current_request_ids,
+        "C18 trace scope did not complete after the matching request close arrived",
+    )
+    scoped_rows = c18_scoped_trace_rows(
+        complete_rows,
+        complete,
+        expected_request_count=2,
+        label="C18 trace-scope self-test",
+    )
+    scoped_request_ids = {
+        item["raw"]["request_id"] for item in scoped_rows
+    }
+    require(
+        stale_request_id not in scoped_request_ids
+        and f"{C18_PRODUCT_REQUEST_PREFIX}{stale_request_id}"
+        not in scoped_request_ids
+        and scoped_request_ids
+        == {
+            *current_request_ids,
+            f"{C18_PRODUCT_REQUEST_PREFIX}{current_request_ids[0]}",
+        },
+        "C18 trace scope retained a foreign request",
+    )
+    print(C18_TRACE_SCOPE_SELFTEST_PASS_LINE)
+    return 0
+
+
+def self_test_stream_pair_contracts() -> None:
+    def usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+    def transcript(
+        *,
+        case_id: str,
+        reference_request: dict[str, Any],
+        reference_message: dict[str, Any],
+        reference_finish: str,
+        reference_usage: dict[str, int],
+        stream_content: str,
+        stream_reasoning: str,
+        stream_finish: str,
+        stream_usage: dict[str, int],
+        stream_tool_calls: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        stream_request = copy.deepcopy(reference_request)
+        stream_request.update(
+            {"stream": True, "stream_options": {"include_usage": True}}
+        )
+        return {
+            "case_id": case_id,
+            "exchanges": [
+                {
+                    "request": reference_request,
+                    "status": 200,
+                    "response": {
+                        "choices": [
+                            {
+                                "message": reference_message,
+                                "finish_reason": reference_finish,
+                            }
+                        ],
+                        "usage": reference_usage,
+                    },
+                },
+                {"request": stream_request, "status": 200, "response": {}},
+            ],
+            "done_count": 1,
+            "usage_count": 1,
+            "delta_count": 2,
+            "stream_reconstruction": {
+                "malformed_count": 0,
+                "content": stream_content,
+                "reasoning": stream_reasoning,
+                "finish_reason": stream_finish,
+                "usage": stream_usage,
+                "tool_calls": stream_tool_calls,
+            },
+        }
+
+    with tempfile.TemporaryDirectory(
+        prefix="runtime-vnext-stream-contract-"
+    ) as tmp:
+        stdout_path = Path(tmp) / "stdout.log"
+        stdout_path.write_text("{}\n", encoding="utf-8")
+        tool_calls = [
+            {
+                "id": "call-c12-023",
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+            }
+        ]
+        c12_request = {
+            "model": "m2-qwen35-35b-a3b",
+            "messages": [{"role": "user", "content": "Use lookup_weather for Paris."}],
+            "metadata": {
+                "g00_ordinal": 23,
+                "g00_reference_contract": "C11",
+                "g00_reference_case_id": "c11-023",
+            },
+        }
+        c12 = transcript(
+            case_id="c12-023",
+            reference_request=c12_request,
+            reference_message={
+                "content": None,
+                "reasoning_content": "reference numerical branch",
+                "tool_calls": tool_calls,
+            },
+            reference_finish="tool_calls",
+            reference_usage=usage(284, 88),
+            stream_content="",
+            stream_reasoning="different valid numerical branch",
+            stream_finish="tool_calls",
+            stream_usage=usage(284, 91),
+            stream_tool_calls=copy.deepcopy(tool_calls),
+        )
+        validate_case_output(
+            "C12",
+            "streamed-tool",
+            "serve",
+            stdout_path,
+            c12,
+            {"case_id": "c12-023"},
+            "C12 numerical-branch fixture",
+        )
+        c12_prompt_mismatch = copy.deepcopy(c12)
+        c12_prompt_mismatch["stream_reconstruction"]["usage"] = usage(285, 91)
+        prompt_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C12",
+                "streamed-tool",
+                "serve",
+                stdout_path,
+                c12_prompt_mismatch,
+                {"case_id": "c12-023"},
+                "C12 prompt mismatch fixture",
+            )
+        )
+        require(
+            isinstance(prompt_failure, ScenarioError)
+            and "prompt token counts differ" in str(prompt_failure),
+            "C12 accepted mismatched prompt usage",
+        )
+        c12_tool_mismatch = copy.deepcopy(c12)
+        c12_tool_mismatch["stream_reconstruction"]["tool_calls"][0]["function"][
+            "arguments"
+        ] = '{"city":"London"}'
+        tool_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C12",
+                "streamed-tool",
+                "serve",
+                stdout_path,
+                c12_tool_mismatch,
+                {"case_id": "c12-023"},
+                "C12 tool mismatch fixture",
+            )
+        )
+        require(
+            isinstance(tool_failure, ScenarioError)
+            and "streamed tool call differs" in str(tool_failure),
+            "C12 accepted a semantically different streamed tool call",
+        )
+
+        c06_request = {
+            "model": "m2-qwen35-35b-a3b",
+            "messages": [{"role": "user", "content": "Return C06-MARKER."}],
+            "metadata": {
+                "g00_ordinal": 1,
+                "g00_reference_contract": "C05",
+                "g00_reference_case_id": "c05-001",
+            },
+        }
+        c06 = transcript(
+            case_id="c06-001",
+            reference_request=c06_request,
+            reference_message={
+                "content": "C06-MARKER",
+                "reasoning_content": "reference reasoning",
+            },
+            reference_finish="stop",
+            reference_usage=usage(8, 4),
+            stream_content="C06-MARKER",
+            stream_reasoning="different reasoning",
+            stream_finish="stop",
+            stream_usage=usage(8, 4),
+            stream_tool_calls=[],
+        )
+        c06_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C06",
+                "stream",
+                "serve",
+                stdout_path,
+                c06,
+                {"case_id": "c06-001", "expected_marker": "C06-MARKER"},
+                "C06 exact parity fixture",
+            )
+        )
+        require(
+            isinstance(c06_failure, ScenarioError)
+            and "reasoning differs" in str(c06_failure),
+            "C06 lost its exact stream parity contract",
+        )
+
+        c21_request = {
+            "model": "m2-qwen35-35b-a3b",
+            "messages": [{"role": "user", "content": "Discuss C21-MARKER."}],
+            "metadata": {"g00_ordinal": 1},
+        }
+        c21 = transcript(
+            case_id="c21-005",
+            reference_request=c21_request,
+            reference_message={
+                "content": "C21-MARKER reference answer",
+                "reasoning_content": "reference sampled reasoning",
+            },
+            reference_finish="stop",
+            reference_usage=usage(12, 6),
+            stream_content="C21-MARKER streamed answer",
+            stream_reasoning="different sampled reasoning",
+            stream_finish="eos",
+            stream_usage=usage(12, 8),
+            stream_tool_calls=[],
+        )
+        validate_case_output(
+            "C21",
+            "serve-stream",
+            "serve",
+            stdout_path,
+            c21,
+            {"case_id": "c21-005", "expected_marker": "C21-MARKER"},
+            "C21 stochastic stream fixture",
+        )
+        c21_missing_marker = copy.deepcopy(c21)
+        c21_missing_marker["stream_reconstruction"]["content"] = "unrelated output"
+        marker_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C21",
+                "serve-stream",
+                "serve",
+                stdout_path,
+                c21_missing_marker,
+                {"case_id": "c21-005", "expected_marker": "C21-MARKER"},
+                "C21 missing marker fixture",
+            )
+        )
+        require(
+            isinstance(marker_failure, ScenarioError)
+            and "lost its expected marker" in str(marker_failure),
+            "C21 accepted a sampled response that lost the requested marker",
+        )
+
+
 def self_test() -> int:
+    self_test_c18_trace_scope()
+    self_test_stream_pair_contracts()
+    validate_c17_markers()
+    focus_fixture_rows = [
+        {"case_id": "c01-001", "scenario_id": "C01"},
+        {"case_id": "c01-002", "scenario_id": "C01"},
+        {"case_id": "c11-001", "scenario_id": "C11"},
+    ]
+    focused_rows = select_focused_rows(
+        focus_fixture_rows,
+        case_ids=["c11-001"],
+        scenario_ids=["C01"],
+    )
+    require(
+        [row["case_id"] for row in focused_rows]
+        == ["c01-001", "c01-002", "c11-001"],
+        "focused selector must preserve canonical row order and union case/scenario scope",
+    )
+    for invalid_cases, invalid_scenarios, marker in (
+        (["c11-001", "c11-001"], [], "duplicate case"),
+        ([], ["C01", "C01"], "duplicate scenario"),
+        (["c21-999"], [], "did not match canonical cases"),
+        ([], ["C21"], "did not match canonical scenarios"),
+    ):
+        try:
+            select_focused_rows(
+                focus_fixture_rows,
+                case_ids=invalid_cases,
+                scenario_ids=invalid_scenarios,
+            )
+        except ScenarioError as exc:
+            require(
+                marker in str(exc),
+                f"focused selector rejected invalid scope for unexpected reason: {exc}",
+            )
+        else:
+            raise AssertionError(
+                f"focused selector accepted invalid scope: {invalid_cases}/{invalid_scenarios}"
+            )
+
+    def c09_fixture_request_rows(
+        request_id: str,
+        collection_phase: str,
+        base_ns: int,
+        *,
+        disconnected: bool,
+        scheduler_tick_delta: int = 1,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        event_index = 0
+
+        def append(
+            phase: str,
+            resource: dict[str, Any] | None = None,
+            *,
+            shape: dict[str, Any] | None = None,
+            attributes: dict[str, Any] | None = None,
+        ) -> None:
+            nonlocal event_index
+            event_index += 1
+            monotonic_ns = base_ns + event_index * 1_000_000
+            raw = {
+                "ts_unix_nanos": 1_700_000_000_000_000_000 + monotonic_ns,
+                "event_id": f"fixture-{request_id}-{event_index}",
+                "phase": phase,
+                "request_id": request_id,
+                "correlation_id": request_id,
+                "status": "ok",
+                "error": None,
+                "resource": (
+                    {
+                        "owner_kind": "request",
+                        "owner_id": request_id,
+                        **resource,
+                    }
+                    if resource is not None
+                    else None
+                ),
+                "shape": shape or {},
+                "attributes": {
+                    "monotonic_nanos": monotonic_ns,
+                    **(attributes or {}),
+                },
+            }
+            rows.append(
+                {
+                    "raw": raw,
+                    "collection_phase": collection_phase,
+                    "collector_observed_monotonic_ns": monotonic_ns,
+                    "raw_sha256": canonical_json_sha256(raw),
+                }
+            )
+
+        append(
+            "engine_request_open",
+            {"resource_kind": "request_slot", "action": "request_open"},
+        )
+        append(
+            "engine_request_slot_reserve",
+            {
+                "resource_kind": "request_slot",
+                "action": "reserve",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+            },
+        )
+        append(
+            "engine_request_slot_commit",
+            {
+                "resource_kind": "request_slot",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+            },
+        )
+        append(
+            "plan_runtime_workspace_reserve",
+            {
+                "resource_kind": "backend_workspace",
+                "action": "reserve",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 32,
+            },
+        )
+        append(
+            "plan_runtime_workspace_commit",
+            {
+                "resource_kind": "backend_workspace",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 32,
+            },
+        )
+        if disconnected:
+            append(
+                "engine_client_disconnect_detected",
+                shape={"scheduler_iteration": 10},
+                attributes={"terminal_state": "pending_release"},
+            )
+        append(
+            "plan_runtime_workspace_release",
+            {
+                "resource_kind": "backend_workspace",
+                "action": "release",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+                "capacity": 32,
+            },
+        )
+        append(
+            "engine_request_slot_release",
+            {
+                "resource_kind": "request_slot",
+                "action": "release",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+            },
+        )
+        append(
+            "engine_request_close",
+            {"resource_kind": "request_slot", "action": "request_close"},
+            attributes={
+                "resource_owner_outstanding_count": 0,
+                "resource_owner_outstanding_kinds": [],
+            },
+        )
+        if disconnected:
+            append(
+                "engine_client_disconnect_released",
+                shape={
+                    "detected_scheduler_iteration": 10,
+                    "terminal_scheduler_iteration": 10 + scheduler_tick_delta,
+                    "scheduler_tick_delta": scheduler_tick_delta,
+                },
+                attributes={
+                    "scheduler_cancel_result": "cancelled",
+                    "terminal_state": "released",
+                },
+            )
+        return rows
+
+    abort_exchange = {
+        "started_monotonic_ns": 9_998_000_000,
+        "finished_monotonic_ns": 9_999_000_000,
+        "response": {
+            "admission_observed": True,
+            "admission_request_id": "c09-cancel",
+        },
+    }
+    recovery_exchange = {
+        "started_monotonic_ns": 10_050_000_000,
+        "finished_monotonic_ns": 10_100_000_000,
+    }
+    admitted_rows = [
+        *c09_fixture_request_rows(
+            "c09-cancel", "abort_window", 10_000_000_000, disconnected=True
+        ),
+        *c09_fixture_request_rows(
+            "c09-recovery", "recovery_window", 10_060_000_000, disconnected=False
+        ),
+    ]
+    admitted_outcome = c09_terminal_outcome(
+        admitted_rows, abort_exchange, recovery_exchange
+    )
+    require(
+        admitted_outcome["cancel_resource_outcome"] == C09_ADMITTED_RELEASED
+        and admitted_outcome["cancel_coverage"] == "exercised",
+        "C09 admitted cancellation fixture did not reach released terminal state",
+    )
+    stale_abort_rows = [
+        row
+        for row in c09_fixture_request_rows(
+            "c09-prior-request",
+            "abort_window",
+            9_999_000_000,
+            disconnected=False,
+        )
+        if row["raw"].get("phase")
+        in {
+            "plan_runtime_workspace_release",
+            "engine_request_slot_release",
+            "engine_request_close",
+        }
+    ]
+    contaminated_outcome = c09_terminal_outcome(
+        [*stale_abort_rows, *admitted_rows],
+        abort_exchange,
+        recovery_exchange,
+    )
+    require(
+        contaminated_outcome["cancel_request_id"] == "c09-cancel"
+        and contaminated_outcome["cancel_resource_outcome"]
+        == C09_ADMITTED_RELEASED,
+        "C09 admitted cancellation was obscured by a prior request tail",
+    )
+    pre_admission_exchange = {
+        **abort_exchange,
+        "response": {
+            "admission_observed": False,
+            "admission_request_id": None,
+        },
+    }
+    pre_admission_outcome = c09_terminal_outcome(
+        c09_fixture_request_rows(
+            "c09-recovery", "recovery_window", 10_060_000_000, disconnected=False
+        ),
+        pre_admission_exchange,
+        recovery_exchange,
+    )
+    require(
+        pre_admission_outcome["cancel_resource_outcome"] == C09_NOT_ADMITTED_SAFE
+        and pre_admission_outcome["cancel_coverage"] == "not_exercised"
+        and pre_admission_outcome["scheduler_ticks_to_terminal"] is None,
+        "C09 pre-admission abort was incorrectly counted as release coverage",
+    )
+
+    def expect_c09_reject(rows: list[dict[str, Any]], label: str) -> None:
+        try:
+            c09_terminal_outcome(rows, abort_exchange, recovery_exchange)
+        except ScenarioError:
+            return
+        raise AssertionError(f"C09 {label} fixture unexpectedly passed")
+
+    expect_c09_reject(
+        [
+            row
+            for row in admitted_rows
+            if row["raw"].get("phase") != "engine_client_disconnect_released"
+        ],
+        "missing disconnect release",
+    )
+    tick_overrun_rows = copy.deepcopy(admitted_rows)
+    next(
+        row
+        for row in tick_overrun_rows
+        if row["raw"].get("phase") == "engine_client_disconnect_released"
+    )["raw"]["shape"]["scheduler_tick_delta"] = 3
+    expect_c09_reject(tick_overrun_rows, "scheduler tick overrun")
+    duplicate_release_rows = copy.deepcopy(admitted_rows)
+    duplicate_release = copy.deepcopy(
+        next(
+            row
+            for row in duplicate_release_rows
+            if row["raw"].get("phase") == "plan_runtime_workspace_release"
+            and row["collection_phase"] == "abort_window"
+        )
+    )
+    duplicate_release_rows.insert(7, duplicate_release)
+    expect_c09_reject(duplicate_release_rows, "duplicate resource release")
+    expect_c09_reject(
+        [
+            row
+            for row in admitted_rows
+            if not (
+                row["collection_phase"] == "recovery_window"
+                and row["raw"].get("phase") == "engine_request_close"
+            )
+        ],
+        "missing recovery close",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-jsonl-tail-") as tmp:
+        trace_path = Path(tmp) / "trace.jsonl"
+        first = json.dumps({"row": 1}).encode("utf-8") + b"\n"
+        second = json.dumps({"row": 2}).encode("utf-8") + b"\n"
+        trace_path.write_bytes(first + second[:5])
+        require(
+            complete_jsonl_offset(trace_path) == len(first),
+            "JSONL live cursor did not stop at the last complete record",
+        )
+        rows, offset = read_jsonl_since(trace_path, 0)
+        require(rows == [{"row": 1}] and offset == len(first), "JSONL reader consumed a partial row")
+        with trace_path.open("ab") as handle:
+            handle.write(second[5:])
+        require(
+            complete_jsonl_offset(trace_path) == len(first) + len(second),
+            "JSONL live cursor did not advance across a completed tail record",
+        )
+        rows, offset = read_jsonl_since(trace_path, offset)
+        require(rows == [{"row": 2}] and offset == len(first) + len(second), "JSONL reader lost a completed tail row")
+        trace_path.write_bytes(b"{invalid}\n")
+        try:
+            read_jsonl_since(trace_path, 0)
+        except ScenarioError as exc:
+            require("invalid JSONL" in str(exc), f"invalid JSONL rejection drifted: {exc}")
+        else:
+            raise AssertionError("JSONL reader silently skipped a complete invalid row")
+
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-c17-normalization-") as tmp:
+        stdout_path = Path(tmp) / "stdout.jsonl"
+        nfd_marker = "e\u0301"
+        nfc_marker = unicodedata.normalize("NFC", nfd_marker)
+        require(nfc_marker != nfd_marker, "C17 normalization negative fixture must differ by bytes")
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "event": "assistant",
+                    "content": nfc_marker,
+                    "finish_reason": "stop",
+                    "n_tokens": 2,
+                    "chunk_count": 2,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        normalization_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C17",
+                "combining",
+                "run",
+                stdout_path,
+                None,
+                {"expected_marker": nfd_marker},
+                "c17-normalization-negative",
+            )
+        )
+        require(
+            isinstance(normalization_failure, ScenarioError)
+            and "Unicode run content mismatch" in str(normalization_failure),
+            "C17 exact-byte oracle accepted canonically equivalent but byte-distinct output",
+        )
+    json_failure = capture_case_output_error(lambda: json.loads(""))
+    scenario_failure = capture_case_output_error(lambda: require(False, "case-output scenario failure"))
+    no_failure = capture_case_output_error(lambda: None)
+    require(isinstance(json_failure, json.JSONDecodeError), "case-output JSON decode failure was not captured")
+    require(isinstance(scenario_failure, ScenarioError), "case-output scenario failure was not captured")
+    require(no_failure is None, "successful case output produced a captured failure")
+    for ordinal, variant in enumerate(("image-url", "video-url", "mixed-text-media"), start=1):
+        payload = case_http_payload(
+            {
+                "case_id": f"c20-{ordinal:03d}",
+                "scenario_id": "C20",
+                "ordinal": ordinal,
+                "variant": variant,
+                "preset": None,
+            },
+            "m3-qwen3-30b-a3b",
+        )
+        content = payload["messages"][0]["content"]
+        media = next(item for item in content if item["type"] in {"image_url", "video_url"})
+        url = media[media["type"]]["url"]
+        require(url == C20_REMOTE_MEDIA_URL, f"C20 {variant} did not use the pinned real media URL")
+        lowered = url.lower()
+        require(
+            not any(marker in lowered for marker in ("selftest", "self-test", "synthetic", "example.invalid")),
+            f"C20 {variant} used a synthetic/self-test media URL",
+        )
+    history_errors: list[dict[str, Any]] = []
+    valid_history = history_response_message(
+        {"response": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}},
+        "history-fixture.valid",
+        history_errors,
+    )
+    require(valid_history == {"role": "assistant", "content": "ok"} and not history_errors, "valid history response was not preserved")
+    malformed_history = history_response_message(
+        {"response": {"error": {"message": "legacy malformed response"}}},
+        "history-fixture.malformed",
+        history_errors,
+    )
+    require(malformed_history is None and len(history_errors) == 1, "malformed history response did not become evidence")
+    require(
+        history_errors[0]["error"] == "history-fixture.malformed.choices must be a JSON array"
+        and SHA256_RE.fullmatch(history_errors[0]["response_sha256"]) is not None,
+        "malformed history response evidence is incomplete",
+    )
+    require(
+        scheduler_trace_rows_for_status([], case_status="known-fail", label="known-fail fixture") == [],
+        "known-fail scheduler trace absence was not preserved",
+    )
+    require(
+        scheduler_success_derivation_required("pass")
+        and not scheduler_success_derivation_required("known-fail"),
+        "scheduler success derivation policy does not distinguish pass from known-fail",
+    )
+    known_fail_concurrency_cells = [
+        {
+            "requested_concurrency": requested,
+            "case_count": 1,
+            "passed_count": 0,
+            "completion_rate": 0.0,
+            "typed_admission_cap": 4,
+            "observed_max_active": 0,
+            "error_count": 1,
+            "bad_output_count": 0,
+            "crosstalk_count": 0,
+            "bad_checksum_count": 0,
+            "server_500_count": 0,
+            "panic_count": 0,
+            "oom_count": 0,
+        }
+        for requested in (1, 4, 16)
+    ]
+    validate_concurrency_cells("metal", known_fail_concurrency_cells, case_count=3, require_pass=False)
+    passing_concurrency_cells = copy.deepcopy(known_fail_concurrency_cells)
+    for cell in passing_concurrency_cells:
+        cell.update(
+            {
+                "passed_count": 1,
+                "request_count": cell["requested_concurrency"],
+                "completed_request_count": cell["requested_concurrency"],
+                "completion_rate": 1.0,
+                "error_count": 0,
+            }
+        )
+    try:
+        validate_concurrency_cells("metal", passing_concurrency_cells, case_count=3, require_pass=True)
+    except ScenarioError as exc:
+        require("observed_max_active must be >= 1" in str(exc), f"passing zero-active cell used unexpected rejection: {exc}")
+    else:
+        raise AssertionError("passing zero-active concurrency cells unexpectedly passed")
+    try:
+        scheduler_trace_rows_for_status([], case_status="pass", label="passing fixture")
+    except ScenarioError as exc:
+        require("scheduler trace evidence is empty" in str(exc), f"passing trace rejection used unexpected reason: {exc}")
+    else:
+        raise AssertionError("passing scheduler case accepted empty trace evidence")
+    require(
+        allow_c01_known_failure_unknown_architecture("C01", "known-fail", "c01-contract-violation"),
+        "exact C01 known-fail architecture allowance did not resolve",
+    )
+    for scenario_id, status, failure_class in (
+        ("C01", "pass", None),
+        ("C01", "known-fail", "other-contract-violation"),
+        ("C02", "known-fail", "c01-contract-violation"),
+    ):
+        require(
+            not allow_c01_known_failure_unknown_architecture(scenario_id, status, failure_class),
+            f"C01 architecture allowance leaked to {scenario_id}/{status}/{failure_class}",
+        )
+    require(
+        allow_frozen_unknown_architecture("m3-qwen3-30b-a3b", "metal"),
+        "M3 Metal frozen unknown-architecture allowance did not resolve",
+    )
+    for model_key, backend in (
+        ("m3-qwen3-30b-a3b", "cuda"),
+        ("m1-qwen35-4b", "metal"),
+        ("m2-qwen35-35b-a3b", "metal"),
+    ):
+        require(
+            not allow_frozen_unknown_architecture(model_key, backend),
+            f"frozen unknown-architecture allowance leaked to {model_key}/{backend}",
+        )
+    unknown_architecture_config = {
+        "schema_version": SCHEMA_VERSION,
+        "entries": [{"key": "FERRUM_BACKEND", "effective_value": "metal"}],
+        "hardware_capabilities": {"backend": "metal"},
+        "model_capabilities": {"architecture": "unknown"},
+        "workload_profile": {"serving_mode": "openai_chat", "target_concurrency": 1},
+        "decisions": [],
+    }
+    try:
+        validate_actual_effective_config(
+            unknown_architecture_config,
+            expected_backend="metal",
+            expected_model_key="m3-qwen3-30b-a3b",
+            label="passing C01 architecture fixture",
+        )
+    except ScenarioError as exc:
+        require("architecture differs from lane model" in str(exc), f"passing architecture fixture used unexpected rejection: {exc}")
+    else:
+        raise AssertionError("passing C01 architecture fixture accepted unknown architecture")
+    validate_actual_effective_config(
+        unknown_architecture_config,
+        expected_backend="metal",
+        expected_model_key="m3-qwen3-30b-a3b",
+        label="known-fail C01 architecture fixture",
+        allow_unknown_architecture=True,
+    )
+    wrong_known_architecture_config = copy.deepcopy(unknown_architecture_config)
+    wrong_known_architecture_config["model_capabilities"]["architecture"] = "qwen3_5"
+    try:
+        validate_actual_effective_config(
+            wrong_known_architecture_config,
+            expected_backend="metal",
+            expected_model_key="m3-qwen3-30b-a3b",
+            label="wrong known architecture fixture",
+            allow_unknown_architecture=True,
+        )
+    except ScenarioError as exc:
+        require(
+            "architecture differs from lane model" in str(exc),
+            f"wrong known architecture fixture used unexpected rejection: {exc}",
+        )
+    else:
+        raise AssertionError("unknown-architecture allowance accepted a wrong known architecture")
+    legacy_top_level_backend_config = copy.deepcopy(unknown_architecture_config)
+    legacy_top_level_backend_config["backend"] = "metal"
+    legacy_top_level_backend_config["entries"] = [
+        {"key": "FERRUM_KV_CAPACITY", "effective_value": "4096"}
+    ]
+    validate_actual_effective_config(
+        legacy_top_level_backend_config,
+        expected_backend="metal",
+        expected_model_key="m3-qwen3-30b-a3b",
+        label="legacy top-level backend fixture",
+        allow_unknown_architecture=True,
+    )
+    for name, mutate, marker in (
+        (
+            "missing backend evidence",
+            lambda config: config.update(
+                {"entries": [{"key": "FERRUM_KV_CAPACITY", "effective_value": "4096"}]}
+            ),
+            "typed backend evidence missing",
+        ),
+        (
+            "contradictory backend entry",
+            lambda config: config.update(
+                {
+                    "backend": "metal",
+                    "entries": [{"key": "FERRUM_BACKEND", "effective_value": "cuda"}],
+                }
+            ),
+            "typed backend entry mismatch",
+        ),
+        (
+            "contradictory top-level backend",
+            lambda config: config.update({"backend": "cuda"}),
+            "top-level backend differs from lane",
+        ),
+    ):
+        candidate = copy.deepcopy(unknown_architecture_config)
+        mutate(candidate)
+        try:
+            validate_actual_effective_config(
+                candidate,
+                expected_backend="metal",
+                expected_model_key="m3-qwen3-30b-a3b",
+                label=name,
+                allow_unknown_architecture=True,
+            )
+        except ScenarioError as exc:
+            require(marker in str(exc), f"{name} used unexpected rejection: {exc}")
+        else:
+            raise AssertionError(f"{name} unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="ferrum-vnext-c03-contract-") as contract_tmp:
+        marker = "G00-c03-001-OK"
+        observed = {"case_id": "c03-001", "expected_marker": marker, "contract_id": C03_CONTRACT_ID}
+        rows: list[dict[str, Any]] = [{"event": "ready", "model": "fixture", "backend": "metal"}]
+        for turn, (user_content, assistant_content) in enumerate(
+            zip(c03_user_turns(marker), c03_expected_assistant_turns(marker), strict=True)
+        ):
+            rows.extend(
+                [
+                    {"event": "user", "turn": turn, "content": user_content},
+                    {
+                        "event": "assistant",
+                        "turn": turn,
+                        "content": assistant_content,
+                        "finish_reason": "stop",
+                        "n_tokens": 1,
+                        "chunk_count": 1,
+                    },
+                ]
+            )
+        rows.append({"event": "exit", "reason": "eof"})
+        stdout_path = Path(contract_tmp) / "stdout.jsonl"
+
+        def validate_c03_rows(candidate_rows: list[dict[str, Any]], label: str) -> None:
+            stdout_path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in candidate_rows), encoding="utf-8")
+            validate_case_output("C03", "all", "run", stdout_path, None, observed, label)
+
+        validate_c03_rows(rows, "valid C03 fixture")
+        c03_mutations: tuple[tuple[str, Callable[[list[dict[str, Any]]], None], str], ...] = (
+            ("first-assistant", lambda value: value[2].update({"content": "ACK"}), "assistant turns differ"),
+            ("second-assistant", lambda value: value[4].update({"content": "PROCEED"}), "assistant turns differ"),
+            ("final-assistant", lambda value: value[6].update({"content": "wrong-marker"}), "assistant turns differ"),
+            ("assistant-turn-order", lambda value: value[4].update({"turn": 2}), "assistant turn sequence mismatch"),
+        )
+        for name, mutate, rejection in c03_mutations:
+            candidate_rows = copy.deepcopy(rows)
+            mutate(candidate_rows)
+            try:
+                validate_c03_rows(candidate_rows, name)
+            except ScenarioError as exc:
+                require(rejection in str(exc), f"{name} C03 mutation used unexpected rejection: {exc}")
+            else:
+                raise AssertionError(f"{name} C03 mutation unexpectedly passed")
+    selector_catalog = internal_expectations_catalog()
+    selector_rules = selector_catalog["lanes"]["m3-qwen3-30b-a3b/metal"]["rules"]
+    exact_case_rule = copy.deepcopy(selector_rules[0])
+    exact_case_rule.update(
+        {
+            "selector": {
+                "scenario_id": "C03",
+                "variant": "all",
+                "preset": "P_DETERMINISTIC",
+                "entrypoint": "run",
+                "case_id": "c03-001",
+            },
+            "expected_status": "known-fail",
+            "failure_class": "selector-case-fixture",
+        }
+    )
+    serve_rule = copy.deepcopy(selector_rules[0])
+    serve_rule.update(
+        {
+            "selector": {
+                "scenario_id": "C21",
+                "variant": "*",
+                "preset": "*",
+                "entrypoint": "serve",
+                "case_id": "*",
+            },
+            "expected_status": "known-fail",
+            "failure_class": "selector-entrypoint-fixture",
+        }
+    )
+    selector_rules.extend((exact_case_rule, serve_rule))
+    validate_expectations_catalog(selector_catalog)
+    exact = resolve_expectation(
+        selector_catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="metal",
+        scenario_id="C03",
+        variant="all",
+        preset="P_DETERMINISTIC",
+        entrypoint="run",
+        case_id="c03-001",
+    )
+    neighbor = resolve_expectation(
+        selector_catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="metal",
+        scenario_id="C03",
+        variant="all",
+        preset="P_DETERMINISTIC",
+        entrypoint="run",
+        case_id="c03-002",
+    )
+    serve = resolve_expectation(
+        selector_catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="metal",
+        scenario_id="C21",
+        variant="tool-priority",
+        preset="P_DETERMINISTIC",
+        entrypoint="serve",
+        case_id="c21-001",
+    )
+    require(exact["failure_class"] == "selector-case-fixture", "case selector did not override its neighboring cases")
+    require(neighbor["expected_status"] == "pass", "case selector leaked into a neighboring case")
+    require(serve["failure_class"] == "selector-entrypoint-fixture", "entrypoint selector did not resolve")
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-scenario-runner-") as tmp:
         root = Path(tmp) / "artifacts"
         root.mkdir()
@@ -5405,6 +11245,8 @@ def self_test() -> int:
         except ScenarioError as exc:
             require(
                 "expectations catalog is not the checked-in contract" in str(exc)
+                or "expectations catalog is not the canonical execution contract" in str(exc)
+                or "legacy expectations differ from checked-in blob" in str(exc)
                 or "fixture runner is forbidden" in str(exc)
                 or "exists on disk, but not in 'HEAD'" in str(exc),
                 f"canonical fixture rejection used unexpected reason: {exc}",
@@ -5423,13 +11265,207 @@ def self_test() -> int:
         execution_root = Path(tmp) / "execution-artifacts"
         execution_root.mkdir()
         execution_manifest = make_execution_fixture_manifest(execution_root)
+        fixture_weight = Path(execution_manifest["execution"]["model_arg"]) / "weights.gguf"
+        fixture_weight_bytes = fixture_weight.read_bytes()
+        fixture_weight.write_bytes(fixture_weight_bytes + b"tampered")
+        try:
+            validate_execution_manifest(execution_manifest, execution_root)
+        except ScenarioError as exc:
+            require("locked weight missing or SHA mismatch" in str(exc), f"weight mutation used unexpected rejection: {exc}")
+        else:
+            raise AssertionError("execution manifest accepted mutated model bytes")
+        fixture_weight.write_bytes(fixture_weight_bytes)
+
+        focused_root = Path(tmp) / "focused-execution-artifacts"
+        focused_root.mkdir()
+        focused_manifest = make_execution_fixture_manifest(focused_root)
+        focused_out = focused_root / "focused-report.json"
+        focused_report = execute_manifest(
+            focused_manifest,
+            focused_root,
+            focused_out,
+            discover=False,
+            focus_case_ids=["c11-001"],
+            allow_internal_fixture=True,
+        )
+        write_json(focused_out, focused_report)
+        require(
+            focused_report["artifact_kind"] == "runtime-vnext-focused-diagnostic"
+            and focused_report["decision"] == "KEEP"
+            and focused_report["formal_pass_allowed"] is False
+            and focused_report["scope"]["selected_case_ids"] == ["c11-001"]
+            and focused_report["scope"]["case_count"] == 1
+            and focused_report["scope"]["canonical_case_count"] == 783
+            and focused_report["pass_line"]
+            == f"{FOCUSED_DIAGNOSTIC_KEEP_PREFIX}: {focused_out.resolve()}",
+            "focused execution fixture lost its non-formal exact-case contract",
+        )
+        require(
+            len(focused_report["cases"]) == 1
+            and (focused_root / focused_report["cases"][0]["path"]).is_file(),
+            "focused execution fixture did not preserve exact case evidence",
+        )
+        try:
+            validate_report_document(
+                focused_report,
+                focused_root,
+                report_path=focused_out,
+                allow_internal_fixture=True,
+                require_current_output_path=True,
+            )
+        except ScenarioError as exc:
+            require(
+                "not produced by canonical executor mode" in str(exc),
+                f"full validator rejected focused evidence for unexpected reason: {exc}",
+            )
+        else:
+            raise AssertionError("full validator accepted focused diagnostic evidence")
+
+        failure_root = Path(tmp) / "unexpected-status-artifacts"
+        failure_root.mkdir()
+        failure_manifest = make_execution_fixture_manifest(failure_root)
+        failure_identity_path = Path(failure_manifest["execution"]["model_arg"]) / "g00-resolution-identity.json"
+        failure_identity = read_json(failure_identity_path)
+        failure_identity["resolved_model"] = "internal/unexpected-model"
+        write_json(failure_identity_path, failure_identity)
+        try:
+            execute_manifest(
+                failure_manifest,
+                failure_root,
+                failure_root / "unexpected-status-report.json",
+                discover=False,
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require("unexpected status" in str(exc), f"unexpected-status fixture failed for the wrong reason: {exc}")
+        else:
+            raise AssertionError("unexpected-status fixture incorrectly completed")
+        failed_case_root = failure_root / "correctness/m3-qwen3-30b-a3b/cuda/scenarios/C01/cases/c01-001"
+        for artifact_name in ("command-spec.json", "checker.log", "execution-envelope.json", "case.json"):
+            require((failed_case_root / artifact_name).is_file(), f"unexpected-status fixture lost {artifact_name}")
+        failed_case = read_json(failed_case_root / "case.json")
+        require(
+            failed_case["status"] == "known-fail"
+            and failed_case["checks"].get("expectation_match") is False,
+            "unexpected-status fixture did not preserve its observed failure",
+        )
+
+        candidate_catalog = validate_expectations_catalog(
+            candidate_expectations_catalog(FROZEN_LEGACY_SHA),
+            expected_contract=G08_EXECUTION_CONTRACT,
+        )
+        candidate_rows = planned_case_rows(
+            "m2-qwen35-35b-a3b",
+            "cuda",
+            candidate_catalog,
+        )
+        require(
+            len(candidate_rows) == 703
+            and {row["expectation"]["expected_status"] for row in candidate_rows} == {"pass"},
+            "G08 candidate catalog does not require all 703 M2 CUDA cases to pass",
+        )
+        diagnostic_rows = select_c09_diagnostic_rows(candidate_rows)
+        require(
+            [(row["case_id"], row["variant"]) for row in diagnostic_rows]
+            == [
+                ("c09-001", "cancel"),
+                ("c09-021", "timeout"),
+                ("c09-041", "disconnect"),
+            ],
+            "C09 diagnostic selector drifted",
+        )
+        hostile_candidate_catalog = copy.deepcopy(candidate_catalog)
+        hostile_candidate_catalog["lanes"]["m2-qwen35-35b-a3b/cuda"]["rules"][0].update(
+            {
+                "expected_status": "known-fail",
+                "failure_class": "c18-contract-violation",
+            }
+        )
+        try:
+            validate_expectations_catalog(
+                hostile_candidate_catalog,
+                expected_contract=G08_EXECUTION_CONTRACT,
+            )
+        except ScenarioError as exc:
+            require(
+                "candidate expectation must declare pass" in str(exc),
+                f"G08 candidate known-fail mutation used unexpected rejection: {exc}",
+            )
+        else:
+            raise AssertionError("G08 candidate catalog accepted a known-fail expectation")
+        candidate_manifest = copy.deepcopy(execution_manifest)
+        candidate_manifest["execution_contract"] = G08_EXECUTION_CONTRACT
+        candidate_effective_path = execution_root / "candidate-effective-config.json"
+        candidate_effective = read_json(
+            execution_root / candidate_manifest["effective_config"]["path"]
+        )
+        candidate_effective["execution_contract"] = G08_EXECUTION_CONTRACT
+        write_json(candidate_effective_path, candidate_effective)
+        candidate_manifest["effective_config"] = existing_artifact_ref(
+            execution_root,
+            candidate_effective_path,
+            "raw-json",
+        )
+        candidate_manifest["binary_build_receipt"] = make_candidate_build_receipt_fixture(
+            execution_root,
+            candidate_manifest,
+        )
+        validated_candidate = validate_execution_manifest(
+            candidate_manifest,
+            execution_root,
+            allow_internal_fixture=True,
+        )
+        require(
+            validated_candidate["execution_contract"] == G08_EXECUTION_CONTRACT,
+            "G08 candidate execution manifest lost its explicit contract",
+        )
+        hostile_build_receipt = read_json(
+            execution_root / candidate_manifest["binary_build_receipt"]["path"]
+        )
+        hostile_build_receipt["command"] = ["cargo", "build"]
+        hostile_build_receipt_path = execution_root / "build/candidate/hostile-build-receipt.json"
+        write_json(hostile_build_receipt_path, hostile_build_receipt)
+        hostile_candidate_manifest = copy.deepcopy(candidate_manifest)
+        hostile_candidate_manifest["binary_build_receipt"] = existing_artifact_ref(
+            execution_root,
+            hostile_build_receipt_path,
+            "raw-json",
+        )
+        try:
+            validate_execution_manifest(
+                hostile_candidate_manifest,
+                execution_root,
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require(
+                "build command is not canonical" in str(exc),
+                f"G08 candidate build receipt mutation used unexpected rejection: {exc}",
+            )
+        else:
+            raise AssertionError("G08 candidate execution accepted an unbound build command")
+        try:
+            execute_manifest(
+                candidate_manifest,
+                execution_root,
+                execution_root / "candidate-discovery.json",
+                discover=True,
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require(
+                "does not support discovery mode" in str(exc),
+                f"G08 candidate discovery mutation used unexpected rejection: {exc}",
+            )
+        else:
+            raise AssertionError("G08 candidate execution accepted discovery mode")
         execution_out = execution_root / "correctness/m3-qwen3-30b-a3b/cuda/scenario-report.json"
         hostile_key = "FERRUM_HOSTILE_PARENT_SWITCH"
         previous_hostile = os.environ.get(hostile_key)
         os.environ[hostile_key] = "must-not-reach-product"
         try:
             execution_report = execute_manifest(
-                execution_manifest,
+                candidate_manifest,
                 execution_root,
                 execution_out,
                 discover=False,
@@ -5448,6 +11484,44 @@ def self_test() -> int:
             allow_internal_fixture=True,
             require_current_output_path=True,
         )
+        execution_commands = {command["id"]: command for command in execution_report["commands"]}
+        expected_run_commands = {f"actual-run-{index:02d}" for index in range(1, 6)}
+        require(
+            set(execution_commands) == expected_run_commands | {"actual-serve-01", "actual-serve-02"},
+            "execution fixture did not persist five run and two C09-isolated serve sessions",
+        )
+        require(
+            [execution_commands[f"actual-run-{index:02d}"]["case_count"] for index in range(1, 6)]
+            == [20, 63, 10, 2, 2],
+            "execution fixture resident run partition drifted",
+        )
+        first_serve_receipt = read_json(execution_root / execution_commands["actual-serve-01"]["process_receipt"]["path"])
+        second_serve_receipt = read_json(execution_root / execution_commands["actual-serve-02"]["process_receipt"]["path"])
+        require(first_serve_receipt["pid"] != second_serve_receipt["pid"], "execution fixture did not restart serve after C09")
+        require(
+            execution_report["scenarios"][8]["command_ids"] == ["actual-serve-01"]
+            and execution_report["scenarios"][13]["command_ids"] == ["actual-serve-02"],
+            "C09/C14 command evidence crossed the isolation boundary",
+        )
+        executor_prefix = "correctness/m3-qwen3-30b-a3b/cuda/commands/"
+        invocation_ref = require_object(execution_report.get("executor_invocation"), "execution fixture invocation ref")
+        require(str(invocation_ref.get("path", "")).startswith(executor_prefix), "executor invocation is not lane-local")
+        invocation_document = read_json(execution_root / invocation_ref["path"])
+        run_receipts = [
+            read_json(execution_root / execution_commands[command_id]["process_receipt"]["path"])
+            for command_id in sorted(expected_run_commands)
+        ]
+        require(len({receipt["pid"] for receipt in run_receipts}) == 5, "execution fixture reused a resident run product pid")
+        require(
+            all(
+                receipt["pgid"] == invocation_document["pgid"]
+                for receipt in (*run_receipts, first_serve_receipt, second_serve_receipt)
+            ),
+            "execution fixture product escaped the bounded executor process group",
+        )
+        for key in ("manifest_snapshot", "process_receipt"):
+            ref = require_object(invocation_document.get(key), f"execution fixture invocation {key}")
+            require(str(ref.get("path", "")).startswith(executor_prefix), f"executor {key} is not lane-local")
         require(len(planned_case_rows("m3-qwen3-30b-a3b", "cuda", internal_expectations_catalog())) == 783, "fake executor did not cover the complete C01-C21 case corpus")
         require(
             hostile_key not in json.dumps(execution_report, sort_keys=True),
@@ -5455,7 +11529,112 @@ def self_test() -> int:
         )
         for receipt_path in execution_root.rglob("*process-receipt.json"):
             require(hostile_key not in receipt_path.read_text(encoding="utf-8"), f"hostile environment leaked into {receipt_path}")
+        for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"):
+            for preset_name in ("P_THINKING", "P_OFFICIAL_DEFAULT"):
+                preset = preset_values(model_key, preset_name)
+                require(
+                    preset.get("output_budget_mode") == "auto-ceiling"
+                    and preset.get("max_tokens") == 4096,
+                    f"{model_key} {preset_name} must use the 4096 auto ceiling",
+                )
+            c19_default = {
+                **next(
+                    row
+                    for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                    if row["scenario_id"] == "C19" and row["variant"] == "default-thinking"
+                ),
+                "model_key": model_key,
+            }
+            c19_argv, _ = run_case_option_args(c19_default)
+            require("--max-tokens" in c19_argv, f"{model_key} C19 run omitted auto ceiling")
+            require(
+                c19_argv[c19_argv.index("--max-tokens") + 1] == "4096",
+                f"{model_key} C19 run changed the auto ceiling",
+            )
+            require(
+                "max_tokens" not in case_http_payload(c19_default, model_key),
+                f"{model_key} C19 serve serialized the auto ceiling as an explicit limit",
+            )
+            c21_serve = {
+                **next(
+                    row
+                    for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                    if row["scenario_id"] == "C21" and row["entrypoint"] == "serve"
+                ),
+                "model_key": model_key,
+            }
+            require(
+                "max_tokens" not in case_http_payload(c21_serve, model_key),
+                f"{model_key} C21 serve serialized the official auto ceiling as an explicit limit",
+            )
+            planned_rows = planned_case_rows(
+                model_key,
+                "cuda",
+                internal_expectations_catalog(),
+            )
+            for preset_name, thinking_enabled in (
+                ("P_NO_THINKING", False),
+                ("P_THINKING", True),
+            ):
+                paired_payloads = []
+                for scenario_id in ("C11", "C12"):
+                    pair_case = {
+                        **next(
+                            row
+                            for row in planned_rows
+                            if row["scenario_id"] == scenario_id
+                            and row["preset"] == preset_name
+                        ),
+                        "model_key": model_key,
+                    }
+                    pair_payload = case_http_payload(pair_case, model_key)
+                    deterministic = preset_values(model_key, "P_DETERMINISTIC")
+                    require(
+                        all(
+                            pair_payload.get(key) == deterministic.get(key)
+                            for key in DETERMINISTIC_PARITY_SAMPLING_KEYS
+                        ),
+                        f"{model_key} {scenario_id}/{preset_name} lost deterministic parity sampling",
+                    )
+                    require(
+                        pair_payload.get("chat_template_kwargs")
+                        == {"enable_thinking": thinking_enabled},
+                        f"{model_key} {scenario_id}/{preset_name} lost its thinking mode",
+                    )
+                    require(
+                        pair_payload["metadata"].get("g00_sampling_contract")
+                        == "deterministic-stream-parity",
+                        f"{model_key} {scenario_id}/{preset_name} lost its sampling contract",
+                    )
+                    paired_payloads.append(
+                        canonical_pair_payload(
+                            pair_payload,
+                            f"{model_key} {scenario_id}/{preset_name}",
+                        )
+                    )
+                require(
+                    paired_payloads[0] == paired_payloads[1],
+                    f"{model_key} C11/C12 {preset_name} parity payloads differ",
+                )
+            official_tool_case = {
+                **next(
+                    row
+                    for row in planned_rows
+                    if row["scenario_id"] == "C10"
+                    and row["preset"] == "P_THINKING"
+                ),
+                "model_key": model_key,
+            }
+            require(
+                case_http_payload(official_tool_case, model_key).get("temperature")
+                == preset_values(model_key, "P_THINKING")["temperature"],
+                f"{model_key} C10 official thinking sampling was overwritten",
+            )
         for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
+            require(
+                preset_values(model_key, "P_THINKING")["max_tokens"] == 4096,
+                f"{model_key} C19 thinking correctness budget must be 4096",
+            )
             modes = {
                 row["variant"]
                 for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
@@ -5465,6 +11644,143 @@ def self_test() -> int:
                 {"soft-think-misuse", "soft-no-think-misuse"} <= modes and not ({"soft-think", "soft-no-think"} & modes),
                 f"{model_key} C19 does not distinguish soft-command misuse from Qwen3 soft switches",
             )
+            expected_overrides: dict[str, bool | str] = {
+                "default-thinking": "model-default",
+                "hard-thinking": True,
+                "hard-no-thinking": False,
+                "soft-think-misuse": False,
+                "soft-no-think-misuse": True,
+            }
+            c19_rows = [
+                row
+                for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                if row["scenario_id"] == "C19"
+            ]
+            preset_case = {
+                **next(row for row in c19_rows if row["variant"] == "default-thinking"),
+                "model_key": model_key,
+            }
+            preset_argv, _ = run_case_option_args(preset_case)
+            preset_payload = case_http_payload(preset_case, model_key)
+            for flag, key in (
+                ("--temperature", "temperature"),
+                ("--top-p", "top_p"),
+                ("--top-k", "top_k"),
+                ("--min-p", "min_p"),
+                ("--presence-penalty", "presence_penalty"),
+                ("--repeat-penalty", "repetition_penalty"),
+                ("--seed", "seed"),
+                ("--max-tokens", "max_tokens"),
+            ):
+                expected_value = preset_values(model_key, "P_THINKING")[key]
+                require(flag in preset_argv, f"{model_key} P_THINKING run omitted {key}")
+                require(
+                    preset_argv[preset_argv.index(flag) + 1] == str(expected_value),
+                    f"{model_key} P_THINKING run changed {key}",
+                )
+                if key == "max_tokens":
+                    require(
+                        key not in preset_payload,
+                        f"{model_key} P_THINKING serve serialized the auto ceiling as explicit",
+                    )
+                else:
+                    require(preset_payload.get(key) == expected_value, f"{model_key} P_THINKING serve omitted or changed {key}")
+            for variant, expected_override in expected_overrides.items():
+                case = {
+                    **next(row for row in c19_rows if row["variant"] == variant),
+                    "model_key": model_key,
+                }
+                _, run_override = run_case_option_args(case)
+                payload_override = case_http_payload(case, model_key).get("chat_template_kwargs")
+                expected_payload = (
+                    None
+                    if expected_override == "model-default"
+                    else {"enable_thinking": expected_override}
+                )
+                require(run_override == expected_override, f"{model_key} {variant} run hard-toggle precedence drift")
+                require(payload_override == expected_payload, f"{model_key} {variant} serve hard-toggle precedence drift")
+                require(
+                    thinking_reasoning_expected(model_key, variant) is (expected_override is not False),
+                    f"{model_key} {variant} reasoning oracle differs from hard-toggle precedence",
+                )
+
+            c08_case = {
+                **next(
+                    row
+                    for row in planned_case_rows(model_key, "cuda", internal_expectations_catalog())
+                    if row["scenario_id"] == "C08" and row["variant"] == "max-tokens"
+                ),
+                "model_key": model_key,
+            }
+            require(
+                case_http_payload(c08_case, model_key).get("max_tokens") == 8,
+                f"{model_key} C08 serve explicit max-token budget lost precedence",
+            )
+
+        m3_c19_rows = [
+            row
+            for row in planned_case_rows("m3-qwen3-30b-a3b", "cuda", internal_expectations_catalog())
+            if row["scenario_id"] == "C19"
+        ]
+        for variant in ("default-thinking", "soft-think", "soft-no-think"):
+            case = {
+                **next(row for row in m3_c19_rows if row["variant"] == variant),
+                "model_key": "m3-qwen3-30b-a3b",
+            }
+            _, run_override = run_case_option_args(case)
+            require(run_override == "model-default", f"M3 {variant} unexpectedly sent a hard run toggle")
+            require(case_http_payload(case, "m3-qwen3-30b-a3b").get("chat_template_kwargs") is None, f"M3 {variant} unexpectedly sent a hard serve toggle")
+
+        scoped_root = Path(tmp) / "scoped-discovery-artifacts"
+        scoped_root.mkdir()
+        scoped_manifest = make_execution_fixture_manifest(scoped_root)
+        scoped_out = scoped_root / "discovery/m3-qwen3-30b-a3b/cuda/scenario-report.json"
+        scoped_report = execute_manifest(
+            scoped_manifest,
+            scoped_root,
+            scoped_out,
+            discover=True,
+            discovery_scenario="C03",
+            allow_internal_fixture=True,
+        )
+        write_json(scoped_out, scoped_report)
+        require(
+            scoped_report.get("scope")
+            == {
+                "kind": "scenario-contract",
+                "scenario_id": "C03",
+                "contract_id": C03_CONTRACT_ID,
+                "expected_case_count": 10,
+            },
+            "scoped discovery report contract drift",
+        )
+        scoped_observations = require_list(scoped_report.get("observations"), "scoped discovery observations")
+        require(scoped_report.get("case_count") == len(scoped_observations) == 10, "scoped discovery did not execute exactly ten cases")
+        scoped_cases = [read_json(scoped_root / require_object(ref, "scoped observation")["path"]) for ref in scoped_observations]
+        require(
+            {case.get("case_id") for case in scoped_cases} == {f"c03-{index:03d}" for index in range(1, 11)}
+            and {case.get("scenario_id") for case in scoped_cases} == {"C03"},
+            "scoped discovery observation matrix drift",
+        )
+        scoped_invocation = read_json(scoped_root / require_object(scoped_report.get("executor_invocation"), "scoped invocation")["path"])
+        require(
+            "--discover-scenario" in scoped_invocation["argv"]
+            and scoped_invocation["argv"][scoped_invocation["argv"].index("--discover-scenario") + 1] == "C03",
+            "scoped discovery invocation lacks its C03 selector",
+        )
+        try:
+            execute_manifest(
+                scoped_manifest,
+                scoped_root,
+                scoped_out,
+                discover=False,
+                discovery_scenario="C03",
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require("only in discovery mode" in str(exc), f"canonical scope rejection used unexpected reason: {exc}")
+        else:
+            raise AssertionError("canonical execution accepted a discovery scenario filter")
 
         rejected_mutations: set[str] = set()
 
@@ -5475,20 +11791,50 @@ def self_test() -> int:
         expect_execution_report_reject(execution_root, candidate, "environment differs from process receipt")
         rejected_mutations.add("command-receipt-environment-divergence")
 
+        candidate = copy.deepcopy(execution_report)
+        candidate["commands"][0]["wire_receipt"] = copy.deepcopy(
+            candidate["commands"][1]["wire_receipt"]
+        )
+        expect_execution_report_reject(execution_root, candidate, "wire command binding mismatch")
+        rejected_mutations.add("resident-wire-cross-command-binding")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c14-command-binding") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=13)
+            envelope = read_json(envelope_path)
+            scenario["command_ids"] = ["actual-serve-01"]
+            raw["command_ids"] = ["actual-serve-01"]
+            case["command_id"] = "actual-serve-01"
+            envelope["command_id"] = "actual-serve-01"
+            persist_execution_case_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path=envelope_path,
+                envelope=envelope,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "is not bound to command actual-serve-01 process receipt")
+            rejected_mutations.add("post-c09-case-old-process-binding")
+
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-resolution") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0)
             envelope = read_json(envelope_path)
             input_path = mutation_root / case["artifacts"]["input"]["path"]
             input_document = read_json(input_path)
             input_document.pop("resolution_probe")
-            write_json(input_path, input_document)
-            update_ref_sha(case["artifacts"]["input"], mutation_root)
-            command_spec_path = mutation_root / envelope["command_spec"]["path"]
-            command_spec = read_json(command_spec_path)
-            command_spec["input_sha256"] = file_sha256(input_path)
-            write_json(command_spec_path, command_spec)
-            update_ref_sha(envelope["command_spec"], mutation_root)
-            persist_execution_case_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path=envelope_path, envelope=envelope)
+            persist_input_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path,
+                envelope,
+                input_document,
+            )
             expect_execution_report_reject(mutation_root, candidate, "resolution_probe")
             rejected_mutations.add("c01-missing-resolution-probe")
 
@@ -5504,6 +11850,54 @@ def self_test() -> int:
             persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
             expect_execution_report_reject(mutation_root, candidate, "lacks exact unsupported architecture/layout evidence")
             rejected_mutations.add("c01-wrong-negative-failure-class")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-negative-tokenizer") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0, case_index=15)
+            envelope = read_json(envelope_path)
+            input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
+            negative = require_object(input_document.get("negative_probe"), "C01 mutation negative probe")
+            negative_tokenizer = mutation_root / negative["artifacts"]["tokenizer"]["path"]
+            write_json(negative_tokenizer, {"tampered": True})
+            update_ref_sha(negative["artifacts"]["tokenizer"], mutation_root)
+            negative["fixture_manifest_sha256"] = canonical_json_sha256(negative["artifacts"])
+            persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
+            expect_execution_report_reject(mutation_root, candidate, "negative tokenizer differs from the locked source")
+            rejected_mutations.add("c01-negative-tokenizer-drift")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-pass-architecture") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0)
+            envelope = read_json(envelope_path)
+            actual_config_path = mutation_root / envelope["actual_effective_config"]["path"]
+            actual_config = read_json(actual_config_path)
+            actual_config["model_capabilities"]["architecture"] = "unknown"
+            write_json(actual_config_path, actual_config)
+            update_ref_sha(envelope["actual_effective_config"], mutation_root)
+            command_spec_path = mutation_root / envelope["command_spec"]["path"]
+            command_spec = read_json(command_spec_path)
+            command_spec["actual_effective_config_sha256"] = file_sha256(actual_config_path)
+            write_json(command_spec_path, command_spec)
+            update_ref_sha(envelope["command_spec"], mutation_root)
+            persist_execution_case_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path=envelope_path,
+                envelope=envelope,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "architecture differs from lane model")
+            rejected_mutations.add("c01-pass-architecture-mismatch")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c03-input-contract") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=2)
+            envelope = read_json(envelope_path)
+            input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
+            input_document["contract_id"] = "c03-unbound-mutation"
+            persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
+            expect_execution_report_reject(mutation_root, candidate, "versioned C03 contract")
+            rejected_mutations.add("c03-input-contract-drift")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-forged-pair-payload") as (mutation_root, candidate):
             for scenario_index in (4, 5):
@@ -5624,7 +12018,6 @@ def self_test() -> int:
             envelope = read_json(envelope_path)
             for process in (envelope["spawn"], envelope["product_process"]):
                 process["pid"] = 99_999_999
-                process["pgid"] = 99_999_999
             persist_execution_case_mutation(
                 mutation_root,
                 scenario,
@@ -5637,6 +12030,23 @@ def self_test() -> int:
             )
             expect_execution_report_reject(mutation_root, candidate, "PID/PGID mismatch")
             rejected_mutations.add("nonexistent-pid-pgid")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-escaped-product-group") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root)
+            envelope = read_json(envelope_path)
+            envelope["product_process"]["pgid"] += 1
+            persist_execution_case_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path=envelope_path,
+                envelope=envelope,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "escaped the bounded executor process group")
+            rejected_mutations.add("escaped-product-process-group")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c09-trace") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=8)
@@ -5669,8 +12079,39 @@ def self_test() -> int:
             next(cell for cell in raw["concurrency_cells"] if cell["requested_concurrency"] == 32)["observed_max_active"] = 1
             next(cell for cell in scenario["concurrency_cells"] if cell["requested_concurrency"] == 32)["observed_max_active"] = 1
             persist_execution_case_mutation(mutation_root, scenario, raw_path, raw, case_path, case)
-            expect_execution_report_reject(mutation_root, candidate, "observed max-active is not derived from trace")
+            expect_execution_report_reject(mutation_root, candidate, "timeline max-active mismatch")
             rejected_mutations.add("c18-fabricated-max-active")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c18-resource-release") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(
+                candidate,
+                mutation_root,
+                scenario_index=17,
+                case_index=3,
+            )
+            envelope = read_json(envelope_path)
+            transcript = read_json(mutation_root / case["artifacts"]["http_transcript"]["path"])
+            release_row = next(
+                row
+                for row in transcript["scheduler_trace_rows"]
+                if row["raw"].get("resource", {}).get("resource_kind") == "request_slot"
+                and row["raw"].get("resource", {}).get("action") == "release"
+            )
+            release_row["raw"]["resource"]["after"] = 1
+            release_row["raw_sha256"] = canonical_json_sha256(release_row["raw"])
+            persist_transcript_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path,
+                envelope,
+                transcript,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "resource transition mismatch")
+            rejected_mutations.add("c18-forged-resource-release")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-invocation-time") as (mutation_root, candidate):
             invocation_path = mutation_root / candidate["executor_invocation"]["path"]
@@ -5754,19 +12195,139 @@ def self_test() -> int:
         rejected_mutations.add("runner-identity")
 
         canonical_catalog = validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
-        unresolved = [row for row in planned_case_rows("m1-qwen35-4b", "cuda", canonical_catalog) if row["expectation"]["expected_status"] == "discovery-required"]
-        require(unresolved, "discovery-required guard fixture unexpectedly resolved every M1 CUDA case")
-        for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
-            lane_key = f"{model_key}/cuda"
+        m3_failure_counts = {
+            "c01-contract-violation": 20,
+            "c04-contract-violation": 3,
+            "c05-contract-violation": 20,
+            "c06-contract-violation": 20,
+            "c07-contract-violation": 6,
+            "c09-contract-violation": 60,
+            "c10-contract-violation": 60,
+            "c11-contract-violation": 60,
+            "c12-contract-violation": 60,
+            "c13-contract-violation": 60,
+            "c14-contract-violation": 70,
+            "c15-contract-violation": 70,
+            "c17-contract-violation": 60,
+            "c19-contract-violation": 20,
+            "c20-contract-violation": 50,
+            "c21-contract-violation": 16,
+        }
+        locked_lanes = {
+            ("m1-qwen35-4b", "cuda"): {
+                "case_count": 703,
+                "status_counts": {"pass": 465, "known-fail": 238},
+                "failure_counts": {
+                    "c01-contract-violation": 20,
+                    "c04-contract-violation": 3,
+                    "c09-contract-violation": 60,
+                    "c14-contract-violation": 20,
+                    "c15-contract-violation": 5,
+                    "c16-contract-violation": 6,
+                    "c17-contract-violation": 50,
+                    "c18-contract-violation": 4,
+                    "c19-contract-violation": 16,
+                    "c20-contract-violation": 50,
+                    "c21-contract-violation": 4,
+                },
+            },
+            ("m2-qwen35-35b-a3b", "cuda"): {
+                "case_count": 703,
+                "status_counts": {"pass": 114, "known-fail": 589},
+                "failure_counts": {
+                    "c01-contract-violation": 20,
+                    "c03-contract-violation": 10,
+                    "c04-contract-violation": 3,
+                    "c05-contract-violation": 20,
+                    "c06-contract-violation": 20,
+                    "c07-contract-violation": 6,
+                    "c09-contract-violation": 60,
+                    "c10-contract-violation": 40,
+                    "c11-contract-violation": 40,
+                    "c12-contract-violation": 40,
+                    "c13-contract-violation": 40,
+                    "c14-contract-violation": 70,
+                    "c15-contract-violation": 70,
+                    "c17-contract-violation": 60,
+                    "c18-contract-violation": 4,
+                    "c19-contract-violation": 20,
+                    "c20-contract-violation": 50,
+                    "c21-contract-violation": 16,
+                },
+            },
+            ("m3-qwen3-30b-a3b", "cuda"): {
+                "case_count": 783,
+                "status_counts": {"pass": 124, "known-fail": 659},
+                "failure_counts": {**m3_failure_counts, "c18-contract-violation": 4},
+            },
+            ("m3-qwen3-30b-a3b", "metal"): {
+                "case_count": 782,
+                "status_counts": {"pass": 124, "known-fail": 658},
+                "failure_counts": {**m3_failure_counts, "c18-contract-violation": 3},
+            },
+        }
+        for (model_key, backend), locked in locked_lanes.items():
+            rows = planned_case_rows(model_key, backend, canonical_catalog)
+            require(len(rows) == locked["case_count"], f"{model_key}/{backend} locked expectation matrix size drift")
+            status_counts: dict[str, int] = {}
+            failure_counts: dict[str, int] = {}
+            for row in rows:
+                expectation = row["expectation"]
+                status = expectation["expected_status"]
+                status_counts[status] = status_counts.get(status, 0) + 1
+                failure_class = expectation["failure_class"]
+                if failure_class is not None:
+                    failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
+            require(status_counts == locked["status_counts"], f"{model_key}/{backend} locked status distribution drift")
+            require(failure_counts == locked["failure_counts"], f"{model_key}/{backend} locked failure distribution drift")
+
+        discovery_catalog = copy.deepcopy(canonical_catalog)
+        discovery_catalog["lanes"]["m2-qwen35-35b-a3b/cuda"]["rules"] = [
+            {
+                "selector": {
+                    "scenario_id": "*",
+                    "variant": "*",
+                    "preset": "*",
+                    "entrypoint": "*",
+                    "case_id": "*",
+                },
+                "expected_status": "discovery-required",
+                "failure_class": "g00-case-contract-not-previously-observed",
+                "downstream_goal": "G08B",
+                "owner": "discovery-guard-fixture",
+                "evidence_basis": "Mutation fixture requires discovery before formal collection.",
+                "next_action": "Run discovery and review an expectation amendment.",
+            }
+        ]
+        validate_expectations_catalog(discovery_catalog)
+        unresolved = [
+            row
+            for row in planned_case_rows("m2-qwen35-35b-a3b", "cuda", discovery_catalog)
+            if row["expectation"]["expected_status"] == "discovery-required"
+        ]
+        require(len(unresolved) == 703, "discovery-required guard fixture did not cover the complete M2 CUDA lane")
+        for model_key, backend, downstream_goal in (
+            ("m1-qwen35-4b", "cuda", "G08A"),
+            ("m2-qwen35-35b-a3b", "cuda", "G08B"),
+            ("m3-qwen3-30b-a3b", "cuda", "G08C"),
+            ("m3-qwen3-30b-a3b", "metal", "G08C"),
+        ):
+            lane_key = f"{model_key}/{backend}"
             blocked_catalog = copy.deepcopy(canonical_catalog)
             blocked_catalog["lanes"][lane_key]["rules"] = [
                 {
-                    "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+                    "selector": {
+                        "scenario_id": "*",
+                        "variant": "*",
+                        "preset": "*",
+                        "entrypoint": "*",
+                        "case_id": "*",
+                    },
                     "expected_status": "blocked",
                     "failure_class": "legacy-model-backend-unsupported",
-                    "downstream_goal": "G08A" if model_key == "m1-qwen35-4b" else "G08B",
+                    "downstream_goal": downstream_goal,
                     "owner": "red-team-fixture",
-                    "evidence_basis": "Hand-authored whole-lane blocker must not replace CUDA execution.",
+                    "evidence_basis": "Hand-authored whole-lane blocker must not replace executable product evidence.",
                     "next_action": "Run discovery and formal product cases.",
                 }
             ]
@@ -5776,12 +12337,17 @@ def self_test() -> int:
                 require("cannot use blocked for executable lane" in str(exc), f"{lane_key} blocked mutation rejected for unexpected reason: {exc}")
             else:
                 raise AssertionError(f"{lane_key} hand-authored blocked lane unexpectedly passed")
-            rejected_mutations.add(f"{model_key}-cuda-blocked-lane")
+            rejected_mutations.add(f"{model_key}-{backend}-blocked-lane")
 
         required_rejections = {
             "command-receipt-environment-divergence",
+            "resident-wire-cross-command-binding",
+            "post-c09-case-old-process-binding",
             "c01-missing-resolution-probe",
+            "c01-negative-tokenizer-drift",
+            "c01-pass-architecture-mismatch",
             "c01-wrong-negative-failure-class",
+            "c03-input-contract-drift",
             "simultaneously-forged-pair-payload",
             "simultaneously-forged-tool-pair-payload",
             "c06-missing-stream-reconstruction",
@@ -5795,8 +12361,10 @@ def self_test() -> int:
             "invocation-mode",
             "bilateral-status",
             "nonexistent-pid-pgid",
+            "escaped-product-process-group",
             "c09-missing-scheduler-trace",
             "c18-fabricated-max-active",
+            "c18-forged-resource-release",
             "invocation-disjoint-time",
             "unrelated-manifest-snapshot",
             "wrong-product-argv-model",
@@ -5805,6 +12373,8 @@ def self_test() -> int:
             "runner-identity",
             "m1-qwen35-4b-cuda-blocked-lane",
             "m2-qwen35-35b-a3b-cuda-blocked-lane",
+            "m3-qwen3-30b-a3b-cuda-blocked-lane",
+            "m3-qwen3-30b-a3b-metal-blocked-lane",
         }
         require(rejected_mutations == required_rejections, "self-test did not reject the complete mutation corpus")
     print(SELFTEST_PASS_LINE)
@@ -5816,11 +12386,34 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--execute", action="store_true")
     parser.add_argument("--discover", action="store_true")
+    parser.add_argument("--discover-scenario", choices=("C03",))
+    parser.add_argument("--diagnose-c09", action="store_true")
+    parser.add_argument("--focus-case", action="append", default=[])
+    parser.add_argument("--focus-scenario", action="append", choices=SCENARIO_IDS, default=[])
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--self-test-c18-trace-scope", action="store_true")
     args = parser.parse_args()
+    if args.self_test_c18_trace_scope:
+        return self_test_c18_trace_scope()
     if args.self_test:
         return self_test()
+    if args.discover_scenario is not None and not args.discover:
+        parser.error("--discover-scenario requires --discover")
+    if (args.focus_case or args.focus_scenario) and not args.execute:
+        parser.error("--focus-case/--focus-scenario require --execute")
+    invalid_case_ids = [
+        case_id for case_id in args.focus_case if not CASE_ID_RE.fullmatch(case_id)
+    ]
+    if invalid_case_ids:
+        parser.error(f"--focus-case values must be canonical case ids: {invalid_case_ids}")
+    if sum((args.execute, args.discover, args.diagnose_c09)) > 1:
+        parser.error("--execute, --discover, and --diagnose-c09 are mutually exclusive")
+    if (args.focus_case or args.focus_scenario) and (
+        args.discover or args.diagnose_c09
+    ):
+        parser.error("focused execution, discovery, and C09 diagnostic are mutually exclusive")
     if args.manifest is None or args.artifact_root is None or args.out is None:
         parser.error("--manifest, --artifact-root, and --out are required")
     root = args.artifact_root.resolve()
@@ -5828,10 +12421,97 @@ def main() -> int:
     try:
         out.relative_to(root)
         manifest = read_json(args.manifest.resolve())
-        report = execute_manifest(manifest, root, out, discover=args.discover) if args.discover else collect_manifest(manifest, root, out)
+        report = (
+            execute_manifest(
+                manifest,
+                root,
+                out,
+                discover=args.discover,
+                discovery_scenario=args.discover_scenario,
+                diagnose_c09=args.diagnose_c09,
+                focus_case_ids=args.focus_case,
+                focus_scenario_ids=args.focus_scenario,
+            )
+            if args.execute or args.discover or args.diagnose_c09
+            else collect_manifest(manifest, root, out)
+        )
         write_json(out, report)
     except (ScenarioError, ValueError) as exc:
-        print(f"FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL: {args.out}: {exc}", file=sys.stderr)
+        manifest_value = locals().get("manifest")
+        contract = (
+            manifest_value.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+            if isinstance(manifest_value, dict)
+            else LEGACY_EXECUTION_CONTRACT
+        )
+        fail_prefix = (
+            C09_DIAGNOSTIC_REJECT_PREFIX
+            if args.diagnose_c09
+            else FOCUSED_DIAGNOSTIC_REJECT_PREFIX
+            if args.focus_case or args.focus_scenario
+            else "FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS FAIL"
+            if contract == G08_EXECUTION_CONTRACT
+            else "FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL"
+        )
+        diagnostic_requested = bool(
+            args.diagnose_c09 or args.focus_case or args.focus_scenario
+        )
+        if diagnostic_requested and args.out is not None:
+            reject_out = args.out.resolve()
+            try:
+                reject_out.relative_to(root)
+            except ValueError:
+                pass
+            else:
+                focused = bool(args.focus_case or args.focus_scenario)
+                write_json(
+                    reject_out,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "artifact_kind": (
+                            "runtime-vnext-focused-diagnostic"
+                            if focused
+                            else "runtime-vnext-c09-three-variant-diagnostic"
+                        ),
+                        "status": "fail",
+                        "decision": "REJECT",
+                        "formal_pass_allowed": False,
+                        "error": str(exc),
+                        **(
+                            {
+                                "scope": {
+                                    "kind": "focused-diagnostic",
+                                    "requested_case_ids": args.focus_case,
+                                    "requested_scenario_ids": args.focus_scenario,
+                                }
+                            }
+                            if focused
+                            else {}
+                        ),
+                        **(
+                            {
+                                key: manifest_value[key]
+                                for key in (
+                                    "source_git_sha",
+                                    "source_tree_sha",
+                                    "dirty_status",
+                                    "models_lock_sha256",
+                                    "binary_sha256",
+                                    "model_key",
+                                    "backend",
+                                    "model_revision",
+                                    "model_files",
+                                    "hardware_id",
+                                )
+                                if key in manifest_value
+                            }
+                            if isinstance(manifest_value, dict)
+                            else {}
+                        ),
+                        "artifact_path": str(reject_out),
+                        "pass_line": None,
+                    },
+                )
+        print(f"{fail_prefix}: {args.out}: {exc}", file=sys.stderr)
         return 1
     if args.discover:
         print(f"FERRUM RUNTIME VNEXT G00 SCENARIOS DISCOVERY COMPLETE: {out}")

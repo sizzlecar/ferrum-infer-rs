@@ -9,6 +9,8 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::backend::native_status::StagedNativeStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CudaMarlinRuntimeConfig {
     profile: bool,
@@ -1036,6 +1038,230 @@ pub fn marlin_gemm_moe(
 
 // ===================== Stage 14: vLLM marlin_moe_wna16 port =====================
 
+fn marlin_moe_ffi_status(ret: i32) -> (&'static str, u32) {
+    let status =
+        StagedNativeStatus::decode(ret).expect("Marlin-MoE status decoder requires a failure");
+    let stage = match status.stage() {
+        1 => "sm-count",
+        2 => "max-shared-memory",
+        3 => "act-order-launch",
+        4 => "blocks-per-sm",
+        5 => "function-attribute",
+        6 => "kernel-launch",
+        _ => "unknown",
+    };
+    (stage, u32::from(status.native_status()))
+}
+
+/// Raw, allocation-agnostic arguments for the vLLM Marlin-MoE launch.
+///
+/// The owning caller must retain every allocation until work enqueued on
+/// `stream` has completed. Optional pointers deliberately retain their
+/// corresponding mode flags so this boundary can reject inconsistent FFI
+/// states before the vendored C++ implementation reaches `TORCH_CHECK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarlinMoeRawLaunchArgs {
+    pub(crate) a: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) b: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c_tmp: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) scales: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) zero_points: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) workspace: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) sorted_token_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) expert_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) num_tokens_past_padded: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) topk_weights: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) moe_block_size: i32,
+    pub(crate) top_k: i32,
+    pub(crate) mul_topk_weights: bool,
+    pub(crate) is_ep: bool,
+    pub(crate) prob_m: i32,
+    pub(crate) prob_n: i32,
+    pub(crate) prob_k: i32,
+    pub(crate) group_size: i32,
+    pub(crate) has_zero_points: bool,
+    pub(crate) device_ordinal: i32,
+    pub(crate) use_atomic_add: bool,
+    pub(crate) use_fp32_reduce: bool,
+}
+
+impl MarlinMoeRawLaunchArgs {
+    fn validate(&self) -> candle_core::Result<()> {
+        validate_marlin_moe_pointer("a", self.a, 16)?;
+        validate_marlin_moe_pointer("b", self.b, 16)?;
+        validate_marlin_moe_pointer("c", self.c, 16)?;
+        validate_marlin_moe_pointer("scales", self.scales, 16)?;
+        validate_marlin_moe_pointer("workspace", self.workspace, 4)?;
+        validate_marlin_moe_pointer("sorted_token_ids", self.sorted_token_ids, 4)?;
+        validate_marlin_moe_pointer("expert_ids", self.expert_ids, 4)?;
+        validate_marlin_moe_pointer("num_tokens_past_padded", self.num_tokens_past_padded, 4)?;
+        if let Some(pointer) = self.c_tmp {
+            validate_marlin_moe_pointer("c_tmp", pointer, 16)?;
+        }
+        if let Some(pointer) = self.zero_points {
+            validate_marlin_moe_pointer("zero_points", pointer, 16)?;
+        }
+        if let Some(pointer) = self.topk_weights {
+            validate_marlin_moe_pointer("topk_weights", pointer, 4)?;
+        }
+
+        if self.prob_m <= 0 || self.prob_n <= 0 || self.prob_k <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "prob_m, prob_n, and prob_k must be positive, got [{}, {}, {}]",
+                self.prob_m, self.prob_n, self.prob_k
+            )));
+        }
+        if !matches!(self.moe_block_size, 8 | 16 | 32 | 48 | 64) {
+            return Err(invalid_marlin_moe_args(format!(
+                "unsupported moe_block_size {}; expected one of 8, 16, 32, 48, 64",
+                self.moe_block_size
+            )));
+        }
+        if self.top_k <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "top_k must be positive, got {}",
+                self.top_k
+            )));
+        }
+        if self.prob_m.checked_mul(self.top_k).is_none() {
+            return Err(invalid_marlin_moe_args(
+                "prob_m * top_k overflows the kernel's i32 output-row domain",
+            ));
+        }
+        if self.prob_n % 64 != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "prob_n {} must be divisible by the Marlin minimum thread width 64",
+                self.prob_n
+            )));
+        }
+        if self.prob_k % 64 != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "prob_k {} must be divisible by the Marlin minimum thread width 64",
+                self.prob_k
+            )));
+        }
+        if self.group_size != -1 {
+            if self.group_size <= 0 || self.group_size % 16 != 0 {
+                return Err(invalid_marlin_moe_args(format!(
+                    "group_size must be -1 or a positive multiple of 16, got {}",
+                    self.group_size
+                )));
+            }
+            if self.prob_k % self.group_size != 0 {
+                return Err(invalid_marlin_moe_args(format!(
+                    "prob_k {} must be divisible by group_size {}",
+                    self.prob_k, self.group_size
+                )));
+            }
+        }
+        if self.device_ordinal < 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "device_ordinal must be non-negative, got {}",
+                self.device_ordinal
+            )));
+        }
+        if self.has_zero_points != self.zero_points.is_some() {
+            return Err(invalid_marlin_moe_args(
+                "has_zero_points must exactly match the zero_points pointer",
+            ));
+        }
+        if self.mul_topk_weights && self.topk_weights.is_none() {
+            return Err(invalid_marlin_moe_args(
+                "mul_topk_weights requires a non-null topk_weights pointer",
+            ));
+        }
+        if self.use_atomic_add == self.use_fp32_reduce {
+            return Err(invalid_marlin_moe_args(
+                "exactly one of use_atomic_add and use_fp32_reduce must be enabled",
+            ));
+        }
+        if self.use_fp32_reduce != self.c_tmp.is_some() {
+            return Err(invalid_marlin_moe_args(
+                "use_fp32_reduce must exactly match the c_tmp pointer",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_marlin_moe_pointer(
+    name: &str,
+    pointer: cudarc::driver::sys::CUdeviceptr,
+    alignment: u64,
+) -> candle_core::Result<()> {
+    if pointer == 0 {
+        return Err(invalid_marlin_moe_args(format!(
+            "{name} pointer must be non-null"
+        )));
+    }
+    if pointer % alignment != 0 {
+        return Err(invalid_marlin_moe_args(format!(
+            "{name} pointer 0x{pointer:x} must be aligned to {alignment} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_marlin_moe_args(reason: impl std::fmt::Display) -> candle_core::Error {
+    candle_core::Error::Msg(format!("invalid vLLM Marlin-MoE launch: {reason}"))
+}
+
+#[cfg(feature = "vllm-moe-marlin")]
+pub(crate) fn launch_marlin_moe_vllm_raw(
+    stream: &CudaStream,
+    args: MarlinMoeRawLaunchArgs,
+) -> candle_core::Result<()> {
+    args.validate()?;
+    let ret = unsafe {
+        ferrum_vllm_marlin_moe_f16(
+            args.a as *const _,
+            args.b as *const _,
+            args.c as *mut _,
+            args.c_tmp.unwrap_or_default() as *mut _,
+            args.scales as *const _,
+            args.zero_points.unwrap_or_default() as *const _,
+            args.workspace as *mut _,
+            args.sorted_token_ids as *const i32,
+            args.expert_ids as *const i32,
+            args.num_tokens_past_padded as *const i32,
+            args.topk_weights.unwrap_or_default() as *const f32,
+            args.moe_block_size,
+            args.top_k,
+            i32::from(args.mul_topk_weights),
+            i32::from(args.is_ep),
+            args.prob_m,
+            args.prob_n,
+            args.prob_k,
+            args.group_size,
+            i32::from(args.has_zero_points),
+            args.device_ordinal,
+            stream.cu_stream(),
+            i32::from(args.use_atomic_add),
+            i32::from(args.use_fp32_reduce),
+        )
+    };
+    if ret != 0 {
+        let (stage, cuda_status) = marlin_moe_ffi_status(ret);
+        return Err(candle_core::Error::Msg(format!(
+            "ferrum_vllm_marlin_moe_f16 failed at {stage}: \
+             cuda_status={cuda_status}, ret={ret} (m={}, n={}, k={})",
+            args.prob_m, args.prob_n, args.prob_k
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-moe-marlin"))]
+pub(crate) fn launch_marlin_moe_vllm_raw(
+    _stream: &CudaStream,
+    _args: MarlinMoeRawLaunchArgs,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "vLLM marlin_moe_wna16 not built — compile with --features vllm-moe-marlin".into(),
+    ))
+}
+
 /// Stage 14 — fused MoE Marlin via the vendored vLLM marlin_moe_wna16
 /// kernel. Replaces our Stage 12.1 bucketed `marlin_gemm_moe` with a
 /// single launch that processes ALL `(token, expert)` pairs of a layer
@@ -1090,8 +1316,8 @@ pub fn marlin_gemm_moe_vllm(
     let (c_ptr, _cg) = output.device_ptr(stream);
     let (s_ptr, _sg) = weight.scales.device_ptr(stream);
     let z_ptr = match weight.qzeros.as_ref() {
-        Some(z) => z.device_ptr(stream).0 as *const std::ffi::c_void,
-        None => std::ptr::null(),
+        Some(z) => Some(z.device_ptr(stream).0),
+        None => None,
     };
     let (ws_ptr, _wg) = weight.workspace.device_ptr(stream);
     let (st_ptr, _stg) = sorted_token_ids.device_ptr(stream);
@@ -1099,48 +1325,45 @@ pub fn marlin_gemm_moe_vllm(
     let (npp_ptr, _nppg) = num_tokens_past_padded.device_ptr(stream);
 
     let c_tmp_ptr = match c_tmp.as_ref() {
-        Some(c) => c.device_ptr(stream).0 as *mut std::ffi::c_void,
-        None => std::ptr::null_mut(),
+        Some(c) => Some(c.device_ptr(stream).0),
+        None => None,
     };
     let topk_w_ptr = match topk_weights {
-        Some(w) => w.device_ptr(stream).0 as *const f32,
-        None => std::ptr::null(),
+        Some(w) => Some(w.device_ptr(stream).0),
+        None => None,
     };
 
     let timer = profile
         .then(|| CudaMarlinEventTimer::start(raw_stream))
         .flatten();
-    let ret = unsafe {
-        ferrum_vllm_marlin_moe_f16(
-            a_ptr as *const _,
-            b_ptr as *const _,
-            c_ptr as *mut _,
-            c_tmp_ptr,
-            s_ptr as *const _,
-            z_ptr,
-            ws_ptr as *mut _,
-            st_ptr as *const _,
-            eid_ptr as *const _,
-            npp_ptr as *const _,
-            topk_w_ptr,
+    let result = launch_marlin_moe_vllm_raw(
+        stream,
+        MarlinMoeRawLaunchArgs {
+            a: a_ptr,
+            b: b_ptr,
+            c: c_ptr,
+            c_tmp: c_tmp_ptr,
+            scales: s_ptr,
+            zero_points: z_ptr,
+            workspace: ws_ptr,
+            sorted_token_ids: st_ptr,
+            expert_ids: eid_ptr,
+            num_tokens_past_padded: npp_ptr,
+            topk_weights: topk_w_ptr,
             moe_block_size,
             top_k,
-            if mul_topk_weights { 1 } else { 0 },
-            if is_ep { 1 } else { 0 },
+            mul_topk_weights,
+            is_ep,
             prob_m,
             prob_n,
             prob_k,
-            weight.group_size,
-            if weight.qzeros.is_some() { 1 } else { 0 },
-            0, // dev
-            raw_stream,
-            // Atomic-add path when c_tmp is null (fp32-reduce needs the
-            // scratch buffer; passing it but having c_tmp=null makes the
-            // kernel deref a null pointer → NaN / OOB).
-            if c_tmp_ptr.is_null() { 1 } else { 0 }, // use_atomic_add
-            if c_tmp_ptr.is_null() { 0 } else { 1 }, // use_fp32_reduce
-        )
-    };
+            group_size: weight.group_size,
+            has_zero_points: weight.qzeros.is_some(),
+            device_ordinal: 0,
+            use_atomic_add: c_tmp_ptr.is_none(),
+            use_fp32_reduce: c_tmp_ptr.is_some(),
+        },
+    );
     if let Some(timer) = timer {
         let elapsed_us = timer.finish_us(raw_stream);
         MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
@@ -1149,12 +1372,7 @@ pub fn marlin_gemm_moe_vllm(
             record_marlin_kernel(bucket, elapsed_us);
         }
     }
-    if ret != 0 {
-        return Err(candle_core::Error::Msg(format!(
-            "ferrum_vllm_marlin_moe_f16 failed: ret={ret} (m={prob_m}, n={prob_n}, k={prob_k})"
-        )));
-    }
-    Ok(())
+    result
 }
 
 #[cfg(not(feature = "vllm-moe-marlin"))]
@@ -1182,264 +1400,164 @@ pub fn marlin_gemm_moe_vllm(
     ))
 }
 
-// ===================== Weight Repacking (GPTQ → Marlin) =====================
-
-/// Permute GPTQ INT4 qweight rows by `perm` (one-time, CPU work at load).
-/// Input qweight is [K/8, N] packed (8 INT4s per i32 along K). Output is
-/// the same shape, with rows reordered: out[i, n] = in[perm[i], n] (after
-/// unpacking + repacking). Used to put rows in g_idx-sorted order so the
-/// downstream Marlin repack sees a layout where group_idx = i / group_size.
-pub fn permute_gptq_qweight_rows(
-    qweight_gptq: &[i32], // [K/8, N] packed
-    perm: &[usize],       // [K]
-    k: usize,
-    n: usize,
-) -> Vec<i32> {
-    debug_assert_eq!(perm.len(), k);
-    debug_assert_eq!(qweight_gptq.len(), (k / 8) * n);
-
-    // Step 1: Unpack [K/8, N] → [K, N] (one INT4 per byte slot, low 4 bits).
-    let mut kn = vec![0u8; k * n];
-    let packed_rows = k / 8;
-    for pr in 0..packed_rows {
-        for col in 0..n {
-            let packed = qweight_gptq[pr * n + col] as u32;
-            for i in 0..8 {
-                kn[(pr * 8 + i) * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
-            }
-        }
-    }
-
-    // Step 2: Permute rows. out[i, n] = in[perm[i], n].
-    let mut sorted = vec![0u8; k * n];
-    for i in 0..k {
-        let src_row = perm[i];
-        for col in 0..n {
-            sorted[i * n + col] = kn[src_row * n + col];
-        }
-    }
-
-    // Step 3: Repack [K, N] → [K/8, N] (8 INT4s per i32 along K).
-    let mut packed = vec![0i32; (k / 8) * n];
-    for pr in 0..packed_rows {
-        for col in 0..n {
-            let mut word = 0u32;
-            for i in 0..8 {
-                word |= (sorted[(pr * 8 + i) * n + col] as u32) << (i * 4);
-            }
-            packed[pr * n + col] = word as i32;
-        }
-    }
-    packed
-}
-
-/// Repack GPTQ INT4 weights to Marlin format on CPU.
-///
-/// GPTQ format: qweight [K/8, N] int32 (in_features packed, out_features columns)
-/// Marlin format: [N/16, K*16/8] int32, tiled and permuted for tensor core access
-///
-/// Key: Marlin operates on [N, K] layout (out_features first, like PyTorch Linear.weight).
-/// GPTQ stores [K, N]. Must transpose before tiling.
-///
-/// Reference: IST-DASLab/marlin __init__.py Layer.pack()
-pub fn repack_gptq_to_marlin(
-    qweight_gptq: &[i32], // [K/8, N]
-    k: usize,
-    n: usize,
-) -> Vec<i32> {
-    use rayon::prelude::*;
-
-    // Step 1: Unpack GPTQ [K/8, N] → individual INT4 values [K, N].
-    // Parallelize over packed_rows. Each packed row produces 8 output rows
-    // of `n` u8s — disjoint output slices, fully independent.
-    let _packed_rows = k / 8;
-    let mut kn = vec![0u8; k * n];
-    kn.par_chunks_mut(8 * n)
-        .zip(qweight_gptq.par_chunks(n))
-        .for_each(|(kn_block, qw_row)| {
-            // qw_row is one packed row [n] i32; kn_block is 8 unpacked rows [8 * n] u8.
-            for col in 0..n {
-                let packed = qw_row[col];
-                for i in 0..8 {
-                    kn_block[i * n + col] = ((packed >> (i * 4)) & 0xF) as u8;
-                }
-            }
-        });
-
-    // Step 2: Tile [K, N] → [K/16, N/16, 16, 16].
-    // tiled[tk * (n * tile) + tn * (tile*tile) + ik * tile + in_]
-    //                         = kn[(tk*tile + ik) * n + (tn*tile + in_)]
-    // Parallelize over tk (each tk owns a disjoint output range
-    // tiled[tk * (n * tile) .. (tk+1) * (n * tile)]).
-    let tile = 16;
-    let _kt = k / tile;
-    let nt = n / tile;
-    let mut tiled = vec![0u8; k * n];
-    tiled
-        .par_chunks_mut(n * tile)
-        .enumerate()
-        .for_each(|(tk, tile_block)| {
-            for tn in 0..nt {
-                for ik in 0..tile {
-                    for in_ in 0..tile {
-                        let src = (tk * tile + ik) * n + (tn * tile + in_);
-                        let dst = tn * (tile * tile) + ik * tile + in_;
-                        tile_block[dst] = kn[src];
-                    }
-                }
-            }
-        });
-    // Drop kn early — its memory can be reused for permuted/result.
-    drop(kn);
-
-    // Step 3: Apply _perm in blocks of 1024. Each block reads 1024 contiguous
-    // u8s from `tiled` and writes 1024 to `permuted` via the perm table.
-    // Blocks are disjoint in both src and dst → trivially parallel.
-    let perm = build_marlin_perm();
-    let total = k * n;
-    let mut permuted = vec![0u8; total];
-    permuted
-        .par_chunks_mut(1024)
-        .zip(tiled.par_chunks(1024))
-        .for_each(|(out_blk, in_blk)| {
-            for (dst, &src) in perm.iter().enumerate() {
-                out_blk[dst] = in_blk[src];
-            }
-        });
-    drop(tiled);
-
-    // Step 4: Pack 8 INT4 → i32, output shape [N/16, K*2].
-    // Each output i32 reads 8 contiguous u8s — independent.
-    let packed_len = total / 8;
-    let mut result = vec![0i32; packed_len];
-    result
-        .par_iter_mut()
-        .zip(permuted.par_chunks_exact(8))
-        .for_each(|(out, chunk)| {
-            let mut word = 0u32;
-            for (j, &b) in chunk.iter().enumerate() {
-                word |= (b as u32) << (j * 4);
-            }
-            *out = word as i32;
-        });
-
-    result
-}
-
-/// Permute scales from GPTQ layout to Marlin access pattern.
-///
-/// GPTQ: [num_groups, N] row-major (groups along K, columns are out_features)
-/// Marlin: [num_groups, N] but reshuffled to match the kernel's tile access.
-///
-/// Reference: IST-DASLab/marlin __init__.py _scale_perm / _scale_perm_single
-pub fn repack_scales_to_marlin(
-    scales_gptq: &[half::f16], // [num_groups, N]
-    k: usize,
-    n: usize,
-    group_size: usize,
-) -> Vec<half::f16> {
-    let num_groups = k / group_size;
-
-    // Build permutation table matching Marlin's scale access pattern
-    let scale_perm: Vec<usize> = if num_groups > 1 {
-        // Grouped quantization (group_size=128, group_blocks=8)
-        // _scale_perm = [i + 8*j for i in range(8) for j in range(8)]
-        (0..8)
-            .flat_map(|i| (0..8).map(move |j| i + 8 * j))
-            .collect()
-    } else {
-        // Per-channel (group_size=-1, group_blocks=-1)
-        // _scale_perm_single = [2*i+j for i in range(4) for j in [0,1,8,9,16,17,24,25]]
-        (0..4)
-            .flat_map(|i| [0, 1, 8, 9, 16, 17, 24, 25].map(move |j| 2 * i + j))
-            .collect()
-    };
-
-    // Flatten scales, apply permutation in blocks
-    let total = num_groups * n;
-    let perm_len = scale_perm.len();
-    let mut result = vec![half::f16::ZERO; total];
-
-    // Reshape scales as flat array, permute in blocks of perm_len
-    for blk in 0..(total / perm_len) {
-        let base = blk * perm_len;
-        for (dst, &src) in scale_perm.iter().enumerate() {
-            result[base + dst] = scales_gptq[base + src];
-        }
-    }
-    // Remainder (if total not divisible by perm_len)
-    let rem_start = (total / perm_len) * perm_len;
-    for i in rem_start..total {
-        result[i] = scales_gptq[i];
-    }
-    result
-}
-
-/// Build the 1024-element Marlin weight permutation array.
-///
-/// This encodes the m16n8k16 tensor core mma fragment layout.
-/// Each 1024-element block of the tiled weight [N/16, K*16] is
-/// permuted to match how the Marlin kernel loads data into
-/// tensor core fragments via shared memory.
-///
-/// Reference: IST-DASLab/marlin __init__.py _perm construction
-fn build_marlin_perm() -> Vec<usize> {
-    let mut perm = Vec::with_capacity(1024);
-
-    for i in 0..32 {
-        let col = i / 4;
-        let mut perm1 = Vec::with_capacity(8);
-
-        for _block in 0..2 {
-            for &row_off in &[0, 1, 8, 9] {
-                let row = 2 * (i % 4) + row_off / 8 * 8 + row_off % 8;
-                // Actually, the original Python is:
-                // for row in [2*(i%4), 2*(i%4)+1, 2*(i%4+4), 2*(i%4+4)+1]:
-                //     perm1.append(16*row + col + 8*block)
-                let _ = row; // ignore, use direct construction below
-            }
-        }
-
-        // Direct from Python: for block in [0,1]: for row in [...]: perm1.append(...)
-        perm1.clear();
-        for block in 0..2 {
-            for &row in &[
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ] {
-                perm1.push(16 * row + col + 8 * block);
-            }
-        }
-
-        for j in 0..4 {
-            for &p in &perm1 {
-                perm.push(p + 256 * j);
-            }
-        }
-    }
-
-    assert_eq!(perm.len(), 1024);
-
-    // KEY: apply interleave [0,2,4,6,1,3,5,7] within each group of 8
-    let interleave = [0usize, 2, 4, 6, 1, 3, 5, 7];
-    let mut perm_interleaved = vec![0usize; 1024];
-    for g in 0..128 {
-        for i in 0..8 {
-            perm_interleaved[g * 8 + i] = perm[g * 8 + interleave[i]];
-        }
-    }
-
-    perm_interleaved
-}
+pub use crate::marlin_repack::{
+    permute_gptq_qweight_rows, repack_gptq_to_marlin, repack_scales_to_marlin,
+};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        marlin_profile_bucket_from_label, should_zero_workspace, CudaMarlinRuntimeConfig,
-        MarlinProfileBucket, MarlinProfileBucketStats,
+        marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
+        CudaMarlinRuntimeConfig, MarlinMoeRawLaunchArgs, MarlinProfileBucket,
+        MarlinProfileBucketStats,
     };
+
+    fn valid_marlin_moe_raw_args() -> MarlinMoeRawLaunchArgs {
+        MarlinMoeRawLaunchArgs {
+            a: 0x1000,
+            b: 0x2000,
+            c: 0x3000,
+            c_tmp: None,
+            scales: 0x4000,
+            zero_points: None,
+            workspace: 0x5000,
+            sorted_token_ids: 0x6000,
+            expert_ids: 0x7000,
+            num_tokens_past_padded: 0x8000,
+            topk_weights: None,
+            moe_block_size: 16,
+            top_k: 8,
+            mul_topk_weights: false,
+            is_ep: false,
+            prob_m: 4,
+            prob_n: 1024,
+            prob_k: 2048,
+            group_size: 128,
+            has_zero_points: false,
+            device_ordinal: 0,
+            use_atomic_add: true,
+            use_fp32_reduce: false,
+        }
+    }
+
+    #[test]
+    fn marlin_moe_ffi_status_preserves_failure_stage_and_cuda_status() {
+        assert_eq!(marlin_moe_ffi_status((1 << 16) | 10), ("sm-count", 10));
+        assert_eq!(
+            marlin_moe_ffi_status((5 << 16) | 9),
+            ("function-attribute", 9)
+        );
+        assert_eq!(
+            marlin_moe_ffi_status((6 << 16) | 701),
+            ("kernel-launch", 701)
+        );
+        assert_eq!(marlin_moe_ffi_status(17), ("unknown", 17));
+    }
+
+    fn assert_invalid_marlin_moe_args(args: MarlinMoeRawLaunchArgs, expected: &str) {
+        let error = args.validate().expect_err("launch arguments must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_accept_supported_modes() {
+        valid_marlin_moe_raw_args().validate().unwrap();
+
+        let mut fp32_reduce = valid_marlin_moe_raw_args();
+        fp32_reduce.c_tmp = Some(0x9000);
+        fp32_reduce.zero_points = Some(0xa000);
+        fp32_reduce.topk_weights = Some(0xb000);
+        fp32_reduce.has_zero_points = true;
+        fp32_reduce.mul_topk_weights = true;
+        fp32_reduce.use_atomic_add = false;
+        fp32_reduce.use_fp32_reduce = true;
+        fp32_reduce.validate().unwrap();
+
+        let mut per_channel = valid_marlin_moe_raw_args();
+        per_channel.group_size = -1;
+        per_channel.validate().unwrap();
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_reject_invalid_pointers() {
+        let mut args = valid_marlin_moe_raw_args();
+        args.a = 0;
+        assert_invalid_marlin_moe_args(args, "a pointer must be non-null");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.scales += 2;
+        assert_invalid_marlin_moe_args(args, "scales pointer");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.topk_weights = Some(0xb002);
+        assert_invalid_marlin_moe_args(args, "topk_weights pointer");
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_reject_invalid_shapes_and_config() {
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_m = 0;
+        assert_invalid_marlin_moe_args(args, "must be positive");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.moe_block_size = 24;
+        assert_invalid_marlin_moe_args(args, "unsupported moe_block_size");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.top_k = 0;
+        assert_invalid_marlin_moe_args(args, "top_k must be positive");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_m = i32::MAX;
+        assert_invalid_marlin_moe_args(args, "prob_m * top_k overflows");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_n = 96;
+        assert_invalid_marlin_moe_args(args, "prob_n 96 must be divisible");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.prob_k = 96;
+        args.group_size = -1;
+        assert_invalid_marlin_moe_args(args, "prob_k 96 must be divisible");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.group_size = 0;
+        assert_invalid_marlin_moe_args(args, "group_size must be -1");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.group_size = 96;
+        assert_invalid_marlin_moe_args(args, "must be divisible by group_size");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.device_ordinal = -1;
+        assert_invalid_marlin_moe_args(args, "device_ordinal must be non-negative");
+    }
+
+    #[test]
+    fn marlin_moe_raw_args_reject_inconsistent_optional_modes() {
+        let mut args = valid_marlin_moe_raw_args();
+        args.has_zero_points = true;
+        assert_invalid_marlin_moe_args(args, "has_zero_points must exactly match");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.mul_topk_weights = true;
+        assert_invalid_marlin_moe_args(args, "requires a non-null topk_weights");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.use_fp32_reduce = true;
+        assert_invalid_marlin_moe_args(args, "exactly one");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.use_atomic_add = false;
+        assert_invalid_marlin_moe_args(args, "exactly one");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.c_tmp = Some(0x9000);
+        assert_invalid_marlin_moe_args(args, "use_fp32_reduce must exactly match");
+    }
 
     #[test]
     fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
