@@ -9,6 +9,8 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::backend::native_status::StagedNativeStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CudaMarlinRuntimeConfig {
     profile: bool,
@@ -1036,6 +1038,21 @@ pub fn marlin_gemm_moe(
 
 // ===================== Stage 14: vLLM marlin_moe_wna16 port =====================
 
+fn marlin_moe_ffi_status(ret: i32) -> (&'static str, u32) {
+    let status =
+        StagedNativeStatus::decode(ret).expect("Marlin-MoE status decoder requires a failure");
+    let stage = match status.stage() {
+        1 => "sm-count",
+        2 => "max-shared-memory",
+        3 => "act-order-launch",
+        4 => "blocks-per-sm",
+        5 => "function-attribute",
+        6 => "kernel-launch",
+        _ => "unknown",
+    };
+    (stage, u32::from(status.native_status()))
+}
+
 /// Raw, allocation-agnostic arguments for the vLLM Marlin-MoE launch.
 ///
 /// The owning caller must retain every allocation until work enqueued on
@@ -1225,8 +1242,10 @@ pub(crate) fn launch_marlin_moe_vllm_raw(
         )
     };
     if ret != 0 {
+        let (stage, cuda_status) = marlin_moe_ffi_status(ret);
         return Err(candle_core::Error::Msg(format!(
-            "ferrum_vllm_marlin_moe_f16 failed: ret={ret} (m={}, n={}, k={})",
+            "ferrum_vllm_marlin_moe_f16 failed at {stage}: \
+             cuda_status={cuda_status}, ret={ret} (m={}, n={}, k={})",
             args.prob_m, args.prob_n, args.prob_k
         )));
     }
@@ -1388,8 +1407,9 @@ pub use crate::marlin_repack::{
 #[cfg(test)]
 mod tests {
     use super::{
-        marlin_profile_bucket_from_label, should_zero_workspace, CudaMarlinRuntimeConfig,
-        MarlinMoeRawLaunchArgs, MarlinProfileBucket, MarlinProfileBucketStats,
+        marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
+        CudaMarlinRuntimeConfig, MarlinMoeRawLaunchArgs, MarlinProfileBucket,
+        MarlinProfileBucketStats,
     };
 
     fn valid_marlin_moe_raw_args() -> MarlinMoeRawLaunchArgs {
@@ -1418,6 +1438,20 @@ mod tests {
             use_atomic_add: true,
             use_fp32_reduce: false,
         }
+    }
+
+    #[test]
+    fn marlin_moe_ffi_status_preserves_failure_stage_and_cuda_status() {
+        assert_eq!(marlin_moe_ffi_status((1 << 16) | 10), ("sm-count", 10));
+        assert_eq!(
+            marlin_moe_ffi_status((5 << 16) | 9),
+            ("function-attribute", 9)
+        );
+        assert_eq!(
+            marlin_moe_ffi_status((6 << 16) | 701),
+            ("kernel-launch", 701)
+        );
+        assert_eq!(marlin_moe_ffi_status(17), ("unknown", 17));
     }
 
     fn assert_invalid_marlin_moe_args(args: MarlinMoeRawLaunchArgs, expected: &str) {
