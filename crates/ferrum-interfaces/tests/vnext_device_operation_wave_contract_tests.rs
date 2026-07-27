@@ -858,6 +858,23 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
         evidence.attribution().submission_fingerprint(),
         submission_fingerprint
     );
+    let artifact =
+        serde_json::to_value(evidence.into_artifact_execution("eager-00").unwrap()).unwrap();
+    assert_eq!(artifact["mode"], "eager");
+    assert_eq!(
+        artifact["initialization_identity"]["input_sha256"],
+        initialization_identity.input_sha256()
+    );
+    assert!(artifact["attribution"]["physical_commands"]
+        .as_array()
+        .is_some_and(|commands| !commands.is_empty()));
+    assert_eq!(
+        artifact["attribution"]["replayed_segments"],
+        serde_json::json!([])
+    );
+    assert!(artifact["witnesses"]
+        .as_array()
+        .is_some_and(|witnesses| !witnesses.is_empty()));
 
     drop(providers);
     drop(active_bindings);
@@ -2541,6 +2558,18 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         .physical_readbacks()
         .iter()
         .all(|readback| !readback.bytes().is_empty() && readback.raw_sha256().len() == 64));
+    let artifact =
+        serde_json::to_value(evidence.into_artifact_execution("replay-00").unwrap()).unwrap();
+    assert_eq!(artifact["mode"], "replay");
+    assert_eq!(
+        artifact["attribution"]["replayed_segments"][0]["logical_commands"]
+            .as_array()
+            .map(Vec::len),
+        Some(providers.len())
+    );
+    assert!(artifact["attribution"]
+        .get("reusable_executable_fingerprint")
+        .is_none());
 
     drop(providers);
     drop(active_bindings);

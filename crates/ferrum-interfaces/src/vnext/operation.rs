@@ -32,16 +32,24 @@ use super::{
 
 mod compiled_submission_wave;
 mod determinism;
+mod determinism_artifact;
 mod dispatch;
 
 pub use compiled_submission_wave::CompiledSubmissionWaveIdentity;
 use compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
 pub use determinism::{
     SubmissionWaveDeterminismEvidence, SubmissionWaveDeterminismHandle,
-    SubmissionWaveDeterminismLogicalRange, SubmissionWaveDeterminismPhysicalReadback,
-    SubmissionWaveDeterminismReadbackPlan, SubmissionWaveDeterminismReadbackTarget,
-    SubmissionWaveDeterminismRestore, SubmissionWaveDeterminismRestoreLayout,
-    SubmissionWaveDeterminismWitnessReadback,
+    SubmissionWaveDeterminismInitializationIdentity, SubmissionWaveDeterminismLogicalRange,
+    SubmissionWaveDeterminismPhysicalReadback, SubmissionWaveDeterminismReadbackPlan,
+    SubmissionWaveDeterminismReadbackTarget, SubmissionWaveDeterminismRestore,
+    SubmissionWaveDeterminismRestoreLayout, SubmissionWaveDeterminismWitnessReadback,
+};
+pub use determinism_artifact::{
+    SubmissionWaveDeterminismArtifactAttribution, SubmissionWaveDeterminismArtifactExecution,
+    SubmissionWaveDeterminismArtifactInitializationIdentity,
+    SubmissionWaveDeterminismArtifactLogicalCommand,
+    SubmissionWaveDeterminismArtifactPhysicalCommand,
+    SubmissionWaveDeterminismArtifactReplayedSegment, SubmissionWaveDeterminismArtifactWitness,
 };
 pub use dispatch::{
     BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatch,
