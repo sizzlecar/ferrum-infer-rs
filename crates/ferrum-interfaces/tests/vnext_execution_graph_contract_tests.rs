@@ -641,6 +641,22 @@ fn execution_determinism_witness_scope_is_exact_canonical_and_plan_derived() {
         .iter()
         .flat_map(|requirement| requirement.node_ids())
         .all(|node_id| witness_plan.node_ids().contains(node_id)));
+    let encoded = witness_plan.to_json().unwrap();
+    assert_eq!(
+        ExecutionDeterminismWitnessPlan::decode_untrusted(&encoded).unwrap(),
+        witness_plan
+    );
+    assert_eq!(witness_plan.fingerprint().unwrap().len(), 64);
+
+    let mut missing_output: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    missing_output["witnesses"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|witness| witness["location"]["node_id"] != nodes[1].id().as_str());
+    assert!(ExecutionDeterminismWitnessPlan::decode_untrusted(
+        &serde_json::to_vec(&missing_output).unwrap()
+    )
+    .is_err());
 
     assert!(fixture
         .plan
