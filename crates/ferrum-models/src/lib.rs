@@ -51,7 +51,10 @@ pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
     BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
+    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
+    VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
     VNextExecutorConfig, VNextModelExecutor, WhisperModelExecutor,
+    MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
