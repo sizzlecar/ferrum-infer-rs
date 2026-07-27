@@ -15,14 +15,22 @@ use ferrum_interfaces::vnext::{
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
+#[cfg(feature = "vllm-marlin")]
+use super::{
+    moe_weights::{
+        resolve_gptq_marlin_matrix_weight, GPTQ_MARLIN_CAPABILITY_ID,
+        GPTQ_MARLIN_QUANTIZATION_FORMAT_ID, GPTQ_MARLIN_WEIGHT_FORMAT_ID,
+    },
+    MarlinProjectionRuntime,
+};
 #[cfg(feature = "vllm-paged-attn-v2")]
 use crate::backend::cuda::vllm_paged_attn::{
     dispatch_vnext_addressed_paged_attention_raw, VnextAddressedPagedAttentionKernel,
@@ -74,6 +82,8 @@ const VARLEN_TILED_QUERY_TOKENS: u64 = 4;
 pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider {
     descriptor: OperationProviderDescriptor,
     functions: CausalAttentionFunctions,
+    #[cfg(feature = "vllm-marlin")]
+    projection_runtime: MarlinProjectionRuntime,
 }
 
 #[derive(Clone)]
@@ -110,6 +120,12 @@ impl CudaCausalPagedAttentionProvider {
             crate::ptx::QK_NORM_ROPE.as_bytes(),
             crate::ptx::RESIDUAL_ADD.as_bytes(),
         ];
+        #[cfg(feature = "vllm-marlin")]
+        provider_sources.extend([
+            include_str!("moe_weights.rs").as_bytes(),
+            include_str!("../../vllm_marlin.rs").as_bytes(),
+            GPTQ_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
+        ]);
         #[cfg(feature = "vllm-paged-attn-v2")]
         provider_sources.extend([
             include_str!("../../vllm_paged_attn.rs").as_bytes(),
@@ -128,6 +144,33 @@ impl CudaCausalPagedAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint =
             implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
+        let mut provider_capabilities = BTreeSet::from([capability]);
+        let mut accepted_weight_formats =
+            BTreeSet::from([
+                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
+            ]);
+        let mut accepted_quantization_formats = BTreeSet::new();
+        #[cfg(feature = "vllm-marlin")]
+        {
+            let marlin_capability =
+                CapabilityId::new(GPTQ_MARLIN_CAPABILITY_ID).map_err(contract_error)?;
+            if !runtime
+                .descriptor()
+                .capabilities
+                .contains(&marlin_capability)
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA runtime does not advertise causal-attention GPTQ-Marlin",
+                ));
+            }
+            provider_capabilities.insert(marlin_capability);
+            accepted_weight_formats
+                .insert(WeightFormatId::new(GPTQ_MARLIN_WEIGHT_FORMAT_ID).map_err(contract_error)?);
+            accepted_quantization_formats.insert(
+                QuantizationFormatId::new(GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+        }
         let descriptor = OperationProviderDescriptor::new(
             ProviderId::new(PROVIDER_ID).map_err(contract_error)?,
             contract.descriptor().id.clone(),
@@ -139,11 +182,9 @@ impl CudaCausalPagedAttentionProvider {
             ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
-            BTreeSet::from([capability]),
-            BTreeSet::from([
-                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
-            ]),
-            BTreeSet::new(),
+            provider_capabilities,
+            accepted_weight_formats,
+            accepted_quantization_formats,
             storage_bindings().map_err(contract_error)?,
             ESTIMATOR_ID,
             ContractVersion::new(1, 0),
@@ -218,6 +259,8 @@ impl CudaCausalPagedAttentionProvider {
         Ok(Self {
             descriptor,
             functions,
+            #[cfg(feature = "vllm-marlin")]
+            projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
     }
 }
@@ -277,9 +320,23 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         )?;
         let shape =
             CausalAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
+        #[cfg(feature = "vllm-marlin")]
+        let projection = CausalProjection::from_values(request.values(), self.projection_runtime)
+            .map_err(invalid_plan)?;
+        #[cfg(not(feature = "vllm-marlin"))]
+        let projection = CausalProjection::F16;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                shape.vllm_scratch_bytes().map_err(invalid_plan)?,
+                shape
+                    .vllm_scratch_bytes()
+                    .and_then(|bytes| {
+                        bytes
+                            .checked_add(projection.workspace_bytes()?)
+                            .ok_or_else(|| {
+                                "causal attention fixed scratch size overflows".to_owned()
+                            })
+                    })
+                    .map_err(invalid_plan)?,
                 0,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
@@ -331,6 +388,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         encode_attention(
             &self.functions,
             self.descriptor.provider_implementation_fingerprint(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
             invocation,
         )
         .map_err(|message| {
@@ -864,8 +923,71 @@ struct CudaCausalAttentionShape {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum CausalProjection {
+    F16,
+    #[cfg(feature = "vllm-marlin")]
+    GptqMarlin {
+        runtime: MarlinProjectionRuntime,
+    },
+}
+
+impl CausalProjection {
+    #[cfg(feature = "vllm-marlin")]
+    fn from_values(
+        values: &[ResolvedValueBinding],
+        runtime: MarlinProjectionRuntime,
+    ) -> Result<Self, String> {
+        let mut uses_marlin = false;
+        for ordinal in 2..=5 {
+            let value = binding(values, ResolvedValueRole::Input, ordinal)?;
+            let weight = value.weight().ok_or_else(|| {
+                format!(
+                    "causal attention projection input {ordinal} lacks its physical weight layout"
+                )
+            })?;
+            let quantization_formats = weight.quantization_formats();
+            if quantization_formats.is_empty() {
+                continue;
+            }
+            if quantization_formats.len() != 1
+                || !quantization_formats
+                    .iter()
+                    .any(|format| format.as_str() == GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
+            {
+                return Err(format!(
+                    "causal attention projection input {ordinal} is not exact symmetric GPTQ-Marlin INT4"
+                ));
+            }
+            uses_marlin = true;
+        }
+        Ok(if uses_marlin {
+            Self::GptqMarlin { runtime }
+        } else {
+            Self::F16
+        })
+    }
+
+    fn workspace_bytes(self) -> Result<u64, String> {
+        match self {
+            Self::F16 => Ok(0),
+            #[cfg(feature = "vllm-marlin")]
+            Self::GptqMarlin { runtime } => runtime.workspace_bytes(),
+        }
+    }
+
+    fn replay_tag(self) -> &'static str {
+        match self {
+            Self::F16 => "f16-cublas",
+            #[cfg(feature = "vllm-marlin")]
+            Self::GptqMarlin { .. } => "mixed-gptq-marlin-u4b8-f16-reduce",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
+    projection_workspace: Option<u64>,
     normalized: u64,
     query_raw: u64,
     key_raw: u64,
@@ -884,11 +1006,19 @@ struct VllmScratchLayout {
 }
 
 impl ScratchLayout {
-    fn new(shape: CausalAttentionShape, total_tokens: u64) -> Result<Self, String> {
+    fn new(
+        shape: CausalAttentionShape,
+        total_tokens: u64,
+        projection: CausalProjection,
+    ) -> Result<Self, String> {
         if total_tokens == 0 {
             return Err("causal attention scratch cannot be sized for empty work".to_owned());
         }
         let mut offset = 0;
+        let projection_workspace_bytes = projection.workspace_bytes()?;
+        let projection_workspace = (projection_workspace_bytes > 0)
+            .then(|| reserve_elements(&mut offset, projection_workspace_bytes, 1))
+            .transpose()?;
         let normalized = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
         let query_raw = reserve_tokens(&mut offset, shape.query_projection_features, total_tokens)?;
         let key_raw = reserve_tokens(&mut offset, shape.kv_features, total_tokens)?;
@@ -925,12 +1055,14 @@ impl ScratchLayout {
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         let expected = token_bytes
             .checked_add(shape.vllm_scratch_bytes()?)
+            .and_then(|bytes| bytes.checked_add(projection_workspace_bytes))
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         if offset != expected {
             return Err("causal attention scratch layout differs from its estimate".to_owned());
         }
         Ok(Self {
             required_bytes: offset,
+            projection_workspace,
             normalized,
             query_raw,
             key_raw,
@@ -980,14 +1112,37 @@ impl BindingLayout {
 #[derive(Debug, Clone, Copy)]
 struct SharedRegions {
     input_norm: usize,
-    query_weight: usize,
-    key_weight: usize,
-    value_weight: usize,
-    output_weight: usize,
+    query_weight: SharedProjectionWeight,
+    key_weight: SharedProjectionWeight,
+    value_weight: SharedProjectionWeight,
+    output_weight: SharedProjectionWeight,
     query_norm: usize,
     key_norm: usize,
     scratch: usize,
     binding: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SharedProjectionWeight {
+    F16 {
+        region: usize,
+    },
+    #[cfg(feature = "vllm-marlin")]
+    GptqMarlin {
+        packed_region: usize,
+        scales_region: usize,
+        group_size: i32,
+    },
+}
+
+impl SharedProjectionWeight {
+    fn replay_tag(self) -> &'static str {
+        match self {
+            Self::F16 { .. } => "f16",
+            #[cfg(feature = "vllm-marlin")]
+            Self::GptqMarlin { .. } => "gptq-marlin-u4b8",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1015,6 +1170,7 @@ struct CausalAttentionBinding {
 fn encode_attention(
     functions: &CausalAttentionFunctions,
     provider_fingerprint: &str,
+    #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
@@ -1024,17 +1180,29 @@ fn encode_attention(
     }
     let first = &invocation.participants()[0];
     let shape = CausalAttentionShape::from_attributes(first.attributes())?;
+    #[cfg(feature = "vllm-marlin")]
+    let projection = CausalProjection::from_values(first.bindings(), projection_runtime)?;
+    #[cfg(not(feature = "vllm-marlin"))]
+    let projection = CausalProjection::F16;
     validate_signature(first, shape)?;
     for participant in &invocation.participants()[1..] {
         if CausalAttentionShape::from_attributes(participant.attributes())? != shape {
             return Err("CUDA causal attention participant attributes disagree".to_owned());
+        }
+        #[cfg(feature = "vllm-marlin")]
+        if CausalProjection::from_values(participant.bindings(), projection_runtime)?.replay_tag()
+            != projection.replay_tag()
+        {
+            return Err(
+                "CUDA causal attention participants use different projection ABIs".to_owned(),
+            );
         }
         validate_signature(participant, shape)?;
     }
     let program_binding = invocation.program_binding().cloned();
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens)?;
+    let layout = ScratchLayout::new(shape, total_tokens, projection)?;
     let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
@@ -1053,10 +1221,30 @@ fn encode_attention(
     let mut compute_regions = Vec::new();
     let shared = SharedRegions {
         input_norm: push_shared_weight(&mut compute_regions, &invocation, 1)?,
-        query_weight: push_shared_weight(&mut compute_regions, &invocation, 2)?,
-        key_weight: push_shared_weight(&mut compute_regions, &invocation, 3)?,
-        value_weight: push_shared_weight(&mut compute_regions, &invocation, 4)?,
-        output_weight: push_shared_weight(&mut compute_regions, &invocation, 5)?,
+        query_weight: push_shared_projection_weight(
+            &mut compute_regions,
+            &invocation,
+            2,
+            &[shape.query_projection_features, shape.hidden_size],
+        )?,
+        key_weight: push_shared_projection_weight(
+            &mut compute_regions,
+            &invocation,
+            3,
+            &[shape.kv_features, shape.hidden_size],
+        )?,
+        value_weight: push_shared_projection_weight(
+            &mut compute_regions,
+            &invocation,
+            4,
+            &[shape.kv_features, shape.hidden_size],
+        )?,
+        output_weight: push_shared_projection_weight(
+            &mut compute_regions,
+            &invocation,
+            5,
+            &[shape.hidden_size, shape.query_features],
+        )?,
         query_norm: push_shared_weight(&mut compute_regions, &invocation, 6)?,
         key_norm: push_shared_weight(&mut compute_regions, &invocation, 7)?,
         scratch: {
@@ -1250,6 +1438,11 @@ fn encode_attention(
         .then(|| {
             let mut replay_key =
                 CudaCommandReplayKeyBuilder::new(provider_fingerprint, compute_operation)
+                    .bytes(projection.replay_tag().as_bytes())
+                    .bytes(shared.query_weight.replay_tag().as_bytes())
+                    .bytes(shared.key_weight.replay_tag().as_bytes())
+                    .bytes(shared.value_weight.replay_tag().as_bytes())
+                    .bytes(shared.output_weight.replay_tag().as_bytes())
                     .u64(shape.hidden_size)
                     .u64(shape.query_heads)
                     .u64(shape.key_value_heads)
@@ -1265,6 +1458,7 @@ fn encode_attention(
                     .boolean(shape.output_gate)
                     .u64(total_tokens)
                     .u64(layout.required_bytes)
+                    .u64(layout.projection_workspace.unwrap_or(u64::MAX))
                     .u64(layout.normalized)
                     .u64(layout.query_raw)
                     .u64(layout.key_raw)
@@ -1294,15 +1488,16 @@ fn encode_attention(
         });
 
     let functions = functions.clone();
-    let enqueue_compute =
-        move |stream: &CudaStream, blas: &CudaBlas, regions: &[CudaBufferRegion]| {
-            for launch in &launches {
-                enqueue_attention(
-                    stream, blas, &functions, shape, cuda, layout, shared, *launch, regions,
-                )?;
-            }
-            Ok(())
-        };
+    let enqueue_compute = move |stream: &CudaStream,
+                                blas: &CudaBlas,
+                                regions: &[CudaBufferRegion]| {
+        for launch in &launches {
+            enqueue_attention(
+                stream, blas, &functions, projection, shape, cuda, layout, shared, *launch, regions,
+            )?;
+        }
+        Ok(())
+    };
     let compute_command = match replay_key {
         Some(replay_key) => {
             CudaDeviceCommand::replayable_operation_with_blas_and_fence_dependencies(
@@ -1498,6 +1693,7 @@ fn enqueue_attention(
     stream: &CudaStream,
     blas: &CudaBlas,
     functions: &CausalAttentionFunctions,
+    projection: CausalProjection,
     logical: CausalAttentionShape,
     cuda: CudaCausalAttentionShape,
     layout: ScratchLayout,
@@ -1558,11 +1754,16 @@ fn enqueue_attention(
             "causal attention V GEMM",
         ),
     ] {
-        launch_gemm_f16(
+        launch_causal_projection(
+            stream,
             blas,
+            projection,
+            weight,
             normalized,
-            regions[weight].device_ptr(),
             destination,
+            scratch,
+            layout,
+            regions,
             launch.tokens_i32,
             out_features,
             cuda.hidden_size,
@@ -1607,11 +1808,16 @@ fn enqueue_attention(
             cuda,
         )?;
     }
-    launch_gemm_f16(
+    launch_causal_projection(
+        stream,
         blas,
+        projection,
+        shared.output_weight,
         context,
-        regions[shared.output_weight].device_ptr(),
         projected,
+        scratch,
+        layout,
+        regions,
         launch.tokens_i32,
         cuda.hidden_size,
         cuda.query_features,
@@ -1630,6 +1836,83 @@ fn enqueue_attention(
         output,
         elements,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_causal_projection(
+    stream: &CudaStream,
+    blas: &CudaBlas,
+    projection: CausalProjection,
+    weight: SharedProjectionWeight,
+    input: u64,
+    output: u64,
+    scratch: &CudaBufferRegion,
+    layout: ScratchLayout,
+    regions: &[CudaBufferRegion],
+    rows: i32,
+    output_features: i32,
+    input_features: i32,
+    operation: &'static str,
+) -> Result<(), CudaDeviceRuntimeError> {
+    match weight {
+        SharedProjectionWeight::F16 { region } => launch_gemm_f16(
+            blas,
+            input,
+            regions[region].device_ptr(),
+            output,
+            rows,
+            output_features,
+            input_features,
+            operation,
+        ),
+        #[cfg(feature = "vllm-marlin")]
+        SharedProjectionWeight::GptqMarlin {
+            packed_region,
+            scales_region,
+            group_size,
+        } => {
+            let CausalProjection::GptqMarlin { runtime } = projection else {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "{operation} has GPTQ-Marlin weights without an admitted projection runtime"
+                )));
+            };
+            let workspace_offset = layout.projection_workspace.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(format!(
+                    "{operation} lacks its admitted GPTQ-Marlin lock workspace"
+                ))
+            })?;
+            let workspace_bytes = runtime
+                .workspace_bytes()
+                .map_err(CudaDeviceRuntimeError::contract)?;
+            let workspace_end = workspace_offset
+                .checked_add(workspace_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(format!(
+                        "{operation} GPTQ-Marlin workspace range overflows"
+                    ))
+                })?;
+            if workspace_end > scratch.length_bytes() {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "{operation} GPTQ-Marlin workspace exceeds causal-attention scratch"
+                )));
+            }
+            runtime.launch(
+                crate::backend::cuda::vllm_marlin::MarlinF16WeightType::U4B8,
+                stream,
+                input,
+                regions[packed_region].device_ptr(),
+                regions[scales_region].device_ptr(),
+                output,
+                scratch_pointer(scratch.device_ptr(), workspace_offset)?,
+                workspace_bytes,
+                rows,
+                output_features,
+                input_features,
+                group_size,
+                operation,
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2235,6 +2518,87 @@ fn validate_signature(
     Ok(())
 }
 
+fn push_shared_projection_weight(
+    regions: &mut Vec<CudaBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+) -> Result<SharedProjectionWeight, String> {
+    let [expected_output_features, expected_input_features] = logical_dimensions else {
+        return Err(format!(
+            "causal attention projection input {ordinal} must have two logical dimensions"
+        ));
+    };
+    #[cfg(feature = "vllm-marlin")]
+    {
+        let first_participant = &invocation.participants()[0];
+        let first_binding = binding(
+            first_participant.bindings(),
+            ResolvedValueRole::Input,
+            ordinal,
+        )?;
+        let first_layout = first_binding.weight().ok_or_else(|| {
+            format!("causal attention projection input {ordinal} lacks its physical weight layout")
+        })?;
+        if !first_layout.quantization_formats().is_empty() {
+            let first = resolve_gptq_marlin_matrix_weight(
+                first_participant,
+                first_binding,
+                logical_dimensions,
+            )?;
+            if first.logical_dimensions() != logical_dimensions
+                || first.logical_dimensions()
+                    != [*expected_output_features, *expected_input_features]
+            {
+                return Err(format!(
+                    "causal attention projection input {ordinal} resolved inconsistent GPTQ-Marlin dimensions"
+                ));
+            }
+            for participant in &invocation.participants()[1..] {
+                let candidate = resolve_gptq_marlin_matrix_weight(
+                    participant,
+                    binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
+                    logical_dimensions,
+                )?;
+                if candidate.logical_dimensions() != first.logical_dimensions()
+                    || candidate.packed_physical_dimensions() != first.packed_physical_dimensions()
+                    || candidate.scales_physical_dimensions() != first.scales_physical_dimensions()
+                    || candidate.group_size() != first.group_size()
+                    || !super::same_physical_region(
+                        first.packed_region(),
+                        candidate.packed_region(),
+                    )
+                    || !super::same_physical_region(
+                        first.scales_region(),
+                        candidate.scales_region(),
+                    )
+                {
+                    return Err(format!(
+                        "causal attention projection input {ordinal} is not one shared physical GPTQ-Marlin matrix"
+                    ));
+                }
+            }
+            let group_size = i32::try_from(first.group_size()).map_err(|_| {
+                format!("causal attention projection input {ordinal} group size exceeds i32")
+            })?;
+            let [packed, scales] = first.into_regions();
+            let packed_region = regions.len();
+            regions.push(packed);
+            let scales_region = regions.len();
+            regions.push(scales);
+            return Ok(SharedProjectionWeight::GptqMarlin {
+                packed_region,
+                scales_region,
+                group_size,
+            });
+        }
+    }
+
+    Ok(SharedProjectionWeight::F16 {
+        region: push_shared_weight(regions, invocation, ordinal)?,
+    })
+}
+
 fn push_shared_weight(
     regions: &mut Vec<CudaBufferRegion>,
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -2472,7 +2836,7 @@ mod tests {
     #[test]
     fn scratch_estimator_and_layout_are_identical() {
         let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
-        let layout = ScratchLayout::new(shape, 17).unwrap();
+        let layout = ScratchLayout::new(shape, 17, CausalProjection::F16).unwrap();
         let bindings = BindingLayout::new(shape, 3).unwrap();
         assert_eq!(
             layout.required_bytes,

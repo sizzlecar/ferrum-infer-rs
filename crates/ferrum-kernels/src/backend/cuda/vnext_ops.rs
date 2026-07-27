@@ -157,6 +157,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         capabilities.insert(CapabilityId::new(
             crate::marlin_fp8_materializer::MARLIN_FP8_CAPABILITY_ID,
         )?);
+        capabilities.insert(CapabilityId::new(transformer::GPTQ_MARLIN_CAPABILITY_ID)?);
         capabilities
     };
     Ok(capabilities)

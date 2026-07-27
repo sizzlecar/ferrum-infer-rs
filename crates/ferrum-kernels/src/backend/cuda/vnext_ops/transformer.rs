@@ -54,7 +54,7 @@ mod moe;
 mod moe_launch;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe_routed;
-#[cfg(feature = "vllm-moe-marlin")]
+#[cfg(feature = "vllm-marlin")]
 mod moe_weights;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe_workspace;
@@ -65,6 +65,8 @@ pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
 pub(super) use moe::CudaRoutedSharedSwiGluMoeProvider;
 #[cfg(feature = "vllm-moe-marlin")]
 pub(super) use moe_routed::CudaRoutedSwiGluMoeProvider;
+#[cfg(feature = "vllm-marlin")]
+pub(super) use moe_weights::GPTQ_MARLIN_CAPABILITY_ID;
 
 const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
@@ -231,7 +233,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
 #[cfg(feature = "vllm-marlin")]
 pub(super) struct CudaMarlinFp8DenseLinearProvider {
     descriptor: OperationProviderDescriptor,
-    projection_runtime: MarlinFp8ProjectionRuntime,
+    projection_runtime: MarlinProjectionRuntime,
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -291,7 +293,7 @@ impl CudaMarlinFp8DenseLinearProvider {
             estimator_fingerprint,
         )
         .map_err(contract_error)?;
-        let projection_runtime = MarlinFp8ProjectionRuntime::query(runtime)?;
+        let projection_runtime = MarlinProjectionRuntime::query(runtime)?;
         Ok(Self {
             descriptor,
             projection_runtime,
@@ -879,7 +881,7 @@ fn encode_dense_linear(
 #[cfg(feature = "vllm-marlin")]
 fn encode_marlin_fp8_dense_linear(
     provider_fingerprint: &str,
-    projection_runtime: MarlinFp8ProjectionRuntime,
+    projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     use marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE};
@@ -1040,6 +1042,7 @@ fn encode_marlin_fp8_dense_linear(
             }
             for launch in &launches {
                 projection_runtime.launch(
+                    MarlinF16WeightType::E4M3Fn,
                     stream,
                     regions[launch.input_region].device_ptr(),
                     regions[0].device_ptr(),
@@ -1071,13 +1074,13 @@ fn encode_marlin_fp8_dense_linear(
 
 #[cfg(feature = "vllm-marlin")]
 #[derive(Debug, Clone, Copy)]
-pub(super) struct MarlinFp8ProjectionRuntime {
+pub(super) struct MarlinProjectionRuntime {
     multiprocessor_count: i32,
     device_ordinal: i32,
 }
 
 #[cfg(feature = "vllm-marlin")]
-impl MarlinFp8ProjectionRuntime {
+impl MarlinProjectionRuntime {
     pub(super) fn query(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         let multiprocessor_count = runtime
             .context()
@@ -1106,6 +1109,7 @@ impl MarlinFp8ProjectionRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn launch(
         self,
+        weight_type: MarlinF16WeightType,
         stream: &CudaStream,
         input: u64,
         packed_weight: u64,
@@ -1141,7 +1145,7 @@ impl MarlinFp8ProjectionRuntime {
         .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))?;
         unsafe {
             launch_marlin_mm_f16_weight(
-                MarlinF16WeightType::E4M3Fn,
+                weight_type,
                 input as *const c_void,
                 packed_weight as *const c_void,
                 output as *mut c_void,

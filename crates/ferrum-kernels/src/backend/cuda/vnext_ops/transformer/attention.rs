@@ -31,7 +31,7 @@ use super::{
 #[cfg(feature = "vllm-marlin")]
 use super::{
     marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE},
-    MarlinFp8ProjectionRuntime,
+    MarlinProjectionRuntime,
 };
 use crate::backend::cuda::vnext_ops::{
     binding, contiguous_region, contiguous_token_region, contract_error,
@@ -72,7 +72,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
     execution_capabilities: GatedDeltaExecutionCapabilities,
     functions: AttentionFunctions,
     #[cfg(feature = "vllm-marlin")]
-    projection_runtime: MarlinFp8ProjectionRuntime,
+    projection_runtime: MarlinProjectionRuntime,
 }
 
 #[derive(Clone)]
@@ -217,7 +217,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             execution_capabilities,
             functions,
             #[cfg(feature = "vllm-marlin")]
-            projection_runtime: MarlinFp8ProjectionRuntime::query(runtime)?,
+            projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
     }
 }
@@ -631,7 +631,7 @@ enum AttentionProjection {
     F16,
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
-        runtime: MarlinFp8ProjectionRuntime,
+        runtime: MarlinProjectionRuntime,
     },
 }
 
@@ -639,7 +639,7 @@ impl AttentionProjection {
     #[cfg(feature = "vllm-marlin")]
     fn from_values(
         values: &[ResolvedValueBinding],
-        runtime: MarlinFp8ProjectionRuntime,
+        runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
         let mut uses_marlin = false;
         for ordinal in [2, 7] {
@@ -929,7 +929,7 @@ fn encode_attention(
     provider_fingerprint: &str,
     functions: &AttentionFunctions,
     execution_capabilities: GatedDeltaExecutionCapabilities,
-    #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinFp8ProjectionRuntime,
+    #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
@@ -1773,6 +1773,7 @@ fn launch_attention_projection(
                 )));
             }
             runtime.launch(
+                crate::backend::cuda::vllm_marlin::MarlinF16WeightType::E4M3Fn,
                 stream,
                 input,
                 regions[packed_region].device_ptr(),
