@@ -21,6 +21,9 @@ RUNTIME_VNEXT_INVENTORY = REPO_ROOT / "scripts/release/runtime_vnext_inventory.p
 RUNTIME_VNEXT_MODEL_RESOLVER = REPO_ROOT / "scripts/release/runtime_vnext_model_resolver.py"
 RUNTIME_VNEXT_HARDWARE_PROBE = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
 RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
+RUNTIME_VNEXT_CUDA_CORRECTNESS_BUILD = (
+    REPO_ROOT / "scripts/release/runtime_vnext_cuda_correctness_build.py"
+)
 JSONL_PRODUCT_SESSION = REPO_ROOT / "scripts/release/jsonl_product_session.py"
 RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
 RUNTIME_VNEXT_EXPECTATION_AMENDMENT = REPO_ROOT / "scripts/release/runtime_vnext_expectation_amendment.py"
@@ -421,6 +424,14 @@ def test_runtime_vnext_build_timing_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_BUILD_TIMING), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("RUNTIME VNEXT BUILD TIMING SELF-TEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_cuda_correctness_build_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_CUDA_CORRECTNESS_BUILD), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
 def test_jsonl_product_session_selftest() -> None:
@@ -1075,6 +1086,7 @@ def main() -> int:
     test_runtime_vnext_model_resolver_selftest()
     test_runtime_vnext_hardware_probe_selftest()
     test_runtime_vnext_build_timing_selftest()
+    test_runtime_vnext_cuda_correctness_build_selftest()
     test_jsonl_product_session_selftest()
     test_runtime_vnext_baseline_scenarios_selftest()
     test_runtime_vnext_expectation_amendment_selftest()

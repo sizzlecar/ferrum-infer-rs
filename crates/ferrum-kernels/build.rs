@@ -1,13 +1,18 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use ferrum_native_ops::{NativeOperatorResolveRequest, NativeOperatorResolver};
+use ferrum_native_ops::{
+    NativeBuildArtifactCache, NativeBuildArtifactLookup, NativeBuildArtifactSpec,
+    NativeOperatorResolveRequest, NativeOperatorResolver,
+};
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
     NativeOperatorRequirement,
 };
+use sha2::{Digest, Sha256};
 
 const FA2_NATIVE_MANIFEST_ENV: &str = "FERRUM_FA2_NATIVE_MANIFEST";
 const FA2_NATIVE_ARTIFACT_ENV: &str = "FERRUM_FA2_NATIVE_ARTIFACT";
@@ -20,6 +25,9 @@ const COMPILED_FA2_NATIVE_ARTIFACT_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_ARTIF
 const COMPILED_FA2_NATIVE_SOURCE_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_SOURCE_SHA256";
 const COMPILED_FA2_NATIVE_INPUTS_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_INPUTS_SHA256";
 const COMPILED_FA2_NATIVE_BINARY_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256";
+const CUDA_NATIVE_BUILD_CACHE_ENV: &str = "FERRUM_CUDA_NATIVE_BUILD_CACHE";
+const CUDA_NATIVE_IMPORT_DIRS_ENV: &str = "FERRUM_CUDA_NATIVE_IMPORT_DIRS";
+const CUDA_NATIVE_SIGNATURE_SCHEMA: &str = "ferrum-cuda-native-input-v2";
 
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
@@ -95,17 +103,149 @@ fn file_fingerprint(path: &str) -> String {
     format!("{path}:len={}:fnv1a64={hash:016x}", meta.len())
 }
 
-fn fnv1a64(input: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in input.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+fn sha256_file_fingerprint(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    format!(
+        "{}:len={}:sha256={:x}",
+        path.display(),
+        bytes.len(),
+        Sha256::digest(&bytes)
+    )
+}
+
+fn resolve_program(program: &Path) -> PathBuf {
+    if program.components().count() > 1 {
+        return program
+            .canonicalize()
+            .unwrap_or_else(|_| program.to_path_buf());
     }
-    hash
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
+        .unwrap_or_else(|| program.to_path_buf())
+}
+
+fn command_version_fingerprint(program: &Path) -> String {
+    let resolved = resolve_program(program);
+    let metadata = fs::metadata(&resolved)
+        .ok()
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| format!("{}.{:09}", value.as_secs(), value.subsec_nanos()))
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("len={}:mtime={modified}", metadata.len())
+        })
+        .unwrap_or_else(|| "metadata=unavailable".to_string());
+    let output = std::process::Command::new(&resolved)
+        .arg("--version")
+        .output();
+    match output {
+        Ok(output) => {
+            let mut bytes = output.stdout;
+            bytes.extend_from_slice(&output.stderr);
+            format!(
+                "program={}:resolved={}:{}:status={:?}:sha256={:x}",
+                program.display(),
+                resolved.display(),
+                metadata,
+                output.status.code(),
+                Sha256::digest(&bytes)
+            )
+        }
+        Err(error) => format!(
+            "program={}:resolved={}:{}:spawn_error={error}",
+            program.display(),
+            resolved.display(),
+            metadata
+        ),
+    }
+}
+
+fn cuda_native_toolchain_identity() -> &'static str {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        for key in [
+            "TARGET",
+            "HOST",
+            "NVCC_CCBIN",
+            "CC",
+            "CXX",
+            "NVCC_PREPEND_FLAGS",
+            "NVCC_APPEND_FLAGS",
+        ] {
+            println!("cargo:rerun-if-env-changed={key}");
+        }
+        let cuda_root = cuda_root_from_env();
+        let nvcc = cuda_root
+            .as_ref()
+            .map(|root| root.join("bin").join("nvcc"))
+            .unwrap_or_else(|| PathBuf::from("nvcc"));
+        if nvcc.is_absolute() && nvcc.is_file() {
+            println!("cargo:rerun-if-changed={}", nvcc.display());
+        }
+        let ccbin = env::var_os("NVCC_CCBIN")
+            .or_else(|| env::var_os("CC"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cc"));
+        let cxx = env::var_os("CXX")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("c++"));
+        let mut lines = vec![
+            format!("schema={CUDA_NATIVE_SIGNATURE_SCHEMA}"),
+            format!("target={}", env::var("TARGET").unwrap_or_default()),
+            format!("host={}", env::var("HOST").unwrap_or_default()),
+            format!(
+                "cuda_root={}",
+                cuda_root
+                    .as_deref()
+                    .map(Path::display)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<path-search>".to_string())
+            ),
+            format!("nvcc={}", command_version_fingerprint(&nvcc)),
+            format!("ccbin={}", command_version_fingerprint(&ccbin)),
+            format!("cxx={}", command_version_fingerprint(&cxx)),
+            format!("ar={}", command_version_fingerprint(&PathBuf::from("ar"))),
+        ];
+        for key in [
+            "NVCC_CCBIN",
+            "CC",
+            "CXX",
+            "NVCC_PREPEND_FLAGS",
+            "NVCC_APPEND_FLAGS",
+        ] {
+            lines.push(format!(
+                "env.{key}={}",
+                env::var(key).unwrap_or_else(|_| "<unset>".to_string())
+            ));
+        }
+        if let Some(cuda_root) = cuda_root {
+            for relative in ["include/cuda.h", "include/cuda_runtime.h"] {
+                let path = cuda_root.join(relative);
+                if path.is_file() {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                    lines.push(sha256_file_fingerprint(&path));
+                } else {
+                    lines.push(format!("{}=<missing>", path.display()));
+                }
+            }
+        }
+        lines.join("\n")
+    })
+}
+
+fn cuda_native_input_signature(content_signature: &str) -> String {
+    format!("{content_signature}\n{}", cuda_native_toolchain_identity())
 }
 
 fn signature_hash(signature: &str) -> String {
-    format!("fnv1a64:{:016x}", fnv1a64(signature))
+    format!("sha256:{:x}", Sha256::digest(signature.as_bytes()))
 }
 
 fn emit_cuda_build_summary(
@@ -372,6 +512,17 @@ fn static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String 
     lines.join("\n")
 }
 
+fn content_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String {
+    let mut lines = Vec::with_capacity(2 + deps.len() + flags.len());
+    lines.push(format!("label={label}"));
+    lines.extend(flags.iter().map(|flag| format!("flag={flag}")));
+    lines.extend(
+        deps.iter()
+            .map(|path| sha256_file_fingerprint(Path::new(path))),
+    );
+    lines.join("\n")
+}
+
 fn metadata_hash_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String {
     let mut lines = Vec::with_capacity(2 + deps.len() + flags.len());
     lines.push(format!("label={label}"));
@@ -393,12 +544,169 @@ enum CacheState {
     Stale(&'static str),
 }
 
-fn static_lib_cache_state(
+struct CudaNativeBuildCache {
+    cache: NativeBuildArtifactCache,
+    import_dirs: Vec<PathBuf>,
+}
+
+fn configured_cuda_native_build_cache() -> Option<CudaNativeBuildCache> {
+    println!("cargo:rerun-if-env-changed={CUDA_NATIVE_BUILD_CACHE_ENV}");
+    println!("cargo:rerun-if-env-changed={CUDA_NATIVE_IMPORT_DIRS_ENV}");
+    let cache_root = env::var_os(CUDA_NATIVE_BUILD_CACHE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let import_dirs = env::var_os(CUDA_NATIVE_IMPORT_DIRS_ENV)
+        .filter(|value| !value.is_empty())
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(cache_root) = cache_root else {
+        if !import_dirs.is_empty() {
+            panic!("{CUDA_NATIVE_IMPORT_DIRS_ENV} requires {CUDA_NATIVE_BUILD_CACHE_ENV}");
+        }
+        return None;
+    };
+    if !cache_root.is_absolute() {
+        panic!(
+            "{CUDA_NATIVE_BUILD_CACHE_ENV} must be absolute, got {}",
+            cache_root.display()
+        );
+    }
+    for import_dir in &import_dirs {
+        if !import_dir.is_absolute() || !import_dir.is_dir() {
+            panic!(
+                "{CUDA_NATIVE_IMPORT_DIRS_ENV} entries must be absolute directories, got {}",
+                import_dir.display()
+            );
+        }
+    }
+    let cache = NativeBuildArtifactCache::new(&cache_root).unwrap_or_else(|error| {
+        panic!(
+            "failed to configure CUDA native build cache {}: {error}",
+            cache_root.display()
+        )
+    });
+    eprintln!(
+        "[cuda-native-build-cache] root={} import_dirs={} toolchain_hash={}",
+        cache.root().display(),
+        import_dirs.len(),
+        signature_hash(cuda_native_toolchain_identity())
+    );
+    Some(CudaNativeBuildCache { cache, import_dirs })
+}
+
+fn artifact_stamp_matches(stamp: &Path, signature: &str, migration_signatures: &[&str]) -> bool {
+    fs::read_to_string(stamp).is_ok_and(|existing| {
+        existing == signature
+            || migration_signatures
+                .iter()
+                .any(|candidate| existing == **candidate)
+    })
+}
+
+fn publish_cuda_build_artifact(
+    config: Option<&CudaNativeBuildCache>,
+    artifact_id: &str,
+    file_name: &str,
+    signature: &str,
+    source: &Path,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    let spec = NativeBuildArtifactSpec::new(artifact_id, file_name, signature)
+        .unwrap_or_else(|error| panic!("invalid CUDA build artifact identity: {error}"));
+    let receipt = config.cache.publish(&spec, source).unwrap_or_else(|error| {
+        panic!(
+            "failed to publish CUDA build artifact {artifact_id} from {}: {error}",
+            source.display()
+        )
+    });
+    eprintln!(
+        "[cuda-native-build-cache] artifact={artifact_id} status=published \
+sha256={} bytes={} entry={}",
+        receipt.artifact_sha256,
+        receipt.artifact_size_bytes,
+        receipt.cache_entry.display()
+    );
+}
+
+fn restore_cuda_build_artifact(
+    config: Option<&CudaNativeBuildCache>,
     out_dir: &Path,
-    lib_name: &str,
+    artifact_id: &str,
+    file_name: &str,
+    stamp_file_name: &str,
     signature: &str,
     migration_signatures: &[&str],
-) -> CacheState {
+) -> Option<String> {
+    let config = config?;
+    let spec = NativeBuildArtifactSpec::new(artifact_id, file_name, signature)
+        .unwrap_or_else(|error| panic!("invalid CUDA build artifact identity: {error}"));
+    let destination = out_dir.join(file_name);
+    match config
+        .cache
+        .restore(&spec, &destination)
+        .unwrap_or_else(|error| {
+            panic!("failed to restore CUDA build artifact {artifact_id}: {error}")
+        }) {
+        NativeBuildArtifactLookup::Hit(receipt) => {
+            fs::write(out_dir.join(stamp_file_name), signature).unwrap_or_else(|error| {
+                panic!("failed to write restored CUDA build artifact stamp: {error}")
+            });
+            eprintln!(
+                "[cuda-native-build-cache] artifact={artifact_id} status=cache_hit \
+sha256={} entry={}",
+                receipt.artifact_sha256,
+                receipt.cache_entry.display()
+            );
+            return Some("shared-native-build-cache".to_string());
+        }
+        NativeBuildArtifactLookup::Miss { .. } => {}
+    }
+
+    for import_dir in &config.import_dirs {
+        let import_artifact = import_dir.join(file_name);
+        let import_stamp = import_dir.join(stamp_file_name);
+        if !import_artifact.is_file()
+            || !artifact_stamp_matches(&import_stamp, signature, migration_signatures)
+        {
+            continue;
+        }
+        let published = config
+            .cache
+            .publish(&spec, &import_artifact)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to import CUDA build artifact {artifact_id} from {}: {error}",
+                    import_artifact.display()
+                )
+            });
+        match config
+            .cache
+            .restore(&spec, &destination)
+            .unwrap_or_else(|error| {
+                panic!("failed to restore imported CUDA build artifact {artifact_id}: {error}")
+            }) {
+            NativeBuildArtifactLookup::Hit(_) => {}
+            NativeBuildArtifactLookup::Miss { reason } => {
+                panic!("imported CUDA build artifact {artifact_id} was not restorable: {reason}")
+            }
+        }
+        fs::write(out_dir.join(stamp_file_name), signature).unwrap_or_else(|error| {
+            panic!("failed to write imported CUDA build artifact stamp: {error}")
+        });
+        eprintln!(
+            "[cuda-native-build-cache] artifact={artifact_id} status=imported \
+sha256={} import_dir={}",
+            published.artifact_sha256,
+            import_dir.display()
+        );
+        return Some(format!("imported-native-output:{}", import_dir.display()));
+    }
+    None
+}
+
+fn static_lib_cache_state(out_dir: &Path, lib_name: &str, signature: &str) -> CacheState {
     let lib_file = out_dir.join(format!("lib{lib_name}.a"));
     let stamp_file = out_dir.join(format!("lib{lib_name}.stamp"));
     if !lib_file.is_file() {
@@ -411,14 +719,6 @@ fn static_lib_cache_state(
         Ok(existing) if existing == signature => {
             eprintln!("[{lib_name}] cache hit: {}", lib_file.display());
             CacheState::Fresh("signature-match")
-        }
-        Ok(existing) if migration_signatures.iter().any(|s| existing == **s) => {
-            write_static_lib_stamp(out_dir, lib_name, signature);
-            eprintln!(
-                "[{lib_name}] cache hit: {} (migrated stamp)",
-                lib_file.display()
-            );
-            CacheState::Fresh("migrated-stamp")
         }
         Ok(_) => CacheState::Stale("signature-changed"),
         Err(_) => CacheState::Stale("stamp-read-error"),
@@ -465,20 +765,21 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by cargo"));
+    let native_build_cache = configured_cuda_native_build_cache();
     let out_dir_clone = out_dir.clone();
-    compile_core_ptx(&out_dir_clone);
+    compile_core_ptx(&out_dir_clone, native_build_cache.as_ref());
 
     // Compile Marlin INT4xFP16 kernel separately (uses runtime API, not PTX).
     // Only when "marlin" feature is enabled. Requires SM >= 8.0 (Ampere).
     if env::var_os("CARGO_FEATURE_MARLIN").is_some() {
-        compile_marlin(&out_dir_clone);
+        compile_marlin(&out_dir_clone, native_build_cache.as_ref());
     }
 
     // vLLM gptq_marlin port (Phase 12). Heavier C++ template instantiations
     // than the IST-DASLab port — compile time ~30 min on first build. Opt-in
     // via `--features vllm-marlin`.
     if env::var_os("CARGO_FEATURE_VLLM_MARLIN").is_some() {
-        compile_vllm_marlin(&out_dir_clone);
+        compile_vllm_marlin(&out_dir_clone, native_build_cache.as_ref());
     }
 
     // vLLM moe_marlin_wna16 port (Stage 14). Vendored from
@@ -486,7 +787,7 @@ fn main() {
     // many template instantiations via COMMON_GET_IF macros — compile
     // time ~15-20 min on first build. Opt-in via `--features vllm-moe-marlin`.
     if env::var_os("CARGO_FEATURE_VLLM_MOE_MARLIN").is_some() {
-        compile_vllm_moe_marlin(&out_dir_clone);
+        compile_vllm_moe_marlin(&out_dir_clone, native_build_cache.as_ref());
     }
 
     // vLLM paged_attention_v2 port (2026-05-12). Vendored from vllm v0.20.2
@@ -495,7 +796,7 @@ fn main() {
     // Builds a static lib of the single (HEAD=128, BLOCK=16, FP16, no-FP8,
     // no-blocksparse) instantiation — ~1-2 min compile.
     if env::var_os("CARGO_FEATURE_VLLM_PAGED_ATTN_V2").is_some() {
-        compile_vllm_paged_attn(&out_dir_clone);
+        compile_vllm_paged_attn(&out_dir_clone, native_build_cache.as_ref());
     }
 
     // Legacy compatibility switch. The source-linked FA2 path has moved out of
@@ -542,6 +843,20 @@ fn core_ptx_signature(kernel: &str, flags: &[String]) -> String {
     lines.extend(flags.iter().map(|f| format!("flag={f}")));
     lines.push(file_fingerprint(kernel));
     lines.extend(CORE_PTX_HEADERS.iter().map(|p| file_fingerprint(p)));
+    lines.join("\n")
+}
+
+fn content_core_ptx_signature(kernel: &str, flags: &[String]) -> String {
+    let mut lines = Vec::with_capacity(2 + flags.len() + CORE_PTX_HEADERS.len());
+    lines.push("label=core-ptx".to_string());
+    lines.push(format!("kernel={kernel}"));
+    lines.extend(flags.iter().map(|flag| format!("flag={flag}")));
+    lines.push(sha256_file_fingerprint(Path::new(kernel)));
+    lines.extend(
+        CORE_PTX_HEADERS
+            .iter()
+            .map(|path| sha256_file_fingerprint(Path::new(path))),
+    );
     lines.join("\n")
 }
 
@@ -595,7 +910,7 @@ fn write_core_ptx_bindings(out_dir: &Path) {
     }
 }
 
-fn compile_core_ptx(out_dir: &Path) {
+fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildCache>) {
     for path in CORE_PTX_KERNELS.iter().chain(CORE_PTX_HEADERS.iter()) {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -633,9 +948,25 @@ fn compile_core_ptx(out_dir: &Path) {
 
     for kernel in CORE_PTX_KERNELS {
         let start = Instant::now();
-        let signature = core_ptx_signature(kernel, &flags);
+        let legacy_signature = core_ptx_signature(kernel, &flags);
+        let content_signature = content_core_ptx_signature(kernel, &flags);
+        let signature = cuda_native_input_signature(&content_signature);
+        let stem = Path::new(kernel)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("kernel filename");
+        let file_name = format!("{stem}.ptx");
+        let stamp_file_name = format!("{stem}.ptx.stamp");
+        let artifact_id = format!("core_ptx.{stem}");
         match core_ptx_cache_state(out_dir, kernel, &signature) {
             CacheState::Fresh(reason) => {
+                publish_cuda_build_artifact(
+                    native_build_cache,
+                    &artifact_id,
+                    &file_name,
+                    &signature,
+                    &out_dir.join(&file_name),
+                );
                 emit_cuda_build_summary(
                     &format!("core-ptx:{}", Path::new(kernel).display()),
                     "cache_hit",
@@ -645,6 +976,24 @@ fn compile_core_ptx(out_dir: &Path) {
                 );
             }
             CacheState::Stale(reason) => {
+                if let Some(cache_reason) = restore_cuda_build_artifact(
+                    native_build_cache,
+                    out_dir,
+                    &artifact_id,
+                    &file_name,
+                    &stamp_file_name,
+                    &signature,
+                    &[&legacy_signature],
+                ) {
+                    emit_cuda_build_summary(
+                        &format!("core-ptx:{}", Path::new(kernel).display()),
+                        "cache_hit",
+                        &cache_reason,
+                        start.elapsed(),
+                        &signature,
+                    );
+                    continue;
+                }
                 let mut command = std::process::Command::new(&nvcc);
                 command
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
@@ -680,6 +1029,13 @@ fn compile_core_ptx(out_dir: &Path) {
                     );
                 }
                 write_core_ptx_stamp(out_dir, kernel, &signature);
+                publish_cuda_build_artifact(
+                    native_build_cache,
+                    &artifact_id,
+                    &file_name,
+                    &signature,
+                    &out_dir.join(&file_name),
+                );
                 emit_cuda_build_summary(
                     &format!("core-ptx:{}", Path::new(kernel).display()),
                     "built",
@@ -705,7 +1061,7 @@ fn report_fa2_source_obsolete() {
     );
 }
 
-fn compile_vllm_paged_attn(out_dir: &PathBuf) {
+fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuildCache>) {
     let cu_files: &[&str] = &["kernels/vllm_attn/launcher.cu"];
     let header_files: &[&str] = &[
         "kernels/vllm_attn/attention_kernels.cuh",
@@ -717,6 +1073,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
         "kernels/vllm_attn/dtype_bfloat16.cuh",
         "kernels/vllm_attn/dtype_fp8.cuh",
         "kernels/vllm_attn/ferrum_shim.h",
+        "kernels/vllm_attn/quant_utils_stub.cuh",
         "kernels/vllm_attn/include/cuda_compat.h",
     ];
     for f in cu_files.iter().chain(header_files.iter()) {
@@ -749,19 +1106,34 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
         .chain(header_files.iter())
         .copied()
         .collect();
-    let signature = static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
+    let pre_quant_header_deps: Vec<&str> = deps
+        .iter()
+        .copied()
+        .filter(|path| *path != "kernels/vllm_attn/quant_utils_stub.cuh")
+        .collect();
+    let pre_quant_header_signature =
+        static_lib_signature("vllm-paged-attn-v2", &pre_quant_header_deps, &flags);
+    let pre_quant_header_metadata_hash_signature =
+        metadata_hash_static_lib_signature("vllm-paged-attn-v2", &pre_quant_header_deps, &flags);
+    let pre_quant_header_metadata_signature =
+        metadata_static_lib_signature("vllm-paged-attn-v2", &pre_quant_header_deps, &flags);
+    let legacy_signature = static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
+    let content_signature = content_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
+    let signature = cuda_native_input_signature(&content_signature);
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
     let build_start = Instant::now();
-    let cache_state = static_lib_cache_state(
-        out_dir,
-        "vllm_paged_attn",
-        &signature,
-        &[&metadata_hash_signature, &metadata_signature],
-    );
+    let cache_state = static_lib_cache_state(out_dir, "vllm_paged_attn", &signature);
     let build_reason = match cache_state {
         CacheState::Fresh(reason) => {
+            publish_cuda_build_artifact(
+                native_build_cache,
+                "static.vllm_paged_attn",
+                "libvllm_paged_attn.a",
+                &signature,
+                &out_dir.join("libvllm_paged_attn.a"),
+            );
             emit_cuda_build_summary(
                 "vllm_paged_attn",
                 "cache_hit",
@@ -772,7 +1144,35 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
             emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
             return;
         }
-        CacheState::Stale(reason) => reason,
+        CacheState::Stale(reason) => {
+            if let Some(cache_reason) = restore_cuda_build_artifact(
+                native_build_cache,
+                out_dir,
+                "static.vllm_paged_attn",
+                "libvllm_paged_attn.a",
+                "libvllm_paged_attn.stamp",
+                &signature,
+                &[
+                    &legacy_signature,
+                    &metadata_hash_signature,
+                    &metadata_signature,
+                    &pre_quant_header_signature,
+                    &pre_quant_header_metadata_hash_signature,
+                    &pre_quant_header_metadata_signature,
+                ],
+            ) {
+                emit_cuda_build_summary(
+                    "vllm_paged_attn",
+                    "cache_hit",
+                    &cache_reason,
+                    build_start.elapsed(),
+                    &signature,
+                );
+                emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
+                return;
+            }
+            reason
+        }
     };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
@@ -825,6 +1225,13 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     }
 
     write_static_lib_stamp(out_dir, "vllm_paged_attn", &signature);
+    publish_cuda_build_artifact(
+        native_build_cache,
+        "static.vllm_paged_attn",
+        "libvllm_paged_attn.a",
+        &signature,
+        &lib_file,
+    );
     emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
     eprintln!(
         "[vllm-paged-attn-v2] static lib built: {}",
@@ -839,7 +1246,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     );
 }
 
-fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
+fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuildCache>) {
     // CUDA 13 hidden-default-visibility workaround: implicit Marlin<...>
     // instantiations inside ops.cu's dispatcher are emitted with hidden
     // ELF visibility and `ar`-bundling rejects them at the final rust-lld
@@ -890,19 +1297,23 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
         .chain(header_files.iter())
         .copied()
         .collect();
-    let signature = static_lib_signature("vllm-moe-marlin", &deps, &flags);
+    let legacy_signature = static_lib_signature("vllm-moe-marlin", &deps, &flags);
+    let content_signature = content_static_lib_signature("vllm-moe-marlin", &deps, &flags);
+    let signature = cuda_native_input_signature(&content_signature);
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("vllm-moe-marlin", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-moe-marlin", &deps, &flags);
     let build_start = Instant::now();
-    let cache_state = static_lib_cache_state(
-        out_dir,
-        "vllm_moe_marlin",
-        &signature,
-        &[&metadata_hash_signature, &metadata_signature],
-    );
+    let cache_state = static_lib_cache_state(out_dir, "vllm_moe_marlin", &signature);
     let build_reason = match cache_state {
         CacheState::Fresh(reason) => {
+            publish_cuda_build_artifact(
+                native_build_cache,
+                "static.vllm_moe_marlin",
+                "libvllm_moe_marlin.a",
+                &signature,
+                &out_dir.join("libvllm_moe_marlin.a"),
+            );
             emit_cuda_build_summary(
                 "vllm_moe_marlin",
                 "cache_hit",
@@ -913,7 +1324,32 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
             emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
             return;
         }
-        CacheState::Stale(reason) => reason,
+        CacheState::Stale(reason) => {
+            if let Some(cache_reason) = restore_cuda_build_artifact(
+                native_build_cache,
+                out_dir,
+                "static.vllm_moe_marlin",
+                "libvllm_moe_marlin.a",
+                "libvllm_moe_marlin.stamp",
+                &signature,
+                &[
+                    &legacy_signature,
+                    &metadata_hash_signature,
+                    &metadata_signature,
+                ],
+            ) {
+                emit_cuda_build_summary(
+                    "vllm_moe_marlin",
+                    "cache_hit",
+                    &cache_reason,
+                    build_start.elapsed(),
+                    &signature,
+                );
+                emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
+                return;
+            }
+            reason
+        }
     };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
@@ -975,6 +1411,13 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
     }
 
     write_static_lib_stamp(out_dir, "vllm_moe_marlin", &signature);
+    publish_cuda_build_artifact(
+        native_build_cache,
+        "static.vllm_moe_marlin",
+        "libvllm_moe_marlin.a",
+        &signature,
+        &lib_file,
+    );
     emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
     eprintln!("[vllm-moe-marlin] static lib built: {}", lib_file.display());
     emit_cuda_build_summary(
@@ -986,7 +1429,7 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
     );
 }
 
-fn compile_vllm_marlin(out_dir: &PathBuf) {
+fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuildCache>) {
     // The dispatcher references the full generated specialization set even
     // though the versioned FFI exposes only typed, validated combinations.
     // Compile the complete selector closure so adding a supported dtype mapping
@@ -1057,18 +1500,22 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
         .chain(header_files.iter())
         .copied()
         .collect();
-    let signature = static_lib_signature("vllm-marlin", &deps, &flags);
+    let legacy_signature = static_lib_signature("vllm-marlin", &deps, &flags);
+    let content_signature = content_static_lib_signature("vllm-marlin", &deps, &flags);
+    let signature = cuda_native_input_signature(&content_signature);
     let metadata_hash_signature = metadata_hash_static_lib_signature("vllm-marlin", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-marlin", &deps, &flags);
     let build_start = Instant::now();
-    let cache_state = static_lib_cache_state(
-        out_dir,
-        "vllm_marlin",
-        &signature,
-        &[&metadata_hash_signature, &metadata_signature],
-    );
+    let cache_state = static_lib_cache_state(out_dir, "vllm_marlin", &signature);
     let build_reason = match cache_state {
         CacheState::Fresh(reason) => {
+            publish_cuda_build_artifact(
+                native_build_cache,
+                "static.vllm_marlin",
+                "libvllm_marlin.a",
+                &signature,
+                &out_dir.join("libvllm_marlin.a"),
+            );
             emit_cuda_build_summary(
                 "vllm_marlin",
                 "cache_hit",
@@ -1079,7 +1526,32 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
             emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
             return;
         }
-        CacheState::Stale(reason) => reason,
+        CacheState::Stale(reason) => {
+            if let Some(cache_reason) = restore_cuda_build_artifact(
+                native_build_cache,
+                out_dir,
+                "static.vllm_marlin",
+                "libvllm_marlin.a",
+                "libvllm_marlin.stamp",
+                &signature,
+                &[
+                    &legacy_signature,
+                    &metadata_hash_signature,
+                    &metadata_signature,
+                ],
+            ) {
+                emit_cuda_build_summary(
+                    "vllm_marlin",
+                    "cache_hit",
+                    &cache_reason,
+                    build_start.elapsed(),
+                    &signature,
+                );
+                emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
+                return;
+            }
+            reason
+        }
     };
 
     // Compile each .cu to its own .o
@@ -1148,6 +1620,13 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
     }
 
     write_static_lib_stamp(out_dir, "vllm_marlin", &signature);
+    publish_cuda_build_artifact(
+        native_build_cache,
+        "static.vllm_marlin",
+        "libvllm_marlin.a",
+        &signature,
+        &lib_file,
+    );
     emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
     eprintln!("[vllm-marlin] static lib built: {}", lib_file.display());
     emit_cuda_build_summary(
@@ -1159,7 +1638,7 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
     );
 }
 
-fn compile_marlin(out_dir: &PathBuf) {
+fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuildCache>) {
     println!("cargo:rerun-if-changed=kernels/marlin_cuda_kernel.cu");
 
     let cuda_root = cuda_root_from_env();
@@ -1181,20 +1660,26 @@ fn compile_marlin(out_dir: &PathBuf) {
         format!("reported_compute_cap={compute_cap}"),
         "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr -Xcompiler -fPIC".to_string(),
     ];
-    let signature = static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
+    let legacy_signature =
+        static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
+    let content_signature =
+        content_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
+    let signature = cuda_native_input_signature(&content_signature);
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
     let metadata_signature =
         metadata_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
     let build_start = Instant::now();
-    let cache_state = static_lib_cache_state(
-        out_dir,
-        "marlin",
-        &signature,
-        &[&metadata_hash_signature, &metadata_signature],
-    );
+    let cache_state = static_lib_cache_state(out_dir, "marlin", &signature);
     let build_reason = match cache_state {
         CacheState::Fresh(reason) => {
+            publish_cuda_build_artifact(
+                native_build_cache,
+                "static.marlin",
+                "libmarlin.a",
+                &signature,
+                &out_dir.join("libmarlin.a"),
+            );
             emit_cuda_build_summary(
                 "marlin",
                 "cache_hit",
@@ -1205,7 +1690,32 @@ fn compile_marlin(out_dir: &PathBuf) {
             emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
             return;
         }
-        CacheState::Stale(reason) => reason,
+        CacheState::Stale(reason) => {
+            if let Some(cache_reason) = restore_cuda_build_artifact(
+                native_build_cache,
+                out_dir,
+                "static.marlin",
+                "libmarlin.a",
+                "libmarlin.stamp",
+                &signature,
+                &[
+                    &legacy_signature,
+                    &metadata_hash_signature,
+                    &metadata_signature,
+                ],
+            ) {
+                emit_cuda_build_summary(
+                    "marlin",
+                    "cache_hit",
+                    &cache_reason,
+                    build_start.elapsed(),
+                    &signature,
+                );
+                emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
+                return;
+            }
+            reason
+        }
     };
 
     let obj_file = out_dir.join("marlin_cuda_kernel.o");
@@ -1238,6 +1748,13 @@ fn compile_marlin(out_dir: &PathBuf) {
             if let Ok(s) = ar_status {
                 if s.success() {
                     write_static_lib_stamp(out_dir, "marlin", &signature);
+                    publish_cuda_build_artifact(
+                        native_build_cache,
+                        "static.marlin",
+                        "libmarlin.a",
+                        &signature,
+                        &lib_file,
+                    );
                     emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
                     eprintln!("Marlin kernel compiled successfully (sm_{compute_cap})");
                     emit_cuda_build_summary(
