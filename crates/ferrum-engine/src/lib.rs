@@ -61,6 +61,8 @@ pub mod speculative;
 pub mod tensor_factory;
 pub mod transcription_engine;
 pub mod tts_engine;
+#[cfg(feature = "cuda")]
+pub mod vnext_determinism;
 
 // Re-exports of interfaces
 pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
