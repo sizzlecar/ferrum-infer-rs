@@ -101,6 +101,45 @@ fingerprint 中解耦前，继续微调 `nvcc --threads` 不能解决该失效�
 `cuda-unit.log`、candidate `cargo.log`、两个 build output identity 和实际 nvcc invocation
 作为 invalidation fixture，并用目标 graph 证明相同 Rust leaf edit 的 nvcc TU 数量为 `0`。
 
+### 2026-07-28 CUDA correctness build source checkpoint
+
+clean commit `9b318ea9` 建立了下一次 M2 CUDA exact replay 的 bounded 开发构建路径：
+
+- `cuda-correctness` 继承 release 的 `opt-level=3` 和正式 features，只关闭 release LTO、
+  放宽 codegen units、启用 incremental 并保留符号；这些差异不能改变产品语义。
+- core PTX、Marlin、MoE Marlin 和 paged-attention archive 通过
+  `ferrum-native-ops::NativeBuildArtifactCache` 在 profile/OUT_DIR 间按内容地址复用。
+  payload 与 manifest 均校验 SHA256；复制使用同一打开文件的 copy+reread 验证，restore
+  在发布 destination 前再次核对实际复制内容。
+- compatibility key 绑定 source/header SHA256、SM、CUDA header SHA256、
+  `nvcc`/host compiler/archiver identity、`TARGET/HOST` 和影响 nvcc 的 ambient flags。
+  `quant_utils_stub.cuh` 已补入 paged-attention dependency closure；修改该 header 必须使
+  Cargo 和 shared cache 同时失效。
+- publish 使用 OS advisory lock；进程被 deadline kill、写锁信息失败或留下旧 lock 文件
+  后，kernel cache 不会永久进入 30 秒超时循环。
+- correctness build 会先强制 ferrum 非 fresh relink 和 `ferrum-kernels` build-script
+  重跑，要求每个 native artifact 都有 cache evidence，发现任意 nvcc TU 重编即 REJECT。
+  inventory 只打印 `IMPORT INVENTORY READY`，可执行产物只打印 `BINARY READY`，两者都不是
+  PASS。
+- semantic validator 必须同时绑定 build manifest、execution manifest、focused
+  `c13-022` report、实际执行 binary SHA256 和 scheduler trace；只有 trace 的
+  `vnext.plan_built` hash 精确匹配 reference 才打印
+  `FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS`。
+
+本地 staged evidence：
+
+| Gate | Result | Artifact |
+|---|---|---|
+| native cache focused tests | `15/15 PASS` | `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-cache-local-20260728/native-ops-test-r4/bounded.receipt.json` |
+| `ferrum-kernels --no-default-features` check | PASS | `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-cache-local-20260728/kernels-check-r2/bounded.receipt.json` |
+| `cuda-correctness` profile check | PASS | `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-cache-local-20260728/profile-check-r2/bounded.receipt.json` |
+| build/semantic validator self-test | PASS | `FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS` |
+
+这不是 G07A PASS：固定 CUDA host 上的真实 `BINARY READY`、release/dev semantic-plan
+equivalence、五样本增量 p95、workspace source gate 和 canonical G07A validator 仍未完成。
+下一 paid lane 的 stop condition 是 native rebuild、build deadline、semantic hash mismatch
+或 exact `c13-022` 结果中的任意一个；在 exact case 通过前不运行 suffix 或 703 full。
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。
