@@ -9,6 +9,9 @@ use super::{
 };
 use crate::vnext::{ProviderExecutionContractFingerprint, ProviderReplayEquivalence};
 
+mod coverage;
+pub use coverage::*;
+
 pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(3, 0);
 
 /// Trusted semantic-to-physical projection shared by determinism
