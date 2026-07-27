@@ -1,4 +1,4 @@
-//! Typed GPTQ-Marlin MoE weight translation for CUDA vNext providers.
+//! Typed GPTQ-Marlin weight translation for CUDA vNext providers.
 //!
 //! This boundary accepts one exact physical ABI. It deliberately does not
 //! infer component meaning from sorted ids, model names, or allocation sizes.
@@ -17,6 +17,7 @@ use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
 pub(super) const GPTQ_MARLIN_WEIGHT_FORMAT_ID: &str = "weight-format.safetensors.gptq-marlin-int4";
 pub(super) const GPTQ_MARLIN_QUANTIZATION_FORMAT_ID: &str =
     "quantization.marlin.gptq-int4-symmetric";
+pub(super) const GPTQ_MARLIN_CAPABILITY_ID: &str = "capability.kernel.cuda.marlin.gptq-int4-w4a16";
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
 
 /// Retained, expert-major physical regions accepted by the CUDA Marlin-MoE
@@ -32,6 +33,8 @@ pub(super) struct CudaMarlinMoeWeight {
     scales_expert_stride_bytes: u64,
     group_size: u32,
 }
+
+pub(super) type CudaMarlinGptqMatrixWeight = CudaMarlinMoeWeight;
 
 impl CudaMarlinMoeWeight {
     pub(super) fn packed_region(&self) -> &CudaBufferRegion {
@@ -94,6 +97,50 @@ struct MarlinMoeWeightMetadata {
 /// CUDA regions. `logical_dimensions` is supplied by the operation provider;
 /// it must exactly equal the immutable logical shape on the binding.
 pub(super) fn resolve_gptq_marlin_moe_weight(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    logical_dimensions: &[u64],
+) -> Result<CudaMarlinMoeWeight, String> {
+    if logical_dimensions.len() < 3 {
+        return Err(
+            "CUDA Marlin-MoE logical shape must be a non-empty expert-major matrix stack"
+                .to_owned(),
+        );
+    }
+    let projection_axes = &logical_dimensions[1..logical_dimensions.len() - 2];
+    let projections_per_expert = projection_axes
+        .iter()
+        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| "CUDA Marlin-MoE projection count overflows".to_owned())?;
+    let output_features = logical_dimensions[logical_dimensions.len() - 2]
+        .checked_mul(projections_per_expert)
+        .ok_or_else(|| "CUDA Marlin-MoE fused output width overflows".to_owned())?;
+    let input_features = logical_dimensions[logical_dimensions.len() - 1];
+    validate_marlin_thread_tile(output_features, input_features, "CUDA Marlin-MoE")?;
+    resolve_gptq_marlin_weight(participant, binding, logical_dimensions)
+}
+
+/// Resolve one exact rank-2 GPTQ-Marlin projection matrix `[N, K]`.
+pub(super) fn resolve_gptq_marlin_matrix_weight(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    logical_dimensions: &[u64],
+) -> Result<CudaMarlinGptqMatrixWeight, String> {
+    let [output_features, input_features] = logical_dimensions else {
+        return Err(
+            "CUDA GPTQ-Marlin projection must have exactly two logical dimensions [N, K]"
+                .to_owned(),
+        );
+    };
+    validate_marlin_thread_tile(
+        *output_features,
+        *input_features,
+        "CUDA GPTQ-Marlin projection",
+    )?;
+    resolve_gptq_marlin_weight(participant, binding, logical_dimensions)
+}
+
+fn resolve_gptq_marlin_weight(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     binding: &ResolvedValueBinding,
     logical_dimensions: &[u64],
@@ -186,13 +233,10 @@ fn validate_gptq_marlin_moe_contract(
             "CUDA Marlin-MoE caller shape {caller_logical_dimensions:?} differs from bound shape {bound_logical_dimensions:?}"
         ));
     }
-    if bound_logical_dimensions.len() < 3
+    if bound_logical_dimensions.len() < 2
         || bound_logical_dimensions.iter().any(|extent| *extent == 0)
     {
-        return Err(
-            "CUDA Marlin-MoE logical shape must be a non-empty expert-major matrix stack"
-                .to_owned(),
-        );
+        return Err("CUDA GPTQ-Marlin logical shape must end in a non-empty matrix".to_owned());
     }
     if logical_element_type != ElementType::F16 {
         return Err(format!(
@@ -312,7 +356,11 @@ fn validate_gptq_marlin_moe_contract(
         ));
     }
 
-    let expert_count = bound_logical_dimensions[0];
+    let expert_count = if bound_logical_dimensions.len() == 2 {
+        1
+    } else {
+        bound_logical_dimensions[0]
+    };
     let mut expected_packed_dimensions = bound_logical_dimensions.to_vec();
     if !expected_packed_dimensions[last_axis].is_multiple_of(2) {
         return Err(
@@ -343,8 +391,9 @@ fn validate_gptq_marlin_moe_contract(
             "CUDA Marlin-MoE scales physical shape must be {expected_scales_dimensions:?}"
         ));
     }
-    if expected_packed_dimensions[0] != expert_count
-        || expected_scales_dimensions[0] != expert_count
+    if bound_logical_dimensions.len() >= 3
+        && (expected_packed_dimensions[0] != expert_count
+            || expected_scales_dimensions[0] != expert_count)
     {
         return Err("CUDA Marlin-MoE first physical axis must equal the expert count".to_owned());
     }
@@ -392,6 +441,21 @@ fn validate_gptq_marlin_moe_contract(
         scales_expert_stride_bytes,
         group_size,
     })
+}
+
+fn validate_marlin_thread_tile(
+    output_features: u64,
+    input_features: u64,
+    label: &str,
+) -> Result<(), String> {
+    let supported = (output_features.is_multiple_of(64) && input_features.is_multiple_of(128))
+        || (output_features.is_multiple_of(128) && input_features.is_multiple_of(64));
+    if output_features == 0 || input_features == 0 || !supported {
+        return Err(format!(
+            "{label} shape N={output_features}, K={input_features} does not satisfy a Marlin 64x128 or 128x64 thread tile"
+        ));
+    }
+    Ok(())
 }
 
 fn required_component<'a>(
@@ -602,6 +666,32 @@ mod tests {
         }
     }
 
+    fn valid_matrix_schema() -> WeightSchema {
+        let mut schema = valid_schema();
+        schema.layout_id = WeightLayoutId::new("weight-layout.test.marlin-matrix").unwrap();
+        schema.components[0].dimensions = vec![64, 64];
+        schema.components[0].external_names = vec![
+            "projection.qweight".to_owned(),
+            "projection.qzeros".to_owned(),
+            "projection.g_idx".to_owned(),
+        ];
+        schema.components[1].dimensions = vec![64, 1];
+        schema.components[1].external_names = vec!["projection.scales".to_owned()];
+        schema.tensors[0].id = id("weight.projection");
+        schema.tensors[0].dimensions = vec![64, 128];
+        let PhysicalWeightLayout::Quantized {
+            packed_dimensions,
+            group_axis,
+            ..
+        } = &mut schema.tensors[0].physical_layout
+        else {
+            unreachable!();
+        };
+        *packed_dimensions = vec![64, 64];
+        *group_axis = 1;
+        schema
+    }
+
     fn resolved(schema: &WeightSchema) -> ResolvedWeightBinding {
         ResolvedWeightBinding::from_schema(schema, &schema.tensors[0].id).unwrap()
     }
@@ -631,6 +721,25 @@ mod tests {
         assert_eq!(metadata.packed_expert_stride_bytes, 4096);
         assert_eq!(metadata.scales_expert_stride_bytes, 128);
         assert_eq!(metadata.group_size, 128);
+    }
+
+    #[test]
+    fn accepts_exact_rank_two_projection_contract() {
+        let schema = valid_matrix_schema();
+        let metadata = validate(&schema).unwrap();
+        validate_marlin_thread_tile(64, 128, "test projection").unwrap();
+        assert_eq!(metadata.logical_dimensions, [64, 128]);
+        assert_eq!(metadata.packed_physical_dimensions, [64, 64]);
+        assert_eq!(metadata.scales_physical_dimensions, [64, 1]);
+        assert_eq!(metadata.expert_count, 1);
+        assert_eq!(metadata.packed_expert_stride_bytes, 4096);
+        assert_eq!(metadata.scales_expert_stride_bytes, 128);
+    }
+
+    #[test]
+    fn rejects_rank_two_projection_outside_marlin_thread_tiles() {
+        let error = validate_marlin_thread_tile(48, 128, "test projection").unwrap_err();
+        assert!(error.contains("64x128 or 128x64"), "{error}");
     }
 
     #[test]
