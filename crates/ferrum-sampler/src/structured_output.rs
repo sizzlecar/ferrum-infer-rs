@@ -69,6 +69,7 @@ pub struct StructuredOutputFactory {
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     vocab_size: usize,
     defined_token_ids: Arc<[bool]>,
+    json_token_classes: Arc<[StructuredOutputTokenClass]>,
     grammar_templates: Mutex<HashMap<String, Matcher>>,
 }
 
@@ -107,17 +108,20 @@ impl StructuredOutputFactory {
 
         let special_ids = tokenizer_special_ids(tokenizer.as_ref());
         let mut defined_token_ids = Vec::with_capacity(vocab_size);
+        let mut json_token_classes = Vec::with_capacity(vocab_size);
         let token_bytes = (0..vocab_size)
             .map(|idx| {
                 let token = TokenId::new(idx as u32);
                 if special_ids.contains(&token.get()) {
                     defined_token_ids.push(true);
+                    json_token_classes.push(StructuredOutputTokenClass::Control);
                     special_token_marker(token)
                 } else if let Some(bytes) = tokenizer
                     .token_bytes(token)
                     .filter(|bytes| !bytes.is_empty())
                 {
                     defined_token_ids.push(true);
+                    json_token_classes.push(classify_json_token_bytes(&bytes));
                     bytes
                 } else {
                     // Keep vocabulary holes out of the trie. The explicit
@@ -125,6 +129,7 @@ impl StructuredOutputFactory {
                     // llguidance's wildcard slice represents its root as an
                     // all-token bitset, including IDs with no trie node.
                     defined_token_ids.push(false);
+                    json_token_classes.push(StructuredOutputTokenClass::Undefined);
                     Vec::new()
                 }
             })
@@ -171,6 +176,7 @@ impl StructuredOutputFactory {
             tokenizer,
             vocab_size,
             defined_token_ids: defined_token_ids.into(),
+            json_token_classes: json_token_classes.into(),
             grammar_templates: Mutex::new(HashMap::new()),
         })
     }
@@ -272,6 +278,7 @@ impl StructuredOutputFactory {
             }
         };
 
+        let grammar_start = matches!(activation, Activation::Active).then_some(0);
         Ok(Some(StructuredOutputProcessor {
             state: Mutex::new(ProcessorState {
                 matcher,
@@ -280,9 +287,11 @@ impl StructuredOutputFactory {
                 consumed: 0,
                 boundary_forced: false,
                 boundary_start: None,
+                grammar_start,
             }),
             vocab_size: self.vocab_size,
             defined_token_ids: Arc::clone(&self.defined_token_ids),
+            json_token_classes: Arc::clone(&self.json_token_classes),
             budget,
         }))
     }
@@ -293,6 +302,7 @@ pub struct StructuredOutputProcessor {
     state: Mutex<ProcessorState>,
     vocab_size: usize,
     defined_token_ids: Arc<[bool]>,
+    json_token_classes: Arc<[StructuredOutputTokenClass]>,
     budget: Option<StructuredOutputBudgetPlan>,
 }
 
@@ -302,6 +312,24 @@ pub enum StructuredOutputPhase {
     WaitingForDelimiter,
     ForcingDelimiter,
     EnforcingGrammar,
+}
+
+/// Privacy-safe lexical class for the tail of an incomplete grammar.
+///
+/// This deliberately exposes neither decoded text nor a token history. It is
+/// used only by terminal diagnostics to distinguish an unbounded whitespace,
+/// number, string, or control-token run from a parser activation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StructuredOutputTokenClass {
+    Whitespace,
+    Number,
+    Structural,
+    StringBoundary,
+    Literal,
+    Other,
+    Control,
+    Undefined,
 }
 
 /// Allocation-free hot-path result of one structured-output mask operation.
@@ -328,6 +356,11 @@ pub struct StructuredOutputProgress {
     pub reasoning_token_count: Option<usize>,
     pub boundary_forced: bool,
     pub budget: Option<StructuredOutputBudgetPlan>,
+    pub grammar_token_count: usize,
+    pub trailing_token_class: Option<StructuredOutputTokenClass>,
+    pub trailing_token_class_count: usize,
+    pub trailing_token_id: Option<u32>,
+    pub trailing_identical_token_count: usize,
     pub accepting: bool,
 }
 
@@ -350,6 +383,7 @@ struct ProcessorState {
     consumed: usize,
     boundary_forced: bool,
     boundary_start: Option<usize>,
+    grammar_start: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -551,6 +585,37 @@ impl StructuredOutputProcessor {
                     })?,
                 ),
             };
+        let grammar_tokens = state
+            .grammar_start
+            .and_then(|start| generated.get(start..))
+            .unwrap_or_default();
+        let trailing_token_id = grammar_tokens.last().map(|token| token.get());
+        let trailing_token_class = trailing_token_id.map(|token| {
+            self.json_token_classes
+                .get(token as usize)
+                .copied()
+                .unwrap_or(StructuredOutputTokenClass::Undefined)
+        });
+        let trailing_token_class_count = trailing_token_class.map_or(0, |class| {
+            grammar_tokens
+                .iter()
+                .rev()
+                .take_while(|token| {
+                    self.json_token_classes
+                        .get(token.get() as usize)
+                        .copied()
+                        .unwrap_or(StructuredOutputTokenClass::Undefined)
+                        == class
+                })
+                .count()
+        });
+        let trailing_identical_token_count = trailing_token_id.map_or(0, |token_id| {
+            grammar_tokens
+                .iter()
+                .rev()
+                .take_while(|token| token.get() == token_id)
+                .count()
+        });
         Ok(StructuredOutputProgress {
             phase,
             generated_token_count: generated.len(),
@@ -563,6 +628,11 @@ impl StructuredOutputProcessor {
                 .map(|_| state.boundary_start.unwrap_or(generated.len())),
             boundary_forced: state.boundary_forced,
             budget: self.budget,
+            grammar_token_count: grammar_tokens.len(),
+            trailing_token_class,
+            trailing_token_class_count,
+            trailing_token_id,
+            trailing_identical_token_count,
             accepting,
         })
     }
@@ -577,6 +647,7 @@ impl StructuredOutputProcessor {
         state.consumed = 0;
         state.boundary_forced = false;
         state.boundary_start = None;
+        state.grammar_start = matches!(state.initial_activation, Activation::Active).then_some(0);
         Ok(())
     }
 }
@@ -663,6 +734,7 @@ fn advance_state(
         {
             let grammar_start = search_from + offset + delimiter_tokens.len();
             state.boundary_start = Some(grammar_start - delimiter_tokens.len());
+            state.grammar_start = Some(grammar_start);
             state.activation = Activation::Active;
             state.consumed = grammar_start;
         } else {
@@ -737,6 +809,33 @@ fn special_token_marker(token: TokenId) -> Vec<u8> {
     let mut marker = vec![TokTrie::SPECIAL_TOKEN_MARKER];
     marker.extend_from_slice(format!("[{}]", token.get()).as_bytes());
     marker
+}
+
+fn classify_json_token_bytes(bytes: &[u8]) -> StructuredOutputTokenClass {
+    if bytes.is_empty() {
+        StructuredOutputTokenClass::Undefined
+    } else if bytes
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        StructuredOutputTokenClass::Whitespace
+    } else if bytes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E'))
+    {
+        StructuredOutputTokenClass::Number
+    } else if bytes
+        .iter()
+        .all(|byte| matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':'))
+    {
+        StructuredOutputTokenClass::Structural
+    } else if bytes.iter().all(|byte| matches!(byte, b'"' | b'\\')) {
+        StructuredOutputTokenClass::StringBoundary
+    } else if bytes.iter().all(u8::is_ascii_alphabetic) {
+        StructuredOutputTokenClass::Literal
+    } else {
+        StructuredOutputTokenClass::Other
+    }
 }
 
 #[cfg(test)]
@@ -948,6 +1047,67 @@ mod tests {
         let mut generated = Vec::new();
         assert_and_append(&processor, &mut generated, r#"{"answer":42}"#);
         assert!(processor.is_accepting(&generated).unwrap());
+    }
+
+    #[test]
+    fn terminal_progress_classifies_an_unclosed_number_without_retaining_text() {
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonSchema(
+                    r#"{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}"#
+                        .to_string(),
+                ),
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let generated =
+            r#"{"value":123777"#.bytes().map(|byte| TokenId::new(byte as u32)).collect::<Vec<_>>();
+        let progress = processor
+            .progress_with_terminals(&generated, &HashSet::new())
+            .unwrap();
+
+        assert_eq!(progress.phase, StructuredOutputPhase::EnforcingGrammar);
+        assert_eq!(progress.grammar_token_count, generated.len());
+        assert_eq!(
+            progress.trailing_token_class,
+            Some(StructuredOutputTokenClass::Number)
+        );
+        assert_eq!(progress.trailing_token_class_count, 6);
+        assert_eq!(progress.trailing_token_id, Some(b'7' as u32));
+        assert_eq!(progress.trailing_identical_token_count, 3);
+        assert!(!progress.accepting);
+    }
+
+    #[test]
+    fn lexical_diagnostics_classify_json_bytes_without_decoding_content() {
+        assert_eq!(
+            classify_json_token_bytes(b" \n\t"),
+            StructuredOutputTokenClass::Whitespace
+        );
+        assert_eq!(
+            classify_json_token_bytes(b"-12.5e+3"),
+            StructuredOutputTokenClass::Number
+        );
+        assert_eq!(
+            classify_json_token_bytes(br#"{}[],:"#),
+            StructuredOutputTokenClass::Structural
+        );
+        assert_eq!(
+            classify_json_token_bytes(br#"\""#),
+            StructuredOutputTokenClass::StringBoundary
+        );
+        assert_eq!(
+            classify_json_token_bytes(b"true"),
+            StructuredOutputTokenClass::Literal
+        );
+        assert_eq!(
+            classify_json_token_bytes(br#""value":"#),
+            StructuredOutputTokenClass::Other
+        );
     }
 
     struct FragmentedUtf8Tokenizer {
