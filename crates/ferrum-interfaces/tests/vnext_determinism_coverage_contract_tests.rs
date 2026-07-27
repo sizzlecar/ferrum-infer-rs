@@ -60,6 +60,62 @@ fn live_catalog_and_resolved_plan_form_one_exact_coverage_registry() {
 }
 
 #[test]
+fn live_catalog_and_resolved_plans_form_one_typed_witness_denominator() {
+    let fixture =
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding);
+    let denominator = ExecutionDeterminismEvidenceDenominator::from_catalog_and_resolved_plans(
+        &fixture.resolved.parts().capabilities,
+        &[("M1", &fixture.resolved)],
+    )
+    .unwrap();
+
+    assert_eq!(denominator.coverage().models().len(), 1);
+    assert_eq!(
+        denominator.provider_evidence().len(),
+        denominator.coverage().provider_requirements().len()
+    );
+    assert!(denominator.provider_evidence().iter().all(|evidence| {
+        evidence.model_key() == "M1"
+            && !evidence.node_ids().is_empty()
+            && !evidence.witness_plan().witnesses().is_empty()
+            && evidence.witness_plan_fingerprint().len() == 64
+            && evidence.required_comparisons()
+                == [
+                    ExecutionDeterminismComparisonKind::EagerEager,
+                    ExecutionDeterminismComparisonKind::ReplayReplay,
+                    ExecutionDeterminismComparisonKind::EagerReplay,
+                ]
+    }));
+
+    let encoded = denominator.to_json().unwrap();
+    assert_eq!(
+        ExecutionDeterminismEvidenceDenominator::decode_untrusted(&encoded).unwrap(),
+        denominator
+    );
+    assert_eq!(denominator.fingerprint().unwrap().len(), 64);
+
+    let mut missing_witness: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    missing_witness["provider_evidence"][0]["witness_plan"]["witnesses"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(ExecutionDeterminismEvidenceDenominator::decode_untrusted(
+        &serde_json::to_vec(&missing_witness).unwrap()
+    )
+    .is_err());
+
+    let mut stale_provider: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    stale_provider["provider_evidence"][0]["provider_implementation_fingerprint"] =
+        serde_json::json!("0".repeat(64));
+    assert!(ExecutionDeterminismEvidenceDenominator::decode_untrusted(
+        &serde_json::to_vec(&stale_provider).unwrap()
+    )
+    .is_err());
+
+    close_fixture(fixture);
+}
+
+#[test]
 fn coverage_registry_rejects_reused_models_and_foreign_catalogs() {
     let fixture = fixture_with_determinism_provider_behavior(false, ProviderBehavior::Success);
     let mut registry =

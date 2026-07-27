@@ -10,11 +10,14 @@ use crate::vnext::{
     ResolvedModelPlan, VNextError,
 };
 
-use super::invalid_plan;
+use super::{invalid_plan, ExecutionDeterminismWitnessPlan};
 
 pub const EXECUTION_DETERMINISM_COVERAGE_VERSION: ContractVersion = ContractVersion::new(1, 0);
+pub const EXECUTION_DETERMINISM_EVIDENCE_DENOMINATOR_VERSION: ContractVersion =
+    ContractVersion::new(1, 0);
 
 const MAX_COVERAGE_WIRE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVIDENCE_DENOMINATOR_WIRE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COVERAGE_MODELS: usize = 32;
 const MAX_COVERAGE_PROVIDERS: usize = 512;
 const MAX_COVERAGE_NODES_PER_MODEL: usize = 65_536;
@@ -515,6 +518,283 @@ impl ExecutionDeterminismCoverageRegistry {
             if covered != expected {
                 return Err(invalid_plan(
                     "execution determinism provider selections do not cover the resolved plan exactly",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact immutable witness denominator for one provider selection in one
+/// resolved model plan.
+///
+/// The duplicated plan/provider identities are intentional. They make a
+/// detached hardware artifact self-describing while `validate_shape` proves
+/// that every row is still derived from the nested live coverage registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDeterminismProviderEvidenceDenominator {
+    model_key: String,
+    resolved_plan_fingerprint: String,
+    plan_hash: PlanHash,
+    operation_id: OperationId,
+    operation_fingerprint: String,
+    provider_id: ProviderId,
+    provider_implementation_fingerprint: String,
+    provider_execution_contract_fingerprint: ProviderExecutionContractFingerprint,
+    replay_equivalence: ProviderReplayEquivalence,
+    required_comparisons: Vec<ExecutionDeterminismComparisonKind>,
+    node_ids: Vec<NodeId>,
+    witness_plan_fingerprint: String,
+    witness_plan: ExecutionDeterminismWitnessPlan,
+}
+
+impl ExecutionDeterminismProviderEvidenceDenominator {
+    pub fn model_key(&self) -> &str {
+        &self.model_key
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
+    }
+
+    pub fn required_comparisons(&self) -> &[ExecutionDeterminismComparisonKind] {
+        &self.required_comparisons
+    }
+
+    pub fn witness_plan_fingerprint(&self) -> &str {
+        &self.witness_plan_fingerprint
+    }
+
+    pub fn witness_plan(&self) -> &ExecutionDeterminismWitnessPlan {
+        &self.witness_plan
+    }
+
+    fn canonical_key(&self) -> (&str, &OperationId, &ProviderId) {
+        (&self.model_key, &self.operation_id, &self.provider_id)
+    }
+}
+
+/// Current-binary source of truth consumed by the CUDA determinism collector.
+///
+/// Construction requires the live capability catalog and every resolved model
+/// plan in the release matrix in the same process. This prevents Python gate
+/// code or an artifact author from inventing provider counts, node scopes, or
+/// output/state witness ranges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDeterminismEvidenceDenominator {
+    schema_version: ContractVersion,
+    coverage: ExecutionDeterminismCoverageRegistry,
+    provider_evidence: Vec<ExecutionDeterminismProviderEvidenceDenominator>,
+}
+
+impl ExecutionDeterminismEvidenceDenominator {
+    pub fn from_catalog_and_resolved_plans(
+        catalog: &CapabilityCatalog,
+        plans: &[(&str, &ResolvedModelPlan)],
+    ) -> Result<Self, VNextError> {
+        if plans.is_empty() || plans.len() > MAX_COVERAGE_MODELS {
+            return Err(invalid_plan(
+                "execution determinism evidence model denominator is empty or exceeds its bound",
+            ));
+        }
+        let mut plan_by_key = BTreeMap::new();
+        let mut coverage = ExecutionDeterminismCoverageRegistry::from_catalog(catalog)?;
+        for (model_key, plan) in plans {
+            validate_model_key(model_key)?;
+            if plan_by_key.insert((*model_key).to_owned(), *plan).is_some() {
+                return Err(invalid_plan(
+                    "execution determinism evidence model keys must be unique",
+                ));
+            }
+            coverage.try_add_resolved_model_plan(*model_key, plan)?;
+        }
+        if coverage.unselected_provider_requirements().next().is_some() {
+            return Err(invalid_plan(
+                "execution determinism live catalog contains a provider absent from all resolved plans",
+            ));
+        }
+
+        let mut provider_evidence = Vec::new();
+        for requirement in &coverage.provider_requirements {
+            for selection in &requirement.model_selections {
+                let plan = plan_by_key
+                    .get(selection.model_key.as_str())
+                    .expect("coverage model came from the exact plan map");
+                let witness_plan = plan
+                    .execution_plan()
+                    .determinism_witness_plan_for_nodes(&selection.node_ids)?;
+                let witness_plan_fingerprint = witness_plan.fingerprint()?;
+                provider_evidence.push(ExecutionDeterminismProviderEvidenceDenominator {
+                    model_key: selection.model_key.clone(),
+                    resolved_plan_fingerprint: selection.resolved_plan_fingerprint.clone(),
+                    plan_hash: selection.plan_hash.clone(),
+                    operation_id: requirement.operation_id.clone(),
+                    operation_fingerprint: requirement.operation_fingerprint.clone(),
+                    provider_id: requirement.provider_id.clone(),
+                    provider_implementation_fingerprint: requirement
+                        .provider_implementation_fingerprint
+                        .clone(),
+                    provider_execution_contract_fingerprint: requirement
+                        .provider_execution_contract_fingerprint,
+                    replay_equivalence: requirement.replay_equivalence,
+                    required_comparisons: requirement.required_comparisons.clone(),
+                    node_ids: selection.node_ids.clone(),
+                    witness_plan_fingerprint,
+                    witness_plan,
+                });
+            }
+        }
+        provider_evidence.sort_by(|left, right| left.canonical_key().cmp(&right.canonical_key()));
+        let denominator = Self {
+            schema_version: EXECUTION_DETERMINISM_EVIDENCE_DENOMINATOR_VERSION,
+            coverage,
+            provider_evidence,
+        };
+        denominator.validate_shape()?;
+        Ok(denominator)
+    }
+
+    pub const fn schema_version(&self) -> ContractVersion {
+        self.schema_version
+    }
+
+    pub fn coverage(&self) -> &ExecutionDeterminismCoverageRegistry {
+        &self.coverage
+    }
+
+    pub fn provider_evidence(&self) -> &[ExecutionDeterminismProviderEvidenceDenominator] {
+        &self.provider_evidence
+    }
+
+    pub fn to_json(&self) -> Result<Vec<u8>, VNextError> {
+        self.validate_shape()?;
+        serde_json::to_vec_pretty(self).map_err(|error| VNextError::Serialization {
+            context: "serialize execution determinism evidence denominator",
+            message: error.to_string(),
+        })
+    }
+
+    pub fn fingerprint(&self) -> Result<String, VNextError> {
+        Ok(format!("{:x}", Sha256::digest(self.to_json()?)))
+    }
+
+    pub fn decode_untrusted(bytes: &[u8]) -> Result<Self, VNextError> {
+        if bytes.len() > MAX_EVIDENCE_DENOMINATOR_WIRE_BYTES {
+            return Err(invalid_plan(
+                "execution determinism evidence denominator exceeds its wire bound",
+            ));
+        }
+        let denominator =
+            serde_json::from_slice::<Self>(bytes).map_err(|error| VNextError::Serialization {
+                context: "decode execution determinism evidence denominator",
+                message: error.to_string(),
+            })?;
+        denominator.validate_shape()?;
+        Ok(denominator)
+    }
+
+    fn validate_shape(&self) -> Result<(), VNextError> {
+        self.coverage.validate_shape(true)?;
+        if self.schema_version != EXECUTION_DETERMINISM_EVIDENCE_DENOMINATOR_VERSION
+            || self.provider_evidence.is_empty()
+            || self.provider_evidence.len()
+                > MAX_COVERAGE_MODELS.saturating_mul(MAX_COVERAGE_PROVIDERS)
+            || self
+                .coverage
+                .unselected_provider_requirements()
+                .next()
+                .is_some()
+            || self
+                .provider_evidence
+                .windows(2)
+                .any(|pair| pair[0].canonical_key() >= pair[1].canonical_key())
+        {
+            return Err(invalid_plan(
+                "execution determinism evidence denominator identity or cardinality is invalid",
+            ));
+        }
+
+        let requirements = self
+            .coverage
+            .provider_requirements
+            .iter()
+            .map(|requirement| (requirement.canonical_key(), requirement))
+            .collect::<BTreeMap<_, _>>();
+        let models = self
+            .coverage
+            .models
+            .iter()
+            .map(|model| (model.model_key.as_str(), model))
+            .collect::<BTreeMap<_, _>>();
+        let mut expected = BTreeSet::new();
+        for requirement in &self.coverage.provider_requirements {
+            for selection in &requirement.model_selections {
+                expected.insert((
+                    selection.model_key.as_str(),
+                    &requirement.operation_id,
+                    &requirement.provider_id,
+                ));
+            }
+        }
+        let actual = self
+            .provider_evidence
+            .iter()
+            .map(ExecutionDeterminismProviderEvidenceDenominator::canonical_key)
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(invalid_plan(
+                "execution determinism provider evidence does not equal the live plan denominator",
+            ));
+        }
+
+        for evidence in &self.provider_evidence {
+            let requirement = requirements
+                .get(&(&evidence.operation_id, &evidence.provider_id))
+                .expect("validated evidence key exists in coverage");
+            let selection = requirement
+                .model_selections
+                .iter()
+                .find(|selection| selection.model_key == evidence.model_key)
+                .expect("validated evidence key has a model selection");
+            let model = models
+                .get(evidence.model_key.as_str())
+                .expect("validated evidence model exists in coverage");
+            evidence.witness_plan.validate_shape()?;
+            if evidence.resolved_plan_fingerprint != selection.resolved_plan_fingerprint
+                || evidence.resolved_plan_fingerprint != model.resolved_plan_fingerprint
+                || evidence.plan_hash != selection.plan_hash
+                || evidence.plan_hash != model.plan_hash
+                || evidence.operation_fingerprint != requirement.operation_fingerprint
+                || evidence.provider_implementation_fingerprint
+                    != requirement.provider_implementation_fingerprint
+                || evidence.provider_execution_contract_fingerprint
+                    != requirement.provider_execution_contract_fingerprint
+                || evidence.replay_equivalence != requirement.replay_equivalence
+                || evidence.required_comparisons != requirement.required_comparisons
+                || evidence.node_ids != selection.node_ids
+                || evidence.witness_plan.plan_hash() != &evidence.plan_hash
+                || evidence.witness_plan.node_ids() != evidence.node_ids
+                || evidence.witness_plan.fingerprint()? != evidence.witness_plan_fingerprint
+                || evidence.witness_plan.witnesses().iter().any(|witness| {
+                    witness.provider_id() != &evidence.provider_id
+                        || witness.provider_implementation_fingerprint()
+                            != evidence.provider_implementation_fingerprint
+                        || witness.provider_execution_contract_fingerprint()
+                            != evidence.provider_execution_contract_fingerprint
+                })
+            {
+                return Err(invalid_plan(
+                    "execution determinism provider evidence differs from its live catalog, plan, or witness denominator",
                 ));
             }
         }

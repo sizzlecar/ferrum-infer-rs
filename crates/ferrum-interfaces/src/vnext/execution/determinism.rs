@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{
     invalid_plan, AllocationLifetime, BufferUsage, ContractVersion, DynamicResourceDemand,
@@ -16,6 +17,10 @@ mod coverage;
 pub use coverage::*;
 
 pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(4, 0);
+const MAX_EXECUTION_DETERMINISM_WITNESS_WIRE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXECUTION_DETERMINISM_WITNESS_NODES: usize = 65_536;
+const MAX_EXECUTION_DETERMINISM_INITIALIZATIONS: usize = 262_144;
+const MAX_EXECUTION_DETERMINISM_WITNESSES: usize = 1_048_576;
 
 /// Runtime work projection for one immutable value binding.
 ///
@@ -558,6 +563,172 @@ impl ExecutionDeterminismWitnessPlan {
     pub fn witnesses(&self) -> &[ExecutionDeterminismWitnessSpec] {
         &self.witnesses
     }
+
+    pub fn to_json(&self) -> Result<Vec<u8>, VNextError> {
+        self.validate_shape()?;
+        serde_json::to_vec_pretty(self).map_err(|error| VNextError::Serialization {
+            context: "serialize execution determinism witness plan",
+            message: error.to_string(),
+        })
+    }
+
+    pub fn fingerprint(&self) -> Result<String, VNextError> {
+        Ok(format!("{:x}", Sha256::digest(self.to_json()?)))
+    }
+
+    pub fn decode_untrusted(bytes: &[u8]) -> Result<Self, VNextError> {
+        if bytes.len() > MAX_EXECUTION_DETERMINISM_WITNESS_WIRE_BYTES {
+            return Err(invalid_plan(
+                "execution determinism witness plan exceeds its wire bound",
+            ));
+        }
+        let plan =
+            serde_json::from_slice::<Self>(bytes).map_err(|error| VNextError::Serialization {
+                context: "decode execution determinism witness plan",
+                message: error.to_string(),
+            })?;
+        plan.validate_shape()?;
+        Ok(plan)
+    }
+
+    fn validate_shape(&self) -> Result<(), VNextError> {
+        if self.schema_version != EXECUTION_DETERMINISM_WITNESS_VERSION
+            || self.node_ids.is_empty()
+            || self.node_ids.len() > MAX_EXECUTION_DETERMINISM_WITNESS_NODES
+            || self.initializations.len() > MAX_EXECUTION_DETERMINISM_INITIALIZATIONS
+            || self.witnesses.is_empty()
+            || self.witnesses.len() > MAX_EXECUTION_DETERMINISM_WITNESSES
+        {
+            return Err(invalid_plan(
+                "execution determinism witness plan identity or cardinality is invalid",
+            ));
+        }
+        let node_ids = self.node_ids.iter().collect::<BTreeSet<_>>();
+        if node_ids.len() != self.node_ids.len() {
+            return Err(invalid_plan(
+                "execution determinism witness plan node scope is not unique",
+            ));
+        }
+
+        let mut replay_provider_ids = BTreeSet::new();
+        let mut replay_nodes = BTreeSet::new();
+        for requirement in &self.replay_provider_requirements {
+            if !replay_provider_ids.insert(&requirement.provider_id)
+                || !super::is_canonical_sha256(&requirement.provider_implementation_fingerprint)
+                || requirement.node_ids.is_empty()
+                || requirement.node_ids.iter().collect::<BTreeSet<_>>().len()
+                    != requirement.node_ids.len()
+                || requirement
+                    .node_ids
+                    .iter()
+                    .any(|node_id| !node_ids.contains(node_id))
+            {
+                return Err(invalid_plan(
+                    "execution determinism replay provider denominator is invalid",
+                ));
+            }
+            for node_id in &requirement.node_ids {
+                if !replay_nodes.insert(node_id) {
+                    return Err(invalid_plan(
+                        "execution determinism replay node belongs to multiple providers",
+                    ));
+                }
+            }
+        }
+
+        let mut initialization_rows = BTreeSet::new();
+        for initialization in &self.initializations {
+            let location = initialization.location();
+            if initialization.consumer_node_ids.is_empty()
+                || initialization
+                    .consumer_node_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != initialization.consumer_node_ids.len()
+                || initialization
+                    .consumer_node_ids
+                    .iter()
+                    .any(|node_id| !node_ids.contains(node_id))
+                || !node_ids.contains(location.node_id())
+            {
+                return Err(invalid_plan(
+                    "execution determinism initialization scope is invalid",
+                ));
+            }
+            validate_determinism_location(location)?;
+            let row = serde_json::to_string(initialization).map_err(|error| {
+                VNextError::Serialization {
+                    context: "canonicalize execution determinism initialization",
+                    message: error.to_string(),
+                }
+            })?;
+            if !initialization_rows.insert(row) {
+                return Err(invalid_plan(
+                    "execution determinism initialization denominator contains duplicates",
+                ));
+            }
+        }
+
+        let mut witness_rows = BTreeSet::new();
+        let mut output_nodes = BTreeSet::new();
+        let mut replay_witness_nodes = BTreeSet::new();
+        for witness in &self.witnesses {
+            if !node_ids.contains(witness.node_id())
+                || !super::is_canonical_sha256(&witness.provider_implementation_fingerprint)
+            {
+                return Err(invalid_plan(
+                    "execution determinism witness identity is invalid",
+                ));
+            }
+            validate_determinism_location(witness.location())?;
+            if matches!(
+                witness.kind(),
+                ExecutionDeterminismWitnessKind::Output { .. }
+            ) {
+                output_nodes.insert(witness.node_id());
+            }
+            if replay_provider_ids.contains(witness.provider_id()) {
+                replay_witness_nodes.insert(witness.node_id());
+            }
+            let row =
+                serde_json::to_string(witness).map_err(|error| VNextError::Serialization {
+                    context: "canonicalize execution determinism witness",
+                    message: error.to_string(),
+                })?;
+            if !witness_rows.insert(row) {
+                return Err(invalid_plan(
+                    "execution determinism witness denominator contains duplicates",
+                ));
+            }
+        }
+        if output_nodes != node_ids || replay_witness_nodes != replay_nodes {
+            return Err(invalid_plan(
+                "execution determinism witness denominator does not cover its node scope",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_determinism_location(
+    location: &ExecutionDeterminismValueLocation,
+) -> Result<(), VNextError> {
+    let element_bytes = location.element_type().size_bytes();
+    if location.declared_length_bytes == 0
+        || location.logical_offset_bytes % element_bytes != 0
+        || location.declared_length_bytes % element_bytes != 0
+        || location
+            .logical_offset_bytes
+            .checked_add(location.declared_length_bytes)
+            .is_none()
+        || location.maximum_bound_length_bytes()? < location.declared_length_bytes
+    {
+        return Err(invalid_plan(
+            "execution determinism value location has an invalid byte range",
+        ));
+    }
+    Ok(())
 }
 
 impl ExecutionPlan {
@@ -874,14 +1045,16 @@ impl ExecutionPlan {
             )
             .collect();
 
-        Ok(ExecutionDeterminismWitnessPlan {
+        let witness_plan = ExecutionDeterminismWitnessPlan {
             schema_version: EXECUTION_DETERMINISM_WITNESS_VERSION,
             plan_hash: self.plan_hash().clone(),
             node_ids: canonical_node_ids,
             replay_provider_requirements,
             initializations,
             witnesses,
-        })
+        };
+        witness_plan.validate_shape()?;
+        Ok(witness_plan)
     }
 }
 
