@@ -1578,6 +1578,7 @@ name = "ferrum-native-ops"
 version = "0.7.7"
 dependencies = [
  "ferrum-types",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

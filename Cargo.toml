@@ -169,5 +169,12 @@ lto = true
 codegen-units = 1
 strip = true
 
+[profile.cuda-correctness]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+strip = false
+
 [profile.bench]
 inherits = "release"
