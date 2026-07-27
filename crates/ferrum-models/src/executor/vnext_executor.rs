@@ -42,6 +42,7 @@ use super::{
     common,
     vnext_checkpoint::{
         VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointClaim,
+        VNextCheckpointProductOutputMode, VNextCheckpointProductOutputRecord,
         VNextCheckpointSelection,
     },
     vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
@@ -583,6 +584,15 @@ enum VNextExecutionWaveKind {
 enum VNextProductOutputMode {
     FullLogits,
     GreedyToken,
+}
+
+impl VNextProductOutputMode {
+    const fn checkpoint_mode(self) -> VNextCheckpointProductOutputMode {
+        match self {
+            Self::FullLogits => VNextCheckpointProductOutputMode::FullLogits,
+            Self::GreedyToken => VNextCheckpointProductOutputMode::GreedyToken,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5588,10 +5598,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             drop(receipt);
             return Err(self.abort_step(step, message).await);
         }
-        let processed = (|| -> Result<(Vec<Vec<f32>>, u64, Vec<VNextCheckpointArtifactRecord>)> {
+        let processed = (|| -> Result<(
+            Vec<Vec<f32>>,
+            u64,
+            Vec<VNextCheckpointArtifactRecord>,
+            Vec<VNextCheckpointProductOutputRecord>,
+        )> {
             let mut logits = vec![None; participants.len()];
             let mut readback_bytes = 0_u64;
             let mut checkpoint_records = Vec::new();
+            let mut product_output_records = Vec::new();
             for disposition in receipt.dispositions() {
                 let CompletionReadbackDisposition::Succeeded(output) = disposition else {
                     return Err(FerrumError::backend(format!(
@@ -5644,6 +5660,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ));
                     }
                     *slot = Some(self.decode_product_output(output.bytes(), output_mode)?);
+                    if let (Some(capture_claim), Some(capture)) =
+                        (capture_claim, self.checkpoint_capture.as_ref())
+                    {
+                        if capture.captures_product_output() {
+                            let participant =
+                                participants.get(participant_index).ok_or_else(|| {
+                                    FerrumError::internal(
+                                        "vNext product-output checkpoint participant index exceeds submitted participants",
+                                    )
+                                })?;
+                            product_output_records.push(capture.write_product_output(
+                                capture_claim,
+                                &participant.sequence.request_id,
+                                participant.span,
+                                output_mode.checkpoint_mode(),
+                                output,
+                            )?);
+                        }
+                    }
                 }
                 if let (Some(capture_claim), Some(capture), Some(checkpoint)) =
                     (capture_claim, self.checkpoint_capture.as_ref(), checkpoint)
@@ -5679,9 +5714,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok((logits, readback_bytes, checkpoint_records))
+            Ok((
+                logits,
+                readback_bytes,
+                checkpoint_records,
+                product_output_records,
+            ))
         })();
-        let (logits, readback_bytes, checkpoint_records) = match processed {
+        let (logits, readback_bytes, checkpoint_records, product_output_records) = match processed {
             Ok(processed) => processed,
             Err(error) => {
                 drop(receipt);
@@ -5697,6 +5737,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 receipt.completion().fingerprint(),
                 receipt.fingerprint(),
                 checkpoint_records,
+                product_output_records,
             ) {
                 drop(receipt);
                 return Err(self.abort_step(step, error.to_string()).await);
