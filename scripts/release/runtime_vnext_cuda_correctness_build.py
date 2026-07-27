@@ -18,12 +18,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 import bounded_command
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 on retained CUDA build hosts.
+    tomllib = None
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -244,10 +248,57 @@ def source_identity(source_root: Path, *, require_clean: bool) -> dict[str, Any]
     }
 
 
+def parse_flat_toml_table(document: str, table_name: str) -> dict[str, Any]:
+    current_table = None
+    result = {}
+    for line_number, raw_line in enumerate(document.splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_table = line[1:-1].strip()
+            continue
+        if current_table != table_name:
+            continue
+        require("=" in line, f"invalid {table_name} TOML line {line_number}")
+        key, raw_value = (part.strip() for part in line.split("=", 1))
+        require(
+            re.fullmatch(r"[A-Za-z0-9_-]+", key) is not None,
+            f"invalid {table_name} key at line {line_number}",
+        )
+        if raw_value in {"true", "false"}:
+            value: Any = raw_value == "true"
+        elif re.fullmatch(r"-?[0-9]+", raw_value):
+            value = int(raw_value)
+        elif raw_value.startswith('"') and raw_value.endswith('"'):
+            value = json.loads(raw_value)
+        else:
+            raise CorrectnessBuildError(
+                f"unsupported {table_name} scalar at line {line_number}: {raw_value!r}"
+            )
+        require(key not in result, f"duplicate {table_name} key: {key}")
+        result[key] = value
+    require(result, f"Cargo table [{table_name}] is missing or empty")
+    return result
+
+
+def load_profile_tables(document: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if tomllib is not None:
+        parsed = tomllib.loads(document)
+        profile_root = parsed.get("profile", {})
+        return (
+            profile_root.get(PROFILE),
+            profile_root.get("release"),
+        )
+    return (
+        parse_flat_toml_table(document, f"profile.{PROFILE}"),
+        parse_flat_toml_table(document, "profile.release"),
+    )
+
+
 def validate_profile(source_root: Path) -> dict[str, Any]:
     cargo_toml = source_root / "Cargo.toml"
-    document = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
-    profile = document.get("profile", {}).get(PROFILE)
+    profile, release = load_profile_tables(cargo_toml.read_text(encoding="utf-8"))
     require(isinstance(profile, dict), f"Cargo profile {PROFILE!r} is missing")
     expected = {
         "inherits": "release",
@@ -257,7 +308,6 @@ def validate_profile(source_root: Path) -> dict[str, Any]:
         "strip": False,
     }
     require(profile == expected, f"Cargo profile {PROFILE!r} drift: {profile!r}")
-    release = document.get("profile", {}).get("release")
     require(isinstance(release, dict), "Cargo release profile is missing")
     require(release.get("opt-level") == 3, "release opt-level must remain 3")
     return {
@@ -975,6 +1025,20 @@ strip = false
             "core PTX inventory parsing drift",
         )
         validate_profile(source)
+        fallback_document = (source / "Cargo.toml").read_text(encoding="utf-8")
+        require(
+            parse_flat_toml_table(
+                fallback_document, f"profile.{PROFILE}"
+            )
+            == {
+                "inherits": "release",
+                "lto": False,
+                "codegen-units": 16,
+                "incremental": True,
+                "strip": False,
+            },
+            "Python 3.10 profile parser drift",
+        )
         import_out = root / "target/release/build/ferrum-kernels-fixture/out"
         import_out.mkdir(parents=True)
         for _, file_name, stamp_name in [*outputs, *STATIC_OUTPUTS]:
