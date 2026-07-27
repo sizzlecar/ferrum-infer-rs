@@ -1790,6 +1790,9 @@ impl OperationDispatch {
             timing_mode,
             execution_policy.compute_path(),
         );
+        if determinism_restore.is_some() {
+            commands.require_logical_execution_path_attribution();
+        }
         let backing_initialization_command_count = completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;

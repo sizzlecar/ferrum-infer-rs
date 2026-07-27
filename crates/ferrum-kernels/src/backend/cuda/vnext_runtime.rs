@@ -21,6 +21,7 @@ use ferrum_interfaces::vnext::{
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
+    DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
     DeviceReusableAddressScope, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
@@ -1061,6 +1062,25 @@ impl CudaDeviceCommand {
         self.reusable_execution.as_ref()
     }
 
+    pub(crate) fn replayed_logical_attribution(
+        &self,
+        logical_command_ordinal: u32,
+        node_index: u32,
+        reusable_graph_node_count: u32,
+    ) -> Option<DeviceReplayedLogicalCommandAttribution> {
+        DeviceReplayedLogicalCommandAttribution::new(
+            logical_command_ordinal,
+            node_index,
+            self.operation,
+            self.batching_form,
+            self.participant_count,
+            self.token_count,
+            self.compute_dispatch_count,
+            self.transfer_command_count,
+            u64::from(reusable_graph_node_count),
+        )
+    }
+
     pub(crate) const fn reusable_address_scope(&self) -> Option<DeviceReusableAddressScope> {
         self.reusable_address_scope
     }
@@ -1148,7 +1168,8 @@ fn cuda_submission_attribution(
     command_node_indices: &[Option<u32>],
     commands: &[CudaDeviceCommand],
     execution_paths: &[DeviceExecutionPath],
-    reusable_graph_node_counts: Option<&[Option<u32>]>,
+    reusable_graph_node_counts: Option<&[Option<u64>]>,
+    replayed_segments: Vec<DeviceReplayedSegmentAttribution>,
 ) -> Result<DeviceSubmissionAttribution, CudaDeviceRuntimeError> {
     if command_phases.len() != commands.len()
         || command_node_indices.len() != commands.len()
@@ -1176,9 +1197,7 @@ fn cuda_submission_attribution(
                 command.token_count,
                 command.compute_dispatch_count,
                 command.transfer_command_count,
-                reusable_graph_node_counts
-                    .and_then(|counts| counts[command_index as usize])
-                    .map(u64::from),
+                reusable_graph_node_counts.and_then(|counts| counts[command_index as usize]),
             )
             .ok_or_else(|| {
                 CudaDeviceRuntimeError::contract(
@@ -1187,7 +1206,7 @@ fn cuda_submission_attribution(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    DeviceSubmissionAttribution::new(rows).ok_or_else(|| {
+    DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments).ok_or_else(|| {
         CudaDeviceRuntimeError::contract("CUDA submission attribution is empty or unordered")
     })
 }
@@ -2026,6 +2045,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let timing_mode = commands.timing_mode();
         let compute_path_requirement = commands.compute_path_requirement();
+        let logical_attribution = commands
+            .attribution_requirement()
+            .logical_execution_path_required();
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands
             .into_entries()
@@ -2050,6 +2072,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .map(|(phase, _, _)| *phase)
             .collect::<Vec<_>>();
         let command_node_indices = (timing_mode.kernel_attribution_enabled()
+            || logical_attribution
             || reusable_execution_capture.is_some())
         .then(|| {
             entries
@@ -2063,12 +2086,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .collect::<Vec<_>>();
         let physical_span_attribution = timing_mode.physical_span_attribution_enabled();
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
+        let native_attribution = kernel_attribution || logical_attribution;
         if kernel_attribution {
             vnext_tool_correlation::prepare();
         }
         let mut execution_paths =
-            kernel_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
-        let mut reusable_graph_node_counts = kernel_attribution.then(|| vec![None; commands.len()]);
+            native_attribution.then(|| vec![DeviceExecutionPath::Eager; commands.len()]);
+        let mut reusable_graph_node_counts = native_attribution.then(|| vec![None; commands.len()]);
         if commands
             .iter()
             .any(|command| command.runtime_instance != self.runtime_instance)
@@ -2128,6 +2152,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 &commands,
                 execution_paths,
                 reusable_graph_node_counts.as_deref(),
+                Vec::new(),
             ) {
                 return Err(DefinitelyNotSubmitted::new(error));
             }
@@ -2142,13 +2167,22 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .iter()
             .filter_map(CudaDeviceCommand::reusable_execution_invocation)
         {
-            match stream.executable_cache.contains_program_segment(invocation) {
+            let resident = if logical_attribution {
+                stream
+                    .executable_cache
+                    .contains_attributable_program_segment(invocation)
+            } else {
+                stream.executable_cache.contains_program_segment(invocation)
+            };
+            match resident {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(DefinitelyNotSubmitted::new(
-                        CudaDeviceRuntimeError::contract(
-                            "CUDA direct reusable execution is not resident in the sealed catalog",
-                        ),
+                        CudaDeviceRuntimeError::contract(if logical_attribution {
+                            "CUDA direct reusable execution lacks sealed logical attribution"
+                        } else {
+                            "CUDA direct reusable execution is not resident in the sealed catalog"
+                        }),
                     ))
                 }
                 Err(error) => {
@@ -2233,6 +2267,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 capture,
                 &executable_candidates,
                 command_node_indices,
+                &commands,
             ) {
                 stream.state.fail();
                 self.quarantine(stream, commands);
@@ -2266,6 +2301,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
         let mut command_spans =
             physical_span_attribution.then(|| Vec::with_capacity(commands.len()));
+        let mut replayed_segments = logical_attribution.then(Vec::new);
         let mut index = 0;
         let mut executable_candidate_index = 0;
         while index < commands.len() {
@@ -2281,6 +2317,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     invocation,
                     physical_span_attribution,
                     false,
+                    logical_attribution,
                 );
                 let end = command_spans.as_ref().and_then(|_| {
                     stream
@@ -2290,6 +2327,51 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 });
                 match launched {
                     Ok(Some(launch)) => {
+                        if let Some(replayed_segments) = replayed_segments.as_mut() {
+                            let physical_command_index = u32::try_from(index).expect(
+                                "CUDA direct replay command index was validated before submission",
+                            );
+                            let reusable_executable_fingerprint = launch
+                                .reusable_executable_fingerprint()
+                                .expect("attributable CUDA replay retained its fingerprint");
+                            let logical_commands = launch
+                                .replayed_logical_commands()
+                                .expect("attributable CUDA replay retained its logical commands");
+                            let reusable_graph_node_count =
+                                logical_commands.iter().try_fold(0_u64, |total, command| {
+                                    total.checked_add(command.reusable_graph_node_count())
+                                });
+                            let Some(reusable_graph_node_count) = reusable_graph_node_count else {
+                                stream.state.fail();
+                                self.quarantine(stream, commands);
+                                panic!(
+                                    "CUDA submission became indeterminate because replay graph attribution overflowed u64"
+                                );
+                            };
+                            let replayed = DeviceReplayedSegmentAttribution::new(
+                                physical_command_index,
+                                invocation.program_id().clone(),
+                                invocation.segment().clone(),
+                                reusable_executable_fingerprint.to_string(),
+                                logical_commands.as_ref().to_vec(),
+                            );
+                            let Some(replayed) = replayed else {
+                                stream.state.fail();
+                                self.quarantine(stream, commands);
+                                panic!(
+                                    "CUDA submission became indeterminate because sealed replay attribution drifted"
+                                );
+                            };
+                            execution_paths
+                                .as_mut()
+                                .expect("logical CUDA attribution retained execution paths")
+                                [index] = DeviceExecutionPath::Replayed;
+                            reusable_graph_node_counts
+                                .as_mut()
+                                .expect("logical CUDA attribution retained graph counts")[index] =
+                                Some(reusable_graph_node_count);
+                            replayed_segments.push(replayed);
+                        }
                         if let Some(command_spans) = command_spans.as_mut() {
                             command_spans.push(
                                 CudaExecutionSpanEventTiming::new(
@@ -2402,7 +2484,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             .iter_mut()
                             .zip(observed.iter().copied())
                         {
-                            *target = Some(observed);
+                            *target = Some(u64::from(observed));
                         }
                     }
                     if let Some(command_spans) = command_spans.as_mut() {
@@ -2488,6 +2570,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     &commands,
                     execution_paths,
                     reusable_graph_node_counts.as_deref(),
+                    replayed_segments.unwrap_or_default(),
                 )
             }) {
             None => None,
@@ -2745,6 +2828,7 @@ mod tests {
             &[compute, binding],
             &[DeviceExecutionPath::Eager, DeviceExecutionPath::Replayed],
             Some(&[None, Some(2)]),
+            Vec::new(),
         )
         .unwrap();
 
@@ -2787,6 +2871,7 @@ mod tests {
             &[zero()],
             &[DeviceExecutionPath::Eager],
             Some(&[None]),
+            Vec::new(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("invalid native work metadata"));
@@ -2800,6 +2885,7 @@ mod tests {
             &[bound],
             &[DeviceExecutionPath::Eager],
             Some(&[None]),
+            Vec::new(),
         )
         .unwrap();
         let [command] = attribution.commands() else {

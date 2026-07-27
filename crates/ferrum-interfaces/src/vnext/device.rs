@@ -720,6 +720,25 @@ pub enum DeviceComputePathRequirement {
     ReplayedOnly,
 }
 
+/// Backend evidence required for one physical submission.
+///
+/// This is independent from timing: deterministic correctness needs actual
+/// eager/replay path attribution without enabling per-kernel profiling or
+/// changing the selected compute path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceSubmissionAttributionRequirement {
+    #[default]
+    None,
+    LogicalExecutionPath,
+}
+
+impl DeviceSubmissionAttributionRequirement {
+    pub const fn logical_execution_path_required(self) -> bool {
+        matches!(self, Self::LogicalExecutionPath)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceBatchingForm {
@@ -2656,6 +2675,7 @@ pub struct DeviceCommandBatch<C> {
     commands: Vec<DeviceCommandEntry<C>>,
     timing_mode: DeviceTimingMode,
     compute_path_requirement: DeviceComputePathRequirement,
+    attribution_requirement: DeviceSubmissionAttributionRequirement,
     reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
 }
 
@@ -2670,6 +2690,7 @@ impl<C> DeviceCommandBatch<C> {
             }],
             timing_mode: DeviceTimingMode::Off,
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
     }
@@ -2679,6 +2700,7 @@ impl<C> DeviceCommandBatch<C> {
             commands: Vec::with_capacity(capacity),
             timing_mode: DeviceTimingMode::Off,
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
     }
@@ -2688,6 +2710,7 @@ impl<C> DeviceCommandBatch<C> {
             commands: Vec::with_capacity(capacity),
             timing_mode,
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
     }
@@ -2701,8 +2724,13 @@ impl<C> DeviceCommandBatch<C> {
             commands: Vec::with_capacity(capacity),
             timing_mode,
             compute_path_requirement,
+            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
+    }
+
+    pub(crate) fn require_logical_execution_path_attribution(&mut self) {
+        self.attribution_requirement = DeviceSubmissionAttributionRequirement::LogicalExecutionPath;
     }
 
     pub(crate) fn set_reusable_execution_capture(
@@ -2835,6 +2863,10 @@ impl<C> DeviceCommandBatch<C> {
 
     pub const fn compute_path_requirement(&self) -> DeviceComputePathRequirement {
         self.compute_path_requirement
+    }
+
+    pub const fn attribution_requirement(&self) -> DeviceSubmissionAttributionRequirement {
+        self.attribution_requirement
     }
 
     pub fn into_commands(self) -> Vec<C> {
@@ -3032,8 +3064,8 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     }
 
     /// Returns backend-observed native work for an already submitted fence.
-    /// Only modes with kernel attribution enabled may carry attribution. The
-    /// returned rows are diagnostic evidence and never grant completion or
+    /// Attribution may be requested explicitly for correctness evidence or by
+    /// a diagnostic timing mode. The returned rows never grant completion or
     /// resource-release authority.
     fn submission_attribution(&self, _fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
         None
@@ -3113,7 +3145,7 @@ mod execution_timing_tests {
         assert!(!DeviceTimingMode::Completion.physical_span_attribution_enabled());
         assert!(!DeviceTimingMode::Off.completion_enabled());
 
-        let batch = DeviceCommandBatch::<()>::with_capacity_timing_and_compute_path(
+        let mut batch = DeviceCommandBatch::<()>::with_capacity_timing_and_compute_path(
             1,
             DeviceTimingMode::Replay,
             DeviceComputePathRequirement::EagerOnly,
@@ -3122,6 +3154,16 @@ mod execution_timing_tests {
             batch.compute_path_requirement(),
             DeviceComputePathRequirement::EagerOnly
         );
+        assert_eq!(
+            batch.attribution_requirement(),
+            DeviceSubmissionAttributionRequirement::None
+        );
+        batch.require_logical_execution_path_attribution();
+        assert_eq!(
+            batch.attribution_requirement(),
+            DeviceSubmissionAttributionRequirement::LogicalExecutionPath
+        );
+        assert_eq!(batch.timing_mode(), DeviceTimingMode::Replay);
     }
 
     #[test]
