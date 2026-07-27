@@ -1436,6 +1436,9 @@ impl OperationDispatch {
         let restore_fingerprint = restore
             .logical_fingerprint()
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        let initialization_identity = restore
+            .initialization_identity()
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1455,6 +1458,7 @@ impl OperationDispatch {
             profiled,
             readback_plan,
             restore_fingerprint,
+            initialization_identity,
             DeviceExecutionPath::Eager,
         ))
     }
@@ -1489,6 +1493,9 @@ impl OperationDispatch {
         let restore_fingerprint = restore
             .logical_fingerprint()
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        let initialization_identity = restore
+            .initialization_identity()
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1508,6 +1515,7 @@ impl OperationDispatch {
             profiled,
             readback_plan,
             restore_fingerprint,
+            initialization_identity,
             DeviceExecutionPath::Replayed,
         ))
     }

@@ -12,16 +12,21 @@ use crate::vnext::{
     BatchInvocationId, BufferUsage, CompletionHandle, CompletionReadbackBatchRequest,
     CompletionReadbackCollectionObservation, CompletionReadbackCollectionRequest,
     CompletionReadbackDisposition, CompletionReadbackRequest, DeviceCommandPhase,
-    DeviceExecutionPath, DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationSpec,
-    ExecutionDeterminismValueExtent, ExecutionDeterminismValueLocation,
-    ExecutionDeterminismWitnessKind, ExecutionDeterminismWitnessPlan,
-    ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId, OperationCompletionDisposition,
-    PlanHash, PreparedStepSubmissionWave, ResourceId, SubmittedOperationReceipt,
-    TrustedActiveSequenceBinding, VNextError,
+    DeviceExecutionPath, DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationKind,
+    ExecutionDeterminismInitializationSpec, ExecutionDeterminismValueExtent,
+    ExecutionDeterminismValueLocation, ExecutionDeterminismWitnessKind,
+    ExecutionDeterminismWitnessPlan, ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId,
+    OperationCompletionDisposition, PlanHash, PreparedStepSubmissionWave, ResourceId,
+    SubmittedOperationReceipt, TrustedActiveSequenceBinding, VNextError,
 };
 
 const LOGICAL_RESTORE_FINGERPRINT_DOMAIN: &[u8] =
     b"ferrum.runtime-vnext.determinism-logical-restore.v1";
+const EXTERNAL_INPUT_FINGERPRINT_DOMAIN: &[u8] =
+    b"ferrum.runtime-vnext.determinism-external-input.v1";
+const INITIAL_STATE_FINGERPRINT_DOMAIN: &[u8] =
+    b"ferrum.runtime-vnext.determinism-initial-state.v1";
+const NO_RNG_STATE_FINGERPRINT_DOMAIN: &[u8] = b"ferrum.runtime-vnext.determinism-no-rng-state.v1";
 
 fn hash_u64(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_le_bytes());
@@ -311,6 +316,30 @@ pub struct SubmissionWaveDeterminismRestore {
     participant_payloads: Vec<Vec<Vec<u8>>>,
 }
 
+/// Domain-separated semantic initialization identities for one deterministic
+/// execution. These values are derived from the exact typed restore payloads;
+/// artifact producers cannot substitute independently computed digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmissionWaveDeterminismInitializationIdentity {
+    input_sha256: String,
+    rng_sha256: String,
+    initial_state_sha256: String,
+}
+
+impl SubmissionWaveDeterminismInitializationIdentity {
+    pub fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+
+    pub fn rng_sha256(&self) -> &str {
+        &self.rng_sha256
+    }
+
+    pub fn initial_state_sha256(&self) -> &str {
+        &self.initial_state_sha256
+    }
+}
+
 impl SubmissionWaveDeterminismRestore {
     pub fn layout(&self) -> &SubmissionWaveDeterminismRestoreLayout {
         &self.layout
@@ -338,6 +367,96 @@ impl SubmissionWaveDeterminismRestore {
             .ok()
             .and_then(|index| self.participant_payloads.get(index))
             .map(Vec::as_slice)
+    }
+
+    fn initialization_fingerprint(
+        &self,
+        domain: &[u8],
+        include: impl Fn(&ExecutionDeterminismInitializationKind) -> bool,
+    ) -> Result<String, VNextError> {
+        let initializations = self.initializations();
+        let selected_count = initializations
+            .iter()
+            .filter(|initialization| include(initialization.kind()))
+            .count()
+            .checked_mul(self.participant_payloads.len())
+            .ok_or_else(|| invalid_operation("determinism initialization count overflows"))?;
+        let mut hasher = Sha256::new();
+        hash_bytes(&mut hasher, domain)?;
+        hash_bytes(
+            &mut hasher,
+            self.layout.witness_plan.fingerprint()?.as_bytes(),
+        )?;
+        hash_u64(
+            &mut hasher,
+            u64::try_from(selected_count)
+                .map_err(|_| invalid_operation("determinism initialization count exceeds u64"))?,
+        );
+        for (participant_index, (payloads, ranges)) in self
+            .participant_payloads
+            .iter()
+            .zip(&self.layout.participant_initialization_ranges)
+            .enumerate()
+        {
+            for (initialization_index, ((initialization, payload), range)) in
+                initializations.iter().zip(payloads).zip(ranges).enumerate()
+            {
+                if !include(initialization.kind()) {
+                    continue;
+                }
+                hash_u64(
+                    &mut hasher,
+                    u64::try_from(participant_index).map_err(|_| {
+                        invalid_operation("determinism participant index exceeds u64")
+                    })?,
+                );
+                hash_u64(
+                    &mut hasher,
+                    u64::try_from(initialization_index).map_err(|_| {
+                        invalid_operation("determinism initialization index exceeds u64")
+                    })?,
+                );
+                let encoded = serde_json::to_vec(initialization).map_err(|error| {
+                    invalid_operation(format!(
+                        "determinism initialization identity serialization failed: {error}"
+                    ))
+                })?;
+                hash_bytes(&mut hasher, &encoded)?;
+                hash_u64(&mut hasher, range.logical_offset_bytes());
+                hash_u64(&mut hasher, range.length_bytes());
+                hash_bytes(&mut hasher, payload)?;
+            }
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Exact input/state digests restored for this wave. The current model
+    /// execution graph contains no stochastic operation input, so the RNG
+    /// identity is an explicit domain-separated empty state rather than a
+    /// collector-supplied placeholder.
+    pub fn initialization_identity(
+        &self,
+    ) -> Result<SubmissionWaveDeterminismInitializationIdentity, VNextError> {
+        let input_sha256 =
+            self.initialization_fingerprint(EXTERNAL_INPUT_FINGERPRINT_DOMAIN, |kind| {
+                matches!(
+                    kind,
+                    ExecutionDeterminismInitializationKind::ExternalInput { .. }
+                )
+            })?;
+        let initial_state_sha256 = self
+            .initialization_fingerprint(INITIAL_STATE_FINGERPRINT_DOMAIN, |kind| {
+                matches!(kind, ExecutionDeterminismInitializationKind::State { .. })
+            })?;
+        let mut rng = Sha256::new();
+        hash_bytes(&mut rng, NO_RNG_STATE_FINGERPRINT_DOMAIN)?;
+        hash_bytes(&mut rng, self.layout.witness_plan.fingerprint()?.as_bytes())?;
+        hash_u64(&mut rng, 0);
+        Ok(SubmissionWaveDeterminismInitializationIdentity {
+            input_sha256,
+            rng_sha256: format!("{:x}", rng.finalize()),
+            initial_state_sha256,
+        })
     }
 
     /// Stable identity of the logical input/state image restored before each
@@ -996,6 +1115,7 @@ impl SubmissionWaveDeterminismWitnessReadback {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubmissionWaveDeterminismEvidence {
     restore_fingerprint: String,
+    initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
     expected_execution_path: DeviceExecutionPath,
     submission_receipt_fingerprint: String,
     terminal_receipt_fingerprint: String,
@@ -1007,6 +1127,10 @@ pub struct SubmissionWaveDeterminismEvidence {
 impl SubmissionWaveDeterminismEvidence {
     pub fn restore_fingerprint(&self) -> &str {
         &self.restore_fingerprint
+    }
+
+    pub fn initialization_identity(&self) -> &SubmissionWaveDeterminismInitializationIdentity {
+        &self.initialization_identity
     }
 
     pub const fn expected_execution_path(&self) -> DeviceExecutionPath {
@@ -1157,6 +1281,7 @@ pub struct SubmissionWaveDeterminismHandle<R: DeviceRuntime> {
     attribution: Option<BoundDeviceSubmissionAttribution>,
     readback_plan: SubmissionWaveDeterminismReadbackPlan,
     restore_fingerprint: String,
+    initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
     expected_execution_path: DeviceExecutionPath,
 }
 
@@ -1165,6 +1290,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         profiled: ProfiledSubmissionHandle<R>,
         readback_plan: SubmissionWaveDeterminismReadbackPlan,
         restore_fingerprint: String,
+        initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
         expected_execution_path: DeviceExecutionPath,
     ) -> Self {
         let (completion, attribution) = profiled.into_parts();
@@ -1173,6 +1299,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
             attribution,
             readback_plan,
             restore_fingerprint,
+            initialization_identity,
             expected_execution_path,
         }
     }
@@ -1210,6 +1337,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
             attribution,
             readback_plan,
             restore_fingerprint,
+            initialization_identity,
             expected_execution_path,
         } = self;
         let submission_receipt_fingerprint = completion.receipt().fingerprint().to_owned();
@@ -1317,6 +1445,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         let terminal_receipt_fingerprint = receipt.fingerprint().to_owned();
         Ok(SubmissionWaveDeterminismEvidence {
             restore_fingerprint,
+            initialization_identity,
             expected_execution_path,
             submission_receipt_fingerprint,
             terminal_receipt_fingerprint,

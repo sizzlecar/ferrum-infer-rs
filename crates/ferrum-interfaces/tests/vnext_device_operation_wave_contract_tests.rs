@@ -786,6 +786,7 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     )
     .unwrap();
     let restore_fingerprint = restore.logical_fingerprint().unwrap();
+    let initialization_identity = restore.initialization_identity().unwrap();
     assert_eq!(handle.restore_fingerprint(), restore_fingerprint);
     let attribution = handle
         .attribution()
@@ -842,6 +843,7 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
         .all(|command| command.execution_path() == DeviceExecutionPath::Eager));
     let evidence = handle.wait_into_evidence().unwrap();
     assert_eq!(evidence.restore_fingerprint(), restore_fingerprint);
+    assert_eq!(evidence.initialization_identity(), &initialization_identity);
     assert_eq!(
         evidence.expected_execution_path(),
         DeviceExecutionPath::Eager
@@ -1203,6 +1205,54 @@ fn determinism_chunk_binds_the_exact_paged_state_prefix_from_the_provider_view()
     );
 
     let participant_payloads = determinism_payloads(&layout, 0x27);
+    let base_identity = layout
+        .clone()
+        .bind(participant_payloads.clone())
+        .unwrap()
+        .initialization_identity()
+        .unwrap();
+    let mut changed_input_payloads = participant_payloads.clone();
+    changed_input_payloads[0][external_input_index].fill(0x28);
+    let changed_input_identity = layout
+        .clone()
+        .bind(changed_input_payloads)
+        .unwrap()
+        .initialization_identity()
+        .unwrap();
+    assert_ne!(
+        base_identity.input_sha256(),
+        changed_input_identity.input_sha256()
+    );
+    assert_eq!(
+        base_identity.initial_state_sha256(),
+        changed_input_identity.initial_state_sha256()
+    );
+    assert_eq!(
+        base_identity.rng_sha256(),
+        changed_input_identity.rng_sha256()
+    );
+
+    let mut changed_state_payloads = participant_payloads.clone();
+    changed_state_payloads[0][state_initialization_index].fill(0x29);
+    let changed_state_identity = layout
+        .clone()
+        .bind(changed_state_payloads)
+        .unwrap()
+        .initialization_identity()
+        .unwrap();
+    assert_eq!(
+        base_identity.input_sha256(),
+        changed_state_identity.input_sha256()
+    );
+    assert_ne!(
+        base_identity.initial_state_sha256(),
+        changed_state_identity.initial_state_sha256()
+    );
+    assert_eq!(
+        base_identity.rng_sha256(),
+        changed_state_identity.rng_sha256()
+    );
+
     let restore = layout.bind(participant_payloads).unwrap();
     let reaper = CompletionReaper::new();
     let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
