@@ -13,19 +13,25 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import runtime_vnext_baseline_scenarios as matrix
-from runtime_vnext_g08b_cuda_matrix_prepare import BACKEND_SPECS as PREPARATION_SPECS
 
 
 SCHEMA_VERSION = 1
-MODEL_KEY = "m2-qwen35-35b-a3b"
+SCRIPT_DIR = Path(__file__).resolve().parent
+G08B_MODEL_KEY = "m2-qwen35-35b-a3b"
 
 
 @dataclass(frozen=True)
 class CheckpointSpec:
     backend: str
+    model_key: str
+    model_label: str
+    model_lock_path: Path
+    weight_revision: str
+    weight_file_count: int
+    semantic_file_count: int
     checkpoint_id: str
     checkpoint_label: str
     expected_case_count: int
@@ -33,21 +39,22 @@ class CheckpointSpec:
     required_active_floor: int
     required_active_duty_cycle: float
     concurrency_cells: tuple[int, ...]
+    artifact_type_prefix: str
     pass_prefix: str
+    fail_prefix: str
     selftest_pass_line: str
     does_not_prove: tuple[str, ...]
-
-    @property
-    def model_lock_path(self) -> Path:
-        return PREPARATION_SPECS[self.backend].model_lock_path
-
-    @property
-    def artifact_type_prefix(self) -> str:
-        return f"runtime_vnext_g08b_{self.backend}_model_matrix"
 
 
 CUDA_SPEC = CheckpointSpec(
     backend="cuda",
+    model_key=G08B_MODEL_KEY,
+    model_label="G08B M2",
+    model_lock_path=SCRIPT_DIR
+    / "configs/runtime_vnext_g08b_m2_cuda.models.lock.json",
+    weight_revision="3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+    weight_file_count=19,
+    semantic_file_count=6,
     checkpoint_id="runtime-vnext-g08b-cuda-model-matrix",
     checkpoint_label="G08B-CUDA-MATRIX",
     expected_case_count=703,
@@ -55,7 +62,9 @@ CUDA_SPEC = CheckpointSpec(
     required_active_floor=16,
     required_active_duty_cycle=0.80,
     concurrency_cells=(1, 4, 16, 32),
+    artifact_type_prefix="runtime_vnext_g08b_cuda_model_matrix",
     pass_prefix="FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS",
+    fail_prefix="FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX FAIL",
     selftest_pass_line="FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX SELFTEST PASS",
     does_not_prove=(
         "G08B Metal Q4_K_S product path",
@@ -70,6 +79,13 @@ CUDA_SPEC = CheckpointSpec(
 
 METAL_SPEC = CheckpointSpec(
     backend="metal",
+    model_key=G08B_MODEL_KEY,
+    model_label="G08B M2",
+    model_lock_path=SCRIPT_DIR
+    / "configs/runtime_vnext_g08b_m2_metal.models.lock.json",
+    weight_revision="bc014a17be43adabd7066b7a86075ff935c6a4e2",
+    weight_file_count=1,
+    semantic_file_count=6,
     checkpoint_id="runtime-vnext-g08b-metal-model-matrix",
     checkpoint_label="G08B-METAL-MATRIX",
     expected_case_count=702,
@@ -77,7 +93,9 @@ METAL_SPEC = CheckpointSpec(
     required_active_floor=4,
     required_active_duty_cycle=0.80,
     concurrency_cells=(1, 4, 16),
+    artifact_type_prefix="runtime_vnext_g08b_metal_model_matrix",
     pass_prefix="FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX PASS",
+    fail_prefix="FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX FAIL",
     selftest_pass_line="FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX SELFTEST PASS",
     does_not_prove=(
         "current-HEAD G08B CUDA GPTQ-Int4 product path",
@@ -145,7 +163,13 @@ def iso_now() -> str:
 
 def expected_case_count(source_git_sha: str, spec: CheckpointSpec) -> int:
     catalog = matrix.candidate_expectations_catalog(source_git_sha)
-    return len(matrix.planned_case_rows(MODEL_KEY, spec.backend, catalog))
+    return len(
+        matrix.planned_case_rows(
+            spec.model_key,
+            spec.backend,
+            catalog,
+        )
+    )
 
 
 def summarize_matrix(
@@ -157,7 +181,10 @@ def summarize_matrix(
         "scenario report is not a G08 candidate execution",
     )
     require(report.get("status") == "pass", "scenario report status is not pass")
-    require(report.get("model_key") == MODEL_KEY, f"scenario report model must be {MODEL_KEY}")
+    require(
+        report.get("model_key") == spec.model_key,
+        f"scenario report model must be {spec.model_key}",
+    )
     require(
         report.get("backend") == spec.backend,
         f"scenario report backend must be {spec.backend}",
@@ -166,7 +193,7 @@ def summarize_matrix(
         report.get("models_lock_sha256") == file_sha256(spec.model_lock_path),
         (
             "scenario report is not bound to the checked-in "
-            f"M2 {spec.backend.upper()} model lock"
+            f"{spec.model_label} {spec.backend.upper()} model lock"
         ),
     )
     source_git_sha = report.get("source_git_sha")
@@ -178,7 +205,7 @@ def summarize_matrix(
     require(
         planned_count == spec.expected_case_count,
         (
-            f"canonical M2 {spec.backend.upper()} planner drifted from "
+            f"canonical {spec.model_label} {spec.backend.upper()} planner drifted from "
             f"{spec.expected_case_count} to {planned_count}"
         ),
     )
@@ -373,7 +400,7 @@ def write_checkpoint(
         "execution_contract": matrix.G08_EXECUTION_CONTRACT,
         "source_git_sha": report["source_git_sha"],
         "source_tree_sha": report["source_tree_sha"],
-        "model_key": MODEL_KEY,
+        "model_key": spec.model_key,
         "backend": spec.backend,
         "model_revision": report["model_revision"],
         "model_files": report["model_files"],
@@ -416,7 +443,7 @@ def write_checkpoint(
 def fixture_report(spec: CheckpointSpec = CUDA_SPEC) -> dict[str, Any]:
     source_git_sha = "1" * 40
     rows = matrix.planned_case_rows(
-        MODEL_KEY,
+        spec.model_key,
         spec.backend,
         matrix.candidate_expectations_catalog(source_git_sha),
     )
@@ -441,7 +468,7 @@ def fixture_report(spec: CheckpointSpec = CUDA_SPEC) -> dict[str, Any]:
             for ordinal, requested in enumerate(spec.concurrency_cells, start=1):
                 case_id = f"c18-{ordinal:03d}"
                 floor = matrix.required_active_floor(
-                    MODEL_KEY,
+                    spec.model_key,
                     spec.backend,
                     requested,
                 )
@@ -487,7 +514,7 @@ def fixture_report(spec: CheckpointSpec = CUDA_SPEC) -> dict[str, Any]:
         "status": "pass",
         "source_git_sha": source_git_sha,
         "models_lock_sha256": file_sha256(spec.model_lock_path),
-        "model_key": MODEL_KEY,
+        "model_key": spec.model_key,
         "backend": spec.backend,
         "commands": [
             {"id": "actual-run", "entrypoint": "run"},
@@ -515,24 +542,29 @@ def expect_reject(
 
 
 def self_test(spec: CheckpointSpec = CUDA_SPEC) -> int:
-    preparation_spec = PREPARATION_SPECS[spec.backend]
     locked_sources = matrix.locked_execution_sources(
         matrix.read_json(spec.model_lock_path),
-        MODEL_KEY,
+        spec.model_key,
         spec.backend,
     )
     require(
-        len(locked_sources["weight_files"]) == preparation_spec.weight_file_count,
-        f"checked-in M2 {spec.backend.upper()} weight lock is incomplete",
+        len(locked_sources["weight_files"]) == spec.weight_file_count,
+        (
+            f"checked-in {spec.model_label} {spec.backend.upper()} "
+            "weight lock is incomplete"
+        ),
     )
     require(
         len(locked_sources["semantic_source"]["files"])
-        == preparation_spec.semantic_file_count,
-        "checked-in M2 semantic lock is incomplete",
+        == spec.semantic_file_count,
+        f"checked-in {spec.model_label} semantic lock is incomplete",
     )
     require(
-        locked_sources["weight_revision"] == preparation_spec.weight_revision,
-        f"checked-in M2 {spec.backend.upper()} revision drift",
+        locked_sources["weight_revision"] == spec.weight_revision,
+        (
+            f"checked-in {spec.model_label} {spec.backend.upper()} "
+            "revision drift"
+        ),
     )
     report = fixture_report(spec)
     summary = summarize_matrix(report, spec)
@@ -550,7 +582,7 @@ def self_test(spec: CheckpointSpec = CUDA_SPEC) -> int:
         report,
         "wrong model lock",
         lambda value: value.update({"models_lock_sha256": "0" * 64}),
-        f"checked-in M2 {spec.backend.upper()} model lock",
+        f"checked-in {spec.model_label} {spec.backend.upper()} model lock",
         spec,
     )
     expect_reject(
@@ -623,6 +655,7 @@ def main(
     *,
     default_backend: str = "cuda",
     fixed_backend: bool = False,
+    checkpoint_specs: Mapping[str, CheckpointSpec] = CHECKPOINT_SPECS,
 ) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-root", type=Path)
@@ -634,11 +667,11 @@ def main(
     else:
         parser.add_argument(
             "--backend",
-            choices=tuple(CHECKPOINT_SPECS),
+            choices=tuple(checkpoint_specs),
             default=default_backend,
         )
     args = parser.parse_args()
-    spec = CHECKPOINT_SPECS[args.backend]
+    spec = checkpoint_specs[args.backend]
     if args.self_test:
         return self_test(spec)
     if args.artifact_root is None or args.scenario_report is None or args.out is None:
@@ -652,10 +685,7 @@ def main(
         )
     except (ValidationError, matrix.ScenarioError, OSError, ValueError) as error:
         print(
-            (
-                "FERRUM RUNTIME VNEXT G08B "
-                f"{spec.backend.upper()} MODEL MATRIX FAIL: {args.out}: {error}"
-            ),
+            f"{spec.fail_prefix}: {args.out}: {error}",
             file=sys.stderr,
         )
         return 1

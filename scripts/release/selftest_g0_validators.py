@@ -82,6 +82,18 @@ RUNTIME_VNEXT_G08B_METAL_MATRIX_CHECKPOINT = (
 RUNTIME_VNEXT_G08B_METAL_MATRIX_PREPARE = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08b_metal_matrix_prepare.py"
 )
+RUNTIME_VNEXT_G08C_CUDA_MATRIX_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08c_cuda_matrix_checkpoint.py"
+)
+RUNTIME_VNEXT_G08C_CUDA_MATRIX_PREPARE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08c_cuda_matrix_prepare.py"
+)
+RUNTIME_VNEXT_G08C_METAL_MATRIX_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08c_metal_matrix_checkpoint.py"
+)
+RUNTIME_VNEXT_G08C_METAL_MATRIX_PREPARE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08c_metal_matrix_prepare.py"
+)
 RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08_performance_smoke.py"
 )
@@ -699,6 +711,66 @@ def test_runtime_vnext_g08b_metal_matrix_prepare_selftest() -> None:
     )
 
 
+def test_runtime_vnext_g08c_cuda_matrix_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08C_CUDA_MATRIX_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08C CUDA MODEL MATRIX SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08c_cuda_matrix_prepare_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08C_CUDA_MATRIX_PREPARE),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08C CUDA PREPARE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08c_metal_matrix_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08C_METAL_MATRIX_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08C METAL MODEL MATRIX SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08c_metal_matrix_prepare_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08C_METAL_MATRIX_PREPARE),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08C METAL PREPARE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_g08_performance_smoke_selftest() -> None:
     ok = run(
         [
@@ -1032,6 +1104,10 @@ def main() -> int:
     test_runtime_vnext_g08b_cuda_matrix_prepare_selftest()
     test_runtime_vnext_g08b_metal_matrix_checkpoint_selftest()
     test_runtime_vnext_g08b_metal_matrix_prepare_selftest()
+    test_runtime_vnext_g08c_cuda_matrix_checkpoint_selftest()
+    test_runtime_vnext_g08c_cuda_matrix_prepare_selftest()
+    test_runtime_vnext_g08c_metal_matrix_checkpoint_selftest()
+    test_runtime_vnext_g08c_metal_matrix_prepare_selftest()
     test_runtime_vnext_g08_performance_smoke_selftest()
     test_runtime_vnext_cuda_replay_kernel_attribution_selftest()
     test_native_work_attribution_gate_selftest()

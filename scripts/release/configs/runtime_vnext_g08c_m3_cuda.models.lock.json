@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "lock_id": "runtime-vnext-g08c-m3-cuda-v1",
+  "provenance": {
+    "source_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+    "source_models_lock_sha256": "41b162618ed277d9a0278a3ede646cdd58e812bd345d3240407f8fe82a4295d3",
+    "source_catalog_sha256": "73018b13c4fb70c3897ef86865ef99b32eedf2baa18c042c4e018c782535becf",
+    "extraction": "exact resolved G00 M3-CUDA lane projection from source_models_lock_sha256; path and sha256 fields preserved"
+  },
+  "models": [
+    {
+      "key": "m3-qwen3-30b-a3b",
+      "lanes": {
+        "cuda": {
+          "catalog_lane_id": "M3-CUDA",
+          "repo": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+          "revision": "9b534e4318b7ebc3c961a839f13eb18b1833f441",
+          "format": "gptq_int4",
+          "files": [
+            {
+              "path": "config.json",
+              "sha256": "ed18d5379b0ee75113173cb684a0cad85559768b82c9dd1d5e5f6acb82ba741c"
+            },
+            {
+              "path": "generation_config.json",
+              "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+            },
+            {
+              "path": "model.safetensors",
+              "sha256": "1ad50ff713f7be134a479990e9d70472f5c8ab12e0745d824e25d22f389c8495"
+            },
+            {
+              "path": "quantize_config.json",
+              "sha256": "4fedb690e8386a507da62b7019ba1ba968744a50286a2af3a86741fc323749be"
+            },
+            {
+              "path": "tokenizer.json",
+              "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+            }
+          ],
+          "semantic_source": {
+            "repo": "Qwen/Qwen3-30B-A3B",
+            "revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+            "files": [
+              {
+                "path": "README.md",
+                "sha256": "1897b7cdf7b5f45ae847b87f9b416d4635fe73228e0daac669a4e1f3e5948858"
+              },
+              {
+                "path": "config.json",
+                "sha256": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297"
+              },
+              {
+                "path": "generation_config.json",
+                "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+              },
+              {
+                "path": "tokenizer.json",
+                "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+              },
+              {
+                "path": "tokenizer_config.json",
+                "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+              }
+            ]
+          },
+          "chat_template": {
+            "source": "semantic_source",
+            "repo": "Qwen/Qwen3-30B-A3B",
+            "revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+            "path": "tokenizer_config.json",
+            "json_pointer": "/chat_template",
+            "container_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+            "content_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+          }
+        }
+      }
+    }
+  ]
+}
