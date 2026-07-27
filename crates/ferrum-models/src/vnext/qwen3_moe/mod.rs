@@ -142,7 +142,7 @@ pub(super) fn validate_semantic_config(
             "Qwen3 MoE semantic validator received unowned metadata identity {expected_metadata_id}"
         )));
     }
-    Qwen3MoeSemanticConfig::parse(raw)
+    Qwen3MoeSemanticConfig::validate_semantic_source(raw)
         .map(|_| ())
         .map_err(ferrum_types::FerrumError::model)
 }
@@ -155,17 +155,13 @@ pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<Prepared
 pub(super) fn prepare_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
 ) -> ferrum_types::Result<PreparedProductionModel> {
-    let semantic = Qwen3MoeSemanticConfig::parse(sources.config_json())
+    let weight_config = sources.weight_config_json().ok_or_else(|| {
+        ferrum_types::FerrumError::model(
+            "Qwen3 MoE GPTQ weight source is missing physical config.json",
+        )
+    })?;
+    let semantic = Qwen3MoeSemanticConfig::parse_sources(sources.config_json(), weight_config)
         .map_err(ferrum_types::FerrumError::model)?;
-    if let Some(weight_config) = sources.weight_config_json() {
-        let physical_semantics = Qwen3MoeSemanticConfig::parse(weight_config)
-            .map_err(ferrum_types::FerrumError::model)?;
-        if semantic != physical_semantics {
-            return Err(ferrum_types::FerrumError::model(
-                "semantic and physical Qwen3 MoE config.json values differ",
-            ));
-        }
-    }
     let tokenizer_config = sources.tokenizer_config_json().ok_or_else(|| {
         ferrum_types::FerrumError::model("tokenizer source missing tokenizer_config.json")
     })?;
