@@ -580,6 +580,7 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         active_bindings.iter(),
         DeviceTimingMode::Off,
         &[upload],
+        SubmissionExecutionPolicy::adaptive(),
         &timing,
         wave,
         &lane,
@@ -663,6 +664,7 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
         active_bindings.iter(),
         DeviceTimingMode::Kernel,
         &[],
+        SubmissionExecutionPolicy::adaptive(),
         &timing,
         wave,
         &lane,
@@ -1171,7 +1173,7 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         DeviceReusableExecutionProgram::new(program_id, vec![segment], (0..node_count).collect())
             .unwrap();
 
-    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
         &providers,
         &fixture.resolved,
         &batch_identity,
@@ -1179,6 +1181,7 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         DeviceTimingMode::Off,
         &[],
         &program,
+        SubmissionExecutionPolicy::determinism_replayed(0xa5),
         wave,
         &lane,
         &reaper,
@@ -1206,6 +1209,10 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
             ]]
         );
         assert_eq!(trace.submitted_reusable_captures, vec![None]);
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::ReplayedOnly]
+        );
     }
     {
         let trace = fixture.provider_trace.lock().unwrap();
@@ -1628,7 +1635,7 @@ fn provider_scratch_is_zeroed_before_every_reused_lane_invocation() {
 }
 
 #[test]
-fn verification_zeroes_overwrite_scratch_without_changing_the_default_path() {
+fn typed_eager_policy_zeroes_overwrite_scratch_independently_from_timing() {
     let (fixture, sequence, session, batch, first_step) = setup_with_fixture(
         fixture_with_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
     );
@@ -1680,12 +1687,14 @@ fn verification_zeroes_overwrite_scratch_without_changing_the_default_path() {
         &lane,
     )
     .unwrap();
-    let second_completion = OperationDispatch::encode_and_submit_wave(
+    let second_completion = OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
         &providers,
         &fixture.resolved,
         &second_identity,
         second_active_bindings.iter(),
-        DeviceTimingMode::Verification,
+        DeviceTimingMode::Off,
+        &[],
+        SubmissionExecutionPolicy::determinism_eager(0),
         second_wave,
         &lane,
         &reaper,
@@ -1729,6 +1738,145 @@ fn verification_zeroes_overwrite_scratch_without_changing_the_default_path() {
     drop(reaper);
     drop(lane);
     teardown(fixture, sequence, session, batch, second_step);
+}
+
+#[test]
+fn typed_eager_policy_poison_fills_overwrite_scratch_before_compute() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    let completion = OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
+        &providers,
+        &fixture.resolved,
+        &identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        SubmissionExecutionPolicy::determinism_eager(0xa5),
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_commands,
+            vec![vec![
+                TestCommand::Upload(0xa5),
+                TestCommand::Upload(0xa5),
+                TestCommand::ScratchProvider,
+                TestCommand::ScratchProvider,
+            ]]
+        );
+        assert_eq!(
+            trace.submitted_command_phases,
+            vec![vec![
+                DeviceCommandPhase::Initialization,
+                DeviceCommandPhase::Initialization,
+                DeviceCommandPhase::Compute,
+                DeviceCommandPhase::Compute,
+            ]]
+        );
+        assert_eq!(trace.scratch_observations, vec![(0, 0xa5), (1, 0xa5)]);
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::EagerOnly]
+        );
+        assert_eq!(
+            trace
+                .uploaded_payloads
+                .iter()
+                .filter(|payload| !payload.is_empty() && payload.iter().all(|byte| *byte == 0xa5))
+                .count(),
+            2
+        );
+    }
+
+    drop(completion);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn replayed_only_policy_rejects_an_eager_wave_before_provider_encoding() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    let error = OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
+        &providers,
+        &fixture.resolved,
+        &identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Replay,
+        &[],
+        SubmissionExecutionPolicy::determinism_replayed(0),
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SubmissionWaveDispatchError::Contract(ref error)
+            if error.to_string().contains(
+                "replayed-only submission requires one sealed reusable execution program"
+            )
+    ));
+    assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
+    assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
 }
 
 #[test]

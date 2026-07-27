@@ -5872,7 +5872,6 @@ fn verification_vnext_profile_requires_eager_kernel_attribution() {
         ferrum_interfaces::vnext::DeviceTimingMode::Verification
     );
     assert!(sink.device_timing_mode().kernel_attribution_enabled());
-    assert!(!sink.device_timing_mode().executable_replay_allowed());
     assert!(!sink
         .device_timing_mode()
         .direct_reusable_execution_allowed());
