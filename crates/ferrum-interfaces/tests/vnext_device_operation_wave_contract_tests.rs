@@ -785,11 +785,16 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
         &reaper,
     )
     .unwrap();
+    let restore_fingerprint = restore.logical_fingerprint().unwrap();
+    assert_eq!(handle.restore_fingerprint(), restore_fingerprint);
     let attribution = handle
         .attribution()
         .expect("determinism eager path must preserve attribution");
+    let submission_fingerprint = attribution.submission_fingerprint().to_owned();
+    let expected_readbacks = handle.readback_plan().collection_request().request_count();
+    let expected_witnesses = handle.readback_plan().witness_count();
     assert_eq!(
-        handle.readback_plan().witness_count(),
+        expected_witnesses,
         fixture
             .plan
             .determinism_witness_plan()
@@ -831,25 +836,83 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     assert!(compute_rows
         .iter()
         .all(|command| command.execution_path() == DeviceExecutionPath::Eager));
-    let readback = match handle.wait_with_determinism_readback().unwrap() {
-        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
-        other => panic!("determinism eager witness readback did not terminate: {other:?}"),
-    };
+    let evidence = handle.wait_into_evidence().unwrap();
+    assert_eq!(evidence.restore_fingerprint(), restore_fingerprint);
     assert_eq!(
-        readback.dispositions().len(),
-        handle.readback_plan().collection_request().request_count()
+        evidence.expected_execution_path(),
+        DeviceExecutionPath::Eager
     );
-    assert!(readback
-        .dispositions()
+    assert_eq!(evidence.physical_readbacks().len(), expected_readbacks);
+    assert_eq!(evidence.witnesses().len(), expected_witnesses);
+    assert!(evidence
+        .physical_readbacks()
         .iter()
-        .all(|disposition| matches!(disposition, CompletionReadbackDisposition::Succeeded(_))));
+        .all(|readback| !readback.bytes().is_empty() && readback.raw_sha256().len() == 64));
+    assert_eq!(
+        evidence.attribution().submission_fingerprint(),
+        submission_fingerprint
+    );
 
-    drop(handle);
     drop(providers);
     drop(active_bindings);
     drop(reaper);
     drop(lane);
     teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn determinism_logical_restore_identity_ignores_fresh_physical_authority() {
+    fn collect(fill_byte: u8) -> String {
+        let (fixture, sequence, session, batch, step) = setup_with_fixture(
+            fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
+        );
+        let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let active_bindings = wave_active_bindings(&wave, &session);
+        let lane = Arc::clone(step.execution_lane());
+        let providers = fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+            .collect::<Vec<_>>();
+        let batch_identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active_bindings.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        let layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
+            fixture.runtime.as_ref(),
+            &providers,
+            &fixture.resolved,
+            &batch_identity,
+            active_bindings.iter(),
+            &wave,
+        )
+        .unwrap();
+        let payloads = determinism_payloads(&layout, fill_byte);
+        let fingerprint = layout
+            .bind(payloads)
+            .unwrap()
+            .logical_fingerprint()
+            .unwrap();
+
+        drop(batch_identity);
+        drop(providers);
+        drop(active_bindings);
+        drop(wave);
+        drop(lane);
+        teardown(fixture, sequence, session, batch, step);
+        fingerprint
+    }
+
+    let first = collect(0x31);
+    let second = collect(0x31);
+    let changed_payload = collect(0x32);
+    assert_eq!(first, second);
+    assert_ne!(first, changed_payload);
 }
 
 #[test]
