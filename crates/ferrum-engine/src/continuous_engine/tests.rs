@@ -9281,6 +9281,39 @@ fn schema_guided_sampling_allows_extended_stop_after_accept() {
 }
 
 #[test]
+fn structured_output_terminal_error_reports_privacy_safe_lexical_progress() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(FragmentedUtf8PolicyTokenizer::new());
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}"#
+            .to_string(),
+    );
+    let mut state = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(b'0' as u32)],
+        Some(tokenizer),
+    );
+    state.generated_tokens =
+        br#"{"value":12777"#.iter().map(|byte| TokenId::new(*byte as u32)).collect();
+
+    let error = state
+        .structured_output_terminal_error(FinishReason::Length)
+        .expect("an incomplete number must produce a terminal error")
+        .to_string();
+
+    assert!(error.contains("grammar_tokens=14"), "{error}");
+    assert!(error.contains("trailing_class=Some(Number)"), "{error}");
+    assert!(error.contains("trailing_class_tokens=5"), "{error}");
+    assert!(
+        error.contains(&format!("trailing_token_id=Some({})", b'7')),
+        "{error}"
+    );
+    assert!(error.contains("trailing_identical_tokens=3"), "{error}");
+    assert!(!error.contains(r#"{"value":12777"#), "{error}");
+}
+
+#[test]
 fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         10,

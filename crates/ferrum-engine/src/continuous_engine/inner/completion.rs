@@ -20,7 +20,10 @@ impl SequenceState {
                 .is_some_and(tokio::sync::mpsc::Sender::is_closed)
     }
 
-    fn structured_output_terminal_error(&self, finish_reason: FinishReason) -> Option<FerrumError> {
+    pub(in crate::continuous_engine) fn structured_output_terminal_error(
+        &self,
+        finish_reason: FinishReason,
+    ) -> Option<FerrumError> {
         let processor = self.structured_output_processor.as_ref()?;
         match processor
             .progress_with_terminals(&self.generated_tokens, &self.stop_token_ids)
@@ -30,7 +33,7 @@ impl SequenceState {
                 "structured-output generation failed after reaching an accepting state",
             )),
             Ok(progress) => Some(FerrumError::model(format!(
-                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}, reasoning_tokens={:?}, boundary_forced={}, budget={:?}",
+                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}, reasoning_tokens={:?}, boundary_forced={}, budget={:?}, grammar_tokens={}, trailing_class={:?}, trailing_class_tokens={}, trailing_token_id={:?}, trailing_identical_tokens={}",
                 progress.phase,
                 progress.generated_token_count,
                 progress.consumed_token_count,
@@ -39,6 +42,11 @@ impl SequenceState {
                 progress.reasoning_token_count,
                 progress.boundary_forced,
                 progress.budget,
+                progress.grammar_token_count,
+                progress.trailing_token_class,
+                progress.trailing_token_class_count,
+                progress.trailing_token_id,
+                progress.trailing_identical_token_count,
             ))),
             Err(error) => Some(error),
         }
