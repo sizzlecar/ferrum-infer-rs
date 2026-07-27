@@ -17,7 +17,7 @@ use ferrum_interfaces::vnext::{
     WeightMaterializerRegistry, JSON_RESOLUTION_SOURCE_PARSER,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
-use ferrum_models::VNextModelExecutor;
+use ferrum_models::{VNextExecutorConfig, VNextModelExecutor};
 use ferrum_types::{EngineConfig, FerrumError, ModelInfo, ResponseFormat, Result, SamplingParams};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -40,6 +40,34 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         prepared,
         model_info,
         engine,
+        runtime,
+        operation_registry,
+        weight_materializers,
+        weight_materializer_id,
+        catalog,
+        |prepared, runtime, catalog, compilation| {
+            resolve_model_plan(engine, prepared, catalog, runtime, compilation)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_vnext_executor_with_config<R: DeviceRuntime>(
+    engine: &EngineConfig,
+    prepared: &PreparedProductionModel,
+    model_info: ModelInfo,
+    executor_config: VNextExecutorConfig,
+    runtime: Arc<R>,
+    operation_registry: OperationRuntimeRegistry<R>,
+    weight_materializers: WeightMaterializerRegistry,
+    weight_materializer_id: WeightMaterializerId,
+    catalog: CapabilityCatalog,
+) -> Result<VNextModelExecutor<R>> {
+    VNextModelExecutor::from_runtime_composition_with_config(
+        prepared,
+        model_info,
+        engine,
+        executor_config,
         runtime,
         operation_registry,
         weight_materializers,

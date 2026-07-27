@@ -12,7 +12,7 @@ use ferrum_kernels::backend::cuda::{
     vnext_ops::CudaVNextComposition, vnext_runtime::CudaDeviceRuntime,
 };
 use ferrum_models::vnext::PreparedProductionModel;
-use ferrum_models::{VNextDeterminismExecutionSpec, VNextModelExecutor};
+use ferrum_models::{VNextDeterminismExecutionSpec, VNextExecutorConfig, VNextModelExecutor};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 
 pub struct CudaVNextDeterminismCollector {
@@ -57,10 +57,13 @@ pub fn create_cuda_vnext_determinism_collector(
         .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
     let (runtime, operation_registry, weight_materializers, weight_materializer_id, catalog) =
         composition.into_parts();
-    let executor = crate::product_composition::create_vnext_executor(
+    let executor_config =
+        VNextExecutorConfig::for_determinism_collection(engine, &model_info, runtime.as_ref())?;
+    let executor = crate::product_composition::create_vnext_executor_with_config(
         engine,
         prepared,
         model_info,
+        executor_config,
         runtime,
         operation_registry,
         weight_materializers,
