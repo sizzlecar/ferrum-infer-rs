@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::dispatch::{BoundDeviceSubmissionAttribution, ProfiledSubmissionHandle};
 use super::{
@@ -8,13 +11,47 @@ use super::{
 use crate::vnext::{
     BatchInvocationId, BufferUsage, CompletionHandle, CompletionReadbackBatchRequest,
     CompletionReadbackCollectionObservation, CompletionReadbackCollectionRequest,
-    CompletionReadbackRequest, DeviceRuntime, ExecutablePlanView,
-    ExecutionDeterminismInitializationSpec, ExecutionDeterminismValueExtent,
-    ExecutionDeterminismValueLocation, ExecutionDeterminismWitnessKind,
-    ExecutionDeterminismWitnessPlan, ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId,
+    CompletionReadbackDisposition, CompletionReadbackRequest, DeviceCommandPhase,
+    DeviceExecutionPath, DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationSpec,
+    ExecutionDeterminismValueExtent, ExecutionDeterminismValueLocation,
+    ExecutionDeterminismWitnessKind, ExecutionDeterminismWitnessPlan,
+    ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId, OperationCompletionDisposition,
     PlanHash, PreparedStepSubmissionWave, ResourceId, SubmittedOperationReceipt,
     TrustedActiveSequenceBinding, VNextError,
 };
+
+const LOGICAL_RESTORE_FINGERPRINT_DOMAIN: &[u8] =
+    b"ferrum.runtime-vnext.determinism-logical-restore.v1";
+
+fn hash_u64(hasher: &mut Sha256, value: u64) {
+    hasher.update(value.to_le_bytes());
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), VNextError> {
+    hash_u64(
+        hasher,
+        u64::try_from(bytes.len())
+            .map_err(|_| invalid_operation("determinism restore fingerprint input exceeds u64"))?,
+    );
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_ranges(
+    hasher: &mut Sha256,
+    ranges: &[SubmissionWaveDeterminismLogicalRange],
+) -> Result<(), VNextError> {
+    hash_u64(
+        hasher,
+        u64::try_from(ranges.len())
+            .map_err(|_| invalid_operation("determinism restore range count exceeds u64"))?,
+    );
+    for range in ranges {
+        hash_u64(hasher, range.logical_offset_bytes());
+        hash_u64(hasher, range.length_bytes());
+    }
+    Ok(())
+}
 
 /// One exact logical range as seen by a provider for one prepared participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -301,6 +338,71 @@ impl SubmissionWaveDeterminismRestore {
             .ok()
             .and_then(|index| self.participant_payloads.get(index))
             .map(Vec::as_slice)
+    }
+
+    /// Stable identity of the logical input/state image restored before each
+    /// execution.
+    ///
+    /// Physical batch, backing, lane, and allocation identities are excluded
+    /// intentionally: repeated executions must allocate fresh submission
+    /// authority while proving that they restored identical semantic bytes.
+    /// Scratch poison is also excluded because it is the independent variable
+    /// compared by the determinism gate.
+    pub fn logical_fingerprint(&self) -> Result<String, VNextError> {
+        let mut hasher = Sha256::new();
+        hash_bytes(&mut hasher, LOGICAL_RESTORE_FINGERPRINT_DOMAIN)?;
+        hash_bytes(
+            &mut hasher,
+            self.layout.witness_plan.fingerprint()?.as_bytes(),
+        )?;
+
+        hash_u64(
+            &mut hasher,
+            u64::try_from(self.layout.node_work_shape_fingerprints.len())
+                .map_err(|_| invalid_operation("determinism restore node count exceeds u64"))?,
+        );
+        for fingerprint in &self.layout.node_work_shape_fingerprints {
+            hash_bytes(&mut hasher, fingerprint.as_bytes())?;
+        }
+
+        hash_u64(
+            &mut hasher,
+            u64::try_from(self.layout.participant_initialization_ranges.len()).map_err(|_| {
+                invalid_operation("determinism restore participant count exceeds u64")
+            })?,
+        );
+        for ranges in &self.layout.participant_initialization_ranges {
+            hash_ranges(&mut hasher, ranges)?;
+        }
+
+        hash_u64(
+            &mut hasher,
+            u64::try_from(self.layout.witness_participant_ranges.len())
+                .map_err(|_| invalid_operation("determinism restore witness count exceeds u64"))?,
+        );
+        for ranges in &self.layout.witness_participant_ranges {
+            hash_ranges(&mut hasher, ranges)?;
+        }
+
+        hash_u64(
+            &mut hasher,
+            u64::try_from(self.participant_payloads.len()).map_err(|_| {
+                invalid_operation("determinism restore payload participant count exceeds u64")
+            })?,
+        );
+        for payloads in &self.participant_payloads {
+            hash_u64(
+                &mut hasher,
+                u64::try_from(payloads.len()).map_err(|_| {
+                    invalid_operation("determinism restore payload count exceeds u64")
+                })?,
+            );
+            for payload in payloads {
+                hash_bytes(&mut hasher, payload)?;
+            }
+        }
+
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     pub(super) fn validate_for(&self, resolved: &dyn ExecutablePlanView) -> Result<(), VNextError> {
@@ -840,6 +942,142 @@ fn validate_terminal_witness_stability(
     Ok(())
 }
 
+/// One physical readback buffer retained once even when multiple semantic
+/// witnesses intentionally project onto the same bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmissionWaveDeterminismPhysicalReadback {
+    request: CompletionReadbackRequest,
+    raw_sha256: String,
+    #[serde(skip)]
+    bytes: Vec<u8>,
+}
+
+impl SubmissionWaveDeterminismPhysicalReadback {
+    pub fn request(&self) -> &CompletionReadbackRequest {
+        &self.request
+    }
+
+    pub fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Semantic witness mapped to exactly one physical participant readback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmissionWaveDeterminismWitnessReadback {
+    witness: ExecutionDeterminismWitnessSpec,
+    participant_index: u32,
+    physical_readback_index: u32,
+}
+
+impl SubmissionWaveDeterminismWitnessReadback {
+    pub fn witness(&self) -> &ExecutionDeterminismWitnessSpec {
+        &self.witness
+    }
+
+    pub const fn participant_index(&self) -> u32 {
+        self.participant_index
+    }
+
+    pub const fn physical_readback_index(&self) -> u32 {
+        self.physical_readback_index
+    }
+}
+
+/// Fail-closed terminal evidence for one forced eager or replay execution.
+///
+/// The physical buffers retain raw bytes for in-process comparison. Their
+/// serialized form contains only SHA256 digests so a detached artifact cannot
+/// accidentally duplicate large device outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmissionWaveDeterminismEvidence {
+    restore_fingerprint: String,
+    expected_execution_path: DeviceExecutionPath,
+    submission_receipt_fingerprint: String,
+    terminal_receipt_fingerprint: String,
+    attribution: BoundDeviceSubmissionAttribution,
+    physical_readbacks: Vec<SubmissionWaveDeterminismPhysicalReadback>,
+    witnesses: Vec<SubmissionWaveDeterminismWitnessReadback>,
+}
+
+impl SubmissionWaveDeterminismEvidence {
+    pub fn restore_fingerprint(&self) -> &str {
+        &self.restore_fingerprint
+    }
+
+    pub const fn expected_execution_path(&self) -> DeviceExecutionPath {
+        self.expected_execution_path
+    }
+
+    pub fn submission_receipt_fingerprint(&self) -> &str {
+        &self.submission_receipt_fingerprint
+    }
+
+    pub fn terminal_receipt_fingerprint(&self) -> &str {
+        &self.terminal_receipt_fingerprint
+    }
+
+    pub fn attribution(&self) -> &BoundDeviceSubmissionAttribution {
+        &self.attribution
+    }
+
+    pub fn physical_readbacks(&self) -> &[SubmissionWaveDeterminismPhysicalReadback] {
+        &self.physical_readbacks
+    }
+
+    pub fn witnesses(&self) -> &[SubmissionWaveDeterminismWitnessReadback] {
+        &self.witnesses
+    }
+}
+
+fn validate_determinism_attribution(
+    attribution: &BoundDeviceSubmissionAttribution,
+    node_ids: &[NodeId],
+    expected_execution_path: DeviceExecutionPath,
+) -> Result<(), VNextError> {
+    let expected_nodes = node_ids.iter().collect::<BTreeSet<_>>();
+    let mut observed_nodes = BTreeSet::new();
+    for command in attribution.device().commands() {
+        if command.command_phase() != DeviceCommandPhase::Compute {
+            continue;
+        }
+        let Some(node_index) = command.node_index() else {
+            continue;
+        };
+        let node_index = usize::try_from(node_index)
+            .map_err(|_| invalid_operation("determinism attribution node index exceeds usize"))?;
+        let Some(node_id) = attribution.batch_identity().node_id_at(node_index) else {
+            return Err(invalid_operation(
+                "determinism attribution references a node absent from its batch",
+            ));
+        };
+        if !expected_nodes.contains(node_id) {
+            continue;
+        }
+        let replay_shape_matches = match expected_execution_path {
+            DeviceExecutionPath::Eager => command.reusable_graph_node_count().is_none(),
+            DeviceExecutionPath::Replayed => command.reusable_graph_node_count().is_some(),
+        };
+        if command.execution_path() != expected_execution_path || !replay_shape_matches {
+            return Err(invalid_operation(format!(
+                "determinism node `{node_id}` did not execute through the required {} path",
+                expected_execution_path.as_str()
+            )));
+        }
+        observed_nodes.insert(node_id);
+    }
+    if observed_nodes != expected_nodes {
+        return Err(invalid_operation(
+            "determinism attribution does not cover every requested plan node",
+        ));
+    }
+    Ok(())
+}
+
 /// Submitted deterministic work whose terminal observation remains bound to
 /// the exact immutable-plan witness denominator.
 #[must_use = "deterministic submission must collect its exact witness readback"]
@@ -847,18 +1085,24 @@ pub struct SubmissionWaveDeterminismHandle<R: DeviceRuntime> {
     completion: CompletionHandle<R>,
     attribution: Option<BoundDeviceSubmissionAttribution>,
     readback_plan: SubmissionWaveDeterminismReadbackPlan,
+    restore_fingerprint: String,
+    expected_execution_path: DeviceExecutionPath,
 }
 
 impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
     pub(super) fn from_profiled(
         profiled: ProfiledSubmissionHandle<R>,
         readback_plan: SubmissionWaveDeterminismReadbackPlan,
+        restore_fingerprint: String,
+        expected_execution_path: DeviceExecutionPath,
     ) -> Self {
         let (completion, attribution) = profiled.into_parts();
         Self {
             completion,
             attribution,
             readback_plan,
+            restore_fingerprint,
+            expected_execution_path,
         }
     }
 
@@ -874,10 +1118,140 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         &self.readback_plan
     }
 
+    pub fn restore_fingerprint(&self) -> &str {
+        &self.restore_fingerprint
+    }
+
     pub fn wait_with_determinism_readback(
         &self,
     ) -> Result<CompletionReadbackCollectionObservation, VNextError> {
         self.completion
             .wait_with_readback_collection(self.readback_plan.collection_request().clone())
+    }
+
+    /// Waits for terminal completion and consumes the handle into one typed
+    /// evidence object. Missing actual-path attribution, nonterminal
+    /// completion, failed readback, or any semantic/physical mapping drift is
+    /// rejected after the submitted work has been observed to completion.
+    pub fn wait_into_evidence(self) -> Result<SubmissionWaveDeterminismEvidence, VNextError> {
+        let Self {
+            completion,
+            attribution,
+            readback_plan,
+            restore_fingerprint,
+            expected_execution_path,
+        } = self;
+        let submission_receipt_fingerprint = completion.receipt().fingerprint().to_owned();
+        let observation =
+            completion.wait_with_readback_collection(readback_plan.collection_request().clone())?;
+        let receipt = match observation {
+            CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+            other => {
+                return Err(invalid_operation(format!(
+                    "determinism readback did not reach a terminal observation: {other:?}"
+                )))
+            }
+        };
+        if !matches!(
+            receipt.completion().disposition(),
+            OperationCompletionDisposition::Succeeded
+        ) {
+            return Err(invalid_operation(
+                "determinism submission completed without a successful disposition",
+            ));
+        }
+
+        let attribution = attribution
+            .ok_or_else(|| {
+                invalid_operation("determinism submission lacks actual-path device attribution")
+            })?
+            .bind_terminal_timing(receipt.completion().submission_timing().clone())?;
+        validate_determinism_attribution(
+            &attribution,
+            readback_plan.node_ids(),
+            expected_execution_path,
+        )?;
+
+        let expected_readbacks = readback_plan
+            .targets()
+            .iter()
+            .map(|target| target.batch().requests().len())
+            .sum::<usize>();
+        if receipt.dispositions().len() != expected_readbacks {
+            return Err(invalid_operation(
+                "determinism terminal readback count differs from its typed plan",
+            ));
+        }
+
+        let mut physical_readbacks = Vec::with_capacity(expected_readbacks);
+        let mut witnesses = Vec::with_capacity(
+            readback_plan.witness_count().saturating_mul(
+                readback_plan
+                    .targets()
+                    .first()
+                    .map_or(0, |target| target.batch().requests().len()),
+            ),
+        );
+        let mut disposition_index = 0_usize;
+        for target in readback_plan.targets() {
+            let first_physical_index = physical_readbacks.len();
+            for expected_request in target.batch().requests() {
+                let disposition =
+                    receipt
+                        .dispositions()
+                        .get(disposition_index)
+                        .ok_or_else(|| {
+                            invalid_operation("determinism terminal readback disappeared")
+                        })?;
+                let CompletionReadbackDisposition::Succeeded(output) = disposition else {
+                    return Err(invalid_operation(format!(
+                        "determinism terminal readback failed: {disposition:?}"
+                    )));
+                };
+                if output.request() != expected_request {
+                    return Err(invalid_operation(
+                        "determinism terminal readback differs from its exact request",
+                    ));
+                }
+                physical_readbacks.push(SubmissionWaveDeterminismPhysicalReadback {
+                    request: output.request().clone(),
+                    raw_sha256: output.sha256().to_owned(),
+                    bytes: output.bytes().to_vec(),
+                });
+                disposition_index += 1;
+            }
+            for witness in target.witnesses() {
+                for participant_index in 0..target.batch().requests().len() {
+                    let physical_readback_index = first_physical_index
+                        .checked_add(participant_index)
+                        .and_then(|index| u32::try_from(index).ok())
+                        .ok_or_else(|| {
+                            invalid_operation("determinism physical readback index exceeds u32")
+                        })?;
+                    witnesses.push(SubmissionWaveDeterminismWitnessReadback {
+                        witness: witness.clone(),
+                        participant_index: u32::try_from(participant_index).map_err(|_| {
+                            invalid_operation("determinism witness participant index exceeds u32")
+                        })?,
+                        physical_readback_index,
+                    });
+                }
+            }
+        }
+        if disposition_index != receipt.dispositions().len() {
+            return Err(invalid_operation(
+                "determinism terminal readback left unowned physical outputs",
+            ));
+        }
+        let terminal_receipt_fingerprint = receipt.fingerprint().to_owned();
+        Ok(SubmissionWaveDeterminismEvidence {
+            restore_fingerprint,
+            expected_execution_path,
+            submission_receipt_fingerprint,
+            terminal_receipt_fingerprint,
+            attribution,
+            physical_readbacks,
+            witnesses,
+        })
     }
 }

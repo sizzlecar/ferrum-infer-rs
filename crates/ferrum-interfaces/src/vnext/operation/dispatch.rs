@@ -12,7 +12,7 @@ use super::super::{
     CompletionHandle, CompletionReaper, CompletionReservation,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
     DeviceBatchingForm, DeviceCommandBatch, DeviceCommandLogicalWork, DeviceComputePathRequirement,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceExecutionPath, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceSubmissionAttribution,
     DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
@@ -1402,6 +1402,9 @@ impl OperationDispatch {
             restore,
         )
         .map_err(SubmissionWaveDispatchError::Contract)?;
+        let restore_fingerprint = restore
+            .logical_fingerprint()
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1420,6 +1423,8 @@ impl OperationDispatch {
         Ok(SubmissionWaveDeterminismHandle::from_profiled(
             profiled,
             readback_plan,
+            restore_fingerprint,
+            DeviceExecutionPath::Eager,
         ))
     }
 
@@ -1450,6 +1455,9 @@ impl OperationDispatch {
             restore,
         )
         .map_err(SubmissionWaveDispatchError::Contract)?;
+        let restore_fingerprint = restore
+            .logical_fingerprint()
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1468,6 +1476,8 @@ impl OperationDispatch {
         Ok(SubmissionWaveDeterminismHandle::from_profiled(
             profiled,
             readback_plan,
+            restore_fingerprint,
+            DeviceExecutionPath::Replayed,
         ))
     }
 
