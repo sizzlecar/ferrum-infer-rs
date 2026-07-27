@@ -20,34 +20,26 @@ extern "C" __global__ void moe_align_block_size_pair_ids_f32(
     int block_size,
     int sorted_max_size
 ) {
-    __shared__ int counts[MAX_NUM_EXPERTS];
     __shared__ int counts_padded[MAX_NUM_EXPERTS];
     __shared__ int offsets[MAX_NUM_EXPERTS + 1];
-    __shared__ int cursors[MAX_NUM_EXPERTS];
-
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
-
-    for (int e = tid; e < num_experts; e += nthreads) {
-        counts[e] = 0;
-    }
-    __syncthreads();
 
     for (int i = tid; i < sorted_max_size; i += nthreads) {
         sorted_token_ids[i] = batch_x_topk;
     }
 
-    for (int p = tid; p < batch_x_topk; p += nthreads) {
-        int e = expert_ids_per_pair[p];
-        if (e >= 0 && e < num_experts) {
-            atomicAdd(&counts[e], 1);
+    // One thread owns each expert and scans pair ids in ascending order.
+    // Threads in a warp read the same pair-id address, so these scans are
+    // cache-broadcast while avoiding the nondeterministic atomic scatter that
+    // changes Marlin row-to-thread mapping and therefore FP reduction order.
+    for (int e = tid; e < num_experts; e += nthreads) {
+        int count = 0;
+        for (int p = 0; p < batch_x_topk; ++p) {
+            count += expert_ids_per_pair[p] == e;
         }
-    }
-    __syncthreads();
-
-    if (tid < num_experts) {
-        int c = counts[tid];
-        counts_padded[tid] = ((c + block_size - 1) / block_size) * block_size;
+        counts_padded[e] =
+            ((count + block_size - 1) / block_size) * block_size;
     }
     __syncthreads();
 
@@ -63,15 +55,11 @@ extern "C" __global__ void moe_align_block_size_pair_ids_f32(
     __syncthreads();
 
     for (int e = tid; e < num_experts; e += nthreads) {
-        cursors[e] = offsets[e];
-    }
-    __syncthreads();
-
-    for (int p = tid; p < batch_x_topk; p += nthreads) {
-        int e = expert_ids_per_pair[p];
-        if (e >= 0 && e < num_experts) {
-            int slot = atomicAdd(&cursors[e], 1);
-            sorted_token_ids[slot] = p;
+        int slot = offsets[e];
+        for (int p = 0; p < batch_x_topk; ++p) {
+            if (expert_ids_per_pair[p] == e) {
+                sorted_token_ids[slot++] = p;
+            }
         }
     }
     __syncthreads();
