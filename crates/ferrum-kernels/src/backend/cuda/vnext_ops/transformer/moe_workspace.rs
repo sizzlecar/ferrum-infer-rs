@@ -1,4 +1,4 @@
-//! Invocation-scoped CUDA workspace geometry for routed/shared SwiGLU MoE.
+//! Invocation-scoped CUDA workspace geometry for routed SwiGLU MoE.
 
 const ALIGNMENT_BYTES: u64 = 16;
 const F16_BYTES: u64 = 2;
@@ -7,7 +7,8 @@ const F32_BYTES: u64 = 4;
 const MARLIN_MIN_THREAD_N: u64 = 64;
 const MARLIN_MAX_THREAD_N: u64 = 256;
 const MARLIN_BLOCKS_PER_SM_BOUND: u64 = 4;
-const REGION_COUNT: u64 = 15;
+const ROUTED_REGION_COUNT: u64 = 11;
+const SHARED_REGION_COUNT: u64 = 4;
 
 pub(super) const MOE_BLOCK_SIZE: u64 = 16;
 pub(super) const MAX_ROUTER_EXPERTS: u64 = 256;
@@ -42,14 +43,19 @@ pub(super) struct MoeWorkspaceLayout {
     pub(super) routed_gate_up: WorkspaceRegion,
     pub(super) routed_activation: WorkspaceRegion,
     pub(super) routed_down_slots: WorkspaceRegion,
-    pub(super) shared_gate: WorkspaceRegion,
-    pub(super) shared_gate_up: WorkspaceRegion,
-    pub(super) shared_activation: WorkspaceRegion,
-    pub(super) shared_output: WorkspaceRegion,
+    shared: Option<SharedMoeWorkspaceLayout>,
     pub(super) total_bytes: u64,
     pub(super) pair_count: u64,
     pub(super) sorted_capacity: u64,
     pub(super) block_capacity: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SharedMoeWorkspaceLayout {
+    pub(super) gate: WorkspaceRegion,
+    pub(super) gate_up: WorkspaceRegion,
+    pub(super) activation: WorkspaceRegion,
+    pub(super) output: WorkspaceRegion,
 }
 
 impl MoeWorkspaceLayout {
@@ -61,6 +67,46 @@ impl MoeWorkspaceLayout {
         hidden_size: u64,
         routed_intermediate_size: u64,
         shared_intermediate_size: u64,
+        multiprocessor_count: u64,
+    ) -> Result<Self, String> {
+        Self::build(
+            tokens,
+            expert_count,
+            experts_per_token,
+            hidden_size,
+            routed_intermediate_size,
+            Some(shared_intermediate_size),
+            multiprocessor_count,
+        )
+    }
+
+    pub(super) fn routed_only(
+        tokens: u64,
+        expert_count: u64,
+        experts_per_token: u64,
+        hidden_size: u64,
+        routed_intermediate_size: u64,
+        multiprocessor_count: u64,
+    ) -> Result<Self, String> {
+        Self::build(
+            tokens,
+            expert_count,
+            experts_per_token,
+            hidden_size,
+            routed_intermediate_size,
+            None,
+            multiprocessor_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        tokens: u64,
+        expert_count: u64,
+        experts_per_token: u64,
+        hidden_size: u64,
+        routed_intermediate_size: u64,
+        shared_intermediate_size: Option<u64>,
         multiprocessor_count: u64,
     ) -> Result<Self, String> {
         validate_shape(
@@ -141,29 +187,35 @@ impl MoeWorkspaceLayout {
             F16_BYTES,
             "MoE routed down slots",
         )?)?;
-        let shared_gate = cursor.allocate(elements_bytes(tokens, F16_BYTES, "MoE shared gate")?)?;
-        let shared_gate_up = cursor.allocate(elements_bytes(
-            checked_mul(
-                checked_mul(tokens, shared_intermediate_size, "MoE shared gate/up")?,
-                2,
-                "MoE shared gate/up",
-            )?,
-            F16_BYTES,
-            "MoE shared gate/up",
-        )?)?;
-        let shared_activation = cursor.allocate(elements_bytes(
-            checked_mul(tokens, shared_intermediate_size, "MoE shared activation")?,
-            F16_BYTES,
-            "MoE shared activation",
-        )?)?;
-        let shared_output = cursor.allocate(elements_bytes(
-            checked_mul(tokens, hidden_size, "MoE shared output")?,
-            F16_BYTES,
-            "MoE shared output",
-        )?)?;
+        let shared = shared_intermediate_size
+            .map(|shared_intermediate_size| {
+                Ok::<SharedMoeWorkspaceLayout, String>(SharedMoeWorkspaceLayout {
+                    gate: cursor.allocate(elements_bytes(tokens, F16_BYTES, "MoE shared gate")?)?,
+                    gate_up: cursor.allocate(elements_bytes(
+                        checked_mul(
+                            checked_mul(tokens, shared_intermediate_size, "MoE shared gate/up")?,
+                            2,
+                            "MoE shared gate/up",
+                        )?,
+                        F16_BYTES,
+                        "MoE shared gate/up",
+                    )?)?,
+                    activation: cursor.allocate(elements_bytes(
+                        checked_mul(tokens, shared_intermediate_size, "MoE shared activation")?,
+                        F16_BYTES,
+                        "MoE shared activation",
+                    )?)?,
+                    output: cursor.allocate(elements_bytes(
+                        checked_mul(tokens, hidden_size, "MoE shared output")?,
+                        F16_BYTES,
+                        "MoE shared output",
+                    )?)?,
+                })
+            })
+            .transpose()?;
         let total_bytes = align_up(cursor.offset, ALIGNMENT_BYTES)?;
 
-        let (fixed_bytes, bytes_per_token) = workspace_formula_terms(
+        let (fixed_bytes, bytes_per_token) = workspace_formula_terms_for(
             expert_count,
             experts_per_token,
             hidden_size,
@@ -196,15 +248,16 @@ impl MoeWorkspaceLayout {
             routed_gate_up,
             routed_activation,
             routed_down_slots,
-            shared_gate,
-            shared_gate_up,
-            shared_activation,
-            shared_output,
+            shared,
             total_bytes,
             pair_count,
             sorted_capacity,
             block_capacity,
         })
+    }
+
+    pub(super) const fn shared(&self) -> Option<SharedMoeWorkspaceLayout> {
+        self.shared
     }
 }
 
@@ -215,6 +268,42 @@ pub(super) fn workspace_formula_terms(
     hidden_size: u64,
     routed_intermediate_size: u64,
     shared_intermediate_size: u64,
+    multiprocessor_count: u64,
+) -> Result<(u64, u64), String> {
+    workspace_formula_terms_for(
+        expert_count,
+        experts_per_token,
+        hidden_size,
+        routed_intermediate_size,
+        Some(shared_intermediate_size),
+        multiprocessor_count,
+    )
+}
+
+pub(super) fn routed_workspace_formula_terms(
+    expert_count: u64,
+    experts_per_token: u64,
+    hidden_size: u64,
+    routed_intermediate_size: u64,
+    multiprocessor_count: u64,
+) -> Result<(u64, u64), String> {
+    workspace_formula_terms_for(
+        expert_count,
+        experts_per_token,
+        hidden_size,
+        routed_intermediate_size,
+        None,
+        multiprocessor_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workspace_formula_terms_for(
+    expert_count: u64,
+    experts_per_token: u64,
+    hidden_size: u64,
+    routed_intermediate_size: u64,
+    shared_intermediate_size: Option<u64>,
     multiprocessor_count: u64,
 ) -> Result<(u64, u64), String> {
     validate_shape(
@@ -255,9 +344,13 @@ pub(super) fn workspace_formula_terms(
             .ok_or_else(|| "Marlin-MoE fixed FP32 workspace overflows u64".to_owned())?,
     ];
     let mut fixed_bytes = checked_sum(fixed_terms, "MoE fixed workspace")?;
+    let region_count = ROUTED_REGION_COUNT
+        + shared_intermediate_size
+            .map(|_| SHARED_REGION_COUNT)
+            .unwrap_or(0);
     fixed_bytes = checked_add(
         fixed_bytes,
-        checked_mul(REGION_COUNT + 1, ALIGNMENT_BYTES, "MoE alignment reserve")?,
+        checked_mul(region_count + 1, ALIGNMENT_BYTES, "MoE alignment reserve")?,
         "MoE fixed workspace alignment",
     )?;
 
@@ -274,18 +367,7 @@ pub(super) fn workspace_formula_terms(
         .checked_mul(hidden_size)
         .and_then(|value| value.checked_mul(F16_BYTES))
         .ok_or_else(|| "MoE routed down bytes per token overflow u64".to_owned())?;
-    let shared_gate_up_bytes = shared_intermediate_size
-        .checked_mul(2)
-        .and_then(|value| value.checked_mul(F16_BYTES))
-        .ok_or_else(|| "MoE shared gate/up bytes per token overflow u64".to_owned())?;
-    let shared_activation_bytes = checked_mul(
-        shared_intermediate_size,
-        F16_BYTES,
-        "MoE shared activation bytes per token",
-    )?;
-    let shared_output_bytes =
-        checked_mul(hidden_size, F16_BYTES, "MoE shared output bytes per token")?;
-    let per_token_terms = [
+    let mut per_token_terms = vec![
         checked_mul(expert_count, F16_BYTES, "MoE router bytes per token")?,
         checked_mul(experts_per_token, I32_BYTES, "MoE route ids per token")?,
         checked_mul(experts_per_token, F32_BYTES, "MoE route weights per token")?,
@@ -298,12 +380,27 @@ pub(super) fn workspace_formula_terms(
         routed_gate_up_bytes,
         routed_activation_bytes,
         routed_down_bytes,
-        F16_BYTES,
-        shared_gate_up_bytes,
-        shared_activation_bytes,
-        shared_output_bytes,
     ];
-    let bytes_per_token = checked_sum(per_token_terms, "MoE bytes per token")?;
+    if let Some(shared_intermediate_size) = shared_intermediate_size {
+        let shared_gate_up_bytes = shared_intermediate_size
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(F16_BYTES))
+            .ok_or_else(|| "MoE shared gate/up bytes per token overflow u64".to_owned())?;
+        let shared_activation_bytes = checked_mul(
+            shared_intermediate_size,
+            F16_BYTES,
+            "MoE shared activation bytes per token",
+        )?;
+        let shared_output_bytes =
+            checked_mul(hidden_size, F16_BYTES, "MoE shared output bytes per token")?;
+        per_token_terms.extend([
+            F16_BYTES,
+            shared_gate_up_bytes,
+            shared_activation_bytes,
+            shared_output_bytes,
+        ]);
+    }
+    let bytes_per_token = checked_sum_iter(per_token_terms, "MoE bytes per token")?;
     Ok((fixed_bytes, bytes_per_token))
 }
 
@@ -314,7 +411,7 @@ fn validate_shape(
     experts_per_token: u64,
     hidden_size: u64,
     routed_intermediate_size: u64,
-    shared_intermediate_size: u64,
+    shared_intermediate_size: Option<u64>,
     multiprocessor_count: u64,
 ) -> Result<(), String> {
     if tokens == 0
@@ -325,7 +422,7 @@ fn validate_shape(
         || experts_per_token > MAX_ROUTER_TOP_K
         || hidden_size == 0
         || routed_intermediate_size == 0
-        || shared_intermediate_size == 0
+        || shared_intermediate_size.is_some_and(|size| size == 0)
         || multiprocessor_count == 0
     {
         return Err("CUDA MoE workspace received unsupported zero or routing geometry".to_owned());
@@ -378,6 +475,10 @@ fn checked_add(left: u64, right: u64, label: &str) -> Result<u64, String> {
 }
 
 fn checked_sum<const N: usize>(values: [u64; N], label: &str) -> Result<u64, String> {
+    checked_sum_iter(values, label)
+}
+
+fn checked_sum_iter(values: impl IntoIterator<Item = u64>, label: &str) -> Result<u64, String> {
     values.into_iter().try_fold(0_u64, |sum, value| {
         sum.checked_add(value)
             .ok_or_else(|| format!("{label} overflows u64"))
@@ -426,8 +527,23 @@ mod tests {
     }
 
     #[test]
+    fn routed_only_workspace_omits_every_shared_region() {
+        let (fixed, per_token) = routed_workspace_formula_terms(E, K, H, R, SMS).unwrap();
+        for tokens in [1, 32, 2048] {
+            let layout = MoeWorkspaceLayout::routed_only(tokens, E, K, H, R, SMS).unwrap();
+            assert!(layout.shared().is_none());
+            assert!(layout.total_bytes <= fixed + per_token * tokens);
+
+            let shared = MoeWorkspaceLayout::new(tokens, E, K, H, R, S, SMS).unwrap();
+            assert!(shared.shared().is_some());
+            assert!(layout.total_bytes < shared.total_bytes);
+        }
+    }
+
+    #[test]
     fn every_region_is_aligned_nonempty_and_nonoverlapping() {
         let layout = MoeWorkspaceLayout::new(32, E, K, H, R, S, SMS).unwrap();
+        let shared = layout.shared().unwrap();
         let regions = [
             layout.router_logits,
             layout.route_ids,
@@ -440,10 +556,10 @@ mod tests {
             layout.routed_gate_up,
             layout.routed_activation,
             layout.routed_down_slots,
-            layout.shared_gate,
-            layout.shared_gate_up,
-            layout.shared_activation,
-            layout.shared_output,
+            shared.gate,
+            shared.gate_up,
+            shared.activation,
+            shared.output,
         ];
         for region in regions {
             assert_eq!(region.offset_bytes() % ALIGNMENT_BYTES, 0);

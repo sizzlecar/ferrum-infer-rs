@@ -29,7 +29,8 @@ use ferrum_interfaces::vnext::{
 };
 #[cfg(feature = "vllm-moe-marlin")]
 use ferrum_interfaces::vnext::{
-    routed_shared_swiglu_moe_contract, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
+    routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract,
+    ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -88,6 +89,7 @@ pub fn cuda_vnext_runtime_config(
         fingerprint_parts.extend([
             include_str!("vnext_ops/transformer/moe.rs").as_bytes(),
             include_str!("vnext_ops/transformer/moe_launch.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/moe_routed.rs").as_bytes(),
             include_str!("vnext_ops/transformer/moe_weights.rs").as_bytes(),
             include_str!("vnext_ops/transformer/moe_workspace.rs").as_bytes(),
             crate::ptx::MOE_ROUTER.as_bytes(),
@@ -146,6 +148,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         capabilities.insert(CapabilityId::new(
             ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
         )?);
+        capabilities.insert(CapabilityId::new(ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID)?);
         capabilities
     };
     #[cfg(feature = "vllm-marlin")]
@@ -180,6 +183,9 @@ pub fn cuda_vnext_operation_registry(
         contracts.push(Box::new(
             routed_shared_swiglu_moe_contract().map_err(contract_error)?,
         ));
+        contracts.push(Box::new(
+            routed_swiglu_moe_contract().map_err(contract_error)?,
+        ));
         contracts
     };
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
@@ -209,6 +215,9 @@ pub fn cuda_vnext_operation_registry(
         providers.push(Box::new(
             transformer::CudaRoutedSharedSwiGluMoeProvider::new(runtime)?,
         ));
+        providers.push(Box::new(transformer::CudaRoutedSwiGluMoeProvider::new(
+            runtime,
+        )?));
         providers
     };
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
