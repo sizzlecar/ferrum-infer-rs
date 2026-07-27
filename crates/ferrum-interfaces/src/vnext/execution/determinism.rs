@@ -3,37 +3,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    invalid_plan, AllocationLifetime, ContractVersion, ElementType, ExecutionPlan, NodeId,
-    PlanHash, ProgramValueId, ProviderId, ResolvedValueBinding, ResourceId, StateId, TensorAccess,
-    TokenSpanWork, VNextError, WeightId,
+    invalid_plan, AllocationLifetime, BufferUsage, ContractVersion, ElementType, ExecutionPlan,
+    NodeId, PlanHash, ProgramValueId, ProviderId, ResolvedValueBinding, ResolvedValueRole,
+    ResourceId, StateId, TensorAccess, TokenSpanWork, VNextError, WeightId,
 };
 use crate::vnext::{ProviderExecutionContractFingerprint, ProviderReplayEquivalence};
 
-pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(1, 0);
+pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(2, 0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ExecutionDeterminismWitnessKind {
-    Output {
-        value_id: ProgramValueId,
-        output_ordinal: u32,
-    },
-    StateEffect {
-        state_id: StateId,
-        state_value_id: ProgramValueId,
-        lifetime: AllocationLifetime,
-        access: TensorAccess,
-    },
-}
-
+/// Trusted semantic-to-physical projection shared by determinism
+/// initialization and terminal witnesses.
+///
+/// Gate code never reconstructs a backend resource, offset, or byte length
+/// from model names. Every range comes from one validated plan binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExecutionDeterminismWitnessSpec {
+pub struct ExecutionDeterminismValueLocation {
     node_id: NodeId,
-    provider_id: ProviderId,
-    provider_implementation_fingerprint: String,
-    provider_execution_contract_fingerprint: ProviderExecutionContractFingerprint,
-    kind: ExecutionDeterminismWitnessKind,
+    value_id: ProgramValueId,
+    role: ResolvedValueRole,
+    ordinal: u32,
+    usage: BufferUsage,
     storage_component_ordinal: u32,
     storage_component_id: Option<WeightId>,
     resource_id: ResourceId,
@@ -43,10 +33,9 @@ pub struct ExecutionDeterminismWitnessSpec {
     token_bytes_per_token: Option<u64>,
 }
 
-impl ExecutionDeterminismWitnessSpec {
+impl ExecutionDeterminismValueLocation {
     fn from_binding(
         node: &super::PlanNode,
-        kind: ExecutionDeterminismWitnessKind,
         binding: &ResolvedValueBinding,
     ) -> Result<Vec<Self>, VNextError> {
         let components = binding.storage().components();
@@ -70,7 +59,7 @@ impl ExecutionDeterminismWitnessSpec {
                         .is_none()
                 {
                     return Err(invalid_plan(format!(
-                        "node `{}` determinism witness `{}` component {component_ordinal} has an invalid physical range",
+                        "node `{}` determinism value `{}` component {component_ordinal} has an invalid physical range",
                         node.id(),
                         binding.value_id()
                     )));
@@ -84,7 +73,7 @@ impl ExecutionDeterminismWitnessSpec {
                             || canonical_length_bytes % canonical_extent != 0
                         {
                             return Err(invalid_plan(format!(
-                                "node `{}` determinism witness `{}` component {component_ordinal} has a non-integral token projection",
+                                "node `{}` determinism value `{}` component {component_ordinal} has a non-integral token projection",
                                 node.id(),
                                 binding.value_id()
                             )));
@@ -94,7 +83,7 @@ impl ExecutionDeterminismWitnessSpec {
                             .filter(|bytes| *bytes > 0)
                             .ok_or_else(|| {
                                 invalid_plan(format!(
-                                    "node `{}` determinism witness `{}` component {component_ordinal} has an invalid token projection",
+                                    "node `{}` determinism value `{}` component {component_ordinal} has an invalid token projection",
                                     node.id(),
                                     binding.value_id()
                                 ))
@@ -103,16 +92,12 @@ impl ExecutionDeterminismWitnessSpec {
                     .transpose()?;
                 Ok(Self {
                     node_id: node.id().clone(),
-                    provider_id: node.selection().selected_provider().clone(),
-                    provider_implementation_fingerprint: node
-                        .provider_implementation_fingerprint()
-                        .to_owned(),
-                    provider_execution_contract_fingerprint: node
-                        .provider_execution_semantics()
-                        .contract_fingerprint(),
-                    kind: kind.clone(),
+                    value_id: binding.value_id().clone(),
+                    role: binding.role(),
+                    ordinal: binding.ordinal(),
+                    usage: binding.usage(),
                     storage_component_ordinal: u32::try_from(component_ordinal).map_err(|_| {
-                        invalid_plan("determinism witness component ordinal exceeds u32")
+                        invalid_plan("determinism value component ordinal exceeds u32")
                     })?,
                     storage_component_id: component.component_id().cloned(),
                     resource_id: component.resource_id().clone(),
@@ -129,22 +114,20 @@ impl ExecutionDeterminismWitnessSpec {
         &self.node_id
     }
 
-    pub fn provider_id(&self) -> &ProviderId {
-        &self.provider_id
+    pub fn value_id(&self) -> &ProgramValueId {
+        &self.value_id
     }
 
-    pub fn provider_implementation_fingerprint(&self) -> &str {
-        &self.provider_implementation_fingerprint
+    pub const fn role(&self) -> ResolvedValueRole {
+        self.role
     }
 
-    pub const fn provider_execution_contract_fingerprint(
-        &self,
-    ) -> ProviderExecutionContractFingerprint {
-        self.provider_execution_contract_fingerprint
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
     }
 
-    pub fn kind(&self) -> &ExecutionDeterminismWitnessKind {
-        &self.kind
+    pub const fn usage(&self) -> BufferUsage {
+        self.usage
     }
 
     pub const fn storage_component_ordinal(&self) -> u32 {
@@ -179,15 +162,161 @@ impl ExecutionDeterminismWitnessSpec {
         let bytes = match self.token_bytes_per_token {
             Some(bytes_per_token) => bytes_per_token
                 .checked_mul(token_span.immediate_tokens())
-                .ok_or_else(|| invalid_plan("determinism witness active byte extent overflows"))?,
+                .ok_or_else(|| invalid_plan("determinism value active byte extent overflows"))?,
             None => self.canonical_length_bytes,
         };
         if bytes == 0 || bytes > self.canonical_length_bytes {
             return Err(invalid_plan(
-                "determinism witness active byte extent exceeds its canonical value",
+                "determinism value active byte extent exceeds its canonical value",
             ));
         }
         Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionDeterminismWitnessKind {
+    Output {
+        value_id: ProgramValueId,
+        output_ordinal: u32,
+    },
+    StateEffect {
+        state_id: StateId,
+        state_value_id: ProgramValueId,
+        lifetime: AllocationLifetime,
+        access: TensorAccess,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDeterminismWitnessSpec {
+    provider_id: ProviderId,
+    provider_implementation_fingerprint: String,
+    provider_execution_contract_fingerprint: ProviderExecutionContractFingerprint,
+    kind: ExecutionDeterminismWitnessKind,
+    location: ExecutionDeterminismValueLocation,
+}
+
+impl ExecutionDeterminismWitnessSpec {
+    fn from_binding(
+        node: &super::PlanNode,
+        kind: ExecutionDeterminismWitnessKind,
+        binding: &ResolvedValueBinding,
+    ) -> Result<Vec<Self>, VNextError> {
+        ExecutionDeterminismValueLocation::from_binding(node, binding)?
+            .into_iter()
+            .map(|location| {
+                Ok(Self {
+                    provider_id: node.selection().selected_provider().clone(),
+                    provider_implementation_fingerprint: node
+                        .provider_implementation_fingerprint()
+                        .to_owned(),
+                    provider_execution_contract_fingerprint: node
+                        .provider_execution_semantics()
+                        .contract_fingerprint(),
+                    kind: kind.clone(),
+                    location,
+                })
+            })
+            .collect()
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        self.location.node_id()
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub fn provider_implementation_fingerprint(&self) -> &str {
+        &self.provider_implementation_fingerprint
+    }
+
+    pub const fn provider_execution_contract_fingerprint(
+        &self,
+    ) -> ProviderExecutionContractFingerprint {
+        self.provider_execution_contract_fingerprint
+    }
+
+    pub fn kind(&self) -> &ExecutionDeterminismWitnessKind {
+        &self.kind
+    }
+
+    pub fn location(&self) -> &ExecutionDeterminismValueLocation {
+        &self.location
+    }
+
+    pub const fn storage_component_ordinal(&self) -> u32 {
+        self.location.storage_component_ordinal()
+    }
+
+    pub fn storage_component_id(&self) -> Option<&WeightId> {
+        self.location.storage_component_id()
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        self.location.resource_id()
+    }
+
+    pub const fn logical_offset_bytes(&self) -> u64 {
+        self.location.logical_offset_bytes()
+    }
+
+    pub const fn canonical_length_bytes(&self) -> u64 {
+        self.location.canonical_length_bytes()
+    }
+
+    pub const fn element_type(&self) -> ElementType {
+        self.location.element_type()
+    }
+
+    pub const fn token_bytes_per_token(&self) -> Option<u64> {
+        self.location.token_bytes_per_token()
+    }
+
+    pub fn active_length_bytes(&self, token_span: &TokenSpanWork) -> Result<u64, VNextError> {
+        self.location.active_length_bytes(token_span)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionDeterminismInitializationKind {
+    ExternalInput {
+        value_id: ProgramValueId,
+    },
+    State {
+        state_id: StateId,
+        state_value_id: ProgramValueId,
+        lifetime: AllocationLifetime,
+        access: TensorAccess,
+    },
+}
+
+/// One complete logical input/state range that must be restored before a
+/// deterministic eager or replay submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDeterminismInitializationSpec {
+    kind: ExecutionDeterminismInitializationKind,
+    location: ExecutionDeterminismValueLocation,
+    consumer_node_ids: Vec<NodeId>,
+}
+
+impl ExecutionDeterminismInitializationSpec {
+    pub fn kind(&self) -> &ExecutionDeterminismInitializationKind {
+        &self.kind
+    }
+
+    pub fn location(&self) -> &ExecutionDeterminismValueLocation {
+        &self.location
+    }
+
+    pub fn consumer_node_ids(&self) -> &[NodeId] {
+        &self.consumer_node_ids
     }
 }
 
@@ -226,6 +355,7 @@ pub struct ExecutionDeterminismWitnessPlan {
     schema_version: ContractVersion,
     plan_hash: PlanHash,
     replay_provider_requirements: Vec<ProviderDeterminismCoverageRequirement>,
+    initializations: Vec<ExecutionDeterminismInitializationSpec>,
     witnesses: Vec<ExecutionDeterminismWitnessSpec>,
 }
 
@@ -242,6 +372,10 @@ impl ExecutionDeterminismWitnessPlan {
         &self.replay_provider_requirements
     }
 
+    pub fn initializations(&self) -> &[ExecutionDeterminismInitializationSpec] {
+        &self.initializations
+    }
+
     pub fn witnesses(&self) -> &[ExecutionDeterminismWitnessSpec] {
         &self.witnesses
     }
@@ -252,6 +386,137 @@ impl ExecutionPlan {
     /// plan. Hardware runners consume this contract rather than maintaining a
     /// second provider/output/state inventory.
     pub fn determinism_witness_plan(&self) -> Result<ExecutionDeterminismWitnessPlan, VNextError> {
+        let nodes = self.payload().nodes();
+        let produced_values = nodes
+            .iter()
+            .flat_map(|node| {
+                node.values().iter().filter_map(|binding| {
+                    (binding.role() == ResolvedValueRole::Output)
+                        .then(|| binding.value_id().clone())
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let mut external_inputs = BTreeMap::<
+            (ProgramValueId, ResourceId, u64, u64, ElementType),
+            (ExecutionDeterminismValueLocation, BTreeSet<NodeId>),
+        >::new();
+        let mut initial_state = BTreeMap::<
+            (
+                StateId,
+                ProgramValueId,
+                AllocationLifetime,
+                ResourceId,
+                u64,
+                u64,
+                ElementType,
+            ),
+            (
+                ExecutionDeterminismValueLocation,
+                TensorAccess,
+                BTreeSet<NodeId>,
+            ),
+        >::new();
+
+        for node in nodes {
+            for binding in node.values().iter().filter(|binding| {
+                binding.role() == ResolvedValueRole::Input
+                    && binding.usage() == BufferUsage::Activations
+                    && matches!(
+                        binding.access(),
+                        TensorAccess::Read | TensorAccess::ReadWrite
+                    )
+                    && !produced_values.contains(binding.value_id())
+            }) {
+                for location in ExecutionDeterminismValueLocation::from_binding(node, binding)? {
+                    let key = (
+                        binding.value_id().clone(),
+                        location.resource_id().clone(),
+                        location.logical_offset_bytes(),
+                        location.canonical_length_bytes(),
+                        location.element_type(),
+                    );
+                    let (_, consumers) = external_inputs
+                        .entry(key)
+                        .or_insert_with(|| (location, BTreeSet::new()));
+                    consumers.insert(node.id().clone());
+                }
+            }
+
+            for effect in node.state_effects().iter().filter(|effect| {
+                matches!(
+                    effect.access(),
+                    TensorAccess::Read | TensorAccess::ReadWrite
+                )
+            }) {
+                let mut matched_read_binding = false;
+                for binding in node.values().iter().filter(|binding| {
+                    binding.value_id() == effect.state_value_id()
+                        && binding.usage() == BufferUsage::State
+                        && matches!(
+                            binding.access(),
+                            TensorAccess::Read | TensorAccess::ReadWrite
+                        )
+                }) {
+                    for location in ExecutionDeterminismValueLocation::from_binding(node, binding)?
+                    {
+                        matched_read_binding = true;
+                        let key = (
+                            effect.state_id().clone(),
+                            effect.state_value_id().clone(),
+                            effect.lifetime(),
+                            location.resource_id().clone(),
+                            location.logical_offset_bytes(),
+                            location.canonical_length_bytes(),
+                            location.element_type(),
+                        );
+                        let (_, access, consumers) = initial_state
+                            .entry(key)
+                            .or_insert_with(|| (location, effect.access(), BTreeSet::new()));
+                        if effect.access() == TensorAccess::ReadWrite {
+                            *access = TensorAccess::ReadWrite;
+                        }
+                        consumers.insert(node.id().clone());
+                    }
+                }
+                if !matched_read_binding {
+                    return Err(invalid_plan(format!(
+                        "node `{}` readable state `{}` has no exact determinism initialization closure",
+                        node.id(),
+                        effect.state_id()
+                    )));
+                }
+            }
+        }
+
+        let mut initializations =
+            Vec::with_capacity(external_inputs.len().saturating_add(initial_state.len()));
+        initializations.extend(external_inputs.into_iter().map(
+            |((value_id, _, _, _, _), (location, consumer_node_ids))| {
+                ExecutionDeterminismInitializationSpec {
+                    kind: ExecutionDeterminismInitializationKind::ExternalInput { value_id },
+                    location,
+                    consumer_node_ids: consumer_node_ids.into_iter().collect(),
+                }
+            },
+        ));
+        initializations.extend(initial_state.into_iter().map(
+            |(
+                (state_id, state_value_id, lifetime, _, _, _, _),
+                (location, access, consumer_node_ids),
+            )| {
+                ExecutionDeterminismInitializationSpec {
+                    kind: ExecutionDeterminismInitializationKind::State {
+                        state_id,
+                        state_value_id,
+                        lifetime,
+                        access,
+                    },
+                    location,
+                    consumer_node_ids: consumer_node_ids.into_iter().collect(),
+                }
+            },
+        ));
+
         let mut witnesses = Vec::new();
         let mut replay_providers = BTreeMap::<
             ProviderId,
@@ -262,7 +527,7 @@ impl ExecutionPlan {
             ),
         >::new();
 
-        for node in self.payload().nodes() {
+        for node in nodes {
             let semantics = node.provider_execution_semantics();
             if semantics.replay_equivalence() == ProviderReplayEquivalence::BitwiseEagerEquivalent {
                 match replay_providers.entry(node.selection().selected_provider().clone()) {
@@ -369,6 +634,7 @@ impl ExecutionPlan {
             schema_version: EXECUTION_DETERMINISM_WITNESS_VERSION,
             plan_hash: self.plan_hash().clone(),
             replay_provider_requirements,
+            initializations,
             witnesses,
         })
     }

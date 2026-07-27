@@ -493,6 +493,55 @@ fn execution_determinism_witness_closes_outputs_writable_state_and_replay_provid
     .unwrap();
     let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
     assert_eq!(witness_plan.plan_hash(), fixture.plan.plan_hash());
+    assert_eq!(
+        witness_plan.schema_version(),
+        EXECUTION_DETERMINISM_WITNESS_VERSION
+    );
+
+    let external_initializations = witness_plan
+        .initializations()
+        .iter()
+        .filter(|initialization| {
+            matches!(
+                initialization.kind(),
+                ExecutionDeterminismInitializationKind::ExternalInput { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let state_initializations = witness_plan
+        .initializations()
+        .iter()
+        .filter(|initialization| {
+            matches!(
+                initialization.kind(),
+                ExecutionDeterminismInitializationKind::State { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(external_initializations.len(), 2);
+    assert_eq!(state_initializations.len(), 1);
+    assert_eq!(state_initializations[0].consumer_node_ids().len(), 4);
+    assert!(matches!(
+        state_initializations[0].kind(),
+        ExecutionDeterminismInitializationKind::State {
+            access: TensorAccess::ReadWrite,
+            ..
+        }
+    ));
+    assert_eq!(
+        witness_plan
+            .initializations()
+            .iter()
+            .flat_map(|initialization| initialization.consumer_node_ids())
+            .collect::<BTreeSet<_>>(),
+        fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(PlanNode::id)
+            .collect::<BTreeSet<_>>()
+    );
 
     let output_witnesses = witness_plan
         .witnesses()
@@ -571,6 +620,16 @@ fn execution_determinism_witness_excludes_read_only_state() {
     )
     .unwrap();
     let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
+    assert_eq!(witness_plan.initializations().len(), 3);
+    assert!(witness_plan.initializations().iter().any(|initialization| {
+        matches!(
+            initialization.kind(),
+            ExecutionDeterminismInitializationKind::State {
+                access: TensorAccess::Read,
+                ..
+            }
+        )
+    }));
     assert_eq!(witness_plan.witnesses().len(), 2);
     assert!(witness_plan.witnesses().iter().all(|witness| matches!(
         witness.kind(),
