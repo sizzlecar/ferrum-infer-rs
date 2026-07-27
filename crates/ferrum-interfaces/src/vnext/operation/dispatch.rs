@@ -112,6 +112,37 @@ impl BoundDeviceSubmissionAttribution {
                 "device submission attribution differs from batch node identity",
             ));
         }
+        for replayed_segment in device.replayed_segments() {
+            let program_id = replayed_segment.program_id();
+            if program_id.plan_hash() != batch_identity.plan_hash()
+                || program_id.runtime_implementation_fingerprint()
+                    != batch_identity.runtime_implementation_fingerprint()
+                || program_id.lane_id() != batch_identity.lane_id()
+                || replayed_segment.logical_commands().iter().any(|command| {
+                    let Ok(node_index) = usize::try_from(command.node_index()) else {
+                        return true;
+                    };
+                    batch_identity.node_id_at(node_index).is_none()
+                        || u32::try_from(
+                            batch_identity
+                                .node_participant_count(node_index)
+                                .unwrap_or_default(),
+                        )
+                        .map_or(true, |count| count != command.participant_count())
+                })
+                || replayed_segment
+                    .logical_commands()
+                    .first()
+                    .is_none_or(|command| {
+                        program_id.immediate_sequences() != command.participant_count()
+                            || program_id.immediate_tokens() != command.token_count()
+                    })
+            {
+                return Err(invalid_operation(
+                    "replayed segment attribution differs from its batch or sealed program identity",
+                ));
+            }
+        }
         Ok(Self {
             batch_identity,
             submission_fingerprint,

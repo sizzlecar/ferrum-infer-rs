@@ -1041,34 +1041,105 @@ fn validate_determinism_attribution(
 ) -> Result<(), VNextError> {
     let expected_nodes = node_ids.iter().collect::<BTreeSet<_>>();
     let mut observed_nodes = BTreeSet::new();
-    for command in attribution.device().commands() {
-        if command.command_phase() != DeviceCommandPhase::Compute {
-            continue;
+    match expected_execution_path {
+        DeviceExecutionPath::Eager => {
+            for replayed_segment in attribution.device().replayed_segments() {
+                for command in replayed_segment.logical_commands() {
+                    let node_index = usize::try_from(command.node_index()).map_err(|_| {
+                        invalid_operation("determinism replay node index exceeds usize")
+                    })?;
+                    let node_id = attribution
+                        .batch_identity()
+                        .node_id_at(node_index)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "determinism replay attribution references a node absent from its batch",
+                            )
+                        })?;
+                    if expected_nodes.contains(node_id) {
+                        return Err(invalid_operation(format!(
+                            "determinism node `{node_id}` replayed while eager execution was required"
+                        )));
+                    }
+                }
+            }
+            for command in attribution.device().commands() {
+                if command.command_phase() != DeviceCommandPhase::Compute {
+                    continue;
+                }
+                let Some(node_index) = command.node_index() else {
+                    continue;
+                };
+                let node_index = usize::try_from(node_index).map_err(|_| {
+                    invalid_operation("determinism attribution node index exceeds usize")
+                })?;
+                let node_id = attribution
+                    .batch_identity()
+                    .node_id_at(node_index)
+                    .ok_or_else(|| {
+                        invalid_operation(
+                            "determinism attribution references a node absent from its batch",
+                        )
+                    })?;
+                if !expected_nodes.contains(node_id) {
+                    continue;
+                }
+                if command.execution_path() != DeviceExecutionPath::Eager
+                    || command.reusable_graph_node_count().is_some()
+                {
+                    return Err(invalid_operation(format!(
+                        "determinism node `{node_id}` did not execute through the required eager path"
+                    )));
+                }
+                observed_nodes.insert(node_id);
+            }
         }
-        let Some(node_index) = command.node_index() else {
-            continue;
-        };
-        let node_index = usize::try_from(node_index)
-            .map_err(|_| invalid_operation("determinism attribution node index exceeds usize"))?;
-        let Some(node_id) = attribution.batch_identity().node_id_at(node_index) else {
-            return Err(invalid_operation(
-                "determinism attribution references a node absent from its batch",
-            ));
-        };
-        if !expected_nodes.contains(node_id) {
-            continue;
+        DeviceExecutionPath::Replayed => {
+            for command in attribution.device().commands() {
+                if command.command_phase() != DeviceCommandPhase::Compute {
+                    continue;
+                }
+                let Some(node_index) = command.node_index() else {
+                    continue;
+                };
+                let node_index = usize::try_from(node_index).map_err(|_| {
+                    invalid_operation("determinism attribution node index exceeds usize")
+                })?;
+                let node_id = attribution
+                    .batch_identity()
+                    .node_id_at(node_index)
+                    .ok_or_else(|| {
+                        invalid_operation(
+                            "determinism attribution references a node absent from its batch",
+                        )
+                    })?;
+                if expected_nodes.contains(node_id)
+                    && command.execution_path() != DeviceExecutionPath::Replayed
+                {
+                    return Err(invalid_operation(format!(
+                        "determinism node `{node_id}` executed eagerly while replay was required"
+                    )));
+                }
+            }
+            for replayed_segment in attribution.device().replayed_segments() {
+                for command in replayed_segment.logical_commands() {
+                    let node_index = usize::try_from(command.node_index()).map_err(|_| {
+                        invalid_operation("determinism replay node index exceeds usize")
+                    })?;
+                    let node_id = attribution
+                        .batch_identity()
+                        .node_id_at(node_index)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "determinism replay attribution references a node absent from its batch",
+                            )
+                        })?;
+                    if expected_nodes.contains(node_id) {
+                        observed_nodes.insert(node_id);
+                    }
+                }
+            }
         }
-        let replay_shape_matches = match expected_execution_path {
-            DeviceExecutionPath::Eager => command.reusable_graph_node_count().is_none(),
-            DeviceExecutionPath::Replayed => command.reusable_graph_node_count().is_some(),
-        };
-        if command.execution_path() != expected_execution_path || !replay_shape_matches {
-            return Err(invalid_operation(format!(
-                "determinism node `{node_id}` did not execute through the required {} path",
-                expected_execution_path.as_str()
-            )));
-        }
-        observed_nodes.insert(node_id);
     }
     if observed_nodes != expected_nodes {
         return Err(invalid_operation(
