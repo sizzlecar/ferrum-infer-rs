@@ -1105,8 +1105,10 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submitted_command_node_indices: Vec<Vec<Option<u32>>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
     pub(crate) submitted_compute_path_requirements: Vec<DeviceComputePathRequirement>,
+    pub(crate) submitted_attribution_requirements: Vec<DeviceSubmissionAttributionRequirement>,
     pub(crate) uploaded_payloads: Vec<Vec<u8>>,
     pub(crate) submitted_reusable_captures: Vec<Option<DeviceReusableExecutionCapture>>,
+    pending_reusable_invocations: Vec<DeviceReusableExecutionInvocation>,
     pub(crate) scratch_bytes: BTreeMap<u32, u8>,
     pub(crate) scratch_observations: Vec<(u32, u8)>,
     pub(crate) program_binding_coalesce_calls: u64,
@@ -1138,6 +1140,140 @@ pub(crate) struct TestRuntime {
     pub(crate) use_alternate_descriptor: AtomicBool,
     pub(crate) descriptor_reads_until_drift: AtomicU64,
     pub(crate) trace: Arc<Mutex<RuntimeTrace>>,
+}
+
+fn test_submission_attribution(
+    timing_mode: DeviceTimingMode,
+    requirement: DeviceSubmissionAttributionRequirement,
+    entries: &[DeviceCommandEntry<TestCommand>],
+    reusable_invocations: Vec<DeviceReusableExecutionInvocation>,
+) -> Result<Option<DeviceSubmissionAttribution>, TestRuntimeError> {
+    if !timing_mode.kernel_attribution_enabled() && !requirement.logical_execution_path_required() {
+        return Ok(None);
+    }
+    let mut reusable_invocations = reusable_invocations.into_iter();
+    let mut rows = Vec::with_capacity(entries.len());
+    let mut replayed_segments = Vec::new();
+    for (command_index, entry) in entries.iter().enumerate() {
+        let command_index = u32::try_from(command_index)
+            .map_err(|_| TestRuntimeError("command index exceeds u32"))?;
+        let invocation = matches!(entry.command(), TestCommand::ReusableExecution)
+            .then(|| reusable_invocations.next())
+            .flatten();
+        let (native_op_id, execution_path, compute_dispatch_count, transfer_command_count) =
+            match entry.command() {
+                TestCommand::Provider => ("test_provider", DeviceExecutionPath::Eager, 1, 0),
+                TestCommand::ScratchProvider => {
+                    ("test_scratch_provider", DeviceExecutionPath::Eager, 1, 0)
+                }
+                TestCommand::ReusableExecution => (
+                    "test_reusable_execution",
+                    DeviceExecutionPath::Replayed,
+                    1,
+                    0,
+                ),
+                TestCommand::ProgramBinding => {
+                    ("test_program_binding", DeviceExecutionPath::Eager, 0, 1)
+                }
+                TestCommand::CoalescedProgramBinding => (
+                    "test_coalesced_program_binding",
+                    DeviceExecutionPath::Eager,
+                    0,
+                    1,
+                ),
+                TestCommand::DynamicBinding => {
+                    ("test_dynamic_binding", DeviceExecutionPath::Eager, 0, 1)
+                }
+                TestCommand::ResultBinding => {
+                    ("test_result_binding", DeviceExecutionPath::Eager, 0, 1)
+                }
+                TestCommand::Copy => ("test_copy", DeviceExecutionPath::Eager, 0, 1),
+                TestCommand::Upload(_, _) => ("test_upload", DeviceExecutionPath::Eager, 0, 1),
+                TestCommand::Zero => ("test_zero", DeviceExecutionPath::Eager, 0, 1),
+            };
+        let logical_work = entry.logical_work();
+        let batching_form = invocation.as_ref().map_or_else(
+            || logical_work.map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
+            |_| DeviceBatchingForm::ParticipantLoop,
+        );
+        let participant_count = invocation.as_ref().map_or_else(
+            || {
+                logical_work.map_or(u32::from(entry.node_index().is_some()), |work| {
+                    work.participant_count()
+                })
+            },
+            DeviceReusableExecutionInvocation::participant_count,
+        );
+        let token_count = invocation.as_ref().map_or_else(
+            || {
+                logical_work.map_or(u64::from(entry.node_index().is_some()), |work| {
+                    work.token_count()
+                })
+            },
+            DeviceReusableExecutionInvocation::token_count,
+        );
+        let reusable_graph_node_count = invocation
+            .as_ref()
+            .map(|invocation| u64::from(invocation.segment().logical_command_count()));
+        rows.push(
+            DeviceNativeWorkAttribution::new(
+                command_index,
+                entry.node_index(),
+                entry.phase(),
+                native_op_id,
+                execution_path,
+                batching_form,
+                participant_count,
+                token_count,
+                compute_dispatch_count,
+                transfer_command_count,
+                reusable_graph_node_count,
+            )
+            .ok_or(TestRuntimeError("invalid test native attribution"))?,
+        );
+
+        if let Some(invocation) = invocation {
+            let logical_commands = (0..invocation.segment().logical_command_count())
+                .map(|ordinal| {
+                    DeviceReplayedLogicalCommandAttribution::new(
+                        ordinal,
+                        invocation
+                            .segment()
+                            .start_node_index()
+                            .checked_add(ordinal)?,
+                        "test_replayed_logical_command",
+                        DeviceBatchingForm::ParticipantLoop,
+                        invocation.participant_count(),
+                        invocation.token_count(),
+                        1,
+                        0,
+                        1,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or(TestRuntimeError("invalid test logical replay attribution"))?;
+            let fingerprint = format!(
+                "{:064x}",
+                u64::from(invocation.segment().ordinal()).saturating_add(1)
+            );
+            replayed_segments.push(
+                DeviceReplayedSegmentAttribution::new(
+                    command_index,
+                    invocation.program_id().clone(),
+                    invocation.segment().clone(),
+                    fingerprint,
+                    logical_commands,
+                )
+                .ok_or(TestRuntimeError("invalid test replay segment attribution"))?,
+            );
+        }
+    }
+    if reusable_invocations.next().is_some() {
+        return Err(TestRuntimeError("unused reusable invocation metadata"));
+    }
+    DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments)
+        .map(Some)
+        .ok_or(TestRuntimeError("invalid test submission attribution"))
 }
 
 struct TestStaticWeightImport {
@@ -1317,8 +1453,13 @@ impl DeviceRuntime for TestRuntime {
 
     fn encode_reusable_execution(
         &self,
-        _invocation: DeviceReusableExecutionInvocation,
+        invocation: DeviceReusableExecutionInvocation,
     ) -> Result<Option<Self::Command>, Self::Error> {
+        self.trace
+            .lock()
+            .unwrap()
+            .pending_reusable_invocations
+            .push(invocation);
         Ok(Some(TestCommand::ReusableExecution))
     }
 
@@ -1330,6 +1471,7 @@ impl DeviceRuntime for TestRuntime {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
         let compute_path_requirement = commands.compute_path_requirement();
+        let attribution_requirement = commands.attribution_requirement();
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands.into_entries();
         let mut compute_command_count = 0_usize;
@@ -1341,6 +1483,16 @@ impl DeviceRuntime for TestRuntime {
                     usize::from(*entry.command() == TestCommand::ReusableExecution);
             }
         }
+        let reusable_invocations = {
+            let mut trace = self.trace.lock().unwrap();
+            if trace.pending_reusable_invocations.len() != replayed_compute_command_count {
+                trace.pending_reusable_invocations.clear();
+                return Err(DefinitelyNotSubmitted::new(TestRuntimeError(
+                    "reusable invocation metadata differs from encoded commands",
+                )));
+            }
+            std::mem::take(&mut trace.pending_reusable_invocations)
+        };
         let compute_path_matches = match compute_path_requirement {
             DeviceComputePathRequirement::Adaptive => true,
             DeviceComputePathRequirement::EagerOnly => replayed_compute_command_count == 0,
@@ -1355,73 +1507,13 @@ impl DeviceRuntime for TestRuntime {
         }
         let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
         let command_node_indices = entries.iter().map(DeviceCommandEntry::node_index).collect();
-        let attribution = timing_mode.kernel_attribution_enabled().then(|| {
-            entries
-                .iter()
-                .enumerate()
-                .filter_map(|(command_index, entry)| {
-                    let (
-                        native_op_id,
-                        execution_path,
-                        compute_dispatch_count,
-                        transfer_command_count,
-                    ) = match entry.command() {
-                        TestCommand::Provider => {
-                            ("test_provider", DeviceExecutionPath::Eager, 1, 0)
-                        }
-                        TestCommand::ScratchProvider => {
-                            ("test_scratch_provider", DeviceExecutionPath::Eager, 1, 0)
-                        }
-                        TestCommand::ReusableExecution => (
-                            "test_reusable_execution",
-                            DeviceExecutionPath::Replayed,
-                            1,
-                            0,
-                        ),
-                        TestCommand::ProgramBinding => {
-                            ("test_program_binding", DeviceExecutionPath::Eager, 0, 1)
-                        }
-                        TestCommand::CoalescedProgramBinding => (
-                            "test_coalesced_program_binding",
-                            DeviceExecutionPath::Eager,
-                            0,
-                            1,
-                        ),
-                        TestCommand::DynamicBinding => {
-                            ("test_dynamic_binding", DeviceExecutionPath::Eager, 0, 1)
-                        }
-                        TestCommand::ResultBinding => {
-                            ("test_result_binding", DeviceExecutionPath::Eager, 0, 1)
-                        }
-                        TestCommand::Copy => ("test_copy", DeviceExecutionPath::Eager, 0, 1),
-                        TestCommand::Upload(_, _) => {
-                            ("test_upload", DeviceExecutionPath::Eager, 0, 1)
-                        }
-                        TestCommand::Zero => ("test_zero", DeviceExecutionPath::Eager, 0, 1),
-                    };
-                    let logical_work = entry.logical_work();
-                    DeviceNativeWorkAttribution::new(
-                        u32::try_from(command_index).ok()?,
-                        entry.node_index(),
-                        entry.phase(),
-                        native_op_id,
-                        execution_path,
-                        logical_work
-                            .map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
-                        logical_work.map_or(u32::from(entry.node_index().is_some()), |work| {
-                            work.participant_count()
-                        }),
-                        logical_work.map_or(u64::from(entry.node_index().is_some()), |work| {
-                            work.token_count()
-                        }),
-                        compute_dispatch_count,
-                        transfer_command_count,
-                        None,
-                    )
-                })
-                .collect()
-        });
-        let attribution = attribution.and_then(DeviceSubmissionAttribution::new);
+        let attribution = test_submission_attribution(
+            timing_mode,
+            attribution_requirement,
+            &entries,
+            reusable_invocations,
+        )
+        .map_err(DefinitelyNotSubmitted::new)?;
         let scratch_events = entries
             .iter()
             .filter_map(|entry| {
@@ -1457,6 +1549,9 @@ impl DeviceRuntime for TestRuntime {
             trace
                 .submitted_compute_path_requirements
                 .push(compute_path_requirement);
+            trace
+                .submitted_attribution_requirements
+                .push(attribution_requirement);
             for (node_index, value, observe_before_write) in scratch_events {
                 if observe_before_write {
                     let observed = *trace.scratch_bytes.get(&node_index).unwrap_or(&0xa5);

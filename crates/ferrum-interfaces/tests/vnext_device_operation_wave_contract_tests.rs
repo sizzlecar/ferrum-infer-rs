@@ -820,6 +820,10 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
             trace.submitted_compute_path_requirements,
             vec![DeviceComputePathRequirement::EagerOnly]
         );
+        assert_eq!(
+            trace.submitted_attribution_requirements,
+            vec![DeviceSubmissionAttributionRequirement::LogicalExecutionPath]
+        );
         assert_eq!(trace.scratch_observations, vec![(0, 0xa5), (1, 0xa5)]);
         assert!(trace
             .uploaded_payloads
@@ -2436,9 +2440,15 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         &reaper,
     )
     .unwrap();
-    assert!(
-        handle.attribution().is_none(),
-        "replay timing records physical spans without kernel attribution"
+    let attribution = handle
+        .attribution()
+        .expect("determinism replay must retain actual-path attribution");
+    assert_eq!(attribution.device().replayed_segments().len(), 1);
+    assert_eq!(
+        attribution.device().replayed_segments()[0]
+            .logical_commands()
+            .len(),
+        providers.len()
     );
 
     {
@@ -2446,6 +2456,10 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         assert_eq!(
             trace.submitted_compute_path_requirements,
             vec![DeviceComputePathRequirement::ReplayedOnly]
+        );
+        assert_eq!(
+            trace.submitted_attribution_requirements,
+            vec![DeviceSubmissionAttributionRequirement::LogicalExecutionPath]
         );
         assert!(trace
             .uploaded_payloads
@@ -2466,20 +2480,18 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         );
     }
     assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
-    let readback = match handle.wait_with_determinism_readback().unwrap() {
-        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
-        other => panic!("determinism replay witness readback did not terminate: {other:?}"),
-    };
+    let expected_readbacks = handle.readback_plan().collection_request().request_count();
+    let evidence = handle.wait_into_evidence().unwrap();
     assert_eq!(
-        readback.dispositions().len(),
-        handle.readback_plan().collection_request().request_count()
+        evidence.expected_execution_path(),
+        DeviceExecutionPath::Replayed
     );
-    assert!(readback
-        .dispositions()
+    assert_eq!(evidence.physical_readbacks().len(), expected_readbacks);
+    assert!(evidence
+        .physical_readbacks()
         .iter()
-        .all(|disposition| matches!(disposition, CompletionReadbackDisposition::Succeeded(_))));
+        .all(|readback| !readback.bytes().is_empty() && readback.raw_sha256().len() == 64));
 
-    drop(handle);
     drop(providers);
     drop(active_bindings);
     drop(reaper);

@@ -17,8 +17,8 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
-    DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
+    DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
+    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionSegment, ElementType,
@@ -547,6 +547,8 @@ pub(crate) struct CudaExecutableCache {
 struct CudaExecutableProgramSegment {
     descriptor: DeviceReusableExecutionSegment,
     key: CudaExecutableSegmentKey,
+    reusable_executable_fingerprint: Arc<str>,
+    logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -558,6 +560,7 @@ struct CudaExecutableProgram {
 pub(crate) struct CudaExecutableLaunch {
     reusable_executable_fingerprint: Option<Arc<str>>,
     reusable_graph_node_counts: Option<Arc<[u32]>>,
+    replayed_logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
 }
 
 impl CudaExecutableLaunch {
@@ -569,6 +572,12 @@ impl CudaExecutableLaunch {
 
     pub(crate) fn reusable_graph_node_counts(&self) -> Option<Arc<[u32]>> {
         self.reusable_graph_node_counts.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn replayed_logical_commands(
+        &self,
+    ) -> Option<Arc<[DeviceReplayedLogicalCommandAttribution]>> {
+        self.replayed_logical_commands.as_ref().map(Arc::clone)
     }
 }
 
@@ -818,6 +827,7 @@ impl CudaExecutableCache {
         capture: &DeviceReusableExecutionCapture,
         candidates: &[CudaExecutableCandidate],
         command_node_indices: &[Option<u32>],
+        commands: &[CudaDeviceCommand],
     ) -> Result<(), CudaReplayError> {
         if !self.preparation.capture_is_open() {
             return Ok(());
@@ -827,6 +837,10 @@ impl CudaExecutableCache {
             .iter()
             .filter(|candidate| self.entries.contains_key(&candidate.key))
         {
+            let resident = self
+                .entries
+                .get(&candidate.key)
+                .expect("resident reusable candidate was filtered by the same cache");
             let node_indices = command_node_indices
                 .get(candidate.range.clone())
                 .ok_or_else(|| CudaReplayError {
@@ -834,6 +848,14 @@ impl CudaExecutableCache {
                     detail: "candidate command range exceeds node attribution".to_owned(),
                     eager_fallback_safe: false,
                 })?;
+            let candidate_commands =
+                commands
+                    .get(candidate.range.clone())
+                    .ok_or_else(|| CudaReplayError {
+                        stage: "register reusable execution program",
+                        detail: "candidate command range exceeds encoded commands".to_owned(),
+                        eager_fallback_safe: false,
+                    })?;
             let Some(start_node_index) = node_indices.first().copied().flatten() else {
                 return Err(CudaReplayError {
                     stage: "register reusable execution program",
@@ -842,7 +864,9 @@ impl CudaExecutableCache {
                 });
             };
             if node_indices.iter().enumerate().any(|(offset, observed)| {
-                let expected = start_node_index.checked_add(offset as u32);
+                let expected = u32::try_from(offset)
+                    .ok()
+                    .and_then(|offset| start_node_index.checked_add(offset));
                 *observed != expected
             }) {
                 return Err(CudaReplayError {
@@ -887,9 +911,31 @@ impl CudaExecutableCache {
                 detail: error.to_string(),
                 eager_fallback_safe: false,
             })?;
+            let logical_commands = resident
+                .command_graph_node_counts
+                .as_deref()
+                .filter(|counts| counts.len() == candidate_commands.len())
+                .and_then(|counts| {
+                    candidate_commands
+                        .iter()
+                        .zip(node_indices)
+                        .zip(counts)
+                        .enumerate()
+                        .map(|(ordinal, ((command, node_index), graph_node_count))| {
+                            command.replayed_logical_attribution(
+                                u32::try_from(ordinal).ok()?,
+                                (*node_index)?,
+                                *graph_node_count,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .map(Arc::<[DeviceReplayedLogicalCommandAttribution]>::from);
             segments.push(CudaExecutableProgramSegment {
                 descriptor,
                 key: candidate.key,
+                reusable_executable_fingerprint: Arc::from(candidate.key.fingerprint()),
+                logical_commands,
             });
         }
         if segments.is_empty() {
@@ -968,6 +1014,7 @@ impl CudaExecutableCache {
         invocation: &DeviceReusableExecutionInvocation,
         retain_profile_identity: bool,
         tool_correlation: bool,
+        retain_logical_attribution: bool,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let Some(program) = self.programs.get(invocation.program_id()) else {
             return Ok(None);
@@ -984,6 +1031,24 @@ impl CudaExecutableCache {
             });
         };
         let key = segment.key;
+        let sealed_fingerprint = retain_logical_attribution
+            .then(|| Arc::clone(&segment.reusable_executable_fingerprint));
+        let replayed_logical_commands = if retain_logical_attribution {
+            Some(
+                segment
+                    .logical_commands
+                    .as_ref()
+                    .map(Arc::clone)
+                    .ok_or_else(|| CudaReplayError {
+                        stage: "launch reusable execution program",
+                        detail: "sealed program segment lacks logical graph-node attribution"
+                            .to_owned(),
+                        eager_fallback_safe: true,
+                    })?,
+            )
+        } else {
+            None
+        };
         let now = self.tick();
         let Some(entry) = self.entries.get_mut(&key) else {
             return Err(CudaReplayError {
@@ -992,11 +1057,12 @@ impl CudaExecutableCache {
                 eager_fallback_safe: false,
             });
         };
-        let (reusable_executable_fingerprint, reusable_graph_node_counts) =
+        let (profile_fingerprint, reusable_graph_node_counts) =
             entry.launch(stream, now, retain_profile_identity, tool_correlation)?;
         Ok(Some(CudaExecutableLaunch {
-            reusable_executable_fingerprint,
+            reusable_executable_fingerprint: profile_fingerprint.or(sealed_fingerprint),
             reusable_graph_node_counts,
+            replayed_logical_commands,
         }))
     }
 
@@ -1027,6 +1093,24 @@ impl CudaExecutableCache {
         Ok(self.entries.contains_key(&segment.key))
     }
 
+    pub(crate) fn contains_attributable_program_segment(
+        &self,
+        invocation: &DeviceReusableExecutionInvocation,
+    ) -> Result<bool, CudaReplayError> {
+        if !self.contains_program_segment(invocation)? {
+            return Ok(false);
+        }
+        let program = self
+            .programs
+            .get(invocation.program_id())
+            .expect("resident reusable segment retains its program");
+        let segment = program
+            .segments
+            .get(invocation.segment().ordinal() as usize)
+            .expect("validated reusable segment ordinal remains resident");
+        Ok(segment.logical_commands.is_some())
+    }
+
     pub(crate) fn launch(
         &mut self,
         stream: &CudaStream,
@@ -1043,6 +1127,7 @@ impl CudaExecutableCache {
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,
+            replayed_logical_commands: None,
         }))
     }
 
