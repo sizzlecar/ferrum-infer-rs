@@ -24,7 +24,12 @@ LAYER_VALUE_RE = re.compile(
     r"value\.layer\.(?P<layer>[0-9]+)\."
     r"(?P<stage>attention|post_attention_norm|mlp|output)"
 )
-ELEMENT_FORMATS = {"f16": ("<e", 2), "f32": ("<f", 4), "u32": ("<I", 4)}
+ELEMENT_FORMATS = {
+    "f16": ("<e", 2),
+    "bf16": (None, 2),
+    "f32": ("<f", 4),
+    "u32": ("<I", 4),
+}
 
 PLAN_FIELDS_V1 = frozenset(
     {
@@ -40,6 +45,7 @@ PLAN_FIELDS_V1 = frozenset(
     }
 )
 PLAN_FIELDS_V2 = PLAN_FIELDS_V1 | {"maximum_decode_waves"}
+PLAN_FIELDS_V3 = PLAN_FIELDS_V2 | {"capture_product_output"}
 WAVE_FIELDS = frozenset(
     {
         "schema_version",
@@ -57,6 +63,7 @@ WAVE_FIELDS = frozenset(
         "records",
     }
 )
+WAVE_FIELDS_V3 = WAVE_FIELDS | {"product_outputs"}
 CHECKPOINT_FIELDS = frozenset(
     {
         "value_id",
@@ -71,6 +78,21 @@ TENSOR_FIELDS = frozenset({"dimensions", "element_type", "layout"})
 RECORD_FIELDS = frozenset(
     {
         "value",
+        "participant_index",
+        "request_id",
+        "token_span",
+        "output_layout",
+        "raw_file",
+        "raw_bytes",
+        "raw_sha256",
+    }
+)
+PRODUCT_OUTPUT_FIELDS = frozenset(
+    {
+        "output_mode",
+        "node_id",
+        "resource_id",
+        "logical_offset_bytes",
         "participant_index",
         "request_id",
         "token_span",
@@ -157,6 +179,11 @@ def integer(value: Any, label: str, *, minimum: int = 0) -> int:
     return value
 
 
+def boolean(value: Any, label: str) -> bool:
+    require(isinstance(value, bool), f"{label} must be a boolean")
+    return value
+
+
 def sha256(value: Any, label: str) -> str:
     digest = text(value, label)
     require(SHA256_RE.fullmatch(digest) is not None, f"{label} must be a lowercase SHA256")
@@ -199,7 +226,14 @@ def tensor_stats(path: Path, element_type: str, element_count: int) -> dict[str,
     fmt, width = ELEMENT_FORMATS[element_type]
     payload = path.read_bytes()
     require(len(payload) == element_count * width, f"{path.name} byte count differs from layout")
-    values = (item[0] for item in struct.iter_unpack(fmt, payload))
+    if element_type == "bf16":
+        values = (
+            struct.unpack("<f", struct.pack("<I", item[0] << 16))[0]
+            for item in struct.iter_unpack("<H", payload)
+        )
+    else:
+        assert fmt is not None
+        values = (item[0] for item in struct.iter_unpack(fmt, payload))
     if element_type == "u32":
         nonzero = sum(value != 0 for value in values)
         return {"element_count": element_count, "nonzero_count": nonzero}
@@ -249,10 +283,15 @@ def validate_artifact(
     raw_plan = load_json(plan_path)
     require(isinstance(raw_plan, dict), "plan must be an object")
     schema_version = integer(raw_plan.get("schema_version"), "plan.schema_version", minimum=1)
-    require(schema_version in (1, 2), "plan.schema_version must be 1 or 2")
+    require(schema_version in (1, 2, 3), "plan.schema_version must be 1, 2, or 3")
+    plan_fields = {
+        1: PLAN_FIELDS_V1,
+        2: PLAN_FIELDS_V2,
+        3: PLAN_FIELDS_V3,
+    }[schema_version]
     plan = exact_object(
         raw_plan,
-        PLAN_FIELDS_V1 if schema_version == 1 else PLAN_FIELDS_V2,
+        plan_fields,
         "plan",
     )
     plan_hash = sha256(plan["plan_hash"], "plan.plan_hash")
@@ -277,10 +316,16 @@ def validate_artifact(
         maximum_decode_waves <= 512,
         "plan.maximum_decode_waves exceeds the product limit",
     )
+    capture_product_output = (
+        boolean(plan["capture_product_output"], "plan.capture_product_output")
+        if schema_version >= 3
+        else False
+    )
     checkpoints_raw = plan["checkpoints"]
     require(
-        isinstance(checkpoints_raw, list) and checkpoints_raw,
-        "plan.checkpoints must be non-empty",
+        isinstance(checkpoints_raw, list)
+        and (bool(checkpoints_raw) or capture_product_output),
+        "plan must capture product output or contain checkpoints",
     )
     checkpoints = [
         validate_checkpoint(item, f"plan.checkpoints[{index}]")
@@ -320,7 +365,11 @@ def validate_artifact(
             wave_path.is_file() and not wave_path.is_symlink(),
             "wave manifest must be a real file",
         )
-        wave = exact_object(load_json(wave_path), WAVE_FIELDS, f"wave[{expected_index}]")
+        wave = exact_object(
+            load_json(wave_path),
+            WAVE_FIELDS_V3 if schema_version >= 3 else WAVE_FIELDS,
+            f"wave[{expected_index}]",
+        )
         require(
             wave["schema_version"] == schema_version,
             "wave.schema_version must match plan.schema_version",
@@ -445,12 +494,165 @@ def validate_artifact(
                 }
             )
         require(record_keys == sorted(set(record_keys)), "wave records must be unique and sorted")
+        product_outputs_raw = wave["product_outputs"] if schema_version >= 3 else []
+        require(
+            isinstance(product_outputs_raw, list),
+            "wave.product_outputs must be a list",
+        )
+        expected_product_outputs = participant_count if capture_product_output else 0
+        require(
+            len(product_outputs_raw) == expected_product_outputs,
+            "wave product-output count differs from capture policy x participant count",
+        )
+        product_output_keys: list[int] = []
+        product_outputs_summary: list[dict[str, Any]] = []
+        for product_index, product_raw in enumerate(product_outputs_raw):
+            label = f"wave.product_outputs[{product_index}]"
+            product = exact_object(product_raw, PRODUCT_OUTPUT_FIELDS, label)
+            output_mode = text(product["output_mode"], f"{label}.output_mode")
+            require(
+                output_mode in ("full-logits", "greedy-token"),
+                f"{label}.output_mode is unsupported",
+            )
+            text(product["node_id"], f"{label}.node_id")
+            text(product["resource_id"], f"{label}.resource_id")
+            logical_offset_bytes = integer(
+                product["logical_offset_bytes"],
+                f"{label}.logical_offset_bytes",
+            )
+            participant_index = integer(
+                product["participant_index"],
+                f"{label}.participant_index",
+            )
+            require(
+                participant_index < participant_count,
+                f"{label}.participant_index is out of range",
+            )
+            text(product["request_id"], f"{label}.request_id")
+            token_span = exact_object(
+                product["token_span"],
+                TOKEN_SPAN_FIELDS,
+                f"{label}.token_span",
+            )
+            immediate_tokens = integer(
+                token_span["immediate_tokens"],
+                f"{label}.token_span.immediate_tokens",
+                minimum=1,
+            )
+            full_tokens = integer(
+                token_span["full_input_tokens"],
+                f"{label}.token_span.full_input_tokens",
+                minimum=1,
+            )
+            fit_tokens = integer(
+                token_span["fit_input_tokens"],
+                f"{label}.token_span.fit_input_tokens",
+                minimum=1,
+            )
+            start = integer(
+                token_span["immediate_start_token"],
+                f"{label}.token_span.immediate_start_token",
+            )
+            end = integer(
+                token_span["immediate_end_token"],
+                f"{label}.token_span.immediate_end_token",
+                minimum=1,
+            )
+            require(
+                end - start == immediate_tokens
+                and full_tokens <= fit_tokens
+                and end <= full_tokens,
+                f"{label}.token_span is inconsistent",
+            )
+            sha256(token_span["fingerprint"], f"{label}.token_span.fingerprint")
+            identity = (product["request_id"], token_span)
+            previous_identity = participant_identity.setdefault(participant_index, identity)
+            require(
+                previous_identity == identity,
+                f"participant {participant_index} request or token span differs across outputs",
+            )
+            layout = exact_object(
+                product["output_layout"],
+                OUTPUT_LAYOUT_FIELDS,
+                f"{label}.output_layout",
+            )
+            element_type = text(
+                layout["element_type"],
+                f"{label}.output_layout.element_type",
+            )
+            element_count = integer(
+                layout["element_count"],
+                f"{label}.output_layout.element_count",
+                minimum=1,
+            )
+            if output_mode == "full-logits":
+                require(
+                    element_type in ("f16", "bf16", "f32"),
+                    f"{label} full logits must use a floating element type",
+                )
+            else:
+                require(
+                    element_type == "u32" and element_count == 1,
+                    f"{label} greedy token must use u32[1]",
+                )
+            raw_name = text(product["raw_file"], f"{label}.raw_file")
+            require(
+                Path(raw_name).name == raw_name,
+                f"{label}.raw_file must be a basename",
+            )
+            raw_path = capture_dir / raw_name
+            require(
+                raw_path.is_file() and not raw_path.is_symlink(),
+                f"{label}.raw_file must be a real file",
+            )
+            raw_bytes = integer(
+                product["raw_bytes"],
+                f"{label}.raw_bytes",
+                minimum=1,
+            )
+            require(
+                raw_path.stat().st_size == raw_bytes,
+                f"{label}.raw_bytes differs from file",
+            )
+            digest = file_sha256(raw_path)
+            require(
+                digest
+                == sha256(product["raw_sha256"], f"{label}.raw_sha256"),
+                f"{label}.raw_sha256 differs from file",
+            )
+            require(
+                raw_name not in referenced_raw,
+                f"raw file is referenced more than once: {raw_name}",
+            )
+            referenced_raw.add(raw_name)
+            product_output_keys.append(participant_index)
+            product_outputs_summary.append(
+                {
+                    "output_mode": output_mode,
+                    "node_id": product["node_id"],
+                    "resource_id": product["resource_id"],
+                    "logical_offset_bytes": logical_offset_bytes,
+                    "participant_index": participant_index,
+                    "request_id": product["request_id"],
+                    "token_span_fingerprint": token_span["fingerprint"],
+                    "raw_file": raw_name,
+                    "raw_bytes": raw_bytes,
+                    "raw_sha256": digest,
+                    "element_type": element_type,
+                    "stats": tensor_stats(raw_path, element_type, element_count),
+                }
+            )
+        require(
+            product_output_keys == list(range(expected_product_outputs)),
+            "wave product outputs must be unique and sorted by participant",
+        )
         summaries.append(
             {
                 "wave_kind": expected_kind,
                 "capture_index": expected_index,
                 "participant_count": participant_count,
                 "records": records_summary,
+                "product_outputs": product_outputs_summary,
             }
         )
 
@@ -467,6 +669,7 @@ def validate_artifact(
         "program_fingerprint": plan["program_fingerprint"],
         "run_id": plan["run_id"],
         "checkpoint_values": value_ids,
+        "capture_product_output": capture_product_output,
         "maximum_prefill_waves": maximum_waves,
         "maximum_decode_waves": maximum_decode_waves,
         "wave_count": len(summaries),
@@ -513,6 +716,7 @@ def compare_artifacts(
         "family_fingerprint",
         "program_fingerprint",
         "checkpoint_values",
+        "capture_product_output",
         "maximum_prefill_waves",
         "maximum_decode_waves",
     ):
@@ -596,6 +800,59 @@ def compare_artifacts(
                     "candidate_raw_sha256": candidate_record["raw_sha256"],
                     "baseline_raw_file": baseline_record["raw_file"],
                     "candidate_raw_file": candidate_record["raw_file"],
+                }
+                break
+        if first_difference is not None:
+            break
+        baseline_products = {
+            record["participant_index"]: record
+            for record in baseline_wave["product_outputs"]
+        }
+        candidate_products = {
+            record["participant_index"]: record
+            for record in candidate_wave["product_outputs"]
+        }
+        require(
+            baseline_products.keys() == candidate_products.keys(),
+            f"comparison product-output topology differs at {wave_key}",
+        )
+        for participant_index in sorted(baseline_products):
+            baseline_product = baseline_products[participant_index]
+            candidate_product = candidate_products[participant_index]
+            for field in ("output_mode", "raw_bytes", "element_type"):
+                require(
+                    baseline_product[field] == candidate_product[field],
+                    f"comparison product {field} differs at {wave_key}/{participant_index}",
+                )
+            if (
+                baseline_product["token_span_fingerprint"]
+                != candidate_product["token_span_fingerprint"]
+            ):
+                first_difference = {
+                    "difference_kind": "input-token-span",
+                    "wave_kind": wave_key[0],
+                    "capture_index": wave_key[1],
+                    "output_mode": baseline_product["output_mode"],
+                    "participant_index": participant_index,
+                    "baseline_token_span_fingerprint": baseline_product[
+                        "token_span_fingerprint"
+                    ],
+                    "candidate_token_span_fingerprint": candidate_product[
+                        "token_span_fingerprint"
+                    ],
+                }
+                break
+            if baseline_product["raw_sha256"] != candidate_product["raw_sha256"]:
+                first_difference = {
+                    "difference_kind": "product-output",
+                    "wave_kind": wave_key[0],
+                    "capture_index": wave_key[1],
+                    "output_mode": baseline_product["output_mode"],
+                    "participant_index": participant_index,
+                    "baseline_raw_sha256": baseline_product["raw_sha256"],
+                    "candidate_raw_sha256": candidate_product["raw_sha256"],
+                    "baseline_raw_file": baseline_product["raw_file"],
+                    "candidate_raw_file": candidate_product["raw_file"],
                 }
                 break
         if first_difference is not None:
@@ -785,6 +1042,121 @@ def self_test() -> None:
         (capture / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
         (capture / "wave-0000.json").write_text(json.dumps(wave), encoding="utf-8")
         validate_artifact(capture, "model.test", ["value.test"])
+
+        product_capture = Path(temporary) / "product-capture"
+        product_capture.mkdir()
+        product_raw = struct.pack("<ee", 3.0, -1.0)
+        product_name = "product-output-0000-participant-0000-full-logits.bin"
+        (product_capture / product_name).write_bytes(product_raw)
+        product_digest = hashlib.sha256(product_raw).hexdigest()
+        product_decode_raw = struct.pack("<ee", 2.0, -0.5)
+        product_decode_name = (
+            "decode-product-output-0000-participant-0000-full-logits.bin"
+        )
+        (product_capture / product_decode_name).write_bytes(product_decode_raw)
+        product_decode_digest = hashlib.sha256(product_decode_raw).hexdigest()
+        product_identity = {
+            **identity,
+            "plan_id": f"plan/sha256/{'8' * 64}",
+            "plan_hash": "8" * 64,
+            "run_id": "run.product",
+        }
+        product_plan = {
+            "schema_version": 3,
+            **product_identity,
+            "maximum_prefill_waves": 1,
+            "maximum_decode_waves": 1,
+            "capture_product_output": True,
+            "checkpoints": [],
+        }
+        product_record = {
+            "output_mode": "full-logits",
+            "node_id": "node.logits",
+            "resource_id": "resource/step/0",
+            "logical_offset_bytes": 0,
+            "participant_index": 0,
+            "request_id": "request.product",
+            "token_span": {
+                "immediate_tokens": 2,
+                "full_input_tokens": 2,
+                "fit_input_tokens": 128,
+                "immediate_start_token": 0,
+                "immediate_end_token": 2,
+                "fingerprint": "9" * 64,
+            },
+            "output_layout": {"element_type": "f16", "element_count": 2},
+            "raw_file": product_name,
+            "raw_bytes": len(product_raw),
+            "raw_sha256": product_digest,
+        }
+        product_wave = {
+            "schema_version": 3,
+            "capture_index": 0,
+            **product_identity,
+            "wave_kind": "prefill",
+            "participant_count": 1,
+            "completion_fingerprint": "a" * 64,
+            "receipt_fingerprint": "b" * 64,
+            "records": [],
+            "product_outputs": [product_record],
+        }
+        product_decode_wave = {
+            **product_wave,
+            "wave_kind": "decode",
+            "product_outputs": [
+                {
+                    **product_record,
+                    "raw_file": product_decode_name,
+                    "raw_bytes": len(product_decode_raw),
+                    "raw_sha256": product_decode_digest,
+                }
+            ],
+        }
+        (product_capture / "plan.json").write_text(
+            json.dumps(product_plan),
+            encoding="utf-8",
+        )
+        (product_capture / "wave-0000.json").write_text(
+            json.dumps(product_wave),
+            encoding="utf-8",
+        )
+        (product_capture / "decode-wave-0000.json").write_text(
+            json.dumps(product_decode_wave),
+            encoding="utf-8",
+        )
+        validated_product = validate_artifact(product_capture, "model.test", [])
+        require(
+            validated_product["capture_product_output"]
+            and not validated_product["checkpoint_values"],
+            "product-only capture did not validate without retained checkpoints",
+        )
+
+        product_candidate = Path(temporary) / "product-candidate"
+        shutil.copytree(product_capture, product_candidate)
+        changed_product = struct.pack("<ee", 2.5, -0.5)
+        (product_candidate / product_decode_name).write_bytes(changed_product)
+        changed_wave = load_json(product_candidate / "decode-wave-0000.json")
+        changed_wave["product_outputs"][0]["raw_sha256"] = hashlib.sha256(
+            changed_product
+        ).hexdigest()
+        (product_candidate / "decode-wave-0000.json").write_text(
+            json.dumps(changed_wave),
+            encoding="utf-8",
+        )
+        product_difference = compare_artifacts(
+            product_capture,
+            product_candidate,
+            "model.test",
+            [],
+            "different",
+        )
+        require(
+            product_difference["first_difference"]["difference_kind"]
+            == "product-output"
+            and product_difference["first_difference"]["wave_kind"] == "decode"
+            and product_difference["first_difference"]["capture_index"] == 0,
+            "comparison did not identify the first product-output difference",
+        )
     print("RUNTIME VNEXT CHECKPOINT ARTIFACT SELF-TEST PASS")
 
 

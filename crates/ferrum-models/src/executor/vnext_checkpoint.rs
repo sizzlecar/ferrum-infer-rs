@@ -16,13 +16,14 @@ use sha2::{Digest, Sha256};
 const MAX_CHECKPOINT_VALUES: usize = 63;
 const MAX_PREFILL_WAVES: usize = 16;
 const MAX_DECODE_WAVES: usize = 512;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 pub(super) struct VNextCheckpointSelection {
     output_dir: PathBuf,
     value_ids: Vec<ProgramValueId>,
     maximum_prefill_waves: usize,
     maximum_decode_waves: usize,
+    capture_product_output: bool,
 }
 
 impl VNextCheckpointSelection {
@@ -37,9 +38,11 @@ impl VNextCheckpointSelection {
                 "vNext checkpoint output directory cannot be empty",
             ));
         }
-        if config.value_ids.is_empty() || config.value_ids.len() > MAX_CHECKPOINT_VALUES {
+        if (config.value_ids.is_empty() && !config.capture_product_output)
+            || config.value_ids.len() > MAX_CHECKPOINT_VALUES
+        {
             return Err(FerrumError::config(format!(
-                "vNext checkpoint value count must be in 1..={MAX_CHECKPOINT_VALUES}"
+                "vNext checkpoint requires product output capture or 1..={MAX_CHECKPOINT_VALUES} values"
             )));
         }
         if config.maximum_prefill_waves == 0 || config.maximum_prefill_waves > MAX_PREFILL_WAVES {
@@ -75,6 +78,7 @@ impl VNextCheckpointSelection {
             value_ids,
             maximum_prefill_waves: config.maximum_prefill_waves,
             maximum_decode_waves: config.maximum_decode_waves,
+            capture_product_output: config.capture_product_output,
         }))
     }
 
@@ -104,6 +108,7 @@ impl VNextCheckpointSelection {
             checkpoints,
             maximum_prefill_waves: self.maximum_prefill_waves,
             maximum_decode_waves: self.maximum_decode_waves,
+            capture_product_output: self.capture_product_output,
             next_prefill_wave: AtomicUsize::new(0),
             next_decode_wave: AtomicUsize::new(0),
             armed: AtomicBool::new(false),
@@ -124,6 +129,7 @@ pub(super) struct VNextCheckpointCapture {
     checkpoints: Vec<RetainedCompletionValue>,
     maximum_prefill_waves: usize,
     maximum_decode_waves: usize,
+    capture_product_output: bool,
     next_prefill_wave: AtomicUsize,
     next_decode_wave: AtomicUsize,
     armed: AtomicBool,
@@ -139,6 +145,13 @@ pub(super) struct VNextCheckpointCapture {
 pub(super) enum VNextCheckpointWaveKind {
     Prefill,
     Decode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum VNextCheckpointProductOutputMode {
+    FullLogits,
+    GreedyToken,
 }
 
 impl VNextCheckpointWaveKind {
@@ -209,6 +222,10 @@ impl VNextCheckpointCapture {
 
     pub(super) fn checkpoints(&self) -> &[RetainedCompletionValue] {
         &self.checkpoints
+    }
+
+    pub(super) const fn captures_product_output(&self) -> bool {
+        self.capture_product_output
     }
 
     pub(super) fn readback_batches(
@@ -288,6 +305,38 @@ impl VNextCheckpointCapture {
         })
     }
 
+    pub(super) fn write_product_output(
+        &self,
+        claim: VNextCheckpointClaim,
+        request_id: &RequestId,
+        token_span: &TokenSpanWork,
+        output_mode: VNextCheckpointProductOutputMode,
+        output: &CompletionReadbackOutput,
+    ) -> Result<VNextCheckpointProductOutputRecord> {
+        if !self.capture_product_output {
+            return Err(FerrumError::internal(
+                "vNext product-output checkpoint was not configured",
+            ));
+        }
+        let stem =
+            product_output_file_stem(claim, output.request().participant_index(), output_mode);
+        let raw_file = format!("{stem}.bin");
+        write_new_file(&self.output_dir.join(&raw_file), output.bytes())?;
+        Ok(VNextCheckpointProductOutputRecord {
+            output_mode,
+            node_id: output.request().node_id().to_string(),
+            resource_id: output.request().resource_id().to_string(),
+            logical_offset_bytes: output.request().logical_offset_bytes(),
+            participant_index: output.request().participant_index(),
+            request_id: request_id.to_string(),
+            token_span: token_span.clone(),
+            output_layout: output.request().output_layout(),
+            raw_file,
+            raw_bytes: u64::try_from(output.bytes().len()).unwrap_or(u64::MAX),
+            raw_sha256: output.sha256().to_owned(),
+        })
+    }
+
     pub(super) fn finish_wave(
         &self,
         claim: VNextCheckpointClaim,
@@ -295,6 +344,7 @@ impl VNextCheckpointCapture {
         completion_fingerprint: &str,
         receipt_fingerprint: &str,
         mut records: Vec<VNextCheckpointArtifactRecord>,
+        mut product_outputs: Vec<VNextCheckpointProductOutputRecord>,
     ) -> Result<()> {
         let expected_records = self
             .checkpoints
@@ -318,12 +368,33 @@ impl VNextCheckpointCapture {
                 "vNext checkpoint wave contains duplicate semantic participant records",
             ));
         }
+        let expected_product_outputs = usize::from(self.capture_product_output)
+            .checked_mul(participant_count)
+            .ok_or_else(|| {
+                FerrumError::internal("vNext product-output record count overflows usize")
+            })?;
+        if product_outputs.len() != expected_product_outputs {
+            return Err(FerrumError::internal(format!(
+                "vNext checkpoint wave produced {} product outputs, expected {expected_product_outputs}",
+                product_outputs.len()
+            )));
+        }
+        let observed_product_participants = product_outputs
+            .iter()
+            .map(|record| record.participant_index)
+            .collect::<BTreeSet<_>>();
+        if observed_product_participants.len() != expected_product_outputs {
+            return Err(FerrumError::internal(
+                "vNext checkpoint wave contains duplicate product-output participant records",
+            ));
+        }
         records.sort_by(|left, right| {
             left.value
                 .value_id()
                 .cmp(right.value.value_id())
                 .then_with(|| left.participant_index.cmp(&right.participant_index))
         });
+        product_outputs.sort_by_key(|record| record.participant_index);
         let manifest = VNextCheckpointWaveManifest {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             capture_index: claim.capture_index,
@@ -338,6 +409,7 @@ impl VNextCheckpointCapture {
             completion_fingerprint,
             receipt_fingerprint,
             records: &records,
+            product_outputs: &product_outputs,
         };
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
             FerrumError::internal(format!("serialize vNext checkpoint wave: {error}"))
@@ -356,6 +428,7 @@ impl VNextCheckpointCapture {
             run_id: &self.run_id,
             maximum_prefill_waves: self.maximum_prefill_waves,
             maximum_decode_waves: self.maximum_decode_waves,
+            capture_product_output: self.capture_product_output,
             checkpoints: &self.checkpoints,
         };
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
@@ -377,6 +450,21 @@ pub(super) struct VNextCheckpointArtifactRecord {
     raw_sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct VNextCheckpointProductOutputRecord {
+    output_mode: VNextCheckpointProductOutputMode,
+    node_id: String,
+    resource_id: String,
+    logical_offset_bytes: u64,
+    participant_index: u32,
+    request_id: String,
+    token_span: TokenSpanWork,
+    output_layout: HostTransferLayout,
+    raw_file: String,
+    raw_bytes: u64,
+    raw_sha256: String,
+}
+
 #[derive(Serialize)]
 struct VNextCheckpointPlanManifest<'a> {
     schema_version: u32,
@@ -388,6 +476,7 @@ struct VNextCheckpointPlanManifest<'a> {
     run_id: &'a str,
     maximum_prefill_waves: usize,
     maximum_decode_waves: usize,
+    capture_product_output: bool,
     checkpoints: &'a [RetainedCompletionValue],
 }
 
@@ -406,6 +495,7 @@ struct VNextCheckpointWaveManifest<'a> {
     completion_fingerprint: &'a str,
     receipt_fingerprint: &'a str,
     records: &'a [VNextCheckpointArtifactRecord],
+    product_outputs: &'a [VNextCheckpointProductOutputRecord],
 }
 
 fn prepare_empty_output_directory(path: &Path) -> Result<()> {
@@ -463,6 +553,25 @@ fn checkpoint_file_stem(
     )
 }
 
+fn product_output_file_stem(
+    claim: VNextCheckpointClaim,
+    participant_index: u32,
+    output_mode: VNextCheckpointProductOutputMode,
+) -> String {
+    let kind_prefix = match claim.kind {
+        VNextCheckpointWaveKind::Prefill => "",
+        VNextCheckpointWaveKind::Decode => "decode-",
+    };
+    let mode = match output_mode {
+        VNextCheckpointProductOutputMode::FullLogits => "full-logits",
+        VNextCheckpointProductOutputMode::GreedyToken => "greedy-token",
+    };
+    format!(
+        "{kind_prefix}product-output-{:04}-participant-{participant_index:04}-{mode}",
+        claim.capture_index
+    )
+}
+
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -491,6 +600,7 @@ mod tests {
             checkpoints: Vec::new(),
             maximum_prefill_waves,
             maximum_decode_waves,
+            capture_product_output: false,
             next_prefill_wave: AtomicUsize::new(0),
             next_decode_wave: AtomicUsize::new(0),
             armed: AtomicBool::new(false),
@@ -518,6 +628,7 @@ mod tests {
             value_ids: vec!["value.z".to_owned(), "value.a".to_owned()],
             maximum_prefill_waves: 2,
             maximum_decode_waves: 64,
+            capture_product_output: false,
         };
         let selection = VNextCheckpointSelection::from_config(Some(&config))
             .unwrap()
@@ -547,6 +658,30 @@ mod tests {
             ..zero_waves
         };
         assert!(VNextCheckpointSelection::from_config(Some(&excessive_decode_waves)).is_err());
+    }
+
+    #[test]
+    fn product_output_only_capture_does_not_change_compile_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = VNextCheckpointCaptureConfig {
+            output_dir: directory.path().join("capture"),
+            value_ids: Vec::new(),
+            maximum_prefill_waves: 1,
+            maximum_decode_waves: 64,
+            capture_product_output: true,
+        };
+        let selection = VNextCheckpointSelection::from_config(Some(&config))
+            .unwrap()
+            .unwrap();
+        let mut options =
+            ProgramPlanCompileOptions::new(std::collections::BTreeMap::new()).unwrap();
+        let unchanged = options.clone();
+
+        selection.retain_in(&mut options);
+
+        assert_eq!(options, unchanged);
+        assert!(selection.value_ids.is_empty());
+        assert!(selection.capture_product_output);
     }
 
     #[test]
@@ -591,6 +726,10 @@ mod tests {
         assert_ne!(
             checkpoint_file_stem(prefill, 0, &value_id),
             checkpoint_file_stem(decode, 0, &value_id)
+        );
+        assert_ne!(
+            product_output_file_stem(prefill, 0, VNextCheckpointProductOutputMode::FullLogits),
+            product_output_file_stem(decode, 0, VNextCheckpointProductOutputMode::FullLogits)
         );
     }
 

@@ -53,6 +53,10 @@ pub struct VNextCheckpointCaptureConfig {
     pub maximum_prefill_waves: usize,
     #[serde(default)]
     pub maximum_decode_waves: usize,
+    /// Persist the product output that the executor already reads back. Unlike
+    /// `value_ids`, this does not retain an activation or alter memory planning.
+    #[serde(default)]
+    pub capture_product_output: bool,
 }
 
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
@@ -906,6 +910,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(capture.maximum_decode_waves, 0);
+        assert!(!capture.capture_product_output);
     }
 
     #[test]
