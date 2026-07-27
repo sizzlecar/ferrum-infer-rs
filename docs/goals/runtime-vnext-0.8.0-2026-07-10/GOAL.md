@@ -4,7 +4,9 @@
 
 Open。创建于 2026-07-10。
 
-截至 2026-07-28 的当前 clean HEAD 为
+截至 2026-07-28，最新已验证 clean source checkpoint 为
+`9b318ea9aa66e7a2c28348d6149a0bc925d146c6`；该提交只修改 G07
+构建/验证基础设施，当前产品 runtime 代码基线仍是
 `7ae12059f4d8fa37ee5ba7c28c97198b2d0d7bf4`。正式 G00-G10 PASS 仍为
 `0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前有效的 M2 CUDA
 correctness 进度为 `404/703`：canonical runner 的第 `405` 个 case `c13-022`
@@ -41,6 +43,20 @@ LTO 边界超时，均未产出可执行二进制，因此没有形成 A/B 结�
 收敛到 G07：先提供与正式 feature/产品语义相同、但不被完整 native 重编或 release LTO
 阻塞的 correctness 开发构建路径，并证明可运行 binary 和 semantic plan hash；禁止再用
 付费 GPU 重复等待相同编译失败。
+
+clean source `9b318ea9` 已完成该路径的 source checkpoint：新增与正式 CUDA features
+一致的 `cuda-correctness` profile、内容寻址 native artifact cache、跨 profile 的显式
+import、bounded binary build，以及独立的真实 execution-trace semantic validator。cache
+key 绑定 source/header SHA256、SM、CUDA headers、`nvcc`/host compiler/archiver version、
+`TARGET/HOST` 和影响 nvcc 的 ambient flags；paged-attention 漏记的
+`quant_utils_stub.cuh` 也已进入 invalidation closure。构建阶段只能打印
+`FERRUM CUDA CORRECTNESS BINARY READY`，不能形成 PASS；只有 build/execution/focused
+三份 manifest 的 source 与 binary SHA256 一致，并且实际 `ferrum serve` trace 中所有
+`vnext.plan_built` hash 精确等于
+`54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`，
+validator 才能打印 semantic trace PASS。该 source checkpoint 的本地聚焦测试已通过，
+但远端 CUDA binary-ready、semantic trace 和 exact `c13-022` 仍未运行，因此 correctness
+进度仍是 `404/703`，G07A/G08B 均保持 Open。
 
 当前只保留 RTX 4090 实例 `45897840`，已确认
 `cur_state=stopped`、`actual_status=exited`，没有 paid/transitional sibling。下一次
