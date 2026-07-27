@@ -4,26 +4,51 @@
 
 Open。创建于 2026-07-10。
 
-截至 2026-07-26 的当前 clean HEAD 为
-`277309dda27f8b2f83f630695637017d5dad8390`。正式 G00-G10 PASS 仍为
-`0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前 M2 CUDA
-correctness artifact
-`/workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-matrix-277309dd-20260726T1410Z`
-在 canonical 703-case runner 中完成 `404` 个 PASS 后，于第 `405` 个 case
-`c13-022` 以 `c13-contract-violation` 停止：请求携带 calculator tool call 和 tool
-result `21`，产品响应却要求用户提供算式。该结果是当前产品正确性 blocker，不是正式
-PASS，也不能由 2026-07-23 的 stale `6fa8e215` 703/703 artifact 替代。相同当前 SHA
-已经在独立 focused lane 和 canonical lane 中分别证明 C09 `60/60`，canonical C12
-也为 `40/40`；C09/C12 不再是当前 blocker。
+截至 2026-07-28 的当前 clean HEAD 为
+`7ae12059f4d8fa37ee5ba7c28c97198b2d0d7bf4`。正式 G00-G10 PASS 仍为
+`0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前有效的 M2 CUDA
+correctness 进度为 `404/703`：canonical runner 的第 `405` 个 case `c13-022`
+仍以 `c13-contract-violation` 停止，后续 `298` 个 case 尚未执行，不能记为失败。
+请求已携带 calculator tool call 和 tool result `21`，产品响应却要求用户提供算式。
+该结果是当前产品正确性 blocker，不是正式 PASS，也不能由 2026-07-23 的 stale
+`6fa8e215` 703/703 artifact 替代。C09 `60/60` 和 C12 `40/40` 已在前置
+current-SHA focused/canonical evidence 中关闭，不再是当前 blocker。
 
-两台 retained RTX 4090 实例 `45319871`、`45897840` 均已确认
-`cur_state=stopped`、`actual_status=exited`，当前没有 paid/transitional sibling。
-在下一次 paid CUDA work 之前只允许完成 C13 的 source/artifact 证据链：比较旧/新
-rendered prompt identity 和首个分叉 logit/token，先以本地 prompt contract 证伪
-history/template 丢失，再决定 product composition 或数值执行修复。禁止输出过滤、模型名
-特判、降低 C13 oracle 或直接重跑完整 703。修复后的执行顺序固定为 exact replay
-`c13-022`、C13 affected-contract、尚未执行的 C13-C16/C18/C20 suffix scenarios，
-最后只运行一次 canonical 703 和 `vnext-g08b-cuda` validator。
+`7ae12059` 已修复 MoE pair alignment 的跨运行顺序漂移。相同 clean source、相同
+binary SHA256
+`0a9c825fe70fc45b721554f9561ffe32d3a2166f80f6e5af1588e8d33a25285c`
+的四次真实 CUDA prefill capture 在 embedding、layer-0 attention、layer-0 output 和
+full logits 四个边界均为 `unique_count=1`，证明当前产品执行在这些观察点已可重复；
+它不证明 C13 语义正确。随后 exact `c13-022` 仍打印 focused diagnostic REJECT，
+错误为 `did not incorporate the tool result`。两个 artifact 已在 GitHub branch
+`artifact/runtime-vnext-c13-7ae12059-20260728` commit `cf3ee553` 保存；determinism
+archive SHA256 为
+`39f3be353dd17253cf57eb73a75ad928aae81fd23f8cdd5162953e5f6e56d9ab`，
+exact REJECT archive SHA256 为
+`f190007d828c95bbe98822d3344985754dba2fd5caf4c2e43dd0827884b16910`。
+
+source/artifact audit 已证伪 rendered prompt、tool history、template/source hash、seed
+传播、reusable execution 和 checkpoint/product readback 竞争是当前缺失 `21` 的直接原因。
+旧 `6fa8e215` 使用 nondeterministic atomic MoE ordering，因此其单次 C13 PASS 不能作为
+bitwise oracle。对 batch-1 finite/unique top-k route 的 host 枚举也证明 direct 和 generic
+Marlin metadata 在 consumed prefix 等价；非有限 router logits 的 duplicate route 仍需
+独立 invariant/test，但没有证据表明它解释当前请求。当前首要未决边界是 decode 期间的
+数值/token 分叉，而不是产品输入丢失。
+
+本轮尝试构建“旧基线 + deterministic alignment”和“当前源码强制 generic MoE”两个
+诊断二进制，分别在 `720s + 360s` 的 native compile continuation 和 `360s` 的 release
+LTO 边界超时，均未产出可执行二进制，因此没有形成 A/B 结论。该结果把下一步前置条件
+收敛到 G07：先提供与正式 feature/产品语义相同、但不被完整 native 重编或 release LTO
+阻塞的 correctness 开发构建路径，并证明可运行 binary 和 semantic plan hash；禁止再用
+付费 GPU 重复等待相同编译失败。
+
+当前只保留 RTX 4090 实例 `45897840`，已确认
+`cur_state=stopped`、`actual_status=exited`，没有 paid/transitional sibling。下一次
+paid CUDA work 必须先有本地/plan-only 构建证据和明确的单变量预测，只运行 exact
+`c13-022`。修复后的执行顺序固定为 exact replay `c13-022`、C13
+affected-contract、尚未执行的 C13-C16/C18/C20 suffix scenarios，最后只运行一次
+canonical 703 和 `vnext-g08b-cuda` validator。禁止输出过滤、模型名特判、降低 C13
+oracle 或因单个失败重跑完整 703。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
