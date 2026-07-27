@@ -123,7 +123,14 @@ runner 从当前实际 CUDA catalog 和三个主模型的 resolved plans 计算 
 coverage registry 完整性，不能打印硬件 PASS。真实 CUDA runner/validator 的唯一 PASS 行是：
 
 ```text
+python3 scripts/release/run_gate.py vnext-cuda-determinism \
+  --cuda-determinism-artifact-root <runner_artifact> \
+  --out <out_dir>
+```
+
+```text
 FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: <out_dir>
+FERRUM GATE vnext-cuda-determinism PASS: <out_dir>
 ```
 
 validator 必须拒绝以下 mutation：

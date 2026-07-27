@@ -39,6 +39,9 @@ RUNTIME_VNEXT_NUMERICAL_TOLERANCES = (
 RUNTIME_VNEXT_CHECKPOINT_ARTIFACT = (
     REPO_ROOT / "scripts/release/runtime_vnext_checkpoint_artifact.py"
 )
+RUNTIME_VNEXT_CUDA_DETERMINISM = (
+    REPO_ROOT / "scripts/release/runtime_vnext_cuda_determinism.py"
+)
 QWEN35_GGUF_LINEAR_ATTENTION_REFERENCE = (
     REPO_ROOT / "scripts/release/qwen35_gguf_linear_attention_reference.py"
 )
@@ -517,6 +520,17 @@ def test_runtime_vnext_checkpoint_artifact_selftest() -> None:
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require(
         "RUNTIME VNEXT CHECKPOINT ARTIFACT SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_cuda_determinism_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_CUDA_DETERMINISM), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT CUDA DETERMINISM SELF-TEST PASS" in ok.stdout,
         ok.stdout,
     )
 
@@ -1003,6 +1017,7 @@ def main() -> int:
     test_runtime_vnext_g01a_checkpoint_selftest()
     test_runtime_vnext_numerical_tolerances_selftest()
     test_runtime_vnext_checkpoint_artifact_selftest()
+    test_runtime_vnext_cuda_determinism_selftest()
     test_qwen35_gguf_linear_attention_reference_selftest()
     test_qwen35_gguf_full_attention_reference_selftest()
     test_qwen35_gguf_model_reference_selftest()
