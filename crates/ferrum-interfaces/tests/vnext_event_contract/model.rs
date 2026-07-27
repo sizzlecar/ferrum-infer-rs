@@ -253,6 +253,7 @@ pub(crate) fn catalog() -> CapabilityCatalog {
         operation.id.clone(),
         operation.fingerprint().unwrap(),
         sha('c'),
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
         ContractVersion::new(1, 0),
         device_id.clone(),
         capabilities.clone(),
@@ -329,6 +330,7 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         None,
     )
     .unwrap()

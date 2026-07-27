@@ -169,6 +169,7 @@ impl PlanNodeResolution {
                 .collect(),
             required_weight_formats,
             required_quantization_formats,
+            policy.execution_determinism_requirement(),
         )?;
         let report = catalog.provider_compatibility(compatibility_request)?;
         report.require_compatible_for_node(&catalog.device().id, &program_node.id)?;

@@ -4,6 +4,7 @@ use super::{
     PreparedModelFamily, ReusableExecutionPolicy, Serialize, TrustedExecutionWeightPlan,
     VNextError,
 };
+use crate::vnext::ExecutionDeterminismRequirement;
 
 /// Typed policy selected before planning. Memory capacity is part of the
 /// public policy contract so a plan cannot depend on an undocumented env var.
@@ -26,6 +27,10 @@ pub trait RuntimePolicy:
     /// not installed capacity: admission still evaluates the exact step shape
     /// against then-live backing before any provider work is encoded.
     fn maximum_scheduled_tokens(&self) -> u64;
+
+    /// Minimum repeatability and reusable-execution equivalence that every
+    /// selected operation provider must prove.
+    fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement;
 
     /// Ordered, non-empty allowlist used by planning after intersecting every
     /// selected provider requirement with the concrete runtime offers.

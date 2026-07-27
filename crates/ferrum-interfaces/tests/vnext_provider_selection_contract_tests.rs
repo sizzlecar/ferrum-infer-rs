@@ -25,6 +25,68 @@ fn provider_implementation_fingerprint_is_plan_hashed_and_revalidated() {
 }
 
 #[test]
+fn provider_execution_semantics_are_plan_hashed_and_revalidated() {
+    let fixture = plan_fixture(0);
+    let original_hash = fixture.plan.plan_hash().as_str().to_owned();
+    let mut value = serde_json::to_value(&fixture.plan).unwrap();
+    assert_eq!(
+        value["payload"]["nodes"][0]["provider_execution_semantics"],
+        serde_json::to_value(ProviderExecutionSemantics::bitwise_eager_and_replay()).unwrap()
+    );
+    value["payload"]["nodes"][0]["provider_execution_semantics"] =
+        serde_json::to_value(ProviderExecutionSemantics::bitwise_eager_only()).unwrap();
+    rehash_plan_json(&mut value);
+    assert_ne!(value["plan_hash"], json!(original_hash));
+    assert!(ExecutionPlan::from_json_validated(
+        &serde_json::to_vec(&value).unwrap(),
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        fixture.node_resolutions.clone(),
+    )
+    .is_err());
+}
+
+#[test]
+fn replay_requirement_rejects_eager_only_provider_with_typed_evidence() {
+    let catalog = catalog_with_memory_and_execution_semantics(
+        1 << 20,
+        ProviderExecutionSemantics::bitwise_eager_only(),
+    );
+    let operation = catalog.operation(&id("operation.main")).unwrap();
+    let report = catalog
+        .provider_compatibility(
+            ProviderCompatibilityRequest::new(
+                operation.id.clone(),
+                ContractVersion::new(1, 0),
+                BTreeSet::new(),
+                BTreeSet::from([id("weight-format.dense")]),
+                BTreeSet::new(),
+                ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert!(report.compatible_provider_ids().is_empty());
+    assert!(matches!(
+        report.rejected()[0].reasons.as_slice(),
+        [ProviderCompatibilityRejectReason::InsufficientExecutionDeterminism {
+            required: ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+            available,
+        }] if *available == ProviderExecutionSemantics::bitwise_eager_only()
+    ));
+}
+
+#[test]
+fn provider_execution_semantics_fingerprint_is_self_validating() {
+    let mut value =
+        serde_json::to_value(ProviderExecutionSemantics::bitwise_eager_and_replay()).unwrap();
+    value["contract_fingerprint"] = json!(sha('0'));
+    assert!(serde_json::from_value::<ProviderExecutionSemantics>(value).is_err());
+}
+
+#[test]
 fn planning_registry_missing_duplicate_and_mismatched_entries_fail_before_plan() {
     let family = TestRegistry::new().prepare();
     let catalog = catalog();
@@ -109,6 +171,7 @@ fn planning_registry_missing_duplicate_and_mismatched_entries_fail_before_plan()
         descriptor.operation_id().clone(),
         descriptor.operation_fingerprint(),
         descriptor.provider_implementation_fingerprint(),
+        descriptor.execution_semantics(),
         descriptor.version(),
         descriptor.device_id().clone(),
         descriptor.capabilities().clone(),
@@ -149,6 +212,7 @@ fn planning_registry_missing_duplicate_and_mismatched_entries_fail_before_plan()
         descriptor.operation_id().clone(),
         descriptor.operation_fingerprint(),
         sha('0'),
+        descriptor.execution_semantics(),
         descriptor.version(),
         descriptor.device_id().clone(),
         descriptor.capabilities().clone(),

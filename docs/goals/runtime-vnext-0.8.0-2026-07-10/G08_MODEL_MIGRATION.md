@@ -59,7 +59,7 @@ M1 用于证明 dense hybrid 不被错误绑定到 MoE。仅 config probe 或 to
 - support contract 和 README row 指向 vNext artifact。
 
 此外，G02 historical corpus 必须在 vNext production mutation/revert-to-bug 上达到
-`15/15 family` 和 `M/M concrete case` kill；仅复用 G02 synthetic analyzer fixture 不算完成。
+`16/16 family` 和 `M/M concrete case` kill；仅复用 G02 synthetic analyzer fixture 不算完成。
 
 G08 的 `performance smoke` 统一为低成本 diagnostic：random `64 input / 32 output`、c=1 和该
 backend 最高 required client concurrency、`--fail-on-error --seed 9271 --n-repeats 3`、每 repeat

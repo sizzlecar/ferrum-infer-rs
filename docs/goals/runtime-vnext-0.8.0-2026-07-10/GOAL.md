@@ -358,6 +358,8 @@ HTTP/SSE 的 I/O 适配，不得各自解析模型 alias、能力、默认值、
 | release binary 中 legacy executor/factory/runtime | `0` |
 | silent fallback / silent default success | `0` |
 | 未声明 sunset 的 compatibility adapter | `0` |
+| 声明 replay-equivalent 但没有当前 provider/binary 的 CUDA 数值证明 | `0` |
+| 用 graph inventory、最终文本或 tolerance 代替同实现 bitwise 证明 | `0` |
 
 必须通过四个扩展演练：
 
@@ -368,6 +370,37 @@ HTTP/SSE 的 I/O 适配，不得各自解析模型 alias、能力、默认值、
 3. 新增 reference backend，模型生产代码改动为 `0`。
 4. 注入 unsupported capability、kernel failure、资源泄漏和坏输出，单个 artifact 必须给出
    request、plan node、operation、phase、资源状态和 first failure event。
+
+### 6.1 CUDA vNext 确定性执行边界
+
+CUDA reusable execution 不是单纯的性能开关。provider 一旦声明
+`bitwise_eager_equivalent`，该声明必须贯穿 provider descriptor、policy selection、plan hash、
+compiled wave identity、runtime binding、receipt/event/profile 和发布证据，任何层都不能推断、
+补默认值或静默降级。
+
+在同一 immutable plan/provider/runtime/device binding 下，给定完全相同的逻辑输入、显式 RNG、
+初始 KV/recurrent state 和已初始化 workspace，以下三组结果必须逐字节相同：
+
+1. eager A 与 eager B；
+2. replay A 与 replay B；
+3. eager witness 与 replay witness。
+
+比较集合必须包含每个 plan node 的全部 declared outputs，以及所有 `Write`/`ReadWrite`
+`PlanStateEffect` 的 post-state；只比较最终 token、文本、logits 摘要、graph 数量或 executable
+inventory 均不合格。scratch 使用至少两个确定性 poison pattern 后仍必须产生相同 witness，
+从而暴露未初始化读取。该 bitwise 门只证明同实现执行语义；CPU/FP32/reference parity 继续使用
+G03 tolerance catalog，两类门互不替代。
+
+统一 child gate 为：
+
+```text
+FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: <out_dir>
+```
+
+它由 `run_gate.py` 注册，必须在 M1/M2/M3 CUDA correctness matrix、CUDA performance 和 G10
+release candidate gate 之前通过。任一 mismatch 立即停止 expensive matrix，保存 first differing
+provider/node/value/state、byte offset、两侧 SHA256 和执行路径；修复后先复跑 exact case，再跑
+affected provider/shape，直到下一冻结点才允许完整矩阵。
 
 ## 7. 正确性总标准
 
@@ -394,6 +427,9 @@ synthetic fixture 代替：
 - natural EOS、custom stop、`max_tokens`、context limit、cancel、timeout 全部通过。
 - Qwen3.5 默认 thinking 与 `enable_thinking=false` 硬切换、Qwen3 的硬/软 thinking 切换、
   content/final/history 隔离均按 [`MODEL_MATRIX.md`](MODEL_MATRIX.md) 分别验证。
+- 所有 CUDA model plan 中被选择且声明 replay-equivalent 的 provider，必须由当前
+  provider implementation fingerprint、plan hash 和 binary SHA256 绑定的 CUDA determinism
+  artifact 覆盖；coverage `100%`，waiver/skip `0`。
 - panic、OOM、resource leak、串话、`<unk>`、`[PAD]`、U+FFFD、mojibake、特殊 token
   泄漏、missing/duplicate DONE 均为 `0`。
 - CUDA client c=1/4/16/32、Metal client c=1/4/16 marker/checksum 隔离全部正确；每 cell
@@ -562,6 +598,10 @@ G00F -> S0A contract/test structural split
 
 S1 -> G07A in parallel with S2/S3
 per-model G00M -> corresponding legacy deletion/parity claim
+G02 determinism evidence + G03 provider execution contract
+  -> CUDA determinism gate
+  -> per-model CUDA correctness matrix
+  -> CUDA performance
 G00P + G06 + G07 + G08 -> S6/G09-dev
   -> G10A-release-freeze
   -> G08-RC + G09-RC

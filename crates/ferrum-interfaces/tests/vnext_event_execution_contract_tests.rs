@@ -3,6 +3,24 @@ mod vnext_event_contract;
 use vnext_event_contract::*;
 
 #[test]
+fn trusted_event_topology_binds_provider_execution_semantics() {
+    let runtime_catalog = catalog();
+    let operation_registry = make_operation_registry(&runtime_catalog);
+    let plan = execution_plan("execution-semantics", &operation_registry);
+    let topology = TrustedExecutionTopology::from_plan(&plan).unwrap();
+
+    for node in plan.payload().nodes() {
+        assert_eq!(
+            topology
+                .node(node.id())
+                .expect("plan node must remain in trusted topology")
+                .provider_execution_semantics(),
+            node.provider_execution_semantics()
+        );
+    }
+}
+
+#[test]
 fn vnext_event_execution_contract() {
     const EXPECTED_CASES: usize = 54;
     let mut passed = 0_usize;

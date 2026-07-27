@@ -38,6 +38,32 @@ provider、negative fixture 和 live model consumer，planner/runtime 主循环�
 - provider 错误必须保留 operation/node/request identity。
 - CPU oracle 默认 FP32；量化 op 保存 dequant/reference 和误差预算来源。
 - CUDA 与 Metal 可使用不同 kernel，但消费相同 semantic fixture。
+- provider 必须声明版本化 execution semantics：同 runtime repeatability，以及是否承诺
+  bitwise eager/replay equivalence；缺字段、未知版本或 fingerprint 不一致均 fail-closed。
+- policy 的 determinism requirement 参与 provider compatibility；要求 replay equivalence 时，
+  eager-only provider 必须在 plan build 前以 typed rejection 退出。
+- execution semantics 必须进入 plan hash、compiled node/wave identity、runtime binding、
+  receipt/event/profile；provider 返回的 reusable topology 不得扩大 descriptor 的声明。
+
+## Determinism Conformance
+
+同实现确定性与 CPU/reference 数值正确性是两个正交 contract：
+
+- same-runtime determinism 对 raw bytes 使用 exact equality，不读取 numerical tolerance catalog；
+- oracle parity 使用 checked-in tolerance row，不允许反向放宽 determinism；
+- replay-ineligible provider 仍必须通过 eager/eager；replay-equivalent provider 还必须通过
+  replay/replay 和 eager/replay；
+- RNG、initial state、workspace 初始化、logical input 或 immutable binding 任一不同的样本不得
+  被错误配对为 determinism case。
+
+CUDA conformance runner 必须从 live catalog 和 resolved model plans 生成 provider coverage，
+并复用 G02 定义的 artifact schema。新增 provider 或修改 implementation fingerprint 后，没有
+当前硬件 proof 时可以编译和运行 focused source tests，但 G03、对应模型 correctness、G09 和
+G10 必须保持未完成，不能依靠 descriptor 自声明形成 PASS。
+
+生产启动期的 executable inventory 检查只可命名为 preparation/inventory validation；它证明
+capture/upload/residency 没漂移，不得命名或记录为 numerical replay validation。正式数值证明
+由独立 CUDA determinism gate 给出，避免把昂贵 readback 放进默认热路径。
 
 ## Qwen3.5 重点
 
@@ -68,6 +94,11 @@ Qwen3.5 Metal 的最低数值门以 MODEL_MATRIX 7.2 为准；任何更宽 row �
 - vNext model/runtime path 中未批准 backend `cfg` 为 `0`；全仓相对 G00 减少 `>=80%`
   的目标移至 G08，G03 期间新增 legacy cfg 为 `0`。
 - supported op conformance cell 通过率 `100%`。
+- same-runtime determinism coverage：所有 supported provider eager/eager `100%`；所有
+  replay-equivalent CUDA provider 的 eager/eager、replay/replay、eager/replay `100%`，
+  mismatch/waiver/skip `0`。
+- 三个主模型 CUDA resolved plans 的 replay-equivalent provider proof coverage `100%`；artifact
+  中 provider implementation fingerprint 与 plan/catalog/binary 不一致数量 `0`。
 - checked-in numerical tolerance catalog coverage `100%`，missing/ambiguous/unowned row、artifact-local
   override 和 post-hoc widening 数量均为 `0`。
 - unsupported cell 在 plan build 时 fail `100%`，进入 kernel 后才失败数量 `0`。
@@ -120,6 +151,7 @@ docs/release/runtime-vnext/0.8.0/g03-backend-ops/
   boundary-audit.json
   legacy-adapter-inventory.json
   dispatch-overhead.json
+  cuda-determinism/
 ```
 
 ```text

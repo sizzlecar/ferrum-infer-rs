@@ -17,7 +17,7 @@
 
 ## 验收
 
-- G02 historical production mutation kill `15/15 family` 且 `M/M concrete case`。
+- G02 historical production mutation kill `16/16 family` 且 `M/M concrete case`。
 - support disposition coverage `100%`，未决/waiver `0`。
 - legacy Backend adapter、decoder runner、factory、fallback、feature、hidden-env toggle 数量 `0`。
 - arch-named backend API `0`；未批准 model/engine backend cfg 相对 G00 减少 `>=80%` 且新增 `0`。

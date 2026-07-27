@@ -73,6 +73,7 @@ fn graph_catalog(alias_policy: AliasPolicy) -> CapabilityCatalog {
                     operation.id.clone(),
                     operation.fingerprint().unwrap(),
                     sha(char::from(b'1' + index as u8)),
+                    ProviderExecutionSemantics::bitwise_eager_and_replay(),
                     ContractVersion::new(1, 0),
                     device_id.clone(),
                     capabilities.clone(),
@@ -143,7 +144,7 @@ fn graph_value_binding(
     .unwrap()
 }
 
-fn graph_weight_binding(ordinal: u32) -> ResolvedValueBinding {
+fn graph_weight_binding(ordinal: u32, weight_schema: &WeightSchema) -> ResolvedValueBinding {
     ResolvedValueBinding::new(
         id("value.weight"),
         ResolvedValueRole::Input,
@@ -152,7 +153,7 @@ fn graph_weight_binding(ordinal: u32) -> ResolvedValueBinding {
         TensorAccess::Read,
         AliasPolicy::NoAlias,
         BufferUsage::Weights,
-        Some(resolved_test_weight()),
+        Some(ResolvedWeightBinding::from_schema(weight_schema, &id("weight.matrix")).unwrap()),
         ResolvedValueStorage::composite(vec![ResolvedStorageComponent::new(
             Some(id("weight.component")),
             id("resource.graph.weight"),
@@ -168,6 +169,7 @@ fn graph_weight_binding(ordinal: u32) -> ResolvedValueBinding {
 
 fn graph_node_bindings(
     node: &ProgramNode,
+    weight_schema: &WeightSchema,
     alias_policy: &AliasPolicy,
     alias_storage: GraphAliasStorage,
 ) -> Vec<ResolvedValueBinding> {
@@ -200,7 +202,7 @@ fn graph_node_bindings(
                     "resource.graph.input.1",
                     0,
                 ),
-                graph_weight_binding(2),
+                graph_weight_binding(2, weight_schema),
                 graph_value_binding(
                     "value.alias",
                     ResolvedValueRole::Output,
@@ -234,7 +236,7 @@ fn graph_node_bindings(
                 "resource.graph.input.1",
                 0,
             ),
-            graph_weight_binding(2),
+            graph_weight_binding(2, weight_schema),
             graph_value_binding(
                 "value.late",
                 ResolvedValueRole::Output,
@@ -283,7 +285,7 @@ fn graph_node_bindings(
                     "resource.graph.input.1",
                     0,
                 ),
-                graph_weight_binding(3),
+                graph_weight_binding(3, weight_schema),
                 graph_value_binding(
                     node.outputs[0].as_str(),
                     ResolvedValueRole::Output,
@@ -332,7 +334,7 @@ fn graph_plan_fixture(
             &policy,
             &planning_handle,
             node.id.clone(),
-            graph_node_bindings(node, &alias_policy, alias_storage),
+            graph_node_bindings(node, family.weight_schema(), &alias_policy, alias_storage),
             BTreeSet::new(),
             None,
         )?);
@@ -479,6 +481,101 @@ fn execution_state_read_only_nodes_remain_independent() {
             |node| node.state_effects()[0].access() == TensorAccess::Read
                 && node.dependencies().is_empty()
         ));
+}
+
+#[test]
+fn execution_determinism_witness_closes_outputs_writable_state_and_replay_providers() {
+    let fixture = graph_plan_fixture(
+        "state_chain",
+        AliasPolicy::NoAlias,
+        GraphAliasStorage::Distinct,
+    )
+    .unwrap();
+    let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
+    assert_eq!(witness_plan.plan_hash(), fixture.plan.plan_hash());
+
+    let output_witnesses = witness_plan
+        .witnesses()
+        .iter()
+        .filter(|witness| {
+            matches!(
+                witness.kind(),
+                ExecutionDeterminismWitnessKind::Output { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let state_witnesses = witness_plan
+        .witnesses()
+        .iter()
+        .filter(|witness| {
+            matches!(
+                witness.kind(),
+                ExecutionDeterminismWitnessKind::StateEffect { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(output_witnesses.len(), 4);
+    assert_eq!(state_witnesses.len(), 2);
+    assert!(state_witnesses.iter().all(|witness| {
+        matches!(
+            witness.kind(),
+            ExecutionDeterminismWitnessKind::StateEffect {
+                access: TensorAccess::ReadWrite,
+                ..
+            }
+        ) && witness.resource_id().as_str() == "resource.graph.state"
+    }));
+
+    let plan_nodes = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| (node.id(), node))
+        .collect::<BTreeMap<_, _>>();
+    assert!(witness_plan.witnesses().iter().all(|witness| {
+        let node = plan_nodes.get(witness.node_id()).unwrap();
+        witness.provider_id() == node.selection().selected_provider()
+            && witness.provider_implementation_fingerprint()
+                == node.provider_implementation_fingerprint()
+            && witness.provider_execution_contract_fingerprint()
+                == node.provider_execution_semantics().contract_fingerprint()
+    }));
+
+    let replay_requirements = witness_plan.replay_provider_requirements();
+    assert_eq!(replay_requirements.len(), 2);
+    assert!(replay_requirements
+        .iter()
+        .all(|requirement| requirement.node_ids().len() == 2));
+    assert_eq!(
+        replay_requirements
+            .iter()
+            .flat_map(|requirement| requirement.node_ids())
+            .collect::<BTreeSet<_>>(),
+        fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(PlanNode::id)
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn execution_determinism_witness_excludes_read_only_state() {
+    let fixture = graph_plan_fixture(
+        "state_read_only",
+        AliasPolicy::NoAlias,
+        GraphAliasStorage::Distinct,
+    )
+    .unwrap();
+    let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
+    assert_eq!(witness_plan.witnesses().len(), 2);
+    assert!(witness_plan.witnesses().iter().all(|witness| matches!(
+        witness.kind(),
+        ExecutionDeterminismWitnessKind::Output { .. }
+    )));
 }
 
 #[test]

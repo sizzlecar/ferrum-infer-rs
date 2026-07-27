@@ -1,8 +1,8 @@
 use super::*;
 use crate::vnext::{
     AttributeSchema, DynamicStorageAllocator, DynamicStorageView, LayoutConstraint, OracleSpec,
-    ProfilePhase, ProviderRequirement, ResourcePresenceRequirement, ResourceRequirements,
-    TensorContract,
+    ProfilePhase, ProviderExecutionSemantics, ProviderRequirement, ResourcePresenceRequirement,
+    ResourceRequirements, TensorContract,
 };
 
 #[test]
@@ -453,13 +453,14 @@ fn plan_node(id: &str, dependencies: &[&str], resources: &[&str]) -> PlanNode {
         operation_version: ContractVersion::new(1, 0),
         operation_fingerprint: "4".repeat(64),
         provider_implementation_fingerprint: "5".repeat(64),
+        provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
         required_capabilities: BTreeSet::new(),
         attributes: BTreeMap::new(),
         work: NodeWorkContract::Fixed,
         selection: ProviderSelection {
             requested_provider: None,
             selected_provider,
-            selection_reason: ProviderSelectionReason::DeterministicCompatible,
+            selection_reason: ProviderSelectionReason::CanonicalCompatible,
             rejected_providers: Vec::new(),
         },
         provider_resources,

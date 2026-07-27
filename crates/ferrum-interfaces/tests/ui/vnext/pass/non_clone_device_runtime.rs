@@ -29,6 +29,10 @@ impl RuntimePolicy for Policy {
         4
     }
 
+    fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
+    }
+
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {
         &self.dynamic_storage_profile_order
     }

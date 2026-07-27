@@ -1900,12 +1900,231 @@ pub trait OperationContract: Send + Sync {
     ) -> Result<(), VNextError>;
 }
 
+pub const PROVIDER_EXECUTION_SEMANTICS_VERSION: ContractVersion = ContractVersion::new(1, 0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProviderExecutionContractFingerprint([u8; 32]);
+
+impl ProviderExecutionContractFingerprint {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderExecutionContractFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ProviderExecutionContractFingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderExecutionContractFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if !canonical_sha256(&value) {
+            return Err(serde::de::Error::custom(
+                "provider execution contract fingerprint must be a lowercase SHA256",
+            ));
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+/// Repeatability promised for one immutable plan/provider/runtime binding.
+///
+/// Bitwise equality covers every declared output and state effect when logical
+/// inputs, explicit RNG state, initial state, and initialized workspaces are
+/// identical. Approximation against an independent oracle is a separate
+/// operation contract and cannot weaken this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExecutionRepeatability {
+    BitwiseSameRuntime,
+}
+
+impl ProviderExecutionRepeatability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BitwiseSameRuntime => "bitwise_same_runtime",
+        }
+    }
+}
+
+/// Whether a provider authorizes reusable device execution for the same
+/// immutable eager operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReplayEquivalence {
+    Ineligible,
+    BitwiseEagerEquivalent,
+}
+
+impl ProviderReplayEquivalence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ineligible => "ineligible",
+            Self::BitwiseEagerEquivalent => "bitwise_eager_equivalent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProviderExecutionSemantics {
+    contract_version: ContractVersion,
+    contract_fingerprint: ProviderExecutionContractFingerprint,
+    repeatability: ProviderExecutionRepeatability,
+    replay_equivalence: ProviderReplayEquivalence,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderExecutionSemanticsWire {
+    contract_version: ContractVersion,
+    contract_fingerprint: ProviderExecutionContractFingerprint,
+    repeatability: ProviderExecutionRepeatability,
+    replay_equivalence: ProviderReplayEquivalence,
+}
+
+impl<'de> Deserialize<'de> for ProviderExecutionSemantics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProviderExecutionSemanticsWire::deserialize(deserializer)?;
+        let semantics = Self::new(
+            wire.contract_version,
+            wire.repeatability,
+            wire.replay_equivalence,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if semantics.contract_fingerprint != wire.contract_fingerprint {
+            return Err(serde::de::Error::custom(format!(
+                "provider execution contract fingerprint mismatch: expected `{}`, actual `{}`",
+                semantics.contract_fingerprint, wire.contract_fingerprint
+            )));
+        }
+        Ok(semantics)
+    }
+}
+
+impl ProviderExecutionSemantics {
+    fn new(
+        contract_version: ContractVersion,
+        repeatability: ProviderExecutionRepeatability,
+        replay_equivalence: ProviderReplayEquivalence,
+    ) -> Result<Self, VNextError> {
+        if contract_version != PROVIDER_EXECUTION_SEMANTICS_VERSION {
+            return Err(invalid_operation(format!(
+                "provider execution semantics version {contract_version} is unsupported"
+            )));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"ferrum.runtime-vnext.provider-execution-semantics.v1\0");
+        digest.update(contract_version.major.to_le_bytes());
+        digest.update(contract_version.minor.to_le_bytes());
+        digest.update([match repeatability {
+            ProviderExecutionRepeatability::BitwiseSameRuntime => 1,
+        }]);
+        digest.update([match replay_equivalence {
+            ProviderReplayEquivalence::Ineligible => 0,
+            ProviderReplayEquivalence::BitwiseEagerEquivalent => 1,
+        }]);
+        Ok(Self {
+            contract_version,
+            contract_fingerprint: ProviderExecutionContractFingerprint(digest.finalize().into()),
+            repeatability,
+            replay_equivalence,
+        })
+    }
+
+    pub fn bitwise_eager_only() -> Self {
+        Self::new(
+            PROVIDER_EXECUTION_SEMANTICS_VERSION,
+            ProviderExecutionRepeatability::BitwiseSameRuntime,
+            ProviderReplayEquivalence::Ineligible,
+        )
+        .expect("built-in eager execution semantics are valid")
+    }
+
+    pub fn bitwise_eager_and_replay() -> Self {
+        Self::new(
+            PROVIDER_EXECUTION_SEMANTICS_VERSION,
+            ProviderExecutionRepeatability::BitwiseSameRuntime,
+            ProviderReplayEquivalence::BitwiseEagerEquivalent,
+        )
+        .expect("built-in reusable execution semantics are valid")
+    }
+
+    pub const fn contract_version(self) -> ContractVersion {
+        self.contract_version
+    }
+
+    pub const fn contract_fingerprint(self) -> ProviderExecutionContractFingerprint {
+        self.contract_fingerprint
+    }
+
+    pub const fn repeatability(self) -> ProviderExecutionRepeatability {
+        self.repeatability
+    }
+
+    pub const fn replay_equivalence(self) -> ProviderReplayEquivalence {
+        self.replay_equivalence
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDeterminismRequirement {
+    BitwiseSameRuntime,
+    BitwiseSameRuntimeWithReplay,
+}
+
+impl ExecutionDeterminismRequirement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BitwiseSameRuntime => "bitwise_same_runtime",
+            Self::BitwiseSameRuntimeWithReplay => "bitwise_same_runtime_with_replay",
+        }
+    }
+
+    pub const fn requires_replay_equivalence(self) -> bool {
+        matches!(self, Self::BitwiseSameRuntimeWithReplay)
+    }
+
+    pub fn accepts(self, semantics: ProviderExecutionSemantics) -> bool {
+        semantics.repeatability == ProviderExecutionRepeatability::BitwiseSameRuntime
+            && (!self.requires_replay_equivalence()
+                || semantics.replay_equivalence
+                    == ProviderReplayEquivalence::BitwiseEagerEquivalent)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationProviderDescriptor {
     provider_id: ProviderId,
     operation_id: OperationId,
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
+    execution_semantics: ProviderExecutionSemantics,
     version: ContractVersion,
     device_id: DeviceId,
     capabilities: BTreeSet<CapabilityId>,
@@ -1924,6 +2143,7 @@ struct OperationProviderDescriptorWire {
     operation_id: OperationId,
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
+    execution_semantics: ProviderExecutionSemantics,
     version: ContractVersion,
     device_id: DeviceId,
     capabilities: BTreeSet<CapabilityId>,
@@ -1947,6 +2167,7 @@ impl<'de> Deserialize<'de> for OperationProviderDescriptor {
             wire.operation_id,
             wire.operation_fingerprint,
             wire.provider_implementation_fingerprint,
+            wire.execution_semantics,
             wire.version,
             wire.device_id,
             wire.capabilities,
@@ -1974,6 +2195,7 @@ impl OperationProviderDescriptor {
         operation_id: OperationId,
         operation_fingerprint: impl Into<String>,
         provider_implementation_fingerprint: impl Into<String>,
+        execution_semantics: ProviderExecutionSemantics,
         version: ContractVersion,
         device_id: DeviceId,
         capabilities: BTreeSet<CapabilityId>,
@@ -2014,6 +2236,7 @@ impl OperationProviderDescriptor {
             operation_id,
             operation_fingerprint,
             provider_implementation_fingerprint,
+            execution_semantics,
             version,
             device_id,
             capabilities,
@@ -2040,6 +2263,10 @@ impl OperationProviderDescriptor {
 
     pub fn provider_implementation_fingerprint(&self) -> &str {
         &self.provider_implementation_fingerprint
+    }
+
+    pub const fn execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.execution_semantics
     }
 
     pub fn version(&self) -> ContractVersion {
@@ -2177,6 +2404,7 @@ pub struct ProviderCompatibilityRequest {
     required_capabilities: BTreeSet<CapabilityId>,
     required_weight_formats: BTreeSet<WeightFormatId>,
     required_quantization_formats: BTreeSet<QuantizationFormatId>,
+    execution_determinism: ExecutionDeterminismRequirement,
 }
 
 #[derive(Deserialize)]
@@ -2187,6 +2415,7 @@ struct ProviderCompatibilityRequestWire {
     required_capabilities: BTreeSet<CapabilityId>,
     required_weight_formats: BTreeSet<WeightFormatId>,
     required_quantization_formats: BTreeSet<QuantizationFormatId>,
+    execution_determinism: ExecutionDeterminismRequirement,
 }
 
 impl<'de> Deserialize<'de> for ProviderCompatibilityRequest {
@@ -2201,6 +2430,7 @@ impl<'de> Deserialize<'de> for ProviderCompatibilityRequest {
             wire.required_capabilities,
             wire.required_weight_formats,
             wire.required_quantization_formats,
+            wire.execution_determinism,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -2213,6 +2443,7 @@ impl ProviderCompatibilityRequest {
         required_capabilities: BTreeSet<CapabilityId>,
         required_weight_formats: BTreeSet<WeightFormatId>,
         required_quantization_formats: BTreeSet<QuantizationFormatId>,
+        execution_determinism: ExecutionDeterminismRequirement,
     ) -> Result<Self, VNextError> {
         if required_version.major == 0 {
             return Err(invalid_operation(
@@ -2225,6 +2456,7 @@ impl ProviderCompatibilityRequest {
             required_capabilities,
             required_weight_formats,
             required_quantization_formats,
+            execution_determinism,
         })
     }
 
@@ -2247,6 +2479,10 @@ impl ProviderCompatibilityRequest {
     pub fn required_quantization_formats(&self) -> &BTreeSet<QuantizationFormatId> {
         &self.required_quantization_formats
     }
+
+    pub const fn execution_determinism(&self) -> ExecutionDeterminismRequirement {
+        self.execution_determinism
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2268,6 +2504,10 @@ pub enum ProviderCompatibilityRejectReason {
     },
     UnsupportedQuantizationFormats {
         formats: BTreeSet<QuantizationFormatId>,
+    },
+    InsufficientExecutionDeterminism {
+        required: ExecutionDeterminismRequirement,
+        available: ProviderExecutionSemantics,
     },
 }
 
@@ -3273,6 +3513,7 @@ pub struct BatchOperationNodeIdentity {
     node_id: NodeId,
     operation_id: OperationId,
     provider_id: ProviderId,
+    provider_execution_semantics: ProviderExecutionSemantics,
     work_shape_fingerprint: String,
     participants: Vec<BatchOperationParticipantIdentity>,
     fingerprint: String,
@@ -3284,6 +3525,7 @@ impl BatchOperationNodeIdentity {
         node_id: NodeId,
         operation_id: OperationId,
         provider_id: ProviderId,
+        provider_execution_semantics: ProviderExecutionSemantics,
         work_shape_fingerprint: String,
         participants: Vec<BatchOperationParticipantIdentity>,
     ) -> Result<Self, VNextError> {
@@ -3317,6 +3559,7 @@ impl BatchOperationNodeIdentity {
             node_id: &'a NodeId,
             operation_id: &'a OperationId,
             provider_id: &'a ProviderId,
+            provider_execution_semantics: ProviderExecutionSemantics,
             work_shape_fingerprint: &'a str,
             participants: &'a [BatchOperationParticipantIdentity],
         }
@@ -3327,6 +3570,7 @@ impl BatchOperationNodeIdentity {
                 node_id: &node_id,
                 operation_id: &operation_id,
                 provider_id: &provider_id,
+                provider_execution_semantics,
                 work_shape_fingerprint: &work_shape_fingerprint,
                 participants: &participants,
             },
@@ -3337,6 +3581,7 @@ impl BatchOperationNodeIdentity {
             node_id,
             operation_id,
             provider_id,
+            provider_execution_semantics,
             work_shape_fingerprint,
             participants,
             fingerprint,
@@ -3357,6 +3602,10 @@ impl BatchOperationNodeIdentity {
 
     pub fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    pub const fn provider_execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.provider_execution_semantics
     }
 
     pub fn work_shape_fingerprint(&self) -> &str {
@@ -3802,6 +4051,7 @@ mod batch_operation_identity_fingerprint_tests {
             node_id: NodeId::new(format!("node.{index}")).unwrap(),
             operation_id: OperationId::new(format!("operation.{index}")).unwrap(),
             provider_id: ProviderId::new(format!("provider.{index}")).unwrap(),
+            provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
             work_shape_fingerprint: std::iter::repeat_n(marker, 64).collect(),
             participants: Vec::new(),
             fingerprint: std::iter::repeat_n(marker, 64).collect(),
@@ -4118,6 +4368,7 @@ impl PreparedOperationDispatchBinding {
             || provider.operation_fingerprint() != node.operation_fingerprint()
             || provider.provider_implementation_fingerprint()
                 != node.provider_implementation_fingerprint()
+            || provider.execution_semantics() != node.provider_execution_semantics()
             || provider.device_id() != plan.payload().device_id()
             || !provider.version().satisfies(node.operation_version())
         {
@@ -5836,6 +6087,7 @@ impl OperationDispatch {
             node.id().clone(),
             node.operation_id().clone(),
             node.selection().selected_provider().clone(),
+            node.provider_execution_semantics(),
             resources.work_shape()?.fingerprint().to_owned(),
             participant_projections,
         )
@@ -6067,10 +6319,29 @@ impl OperationDispatch {
                 wave.claimed_backing(),
                 wave.step_resources().backing_slices(),
             )?;
-            let topology = match provider.provider().reusable_execution_topology(request)? {
-                ReusableExecutionTopology::Static => continue,
-                ReusableExecutionTopology::Dynamic(topology) => topology,
-                ReusableExecutionTopology::Ineligible => return Ok(None),
+            let declared = node.provider_execution_semantics().replay_equivalence();
+            let topology = match (
+                declared,
+                provider.provider().reusable_execution_topology(request)?,
+            ) {
+                (
+                    ProviderReplayEquivalence::BitwiseEagerEquivalent,
+                    ReusableExecutionTopology::Static,
+                ) => continue,
+                (
+                    ProviderReplayEquivalence::BitwiseEagerEquivalent,
+                    ReusableExecutionTopology::Dynamic(topology),
+                ) => topology,
+                (_, ReusableExecutionTopology::Ineligible) => return Ok(None),
+                (
+                    ProviderReplayEquivalence::Ineligible,
+                    ReusableExecutionTopology::Static | ReusableExecutionTopology::Dynamic(_),
+                ) => {
+                    return Err(invalid_operation(format!(
+                        "provider `{}` returned reusable topology without a bitwise eager-equivalence contract",
+                        provider.descriptor().provider_id()
+                    )))
+                }
             };
             let node_index = u32::try_from(node_index)
                 .map_err(|_| invalid_operation("reusable topology node index exceeds u32"))?;
@@ -8359,6 +8630,17 @@ impl CapabilityCatalog {
                 reasons.push(
                     ProviderCompatibilityRejectReason::UnsupportedQuantizationFormats {
                         formats: missing_quantization_formats,
+                    },
+                );
+            }
+            if !request
+                .execution_determinism
+                .accepts(provider.execution_semantics)
+            {
+                reasons.push(
+                    ProviderCompatibilityRejectReason::InsufficientExecutionDeterminism {
+                        required: request.execution_determinism,
+                        available: provider.execution_semantics,
                     },
                 );
             }

@@ -6,6 +6,7 @@ use super::{
     ProviderSelection, ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding,
     ResourceId, RetainedCompletionValue, SemanticValue, Serialize, WeightFormatId,
 };
+use crate::vnext::ProviderExecutionSemantics;
 
 /// Per-node trusted physical resolution. It supplies physical bindings and a
 /// provider estimator result, but cannot provide memory totals, compatibility
@@ -183,6 +184,7 @@ pub struct UnvalidatedPlanNode {
     pub(super) operation_version: ContractVersion,
     pub(super) operation_fingerprint: String,
     pub(super) provider_implementation_fingerprint: String,
+    pub(super) provider_execution_semantics: ProviderExecutionSemantics,
     pub(super) required_capabilities: BTreeSet<CapabilityId>,
     pub(super) attributes: BTreeMap<AttributeId, SemanticValue>,
     pub(super) work: NodeWorkContract,

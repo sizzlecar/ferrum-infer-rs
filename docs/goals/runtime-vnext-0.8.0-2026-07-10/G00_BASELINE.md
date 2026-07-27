@@ -43,7 +43,7 @@
    进程中的 `FERRUM_*`。完整 sanitized env、argv、PID/PGID 和 process start identity 写入 receipt。
 5. 运行 same-host vLLM 与 llama.cpp 外部基线。
 6. 固化 Qwen3-Coder empty-answer、run/serve config drift、UTF-8、graph key、资源 rollback 等
-   historical bug inputs；为 G02 H01-H15 的每个 concrete case 写 evidence ref，并冻结总数 `M`。
+   historical bug inputs；为 G02 H01-H16 的每个 concrete case 写 evidence ref，并冻结总数 `M`。
 7. 测量 CUDA no-op、Rust model leaf、runtime leaf、core PTX、Marlin TU、clean release
    六种构建场景；model/runtime leaf 必须分开，避免掩盖不同失效域。
 8. 生成 current dependency/coupling inventory：trait methods、arch-named APIs、cfg branches、
@@ -134,7 +134,7 @@ G08/G10。该区分不降低最终目标，只防止基线阶段要求未来功�
   拒绝省略 env、只保存 `NO_COLOR` 或 receipt/env SHA 不一致的 artifact。
 - 代码 inventory 覆盖 `crates/` 和 product/release scripts `100%`。
 - inventory 中路径、内容 SHA256、symbol allowlist 和分类字段完整率 `100%`；未裁决分类数 `0`。
-- historical bug family `15/15` 有 source commit/artifact 和最小 reproducer；concrete case
+- historical bug family `16/16` 有 source commit/artifact 和最小 reproducer；concrete case
   evidence 完整率 `M/M`，orphan/重复 case `0`。
 - 不修改冻结 legacy product binary 或核心推理行为；benchmark client/runner 的纯证据增强必须
   独立提交并冻结 collector source/tree/binary SHA。任何改变 `run`/`serve` 推理结果的修复都必须

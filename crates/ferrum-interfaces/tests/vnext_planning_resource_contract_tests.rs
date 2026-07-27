@@ -19,6 +19,7 @@ fn operation_resource_contract_requires_explicit_presence_and_alignment() {
         operation().id,
         operation().fingerprint().unwrap(),
         sha('f'),
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
         ContractVersion::new(1, 0),
         id("device.reference.0"),
         BTreeSet::new(),
@@ -43,6 +44,7 @@ fn operation_resource_contract_requires_explicit_presence_and_alignment() {
         operation().id,
         operation().fingerprint().unwrap(),
         "not-a-sha256",
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
         ContractVersion::new(1, 0),
         id("device.reference.0"),
         BTreeSet::new(),
@@ -205,6 +207,7 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         Some(reusable_execution),
     )
     .unwrap();

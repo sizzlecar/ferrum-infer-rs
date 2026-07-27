@@ -228,6 +228,16 @@ impl VNextExecutorConfig {
             maximum_model_tokens,
             &reusable_execution_prefill_token_counts,
         )?);
+        let execution_determinism = if engine.backend.enable_reusable_execution
+            && descriptor
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID)
+        {
+            ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
+        } else {
+            ExecutionDeterminismRequirement::BitwiseSameRuntime
+        };
 
         let runtime_policy = ResolvedRuntimePolicy::new(
             POLICY_ID,
@@ -248,6 +258,7 @@ impl VNextExecutorConfig {
                 allow_defer: true,
                 cancellation_check_interval_steps: DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS,
             },
+            execution_determinism,
             reusable_execution_policy,
         )
         .map_err(|error| FerrumError::config(format!("invalid vNext policy: {error}")))?;
@@ -441,7 +452,7 @@ struct VNextReusableExecutionStartupReport {
     synthetic_sequences: usize,
     eager_warmup_waves: usize,
     capture_waves: usize,
-    replay_validation_waves: usize,
+    replay_inventory_check_waves: usize,
     prepared_programs: usize,
     device_preparation: DeviceReusableExecutionPreparation,
     elapsed_ms: u64,
@@ -3502,7 +3513,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 synthetic_sequences: 0,
                 eager_warmup_waves: 0,
                 capture_waves: 0,
-                replay_validation_waves: 0,
+                replay_inventory_check_waves: 0,
                 prepared_programs: 0,
                 device_preparation: DeviceReusableExecutionPreparation::unsupported(),
                 elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -3600,7 +3611,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &mut resources,
                     &input_tensor,
                     width,
-                    "replay validation",
+                    "replay inventory check",
                 )
                 .await?;
             }
@@ -3617,7 +3628,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             || !reusable_executable_inventory_matches(captured, replayed)
         {
             return Err(FerrumError::device(format!(
-                "vNext replay validation compiled or changed executable state: before={captured:?}, after={replayed:?}"
+                "vNext replay inventory check compiled or changed executable state: before={captured:?}, after={replayed:?}"
             )));
         }
 
@@ -3742,7 +3753,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             synthetic_sequences,
             eager_warmup_waves: prepared_wave_shapes * REUSABLE_EXECUTION_WARMUP_PASSES,
             capture_waves: prepared_wave_shapes * REUSABLE_EXECUTION_CAPTURE_PASSES,
-            replay_validation_waves: prepared_wave_shapes
+            replay_inventory_check_waves: prepared_wave_shapes
                 * REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
             prepared_programs,
             device_preparation,
