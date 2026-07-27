@@ -889,7 +889,7 @@ pub(crate) enum TestCommand {
     DynamicBinding,
     ResultBinding,
     Copy,
-    Upload(u8),
+    Upload(u8, BufferUsage),
     Zero,
 }
 
@@ -1158,7 +1158,7 @@ impl DeviceRuntime for TestRuntime {
         &self,
         source: &[u8],
         _source_layout: HostTransferLayout,
-        _destination: &Self::Buffer,
+        destination: &Self::Buffer,
         _destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
         self.trace
@@ -1166,7 +1166,10 @@ impl DeviceRuntime for TestRuntime {
             .unwrap()
             .uploaded_payloads
             .push(source.to_vec());
-        Ok(TestCommand::Upload(source.first().copied().unwrap_or(0)))
+        Ok(TestCommand::Upload(
+            source.first().copied().unwrap_or(0),
+            destination.descriptor.usage,
+        ))
     }
 
     fn encode_zero(
@@ -1243,28 +1246,52 @@ impl DeviceRuntime for TestRuntime {
                 .iter()
                 .enumerate()
                 .filter_map(|(command_index, entry)| {
-                    let (native_op_id, compute_dispatch_count, transfer_command_count) =
-                        match entry.command() {
-                            TestCommand::Provider => ("test_provider", 1, 0),
-                            TestCommand::ScratchProvider => ("test_scratch_provider", 1, 0),
-                            TestCommand::ReusableExecution => ("test_reusable_execution", 1, 0),
-                            TestCommand::ProgramBinding => ("test_program_binding", 0, 1),
-                            TestCommand::CoalescedProgramBinding => {
-                                ("test_coalesced_program_binding", 0, 1)
-                            }
-                            TestCommand::DynamicBinding => ("test_dynamic_binding", 0, 1),
-                            TestCommand::ResultBinding => ("test_result_binding", 0, 1),
-                            TestCommand::Copy => ("test_copy", 0, 1),
-                            TestCommand::Upload(_) => ("test_upload", 0, 1),
-                            TestCommand::Zero => ("test_zero", 0, 1),
-                        };
+                    let (
+                        native_op_id,
+                        execution_path,
+                        compute_dispatch_count,
+                        transfer_command_count,
+                    ) = match entry.command() {
+                        TestCommand::Provider => {
+                            ("test_provider", DeviceExecutionPath::Eager, 1, 0)
+                        }
+                        TestCommand::ScratchProvider => {
+                            ("test_scratch_provider", DeviceExecutionPath::Eager, 1, 0)
+                        }
+                        TestCommand::ReusableExecution => (
+                            "test_reusable_execution",
+                            DeviceExecutionPath::Replayed,
+                            1,
+                            0,
+                        ),
+                        TestCommand::ProgramBinding => {
+                            ("test_program_binding", DeviceExecutionPath::Eager, 0, 1)
+                        }
+                        TestCommand::CoalescedProgramBinding => (
+                            "test_coalesced_program_binding",
+                            DeviceExecutionPath::Eager,
+                            0,
+                            1,
+                        ),
+                        TestCommand::DynamicBinding => {
+                            ("test_dynamic_binding", DeviceExecutionPath::Eager, 0, 1)
+                        }
+                        TestCommand::ResultBinding => {
+                            ("test_result_binding", DeviceExecutionPath::Eager, 0, 1)
+                        }
+                        TestCommand::Copy => ("test_copy", DeviceExecutionPath::Eager, 0, 1),
+                        TestCommand::Upload(_, _) => {
+                            ("test_upload", DeviceExecutionPath::Eager, 0, 1)
+                        }
+                        TestCommand::Zero => ("test_zero", DeviceExecutionPath::Eager, 0, 1),
+                    };
                     let logical_work = entry.logical_work();
                     DeviceNativeWorkAttribution::new(
                         u32::try_from(command_index).ok()?,
                         entry.node_index(),
                         entry.phase(),
                         native_op_id,
-                        DeviceExecutionPath::Eager,
+                        execution_path,
                         logical_work
                             .map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
                         logical_work.map_or(u32::from(entry.node_index().is_some()), |work| {
@@ -1289,9 +1316,10 @@ impl DeviceRuntime for TestRuntime {
                     (DeviceCommandPhase::Initialization, TestCommand::Zero) => {
                         Some((node_index, 0, false))
                     }
-                    (DeviceCommandPhase::Initialization, TestCommand::Upload(value)) => {
-                        Some((node_index, *value, false))
-                    }
+                    (
+                        DeviceCommandPhase::Initialization,
+                        TestCommand::Upload(value, BufferUsage::Scratch),
+                    ) => Some((node_index, *value, false)),
                     (_, TestCommand::ScratchProvider) => Some((node_index, 0xa5, true)),
                     _ => None,
                 }

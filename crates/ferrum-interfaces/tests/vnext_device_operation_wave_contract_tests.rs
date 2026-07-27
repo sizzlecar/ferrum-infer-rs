@@ -100,6 +100,26 @@ fn wave_active_bindings(
     vec![active]
 }
 
+fn determinism_restore(plan: &ExecutionPlan, fill_byte: u8) -> SubmissionWaveDeterminismRestore {
+    let witness_plan = plan.determinism_witness_plan().unwrap();
+    assert!(
+        !witness_plan.initializations().is_empty(),
+        "determinism fixture must have at least one typed initialization"
+    );
+    let payloads = witness_plan
+        .initializations()
+        .iter()
+        .map(|initialization| {
+            vec![
+                fill_byte;
+                usize::try_from(initialization.location().canonical_length_bytes())
+                    .expect("test initialization length fits usize")
+            ]
+        })
+        .collect();
+    SubmissionWaveDeterminismRestore::new(&witness_plan, vec![payloads]).unwrap()
+}
+
 fn teardown(
     fixture: Fixture,
     sequence: Arc<AdmittedSequenceResources<TestRuntime>>,
@@ -621,6 +641,112 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
     );
     let (handle, attribution) = handle.into_parts();
     assert!(attribution.is_none());
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn determinism_eager_submission_restores_the_complete_typed_denominator() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
+    );
+    let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
+    let mut invalid_payloads = witness_plan
+        .initializations()
+        .iter()
+        .map(|initialization| {
+            vec![
+                0x31;
+                usize::try_from(initialization.location().canonical_length_bytes())
+                    .expect("test initialization length fits usize")
+            ]
+        })
+        .collect::<Vec<_>>();
+    invalid_payloads
+        .first_mut()
+        .expect("fixture has one typed initialization")
+        .pop();
+    assert!(SubmissionWaveDeterminismRestore::new(&witness_plan, vec![invalid_payloads]).is_err());
+    assert!(SubmissionWaveDeterminismRestore::new(&witness_plan, vec![Vec::new()]).is_err());
+    let restore = determinism_restore(&fixture.plan, 0x31);
+
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    let profiled = OperationDispatch::encode_and_submit_determinism_eager_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Kernel,
+        &restore,
+        0xa5,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let (handle, attribution) = profiled.into_parts();
+    let attribution = attribution.expect("determinism eager path must preserve attribution");
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        let phases = &trace.submitted_command_phases[0];
+        let first_compute = phases
+            .iter()
+            .position(|phase| *phase == DeviceCommandPhase::Compute)
+            .expect("determinism submission has provider compute");
+        assert!(phases[..first_compute]
+            .iter()
+            .all(|phase| *phase == DeviceCommandPhase::Initialization));
+        assert!(phases[first_compute..]
+            .iter()
+            .all(|phase| *phase == DeviceCommandPhase::Compute));
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::EagerOnly]
+        );
+        assert_eq!(trace.scratch_observations, vec![(0, 0xa5), (1, 0xa5)]);
+        assert!(trace
+            .uploaded_payloads
+            .iter()
+            .any(|payload| !payload.is_empty() && payload.iter().all(|byte| *byte == 0x31)));
+    }
+    let compute_rows = attribution
+        .device()
+        .commands()
+        .iter()
+        .filter(|command| command.command_phase() == DeviceCommandPhase::Compute)
+        .collect::<Vec<_>>();
+    assert_eq!(compute_rows.len(), providers.len());
+    assert!(compute_rows
+        .iter()
+        .all(|command| command.execution_path() == DeviceExecutionPath::Eager));
     assert!(matches!(
         handle.wait().unwrap(),
         CompletionObservation::Terminal(_)
@@ -1238,6 +1364,104 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
 }
 
 #[test]
+fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let restore = determinism_restore(&fixture.plan, 0x42);
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("program-binding wave has a reusable identity");
+    let node_count = u32::try_from(providers.len()).unwrap();
+    let program = DeviceReusableExecutionProgram::new(
+        program_id,
+        vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
+        (0..node_count).collect(),
+    )
+    .unwrap();
+
+    let profiled = OperationDispatch::encode_and_submit_determinism_replayed_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Replay,
+        &restore,
+        0xa5,
+        &program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let (handle, attribution) = profiled.into_parts();
+    assert!(
+        attribution.is_none(),
+        "replay timing records physical spans without kernel attribution"
+    );
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::ReplayedOnly]
+        );
+        assert!(trace
+            .uploaded_payloads
+            .iter()
+            .any(|payload| !payload.is_empty() && payload.iter().all(|byte| *byte == 0x42)));
+        let phases = &trace.submitted_command_phases[0];
+        let first_compute = phases
+            .iter()
+            .position(|phase| *phase == DeviceCommandPhase::Compute)
+            .expect("determinism replay has one compute command");
+        assert!(phases[..first_compute]
+            .iter()
+            .all(|phase| *phase != DeviceCommandPhase::Compute));
+        assert_eq!(phases[first_compute..], [DeviceCommandPhase::Compute]);
+        assert_eq!(
+            trace.submitted_commands[0][first_compute],
+            TestCommand::ReusableExecution
+        );
+    }
+    assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn reusable_topology_states_cannot_alias_resident_program_authority() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
@@ -1787,8 +2011,8 @@ fn typed_eager_policy_poison_fills_overwrite_scratch_before_compute() {
         assert_eq!(
             trace.submitted_commands,
             vec![vec![
-                TestCommand::Upload(0xa5),
-                TestCommand::Upload(0xa5),
+                TestCommand::Upload(0xa5, BufferUsage::Scratch),
+                TestCommand::Upload(0xa5, BufferUsage::Scratch),
                 TestCommand::ScratchProvider,
                 TestCommand::ScratchProvider,
             ]]
