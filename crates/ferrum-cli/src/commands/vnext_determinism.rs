@@ -1357,7 +1357,7 @@ mod cuda {
             }
             digest.update(&buffer[..read]);
         }
-        Ok(format!("{digest:x}"))
+        Ok(format!("{:x}", digest.finalize()))
     }
 
     fn write_json_exclusive(path: &Path, value: &impl Serialize) -> Result<()> {
