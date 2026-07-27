@@ -889,7 +889,7 @@ pub(crate) enum TestCommand {
     DynamicBinding,
     ResultBinding,
     Copy,
-    Upload,
+    Upload(u8),
     Zero,
 }
 
@@ -990,6 +990,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submitted_command_phases: Vec<Vec<DeviceCommandPhase>>,
     pub(crate) submitted_command_node_indices: Vec<Vec<Option<u32>>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
+    pub(crate) submitted_compute_path_requirements: Vec<DeviceComputePathRequirement>,
     pub(crate) uploaded_payloads: Vec<Vec<u8>>,
     pub(crate) submitted_reusable_captures: Vec<Option<DeviceReusableExecutionCapture>>,
     pub(crate) scratch_bytes: BTreeMap<u32, u8>,
@@ -1165,7 +1166,7 @@ impl DeviceRuntime for TestRuntime {
             .unwrap()
             .uploaded_payloads
             .push(source.to_vec());
-        Ok(TestCommand::Upload)
+        Ok(TestCommand::Upload(source.first().copied().unwrap_or(0)))
     }
 
     fn encode_zero(
@@ -1211,8 +1212,30 @@ impl DeviceRuntime for TestRuntime {
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
+        let compute_path_requirement = commands.compute_path_requirement();
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands.into_entries();
+        let mut compute_command_count = 0_usize;
+        let mut replayed_compute_command_count = 0_usize;
+        for entry in &entries {
+            if entry.phase() == DeviceCommandPhase::Compute {
+                compute_command_count += 1;
+                replayed_compute_command_count +=
+                    usize::from(*entry.command() == TestCommand::ReusableExecution);
+            }
+        }
+        let compute_path_matches = match compute_path_requirement {
+            DeviceComputePathRequirement::Adaptive => true,
+            DeviceComputePathRequirement::EagerOnly => replayed_compute_command_count == 0,
+            DeviceComputePathRequirement::ReplayedOnly => {
+                compute_command_count > 0 && replayed_compute_command_count == compute_command_count
+            }
+        };
+        if !compute_path_matches {
+            return Err(DefinitelyNotSubmitted::new(TestRuntimeError(
+                "compute-path requirement mismatch",
+            )));
+        }
         let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
         let command_node_indices = entries.iter().map(DeviceCommandEntry::node_index).collect();
         let attribution = timing_mode.kernel_attribution_enabled().then(|| {
@@ -1232,7 +1255,7 @@ impl DeviceRuntime for TestRuntime {
                             TestCommand::DynamicBinding => ("test_dynamic_binding", 0, 1),
                             TestCommand::ResultBinding => ("test_result_binding", 0, 1),
                             TestCommand::Copy => ("test_copy", 0, 1),
-                            TestCommand::Upload => ("test_upload", 0, 1),
+                            TestCommand::Upload(_) => ("test_upload", 0, 1),
                             TestCommand::Zero => ("test_zero", 0, 1),
                         };
                     let logical_work = entry.logical_work();
@@ -1262,9 +1285,14 @@ impl DeviceRuntime for TestRuntime {
             .iter()
             .filter_map(|entry| {
                 let node_index = entry.node_index()?;
-                match entry.command() {
-                    TestCommand::Zero => Some((node_index, None)),
-                    TestCommand::ScratchProvider => Some((node_index, Some(0xa5))),
+                match (entry.phase(), entry.command()) {
+                    (DeviceCommandPhase::Initialization, TestCommand::Zero) => {
+                        Some((node_index, 0, false))
+                    }
+                    (DeviceCommandPhase::Initialization, TestCommand::Upload(value)) => {
+                        Some((node_index, *value, false))
+                    }
+                    (_, TestCommand::ScratchProvider) => Some((node_index, 0xa5, true)),
                     _ => None,
                 }
             })
@@ -1284,14 +1312,15 @@ impl DeviceRuntime for TestRuntime {
                 .submitted_command_node_indices
                 .push(command_node_indices);
             trace.submitted_commands.push(commands);
-            for (node_index, provider_write) in scratch_events {
-                if let Some(provider_write) = provider_write {
+            trace
+                .submitted_compute_path_requirements
+                .push(compute_path_requirement);
+            for (node_index, value, observe_before_write) in scratch_events {
+                if observe_before_write {
                     let observed = *trace.scratch_bytes.get(&node_index).unwrap_or(&0xa5);
                     trace.scratch_observations.push((node_index, observed));
-                    trace.scratch_bytes.insert(node_index, provider_write);
-                } else {
-                    trace.scratch_bytes.insert(node_index, 0);
                 }
+                trace.scratch_bytes.insert(node_index, value);
             }
             trace
                 .submitted_reusable_captures

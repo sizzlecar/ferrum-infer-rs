@@ -654,16 +654,12 @@ pub enum StreamState {
 /// Backend timing is enabled monotonically before product requests start.
 /// `Off` must not allocate backend events or add host clock reads to the hot
 /// path; `Completion` measures only the existing submission terminal and
-/// readback boundaries; `Replay` preserves normal reusable-versus-eager path
-/// selection while measuring physical executable/eager spans; `Kernel`
+/// readback boundaries; `Replay` measures physical executable/eager spans;
+/// `Kernel`
 /// additionally attributes backend-observed physical work to immutable-plan
-/// node indices. `Verification` retains full logical/kernel attribution while
-/// requiring eager command execution so a profiler can compare reusable
-/// execution against the same compiled bindings and resource layout. It also
-/// zeroes provider scratch before every invocation, making stale-workspace
-/// dependence a directly falsifiable diagnostic. Replay and verification
-/// timing are diagnostic instrumentation and may add backend measurement
-/// events, initialization commands, or encoder boundaries.
+/// node indices. `Verification` retains full logical/kernel attribution.
+/// Execution-path selection and scratch initialization are independent typed
+/// submission policy; timing cannot silently change either one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
@@ -692,10 +688,6 @@ impl DeviceTimingMode {
     pub const fn direct_reusable_execution_allowed(self) -> bool {
         !matches!(self, Self::Kernel | Self::Verification)
     }
-
-    pub const fn executable_replay_allowed(self) -> bool {
-        !matches!(self, Self::Verification)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +704,20 @@ impl DeviceExecutionPath {
             Self::Replayed => "replayed",
         }
     }
+}
+
+/// Required compute implementation for one physical submission.
+///
+/// Initialization and dynamic/result binding commands remain eager boundaries;
+/// this requirement applies only to provider compute. Backends must reject a
+/// batch before submission when they cannot honor the requested path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceComputePathRequirement {
+    #[default]
+    Adaptive,
+    EagerOnly,
+    ReplayedOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2439,6 +2445,7 @@ impl<C> DeviceCommandEntry<C> {
 pub struct DeviceCommandBatch<C> {
     commands: Vec<DeviceCommandEntry<C>>,
     timing_mode: DeviceTimingMode,
+    compute_path_requirement: DeviceComputePathRequirement,
     reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
 }
 
@@ -2452,6 +2459,7 @@ impl<C> DeviceCommandBatch<C> {
                 command,
             }],
             timing_mode: DeviceTimingMode::Off,
+            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             reusable_execution_capture: None,
         }
     }
@@ -2460,6 +2468,7 @@ impl<C> DeviceCommandBatch<C> {
         Self {
             commands: Vec::with_capacity(capacity),
             timing_mode: DeviceTimingMode::Off,
+            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             reusable_execution_capture: None,
         }
     }
@@ -2468,6 +2477,20 @@ impl<C> DeviceCommandBatch<C> {
         Self {
             commands: Vec::with_capacity(capacity),
             timing_mode,
+            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            reusable_execution_capture: None,
+        }
+    }
+
+    pub(crate) fn with_capacity_timing_and_compute_path(
+        capacity: usize,
+        timing_mode: DeviceTimingMode,
+        compute_path_requirement: DeviceComputePathRequirement,
+    ) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+            timing_mode,
+            compute_path_requirement,
             reusable_execution_capture: None,
         }
     }
@@ -2598,6 +2621,10 @@ impl<C> DeviceCommandBatch<C> {
 
     pub const fn timing_mode(&self) -> DeviceTimingMode {
         self.timing_mode
+    }
+
+    pub const fn compute_path_requirement(&self) -> DeviceComputePathRequirement {
+        self.compute_path_requirement
     }
 
     pub fn into_commands(self) -> Vec<C> {
@@ -2859,21 +2886,29 @@ mod execution_timing_tests {
     use super::*;
 
     #[test]
-    fn replay_timing_preserves_physical_spans_without_kernel_attribution() {
+    fn timing_capabilities_are_independent_from_compute_path_requirement() {
         assert!(DeviceTimingMode::Replay.completion_enabled());
         assert!(DeviceTimingMode::Replay.physical_span_attribution_enabled());
         assert!(!DeviceTimingMode::Replay.kernel_attribution_enabled());
         assert!(DeviceTimingMode::Kernel.physical_span_attribution_enabled());
         assert!(DeviceTimingMode::Kernel.kernel_attribution_enabled());
-        assert!(DeviceTimingMode::Kernel.executable_replay_allowed());
         assert!(!DeviceTimingMode::Kernel.direct_reusable_execution_allowed());
         assert!(DeviceTimingMode::Verification.completion_enabled());
         assert!(DeviceTimingMode::Verification.physical_span_attribution_enabled());
         assert!(DeviceTimingMode::Verification.kernel_attribution_enabled());
-        assert!(!DeviceTimingMode::Verification.executable_replay_allowed());
         assert!(!DeviceTimingMode::Verification.direct_reusable_execution_allowed());
         assert!(!DeviceTimingMode::Completion.physical_span_attribution_enabled());
         assert!(!DeviceTimingMode::Off.completion_enabled());
+
+        let batch = DeviceCommandBatch::<()>::with_capacity_timing_and_compute_path(
+            1,
+            DeviceTimingMode::Replay,
+            DeviceComputePathRequirement::EagerOnly,
+        );
+        assert_eq!(
+            batch.compute_path_requirement(),
+            DeviceComputePathRequirement::EagerOnly
+        );
     }
 
     #[test]

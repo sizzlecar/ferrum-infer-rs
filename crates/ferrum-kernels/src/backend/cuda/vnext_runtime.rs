@@ -18,17 +18,18 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, D
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
     DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
-    DeviceCommandLogicalWork, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
-    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionSpanKind,
-    DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceReusableAddressScope,
-    DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
-    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionTrim, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
-    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, StreamState, VNextError,
+    DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
+    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
+    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
+    DeviceReusableAddressScope, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ProgramBindingNodeBinding, StreamState, VNextError,
 };
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
@@ -2024,6 +2025,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             ));
         }
         let timing_mode = commands.timing_mode();
+        let compute_path_requirement = commands.compute_path_requirement();
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands
             .into_entries()
@@ -2080,6 +2082,29 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let contains_direct_execution = commands
             .iter()
             .any(|command| command.reusable_execution_invocation().is_some());
+        let mut compute_command_count = 0_usize;
+        let mut direct_compute_command_count = 0_usize;
+        for (phase, command) in command_phases.iter().zip(&commands) {
+            if *phase == DeviceCommandPhase::Compute {
+                compute_command_count += 1;
+                direct_compute_command_count +=
+                    usize::from(command.reusable_execution_invocation().is_some());
+            }
+        }
+        let compute_path_matches = match compute_path_requirement {
+            DeviceComputePathRequirement::Adaptive => true,
+            DeviceComputePathRequirement::EagerOnly => direct_compute_command_count == 0,
+            DeviceComputePathRequirement::ReplayedOnly => {
+                compute_command_count > 0 && direct_compute_command_count == compute_command_count
+            }
+        };
+        if !compute_path_matches {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA compute commands do not satisfy the required execution path",
+                ),
+            ));
+        }
         if reusable_execution_capture.is_some() && contains_direct_execution {
             return Err(DefinitelyNotSubmitted::new(
                 CudaDeviceRuntimeError::contract(
@@ -2133,13 +2158,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
             }
         }
-        let executable_candidates = if timing_mode.executable_replay_allowed() {
-            match cuda_executable_candidates(&command_phases, &commands) {
-                Ok(candidates) => candidates,
-                Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+        let executable_candidates = match compute_path_requirement {
+            DeviceComputePathRequirement::Adaptive => {
+                match cuda_executable_candidates(&command_phases, &commands) {
+                    Ok(candidates) => candidates,
+                    Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+                }
             }
-        } else {
-            Vec::new()
+            DeviceComputePathRequirement::EagerOnly
+            | DeviceComputePathRequirement::ReplayedOnly => Vec::new(),
         };
         let capture_allowed = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {

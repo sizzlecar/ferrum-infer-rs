@@ -14,8 +14,8 @@ use super::{
     CanonicalRational, CapabilityId, ClaimedSubmissionWaveBacking, CompletionHandle,
     CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm, DeviceBufferRetention,
-    DeviceCommandBatch, DeviceCommandLogicalWork, DeviceId, DeviceReusableAddressScope,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceCommandBatch, DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceId,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceSubmissionAttribution,
     DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
@@ -5208,7 +5208,7 @@ fn encode_provider_workspace_initialization<R, Retry>(
     requirement: &ProviderWorkspaceRequirement,
     work: &ResourceWorkShape,
     view: &OperationBufferView<'_, R::Buffer>,
-    force_zero: bool,
+    initialization: SubmissionScratchInitialization,
     commands: &mut DeviceCommandBatch<R::Command>,
 ) -> Result<usize, OperationDispatchError<R, Retry>>
 where
@@ -5220,7 +5220,9 @@ where
             "scratch workspace cannot preserve bytes across invocations",
         )));
     }
-    if !force_zero && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse {
+    if initialization == SubmissionScratchInitialization::ProviderContract
+        && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse
+    {
         return Ok(0);
     }
 
@@ -5278,28 +5280,73 @@ where
             )));
         }
         let length_bytes = physical_range.end - physical_range.start;
-        let command = runtime
-            .encode_zero(buffer, physical_range.start, length_bytes)
-            .map_err(|error| {
-                classify_device_error(runtime, identity.clone(), &error)
-                    .map(OperationDispatchError::Initialization)
-                    .unwrap_or_else(OperationDispatchError::Contract)
-            })?;
-        commands.push_node_initialization(node_index, logical_work, command);
+        match initialization {
+            SubmissionScratchInitialization::ProviderContract
+            | SubmissionScratchInitialization::FillByte(0) => {
+                let command = runtime
+                    .encode_zero(buffer, physical_range.start, length_bytes)
+                    .map_err(|error| {
+                        classify_device_error(runtime, identity.clone(), &error)
+                            .map(OperationDispatchError::Initialization)
+                            .unwrap_or_else(OperationDispatchError::Contract)
+                    })?;
+                commands.push_node_initialization(node_index, logical_work, command);
+                command_count = command_count.checked_add(1).ok_or_else(|| {
+                    OperationDispatchError::Contract(invalid_operation(
+                        "scratch workspace initialization command count overflows usize",
+                    ))
+                })?;
+            }
+            SubmissionScratchInitialization::FillByte(value) => {
+                const FILL_CHUNK_BYTES: u64 = 1024 * 1024;
+                let chunk_len =
+                    usize::try_from(length_bytes.min(FILL_CHUNK_BYTES)).map_err(|_| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace fill chunk exceeds host address space",
+                        ))
+                    })?;
+                let fill = vec![value; chunk_len];
+                let mut offset = physical_range.start;
+                let end = physical_range.end;
+                while offset < end {
+                    let piece_bytes = (end - offset).min(FILL_CHUNK_BYTES);
+                    let piece_len = usize::try_from(piece_bytes).map_err(|_| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace fill piece exceeds host address space",
+                        ))
+                    })?;
+                    let layout = HostTransferLayout::new(ElementType::U8, piece_bytes)
+                        .map_err(OperationDispatchError::Contract)?;
+                    let command = runtime
+                        .encode_upload(&fill[..piece_len], layout, buffer, offset)
+                        .map_err(|error| {
+                            classify_device_error(runtime, identity.clone(), &error)
+                                .map(OperationDispatchError::Initialization)
+                                .unwrap_or_else(OperationDispatchError::Contract)
+                        })?;
+                    commands.push_node_initialization(node_index, logical_work, command);
+                    command_count = command_count.checked_add(1).ok_or_else(|| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace initialization command count overflows usize",
+                        ))
+                    })?;
+                    offset = offset.checked_add(piece_bytes).ok_or_else(|| {
+                        OperationDispatchError::Contract(invalid_operation(
+                            "scratch workspace fill offset overflows u64",
+                        ))
+                    })?;
+                }
+            }
+        }
         encoded_bytes = encoded_bytes.checked_add(length_bytes).ok_or_else(|| {
             OperationDispatchError::Contract(invalid_operation(
-                "scratch workspace zero byte count overflows u64",
-            ))
-        })?;
-        command_count = command_count.checked_add(1).ok_or_else(|| {
-            OperationDispatchError::Contract(invalid_operation(
-                "scratch workspace zero command count overflows usize",
+                "scratch workspace initialization byte count overflows u64",
             ))
         })?;
     }
     if encoded_bytes != required_bytes {
         return Err(OperationDispatchError::Contract(invalid_operation(
-            "scratch workspace zero commands do not cover the logical workspace",
+            "scratch workspace initialization commands do not cover the logical workspace",
         )));
     }
     Ok(command_count)
@@ -5309,7 +5356,7 @@ fn encode_submission_wave_workspace_initializations<R>(
     runtime: &R,
     resolved: &dyn ExecutablePlanView,
     batch_identity: &BatchOperationIdentity,
-    timing_mode: DeviceTimingMode,
+    scratch_initialization: SubmissionScratchInitialization,
     completion: &super::CompletionReservation<R>,
     commands: &mut DeviceCommandBatch<R::Command>,
 ) -> Result<usize, SubmissionWaveDispatchError<R>>
@@ -5322,7 +5369,6 @@ where
             "workspace initialization topology differs from the prepared wave",
         )));
     }
-    let force_zero = matches!(timing_mode, DeviceTimingMode::Verification);
     let mut command_count = 0_usize;
     for (node_index, prepared_node) in completion.wave().nodes().iter().enumerate() {
         let plan_node = plan_nodes
@@ -5348,7 +5394,8 @@ where
         let Some(requirement) = plan_node.provider_resources().scratch() else {
             continue;
         };
-        if !force_zero && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse
+        if scratch_initialization == SubmissionScratchInitialization::ProviderContract
+            && requirement.reuse_policy() != ProviderWorkspaceReusePolicy::ZeroBeforeUse
         {
             continue;
         }
@@ -5392,7 +5439,7 @@ where
             requirement,
             prepared_node.work_shape().resource_work(),
             &view,
-            force_zero,
+            scratch_initialization,
             commands,
         )?;
         command_count = command_count.checked_add(encoded).ok_or_else(|| {
@@ -5736,6 +5783,67 @@ where
                 completion.slot_id().get()
             ),
         }
+    }
+}
+
+/// Scratch bytes presented to every provider invocation in one submission.
+/// `ProviderContract` preserves the selected provider's declared reuse policy;
+/// explicit fill patterns are diagnostic proof inputs and are encoded before
+/// compute outside reusable executable capture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionScratchInitialization {
+    #[default]
+    ProviderContract,
+    FillByte(u8),
+}
+
+/// Core-owned execution controls independent from timing instrumentation.
+///
+/// Determinism gates use the strict constructors. Product requests use
+/// `adaptive`, allowing the runtime to select a compatible eager or resident
+/// path without changing provider semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionExecutionPolicy {
+    compute_path: DeviceComputePathRequirement,
+    scratch_initialization: SubmissionScratchInitialization,
+}
+
+impl SubmissionExecutionPolicy {
+    pub const fn adaptive() -> Self {
+        Self {
+            compute_path: DeviceComputePathRequirement::Adaptive,
+            scratch_initialization: SubmissionScratchInitialization::ProviderContract,
+        }
+    }
+
+    pub const fn determinism_eager(scratch_fill: u8) -> Self {
+        Self {
+            compute_path: DeviceComputePathRequirement::EagerOnly,
+            scratch_initialization: SubmissionScratchInitialization::FillByte(scratch_fill),
+        }
+    }
+
+    pub const fn determinism_replayed(scratch_fill: u8) -> Self {
+        Self {
+            compute_path: DeviceComputePathRequirement::ReplayedOnly,
+            scratch_initialization: SubmissionScratchInitialization::FillByte(scratch_fill),
+        }
+    }
+
+    pub const fn compute_path(self) -> DeviceComputePathRequirement {
+        self.compute_path
+    }
+
+    pub const fn scratch_initialization(self) -> SubmissionScratchInitialization {
+        self.scratch_initialization
+    }
+}
+
+impl Default for SubmissionExecutionPolicy {
+    fn default() -> Self {
+        Self::adaptive()
     }
 }
 
@@ -6454,7 +6562,7 @@ impl OperationDispatch {
                 requirement,
                 invocation.work_shape().resource_work(),
                 scratch_view,
-                false,
+                SubmissionScratchInitialization::ProviderContract,
                 &mut commands,
             )?;
         }
@@ -6579,6 +6687,41 @@ impl OperationDispatch {
             active_bindings,
             timing_mode,
             input_uploads,
+            SubmissionExecutionPolicy::adaptive(),
+            None,
+            &DisabledSubmissionWaveDispatchTimingSink,
+            wave,
+            lane,
+            reaper,
+        )
+        .map(|profiled| profiled.into_parts().0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_inputs_and_policy<'binding, R, I>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -6599,6 +6742,7 @@ impl OperationDispatch {
         active_bindings: I,
         timing_mode: DeviceTimingMode,
         input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
         timing_sink: &S,
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -6616,6 +6760,7 @@ impl OperationDispatch {
             active_bindings,
             timing_mode,
             input_uploads,
+            execution_policy,
             None,
             timing_sink,
             wave,
@@ -6648,6 +6793,42 @@ impl OperationDispatch {
             active_bindings,
             timing_mode,
             input_uploads,
+            SubmissionExecutionPolicy::adaptive(),
+            Some(reusable_program),
+            &DisabledSubmissionWaveDispatchTimingSink,
+            wave,
+            lane,
+            reaper,
+        )
+        .map(|profiled| profiled.into_parts().0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_reusable_wave_with_inputs_and_policy<'binding, R, I>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: &DeviceReusableExecutionProgram,
+        execution_policy: SubmissionExecutionPolicy,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
             Some(reusable_program),
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -6666,6 +6847,7 @@ impl OperationDispatch {
         timing_mode: DeviceTimingMode,
         input_uploads: &[SubmissionWaveInputUpload],
         reusable_program: &DeviceReusableExecutionProgram,
+        execution_policy: SubmissionExecutionPolicy,
         timing_sink: &S,
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -6683,6 +6865,7 @@ impl OperationDispatch {
             active_bindings,
             timing_mode,
             input_uploads,
+            execution_policy,
             Some(reusable_program),
             timing_sink,
             wave,
@@ -6699,6 +6882,7 @@ impl OperationDispatch {
         active_bindings: I,
         timing_mode: DeviceTimingMode,
         input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
         timing_sink: &S,
         mut wave: PreparedStepSubmissionWave<R>,
@@ -6768,9 +6952,11 @@ impl OperationDispatch {
             Self::reusable_execution_program_id_for_wave(providers, resolved, &wave, lane)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
         if let Some(reusable_program) = reusable_program {
-            if !timing_mode.direct_reusable_execution_allowed() {
+            if !timing_mode.direct_reusable_execution_allowed()
+                || execution_policy.compute_path() == DeviceComputePathRequirement::EagerOnly
+            {
                 return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "kernel attribution or verification requires full logical provider encoding",
+                    "submission timing or compute-path policy requires eager provider encoding",
                 )));
             }
             let actual_program_id = reusable_execution_program_id.as_ref().ok_or_else(|| {
@@ -6789,6 +6975,10 @@ impl OperationDispatch {
                     "reusable execution program differs from the exact wave topology",
                 )));
             }
+        } else if execution_policy.compute_path() == DeviceComputePathRequirement::ReplayedOnly {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "replayed-only submission requires one sealed reusable execution program",
+            )));
         }
         wave.begin_dispatch()
             .map_err(SubmissionWaveDispatchError::Contract)?;
@@ -6807,9 +6997,10 @@ impl OperationDispatch {
             timing_sink,
             SubmissionWaveDispatchStage::BackingAndInputEncode,
         );
-        let mut commands = DeviceCommandBatch::with_capacity_and_timing(
+        let mut commands = DeviceCommandBatch::with_capacity_timing_and_compute_path(
             providers.len().saturating_add(input_uploads.len()),
             timing_mode,
+            execution_policy.compute_path(),
         );
         let backing_initialization_command_count = completion
             .encode_backing_initializations(runtime, &mut commands)
@@ -6819,7 +7010,7 @@ impl OperationDispatch {
                 runtime,
                 resolved,
                 batch_identity,
-                timing_mode,
+                execution_policy.scratch_initialization(),
                 &completion,
                 &mut commands,
             )?;

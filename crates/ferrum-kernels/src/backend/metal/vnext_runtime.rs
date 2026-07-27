@@ -17,15 +17,15 @@ use std::time::Instant;
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
-    DeviceCommandExecutionTiming, DeviceCommandLogicalWork, DeviceCommandPhase, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    RetainedHostMemoryRegion, StaticWeightImportSession, StreamState, VNextError,
-    WeightComponentPayload,
+    DeviceCommandExecutionTiming, DeviceCommandLogicalWork, DeviceCommandPhase,
+    DeviceComputePathRequirement, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
+    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionTiming, DeviceId,
+    DeviceNativeWorkAttribution, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, RetainedHostMemoryRegion,
+    StaticWeightImportSession, StreamState, VNextError, WeightComponentPayload,
 };
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, BOOL, YES};
@@ -2114,6 +2114,13 @@ impl DeviceRuntime for MetalDeviceRuntime {
         S: DeviceSubmissionTimingSink,
     {
         let timing_mode = commands.timing_mode();
+        if commands.compute_path_requirement() == DeviceComputePathRequirement::ReplayedOnly {
+            return Err(DefinitelyNotSubmitted::new(
+                MetalDeviceRuntimeError::contract(
+                    "Metal cannot satisfy a replayed-only compute submission",
+                ),
+            ));
+        }
         let entries = commands
             .into_entries()
             .into_iter()

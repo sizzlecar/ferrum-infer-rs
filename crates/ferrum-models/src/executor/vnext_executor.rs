@@ -64,6 +64,18 @@ const MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES: usize = 1_024;
 
 type VNextDriver<R> = RuntimeResourceDriver<R>;
 
+const fn submission_execution_policy_for_timing(
+    timing_mode: DeviceTimingMode,
+) -> SubmissionExecutionPolicy {
+    match timing_mode {
+        DeviceTimingMode::Verification => SubmissionExecutionPolicy::determinism_eager(0),
+        DeviceTimingMode::Off
+        | DeviceTimingMode::Completion
+        | DeviceTimingMode::Replay
+        | DeviceTimingMode::Kernel => SubmissionExecutionPolicy::adaptive(),
+    }
+}
+
 const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {
     match policy {
         SequenceFitPolicy::FullInputMustFit => AdmissionFitPolicy::FullInputMustFit,
@@ -5007,6 +5019,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 phase: phase_timing,
             };
             let device_timing_mode = self.device_timing_mode();
+            let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
             let mut reusable_catalog_miss = false;
             let mut reusable_catalog_epoch_miss = false;
             let reusable_program = if !device_timing_mode.direct_reusable_execution_allowed()
@@ -5072,6 +5085,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             device_timing_mode,
                             &uploads,
                             reusable_program,
+                            execution_policy,
                             &timing_sink,
                             wave,
                             &self.lane,
@@ -5101,6 +5115,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         active_bindings(),
                         device_timing_mode,
                         &uploads,
+                        execution_policy,
                         &timing_sink,
                         wave,
                         &self.lane,
@@ -7484,23 +7499,42 @@ mod tests {
         normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
         product_token_mask_key, reported_allocated_bytes, resolve_reusable_execution_policy,
         resolved_sequence_fit_policy, reusable_executable_inventory_matches,
-        reusable_execution_requires_eager_fallback, token_mask_upload_required, AdmissionFitPolicy,
-        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics,
-        VNextProductOutputMode, VNextProductTokenMaskKey, VNextReusableExecutionDescriptor,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
-        VNextWaveTimingSink,
+        reusable_execution_requires_eager_fallback, submission_execution_policy_for_timing,
+        token_mask_upload_required, AdmissionFitPolicy, DecodeFailureDisposition, FerrumError,
+        SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
+        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
         GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
     };
     use ferrum_interfaces::vnext::{
-        CompletionReadbackBatchObservation, DeviceExecutionInterval, DeviceExecutionIntervalKind,
-        DeviceExecutionSpanKind, DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-        DeviceReusableExecutionPreparation, DeviceSubmissionExecutionSpan,
-        DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTimingMeasurement,
-        StepResourceAdmissionProfilePhase,
+        CompletionReadbackBatchObservation, DeviceComputePathRequirement, DeviceExecutionInterval,
+        DeviceExecutionIntervalKind, DeviceExecutionSpanKind, DeviceReusableExecutionObservation,
+        DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+        DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink,
+        DeviceTimingMeasurement, DeviceTimingMode, StepResourceAdmissionProfilePhase,
     };
+
+    #[test]
+    fn verification_timing_selects_typed_eager_submission_without_owning_other_paths() {
+        assert_eq!(
+            submission_execution_policy_for_timing(DeviceTimingMode::Verification).compute_path(),
+            DeviceComputePathRequirement::EagerOnly
+        );
+        for timing_mode in [
+            DeviceTimingMode::Off,
+            DeviceTimingMode::Completion,
+            DeviceTimingMode::Replay,
+            DeviceTimingMode::Kernel,
+        ] {
+            assert_eq!(
+                submission_execution_policy_for_timing(timing_mode).compute_path(),
+                DeviceComputePathRequirement::Adaptive
+            );
+        }
+    }
 
     #[test]
     fn nonterminal_completion_message_preserves_typed_failure_class() {
