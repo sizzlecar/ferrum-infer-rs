@@ -15,7 +15,7 @@ use ferrum_types::{FerrumError, ResponseFormat, Result, StructuredOutputStart, T
 use llguidance::{
     api::TopLevelGrammar,
     toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenizerEnv},
-    Matcher, ParserFactory,
+    JsonCompileOptions, Matcher, ParserFactory,
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -201,6 +201,7 @@ impl StructuredOutputFactory {
                 })?
             }
         };
+        let schema = compact_json_schema(schema)?;
         let grammar_key = serde_json::to_string(&schema).map_err(|error| {
             FerrumError::invalid_request(format!("serialize structured-output schema: {error}"))
         })?;
@@ -295,6 +296,28 @@ impl StructuredOutputFactory {
             budget,
         }))
     }
+}
+
+fn compact_json_schema(schema: serde_json::Value) -> Result<serde_json::Value> {
+    let mut schema = match schema {
+        schema @ serde_json::Value::Object(_) => schema,
+        schema @ serde_json::Value::Bool(_) => json!({"allOf": [schema]}),
+        _ => {
+            return Err(FerrumError::invalid_request(
+                "response_format.schema must be a JSON Schema object or boolean",
+            ));
+        }
+    };
+
+    // x-guidance is an llguidance compiler extension, not a JSON Schema
+    // constraint. Keep compiler policy owned by Ferrum so a request cannot
+    // re-enable an unbounded whitespace loop or change JSON separators.
+    JsonCompileOptions {
+        whitespace_flexible: false,
+        ..JsonCompileOptions::default()
+    }
+    .apply_to(&mut schema);
+    Ok(schema)
 }
 
 /// Per-request structured-output parser state.
@@ -970,6 +993,27 @@ mod tests {
     }
 
     #[test]
+    fn json_object_uses_compact_separators_without_unbounded_whitespace() {
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let generated = vec![TokenId::new(b'{' as u32)];
+        let mut logits = vec![0.0; EOS as usize + 1];
+        processor.mask_logits(&mut logits, &generated).unwrap();
+
+        assert!(!logits[b' ' as usize].is_finite());
+        assert!(logits[b'}' as usize].is_finite());
+        assert!(logits[b'"' as usize].is_finite());
+    }
+
+    #[test]
     fn undefined_model_vocab_ids_are_masked_inside_wildcard_strings() {
         let tokenizer = Arc::new(ByteTokenizer::new());
         let undefined_token = tokenizer.vocab_size() as u32;
@@ -1046,6 +1090,57 @@ mod tests {
             .unwrap();
         let mut generated = Vec::new();
         assert_and_append(&processor, &mut generated, r#"{"answer":42}"#);
+        assert!(processor.is_accepting(&generated).unwrap());
+    }
+
+    #[test]
+    fn request_cannot_override_compact_json_compiler_policy() {
+        let schema = r#"{
+            "type":"object",
+            "properties":{"answer":{"const":42}},
+            "required":["answer"],
+            "additionalProperties":false,
+            "x-guidance":{
+                "item_separator":", ",
+                "key_separator":": ",
+                "whitespace_flexible":true
+            }
+        }"#;
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonSchema(schema.to_string()),
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated = Vec::new();
+        assert_and_append(&processor, &mut generated, r#"{"answer":"#);
+        let mut logits = vec![0.0; EOS as usize + 1];
+        processor.mask_logits(&mut logits, &generated).unwrap();
+
+        assert!(!logits[b' ' as usize].is_finite());
+        assert!(logits[b'4' as usize].is_finite());
+        assert_and_append(&processor, &mut generated, "42}");
+        assert!(processor.is_accepting(&generated).unwrap());
+    }
+
+    #[test]
+    fn boolean_json_schema_keeps_its_semantics_under_compact_policy() {
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonSchema("true".to_string()),
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated = Vec::new();
+        assert_and_append(&processor, &mut generated, "true");
         assert!(processor.is_accepting(&generated).unwrap());
     }
 
