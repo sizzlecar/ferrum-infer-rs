@@ -29,3 +29,4 @@ pub mod stop;
 pub mod transcribe;
 pub mod tts;
 pub mod vnext_checkpoint;
+pub mod vnext_determinism;

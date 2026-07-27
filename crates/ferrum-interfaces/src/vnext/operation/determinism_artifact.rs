@@ -16,6 +16,20 @@ pub struct SubmissionWaveDeterminismArtifactInitializationIdentity {
     initial_state_sha256: String,
 }
 
+impl SubmissionWaveDeterminismArtifactInitializationIdentity {
+    pub fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+
+    pub fn rng_sha256(&self) -> &str {
+        &self.rng_sha256
+    }
+
+    pub fn initial_state_sha256(&self) -> &str {
+        &self.initial_state_sha256
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubmissionWaveDeterminismArtifactPhysicalCommand {
     command_index: u32,
@@ -73,6 +87,48 @@ pub struct SubmissionWaveDeterminismArtifactWitness {
     raw_sha256: String,
 }
 
+impl SubmissionWaveDeterminismArtifactWitness {
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn semantic_id(&self) -> &str {
+        &self.semantic_id
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
+    pub fn access(&self) -> &str {
+        &self.access
+    }
+
+    pub const fn participant_index(&self) -> u32 {
+        self.participant_index
+    }
+
+    pub const fn logical_offset_bytes(&self) -> u64 {
+        self.logical_offset_bytes
+    }
+
+    pub const fn length_bytes(&self) -> u64 {
+        self.length_bytes
+    }
+
+    pub fn element_type(&self) -> &str {
+        &self.element_type
+    }
+
+    pub fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubmissionWaveDeterminismArtifactExecution {
     execution_id: String,
@@ -83,6 +139,34 @@ pub struct SubmissionWaveDeterminismArtifactExecution {
     receipt_fingerprint: String,
     attribution: SubmissionWaveDeterminismArtifactAttribution,
     witnesses: Vec<SubmissionWaveDeterminismArtifactWitness>,
+}
+
+impl SubmissionWaveDeterminismArtifactExecution {
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    pub fn restore_sha256(&self) -> &str {
+        &self.restore_sha256
+    }
+
+    pub const fn initialization_identity(
+        &self,
+    ) -> &SubmissionWaveDeterminismArtifactInitializationIdentity {
+        &self.initialization_identity
+    }
+
+    pub fn witnesses(&self) -> &[SubmissionWaveDeterminismArtifactWitness] {
+        &self.witnesses
+    }
+
+    pub fn replayed_segments(&self) -> &[SubmissionWaveDeterminismArtifactReplayedSegment] {
+        &self.attribution.replayed_segments
+    }
 }
 
 impl SubmissionWaveDeterminismEvidence {
