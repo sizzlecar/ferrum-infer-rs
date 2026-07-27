@@ -11,6 +11,7 @@ use ferrum_interfaces::vnext::{
     ModelFamilyRegistry, ModelSourceKind, OriginalModelSource, OriginalModelSources,
     PreparedModelFamily, ProgramNode, SemanticValue, StateCapacityDemand, StateLifetime,
     TypedFamilyRegistration, WeightComponentSource, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    ROUTED_SWIGLU_MOE_OPERATION_ID,
 };
 use ferrum_types::{
     DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelType, MoeCapabilities,
@@ -19,6 +20,7 @@ use serde_json::Value;
 
 mod hf_metadata;
 pub mod qwen35;
+pub mod qwen3_moe;
 pub mod source;
 mod weight_layout;
 
@@ -41,17 +43,27 @@ struct ModelLoaderRegistration {
     create_family_registration: CreateFamilyRegistration,
 }
 
-const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
-    external_metadata_ids: &[
-        qwen35::EXTERNAL_METADATA_ID,
-        qwen35::MOE_EXTERNAL_METADATA_ID,
-    ],
-    gguf_architectures: &["qwen35", "qwen35moe"],
-    execution_kind: ProductionExecutionKind::CausalLanguage,
-    validate_semantic_config: qwen35::validate_semantic_config,
-    prepare: qwen35::prepare_from_sources,
-    create_family_registration: qwen35_family_registration,
-}];
+const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
+    ModelLoaderRegistration {
+        external_metadata_ids: &[
+            qwen35::EXTERNAL_METADATA_ID,
+            qwen35::MOE_EXTERNAL_METADATA_ID,
+        ],
+        gguf_architectures: &["qwen35", "qwen35moe"],
+        execution_kind: ProductionExecutionKind::CausalLanguage,
+        validate_semantic_config: qwen35::validate_semantic_config,
+        prepare: qwen35::prepare_from_sources,
+        create_family_registration: qwen35_family_registration,
+    },
+    ModelLoaderRegistration {
+        external_metadata_ids: &[qwen3_moe::EXTERNAL_METADATA_ID],
+        gguf_architectures: &[],
+        execution_kind: ProductionExecutionKind::CausalLanguage,
+        validate_semantic_config: qwen3_moe::validate_semantic_config,
+        prepare: qwen3_moe::prepare_from_sources,
+        create_family_registration: qwen3_moe::family_registration,
+    },
+];
 
 /// Returns whether a GGUF architecture belongs to a family whose product
 /// execution has migrated to vNext. Direct files for these architectures must
@@ -112,9 +124,6 @@ const LEGACY_MODELS: &[LegacyModelRegistration] = &[
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen3ForCausalLM",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.Qwen3MoeForCausalLM",
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Gemma3ForCausalLM",
@@ -473,7 +482,12 @@ fn moe_capabilities_from_program(
         .blocks()
         .iter()
         .flat_map(|block| &block.nodes)
-        .filter(|node| node.operation_id.as_str() == ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID)
+        .filter(|node| {
+            matches!(
+                node.operation_id.as_str(),
+                ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID | ROUTED_SWIGLU_MOE_OPERATION_ID
+            )
+        })
     {
         let current = MoeCapabilities {
             num_experts: required_positive_node_attribute(node, "expert_count")?,
@@ -897,6 +911,15 @@ mod tests {
             .resolve_external(&moe_metadata)
             .unwrap();
         assert_eq!(moe_registration.family_id().as_str(), qwen35::FAMILY_ID);
+        let qwen3_moe_metadata =
+            ExternalModelMetadataId::new(qwen3_moe::EXTERNAL_METADATA_ID).unwrap();
+        let qwen3_moe_registration = (&registry as &dyn ModelFamilyRegistry)
+            .resolve_external(&qwen3_moe_metadata)
+            .unwrap();
+        assert_eq!(
+            qwen3_moe_registration.family_id().as_str(),
+            qwen3_moe::FAMILY_ID
+        );
     }
 
     #[test]
@@ -915,6 +938,25 @@ mod tests {
         assert_eq!(
             registration.external_metadata_id().as_str(),
             qwen35::MOE_EXTERNAL_METADATA_ID
+        );
+    }
+
+    #[test]
+    fn qwen3_moe_metadata_resolves_to_vnext_product_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            r#"{"architectures":["Qwen3MoeForCausalLM"]}"#,
+        )
+        .unwrap();
+
+        let registration = resolve_registered_model_from_dir(directory.path())
+            .unwrap()
+            .into_required()
+            .unwrap();
+        assert_eq!(
+            registration.external_metadata_id().as_str(),
+            qwen3_moe::EXTERNAL_METADATA_ID
         );
     }
 
