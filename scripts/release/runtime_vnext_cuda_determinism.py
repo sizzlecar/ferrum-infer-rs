@@ -1956,16 +1956,32 @@ def validate_case(
     )
     if initial_state_kind in {"zero", "nonzero"}:
         require(state_witness, f"{label} state fixture has no state-effect witness")
+    first_execution_id = min(witness_maps)
     return {
         "case_id": case_id,
         "model_key": model_key,
         "phase": phase,
         "partition": partition,
+        "token_shape_fingerprint": structural_sha256(case["token_shape"]),
+        "dtype": case["dtype"],
+        "quantization": case["quantization"],
+        "initialization_identity": (
+            initialization["input_sha256"],
+            initialization["rng_sha256"],
+            initialization["initial_state_sha256"],
+        ),
         "initial_state_kind": initial_state_kind,
         "workspace_poison": poison,
         "target_node_coverage": target_node_coverage,
+        "target_signature": tuple(
+            sorted(
+                (requirement_key, tuple(sorted(nodes)))
+                for requirement_key, nodes in target_node_coverage.items()
+            )
+        ),
         "target_keys": set(target_node_coverage),
         "target_nodes": target_nodes,
+        "canonical_witnesses": witness_maps[first_execution_id],
         "state_witness": state_witness,
         "execution_count": len(executions),
         "comparison_count": len(comparisons_raw),
@@ -2198,6 +2214,7 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
     coverage_nodes: dict[tuple[str, tuple[str, str]], set[str]] = {}
     poisons: dict[tuple[str, tuple[str, str]], set[str]] = {}
     phases: dict[tuple[str, tuple[str, str]], set[str]] = {}
+    poison_pairs: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
     for case in cases:
         model_key = case["model_key"]
         partitions_by_model[model_key].add((case["phase"], case["partition"]))
@@ -2208,6 +2225,38 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
             coverage_nodes.setdefault(selection_key, set()).update(nodes)
             poisons.setdefault(selection_key, set()).add(case["workspace_poison"])
             phases.setdefault(selection_key, set()).add(case["phase"])
+        poison_pair_key = (
+            model_key,
+            case["phase"],
+            case["partition"],
+            case["token_shape_fingerprint"],
+            case["dtype"],
+            case["quantization"],
+            case["initial_state_kind"],
+            case["target_signature"],
+        )
+        poison_cases = poison_pairs.setdefault(poison_pair_key, {})
+        require(
+            case["workspace_poison"] not in poison_cases,
+            f"duplicate workspace poison fixture for {poison_pair_key}",
+        )
+        poison_cases[case["workspace_poison"]] = case
+
+    for poison_pair_key, poison_cases in poison_pairs.items():
+        require(
+            set(poison_cases) == {"00", "a5"},
+            f"workspace poison fixture lacks an exact counterpart for {poison_pair_key}",
+        )
+        zero_poison = poison_cases["00"]
+        a5_poison = poison_cases["a5"]
+        require(
+            zero_poison["initialization_identity"] == a5_poison["initialization_identity"],
+            f"workspace poison fixtures changed input/RNG/initial-state identity for {poison_pair_key}",
+        )
+        require(
+            zero_poison["canonical_witnesses"] == a5_poison["canonical_witnesses"],
+            f"workspace poison changed raw witness bytes for {poison_pair_key}",
+        )
 
     for model_key in PRIMARY_MODELS:
         require(
@@ -3222,6 +3271,7 @@ def run_self_test() -> None:
             return apply
 
         first_case = "cases/m1-qwen35-4b.prefill.single_token.zero.00.json"
+        first_a5_case = "cases/m1-qwen35-4b.prefill.single_token.zero.a5.json"
         replay_case = "cases/m1-qwen35-4b.decode.c1.zero.00.json"
 
         def mutate_receipt_sampling_error(root: Path) -> None:
@@ -3389,6 +3439,17 @@ def run_self_test() -> None:
                     "raw witness mismatch",
                 ),
                 (
+                    "cross-poison-raw-mismatch",
+                    mutate_case(
+                        first_a5_case,
+                        lambda value: [
+                            execution["witnesses"][0].update({"raw_sha256": "0" * 64})
+                            for execution in value["executions"]
+                        ],
+                    ),
+                    "workspace poison changed raw witness bytes",
+                ),
+                (
                     "restore-drift",
                     mutate_case(
                         first_case,
@@ -3470,20 +3531,12 @@ def run_self_test() -> None:
                 ),
                 (
                     "single-poison",
-                    mutate_all_cases(
-                        lambda value: value["initialization"].update(
-                            {"workspace_poison": "00"}
-                        )
-                    ),
-                    "lacks both workspace poison patterns",
+                    remove_cases(lambda path: path.endswith(".a5.json")),
+                    "lacks an exact counterpart",
                 ),
                 (
                     "zero-state-only",
-                    mutate_all_cases(
-                        lambda value: value["initialization"].update(
-                            {"initial_state_kind": "zero"}
-                        )
-                    ),
+                    remove_cases(lambda path: ".nonzero." in path),
                     "lacks zero/nonzero state-effect evidence",
                 ),
             ]
