@@ -313,7 +313,10 @@ fn operation_with_resource_options(
         tensor_contract(TensorAccess::Read),
     ];
     if zero_state {
-        inputs.push(typed_tensor_contract(ElementType::U8, TensorAccess::Read));
+        inputs.push(typed_tensor_contract(
+            ElementType::U8,
+            TensorAccess::ReadWrite,
+        ));
     }
     OperationDescriptor {
         id: id("operation.main"),
@@ -842,7 +845,7 @@ pub(crate) fn node_values_with_zero_state_for(
             ResolvedValueRole::Input,
             2,
             resolved_tensor_for(ElementType::U8),
-            TensorAccess::Read,
+            TensorAccess::ReadWrite,
             AliasPolicy::NoAlias,
             BufferUsage::State,
             None,
