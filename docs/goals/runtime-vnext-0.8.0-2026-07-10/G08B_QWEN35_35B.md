@@ -1486,6 +1486,80 @@ product-default run decides C13 correctness. No performance claim is attached
 to either focused diagnostic, and no full matrix may restart before this case
 is classified.
 
+### 2026-07-28 C13 Deterministic Boundary and Exact Rejection
+
+The current clean source is
+`7ae12059f4d8fa37ee5ba7c28c97198b2d0d7bf4`. Its product binary SHA256 is
+`0a9c825fe70fc45b721554f9561ffe32d3a2166f80f6e5af1588e8d33a25285c`.
+Commit `7ae12059` replaces atomic pair scatter with stable expert/route-slot
+ordering for MoE alignment. Four identical real-CUDA prefill requests now
+produce one unique SHA at every captured boundary:
+
+| Captured boundary | Captures | Unique SHA count |
+|---|---:|---:|
+| embedding | 4 | 1 |
+| layer-0 attention | 4 | 1 |
+| layer-0 output | 4 | 1 |
+| full product logits | 4 | 1 |
+
+The checkpoint validator printed:
+
+```text
+RUNTIME VNEXT CHECKPOINT ARTIFACT PASS: /workspace/ferrum-artifacts/runtime-vnext-c13-moe-determinism-7ae12059-20260728/product-checkpoint/checkpoint
+```
+
+This is a deterministic-execution KEEP, not C13 correctness. The exact focused
+replay on the same source and binary remains a semantic REJECT:
+
+```text
+FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC REJECT: /workspace/ferrum-artifacts/runtime-vnext-c13-exact-7ae12059-20260727T202300Z/correctness/focused-c13-022-report.json: case c13-022 did not incorporate the tool result
+```
+
+The valid matrix count therefore remains `404/703`: `c13-022` is case 405 and
+the remaining 298 cases have not run. The stale `6fa8e215` 703/703 result used
+an atomic MoE ordering whose row/reduction order could vary across runs, so its
+single C13 output cannot be treated as a bitwise reference.
+
+Prompt bytes, tool history/result `21`, template/source hashes, sampling seed,
+and product composition are identical across the compared evidence. Disabling
+reusable execution does not remove the miss. Checkpoint and product logits use
+the same fence/readback collection, and the four product-logit captures are
+identical, which rules out a capture-only race. A host enumeration of 16,064
+finite, unique batch-one routes found the direct and generic Marlin metadata
+consumed prefixes equivalent. A separate numerical-edge contract remains:
+non-finite router logits can produce duplicate route IDs and must fail closed,
+but no current artifact attributes `c13-022` to that edge.
+
+Two bounded diagnostic builds then attempted to obtain a reliable single-
+variable A/B:
+
+1. old `6fa8e215` plus the deterministic alignment fix;
+2. current `7ae12059` with batch-one direct metadata forced to generic alignment.
+
+The old build hit its `720s` deadline after compiling 16 of 21 Marlin objects;
+an object-reuse continuation then timed out at `360s` in the old MoE
+translation unit. The current generic-alignment build reused native libraries
+and reached Rust final LTO, but hit its `360s` deadline before producing the
+binary. Neither build generated executable evidence, so neither hypothesis is
+classified. The diagnostic-only branches are
+`diagnostic/c13-old-deterministic-build-reuse` at `fee44e22` and
+`diagnostic/c13-current-force-generic-moe` at `a1decd9c`; they must not merge.
+
+The paid diagnostic root remains on the retained stopped instance at
+`/workspace/ferrum-artifacts/runtime-vnext-c13-bisect-7ae12059-20260727T2048Z`
+with remote-only artifact commit `5ee12f57`. Remote GitHub authentication was
+unavailable, so the small build receipts were not copied through an
+unauthorized transport. Instance `45897840` is `stopped/exited`; no paid or
+transitional sibling remains.
+
+Before another paid run, G07 must provide a bounded CUDA correctness build that
+keeps the official features and product semantics, resolves the same native
+artifacts, avoids release LTO on the development loop, emits the semantic plan
+hash, and smokes the resulting binary. The next GPU action may then run only
+`c13-022` with one predicted variable. After it passes: run the affected C13
+contract, continue the unexecuted suffix, and perform one canonical 703 run at
+the milestone. A failed focused case must not restart the full matrix.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
