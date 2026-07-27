@@ -31,15 +31,20 @@ use super::{
 };
 
 mod compiled_submission_wave;
+mod determinism;
 mod dispatch;
 
 pub use compiled_submission_wave::CompiledSubmissionWaveIdentity;
 use compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
+pub use determinism::{
+    SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
+    SubmissionWaveDeterminismReadbackTarget, SubmissionWaveDeterminismRestore,
+};
 pub use dispatch::{
     BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatch,
     OperationDispatchError, ProfiledSubmissionHandle, SubmissionExecutionPolicy,
-    SubmissionScratchInitialization, SubmissionWaveDeterminismRestore, SubmissionWaveDispatchError,
-    SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
+    SubmissionScratchInitialization, SubmissionWaveDispatchError, SubmissionWaveDispatchStage,
+    SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;

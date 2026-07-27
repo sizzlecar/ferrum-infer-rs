@@ -16,14 +16,17 @@ use super::super::{
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceSubmissionAttribution,
     DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-    DeviceTimingMeasurement, DeviceTimingMode, ExecutablePlanView,
-    ExecutionDeterminismInitializationSpec, ExecutionDeterminismWitnessPlan,
-    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, HostTransferLayout,
-    IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome,
-    LogicalBackingBufferView, NodeId, NodeInvocationId, ParticipantNodeKey, PlanHash, PlanNode,
+    DeviceTimingMeasurement, DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, HostTransferLayout, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome,
+    LogicalBackingBufferView, NodeId, NodeInvocationId, ParticipantNodeKey, PlanNode,
     PreparedStepSubmissionWave, ProgramBindingNodeBinding, ResourceId, SpanId,
     StepParticipantFrameAssignment, TrustedActiveSequenceBinding, VNextError,
     EXECUTION_IDENTITY_VERSION,
+};
+use super::determinism::{
+    SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
+    SubmissionWaveDeterminismRestore,
 };
 use super::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
@@ -498,91 +501,6 @@ impl SubmissionWaveInputUpload {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
-    }
-}
-
-/// Complete participant-major input/state restoration for one immutable
-/// determinism witness plan.
-///
-/// The constructor accepts bytes only. Node ids, resource ids, offsets,
-/// element types, and lengths remain copied from the trusted plan-derived
-/// denominator, so a hardware runner cannot silently omit or redirect one
-/// state range.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmissionWaveDeterminismRestore {
-    plan_hash: PlanHash,
-    initializations: Vec<ExecutionDeterminismInitializationSpec>,
-    participant_payloads: Vec<Vec<Vec<u8>>>,
-}
-
-impl SubmissionWaveDeterminismRestore {
-    pub fn new(
-        witness_plan: &ExecutionDeterminismWitnessPlan,
-        participant_payloads: Vec<Vec<Vec<u8>>>,
-    ) -> Result<Self, VNextError> {
-        if participant_payloads.is_empty()
-            || u32::try_from(participant_payloads.len()).is_err()
-            || participant_payloads
-                .iter()
-                .any(|payloads| payloads.len() != witness_plan.initializations().len())
-        {
-            return Err(invalid_operation(
-                "determinism restore must cover every initialization for a non-empty canonical participant set",
-            ));
-        }
-        for payloads in &participant_payloads {
-            for (initialization, bytes) in witness_plan.initializations().iter().zip(payloads) {
-                let location = initialization.location();
-                if u64::try_from(bytes.len()).ok() != Some(location.canonical_length_bytes())
-                    || bytes.len()
-                        % usize::try_from(location.element_type().size_bytes())
-                            .expect("element width fits usize")
-                        != 0
-                {
-                    return Err(invalid_operation(
-                        "determinism restore payload differs from its complete typed initialization range",
-                    ));
-                }
-            }
-        }
-        Ok(Self {
-            plan_hash: witness_plan.plan_hash().clone(),
-            initializations: witness_plan.initializations().to_vec(),
-            participant_payloads,
-        })
-    }
-
-    pub fn plan_hash(&self) -> &PlanHash {
-        &self.plan_hash
-    }
-
-    pub fn initializations(&self) -> &[ExecutionDeterminismInitializationSpec] {
-        &self.initializations
-    }
-
-    pub fn participant_count(&self) -> u32 {
-        u32::try_from(self.participant_payloads.len())
-            .expect("determinism restore participant count was validated")
-    }
-
-    pub fn participant_payloads(&self, participant_index: u32) -> Option<&[Vec<u8>]> {
-        usize::try_from(participant_index)
-            .ok()
-            .and_then(|index| self.participant_payloads.get(index))
-            .map(Vec::as_slice)
-    }
-
-    fn validate_for(&self, resolved: &dyn ExecutablePlanView) -> Result<(), VNextError> {
-        let actual = resolved.execution_plan().determinism_witness_plan()?;
-        if self.plan_hash != *resolved.execution_plan().plan_hash()
-            || self.plan_hash != *actual.plan_hash()
-            || self.initializations != actual.initializations()
-        {
-            return Err(invalid_operation(
-                "determinism restore differs from the exact immutable plan initialization denominator",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -1460,12 +1378,18 @@ impl OperationDispatch {
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
-    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    ) -> Result<SubmissionWaveDeterminismHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        Self::encode_and_submit_wave_with_inputs_timed(
+        let readback_plan = SubmissionWaveDeterminismReadbackPlan::from_prepared_wave(
+            resolved,
+            batch_identity,
+            &wave,
+        )
+        .map_err(SubmissionWaveDispatchError::Contract)?;
+        let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
             batch_identity,
@@ -1479,7 +1403,11 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
-        )
+        )?;
+        Ok(SubmissionWaveDeterminismHandle::from_profiled(
+            profiled,
+            readback_plan,
+        ))
     }
 
     /// Executes the same complete restore through one sealed resident replay
@@ -1497,12 +1425,18 @@ impl OperationDispatch {
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
-    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    ) -> Result<SubmissionWaveDeterminismHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        Self::encode_and_submit_wave_with_inputs_timed(
+        let readback_plan = SubmissionWaveDeterminismReadbackPlan::from_prepared_wave(
+            resolved,
+            batch_identity,
+            &wave,
+        )
+        .map_err(SubmissionWaveDispatchError::Contract)?;
+        let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
             batch_identity,
@@ -1516,7 +1450,11 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
-        )
+        )?;
+        Ok(SubmissionWaveDeterminismHandle::from_profiled(
+            profiled,
+            readback_plan,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -698,7 +698,7 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     )
     .unwrap();
 
-    let profiled = OperationDispatch::encode_and_submit_determinism_eager_wave(
+    let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
         &providers,
         &fixture.resolved,
         &batch_identity,
@@ -711,8 +711,18 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
         &reaper,
     )
     .unwrap();
-    let (handle, attribution) = profiled.into_parts();
-    let attribution = attribution.expect("determinism eager path must preserve attribution");
+    let attribution = handle
+        .attribution()
+        .expect("determinism eager path must preserve attribution");
+    assert_eq!(
+        handle.readback_plan().witness_count(),
+        fixture
+            .plan
+            .determinism_witness_plan()
+            .unwrap()
+            .witnesses()
+            .len()
+    );
 
     {
         let trace = fixture.runtime_trace.lock().unwrap();
@@ -747,10 +757,18 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     assert!(compute_rows
         .iter()
         .all(|command| command.execution_path() == DeviceExecutionPath::Eager));
-    assert!(matches!(
-        handle.wait().unwrap(),
-        CompletionObservation::Terminal(_)
-    ));
+    let readback = match handle.wait_with_determinism_readback().unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("determinism eager witness readback did not terminate: {other:?}"),
+    };
+    assert_eq!(
+        readback.dispositions().len(),
+        handle.readback_plan().collection_request().request_count()
+    );
+    assert!(readback
+        .dispositions()
+        .iter()
+        .all(|disposition| matches!(disposition, CompletionReadbackDisposition::Succeeded(_))));
 
     drop(handle);
     drop(providers);
@@ -758,6 +776,125 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     drop(reaper);
     drop(lane);
     teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn determinism_readback_collects_writable_state_with_exact_typed_usage() {
+    let (fixture, sequence, session, batch, step) =
+        setup_with_fixture(fixture_with_zero_state(true));
+    let witness_plan = fixture.plan.determinism_witness_plan().unwrap();
+    assert!(witness_plan.witnesses().iter().any(|witness| {
+        matches!(
+            witness.kind(),
+            ExecutionDeterminismWitnessKind::StateEffect { .. }
+        ) && witness.location().usage() == BufferUsage::State
+    }));
+    let restore = determinism_restore(&fixture.plan, 0x27);
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Completion,
+        &restore,
+        0x5a,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(handle.readback_plan().targets().iter().any(|target| {
+        target.witnesses().iter().any(|witness| {
+            matches!(
+                witness.kind(),
+                ExecutionDeterminismWitnessKind::StateEffect { .. }
+            )
+        }) && target
+            .batch()
+            .requests()
+            .iter()
+            .all(|request| request.expected_usage() == BufferUsage::State)
+    }));
+
+    let readback = match handle.wait_with_determinism_readback().unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("writable-state determinism readback did not terminate: {other:?}"),
+    };
+    assert!(readback.dispositions().iter().any(|disposition| {
+        matches!(
+            disposition,
+            CompletionReadbackDisposition::Succeeded(output)
+                if output.request().expected_usage() == BufferUsage::State
+        )
+    }));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn determinism_readback_rejects_a_foreign_plan_before_submission() {
+    let foreign_fixture = fixture_with_zero_state(true);
+    let foreign_witness_plan = foreign_fixture.plan.determinism_witness_plan().unwrap();
+    let (fixture, sequence, session, batch, step) = setup();
+    assert_ne!(foreign_witness_plan.plan_hash(), fixture.plan.plan_hash());
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    let error = SubmissionWaveDeterminismReadbackPlan::from_prepared_wave(
+        &foreign_fixture.resolved,
+        &batch_identity,
+        &wave,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("differs from its prepared wave or physical batch identity"));
+    assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
+
+    drop(active_bindings);
+    drop(lane);
+    drop(wave);
+    teardown(fixture, sequence, session, batch, step);
+
+    drop(foreign_fixture.registry);
+    drop(foreign_fixture.impostor_registry);
+    drop(foreign_fixture.runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(foreign_fixture.plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
 }
 
 #[test]
@@ -1403,7 +1540,7 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
     )
     .unwrap();
 
-    let profiled = OperationDispatch::encode_and_submit_determinism_replayed_wave(
+    let handle = OperationDispatch::encode_and_submit_determinism_replayed_wave(
         &providers,
         &fixture.resolved,
         &batch_identity,
@@ -1417,9 +1554,8 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         &reaper,
     )
     .unwrap();
-    let (handle, attribution) = profiled.into_parts();
     assert!(
-        attribution.is_none(),
+        handle.attribution().is_none(),
         "replay timing records physical spans without kernel attribution"
     );
 
@@ -1448,10 +1584,18 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
         );
     }
     assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
-    assert!(matches!(
-        handle.wait().unwrap(),
-        CompletionObservation::Terminal(_)
-    ));
+    let readback = match handle.wait_with_determinism_readback().unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("determinism replay witness readback did not terminate: {other:?}"),
+    };
+    assert_eq!(
+        readback.dispositions().len(),
+        handle.readback_plan().collection_request().request_count()
+    );
+    assert!(readback
+        .dispositions()
+        .iter()
+        .all(|disposition| matches!(disposition, CompletionReadbackDisposition::Succeeded(_))));
 
     drop(handle);
     drop(providers);

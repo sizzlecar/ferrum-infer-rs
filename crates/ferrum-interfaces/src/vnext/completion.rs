@@ -447,9 +447,10 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         }
     }
 
-    fn readback_activation(
+    fn readback_buffer(
         &self,
         backing: &LogicalBackingBufferView<'_, R::Buffer>,
+        expected_usage: BufferUsage,
         logical_offset_bytes: u64,
         output_layout: HostTransferLayout,
         timing_mode: DeviceTimingMode,
@@ -466,14 +467,14 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 ))
             })?;
         let element_bytes = output_layout.element_type().size_bytes();
-        if backing.usage() != BufferUsage::Activations
+        if backing.usage() != expected_usage
             || backing.element_type() != output_layout.element_type()
             || logical_end > backing.size_bytes()
             || logical_offset_bytes % element_bytes != 0
             || output_bytes % element_bytes != 0
         {
             return Err(LaneReadbackError::Contract(invalid_completion(
-                "completion readback must select an aligned activation range with matching element type",
+                "completion readback must select an aligned typed backing range with matching usage and element type",
             )));
         }
         if self.fail_closed.load(Ordering::Acquire) || !self.current_descriptor_matches_snapshot() {
@@ -2592,11 +2593,12 @@ impl<R: DeviceRuntime> Drop for CompletionReaper<R> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[must_use = "a completion readback request identifies one exact logical activation range"]
+#[must_use = "a completion readback request identifies one exact typed logical backing range"]
 pub struct CompletionReadbackRequest {
     node_id: NodeId,
     participant_index: u32,
     resource_id: ResourceId,
+    expected_usage: BufferUsage,
     logical_offset_bytes: u64,
     output_layout: HostTransferLayout,
 }
@@ -2606,6 +2608,24 @@ impl CompletionReadbackRequest {
         node_id: NodeId,
         participant_index: u32,
         resource_id: ResourceId,
+        logical_offset_bytes: u64,
+        output_layout: HostTransferLayout,
+    ) -> Result<Self, VNextError> {
+        Self::new_typed(
+            node_id,
+            participant_index,
+            resource_id,
+            BufferUsage::Activations,
+            logical_offset_bytes,
+            output_layout,
+        )
+    }
+
+    pub fn new_typed(
+        node_id: NodeId,
+        participant_index: u32,
+        resource_id: ResourceId,
+        expected_usage: BufferUsage,
         logical_offset_bytes: u64,
         output_layout: HostTransferLayout,
     ) -> Result<Self, VNextError> {
@@ -2619,6 +2639,7 @@ impl CompletionReadbackRequest {
             node_id,
             participant_index,
             resource_id,
+            expected_usage,
             logical_offset_bytes,
             output_layout,
         })
@@ -2630,6 +2651,10 @@ impl CompletionReadbackRequest {
 
     pub fn resource_id(&self) -> &ResourceId {
         &self.resource_id
+    }
+
+    pub const fn expected_usage(&self) -> BufferUsage {
+        self.expected_usage
     }
 
     pub const fn participant_index(&self) -> u32 {
@@ -2662,10 +2687,12 @@ impl CompletionReadbackBatchRequest {
             usize::try_from(request.participant_index()).ok() != Some(index)
                 || request.node_id() != first.node_id()
                 || request.resource_id() != first.resource_id()
-                || request.output_layout() != first.output_layout()
+                || request.expected_usage() != first.expected_usage()
+                || request.logical_offset_bytes() != first.logical_offset_bytes()
+                || request.output_layout().element_type() != first.output_layout().element_type()
         }) {
             return Err(invalid_completion(
-                "completion readback batch must use canonical participant order and one node/resource/layout",
+                "completion readback batch must use canonical participant order and one typed node/resource/offset/element group",
             ));
         }
         Ok(Self { requests })
@@ -3005,8 +3032,9 @@ fn attempt_completion_readback<R: DeviceRuntime>(
         }
     };
     let readback = catch_unwind(AssertUnwindSafe(|| {
-        lane.readback_activation(
+        lane.readback_buffer(
             &backing,
+            request.expected_usage(),
             request.logical_offset_bytes(),
             request.output_layout(),
             timing_mode,
