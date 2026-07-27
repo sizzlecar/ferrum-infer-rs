@@ -3,16 +3,39 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    invalid_plan, AllocationLifetime, BufferUsage, ContractVersion, ElementType, ExecutionPlan,
-    NodeId, PlanHash, ProgramValueId, ProviderId, ResolvedValueBinding, ResolvedValueRole,
-    ResourceId, StateId, TensorAccess, TokenSpanWork, VNextError, WeightId,
+    invalid_plan, AllocationLifetime, BufferUsage, ContractVersion, DynamicResourceDemand,
+    DynamicResourceDescriptor, ElementType, ExecutionPlan, NodeId, PlanHash, ProgramValueId,
+    ProviderId, ResolvedValueBinding, ResolvedValueRole, ResourceId, StateId, TensorAccess,
+    TokenSpanWork, VNextError, WeightId,
 };
-use crate::vnext::{ProviderExecutionContractFingerprint, ProviderReplayEquivalence};
+use crate::vnext::{
+    BatchParticipantTokenRange, ProviderExecutionContractFingerprint, ProviderReplayEquivalence,
+};
 
 mod coverage;
 pub use coverage::*;
 
-pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(3, 0);
+pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(4, 0);
+
+/// Runtime work projection for one immutable value binding.
+///
+/// `ImmediateTokenSpan` is used by transient activations. `ActiveTokenPrefix`
+/// is used by token-scaled state whose readable history extends from token zero
+/// through the participant's executed source frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionDeterminismValueExtent {
+    Fixed,
+    ImmediateTokenSpan {
+        bytes_per_token: u64,
+        maximum_tokens: u64,
+    },
+    ActiveTokenPrefix {
+        bytes_per_token: u64,
+        maximum_tokens: u64,
+        maximum_storage_bytes: u64,
+    },
+}
 
 /// Trusted semantic-to-physical projection shared by determinism
 /// initialization and terminal witnesses.
@@ -31,15 +54,16 @@ pub struct ExecutionDeterminismValueLocation {
     storage_component_id: Option<WeightId>,
     resource_id: ResourceId,
     logical_offset_bytes: u64,
-    canonical_length_bytes: u64,
+    declared_length_bytes: u64,
     element_type: ElementType,
-    token_bytes_per_token: Option<u64>,
+    extent: ExecutionDeterminismValueExtent,
 }
 
 impl ExecutionDeterminismValueLocation {
     fn from_binding(
         node: &super::PlanNode,
         binding: &ResolvedValueBinding,
+        dynamic_descriptors: &[DynamicResourceDescriptor],
     ) -> Result<Vec<Self>, VNextError> {
         let components = binding.storage().components();
         let single_component_logical_length = (components.len() == 1)
@@ -52,13 +76,13 @@ impl ExecutionDeterminismValueLocation {
                 // A single-component value has a typed logical span. Composite
                 // encodings do not expose a lossless logical-to-component byte
                 // map, so every declared physical byte is part of the proof.
-                let canonical_length_bytes =
+                let declared_length_bytes =
                     single_component_logical_length.unwrap_or(component.length_bytes());
-                if canonical_length_bytes == 0
-                    || canonical_length_bytes > component.length_bytes()
+                if declared_length_bytes == 0
+                    || declared_length_bytes > component.length_bytes()
                     || component
                         .offset_bytes()
-                        .checked_add(canonical_length_bytes)
+                        .checked_add(declared_length_bytes)
                         .is_none()
                 {
                     return Err(invalid_plan(format!(
@@ -67,13 +91,13 @@ impl ExecutionDeterminismValueLocation {
                         binding.value_id()
                     )));
                 }
-                let token_bytes_per_token = node
+                let immediate_projection = node
                     .work()
                     .token_projection(binding.role(), binding.ordinal())
                     .map(|projection| {
                         let canonical_extent = projection.canonical_extent();
                         if canonical_extent == 0
-                            || canonical_length_bytes % canonical_extent != 0
+                            || declared_length_bytes % canonical_extent != 0
                         {
                             return Err(invalid_plan(format!(
                                 "node `{}` determinism value `{}` component {component_ordinal} has a non-integral token projection",
@@ -81,9 +105,10 @@ impl ExecutionDeterminismValueLocation {
                                 binding.value_id()
                             )));
                         }
-                        canonical_length_bytes
+                        declared_length_bytes
                             .checked_div(canonical_extent)
                             .filter(|bytes| *bytes > 0)
+                            .map(|bytes_per_token| (bytes_per_token, canonical_extent))
                             .ok_or_else(|| {
                                 invalid_plan(format!(
                                     "node `{}` determinism value `{}` component {component_ordinal} has an invalid token projection",
@@ -93,6 +118,101 @@ impl ExecutionDeterminismValueLocation {
                             })
                     })
                     .transpose()?;
+                let dynamic_descriptor = dynamic_descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.base_resource_id() == component.resource_id());
+                let descriptor_tokens = dynamic_descriptor
+                    .map(|descriptor| {
+                        if descriptor.base_resource_id() != component.resource_id()
+                            || descriptor.usage() != binding.usage()
+                            || descriptor.element_type() != component.element_type()
+                        {
+                            return Err(invalid_plan(format!(
+                                "node `{}` determinism value `{}` differs from its dynamic resource descriptor",
+                                node.id(),
+                                binding.value_id()
+                            )));
+                        }
+                        Ok(match descriptor.demand() {
+                            DynamicResourceDemand::Tokens {
+                                bytes_per_token,
+                                maximum_tokens,
+                            } => Some((*bytes_per_token, *maximum_tokens)),
+                            _ => None,
+                        })
+                    })
+                    .transpose()?
+                    .flatten();
+                let extent = match (binding.usage(), immediate_projection, descriptor_tokens) {
+                    (
+                        BufferUsage::State,
+                        None,
+                        Some((bytes_per_token, maximum_tokens)),
+                    ) => {
+                        let maximum_storage_bytes =
+                            dynamic_descriptor
+                                .expect("token demand came from this descriptor")
+                                .theoretical_maximum_request_bytes()?;
+                        if components.len() != 1
+                            || component.offset_bytes() != 0
+                            || bytes_per_token < declared_length_bytes
+                            || bytes_per_token % component.element_type().size_bytes() != 0
+                            || maximum_storage_bytes < bytes_per_token
+                        {
+                            return Err(invalid_plan(format!(
+                                "node `{}` token-scaled state `{}` has no lossless active-prefix projection",
+                                node.id(),
+                                binding.value_id()
+                            )));
+                        }
+                        ExecutionDeterminismValueExtent::ActiveTokenPrefix {
+                            bytes_per_token,
+                            maximum_tokens,
+                            maximum_storage_bytes,
+                        }
+                    }
+                    (
+                        BufferUsage::State,
+                        Some(_),
+                        Some(_) | None,
+                    ) => {
+                        return Err(invalid_plan(format!(
+                            "node `{}` state `{}` cannot use a transient token projection",
+                            node.id(),
+                            binding.value_id()
+                        )));
+                    }
+                    (
+                        _,
+                        Some((projected_bytes, projected_tokens)),
+                        descriptor_tokens,
+                    ) => {
+                        let (bytes_per_token, maximum_tokens) =
+                            descriptor_tokens.unwrap_or((projected_bytes, projected_tokens));
+                        if bytes_per_token != projected_bytes
+                            || maximum_tokens < projected_tokens
+                            || bytes_per_token % component.element_type().size_bytes() != 0
+                        {
+                            return Err(invalid_plan(format!(
+                                "node `{}` determinism value `{}` has inconsistent token extent evidence",
+                                node.id(),
+                                binding.value_id()
+                            )));
+                        }
+                        ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+                            bytes_per_token,
+                            maximum_tokens,
+                        }
+                    }
+                    (_, None, Some(_)) => {
+                        return Err(invalid_plan(format!(
+                            "node `{}` token-scaled value `{}` lacks a typed work projection",
+                            node.id(),
+                            binding.value_id()
+                        )));
+                    }
+                    (_, None, None) => ExecutionDeterminismValueExtent::Fixed,
+                };
                 Ok(Self {
                     node_id: node.id().clone(),
                     value_id: binding.value_id().clone(),
@@ -105,9 +225,9 @@ impl ExecutionDeterminismValueLocation {
                     storage_component_id: component.component_id().cloned(),
                     resource_id: component.resource_id().clone(),
                     logical_offset_bytes: component.offset_bytes(),
-                    canonical_length_bytes,
+                    declared_length_bytes,
                     element_type: component.element_type(),
-                    token_bytes_per_token,
+                    extent,
                 })
             })
             .collect()
@@ -149,28 +269,70 @@ impl ExecutionDeterminismValueLocation {
         self.logical_offset_bytes
     }
 
-    pub const fn canonical_length_bytes(&self) -> u64 {
-        self.canonical_length_bytes
+    pub const fn declared_length_bytes(&self) -> u64 {
+        self.declared_length_bytes
     }
 
     pub const fn element_type(&self) -> ElementType {
         self.element_type
     }
 
-    pub const fn token_bytes_per_token(&self) -> Option<u64> {
-        self.token_bytes_per_token
+    pub const fn extent(&self) -> ExecutionDeterminismValueExtent {
+        self.extent
     }
 
-    pub fn active_length_bytes(&self, token_span: &TokenSpanWork) -> Result<u64, VNextError> {
-        let bytes = match self.token_bytes_per_token {
-            Some(bytes_per_token) => bytes_per_token
+    pub fn maximum_bound_length_bytes(&self) -> Result<u64, VNextError> {
+        match self.extent {
+            ExecutionDeterminismValueExtent::Fixed => Ok(self.declared_length_bytes),
+            ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+                bytes_per_token,
+                maximum_tokens,
+            } => bytes_per_token
+                .checked_mul(maximum_tokens)
+                .ok_or_else(|| invalid_plan("determinism value maximum byte extent overflows")),
+            ExecutionDeterminismValueExtent::ActiveTokenPrefix {
+                maximum_storage_bytes,
+                ..
+            } => Ok(maximum_storage_bytes),
+        }
+    }
+
+    pub fn bound_length_bytes(
+        &self,
+        token_span: &TokenSpanWork,
+        token_range: &BatchParticipantTokenRange,
+    ) -> Result<u64, VNextError> {
+        if token_range.immediate_tokens() != token_span.immediate_tokens()
+            || token_range.source_token_range() != token_span.immediate_token_range()
+        {
+            return Err(invalid_plan(
+                "determinism value work span differs from its participant token range",
+            ));
+        }
+        self.bound_length_bytes_for_source_end(token_span, token_range.source_token_range().end)
+    }
+
+    fn bound_length_bytes_for_source_end(
+        &self,
+        token_span: &TokenSpanWork,
+        source_end_tokens: u64,
+    ) -> Result<u64, VNextError> {
+        let bytes = match self.extent {
+            ExecutionDeterminismValueExtent::Fixed => self.declared_length_bytes,
+            ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+                bytes_per_token, ..
+            } => bytes_per_token
                 .checked_mul(token_span.immediate_tokens())
                 .ok_or_else(|| invalid_plan("determinism value active byte extent overflows"))?,
-            None => self.canonical_length_bytes,
+            ExecutionDeterminismValueExtent::ActiveTokenPrefix {
+                bytes_per_token, ..
+            } => bytes_per_token
+                .checked_mul(source_end_tokens)
+                .ok_or_else(|| invalid_plan("determinism state prefix byte extent overflows"))?,
         };
-        if bytes == 0 || bytes > self.canonical_length_bytes {
+        if bytes == 0 || bytes > self.maximum_bound_length_bytes()? {
             return Err(invalid_plan(
-                "determinism value active byte extent exceeds its canonical value",
+                "determinism value active byte extent exceeds its immutable bound",
             ));
         }
         Ok(bytes)
@@ -207,8 +369,9 @@ impl ExecutionDeterminismWitnessSpec {
         node: &super::PlanNode,
         kind: ExecutionDeterminismWitnessKind,
         binding: &ResolvedValueBinding,
+        dynamic_descriptors: &[DynamicResourceDescriptor],
     ) -> Result<Vec<Self>, VNextError> {
-        ExecutionDeterminismValueLocation::from_binding(node, binding)?
+        ExecutionDeterminismValueLocation::from_binding(node, binding, dynamic_descriptors)?
             .into_iter()
             .map(|location| {
                 Ok(Self {
@@ -268,20 +431,28 @@ impl ExecutionDeterminismWitnessSpec {
         self.location.logical_offset_bytes()
     }
 
-    pub const fn canonical_length_bytes(&self) -> u64 {
-        self.location.canonical_length_bytes()
+    pub const fn declared_length_bytes(&self) -> u64 {
+        self.location.declared_length_bytes()
     }
 
     pub const fn element_type(&self) -> ElementType {
         self.location.element_type()
     }
 
-    pub const fn token_bytes_per_token(&self) -> Option<u64> {
-        self.location.token_bytes_per_token()
+    pub const fn extent(&self) -> ExecutionDeterminismValueExtent {
+        self.location.extent()
     }
 
-    pub fn active_length_bytes(&self, token_span: &TokenSpanWork) -> Result<u64, VNextError> {
-        self.location.active_length_bytes(token_span)
+    pub fn maximum_bound_length_bytes(&self) -> Result<u64, VNextError> {
+        self.location.maximum_bound_length_bytes()
+    }
+
+    pub fn bound_length_bytes(
+        &self,
+        token_span: &TokenSpanWork,
+        token_range: &BatchParticipantTokenRange,
+    ) -> Result<u64, VNextError> {
+        self.location.bound_length_bytes(token_span, token_range)
     }
 }
 
@@ -441,8 +612,18 @@ impl ExecutionPlan {
                 })
             })
             .collect::<BTreeSet<_>>();
+        let dynamic_descriptors = self.payload().memory().dynamic_descriptors();
         let mut external_inputs = BTreeMap::<
-            (ProgramValueId, ResourceId, u64, u64, ElementType),
+            (
+                ProgramValueId,
+                ResourceId,
+                u64,
+                u64,
+                ElementType,
+                u32,
+                Option<WeightId>,
+                ExecutionDeterminismValueExtent,
+            ),
             (ExecutionDeterminismValueLocation, BTreeSet<NodeId>),
         >::new();
         let mut initial_state = BTreeMap::<
@@ -454,6 +635,9 @@ impl ExecutionPlan {
                 u64,
                 u64,
                 ElementType,
+                u32,
+                Option<WeightId>,
+                ExecutionDeterminismValueExtent,
             ),
             (
                 ExecutionDeterminismValueLocation,
@@ -472,13 +656,20 @@ impl ExecutionPlan {
                     )
                     && !produced_values.contains(binding.value_id())
             }) {
-                for location in ExecutionDeterminismValueLocation::from_binding(node, binding)? {
+                for location in ExecutionDeterminismValueLocation::from_binding(
+                    node,
+                    binding,
+                    dynamic_descriptors,
+                )? {
                     let key = (
                         binding.value_id().clone(),
                         location.resource_id().clone(),
                         location.logical_offset_bytes(),
-                        location.canonical_length_bytes(),
+                        location.declared_length_bytes(),
                         location.element_type(),
+                        location.storage_component_ordinal(),
+                        location.storage_component_id().cloned(),
+                        location.extent(),
                     );
                     let (_, consumers) = external_inputs
                         .entry(key)
@@ -502,8 +693,11 @@ impl ExecutionPlan {
                             TensorAccess::Read | TensorAccess::ReadWrite
                         )
                 }) {
-                    for location in ExecutionDeterminismValueLocation::from_binding(node, binding)?
-                    {
+                    for location in ExecutionDeterminismValueLocation::from_binding(
+                        node,
+                        binding,
+                        dynamic_descriptors,
+                    )? {
                         matched_read_binding = true;
                         let key = (
                             effect.state_id().clone(),
@@ -511,8 +705,11 @@ impl ExecutionPlan {
                             effect.lifetime(),
                             location.resource_id().clone(),
                             location.logical_offset_bytes(),
-                            location.canonical_length_bytes(),
+                            location.declared_length_bytes(),
                             location.element_type(),
+                            location.storage_component_ordinal(),
+                            location.storage_component_id().cloned(),
+                            location.extent(),
                         );
                         let (_, access, consumers) = initial_state
                             .entry(key)
@@ -536,7 +733,7 @@ impl ExecutionPlan {
         let mut initializations =
             Vec::with_capacity(external_inputs.len().saturating_add(initial_state.len()));
         initializations.extend(external_inputs.into_iter().map(
-            |((value_id, _, _, _, _), (location, consumer_node_ids))| {
+            |((value_id, _, _, _, _, _, _, _), (location, consumer_node_ids))| {
                 ExecutionDeterminismInitializationSpec {
                     kind: ExecutionDeterminismInitializationKind::ExternalInput { value_id },
                     location,
@@ -546,7 +743,7 @@ impl ExecutionPlan {
         ));
         initializations.extend(initial_state.into_iter().map(
             |(
-                (state_id, state_value_id, lifetime, _, _, _, _),
+                (state_id, state_value_id, lifetime, _, _, _, _, _, _, _),
                 (location, access, consumer_node_ids),
             )| {
                 ExecutionDeterminismInitializationSpec {
@@ -610,6 +807,7 @@ impl ExecutionPlan {
                         output_ordinal: binding.ordinal(),
                     },
                     binding,
+                    dynamic_descriptors,
                 )?);
             }
 
@@ -636,6 +834,7 @@ impl ExecutionPlan {
                             access: effect.access(),
                         },
                         binding,
+                        dynamic_descriptors,
                     )?;
                     matched_resources.extend(specs.iter().map(|spec| spec.resource_id().clone()));
                     witnesses.extend(specs);
@@ -741,23 +940,34 @@ mod tests {
                 output_ordinal: 0,
             },
             &binding,
+            &[],
         )
         .unwrap();
         assert_eq!(witnesses.len(), 1);
         let witness = &witnesses[0];
-        assert_eq!(witness.canonical_length_bytes(), 128);
-        assert_eq!(witness.token_bytes_per_token(), Some(16));
+        assert_eq!(witness.declared_length_bytes(), 128);
+        assert_eq!(
+            witness.extent(),
+            ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+                bytes_per_token: 16,
+                maximum_tokens: 8,
+            }
+        );
         assert_eq!(
             witness
-                .active_length_bytes(
-                    &TokenSpanWork::from_token_ids(&[1, 2, 3, 4, 5, 6, 7, 8], 2..5).unwrap()
+                .location()
+                .bound_length_bytes_for_source_end(
+                    &TokenSpanWork::from_token_ids(&[1, 2, 3, 4, 5, 6, 7, 8], 2..5).unwrap(),
+                    5,
                 )
                 .unwrap(),
             48
         );
         assert!(witness
-            .active_length_bytes(
-                &TokenSpanWork::from_token_ids(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 0..9).unwrap()
+            .location()
+            .bound_length_bytes_for_source_end(
+                &TokenSpanWork::from_token_ids(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 0..9).unwrap(),
+                9,
             )
             .is_err());
     }
@@ -800,11 +1010,12 @@ mod tests {
                 output_ordinal: 0,
             },
             &binding,
+            &[],
         )
         .unwrap();
         assert_eq!(witnesses.len(), 1);
         assert_eq!(witnesses[0].logical_offset_bytes(), 16);
-        assert_eq!(witnesses[0].canonical_length_bytes(), 12);
+        assert_eq!(witnesses[0].declared_length_bytes(), 12);
         assert_eq!(witnesses[0].element_type(), ElementType::F16);
     }
 }

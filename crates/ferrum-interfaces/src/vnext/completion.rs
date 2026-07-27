@@ -2688,11 +2688,10 @@ impl CompletionReadbackBatchRequest {
                 || request.node_id() != first.node_id()
                 || request.resource_id() != first.resource_id()
                 || request.expected_usage() != first.expected_usage()
-                || request.logical_offset_bytes() != first.logical_offset_bytes()
                 || request.output_layout().element_type() != first.output_layout().element_type()
         }) {
             return Err(invalid_completion(
-                "completion readback batch must use canonical participant order and one typed node/resource/offset/element group",
+                "completion readback batch must use canonical participant order and one typed node/resource/element group",
             ));
         }
         Ok(Self { requests })

@@ -37,8 +37,9 @@ mod dispatch;
 pub use compiled_submission_wave::CompiledSubmissionWaveIdentity;
 use compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
 pub use determinism::{
-    SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
-    SubmissionWaveDeterminismReadbackTarget, SubmissionWaveDeterminismRestore,
+    SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismLogicalRange,
+    SubmissionWaveDeterminismReadbackPlan, SubmissionWaveDeterminismReadbackTarget,
+    SubmissionWaveDeterminismRestore, SubmissionWaveDeterminismRestoreLayout,
 };
 pub use dispatch::{
     BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatch,

@@ -46,18 +46,44 @@ pub(crate) fn contiguous_storage_profile() -> DynamicStorageProfile {
     .unwrap()
 }
 
+pub(crate) const TEST_PAGED_BLOCK_BYTES: u64 = 16;
+
+pub(crate) fn paged_storage_profile() -> DynamicStorageProfile {
+    DynamicStorageProfile::new(
+        DynamicStorageAllocator::FixedBlockArena {
+            block_bytes: TEST_PAGED_BLOCK_BYTES,
+        },
+        DynamicStorageView::PagedRegions {
+            block_bytes: TEST_PAGED_BLOCK_BYTES,
+        },
+    )
+    .unwrap()
+}
+
 pub(crate) fn contiguous_storage_bindings(
     operation: &OperationDescriptor,
+) -> Vec<ProviderStorageBindingRequirement> {
+    storage_bindings(operation, false)
+}
+
+fn storage_bindings(
+    operation: &OperationDescriptor,
+    paged_state: bool,
 ) -> Vec<ProviderStorageBindingRequirement> {
     operation
         .inputs
         .iter()
         .enumerate()
         .map(|(ordinal, _)| {
+            let storage = if paged_state && ordinal == 2 {
+                DynamicStorageRequirement::new(vec![paged_storage_profile()]).unwrap()
+            } else {
+                DynamicStorageRequirement::contiguous()
+            };
             ProviderStorageBindingRequirement::new(
                 ResolvedValueRole::Input,
                 ordinal as u32,
-                DynamicStorageRequirement::contiguous(),
+                storage,
             )
         })
         .chain(operation.outputs.iter().enumerate().map(|(ordinal, _)| {
@@ -91,6 +117,8 @@ pub(crate) struct TestConfig {
     pub(crate) width: u64,
     #[serde(default)]
     pub(crate) zero_state: bool,
+    #[serde(default)]
+    pub(crate) token_scaled_state: bool,
 }
 
 #[derive(Default)]
@@ -198,6 +226,11 @@ impl ModelFamilyProvider for TestFamily {
     }
 
     fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+        if config.token_scaled_state && !config.zero_state {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "token-scaled test state requires the state binding".to_owned(),
+            });
+        }
         let mut main_inputs = vec![id("value.input"), id("value.weight")];
         let mut tail_inputs = vec![id("value.intermediate"), id("value.weight")];
         let states = if config.zero_state {
@@ -212,11 +245,28 @@ impl ModelFamilyProvider for TestFamily {
                     layout: ResolvedTensorLayout::Contiguous,
                 },
                 lifetime: StateLifetime::Sequence,
-                capacity_demand: StateCapacityDemand::FixedPerScope,
+                capacity_demand: if config.token_scaled_state {
+                    StateCapacityDemand::TokenScaled {
+                        bytes_per_token: config.width,
+                        maximum_tokens: 16,
+                    }
+                } else {
+                    StateCapacityDemand::FixedPerScope
+                },
                 initialization: StateInitialization::Zero,
             }]
         } else {
             Vec::new()
+        };
+        let main_work = if config.token_scaled_state {
+            ProgramNodeWorkSpec::tokens(id("value.input"), 0)
+        } else {
+            ProgramNodeWorkSpec::Fixed
+        };
+        let tail_work = if config.token_scaled_state {
+            ProgramNodeWorkSpec::tokens(id("value.intermediate"), 0)
+        } else {
+            ProgramNodeWorkSpec::Fixed
         };
         ModelProgram::new(
             self.family_id().clone(),
@@ -228,7 +278,7 @@ impl ModelFamilyProvider for TestFamily {
                         id: id("node.main"),
                         operation_id: id("operation.main"),
                         required_version: ContractVersion::new(1, 0),
-                        work: ProgramNodeWorkSpec::Fixed,
+                        work: main_work,
                         inputs: main_inputs,
                         outputs: vec![id("value.intermediate")],
                         attributes: BTreeMap::new(),
@@ -237,7 +287,7 @@ impl ModelFamilyProvider for TestFamily {
                         id: id("node.tail"),
                         operation_id: id("operation.main"),
                         required_version: ContractVersion::new(1, 0),
-                        work: ProgramNodeWorkSpec::Fixed,
+                        work: tail_work,
                         inputs: tail_inputs,
                         outputs: vec![id("value.output")],
                         attributes: BTreeMap::new(),
@@ -296,6 +346,17 @@ pub(crate) fn typed_tensor_contract(
     .unwrap()
 }
 
+fn token_tensor_contract(access: TensorAccess) -> TensorContract {
+    TensorContract::new(
+        vec![DimensionConstraint::Symbol("tokens".to_owned())],
+        BTreeSet::from([ElementType::F32]),
+        vec![LayoutConstraint::Contiguous],
+        access,
+        AliasPolicy::NoAlias,
+    )
+    .unwrap()
+}
+
 pub(crate) fn operation() -> OperationDescriptor {
     operation_with_zero_state(false)
 }
@@ -308,8 +369,20 @@ fn operation_with_resource_options(
     zero_state: bool,
     scratch: ResourcePresenceRequirement,
 ) -> OperationDescriptor {
+    operation_with_resource_options_and_work(zero_state, scratch, false)
+}
+
+fn operation_with_resource_options_and_work(
+    zero_state: bool,
+    scratch: ResourcePresenceRequirement,
+    token_scaled_state: bool,
+) -> OperationDescriptor {
     let mut inputs = vec![
-        tensor_contract(TensorAccess::Read),
+        if token_scaled_state {
+            token_tensor_contract(TensorAccess::Read)
+        } else {
+            tensor_contract(TensorAccess::Read)
+        },
         tensor_contract(TensorAccess::Read),
     ];
     if zero_state {
@@ -322,7 +395,11 @@ fn operation_with_resource_options(
         id: id("operation.main"),
         version: ContractVersion::new(1, 0),
         inputs,
-        outputs: vec![tensor_contract(TensorAccess::Write)],
+        outputs: vec![if token_scaled_state {
+            token_tensor_contract(TensorAccess::Write)
+        } else {
+            tensor_contract(TensorAccess::Write)
+        }],
         attributes: AttributeSchema::empty(),
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
@@ -363,7 +440,21 @@ fn catalog_with_resource_options_and_execution_semantics(
     scratch: ResourcePresenceRequirement,
     execution_semantics: ProviderExecutionSemantics,
 ) -> CapabilityCatalog {
-    let operation = operation_with_resource_options(zero_state, scratch);
+    catalog_with_resource_options_execution_semantics_and_storage(
+        zero_state,
+        scratch,
+        execution_semantics,
+        false,
+    )
+}
+
+fn catalog_with_resource_options_execution_semantics_and_storage(
+    zero_state: bool,
+    scratch: ResourcePresenceRequirement,
+    execution_semantics: ProviderExecutionSemantics,
+    paged_state: bool,
+) -> CapabilityCatalog {
+    let operation = operation_with_resource_options_and_work(zero_state, scratch, paged_state);
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
@@ -377,7 +468,7 @@ fn catalog_with_resource_options_and_execution_semantics(
         capabilities.clone(),
         BTreeSet::from([id("weight-format.device-operation-composite")]),
         BTreeSet::new(),
-        contiguous_storage_bindings(&operation),
+        storage_bindings(&operation, paged_state),
         "resource-estimator.device-operation",
         ContractVersion::new(1, 0),
         sha('b'),
@@ -391,7 +482,11 @@ fn catalog_with_resource_options_and_execution_semantics(
             total_memory_bytes: 1 << 20,
             runtime_implementation_fingerprint: sha('d'),
             capabilities: capabilities.clone(),
-            dynamic_storage_profiles: BTreeSet::from([contiguous_storage_profile()]),
+            dynamic_storage_profiles: if paged_state {
+                BTreeSet::from([contiguous_storage_profile(), paged_storage_profile()])
+            } else {
+                BTreeSet::from([contiguous_storage_profile()])
+            },
         },
         vec![operation.clone()],
         BTreeMap::from([(operation.id.clone(), vec![provider])]),
@@ -697,6 +792,18 @@ fn policy_with_reusable_execution_and_determinism(
     reusable_execution: Option<ReusableExecutionPolicy>,
     execution_determinism: ExecutionDeterminismRequirement,
 ) -> ResolvedRuntimePolicy {
+    policy_with_reusable_execution_determinism_and_storage(
+        reusable_execution,
+        execution_determinism,
+        false,
+    )
+}
+
+fn policy_with_reusable_execution_determinism_and_storage(
+    reusable_execution: Option<ReusableExecutionPolicy>,
+    execution_determinism: ExecutionDeterminismRequirement,
+    paged_state: bool,
+) -> ResolvedRuntimePolicy {
     ResolvedRuntimePolicy::new(
         "runtime-policy.device-operation",
         ContractVersion::new(1, 0),
@@ -705,7 +812,11 @@ fn policy_with_reusable_execution_and_determinism(
             capacity_bytes: 65_536,
             reserve_bytes: 128,
             maximum_active_sequences: 64,
-            dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+            dynamic_storage_profile_order: if paged_state {
+                vec![contiguous_storage_profile(), paged_storage_profile()]
+            } else {
+                vec![contiguous_storage_profile()]
+            },
         },
         AdmissionPolicy {
             maximum_queue_depth: 8,
@@ -1850,25 +1961,34 @@ pub(crate) fn resolved_model_plan_with_zero_state(
     resolved_model_plan_with_zero_state_and_policy(
         registry,
         zero_state,
+        false,
         &runtime_policy,
         &catalog,
         false,
     )
 }
 
+fn test_raw_config(zero_state: bool, token_scaled_state: bool) -> Value {
+    match (zero_state, token_scaled_state) {
+        (false, false) => json!({"width": 4}),
+        (true, false) => json!({"width": 4, "zero_state": true}),
+        (true, true) => {
+            json!({"width": 4, "zero_state": true, "token_scaled_state": true})
+        }
+        (false, true) => unreachable!("token-scaled state requires the state binding"),
+    }
+}
+
 fn resolved_model_plan_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
+    token_scaled_state: bool,
     runtime_policy: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
     retain_determinism_outputs: bool,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
-    let raw_config = if zero_state {
-        json!({"width": 4, "zero_state": true})
-    } else {
-        json!({"width": 4})
-    };
+    let raw_config = test_raw_config(zero_state, token_scaled_state);
     let family = model_registry.registration.prepare(&raw_config).unwrap();
     let resolutions = vec![
         node_resolution_with_zero_state(&family, catalog, runtime_policy, registry, zero_state),
@@ -2034,6 +2154,7 @@ pub(crate) fn plan_for_registry_with_zero_state(
     plan_for_registry_with_zero_state_and_policy(
         registry,
         zero_state,
+        false,
         &runtime_policy,
         &catalog,
         false,
@@ -2043,15 +2164,12 @@ pub(crate) fn plan_for_registry_with_zero_state(
 fn plan_for_registry_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
+    token_scaled_state: bool,
     runtime_policy: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
     retain_determinism_outputs: bool,
 ) -> ExecutionPlan {
-    let raw_config = if zero_state {
-        json!({"width": 4, "zero_state": true})
-    } else {
-        json!({"width": 4})
-    };
+    let raw_config = test_raw_config(zero_state, token_scaled_state);
     let family = TypedFamilyRegistration::new(TestFamily)
         .prepare(&raw_config)
         .unwrap();
@@ -2143,8 +2261,18 @@ pub(crate) fn logical_resources(
     run_id: &str,
     request_id: &str,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
+    logical_resources_with_work(plan_resources, run_id, request_id, one_token_span())
+}
+
+pub(crate) fn logical_resources_with_work(
+    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    run_id: &str,
+    request_id: &str,
+    token_span: TokenSpanWork,
+) -> Arc<AdmittedSequenceResources<TestRuntime>> {
+    let work = ResourceWorkShape::single(token_span).unwrap();
     let request = RequestResourceAdmissionRequest::new(
-        one_token_work(),
+        work.clone(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -2174,7 +2302,7 @@ pub(crate) fn logical_resources(
         }
     };
     let sequence = SequenceResourceAdmissionRequest::new(
-        one_token_work(),
+        work,
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -2224,8 +2352,24 @@ pub(crate) fn begin_single_participant_step_on_lane_with_bucket(
     lane: &Arc<ExecutionLane<TestRuntime>>,
     bucket: Option<&ReusableExecutionBucketSpec>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
+    begin_single_participant_step_on_lane_with_bucket_and_work(
+        batch,
+        lane,
+        bucket,
+        one_token_span(),
+    )
+}
+
+pub(crate) fn begin_single_participant_step_on_lane_with_bucket_and_work(
+    batch: &ExecutionBatchParticipants<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+    bucket: Option<&ReusableExecutionBucketSpec>,
+    token_span: TokenSpanWork,
+) -> Arc<StepResourceLease<TestRuntime>> {
+    let expected_immediate_tokens = token_span.immediate_tokens();
+    let expected_fit_tokens = token_span.fit_input_tokens();
     let request = StepResourceAdmissionRequest::new(
-        batch.bind_work_shape(vec![one_token_span()]).unwrap(),
+        batch.bind_work_shape(vec![token_span]).unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -2239,10 +2383,13 @@ pub(crate) fn begin_single_participant_step_on_lane_with_bucket(
             StepResourceAdmissionDecision::Admitted(step) => {
                 assert_eq!(step.work_shape().participants().len(), 1);
                 assert_eq!(step.work_shape().immediate_sequences(), 1);
-                assert_eq!(step.work_shape().immediate_tokens(), 1);
+                assert_eq!(
+                    step.work_shape().immediate_tokens(),
+                    expected_immediate_tokens
+                );
                 assert_eq!(step.work_shape().immediate_pages(), 0);
                 assert_eq!(step.work_shape().fit_sequences(), 1);
-                assert_eq!(step.work_shape().fit_tokens(), 1);
+                assert_eq!(step.work_shape().fit_tokens(), expected_fit_tokens);
                 assert_eq!(step.work_shape().fit_pages(), 0);
                 assert_eq!(step.work_shape().fingerprint().len(), 64);
                 assert_eq!(step.claimed_backing().fingerprint().len(), 64);
@@ -2402,6 +2549,17 @@ pub(crate) fn fixture_with_determinism_provider_behavior(
     )
 }
 
+pub(crate) fn fixture_with_token_scaled_paged_state() -> Fixture {
+    fixture_with_provider_behavior_execution_semantics_retention_and_storage(
+        true,
+        true,
+        ProviderBehavior::Success,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        true,
+    )
+}
+
 pub(crate) fn fixture_with_provider_behavior_and_execution_semantics(
     zero_state: bool,
     behavior: ProviderBehavior,
@@ -2424,6 +2582,24 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
     execution_determinism: ExecutionDeterminismRequirement,
     retain_determinism_outputs: bool,
 ) -> Fixture {
+    fixture_with_provider_behavior_execution_semantics_retention_and_storage(
+        zero_state,
+        false,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        retain_determinism_outputs,
+    )
+}
+
+fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
+    zero_state: bool,
+    token_scaled_state: bool,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed
@@ -2432,26 +2608,32 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
     } else {
         ResourcePresenceRequirement::Forbidden
     };
-    let catalog = catalog_with_resource_options_and_execution_semantics(
+    let catalog = catalog_with_resource_options_execution_semantics_and_storage(
         zero_state,
         scratch,
         execution_semantics,
+        token_scaled_state,
     );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
         let (_, bucket) = reusable_policy();
         (
-            policy_with_reusable_execution_and_determinism(
+            policy_with_reusable_execution_determinism_and_storage(
                 Some(
                     ReusableExecutionPolicy::new(1, vec![bucket.clone()])
                         .expect("valid reusable execution policy"),
                 ),
                 execution_determinism,
+                token_scaled_state,
             ),
             Some(bucket),
         )
     } else {
         (
-            policy_with_reusable_execution_and_determinism(None, execution_determinism),
+            policy_with_reusable_execution_determinism_and_storage(
+                None,
+                execution_determinism,
+                token_scaled_state,
+            ),
             None,
         )
     };
@@ -2479,6 +2661,7 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
     let (resolved, plan) = resolved_model_plan_with_zero_state_and_policy(
         &registry,
         zero_state,
+        token_scaled_state,
         &runtime_policy,
         &catalog,
         retain_determinism_outputs,
@@ -2491,6 +2674,7 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
     let impostor_plan_hash = plan_for_registry_with_zero_state_and_policy(
         &impostor_registry,
         zero_state,
+        token_scaled_state,
         &runtime_policy,
         &catalog,
         retain_determinism_outputs,
