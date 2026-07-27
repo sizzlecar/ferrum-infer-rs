@@ -12,6 +12,7 @@ mod types;
 pub use types::*;
 
 mod capabilities;
+mod native_status;
 
 #[cfg(any(feature = "cuda", test))]
 mod reusable_execution;
