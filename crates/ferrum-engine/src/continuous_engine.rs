@@ -4556,6 +4556,23 @@ impl VNextProfileEventContext {
                     "provider_id".to_string(),
                     serde_json::json!(node.provider_id().to_string()),
                 );
+                let semantics = node.provider_execution_semantics();
+                attributes.insert(
+                    "provider_execution_contract_version".to_string(),
+                    serde_json::json!(semantics.contract_version().to_string()),
+                );
+                attributes.insert(
+                    "provider_execution_contract_fingerprint".to_string(),
+                    serde_json::json!(semantics.contract_fingerprint().to_string()),
+                );
+                attributes.insert(
+                    "provider_execution_repeatability".to_string(),
+                    serde_json::json!(semantics.repeatability().as_str()),
+                );
+                attributes.insert(
+                    "provider_replay_equivalence".to_string(),
+                    serde_json::json!(semantics.replay_equivalence().as_str()),
+                );
             }
             attributes.insert(
                 "device_timing_status".to_string(),

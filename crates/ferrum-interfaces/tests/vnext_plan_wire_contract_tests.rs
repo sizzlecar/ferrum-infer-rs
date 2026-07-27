@@ -106,7 +106,7 @@ fn breaking_schema_versions_are_rejected_100_of_100() {
 }
 
 #[test]
-fn legacy_schema_is_rejected_before_v7_weight_source_validation() {
+fn legacy_schema_is_rejected_before_v8_provider_execution_validation() {
     let fixture = plan_fixture(0);
     let mut value = serde_json::to_value(&fixture.plan).unwrap();
     value["payload"]["schema"] = json!({"major": 3, "minor": 0});
@@ -122,12 +122,25 @@ fn legacy_schema_is_rejected_before_v7_weight_source_validation() {
     assert!(matches!(
         error,
         VNextError::UnsupportedPlanSchema {
-            expected_major: 7,
+            expected_major: 8,
             expected_minor: 0,
             actual_major: 3,
             actual_minor: 0,
         }
     ));
+}
+
+#[test]
+fn provider_execution_semantics_are_required_on_the_plan_wire() {
+    let fixture = plan_fixture(0);
+    let mut value = serde_json::to_value(&fixture.plan).unwrap();
+    value["payload"]["nodes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_execution_semantics");
+    rehash_plan_json(&mut value);
+
+    assert!(ExecutionPlan::decode_untrusted(&serde_json::to_vec(&value).unwrap()).is_err());
 }
 
 #[test]

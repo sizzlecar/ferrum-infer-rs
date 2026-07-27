@@ -1706,6 +1706,7 @@ fn provider_catalog_and_reference_oracle_fail_closed() {
                 BTreeSet::new(),
                 BTreeSet::from([id("weight-format.unsupported")]),
                 BTreeSet::new(),
+                ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
             )
             .unwrap(),
         )

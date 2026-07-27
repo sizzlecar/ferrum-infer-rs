@@ -7,9 +7,9 @@ use super::{
     BatchOperationParticipantIdentity, BatchStepId, DeviceId, DeviceRuntime, ExecutablePlanView,
     ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, NodeId,
     NodeInvocationId, OperationDispatch, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PreparedStepSubmissionWave, ProviderId, RequestIdentity, ResourcePoolId, RunId, SpanId,
-    StepParticipantFrameAssignment, TransactionId, TrustedActiveSequenceBinding, VNextError,
-    EXECUTION_IDENTITY_VERSION,
+    PreparedStepSubmissionWave, ProviderExecutionSemantics, ProviderId, RequestIdentity,
+    ResourcePoolId, RunId, SpanId, StepParticipantFrameAssignment, TransactionId,
+    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -18,6 +18,7 @@ struct CompiledSubmissionWaveNodeIdentityTemplate {
     node_id: NodeId,
     operation_id: OperationId,
     provider_id: ProviderId,
+    provider_execution_semantics: ProviderExecutionSemantics,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -241,6 +242,7 @@ impl DeferredBatchOperationIdentityRecipe {
             node.node_id.clone(),
             node.operation_id.clone(),
             node.provider_id.clone(),
+            node.provider_execution_semantics,
             self.work_shape_fingerprint.clone(),
             participants,
         )
@@ -379,6 +381,7 @@ impl OperationDispatch {
                     node_id: node.id().clone(),
                     operation_id: node.operation_id().clone(),
                     provider_id: node.selection().selected_provider().clone(),
+                    provider_execution_semantics: node.provider_execution_semantics(),
                 })
             })
             .collect::<Result<Vec<_>, VNextError>>()?;

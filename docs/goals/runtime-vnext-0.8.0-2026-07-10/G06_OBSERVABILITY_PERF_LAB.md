@@ -472,8 +472,8 @@ GitHub artifact branch 为
 - top operations/kernels 累计覆盖 device time `>=80%`。
 - G09 同配置 5 次正式 throughput CV `<=5%`；超过时该性能 claim 的 artifact REJECT 并报告噪声源，
   但不得反向阻塞默认关闭的 profile 功能合同。
-- historical failures：first failure class `15/15 family`、`M/M concrete case` 正确，replay
-  同样达到 `15/15` 和 `M/M`。
+- historical failures：first failure class `16/16 family`、`M/M concrete case` 正确，replay
+  同样达到 `16/16` 和 `M/M`。
 - 从已有 artifact 到自动 top bottleneck/target gap 报告耗时 `<=60s`。
 - 正式 HTTP benchmark client 数量 `1`；正式 regex-derived throughput 数量 `0`。
 - 官方性能 lane `100%` 输出 BenchReport 和 KEEP/REJECT。

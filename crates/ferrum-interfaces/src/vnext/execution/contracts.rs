@@ -4,8 +4,9 @@ use super::{
     ProviderCompatibilityRejectReason, ProviderId, ProviderResourcePlan, ResolvedValueBinding,
     ResolvedValueRole, ResourceId, SemanticValue, Serialize, StateId, TensorAccess, VNextError,
 };
+use crate::vnext::ProviderExecutionSemantics;
 
-pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(7, 0);
+pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(8, 0);
 pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of O(graph) static allocations plus dynamic descriptors.
 /// This limit is independent of the concurrency ceiling.
@@ -83,7 +84,7 @@ impl RejectedProvider {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSelectionReason {
     PreferredCompatible,
-    DeterministicCompatible,
+    CanonicalCompatible,
     FallbackFromPreferred,
 }
 
@@ -273,6 +274,7 @@ pub struct PlanNode {
     pub(super) operation_version: ContractVersion,
     pub(super) operation_fingerprint: String,
     pub(super) provider_implementation_fingerprint: String,
+    pub(super) provider_execution_semantics: ProviderExecutionSemantics,
     pub(super) required_capabilities: BTreeSet<CapabilityId>,
     pub(super) attributes: BTreeMap<AttributeId, SemanticValue>,
     pub(super) work: NodeWorkContract,
@@ -310,13 +312,14 @@ impl PlanNode {
             operation_version: ContractVersion::new(1, 0),
             operation_fingerprint: "4".repeat(64),
             provider_implementation_fingerprint: "5".repeat(64),
+            provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
             required_capabilities: BTreeSet::new(),
             attributes: BTreeMap::new(),
             work: super::NodeWorkContract::Fixed,
             selection: super::ProviderSelection {
                 requested_provider: None,
                 selected_provider,
-                selection_reason: super::ProviderSelectionReason::DeterministicCompatible,
+                selection_reason: super::ProviderSelectionReason::CanonicalCompatible,
                 rejected_providers: Vec::new(),
             },
             provider_resources,
@@ -363,6 +366,10 @@ impl PlanNode {
 
     pub fn provider_implementation_fingerprint(&self) -> &str {
         &self.provider_implementation_fingerprint
+    }
+
+    pub const fn provider_execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.provider_execution_semantics
     }
 
     pub fn required_capabilities(&self) -> &BTreeSet<CapabilityId> {

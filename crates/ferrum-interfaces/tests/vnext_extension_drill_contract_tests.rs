@@ -228,6 +228,7 @@ fn extension_catalog(
                     operation.id.clone(),
                     operation.fingerprint().unwrap(),
                     sha('f'),
+                    ProviderExecutionSemantics::bitwise_eager_and_replay(),
                     operation.version,
                     device_id.clone(),
                     capabilities.clone(),

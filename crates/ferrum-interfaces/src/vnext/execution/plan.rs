@@ -26,8 +26,8 @@ use super::{
 };
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 use crate::vnext::{
-    CompletionReadbackRequest, HostTransferLayout, ResourceWorkShape, WeightComponentPayload,
-    WeightComponentSource, WeightComponentSpec,
+    CompletionReadbackRequest, ExecutionDeterminismRequirement, HostTransferLayout,
+    ResourceWorkShape, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -177,6 +177,7 @@ impl ExecutionPlan {
                 provider_resources,
                 storage_rejection,
                 request.capabilities,
+                request.policy.execution_determinism_requirement(),
                 &producers,
                 node_index,
                 &last_consumers,
@@ -268,6 +269,7 @@ impl ExecutionPlan {
         provider_resources: ProviderResourcePlan,
         storage_rejection: Option<RejectedProvider>,
         catalog: &CapabilityCatalog,
+        execution_determinism: ExecutionDeterminismRequirement,
         producers: &BTreeMap<ProgramValueId, NodeId>,
         node_index: usize,
         last_consumers: &BTreeMap<ProgramValueId, usize>,
@@ -320,6 +322,7 @@ impl ExecutionPlan {
             storage_rejection,
             &required_weight_formats,
             &required_quantization_formats,
+            execution_determinism,
         )?;
         provider_resources.validate_shape()?;
         if provider_resources.provider_id != selection.selected_provider {
@@ -453,6 +456,7 @@ impl ExecutionPlan {
             provider_implementation_fingerprint: selected_provider
                 .provider_implementation_fingerprint()
                 .to_owned(),
+            provider_execution_semantics: selected_provider.execution_semantics(),
             required_capabilities: resolution.required_capabilities,
             attributes: program_node.attributes.clone(),
             work,
@@ -1359,6 +1363,7 @@ impl ExecutionPlan {
         storage_rejection: Option<RejectedProvider>,
         required_weight_formats: &BTreeSet<WeightFormatId>,
         required_quantization_formats: &BTreeSet<QuantizationFormatId>,
+        execution_determinism: ExecutionDeterminismRequirement,
     ) -> Result<ProviderSelection, VNextError> {
         let required_capabilities = operation
             .provider
@@ -1372,6 +1377,7 @@ impl ExecutionPlan {
             required_capabilities,
             required_weight_formats.clone(),
             required_quantization_formats.clone(),
+            execution_determinism,
         )?;
         let report = catalog.provider_compatibility(request)?;
         report.require_compatible_for_node(&catalog.device().id, &node.id)?;
@@ -1389,7 +1395,7 @@ impl ExecutionPlan {
                 ProviderSelectionReason::PreferredCompatible
             }
             Some(_) => ProviderSelectionReason::FallbackFromPreferred,
-            None => ProviderSelectionReason::DeterministicCompatible,
+            None => ProviderSelectionReason::CanonicalCompatible,
         };
         let mut rejected_providers = report
             .rejected()
@@ -1471,7 +1477,7 @@ impl ExecutionPlan {
             selection.requested_provider.as_ref(),
             selection.selection_reason,
         ) {
-            (None, ProviderSelectionReason::DeterministicCompatible) => {}
+            (None, ProviderSelectionReason::CanonicalCompatible) => {}
             (Some(requested), ProviderSelectionReason::PreferredCompatible)
                 if requested == &selection.selected_provider => {}
             (Some(requested), ProviderSelectionReason::FallbackFromPreferred)

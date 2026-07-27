@@ -5,12 +5,32 @@ use super::{
     canonical_fingerprint, invalid_event, validate_sha256, DeviceId, ExecutionPlan, NodeId,
     OperationId, PlanHash, PlanId, ProviderId, VNextError,
 };
+use crate::vnext::ProviderExecutionSemantics;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrustedNodeTopology {
     pub(super) operation_id: OperationId,
     pub(super) provider_id: ProviderId,
+    pub(super) provider_execution_semantics: ProviderExecutionSemantics,
     pub(super) dependencies: BTreeSet<NodeId>,
+}
+
+impl TrustedNodeTopology {
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub const fn provider_execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.provider_execution_semantics
+    }
+
+    pub fn dependencies(&self) -> &BTreeSet<NodeId> {
+        &self.dependencies
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -34,6 +54,7 @@ impl TrustedExecutionTopology {
                     TrustedNodeTopology {
                         operation_id: node.operation_id().clone(),
                         provider_id: node.selection().selected_provider().clone(),
+                        provider_execution_semantics: node.provider_execution_semantics(),
                         dependencies: node.dependencies().iter().cloned().collect(),
                     },
                 )
@@ -86,5 +107,9 @@ impl TrustedExecutionTopology {
 
     pub fn node_ids(&self) -> BTreeSet<NodeId> {
         self.nodes.keys().cloned().collect()
+    }
+
+    pub fn node(&self, node_id: &NodeId) -> Option<&TrustedNodeTopology> {
+        self.nodes.get(node_id)
     }
 }

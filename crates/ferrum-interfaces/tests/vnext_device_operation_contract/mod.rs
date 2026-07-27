@@ -348,6 +348,18 @@ fn catalog_with_resource_options(
     zero_state: bool,
     scratch: ResourcePresenceRequirement,
 ) -> CapabilityCatalog {
+    catalog_with_resource_options_and_execution_semantics(
+        zero_state,
+        scratch,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+    )
+}
+
+fn catalog_with_resource_options_and_execution_semantics(
+    zero_state: bool,
+    scratch: ResourcePresenceRequirement,
+    execution_semantics: ProviderExecutionSemantics,
+) -> CapabilityCatalog {
     let operation = operation_with_resource_options(zero_state, scratch);
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
@@ -356,6 +368,7 @@ fn catalog_with_resource_options(
         operation.id.clone(),
         operation.fingerprint().unwrap(),
         sha('c'),
+        execution_semantics,
         ContractVersion::new(1, 0),
         device_id.clone(),
         capabilities.clone(),
@@ -671,6 +684,16 @@ impl OperationProvider<TestRuntime> for TestProvider {
 fn policy_with_reusable_execution(
     reusable_execution: Option<ReusableExecutionPolicy>,
 ) -> ResolvedRuntimePolicy {
+    policy_with_reusable_execution_and_determinism(
+        reusable_execution,
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+    )
+}
+
+fn policy_with_reusable_execution_and_determinism(
+    reusable_execution: Option<ReusableExecutionPolicy>,
+    execution_determinism: ExecutionDeterminismRequirement,
+) -> ResolvedRuntimePolicy {
     ResolvedRuntimePolicy::new(
         "runtime-policy.device-operation",
         ContractVersion::new(1, 0),
@@ -688,6 +711,7 @@ fn policy_with_reusable_execution(
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        execution_determinism,
         reusable_execution,
     )
     .unwrap()
@@ -2266,6 +2290,20 @@ pub(crate) fn fixture_with_provider_behavior(
     zero_state: bool,
     behavior: ProviderBehavior,
 ) -> Fixture {
+    fixture_with_provider_behavior_and_execution_semantics(
+        zero_state,
+        behavior,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+    )
+}
+
+pub(crate) fn fixture_with_provider_behavior_and_execution_semantics(
+    zero_state: bool,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed
@@ -2274,12 +2312,28 @@ pub(crate) fn fixture_with_provider_behavior(
     } else {
         ResourcePresenceRequirement::Forbidden
     };
-    let catalog = catalog_with_resource_options(zero_state, scratch);
+    let catalog = catalog_with_resource_options_and_execution_semantics(
+        zero_state,
+        scratch,
+        execution_semantics,
+    );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
-        let (policy, bucket) = reusable_policy();
-        (policy, Some(bucket))
+        let (_, bucket) = reusable_policy();
+        (
+            policy_with_reusable_execution_and_determinism(
+                Some(
+                    ReusableExecutionPolicy::new(1, vec![bucket.clone()])
+                        .expect("valid reusable execution policy"),
+                ),
+                execution_determinism,
+            ),
+            Some(bucket),
+        )
     } else {
-        (policy(), None)
+        (
+            policy_with_reusable_execution_and_determinism(None, execution_determinism),
+            None,
+        )
     };
     let provider_behavior = Arc::new(Mutex::new(behavior));
     let provider_trace = Arc::new(Mutex::new(ProviderTrace::default()));

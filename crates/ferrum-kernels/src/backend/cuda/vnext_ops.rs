@@ -332,6 +332,7 @@ impl CudaTokenEmbeddingProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
+            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),

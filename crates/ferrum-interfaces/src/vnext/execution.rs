@@ -77,6 +77,9 @@ pub use compiler::*;
 mod checkpoint;
 pub use checkpoint::*;
 
+mod determinism;
+pub use determinism::*;
+
 #[cfg(test)]
 #[path = "execution/tests.rs"]
 mod tests;

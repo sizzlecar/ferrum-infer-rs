@@ -570,6 +570,16 @@ pub(crate) fn catalog() -> CapabilityCatalog {
 }
 
 pub(crate) fn catalog_with_memory(total_memory_bytes: u64) -> CapabilityCatalog {
+    catalog_with_memory_and_execution_semantics(
+        total_memory_bytes,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+    )
+}
+
+pub(crate) fn catalog_with_memory_and_execution_semantics(
+    total_memory_bytes: u64,
+    execution_semantics: ProviderExecutionSemantics,
+) -> CapabilityCatalog {
     let operation = operation();
     let device_id: DeviceId = id("device.reference.0");
     let capabilities: BTreeSet<CapabilityId> = BTreeSet::from([id("capability.compute")]);
@@ -578,6 +588,7 @@ pub(crate) fn catalog_with_memory(total_memory_bytes: u64) -> CapabilityCatalog 
         operation.id.clone(),
         operation.fingerprint().unwrap(),
         sha('f'),
+        execution_semantics,
         ContractVersion::new(1, 0),
         device_id.clone(),
         capabilities.clone(),
@@ -630,6 +641,7 @@ pub(crate) fn catalog_from_operations(
                     operation.id.clone(),
                     operation.fingerprint()?,
                     sha('f'),
+                    ProviderExecutionSemantics::bitwise_eager_and_replay(),
                     ContractVersion::new(1, 0),
                     device_id.clone(),
                     capabilities.clone(),
@@ -689,6 +701,7 @@ pub(crate) fn catalog_with_secondary_provider_storage(
             operation.id.clone(),
             operation.fingerprint().unwrap(),
             sha(provider_implementation),
+            ProviderExecutionSemantics::bitwise_eager_and_replay(),
             ContractVersion::new(1, 0),
             device_id.clone(),
             capabilities.clone(),
@@ -1204,6 +1217,7 @@ pub(crate) fn policy_with_tokens(
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         None,
     )
 }
@@ -1234,6 +1248,10 @@ impl RuntimePolicy for AdversarialRuntimePolicy {
 
     fn maximum_scheduled_tokens(&self) -> u64 {
         self.maximum_scheduled_tokens
+    }
+
+    fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
     }
 
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {

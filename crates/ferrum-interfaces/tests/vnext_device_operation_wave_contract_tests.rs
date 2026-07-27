@@ -1034,6 +1034,10 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
         &lane,
     )
     .unwrap();
+    assert!(batch_identity.nodes().iter().all(|node| {
+        node.provider_execution_semantics()
+            == ProviderExecutionSemantics::bitwise_eager_and_replay()
+    }));
     let expected_program_id = OperationDispatch::reusable_execution_program_id_for_wave(
         &providers,
         &fixture.resolved,
@@ -1273,6 +1277,49 @@ fn reusable_topology_states_cannot_alias_resident_program_authority() {
         .is_none(),
         "one ineligible provider must veto resident reuse for the complete wave"
     );
+
+    drop(providers);
+    drop(wave);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn eager_only_provider_cannot_authorize_reusable_topology() {
+    let (fixture, sequence, session, batch, step) =
+        setup_with_fixture(fixture_with_provider_behavior_and_execution_semantics(
+            false,
+            ProviderBehavior::ProgramBinding,
+            ProviderExecutionSemantics::bitwise_eager_only(),
+            ExecutionDeterminismRequirement::BitwiseSameRuntime,
+        ));
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let lane = Arc::clone(step.execution_lane());
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+
+    let error = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("without a bitwise eager-equivalence contract"));
+    assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
+    assert!(fixture
+        .runtime_trace
+        .lock()
+        .unwrap()
+        .submitted_command_counts
+        .is_empty());
 
     drop(providers);
     drop(wave);

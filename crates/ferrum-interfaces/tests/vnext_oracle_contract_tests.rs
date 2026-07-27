@@ -74,6 +74,7 @@ fn catalog(operations: &[OperationDescriptor]) -> CapabilityCatalog {
                     operation.id.clone(),
                     operation.fingerprint().unwrap(),
                     sha('d'),
+                    ProviderExecutionSemantics::bitwise_eager_and_replay(),
                     ContractVersion::new(1, 0),
                     device_id.clone(),
                     capabilities.clone(),

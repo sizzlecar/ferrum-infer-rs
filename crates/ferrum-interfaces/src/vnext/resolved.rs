@@ -9,8 +9,8 @@ use std::io::{self, Write};
 use super::model::PreparedModelFamilyWire;
 use super::{
     AdmissionFitPolicy, CapabilityCatalog, CompletionRetentionSpec, ContractVersion,
-    DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView, ExecutionPlan,
-    ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId,
+    DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView, ExecutionDeterminismRequirement,
+    ExecutionPlan, ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId,
     ReusableExecutionPolicy, RuntimePolicy, SpecialTokenRole, TokenizerDescriptor,
     UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, UnvalidatedPreparedModelFamily,
     VNextError,
@@ -1012,6 +1012,7 @@ struct RuntimePolicyFingerprintPayload<'a> {
     scheduling: SchedulingDiscipline,
     memory: &'a RuntimeMemoryPolicy,
     admission: &'a AdmissionPolicy,
+    execution_determinism: ExecutionDeterminismRequirement,
     reusable_execution: &'a Option<ReusableExecutionPolicy>,
 }
 
@@ -1022,6 +1023,7 @@ pub struct ResolvedRuntimePolicy {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    execution_determinism: ExecutionDeterminismRequirement,
     reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
 }
@@ -1034,6 +1036,7 @@ struct ResolvedRuntimePolicyWire {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    execution_determinism: ExecutionDeterminismRequirement,
     reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
 }
@@ -1050,6 +1053,7 @@ impl<'de> Deserialize<'de> for ResolvedRuntimePolicy {
             wire.scheduling,
             wire.memory,
             wire.admission,
+            wire.execution_determinism,
             wire.reusable_execution,
         )
         .map_err(serde::de::Error::custom)?;
@@ -1070,6 +1074,7 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: RuntimeMemoryPolicy,
         admission: AdmissionPolicy,
+        execution_determinism: ExecutionDeterminismRequirement,
         reusable_execution: Option<ReusableExecutionPolicy>,
     ) -> Result<Self, VNextError> {
         let policy_id = policy_id.into();
@@ -1086,6 +1091,7 @@ impl ResolvedRuntimePolicy {
             scheduling,
             &memory,
             &admission,
+            execution_determinism,
             &reusable_execution,
         )?;
         Ok(Self {
@@ -1094,6 +1100,7 @@ impl ResolvedRuntimePolicy {
             scheduling,
             memory,
             admission,
+            execution_determinism,
             reusable_execution,
             fingerprint,
         })
@@ -1160,6 +1167,7 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        execution_determinism: ExecutionDeterminismRequirement,
         reusable_execution: &Option<ReusableExecutionPolicy>,
     ) -> Result<String, VNextError> {
         canonical_fingerprint(
@@ -1169,6 +1177,7 @@ impl ResolvedRuntimePolicy {
                 scheduling,
                 memory,
                 admission,
+                execution_determinism,
                 reusable_execution,
             },
             "serialize resolved runtime policy",
@@ -1193,6 +1202,10 @@ impl ResolvedRuntimePolicy {
 
     pub fn admission(&self) -> &AdmissionPolicy {
         &self.admission
+    }
+
+    pub const fn execution_determinism(&self) -> ExecutionDeterminismRequirement {
+        self.execution_determinism
     }
 
     pub fn reusable_execution(&self) -> Option<&ReusableExecutionPolicy> {
@@ -1225,6 +1238,10 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
         self.admission.maximum_scheduled_tokens
     }
 
+    fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
+        self.execution_determinism
+    }
+
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {
         &self.memory.dynamic_storage_profile_order
     }
@@ -1247,6 +1264,7 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
             self.scheduling,
             &self.memory,
             &self.admission,
+            self.execution_determinism,
             &self.reusable_execution,
         )?;
         if self.fingerprint != computed {
