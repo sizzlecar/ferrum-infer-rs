@@ -366,18 +366,22 @@ EXECUTION_FIELDS = frozenset(
         "execution_id",
         "mode",
         "restore_sha256",
+        "initialization_identity",
         "submission_fingerprint",
         "receipt_fingerprint",
         "attribution",
         "witnesses",
     }
 )
+EXECUTION_INITIALIZATION_IDENTITY_FIELDS = frozenset(
+    {"input_sha256", "rng_sha256", "initial_state_sha256"}
+)
 ATTRIBUTION_FIELDS = frozenset(
     {
         "batch_identity_fingerprint",
         "submission_fingerprint",
-        "reusable_executable_fingerprint",
-        "commands",
+        "physical_commands",
+        "replayed_segments",
     }
 )
 COMMAND_FIELDS = frozenset(
@@ -387,6 +391,26 @@ COMMAND_FIELDS = frozenset(
         "command_phase",
         "native_op_id",
         "execution_path",
+        "batching_form",
+        "participant_count",
+        "token_count",
+        "compute_dispatch_count",
+        "transfer_command_count",
+        "reusable_graph_node_count",
+    }
+)
+REPLAYED_SEGMENT_FIELDS = frozenset(
+    {
+        "physical_command_index",
+        "reusable_executable_fingerprint",
+        "logical_commands",
+    }
+)
+REPLAYED_LOGICAL_COMMAND_FIELDS = frozenset(
+    {
+        "logical_command_ordinal",
+        "node_id",
+        "native_op_id",
         "batching_form",
         "participant_count",
         "token_count",
@@ -1612,6 +1636,16 @@ def validate_execution(
     mode = text(execution["mode"], f"{label}.mode")
     require(mode in {"eager", "replay"}, f"{label}.mode is invalid")
     sha256_text(execution["restore_sha256"], f"{label}.restore_sha256")
+    initialization_identity = exact_object(
+        execution["initialization_identity"],
+        EXECUTION_INITIALIZATION_IDENTITY_FIELDS,
+        f"{label}.initialization_identity",
+    )
+    for field in EXECUTION_INITIALIZATION_IDENTITY_FIELDS:
+        sha256_text(
+            initialization_identity[field],
+            f"{label}.initialization_identity.{field}",
+        )
     submission_fingerprint = sha256_text(
         execution["submission_fingerprint"], f"{label}.submission_fingerprint"
     )
@@ -1626,19 +1660,19 @@ def validate_execution(
         attribution["submission_fingerprint"] == submission_fingerprint,
         f"{label}.attribution submission fingerprint differs from execution",
     )
-    reusable_fingerprint = attribution["reusable_executable_fingerprint"]
-    if mode == "replay":
-        sha256_text(reusable_fingerprint, f"{label}.attribution.reusable_executable_fingerprint")
-    else:
-        require(reusable_fingerprint is None, f"{label} eager execution has reusable attribution")
 
-    commands_raw = attribution["commands"]
-    require(isinstance(commands_raw, list) and commands_raw, f"{label}.attribution.commands must be non-empty")
+    commands_raw = attribution["physical_commands"]
+    require(
+        isinstance(commands_raw, list) and commands_raw,
+        f"{label}.attribution.physical_commands must be non-empty",
+    )
+    physical_commands: dict[int, dict[str, Any]] = {}
     compute_nodes: set[str] = set()
     for index, raw in enumerate(commands_raw):
-        command_label = f"{label}.attribution.commands[{index}]"
+        command_label = f"{label}.attribution.physical_commands[{index}]"
         command = exact_object(raw, COMMAND_FIELDS, command_label)
         require(command["command_index"] == index, f"{command_label}.command_index is not contiguous")
+        physical_commands[index] = command
         node_id = command["node_id"]
         if node_id is not None:
             text(node_id, f"{command_label}.node_id", portable=True)
@@ -1668,22 +1702,156 @@ def validate_execution(
         graph_nodes = command["reusable_graph_node_count"]
         if graph_nodes is not None:
             integer(graph_nodes, f"{command_label}.reusable_graph_node_count", minimum=1)
-        if phase == "compute" and node_id in target_nodes:
+        if mode == "eager" and phase == "compute" and node_id in target_nodes:
             require(
                 command_participants == participant_count,
                 f"{command_label} participant count differs from the case",
             )
-            if mode == "eager":
-                require(
-                    execution_path == "eager" and graph_nodes is None,
-                    f"{command_label} eager proof did not use the eager path",
-                )
-            else:
-                require(
-                    execution_path == "replayed" and graph_nodes is not None,
-                    f"{command_label} replay proof used eager fallback or lacks graph attribution",
-                )
+            require(
+                execution_path == "eager" and graph_nodes is None,
+                f"{command_label} eager proof did not use the eager path",
+            )
             compute_nodes.add(node_id)
+
+    replayed_segments_raw = attribution["replayed_segments"]
+    require(
+        isinstance(replayed_segments_raw, list),
+        f"{label}.attribution.replayed_segments must be a list",
+    )
+    if mode == "eager":
+        require(
+            not replayed_segments_raw,
+            f"{label} eager execution has replayed segment attribution",
+        )
+        require(
+            not any(
+                command["command_phase"] == "compute"
+                and command["execution_path"] == "replayed"
+                for command in physical_commands.values()
+            ),
+            f"{label} eager execution contains a replayed physical command",
+        )
+    else:
+        require(
+            replayed_segments_raw,
+            f"{label} replay execution has no replayed segment attribution",
+        )
+        segment_physical_indices: set[int] = set()
+        previous_physical_index: int | None = None
+        for segment_index, raw in enumerate(replayed_segments_raw):
+            segment_label = (
+                f"{label}.attribution.replayed_segments[{segment_index}]"
+            )
+            segment = exact_object(raw, REPLAYED_SEGMENT_FIELDS, segment_label)
+            physical_index = integer(
+                segment["physical_command_index"],
+                f"{segment_label}.physical_command_index",
+            )
+            require(
+                previous_physical_index is None
+                or previous_physical_index < physical_index,
+                f"{label}.attribution.replayed_segments are not in physical command order",
+            )
+            previous_physical_index = physical_index
+            require(
+                physical_index not in segment_physical_indices,
+                f"{segment_label} duplicates a physical command",
+            )
+            segment_physical_indices.add(physical_index)
+            sha256_text(
+                segment["reusable_executable_fingerprint"],
+                f"{segment_label}.reusable_executable_fingerprint",
+            )
+            physical = physical_commands.get(physical_index)
+            require(
+                physical is not None
+                and physical["command_phase"] == "compute"
+                and physical["execution_path"] == "replayed",
+                f"{segment_label} is not bound to one physical replay command",
+            )
+            logical_raw = segment["logical_commands"]
+            require(
+                isinstance(logical_raw, list) and logical_raw,
+                f"{segment_label}.logical_commands must be non-empty",
+            )
+            logical_graph_nodes = 0
+            first_logical_node: str | None = None
+            for logical_index, logical_value in enumerate(logical_raw):
+                logical_label = f"{segment_label}.logical_commands[{logical_index}]"
+                logical = exact_object(
+                    logical_value,
+                    REPLAYED_LOGICAL_COMMAND_FIELDS,
+                    logical_label,
+                )
+                require(
+                    logical["logical_command_ordinal"] == logical_index,
+                    f"{logical_label}.logical_command_ordinal is not contiguous",
+                )
+                node_id = text(
+                    logical["node_id"], f"{logical_label}.node_id", portable=True
+                )
+                require(
+                    node_id in target_nodes,
+                    f"{logical_label}.node_id is not a target node",
+                )
+                require(
+                    node_id not in compute_nodes,
+                    f"{logical_label}.node_id is attributed more than once",
+                )
+                text(
+                    logical["native_op_id"],
+                    f"{logical_label}.native_op_id",
+                    portable=True,
+                )
+                text(logical["batching_form"], f"{logical_label}.batching_form")
+                require(
+                    integer(
+                        logical["participant_count"],
+                        f"{logical_label}.participant_count",
+                    )
+                    == participant_count,
+                    f"{logical_label} participant count differs from the case",
+                )
+                integer(logical["token_count"], f"{logical_label}.token_count")
+                compute_dispatch_count = integer(
+                    logical["compute_dispatch_count"],
+                    f"{logical_label}.compute_dispatch_count",
+                )
+                transfer_command_count = integer(
+                    logical["transfer_command_count"],
+                    f"{logical_label}.transfer_command_count",
+                )
+                require(
+                    compute_dispatch_count > 0 or transfer_command_count > 0,
+                    f"{logical_label} contains no native work",
+                )
+                logical_graph_nodes += integer(
+                    logical["reusable_graph_node_count"],
+                    f"{logical_label}.reusable_graph_node_count",
+                    minimum=1,
+                )
+                if first_logical_node is None:
+                    first_logical_node = node_id
+                compute_nodes.add(node_id)
+            require(
+                physical["node_id"] == first_logical_node,
+                f"{segment_label} physical command is not bound to its first logical node",
+            )
+            require(
+                physical["participant_count"] == participant_count
+                and physical["reusable_graph_node_count"] == logical_graph_nodes,
+                f"{segment_label} physical work differs from its logical attribution",
+            )
+        replayed_physical_indices = {
+            index
+            for index, command in physical_commands.items()
+            if command["command_phase"] == "compute"
+            and command["execution_path"] == "replayed"
+        }
+        require(
+            replayed_physical_indices == segment_physical_indices,
+            f"{label} replay physical commands and replayed segments differ",
+        )
     require(compute_nodes == target_nodes, f"{label} attribution does not cover every target node")
 
     witnesses_raw = execution["witnesses"]
@@ -1860,7 +2028,7 @@ def validate_case(
     executions: dict[str, dict[str, Any]] = {}
     witness_maps: dict[str, dict[tuple[Any, ...], str]] = {}
     canonical_topology: set[tuple[Any, ...]] | None = None
-    replay_fingerprint: str | None = None
+    replay_shape_fingerprint: str | None = None
     restore_fingerprint: str | None = None
     for index, raw in enumerate(executions_raw):
         execution, witnesses = validate_execution(
@@ -1878,10 +2046,22 @@ def validate_case(
             canonical_topology = topology
         require(topology == canonical_topology, f"{label} execution witness topology drifted")
         if execution["mode"] == "replay":
-            current = execution["attribution"]["reusable_executable_fingerprint"]
-            if replay_fingerprint is None:
-                replay_fingerprint = current
-            require(current == replay_fingerprint, f"{label} replay executable fingerprint drifted")
+            current = structural_sha256(execution["attribution"]["replayed_segments"])
+            if replay_shape_fingerprint is None:
+                replay_shape_fingerprint = current
+            require(
+                current == replay_shape_fingerprint,
+                f"{label} replay executable segment shape drifted",
+            )
+        require(
+            execution["initialization_identity"]
+            == {
+                "input_sha256": initialization["input_sha256"],
+                "rng_sha256": initialization["rng_sha256"],
+                "initial_state_sha256": initialization["initial_state_sha256"],
+            },
+            f"{label} execution initialization identity differs from the exact restored bytes",
+        )
         current_restore = execution["restore_sha256"]
         if restore_fingerprint is None:
             restore_fingerprint = current_restore
@@ -2745,10 +2925,57 @@ def make_selftest_execution(
                 expanded.append(item)
         witnesses = sorted(expanded, key=witness_topology)
     replay = mode == "replay"
+    physical_commands = [
+        {
+            "command_index": command_index,
+            "node_id": node_id,
+            "command_phase": "compute",
+            "native_op_id": "native.test",
+            "execution_path": "replayed" if replay else "eager",
+            "batching_form": "scalar",
+            "participant_count": participant_count,
+            "token_count": participant_count,
+            "compute_dispatch_count": 1,
+            "transfer_command_count": 0,
+            "reusable_graph_node_count": 1 if replay else None,
+        }
+        for command_index, node_id in enumerate(node_ids)
+    ]
+    replayed_segments = (
+        [
+            {
+                "physical_command_index": command_index,
+                "reusable_executable_fingerprint": hashlib.sha256(
+                    f"{model_key}/{partition}/segment/{command_index}".encode()
+                ).hexdigest(),
+                "logical_commands": [
+                    {
+                        "logical_command_ordinal": 0,
+                        "node_id": node_id,
+                        "native_op_id": "native.test",
+                        "batching_form": "scalar",
+                        "participant_count": participant_count,
+                        "token_count": participant_count,
+                        "compute_dispatch_count": 1,
+                        "transfer_command_count": 0,
+                        "reusable_graph_node_count": 1,
+                    }
+                ],
+            }
+            for command_index, node_id in enumerate(node_ids)
+        ]
+        if replay
+        else []
+    )
     return {
         "execution_id": execution_id,
         "mode": mode,
         "restore_sha256": "1" * 64,
+        "initialization_identity": {
+            "input_sha256": "4" * 64,
+            "rng_sha256": "5" * 64,
+            "initial_state_sha256": "6" * 64,
+        },
         "submission_fingerprint": hashlib.sha256(
             f"{model_key}/{partition}/{execution_id}/submission".encode()
         ).hexdigest(),
@@ -2760,23 +2987,8 @@ def make_selftest_execution(
             "submission_fingerprint": hashlib.sha256(
                 f"{model_key}/{partition}/{execution_id}/submission".encode()
             ).hexdigest(),
-            "reusable_executable_fingerprint": "3" * 64 if replay else None,
-            "commands": [
-                {
-                    "command_index": command_index,
-                    "node_id": node_id,
-                    "command_phase": "compute",
-                    "native_op_id": "native.test",
-                    "execution_path": "replayed" if replay else "eager",
-                    "batching_form": "scalar",
-                    "participant_count": participant_count,
-                    "token_count": participant_count,
-                    "compute_dispatch_count": 1,
-                    "transfer_command_count": 0,
-                    "reusable_graph_node_count": 1 if replay else None,
-                }
-                for command_index, node_id in enumerate(node_ids)
-            ],
+            "physical_commands": physical_commands,
+            "replayed_segments": replayed_segments,
         },
         "witnesses": witnesses,
     }
@@ -3409,14 +3621,13 @@ def run_self_test() -> None:
                     "replay-fallback",
                     mutate_case(
                         replay_case,
-                        lambda value: value["executions"][-1]["attribution"]["commands"][0].update(
-                            {
-                                "execution_path": "eager",
-                                "reusable_graph_node_count": None,
-                            }
+                        lambda value: value["executions"][-1]["attribution"][
+                            "physical_commands"
+                        ][0].update(
+                            {"execution_path": "eager", "reusable_graph_node_count": None}
                         ),
                     ),
-                    "eager fallback",
+                    "physical replay command",
                 ),
                 (
                     "tolerance-field",
@@ -3458,6 +3669,16 @@ def run_self_test() -> None:
                         ),
                     ),
                     "do not restore the same input/rng/initial-state bytes",
+                ),
+                (
+                    "invented-initialization-identity",
+                    mutate_case(
+                        first_case,
+                        lambda value: value["executions"][0][
+                            "initialization_identity"
+                        ].update({"input_sha256": "0" * 64}),
+                    ),
+                    "differs from the exact restored bytes",
                 ),
                 (
                     "cross-model",
@@ -3503,14 +3724,36 @@ def run_self_test() -> None:
             secondary_nodes = set(value["coverage_targets"][1]["node_ids"])
             value["coverage_targets"] = value["coverage_targets"][:1]
             for execution in value["executions"]:
-                commands = [
-                    command
-                    for command in execution["attribution"]["commands"]
-                    if command["node_id"] not in secondary_nodes
-                ]
-                for command_index, command in enumerate(commands):
-                    command["command_index"] = command_index
-                execution["attribution"]["commands"] = commands
+                attribution = execution["attribution"]
+                commands = []
+                command_index_map = {}
+                for command in attribution["physical_commands"]:
+                    if command["node_id"] in secondary_nodes:
+                        continue
+                    old_index = command["command_index"]
+                    new_index = len(commands)
+                    command_index_map[old_index] = new_index
+                    command["command_index"] = new_index
+                    commands.append(command)
+                attribution["physical_commands"] = commands
+                segments = []
+                for segment in attribution["replayed_segments"]:
+                    old_index = segment["physical_command_index"]
+                    if old_index not in command_index_map:
+                        continue
+                    logical_commands = [
+                        command
+                        for command in segment["logical_commands"]
+                        if command["node_id"] not in secondary_nodes
+                    ]
+                    if not logical_commands:
+                        continue
+                    for ordinal, command in enumerate(logical_commands):
+                        command["logical_command_ordinal"] = ordinal
+                    segment["physical_command_index"] = command_index_map[old_index]
+                    segment["logical_commands"] = logical_commands
+                    segments.append(segment)
+                attribution["replayed_segments"] = segments
                 execution["witnesses"] = [
                     witness
                     for witness in execution["witnesses"]
