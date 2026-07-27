@@ -71,6 +71,16 @@ impl ProgramPlanCompileOptions {
         self.completion_retention.insert(value_id)
     }
 
+    /// Configures a diagnostic plan whose every operation output remains
+    /// readable after the terminal completion fence.
+    pub fn retain_all_outputs_for_determinism(
+        &mut self,
+        family: &PreparedModelFamily,
+    ) -> Result<(), VNextError> {
+        self.completion_retention = CompletionRetentionSpec::for_determinism_outputs(family)?;
+        Ok(())
+    }
+
     pub fn completion_retention(&self) -> &CompletionRetentionSpec {
         &self.completion_retention
     }

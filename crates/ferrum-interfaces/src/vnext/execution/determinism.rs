@@ -9,7 +9,7 @@ use super::{
 };
 use crate::vnext::{ProviderExecutionContractFingerprint, ProviderReplayEquivalence};
 
-pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(2, 0);
+pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(3, 0);
 
 /// Trusted semantic-to-physical projection shared by determinism
 /// initialization and terminal witnesses.
@@ -354,6 +354,7 @@ impl ProviderDeterminismCoverageRequirement {
 pub struct ExecutionDeterminismWitnessPlan {
     schema_version: ContractVersion,
     plan_hash: PlanHash,
+    node_ids: Vec<NodeId>,
     replay_provider_requirements: Vec<ProviderDeterminismCoverageRequirement>,
     initializations: Vec<ExecutionDeterminismInitializationSpec>,
     witnesses: Vec<ExecutionDeterminismWitnessSpec>,
@@ -366,6 +367,10 @@ impl ExecutionDeterminismWitnessPlan {
 
     pub fn plan_hash(&self) -> &PlanHash {
         &self.plan_hash
+    }
+
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
     }
 
     pub fn replay_provider_requirements(&self) -> &[ProviderDeterminismCoverageRequirement] {
@@ -386,7 +391,44 @@ impl ExecutionPlan {
     /// plan. Hardware runners consume this contract rather than maintaining a
     /// second provider/output/state inventory.
     pub fn determinism_witness_plan(&self) -> Result<ExecutionDeterminismWitnessPlan, VNextError> {
-        let nodes = self.payload().nodes();
+        let node_ids = self
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| node.id().clone())
+            .collect::<Vec<_>>();
+        self.determinism_witness_plan_for_nodes(&node_ids)
+    }
+
+    /// Derives the proof denominator for one canonical plan-ordered node
+    /// subset. Inputs produced outside this subset become explicit restore
+    /// inputs, which permits a hardware runner to probe real resolved-plan
+    /// nodes without constructing a second synthetic plan.
+    pub fn determinism_witness_plan_for_nodes(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<ExecutionDeterminismWitnessPlan, VNextError> {
+        if node_ids.is_empty() || node_ids.iter().collect::<BTreeSet<_>>().len() != node_ids.len() {
+            return Err(invalid_plan(
+                "execution determinism node scope must be non-empty and unique",
+            ));
+        }
+        let requested = node_ids.iter().collect::<BTreeSet<_>>();
+        let nodes = self
+            .payload()
+            .nodes()
+            .iter()
+            .filter(|node| requested.contains(node.id()))
+            .collect::<Vec<_>>();
+        let canonical_node_ids = nodes
+            .iter()
+            .map(|node| node.id().clone())
+            .collect::<Vec<_>>();
+        if canonical_node_ids != node_ids {
+            return Err(invalid_plan(
+                "execution determinism node scope is unknown or not in canonical plan order",
+            ));
+        }
         let produced_values = nodes
             .iter()
             .flat_map(|node| {
@@ -417,7 +459,7 @@ impl ExecutionPlan {
             ),
         >::new();
 
-        for node in nodes {
+        for node in &nodes {
             for binding in node.values().iter().filter(|binding| {
                 binding.role() == ResolvedValueRole::Input
                     && binding.usage() == BufferUsage::Activations
@@ -527,7 +569,7 @@ impl ExecutionPlan {
             ),
         >::new();
 
-        for node in nodes {
+        for node in &nodes {
             let semantics = node.provider_execution_semantics();
             if semantics.replay_equivalence() == ProviderReplayEquivalence::BitwiseEagerEquivalent {
                 match replay_providers.entry(node.selection().selected_provider().clone()) {
@@ -633,6 +675,7 @@ impl ExecutionPlan {
         Ok(ExecutionDeterminismWitnessPlan {
             schema_version: EXECUTION_DETERMINISM_WITNESS_VERSION,
             plan_hash: self.plan_hash().clone(),
+            node_ids: canonical_node_ids,
             replay_provider_requirements,
             initializations,
             witnesses,

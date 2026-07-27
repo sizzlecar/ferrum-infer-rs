@@ -19,10 +19,10 @@ use super::super::{
     DeviceTimingMeasurement, DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope,
     ExecutionIdentityParts, ExecutionLane, HostTransferLayout, IdentifiedFailure,
     IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome,
-    LogicalBackingBufferView, NodeId, NodeInvocationId, ParticipantNodeKey, PlanNode,
+    LogicalBackingBufferView, NodeId, NodeInvocationId, ParticipantNodeKey,
     PreparedStepSubmissionWave, ProgramBindingNodeBinding, ResourceId, SpanId,
-    StepParticipantFrameAssignment, TrustedActiveSequenceBinding, VNextError,
-    EXECUTION_IDENTITY_VERSION,
+    StepParticipantFrameAssignment, SubmissionWavePurpose, TrustedActiveSequenceBinding,
+    VNextError, EXECUTION_IDENTITY_VERSION,
 };
 use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
@@ -514,7 +514,6 @@ where
 /// The only public path from a resolved plan to an operation kernel.
 fn validate_program_binding_patch(
     resolved: &dyn ExecutablePlanView,
-    node_index: usize,
     node_identity: &BatchOperationNodeIdentity,
     program_binding: Option<&ProgramBindingNodeBinding>,
     encoded_program_binding_count: usize,
@@ -528,16 +527,21 @@ fn validate_program_binding_patch(
     let Some(program_binding) = program_binding else {
         return Ok(());
     };
-    let binding_resource = resolved
+    let (plan_node_index, binding_resource) = resolved
         .execution_plan()
         .payload()
         .nodes()
-        .get(node_index)
-        .and_then(PlanNode::binding_resource)
+        .iter()
+        .enumerate()
+        .find(|(_, node)| node.id() == node_identity.node_id())
+        .and_then(|(node_index, node)| {
+            node.binding_resource()
+                .map(|resource| (node_index, resource))
+        })
         .ok_or_else(|| {
             invalid_operation("program binding requires a provider-owned binding workspace")
         })?;
-    if program_binding.node_index() != node_index
+    if program_binding.node_index() != plan_node_index
         || program_binding.slot().node_id() != node_identity.node_id()
         || program_binding.slot().resource_id() != binding_resource
     {
@@ -657,22 +661,12 @@ impl OperationDispatch {
     {
         let plan = resolved.execution_plan();
         let node_id = resources.node_id()?;
-        let node = match resources {
-            OperationInvocationResources::Wave {
-                node_index: resource_node_index,
-                ..
-            } => plan
-                .payload()
-                .nodes()
-                .get(resource_node_index)
-                .filter(|node| node.id() == node_id),
-            OperationInvocationResources::Invocation(_) => plan
-                .payload()
-                .nodes()
-                .iter()
-                .find(|node| node.id() == node_id),
-        }
-        .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        let node = plan
+            .payload()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == node_id)
+            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
         // Wave construction proves every node shares this authority by Arc identity.
         let validate_common_authority = match resources {
             OperationInvocationResources::Invocation(_) => true,
@@ -843,17 +837,23 @@ impl OperationDispatch {
         let plan = resolved.execution_plan();
         if wave.nodes().is_empty()
             || wave.execution_lane_id() != lane.id()
-            || wave.nodes().len() != plan.payload().nodes().len()
             || participant_identities.len() != wave.nodes().len()
             || active_bindings.len() == 0
+            || wave.claimed_backing().node_count() != wave.nodes().len()
+            || wave.claimed_backing().plan_node_count() != plan.payload().nodes().len()
             || wave
                 .nodes()
-                .iter()
-                .zip(plan.payload().nodes())
-                .any(|(prepared, planned)| prepared.node_id() != planned.id())
+                .windows(2)
+                .any(|pair| pair[0].plan_node_index() >= pair[1].plan_node_index())
+            || wave.nodes().iter().any(|prepared| {
+                plan.payload()
+                    .nodes()
+                    .get(prepared.plan_node_index())
+                    .is_none_or(|planned| prepared.node_id() != planned.id())
+            })
         {
             return Err(invalid_operation(
-                "submission wave identity must cover every immutable plan node in order",
+                "submission wave identity must cover one exact canonical immutable-plan node scope",
             ));
         }
         let mut participant_start = 0_u32;
@@ -938,7 +938,7 @@ impl OperationDispatch {
                             resolved,
                             active,
                             frame,
-                            node_index,
+                            node.plan_node_index(),
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -972,7 +972,6 @@ impl OperationDispatch {
         let plan = resolved.execution_plan();
         let plan_nodes = plan.payload().nodes();
         if providers.is_empty()
-            || providers.len() != plan_nodes.len()
             || providers.len() != wave.nodes().len()
             || wave.execution_lane_id() != lane.id()
             || lane.descriptor() != resolved.device()
@@ -989,16 +988,21 @@ impl OperationDispatch {
             return Ok(None);
         };
 
-        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v2\0";
+        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v3\0";
         let mut digest = Sha256::new();
         digest.update(DOMAIN);
-        let mut dynamic_rows = 0_u32;
-        for (node_index, ((provider, prepared_node), node)) in providers
-            .iter()
-            .zip(wave.nodes())
-            .zip(plan_nodes)
-            .enumerate()
+        digest.update(
+            u64::try_from(wave.nodes().len())
+                .map_err(|_| invalid_operation("reusable topology node count exceeds u64"))?
+                .to_le_bytes(),
+        );
+        for (wave_node_index, (provider, prepared_node)) in
+            providers.iter().zip(wave.nodes()).enumerate()
         {
+            let plan_node_index = prepared_node.plan_node_index();
+            let node = plan_nodes.get(plan_node_index).ok_or_else(|| {
+                invalid_operation("reusable execution wave node is absent from the immutable plan")
+            })?;
             if provider.plan_id != *plan.payload().plan_id()
                 || provider.plan_hash != *plan.plan_hash()
                 || provider.node_id != *node.id()
@@ -1019,18 +1023,18 @@ impl OperationDispatch {
                 wave.step_resources().backing_slices(),
             )?;
             let declared = node.provider_execution_semantics().replay_equivalence();
-            let topology = match (
+            let dynamic_topology = match (
                 declared,
                 provider.provider().reusable_execution_topology(request)?,
             ) {
                 (
                     ProviderReplayEquivalence::BitwiseEagerEquivalent,
                     ReusableExecutionTopology::Static,
-                ) => continue,
+                ) => None,
                 (
                     ProviderReplayEquivalence::BitwiseEagerEquivalent,
                     ReusableExecutionTopology::Dynamic(topology),
-                ) => topology,
+                ) => Some(topology),
                 (_, ReusableExecutionTopology::Ineligible) => return Ok(None),
                 (
                     ProviderReplayEquivalence::Ineligible,
@@ -1042,23 +1046,31 @@ impl OperationDispatch {
                     )))
                 }
             };
-            let node_index = u32::try_from(node_index)
-                .map_err(|_| invalid_operation("reusable topology node index exceeds u32"))?;
+            let (topology_kind, topology_bytes) = dynamic_topology
+                .as_ref()
+                .map_or((0_u8, &[][..]), |topology| (1_u8, topology.as_bytes()));
+            let wave_node_index = u64::try_from(wave_node_index)
+                .map_err(|_| invalid_operation("reusable topology wave node index exceeds u64"))?;
+            let plan_node_index = u64::try_from(plan_node_index)
+                .map_err(|_| invalid_operation("reusable topology plan node index exceeds u64"))?;
+            let node_id = node.id().as_str().as_bytes();
             let provider_id = provider.descriptor().provider_id().as_str().as_bytes();
+            let node_id_len = u64::try_from(node_id.len())
+                .map_err(|_| invalid_operation("reusable topology node id exceeds u64"))?;
             let provider_id_len = u64::try_from(provider_id.len())
                 .map_err(|_| invalid_operation("reusable topology provider id exceeds u64"))?;
-            digest.update(node_index.to_le_bytes());
+            let topology_len = u64::try_from(topology_bytes.len())
+                .map_err(|_| invalid_operation("reusable topology payload exceeds u64"))?;
+            digest.update(wave_node_index.to_le_bytes());
+            digest.update(plan_node_index.to_le_bytes());
+            digest.update(node_id_len.to_le_bytes());
+            digest.update(node_id);
             digest.update(provider_id_len.to_le_bytes());
             digest.update(provider_id);
-            digest.update(topology.as_bytes());
-            dynamic_rows = dynamic_rows
-                .checked_add(1)
-                .ok_or_else(|| invalid_operation("reusable topology row count exceeds u32"))?;
+            digest.update([topology_kind]);
+            digest.update(topology_len.to_le_bytes());
+            digest.update(topology_bytes);
         }
-        if dynamic_rows == 0 {
-            return Ok(Some(program_id));
-        }
-        digest.update(dynamic_rows.to_le_bytes());
         Ok(Some(program_id.with_topology_fingerprint(
             DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
         )))
@@ -1607,9 +1619,18 @@ impl OperationDispatch {
                 "wave execution lane, resources, nodes, or participants differ from batch identity",
             )));
         }
+        if !matches!(
+            (wave.purpose(), determinism_restore.is_some()),
+            (SubmissionWavePurpose::FullPlan, false)
+                | (SubmissionWavePurpose::DeterminismProbe, true)
+        ) {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "submission wave purpose differs from its product or determinism dispatch path",
+            )));
+        }
         if let Some(restore) = determinism_restore {
             restore
-                .validate_for(resolved)
+                .validate_for_submission(resolved, batch_identity, &wave)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
             if !input_uploads.is_empty()
                 || usize::try_from(restore.participant_count()).ok()
@@ -1845,7 +1866,6 @@ impl OperationDispatch {
                         let program_binding_count = bindings.program_binding_count();
                         validate_program_binding_patch(
                             resolved,
-                            binding_node_index,
                             node_identity,
                             program_binding.as_ref(),
                             program_binding_count,
@@ -1954,7 +1974,6 @@ impl OperationDispatch {
                 let program_binding_count = operation.program_binding_count();
                 validate_program_binding_patch(
                     resolved,
-                    node_index,
                     node_identity,
                     program_binding.as_ref(),
                     program_binding_count,
@@ -2032,7 +2051,6 @@ impl OperationDispatch {
                 let program_binding_count = operation.program_binding_count();
                 validate_program_binding_patch(
                     resolved,
-                    node_index,
                     node_identity,
                     program_binding.as_ref(),
                     program_binding_count,
@@ -2072,21 +2090,28 @@ impl OperationDispatch {
                 encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
             }
         }
-        if completion
-            .wave()
-            .claimed_backing()
-            .program_binding_layout()
-            .is_some_and(|layout| {
-                program_binding_resources.len() != layout.slots().len()
-                    || layout
-                        .slots()
-                        .iter()
-                        .any(|slot| !program_binding_resources.contains(slot.resource_id()))
-            })
-        {
-            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                "provider program binding patches do not cover the compiled layout exactly",
-            )));
+        if let Some(layout) = completion.wave().claimed_backing().program_binding_layout() {
+            let selected_plan_nodes = completion
+                .wave()
+                .nodes()
+                .iter()
+                .map(|node| node.plan_node_index())
+                .collect::<BTreeSet<_>>();
+            let expected_resources = layout
+                .slots()
+                .iter()
+                .filter(|slot| selected_plan_nodes.contains(&slot.node_index()))
+                .map(|slot| slot.resource_id())
+                .collect::<BTreeSet<_>>();
+            if program_binding_resources.len() != expected_resources.len()
+                || expected_resources
+                    .iter()
+                    .any(|resource| !program_binding_resources.contains(*resource))
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "provider program binding patches do not cover the selected compiled layout exactly",
+                )));
+            }
         }
         let uncoalesced_program_binding_count = program_bindings.len();
         let coalesced_program_bindings = runtime
@@ -2411,7 +2436,7 @@ where
     R: DeviceRuntime,
 {
     restore
-        .validate_for(resolved)
+        .validate_for_submission(resolved, batch_identity, completion.wave())
         .map_err(SubmissionWaveDispatchError::Contract)?;
     let participant_count = usize::try_from(restore.participant_count()).map_err(|_| {
         SubmissionWaveDispatchError::Contract(invalid_operation(

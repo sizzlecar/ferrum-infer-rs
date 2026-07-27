@@ -612,6 +612,55 @@ fn execution_determinism_witness_closes_outputs_writable_state_and_replay_provid
 }
 
 #[test]
+fn execution_determinism_witness_scope_is_exact_canonical_and_plan_derived() {
+    let fixture = graph_plan_fixture(
+        "state_chain",
+        AliasPolicy::NoAlias,
+        GraphAliasStorage::Distinct,
+    )
+    .unwrap();
+    let nodes = fixture.plan.payload().nodes();
+    let node_ids = vec![nodes[1].id().clone(), nodes[2].id().clone()];
+    let witness_plan = fixture
+        .plan
+        .determinism_witness_plan_for_nodes(&node_ids)
+        .unwrap();
+
+    assert_eq!(witness_plan.node_ids(), node_ids);
+    assert!(witness_plan
+        .initializations()
+        .iter()
+        .flat_map(|initialization| initialization.consumer_node_ids())
+        .all(|node_id| witness_plan.node_ids().contains(node_id)));
+    assert!(witness_plan
+        .witnesses()
+        .iter()
+        .all(|witness| witness_plan.node_ids().contains(witness.node_id())));
+    assert!(witness_plan
+        .replay_provider_requirements()
+        .iter()
+        .flat_map(|requirement| requirement.node_ids())
+        .all(|node_id| witness_plan.node_ids().contains(node_id)));
+
+    assert!(fixture
+        .plan
+        .determinism_witness_plan_for_nodes(&[])
+        .is_err());
+    assert!(fixture
+        .plan
+        .determinism_witness_plan_for_nodes(&[nodes[1].id().clone(), nodes[1].id().clone()])
+        .is_err());
+    assert!(fixture
+        .plan
+        .determinism_witness_plan_for_nodes(&[nodes[2].id().clone(), nodes[1].id().clone()])
+        .is_err());
+    assert!(fixture
+        .plan
+        .determinism_witness_plan_for_nodes(&[id("node.determinism.unknown")])
+        .is_err());
+}
+
+#[test]
 fn execution_determinism_witness_excludes_read_only_state() {
     let fixture = graph_plan_fixture(
         "state_read_only",

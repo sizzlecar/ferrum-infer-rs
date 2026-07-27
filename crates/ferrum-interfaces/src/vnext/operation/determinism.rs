@@ -6,9 +6,9 @@ use crate::vnext::{
     BufferUsage, CompletionHandle, CompletionReadbackBatchRequest,
     CompletionReadbackCollectionObservation, CompletionReadbackCollectionRequest,
     CompletionReadbackRequest, DeviceRuntime, ExecutablePlanView,
-    ExecutionDeterminismInitializationSpec, ExecutionDeterminismWitnessPlan,
-    ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId, PlanHash,
-    PreparedStepSubmissionWave, ResourceId, SubmittedOperationReceipt, VNextError,
+    ExecutionDeterminismInitializationSpec, ExecutionDeterminismWitnessKind,
+    ExecutionDeterminismWitnessPlan, ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId,
+    PlanHash, PreparedStepSubmissionWave, ResourceId, SubmittedOperationReceipt, VNextError,
 };
 
 /// Complete participant-major input/state restoration for one immutable
@@ -21,6 +21,7 @@ use crate::vnext::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionWaveDeterminismRestore {
     plan_hash: PlanHash,
+    node_ids: Vec<NodeId>,
     initializations: Vec<ExecutionDeterminismInitializationSpec>,
     participant_payloads: Vec<Vec<Vec<u8>>>,
 }
@@ -57,6 +58,7 @@ impl SubmissionWaveDeterminismRestore {
         }
         Ok(Self {
             plan_hash: witness_plan.plan_hash().clone(),
+            node_ids: witness_plan.node_ids().to_vec(),
             initializations: witness_plan.initializations().to_vec(),
             participant_payloads,
         })
@@ -64,6 +66,10 @@ impl SubmissionWaveDeterminismRestore {
 
     pub fn plan_hash(&self) -> &PlanHash {
         &self.plan_hash
+    }
+
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
     }
 
     pub fn initializations(&self) -> &[ExecutionDeterminismInitializationSpec] {
@@ -83,13 +89,39 @@ impl SubmissionWaveDeterminismRestore {
     }
 
     pub(super) fn validate_for(&self, resolved: &dyn ExecutablePlanView) -> Result<(), VNextError> {
-        let actual = resolved.execution_plan().determinism_witness_plan()?;
+        let actual = resolved
+            .execution_plan()
+            .determinism_witness_plan_for_nodes(&self.node_ids)?;
         if self.plan_hash != *resolved.execution_plan().plan_hash()
             || self.plan_hash != *actual.plan_hash()
+            || self.node_ids != actual.node_ids()
             || self.initializations != actual.initializations()
         {
             return Err(invalid_operation(
                 "determinism restore differs from the exact immutable plan initialization denominator",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_for_submission<R: DeviceRuntime>(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        wave: &PreparedStepSubmissionWave<R>,
+    ) -> Result<(), VNextError> {
+        self.validate_for(resolved)?;
+        if self.node_ids.len() != wave.nodes().len()
+            || self.node_ids.len() != batch_identity.node_count()
+            || self.node_ids.iter().zip(wave.nodes()).enumerate().any(
+                |(node_index, (node_id, prepared_node))| {
+                    prepared_node.node_id() != node_id
+                        || batch_identity.node_id_at(node_index) != Some(node_id)
+                },
+            )
+        {
+            return Err(invalid_operation(
+                "determinism restore node scope differs from its exact prepared wave",
             ));
         }
         Ok(())
@@ -129,6 +161,7 @@ impl SubmissionWaveDeterminismReadbackTarget {
 #[must_use = "the exact plan-derived witness readback must be collected"]
 pub struct SubmissionWaveDeterminismReadbackPlan {
     plan_hash: PlanHash,
+    node_ids: Vec<NodeId>,
     collection: CompletionReadbackCollectionRequest,
     targets: Vec<SubmissionWaveDeterminismReadbackTarget>,
     witness_count: usize,
@@ -140,7 +173,14 @@ impl SubmissionWaveDeterminismReadbackPlan {
         batch_identity: &BatchOperationIdentity,
         wave: &PreparedStepSubmissionWave<R>,
     ) -> Result<Self, VNextError> {
-        let witness_plan = resolved.execution_plan().determinism_witness_plan()?;
+        let node_ids = wave
+            .nodes()
+            .iter()
+            .map(|node| node.node_id().clone())
+            .collect::<Vec<_>>();
+        let witness_plan = resolved
+            .execution_plan()
+            .determinism_witness_plan_for_nodes(&node_ids)?;
         if witness_plan.plan_hash() != batch_identity.plan_hash()
             || wave.nodes().len() != batch_identity.node_count()
             || wave.nodes().iter().enumerate().any(|(node_index, node)| {
@@ -154,6 +194,7 @@ impl SubmissionWaveDeterminismReadbackPlan {
                 "determinism readback plan differs from its prepared wave or physical batch identity",
             ));
         }
+        validate_terminal_witness_stability(resolved, &witness_plan)?;
 
         let mut grouped = BTreeMap::<
             PhysicalReadbackKey,
@@ -262,6 +303,7 @@ impl SubmissionWaveDeterminismReadbackPlan {
 
         Ok(Self {
             plan_hash: witness_plan.plan_hash().clone(),
+            node_ids,
             collection,
             targets,
             witness_count,
@@ -270,6 +312,10 @@ impl SubmissionWaveDeterminismReadbackPlan {
 
     pub fn plan_hash(&self) -> &PlanHash {
         &self.plan_hash
+    }
+
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
     }
 
     pub fn collection_request(&self) -> &CompletionReadbackCollectionRequest {
@@ -283,6 +329,85 @@ impl SubmissionWaveDeterminismReadbackPlan {
     pub const fn witness_count(&self) -> usize {
         self.witness_count
     }
+}
+
+fn validate_terminal_witness_stability(
+    resolved: &dyn ExecutablePlanView,
+    witness_plan: &ExecutionDeterminismWitnessPlan,
+) -> Result<(), VNextError> {
+    if witness_plan.node_ids().len() > 1 {
+        let retained = resolved
+            .execution_plan()
+            .payload()
+            .retained_completion_values();
+        for witness in witness_plan.witnesses() {
+            let ExecutionDeterminismWitnessKind::Output {
+                value_id,
+                output_ordinal,
+            } = witness.kind()
+            else {
+                continue;
+            };
+            let exact = retained.iter().filter(|candidate| {
+                candidate.value_id() == value_id
+                    && candidate.producer_node_id() == witness.node_id()
+                    && candidate.output_ordinal() == *output_ordinal
+                    && candidate.resource_id() == witness.resource_id()
+                    && candidate.logical_offset_bytes() == witness.logical_offset_bytes()
+                    && candidate.tensor().element_type() == witness.element_type()
+                    && candidate.tensor().minimum_storage_bytes().ok()
+                        == Some(witness.canonical_length_bytes())
+            });
+            if exact.count() != 1 {
+                return Err(invalid_operation(format!(
+                    "determinism output `{value_id}` from node `{}` is not retained as one exact terminal witness",
+                    witness.node_id()
+                )));
+            }
+        }
+    }
+
+    let node_order = witness_plan
+        .node_ids()
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| (node_id, index))
+        .collect::<BTreeMap<_, _>>();
+    for witness in witness_plan.witnesses() {
+        if !matches!(
+            witness.kind(),
+            ExecutionDeterminismWitnessKind::StateEffect { .. }
+        ) {
+            continue;
+        }
+        let witness_order = node_order[witness.node_id()];
+        let witness_end = witness
+            .logical_offset_bytes()
+            .checked_add(witness.canonical_length_bytes())
+            .ok_or_else(|| invalid_operation("determinism state witness range overflows"))?;
+        let overwritten = witness_plan.witnesses().iter().any(|later| {
+            let Some(later_order) = node_order.get(later.node_id()) else {
+                return false;
+            };
+            if *later_order <= witness_order || later.resource_id() != witness.resource_id() {
+                return false;
+            }
+            let Some(later_end) = later
+                .logical_offset_bytes()
+                .checked_add(later.canonical_length_bytes())
+            else {
+                return true;
+            };
+            later.logical_offset_bytes() < witness_end && witness.logical_offset_bytes() < later_end
+        });
+        if overwritten {
+            return Err(invalid_operation(format!(
+                "determinism state witness from node `{}` is overwritten later in the same terminal readback scope",
+                witness.node_id()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Submitted deterministic work whose terminal observation remains bound to

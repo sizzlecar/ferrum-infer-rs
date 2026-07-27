@@ -20,6 +20,37 @@ fn compile_options() -> ProgramPlanCompileOptions {
     .unwrap()
 }
 
+#[test]
+fn determinism_compile_option_retains_every_operation_output() {
+    let family = TestRegistry::new().prepare();
+    let catalog = catalog();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let mut options = compile_options();
+    options.retain_all_outputs_for_determinism(&family).unwrap();
+    let expected = family
+        .program()
+        .blocks()
+        .iter()
+        .flat_map(|block| &block.nodes)
+        .flat_map(|node| node.outputs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(options.completion_retention().values(), &expected);
+
+    let planning = registry.planning();
+    let compilation =
+        ProgramPlanCompiler::compile(&family, &catalog, &policy(4096), &planning, &options)
+            .unwrap();
+    let retained = compilation
+        .executable()
+        .execution_plan()
+        .payload()
+        .retained_completion_values()
+        .iter()
+        .map(|value| value.value_id().clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(retained, expected);
+}
+
 struct PaddedDenseMaterializer {
     descriptor: WeightMaterializerDescriptor,
 }
