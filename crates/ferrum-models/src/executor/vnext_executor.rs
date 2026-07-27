@@ -2857,6 +2857,7 @@ impl<R: DeviceRuntime> Drop for VNextPrefillExecutionGuard<'_, R> {
 pub struct VNextModelExecutor<R: DeviceRuntime> {
     info: ModelInfo,
     resolved_plan: ResolvedModelPlan,
+    capability_catalog: CapabilityCatalog,
     runtime: Arc<R>,
     providers: BoundOperationProviderSet<R>,
     policy: ResolvedRuntimePolicy,
@@ -3303,6 +3304,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Ok(Self {
             info,
             resolved_plan,
+            capability_catalog: catalog,
             runtime,
             providers,
             policy: config.runtime_policy,
@@ -3330,6 +3332,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             metrics: VNextExecutorMetrics::default(),
         })
+    }
+
+    pub fn resolved_plan(&self) -> &ResolvedModelPlan {
+        &self.resolved_plan
+    }
+
+    pub fn capability_catalog(&self) -> &CapabilityCatalog {
+        &self.capability_catalog
     }
 
     fn startup_token_tensor(tokens: &[u32]) -> Result<TensorRef> {
