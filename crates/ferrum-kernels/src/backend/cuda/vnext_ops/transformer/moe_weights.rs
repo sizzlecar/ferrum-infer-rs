@@ -17,7 +17,8 @@ use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
 pub(super) const GPTQ_MARLIN_WEIGHT_FORMAT_ID: &str = "weight-format.safetensors.gptq-marlin-int4";
 pub(super) const GPTQ_MARLIN_QUANTIZATION_FORMAT_ID: &str =
     "quantization.marlin.gptq-int4-symmetric";
-pub(super) const GPTQ_MARLIN_CAPABILITY_ID: &str = "capability.kernel.cuda.marlin.gptq-int4-w4a16";
+pub(in crate::backend::cuda::vnext_ops) const GPTQ_MARLIN_CAPABILITY_ID: &str =
+    "capability.kernel.cuda.marlin.gptq-int4-w4a16";
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
 
 /// Retained, expert-major physical regions accepted by the CUDA Marlin-MoE
