@@ -27,6 +27,7 @@ const COMPILED_FA2_NATIVE_INPUTS_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_
 const COMPILED_FA2_NATIVE_BINARY_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256";
 const CUDA_NATIVE_BUILD_CACHE_ENV: &str = "FERRUM_CUDA_NATIVE_BUILD_CACHE";
 const CUDA_NATIVE_IMPORT_DIRS_ENV: &str = "FERRUM_CUDA_NATIVE_IMPORT_DIRS";
+const CUDA_NATIVE_SOURCE_POLICY_ENV: &str = "FERRUM_CUDA_NATIVE_SOURCE_POLICY";
 const CUDA_NATIVE_SIGNATURE_SCHEMA: &str = "ferrum-cuda-native-input-v2";
 const DEFAULT_NVCC_THREADS: u32 = 4;
 const MAX_NVCC_THREADS: u32 = 8;
@@ -267,6 +268,46 @@ fn configured_nvcc_threads() -> String {
             value.to_string()
         })
         .clone()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CudaNativeSourcePolicy {
+    Allow,
+    CacheOnly,
+}
+
+fn configured_cuda_native_source_policy() -> CudaNativeSourcePolicy {
+    static POLICY: OnceLock<CudaNativeSourcePolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        println!("cargo:rerun-if-env-changed={CUDA_NATIVE_SOURCE_POLICY_ENV}");
+        match env::var(CUDA_NATIVE_SOURCE_POLICY_ENV)
+            .unwrap_or_else(|_| "allow".to_string())
+            .as_str()
+        {
+            "allow" => CudaNativeSourcePolicy::Allow,
+            "cache-only" => CudaNativeSourcePolicy::CacheOnly,
+            value => panic!(
+                "{CUDA_NATIVE_SOURCE_POLICY_ENV} must be `allow` or `cache-only`, got {value:?}"
+            ),
+        }
+    })
+}
+
+fn enforce_cuda_native_source_policy(artifact: &str, reason: &str, signature: &str) {
+    if configured_cuda_native_source_policy() == CudaNativeSourcePolicy::CacheOnly {
+        emit_cuda_build_summary(
+            artifact,
+            "rejected",
+            reason,
+            Duration::from_millis(0),
+            signature,
+        );
+        panic!(
+            "CUDA native cache-only policy rejected source compilation: \
+artifact={artifact} reason={reason} inputs_hash={}",
+            signature_hash(signature)
+        );
+    }
 }
 
 fn emit_cuda_build_summary(
@@ -786,6 +827,7 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by cargo"));
+    let _native_source_policy = configured_cuda_native_source_policy();
     let native_build_cache = configured_cuda_native_build_cache();
     let out_dir_clone = out_dir.clone();
     compile_core_ptx(&out_dir_clone, native_build_cache.as_ref());
@@ -1015,6 +1057,11 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     );
                     continue;
                 }
+                enforce_cuda_native_source_policy(
+                    &format!("core-ptx:{}", Path::new(kernel).display()),
+                    reason,
+                    &signature,
+                );
                 let mut command = std::process::Command::new(&nvcc);
                 command
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
@@ -1195,6 +1242,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
             reason
         }
     };
+    enforce_cuda_native_source_policy("vllm_paged_attn", build_reason, &signature);
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -1372,6 +1420,7 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
             reason
         }
     };
+    enforce_cuda_native_source_policy("vllm_moe_marlin", build_reason, &signature);
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -1574,6 +1623,7 @@ fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNative
             reason
         }
     };
+    enforce_cuda_native_source_policy("vllm_marlin", build_reason, &signature);
 
     // Compile each .cu to its own .o
     let mut object_files: Vec<PathBuf> = Vec::new();
@@ -1738,6 +1788,7 @@ fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuild
             reason
         }
     };
+    enforce_cuda_native_source_policy("marlin", build_reason, &signature);
 
     let obj_file = out_dir.join("marlin_cuda_kernel.o");
     let status = std::process::Command::new(&nvcc)
