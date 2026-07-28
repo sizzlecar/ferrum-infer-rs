@@ -130,6 +130,120 @@ impl LogitsReturnPolicy {
     }
 }
 
+/// Typed product output returned by a plan-runtime execution wave.
+///
+/// A selected token is not a one-element logits vector. Keeping the variants
+/// distinct prevents the engine from inferring product semantics from tensor
+/// shape and lets full-logits requests retain every host-side sampler,
+/// grammar, and structured-output processor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutorSamplingOutput {
+    FullLogits(Vec<f32>),
+    GreedyToken(TokenId),
+}
+
+impl ExecutorSamplingOutput {
+    pub fn full_logits(logits: Vec<f32>) -> Result<Self> {
+        if logits.is_empty() {
+            return Err(FerrumError::backend(
+                "plan-runtime sampling output requires non-empty logits",
+            ));
+        }
+        Ok(Self::FullLogits(logits))
+    }
+
+    pub const fn greedy_token(token: TokenId) -> Self {
+        Self::GreedyToken(token)
+    }
+
+    /// Validate that a device-selected token was explicitly authorized.
+    ///
+    /// Returning full logits for a greedy policy remains legal: heterogeneous
+    /// batches may deliberately fall back to host sampling. The inverse would
+    /// skip required product processors and therefore fails closed.
+    pub fn validate_for_policy(
+        &self,
+        policy: &LogitsReturnPolicy,
+        vocabulary_size: usize,
+    ) -> Result<()> {
+        match self {
+            Self::FullLogits(logits) if logits.len() != vocabulary_size => {
+                return Err(FerrumError::backend(format!(
+                    "plan runtime returned {} logits for vocabulary {vocabulary_size}",
+                    logits.len()
+                )));
+            }
+            Self::GreedyToken(_) if policy.requires_full_logits() => {
+                return Err(FerrumError::backend(
+                    "plan runtime returned a greedy token for a full-logits request",
+                ));
+            }
+            Self::GreedyToken(token)
+                if usize::try_from(token.get())
+                    .ok()
+                    .is_none_or(|token| token >= vocabulary_size) =>
+            {
+                return Err(FerrumError::backend(format!(
+                    "plan runtime returned token {} outside vocabulary {vocabulary_size}",
+                    token.get()
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn into_full_logits(self) -> Result<Vec<f32>> {
+        match self {
+            Self::FullLogits(logits) => Ok(logits),
+            Self::GreedyToken(_) => Err(FerrumError::backend(
+                "plan-runtime prefill unexpectedly returned a selected token",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod executor_sampling_output_tests {
+    use super::{ExecutorSamplingOutput, LogitsReturnPolicy};
+    use ferrum_types::TokenId;
+
+    #[test]
+    fn full_logits_require_exact_vocabulary_width() {
+        let output = ExecutorSamplingOutput::full_logits(vec![0.0; 4]).unwrap();
+        assert!(output
+            .validate_for_policy(&LogitsReturnPolicy::FullLogits, 4)
+            .is_ok());
+        assert!(output
+            .validate_for_policy(&LogitsReturnPolicy::FullLogits, 5)
+            .is_err());
+    }
+
+    #[test]
+    fn greedy_token_requires_greedy_policy_and_in_vocabulary_token() {
+        let allowed = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: None,
+        };
+        let output = ExecutorSamplingOutput::greedy_token(TokenId::new(3));
+        assert!(output.validate_for_policy(&allowed, 4).is_ok());
+        assert!(output.validate_for_policy(&allowed, 3).is_err());
+        assert!(output
+            .validate_for_policy(&LogitsReturnPolicy::FullLogits, 4)
+            .is_err());
+    }
+
+    #[test]
+    fn full_logits_are_a_legal_greedy_batch_fallback() {
+        let policy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: None,
+        };
+        let output = ExecutorSamplingOutput::full_logits(vec![0.0; 4]).unwrap();
+        assert!(output.validate_for_policy(&policy, 4).is_ok());
+    }
+}
+
 /// Sparse repetition-penalty metadata for model-side greedy argmax.
 ///
 /// The token list is request-local and de-duplicated. Applying the penalty
@@ -563,6 +677,40 @@ impl UnifiedBatch {
     }
 }
 
+/// Tensor-free decode input for an executor with plan-runtime resource
+/// authority.
+///
+/// The runtime already owns the request's physical cache and accepts exactly
+/// one token per decode frontier, so materializing a host tensor here adds no
+/// information. Legacy and modality executors continue to use [`DecodeInput`].
+#[derive(Debug, Clone)]
+pub struct PlanRuntimeDecodeInput {
+    pub request_id: RequestId,
+    pub input_token: TokenId,
+    pub kv_cache: Arc<dyn KvCacheHandle>,
+    pub logits_policy: LogitsReturnPolicy,
+}
+
+impl PlanRuntimeDecodeInput {
+    pub fn new(
+        request_id: RequestId,
+        input_token: TokenId,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> Self {
+        Self {
+            request_id,
+            input_token,
+            kv_cache,
+            logits_policy: LogitsReturnPolicy::FullLogits,
+        }
+    }
+
+    pub fn with_logits_policy(mut self, logits_policy: LogitsReturnPolicy) -> Self {
+        self.logits_policy = logits_policy;
+        self
+    }
+}
+
 /// Output from decode phase
 #[derive(Debug, Clone)]
 pub struct DecodeOutput {
@@ -594,6 +742,22 @@ impl DecodeOutput {
     pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
         self.recurrent_state = Some(recurrent_state);
         self
+    }
+}
+
+/// Tensor-free decode output from a plan-runtime executor.
+#[derive(Debug, Clone)]
+pub struct PlanRuntimeDecodeOutput {
+    pub sampling_output: ExecutorSamplingOutput,
+    pub kv_cache: Arc<dyn KvCacheHandle>,
+}
+
+impl PlanRuntimeDecodeOutput {
+    pub fn new(sampling_output: ExecutorSamplingOutput, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
+        Self {
+            sampling_output,
+            kv_cache,
+        }
     }
 }
 
@@ -1180,6 +1344,12 @@ pub enum ExecutorBatchDecodeOutcome {
     Deferred(ExecutorExecutionCapacityDeferral),
 }
 
+/// Capacity-aware, tensor-free batch decode result for a plan runtime.
+pub enum PlanRuntimeBatchDecodeOutcome {
+    Completed(Vec<PlanRuntimeDecodeOutput>),
+    Deferred(ExecutorExecutionCapacityDeferral),
+}
+
 /// Capacity-aware result for one planned prefill frontier.
 ///
 /// `Deferred` is only legal before provider encode or device submission. The
@@ -1735,6 +1905,22 @@ pub trait ModelExecutor: Send + Sync {
         self.batch_decode(inputs)
             .await
             .map(ExecutorBatchDecodeOutcome::Completed)
+    }
+
+    /// Tensor-free batch decode for executors that declare
+    /// [`ExecutionResourceAuthority::PlanRuntime`].
+    ///
+    /// Implementations must preserve input ordering and cache identity exactly.
+    /// Temporary pressure may return `Deferred` only before device submission.
+    /// The default fails closed because adapting through [`DecodeInput`] would
+    /// silently restore the host-tensor boundary this contract removes.
+    async fn plan_runtime_batch_decode_with_capacity(
+        &self,
+        _inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        Err(FerrumError::unsupported(
+            "tensor-free plan-runtime batch decode is not implemented",
+        ))
     }
 
     /// Unified mixed-batch forward: process a [`UnifiedBatch`] containing

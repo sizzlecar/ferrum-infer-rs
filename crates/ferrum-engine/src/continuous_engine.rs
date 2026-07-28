@@ -17,13 +17,13 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
-        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
-        ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
-        ExecutorExecutionCapacityPreemption, ExecutorPrefillAdmission,
-        ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
-        TokenSelectionMask,
+        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
+        ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
+        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
+        ExecutorPrefillMaintenanceOutcome, ExecutorSamplingOutput, ExecutorSequenceCompletion,
+        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, PlanRuntimeBatchDecodeOutcome,
+        PlanRuntimeDecodeInput, TokenSelectionMask,
     },
     sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
     vnext::{
@@ -1694,14 +1694,14 @@ impl SequenceState {
     }
 
     pub fn accept_model_greedy_argmax_token(
-        &self,
+        &mut self,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         token: TokenId,
     ) -> Result<()> {
         let token_detail = || self.describe_model_greedy_argmax_token(tokenizer, token);
         if !self.can_use_model_greedy_argmax() {
             return Err(FerrumError::model(format!(
-                "model returned greedy token sentinel for request requiring full logits ({})",
+                "model returned a greedy token for request requiring full logits ({})",
                 token_detail()
             )));
         }
@@ -1742,6 +1742,7 @@ impl SequenceState {
             )));
         }
 
+        *self.token_frequencies.entry(token).or_insert(0) += 1;
         Ok(())
     }
 

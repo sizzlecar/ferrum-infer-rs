@@ -30,7 +30,8 @@ pub use model_executor::{
     DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
     ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
     ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
-    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ModelExecutor,
+    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorSamplingOutput,
+    ModelExecutor, PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
     PrefillInput, PrefillOutput,
 };
 pub use recurrent_state::{

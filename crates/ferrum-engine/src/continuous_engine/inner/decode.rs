@@ -30,17 +30,13 @@ impl EngineInner {
                 let Some(resources) = sequence.ready_decode_resources(rid) else {
                     continue;
                 };
-                let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
-                let input =
-                    ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
-                        .with_request_id(rid.clone())
-                        .with_metadata(sequence.model_decode_metadata())
-                        .with_logits_policy(sequence.model_decode_logits_policy());
-                inputs.push(if let Some(state) = resources.recurrent_state {
-                    input.with_recurrent_state(state)
-                } else {
-                    input
-                });
+                let input = PlanRuntimeDecodeInput::new(
+                    rid.clone(),
+                    resources.last_token,
+                    resources.kv_cache,
+                )
+                .with_logits_policy(sequence.model_decode_logits_policy());
+                inputs.push(input);
                 rids.push(rid.clone());
             }
         }
@@ -52,9 +48,9 @@ impl EngineInner {
             .iter()
             .map(|input| input.kv_cache.cache_id())
             .collect::<Vec<_>>();
-        let input_recurrent_states = inputs
+        let input_logits_policies = inputs
             .iter()
-            .map(|input| input.recurrent_state.clone())
+            .map(|input| input.logits_policy.clone())
             .collect::<Vec<_>>();
         let workspace_lease = self.acquire_backend_workspace_lease(
             rids.clone(),
@@ -63,14 +59,14 @@ impl EngineInner {
         );
         let outputs = match self
             .model_executor
-            .batch_decode_with_capacity(&inputs)
+            .plan_runtime_batch_decode_with_capacity(&inputs)
             .await
         {
-            Ok(ExecutorBatchDecodeOutcome::Completed(outputs)) => {
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
                 workspace_lease.release();
                 outputs
             }
-            Ok(ExecutorBatchDecodeOutcome::Deferred(deferral)) => {
+            Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
                 workspace_lease.release();
                 return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids: rids,
@@ -97,39 +93,32 @@ impl EngineInner {
                     "PlanRuntime batch_decode output {index} returned cache `{actual_cache_id}`, expected `{expected_cache_id}`"
                 )));
             }
+            output.sampling_output.validate_for_policy(
+                &input_logits_policies[index],
+                self.model_executor.info().vocab_size,
+            )?;
         }
-        let logits = outputs
-            .iter()
-            .map(|output| output.logits.to_vec_f32())
-            .collect::<Result<Vec<_>>>()?;
 
-        for (((rid, output), input_recurrent_state), mut logits) in rids
-            .iter()
-            .zip(outputs)
-            .zip(input_recurrent_states)
-            .zip(logits)
-        {
+        for (rid, output) in rids.iter().zip(outputs) {
             let next_token_result = {
                 let mut sequences = self.sequences.write();
                 sequences.get_mut(rid).map(|sequence| {
-                    let token = if logits.len() == 1 {
-                        let token = TokenId::new(logits[0] as u32);
-                        sequence.accept_model_greedy_argmax_token(
-                            Some(self.tokenizer.as_ref()),
-                            token,
-                        )?;
-                        token
-                    } else {
-                        sequence.sample_with_processors_with_tokenizer(
-                            &mut logits,
-                            Some(self.tokenizer.as_ref()),
-                        )?
+                    let token = match output.sampling_output {
+                        ExecutorSamplingOutput::GreedyToken(token) => {
+                            sequence.accept_model_greedy_argmax_token(
+                                Some(self.tokenizer.as_ref()),
+                                token,
+                            )?;
+                            token
+                        }
+                        ExecutorSamplingOutput::FullLogits(mut logits) => sequence
+                            .sample_with_processors_with_tokenizer(
+                                &mut logits,
+                                Some(self.tokenizer.as_ref()),
+                            )?,
                     };
                     sequence.generated_tokens.push(token);
                     sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
-                    sequence.commit_decode_recurrent_state(
-                        output.recurrent_state.clone().or(input_recurrent_state),
-                    );
                     Ok::<TokenId, FerrumError>(token)
                 })
             };
