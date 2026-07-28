@@ -5,10 +5,62 @@
 //! completely separate from model execution to allow for flexible composition.
 
 use ferrum_types::{Result, SamplingParams, TokenId};
-use rand::RngCore;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+
+/// Stable request-local RNG used by every product sampling path.
+///
+/// `rand::rngs::StdRng` intentionally does not promise a portable algorithm.
+/// Naming the generator and seed expansion here makes seeded request replay an
+/// explicit Ferrum contract instead of an incidental dependency choice.
+pub const SAMPLING_RNG_ALGORITHM_ID: &str = "chacha12-rand-core-pcg32-u64-v1";
+
+#[derive(Clone, Debug)]
+pub struct SamplingRng {
+    inner: ChaCha12Rng,
+}
+
+impl SamplingRng {
+    pub fn seeded(seed: u64) -> Self {
+        Self {
+            inner: ChaCha12Rng::seed_from_u64(seed),
+        }
+    }
+
+    pub fn from_seed_bytes(seed: [u8; 32]) -> Self {
+        Self {
+            inner: ChaCha12Rng::from_seed(seed),
+        }
+    }
+
+    pub fn from_entropy() -> Self {
+        let mut entropy = rand::rng();
+        Self {
+            inner: ChaCha12Rng::from_rng(&mut entropy),
+        }
+    }
+
+    pub const fn algorithm_id() -> &'static str {
+        SAMPLING_RNG_ALGORITHM_ID
+    }
+}
+
+impl RngCore for SamplingRng {
+    fn next_u32(&mut self) -> u32 {
+        self.inner.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.inner.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.inner.fill_bytes(dest);
+    }
+}
 
 /// Sampling context passed to logits processors and samplers
 #[derive(Debug)]
@@ -285,44 +337,41 @@ impl TopPProcessor {
 impl LogitsProcessor for TopPProcessor {
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.p < 1.0 && self.p > 0.0 {
-            // Convert logits to probabilities
-            let max_logit = ctx.logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let mut probs: Vec<f32> = ctx
+            // A preceding top-k/min-p processor may already have reduced a
+            // full vocabulary to a small finite set. Sorting only that set
+            // keeps the common combined path proportional to its candidates.
+            let mut candidates = ctx
                 .logits
                 .iter()
-                .map(|&logit| (logit - max_logit).exp())
-                .collect();
-
-            let sum: f32 = probs.iter().sum();
-            for prob in probs.iter_mut() {
-                *prob /= sum;
+                .copied()
+                .enumerate()
+                .filter(|(_, logit)| logit.is_finite())
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return Ok(());
             }
 
-            // Sort by probability
-            let mut indices: Vec<usize> = (0..probs.len()).collect();
-            indices.sort_by(|&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            candidates.sort_by(|(left_idx, left), (right_idx, right)| {
+                right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
             });
 
-            // Find cumulative probability threshold
+            let max_logit = candidates[0].1;
+            let sum = candidates
+                .iter()
+                .map(|(_, logit)| (*logit - max_logit).exp())
+                .sum::<f32>();
             let mut cum_prob = 0.0;
-            let mut cutoff_idx = probs.len();
-
-            for (i, &idx) in indices.iter().enumerate() {
-                cum_prob += probs[idx];
-                if cum_prob > self.p {
+            let mut cutoff_idx = candidates.len();
+            for (i, (_, logit)) in candidates.iter().enumerate() {
+                cum_prob += (*logit - max_logit).exp() / sum;
+                if cum_prob >= self.p {
                     cutoff_idx = i + 1;
                     break;
                 }
             }
 
-            // Mask tokens beyond cutoff
-            for (i, &idx) in indices.iter().enumerate() {
-                if i >= cutoff_idx {
-                    ctx.logits[idx] = f32::NEG_INFINITY;
-                }
+            for (idx, _) in candidates.into_iter().skip(cutoff_idx) {
+                ctx.logits[idx] = f32::NEG_INFINITY;
             }
         }
         Ok(())

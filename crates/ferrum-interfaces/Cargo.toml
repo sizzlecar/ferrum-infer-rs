@@ -22,6 +22,7 @@ smallvec = { version = "1.11", features = ["serde"] }
 
 # Random number generation
 rand = { workspace = true }
+rand_chacha = { workspace = true }
 
 # Tracing
 tracing = { workspace = true }

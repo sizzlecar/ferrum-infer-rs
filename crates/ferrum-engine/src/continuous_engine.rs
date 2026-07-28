@@ -25,7 +25,7 @@ use ferrum_interfaces::{
         ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
         TokenSelectionMask,
     },
-    sampler::SamplingConfig as TokenSamplingPlan,
+    sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
     vnext::{
         AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
         CapacityAvailabilityEpoch, DeferredAction, DeviceCapacityPressureScope,
@@ -61,7 +61,6 @@ use ferrum_types::{
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
 use parking_lot::{Mutex, RwLock};
-use rand::{rngs::StdRng, SeedableRng};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -723,7 +722,7 @@ pub struct SequenceState {
     /// Immutable logits-processing and sampler plan prepared once per request.
     sampling_plan: TokenSamplingPlan,
     pub phase: RequestPhase,
-    pub rng: StdRng,
+    pub rng: SamplingRng,
     pub prefill_complete: bool,
     /// Number of prompt tokens already written into the model KV cache by
     /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
@@ -1127,11 +1126,8 @@ impl SequenceState {
         let rng = request
             .sampling_params
             .seed
-            .map(StdRng::seed_from_u64)
-            .unwrap_or_else(|| {
-                let mut rng = rand::rng();
-                StdRng::from_rng(&mut rng)
-            });
+            .map(SamplingRng::seeded)
+            .unwrap_or_else(SamplingRng::from_entropy);
         let needs_structured_output = !matches!(
             request.sampling_params.response_format,
             ResponseFormat::Text

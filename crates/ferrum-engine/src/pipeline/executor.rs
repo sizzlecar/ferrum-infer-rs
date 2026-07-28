@@ -5,12 +5,12 @@
 
 use super::chunked_prefill::{ChunkedPrefillConfig, ChunkedPrefillExecutor};
 use ferrum_interfaces::{
-    model_executor::DecodeInput, KvCacheHandle, ModelExecutor, Sampler, TensorRef,
+    model_executor::DecodeInput, sampler::SamplingRng, KvCacheHandle, ModelExecutor, Sampler,
+    TensorRef,
 };
 use ferrum_models::CandleTensorWrapper;
 use ferrum_types::{FerrumError, Priority, Result, SamplingParams, TokenId};
 use parking_lot::RwLock;
-use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -76,7 +76,7 @@ pub struct PipelineSequence {
     /// Priority
     pub priority: Priority,
     /// Random number generator
-    pub rng: StdRng,
+    pub rng: SamplingRng,
     /// Prefill start time
     pub prefill_start: Option<Instant>,
     /// First token time (TTFT)
@@ -102,7 +102,7 @@ impl PipelineSequence {
             kv_cache: None,
             sampling_params,
             priority,
-            rng: StdRng::seed_from_u64(seed),
+            rng: SamplingRng::seeded(seed),
             prefill_start: None,
             first_token_time: None,
             completion_time: None,
@@ -476,7 +476,7 @@ impl Clone for PipelineSequence {
             kv_cache: self.kv_cache.clone(),
             sampling_params: self.sampling_params.clone(),
             priority: self.priority,
-            rng: StdRng::seed_from_u64(self.sampling_params.seed.unwrap_or(42)),
+            rng: SamplingRng::seeded(self.sampling_params.seed.unwrap_or(42)),
             prefill_start: self.prefill_start,
             first_token_time: self.first_token_time,
             completion_time: self.completion_time,
