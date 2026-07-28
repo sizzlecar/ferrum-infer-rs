@@ -15,8 +15,10 @@ use ferrum_interfaces::{
         ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
         ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorStatus,
-        PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
-        PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
+        PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput,
+        PlanRuntimeDecodeOutput, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
+        PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimeResourceSnapshot,
+        PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -28,6 +30,7 @@ use std::time::Duration;
 struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
+    admission_accounting: std::sync::Mutex<Vec<(RequestId, usize, usize, usize)>>,
     completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
     maintenance_gated: bool,
     available_admissions: AtomicU64,
@@ -120,6 +123,56 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     decode_calls: AtomicU64,
     batch_decode_calls: AtomicU64,
     released_cache_count: AtomicU64,
+}
+
+fn plan_runtime_prefill_to_mock_input(input: &PlanRuntimePrefillInput) -> PrefillInput {
+    let values = input
+        .input_tokens
+        .iter()
+        .map(|token| token.get() as f32)
+        .collect::<Vec<_>>();
+    PrefillInput::new(MockTensor::from_f32(values, &[1, input.input_tokens.len()]).into_ref())
+        .with_request_context(input.request_id.clone(), input.maximum_sequence_tokens)
+        .with_chunk(input.chunk)
+}
+
+fn plan_runtime_prefill_completion_from_mock(
+    request_id: &RequestId,
+    completion: ExecutorPrefillCompletion,
+) -> Result<PlanRuntimePrefillCompletion> {
+    let (output, planned_chunk, completed_chunk, capacity_probe_count) = completion.into_parts();
+    let logits = output.last_token_logits()?.to_vec_f32()?;
+    let cache: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        output.kv_cache.num_layers(),
+        completed_chunk.end(),
+    ));
+    let output = if completed_chunk.is_final() {
+        PlanRuntimePrefillOutput::final_logits(
+            request_id.clone(),
+            completed_chunk.end(),
+            logits,
+            cache,
+        )?
+    } else {
+        PlanRuntimePrefillOutput::intermediate(request_id.clone(), completed_chunk.end(), cache)
+    };
+    PlanRuntimePrefillCompletion::new(output, planned_chunk, completed_chunk, capacity_probe_count)
+}
+
+fn plan_runtime_prefill_outcome_from_mock(
+    request_id: &RequestId,
+    outcome: ExecutorPrefillOutcome,
+) -> Result<PlanRuntimePrefillOutcome> {
+    match outcome {
+        ExecutorPrefillOutcome::Completed(completion) => {
+            plan_runtime_prefill_completion_from_mock(request_id, completion)
+                .map(PlanRuntimePrefillOutcome::Completed)
+        }
+        ExecutorPrefillOutcome::Deferred(deferral) => {
+            Ok(PlanRuntimePrefillOutcome::Deferred(deferral))
+        }
+    }
 }
 
 impl PlanRuntimeBatchDecodeTestExecutor {
@@ -289,6 +342,15 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         ))
     }
 
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        let mock_input = plan_runtime_prefill_to_mock_input(input);
+        let outcome = self.prefill_with_capacity(&mock_input).await?;
+        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
+    }
+
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         self.inner.decode(input).await
     }
@@ -387,6 +449,15 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             MockTensor::from_f32(logits, &[batch_size, sequence_length, vocabulary_size])
                 .into_ref();
         Ok(output)
+    }
+
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        let mock_input = plan_runtime_prefill_to_mock_input(input);
+        let outcome = self.prefill_with_capacity(&mock_input).await?;
+        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -577,6 +648,7 @@ impl PlanRuntimeAdmissionTestExecutor {
         Self {
             inner: MockModelExecutor::instant(vocab_size),
             retained: std::sync::Mutex::new(HashSet::new()),
+            admission_accounting: std::sync::Mutex::new(Vec::new()),
             completions: std::sync::Mutex::new(Vec::new()),
             maintenance_gated: false,
             available_admissions: AtomicU64::new(0),
@@ -656,7 +728,17 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         &self,
         input: ExecutorPrefillAdmission<'_>,
     ) -> Result<ExecutorPrefillAdmissionDecision> {
+        input.validate()?;
         self.admission_probes.fetch_add(1, Ordering::Relaxed);
+        self.admission_accounting
+            .lock()
+            .expect("admission accounting mutex poisoned")
+            .push((
+                input.request_id.clone(),
+                input.input_tokens.len(),
+                input.product_prompt_tokens,
+                input.replayed_output_tokens,
+            ));
         let inserted = self
             .retained
             .lock()
@@ -787,6 +869,41 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
             completions.push(ExecutorPrefillCompletion::exact(output, chunk));
         }
         Ok(ExecutorBatchPrefillOutcome::Completed(completions))
+    }
+
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        let mock_input = plan_runtime_prefill_to_mock_input(input);
+        let outcome = self.prefill_with_capacity(&mock_input).await?;
+        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
+    }
+
+    async fn plan_runtime_batch_prefill_with_capacity(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
+        let mock_inputs = inputs
+            .iter()
+            .map(plan_runtime_prefill_to_mock_input)
+            .collect::<Vec<_>>();
+        match self.batch_prefill_with_capacity(&mock_inputs).await? {
+            ExecutorBatchPrefillOutcome::Completed(completions) => completions
+                .into_iter()
+                .zip(inputs)
+                .map(|(completion, input)| {
+                    plan_runtime_prefill_completion_from_mock(&input.request_id, completion)
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(PlanRuntimeBatchPrefillOutcome::Completed),
+            ExecutorBatchPrefillOutcome::NotSubmitted(deferral) => {
+                Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral))
+            }
+            ExecutorBatchPrefillOutcome::Unsupported => {
+                Ok(PlanRuntimeBatchPrefillOutcome::Unsupported)
+            }
+        }
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -1121,6 +1238,15 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
             .expect("call order mutex poisoned")
             .push("prefill");
         self.inner.prefill(input).await
+    }
+
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        let mock_input = plan_runtime_prefill_to_mock_input(input);
+        let outcome = self.prefill_with_capacity(&mock_input).await?;
+        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -3995,7 +4121,7 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
     let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
@@ -4038,17 +4164,67 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     assert!(trace.dynamic_admission_ticks >= 1);
 }
 
+#[test]
+fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 8;
+    let request_id = request.id.clone();
+    let mut sequence =
+        SequenceState::new(request.clone(), vec![TokenId::new(11), TokenId::new(12)]);
+    sequence.generated_tokens.push(TokenId::new(13));
+    sequence.phase = RequestPhase::Waiting;
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+
+    let admitted = engine
+        .inner
+        .probe_executor_prefill_admission_for_test(&request);
+
+    assert!(admitted);
+    assert_eq!(
+        executor
+            .admission_accounting
+            .lock()
+            .expect("admission accounting mutex poisoned")
+            .as_slice(),
+        &[(request_id.clone(), 3, 2, 1)]
+    );
+    assert!(executor.cancel_prefill_admission(&request_id));
+}
+
 #[tokio::test]
 async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     config.scheduler.max_running_requests = 2;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(128, &[("test", 5), ("ok", 6)]));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        128,
+        &[("test", 5), ("ok", 6), ("generated", 42)],
+    ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
     let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
@@ -4105,8 +4281,14 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         .expect("retained admission mutex poisoned")
         .is_empty());
     let sequences = engine.inner.sequences.read();
+    let remaining_request_ids = sequences.keys().cloned().collect::<Vec<_>>();
+    let scheduler_trace = scheduler.trace_snapshot();
     for request_id in request_ids {
-        let sequence = sequences.get(&request_id).expect("prefilled sequence");
+        let sequence = sequences.get(&request_id).unwrap_or_else(|| {
+            panic!(
+                "prefilled sequence {request_id} disappeared; remaining={remaining_request_ids:?}; scheduler={scheduler_trace:?}"
+            )
+        });
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
         assert!(sequence.model_cache_id().is_some());
@@ -4122,8 +4304,10 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
     config.batching.max_batch_size = 2;
     config.batching.max_num_batched_tokens = 16;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(128, &[("test", 5), ("ok", 6)]));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        128,
+        &[("test", 5), ("ok", 6), ("generated", 42)],
+    ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
     let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_serial_backing_growth(128));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);

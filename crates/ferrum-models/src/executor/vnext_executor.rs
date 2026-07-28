@@ -24,9 +24,11 @@ use ferrum_interfaces::model_executor::{
     ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
     ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorSamplingOutput,
     ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
-    MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput,
-    PlanRuntimeDecodeOutput, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput,
-    PrefillOutput,
+    MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
+    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
+    PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
+    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimeResourceSnapshot, PrefillChunk,
+    PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -2100,7 +2102,8 @@ struct VNextSequence<R: DeviceRuntime> {
     active: AtomicBool,
     operation: AsyncMutex<()>,
     events: Option<Mutex<VNextExecutionJournal>>,
-    prompt_tokens: u64,
+    product_prompt_tokens: u64,
+    replayed_output_tokens: u64,
     prefill_tokens_processed: AtomicUsize,
 }
 
@@ -2133,6 +2136,33 @@ struct VNextPrefillCandidate<R: DeviceRuntime> {
     planned_chunk: PrefillChunk,
 }
 
+fn validate_sequence_completion_accounting(
+    request_id: &RequestId,
+    product_prompt_tokens: u64,
+    replayed_output_tokens: u64,
+    completion: &ExecutorSequenceCompletion,
+) -> Result<()> {
+    if completion.request_id() != request_id {
+        return Err(FerrumError::request_validation(format!(
+            "vNext completion request `{}` differs from cache owner `{request_id}`",
+            completion.request_id()
+        )));
+    }
+    if completion.input_tokens() != product_prompt_tokens {
+        return Err(FerrumError::request_validation(format!(
+            "vNext completion input count {} differs from admitted product prompt count {product_prompt_tokens}",
+            completion.input_tokens()
+        )));
+    }
+    if completion.output_tokens() < replayed_output_tokens {
+        return Err(FerrumError::request_validation(format!(
+            "vNext completion output count {} precedes recompute baseline {replayed_output_tokens}",
+            completion.output_tokens()
+        )));
+    }
+    Ok(())
+}
+
 impl<R: DeviceRuntime> VNextSequence<R> {
     fn preempt_for_recompute(&self) -> Result<()> {
         if !self.active.load(Ordering::Acquire) {
@@ -2149,21 +2179,14 @@ impl<R: DeviceRuntime> VNextSequence<R> {
     }
 
     fn complete(&self, completion: &ExecutorSequenceCompletion) -> Result<()> {
-        if completion.request_id() != &self.request_id {
+        if let Err(error) = validate_sequence_completion_accounting(
+            &self.request_id,
+            self.product_prompt_tokens,
+            self.replayed_output_tokens,
+            completion,
+        ) {
             self.abort();
-            return Err(FerrumError::request_validation(format!(
-                "vNext completion request `{}` differs from cache owner `{}`",
-                completion.request_id(),
-                self.request_id
-            )));
-        }
-        if completion.input_tokens() != self.prompt_tokens {
-            self.abort();
-            return Err(FerrumError::request_validation(format!(
-                "vNext completion input count {} differs from admitted prompt count {}",
-                completion.input_tokens(),
-                self.prompt_tokens
-            )));
+            return Err(error);
         }
         if !self.active.swap(false, Ordering::AcqRel) {
             return Err(FerrumError::already_exists(format!(
@@ -2773,6 +2796,45 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         drop(state);
         self.prefills.remove(request_id);
         prior.abort();
+        true
+    }
+
+    fn discard_exact_sequence(&mut self, sequence: &Arc<VNextSequence<R>>) -> bool {
+        if self
+            .active
+            .get(&sequence.cache_id)
+            .is_some_and(|current| Arc::ptr_eq(current, sequence))
+        {
+            self.active.remove(&sequence.cache_id);
+            sequence.abort();
+            return true;
+        }
+
+        let Some(slot) = self.prefills.get(&sequence.request_id).cloned() else {
+            return false;
+        };
+        if !self
+            .prefills
+            .get(&sequence.request_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &slot))
+        {
+            return false;
+        }
+        let mut state = slot.state.lock();
+        let owns_sequence = matches!(
+            &*state,
+            VNextPrefillSlotState::Ready(current)
+                | VNextPrefillSlotState::Executing(current)
+                if Arc::ptr_eq(current, sequence)
+        );
+        if !owns_sequence {
+            return false;
+        }
+        *state = VNextPrefillSlotState::Terminal;
+        slot.cancelled.store(true, Ordering::Release);
+        drop(state);
+        self.prefills.remove(&sequence.request_id);
+        sequence.abort();
         true
     }
 
@@ -3472,27 +3534,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self.capability_catalog
     }
 
-    fn startup_token_tensor(tokens: &[u32]) -> Result<TensorRef> {
-        if tokens.is_empty() {
-            return Err(FerrumError::internal(
-                "vNext startup token tensor must be non-empty",
-            ));
-        }
-        let tensor = candle_core::Tensor::new(tokens, &candle_core::Device::Cpu)
-            .and_then(|tensor| tensor.unsqueeze(0))
-            .map_err(|error| FerrumError::model(format!("vNext startup token tensor: {error}")))?;
-        Ok(common::wrap_tensor(tensor))
-    }
-
     async fn admit_startup_sequence(
         &self,
         resources: &mut VNextStartupSequenceGuard<'_, R>,
-        input_tokens: &[TokenId],
-        input_tensor: &TensorRef,
+        input_tokens: Arc<[TokenId]>,
         maximum_sequence_tokens: usize,
     ) -> Result<bool> {
         let Some(request_id) = self
-            .reserve_startup_sequence(resources, input_tokens, maximum_sequence_tokens)
+            .reserve_startup_sequence(resources, &input_tokens, maximum_sequence_tokens)
             .await?
         else {
             return Ok(false);
@@ -3503,7 +3552,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .execute_startup_prefill_chunk(
                 resources,
                 &request_id,
-                input_tensor,
+                input_tokens,
                 maximum_sequence_tokens,
                 chunk,
                 "decode-sequence admission",
@@ -3578,16 +3627,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         resources: &mut VNextStartupSequenceGuard<'_, R>,
         request_id: &RequestId,
-        input_tensor: &TensorRef,
+        input_tokens: Arc<[TokenId]>,
         maximum_sequence_tokens: usize,
         chunk: PrefillChunk,
         phase: &'static str,
     ) -> Result<Option<Arc<dyn KvCacheHandle>>> {
-        let input = PrefillInput::new(Arc::clone(input_tensor))
-            .with_request_context(request_id.clone(), maximum_sequence_tokens)
-            .with_chunk(chunk);
-        match self.execute_prefill_with_capacity(&input).await? {
-            ExecutorPrefillOutcome::Completed(completion) => {
+        let input = PlanRuntimePrefillInput::new(
+            request_id.clone(),
+            input_tokens,
+            maximum_sequence_tokens,
+            chunk,
+        )?;
+        match self
+            .execute_plan_runtime_prefill_with_capacity(&input)
+            .await?
+        {
+            PlanRuntimePrefillOutcome::Completed(completion) => {
                 let (output, planned, completed, _) = completion.into_parts();
                 if planned != chunk || completed != chunk {
                     return Err(FerrumError::internal(format!(
@@ -3595,9 +3650,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         chunk.range()
                     )));
                 }
-                Ok(Some(output.kv_cache))
+                let (authority, _) = output.into_parts();
+                Ok(Some(authority.into_cache()))
             }
-            ExecutorPrefillOutcome::Deferred(_) => {
+            PlanRuntimePrefillOutcome::Deferred(_) => {
                 resources.cancel_pending();
                 Ok(None)
             }
@@ -3609,13 +3665,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         chunk: PrefillChunk,
         phase: &'static str,
     ) -> Result<()> {
-        let raw_tokens = vec![0_u32; chunk.total_prompt_tokens()];
-        let input_tokens = raw_tokens
-            .iter()
-            .copied()
-            .map(TokenId::new)
-            .collect::<Vec<_>>();
-        let input_tensor = Self::startup_token_tensor(&raw_tokens)?;
+        let input_tokens: Arc<[TokenId]> = (0..chunk.total_prompt_tokens())
+            .map(|_| TokenId::new(0))
+            .collect::<Vec<_>>()
+            .into();
         let mut resources = VNextStartupSequenceGuard::new(self);
         let Some(request_id) = self
             .reserve_startup_sequence(&mut resources, &input_tokens, chunk.total_prompt_tokens())
@@ -3633,7 +3686,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .execute_startup_prefill_chunk(
                     &mut resources,
                     &request_id,
-                    &input_tensor,
+                    Arc::clone(&input_tokens),
                     chunk.total_prompt_tokens(),
                     prefix,
                     phase,
@@ -3651,7 +3704,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .execute_startup_prefill_chunk(
                 &mut resources,
                 &request_id,
-                &input_tensor,
+                input_tokens,
                 chunk.total_prompt_tokens(),
                 chunk,
                 phase,
@@ -3676,7 +3729,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     async fn execute_startup_decode_pass(
         &self,
         resources: &mut VNextStartupSequenceGuard<'_, R>,
-        input_tensor: &TensorRef,
+        input_token: TokenId,
         width: usize,
         phase: &'static str,
     ) -> Result<()> {
@@ -3691,12 +3744,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .take(width)
             .map(|sequence| {
-                DecodeInput::new(Arc::clone(input_tensor), Arc::clone(&sequence.kv_cache))
-                    .with_request_id(sequence.request_id.clone())
+                PlanRuntimeDecodeInput::new(
+                    sequence.request_id.clone(),
+                    input_token,
+                    Arc::clone(&sequence.kv_cache),
+                )
             })
             .collect::<Vec<_>>();
-        match self.execute_legacy_decode_batch(&inputs).await? {
-            ExecutorBatchDecodeOutcome::Completed(outputs) => {
+        match self.execute_plan_runtime_decode_batch(&inputs).await? {
+            PlanRuntimeBatchDecodeOutcome::Completed(outputs) => {
                 if outputs.len() != width {
                     return Err(FerrumError::internal(format!(
                         "vNext startup {phase} returned {} outputs for width {width}",
@@ -3708,7 +3764,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
                 Ok(())
             }
-            ExecutorBatchDecodeOutcome::Deferred(deferred) => {
+            PlanRuntimeBatchDecodeOutcome::Deferred(deferred) => {
                 Err(FerrumError::resource_exhausted(format!(
                     "vNext startup {phase} width {width} deferred at {:?}",
                     deferred.stage()
@@ -3764,8 +3820,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
-        let input_tokens = [TokenId::new(0)];
-        let input_tensor = Self::startup_token_tensor(&[0])?;
+        let input_tokens: Arc<[TokenId]> = Arc::from([TokenId::new(0)]);
+        let input_token = TokenId::new(0);
         let mut resources = VNextStartupSequenceGuard::new(self);
         let requested_sequences = requested_decode_widths.first().copied().ok_or_else(|| {
             FerrumError::internal("vNext reusable execution plan has no decode widths")
@@ -3774,8 +3830,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             if !self
                 .admit_startup_sequence(
                     &mut resources,
-                    &input_tokens,
-                    &input_tensor,
+                    Arc::clone(&input_tokens),
                     plan.maximum_decode_sequence_tokens,
                 )
                 .await?
@@ -3794,7 +3849,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             for width in prepared_decode_widths.iter().copied() {
                 self.execute_startup_decode_pass(
                     &mut resources,
-                    &input_tensor,
+                    input_token,
                     width,
                     "eager warmup",
                 )
@@ -3819,7 +3874,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         for _ in 0..REUSABLE_EXECUTION_CAPTURE_PASSES {
             for width in prepared_decode_widths.iter().copied() {
-                self.execute_startup_decode_pass(&mut resources, &input_tensor, width, "capture")
+                self.execute_startup_decode_pass(&mut resources, input_token, width, "capture")
                     .await?;
             }
         }
@@ -3843,7 +3898,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             for width in prepared_decode_widths.iter().copied() {
                 self.execute_startup_decode_pass(
                     &mut resources,
-                    &input_tensor,
+                    input_token,
                     width,
                     "replay inventory check",
                 )
@@ -4363,6 +4418,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         request_id: &RequestId,
         maximum_tokens: usize,
         tokens: Vec<u32>,
+        product_prompt_tokens: usize,
+        replayed_output_tokens: usize,
         work: ResourceWorkShape,
     ) -> Result<VNextPrefillProbeResolution<R>> {
         let identity = RequestIdentity::new(format!("request.product.{request_id}"))
@@ -4402,18 +4459,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(error);
             }
         };
-        let prompt_tokens = match u64::try_from(tokens.len()) {
-            Ok(prompt_tokens) => prompt_tokens,
+        let product_prompt_tokens = match u64::try_from(product_prompt_tokens) {
+            Ok(product_prompt_tokens) => product_prompt_tokens,
             Err(_) => {
                 let _ = session.request_cancel();
                 let _ = session.try_abort();
                 return Err(FerrumError::request_validation(
-                    "prompt token count exceeds u64",
+                    "product prompt token count exceeds u64",
+                ));
+            }
+        };
+        let replayed_output_tokens = match u64::try_from(replayed_output_tokens) {
+            Ok(replayed_output_tokens) => replayed_output_tokens,
+            Err(_) => {
+                let _ = session.request_cancel();
+                let _ = session.try_abort();
+                return Err(FerrumError::request_validation(
+                    "replayed output token count exceeds u64",
                 ));
             }
         };
         let sequence = Arc::new(VNextSequence {
-            cache_id: format!("vnext-cache-{request_id}"),
+            cache_id: format!(
+                "vnext-cache-{request_id}-{}-{}",
+                session.sequence_authority().sparse_id(),
+                session.sequence_authority().generation()
+            ),
             request_id: request_id.clone(),
             session,
             active_binding,
@@ -4422,7 +4493,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             active: AtomicBool::new(true),
             operation: AsyncMutex::new(()),
             events: events.map(Mutex::new),
-            prompt_tokens,
+            product_prompt_tokens,
+            replayed_output_tokens,
             prefill_tokens_processed: AtomicUsize::new(0),
         });
 
@@ -6532,27 +6604,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    async fn execute_prefill_with_capacity(
+    async fn execute_plan_runtime_prefill_with_capacity(
         &self,
-        input: &PrefillInput,
-    ) -> Result<ExecutorPrefillOutcome> {
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
         let started = Instant::now();
-        if input.batch_size() != 1 {
-            return Err(FerrumError::unsupported(
-                "vNext prefill currently requires one sequence per typed submission wave",
-            ));
-        }
-        let request_id = input.request_id.clone().ok_or_else(|| {
-            FerrumError::request_validation(
-                "plan-runtime vNext prefill requires a typed request_id",
-            )
-        })?;
-        let tokens = common::tensor_to_tokens(&input.input_ids)?;
-        let maximum_tokens = input.maximum_sequence_tokens.ok_or_else(|| {
-            FerrumError::request_validation(
-                "plan-runtime vNext prefill requires maximum_sequence_tokens",
-            )
-        })?;
+        let request_id = input.request_id.clone();
+        let tokens = input
+            .input_tokens
+            .iter()
+            .map(|token| token.get())
+            .collect::<Vec<_>>();
+        let maximum_tokens = input.maximum_sequence_tokens;
         if maximum_tokens < tokens.len() || maximum_tokens > self.maximum_model_tokens {
             return Err(FerrumError::request_validation(format!(
                 "request sequence ceiling {maximum_tokens} must cover prompt {} and not exceed {}",
@@ -6560,10 +6623,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 self.maximum_model_tokens
             )));
         }
-        let planned_chunk = match input.chunk {
-            Some(chunk) => chunk,
-            None => PrefillChunk::new(0, tokens.len(), tokens.len())?,
-        };
+        let planned_chunk = input.chunk;
         if planned_chunk.total_prompt_tokens() != tokens.len() {
             return Err(FerrumError::request_validation(format!(
                 "vNext prefill chunk declares {} prompt tokens for input length {}",
@@ -6615,7 +6675,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
                 else {
                     execution.restore_ready()?;
-                    return Ok(ExecutorPrefillOutcome::Deferred(deferred));
+                    return Ok(PlanRuntimePrefillOutcome::Deferred(deferred));
                 };
                 capacity_probe_count = capacity_probe_count.checked_add(1).ok_or_else(|| {
                     FerrumError::internal("vNext prefill capacity probe count overflow")
@@ -6654,7 +6714,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
                     else {
                         execution.restore_ready()?;
-                        return Ok(ExecutorPrefillOutcome::Deferred(deferred));
+                        return Ok(PlanRuntimePrefillOutcome::Deferred(deferred));
                     };
                     capacity_probe_count =
                         capacity_probe_count.checked_add(1).ok_or_else(|| {
@@ -6674,11 +6734,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let logits = logits.pop().ok_or_else(|| {
             FerrumError::internal("vNext single prefill execution returned no logits")
         })?;
-        let logits = self.prefill_tensor(logits.into_full_logits()?)?;
+        let logits = logits.into_full_logits()?;
+        let cache = self.cache_handle(&sequence, completed_chunk.end());
+        let output = if completed_chunk.is_final() {
+            PlanRuntimePrefillOutput::final_logits(
+                request_id.clone(),
+                completed_chunk.end(),
+                logits,
+                cache,
+            )?
+        } else {
+            PlanRuntimePrefillOutput::intermediate(request_id.clone(), completed_chunk.end(), cache)
+        };
+        output.validate_for_completion(&request_id, completed_chunk, self.io.output_elements)?;
         sequence
             .prefill_tokens_processed
             .store(completed_chunk.end(), Ordering::Release);
-        let cache = self.cache_handle(&sequence, completed_chunk.end());
         if completed_chunk.is_final() {
             self.sequences.lock().activate(&slot, &sequence)?;
             execution.disarm();
@@ -6692,9 +6763,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
-        Ok(ExecutorPrefillOutcome::Completed(
-            ExecutorPrefillCompletion::new(
-                PrefillOutput::new(logits, cache),
+        Ok(PlanRuntimePrefillOutcome::Completed(
+            PlanRuntimePrefillCompletion::new(
+                output,
                 planned_chunk,
                 completed_chunk,
                 capacity_probe_count,
@@ -6702,32 +6773,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ))
     }
 
-    async fn execute_prefill_batch_with_capacity(
+    async fn execute_plan_runtime_prefill_batch_with_capacity(
         &self,
-        inputs: &[PrefillInput],
-    ) -> Result<ExecutorBatchPrefillOutcome> {
+        inputs: &[PlanRuntimePrefillInput],
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
         if inputs.is_empty() {
-            return Ok(ExecutorBatchPrefillOutcome::Completed(Vec::new()));
+            return Ok(PlanRuntimeBatchPrefillOutcome::Completed(Vec::new()));
         }
         let started = Instant::now();
         let mut parsed = Vec::with_capacity(inputs.len());
         for (original_index, input) in inputs.iter().enumerate() {
-            if input.batch_size() != 1 {
-                return Err(FerrumError::unsupported(
-                    "each vNext batch-prefill input must contain exactly one sequence",
-                ));
-            }
-            let request_id = input.request_id.clone().ok_or_else(|| {
-                FerrumError::request_validation(
-                    "plan-runtime vNext batch prefill requires a typed request_id",
-                )
-            })?;
-            let tokens = common::tensor_to_tokens(&input.input_ids)?;
-            let maximum_tokens = input.maximum_sequence_tokens.ok_or_else(|| {
-                FerrumError::request_validation(
-                    "plan-runtime vNext batch prefill requires maximum_sequence_tokens",
-                )
-            })?;
+            let request_id = input.request_id.clone();
+            let tokens = input
+                .input_tokens
+                .iter()
+                .map(|token| token.get())
+                .collect::<Vec<_>>();
+            let maximum_tokens = input.maximum_sequence_tokens;
             if maximum_tokens < tokens.len() || maximum_tokens > self.maximum_model_tokens {
                 return Err(FerrumError::request_validation(format!(
                     "request sequence ceiling {maximum_tokens} must cover prompt {} and not exceed {}",
@@ -6735,10 +6797,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.maximum_model_tokens
                 )));
             }
-            let planned_chunk = match input.chunk {
-                Some(chunk) => chunk,
-                None => PrefillChunk::new(0, tokens.len(), tokens.len())?,
-            };
+            let planned_chunk = input.chunk;
             if planned_chunk.total_prompt_tokens() != tokens.len() {
                 return Err(FerrumError::request_validation(format!(
                     "vNext batch prefill chunk declares {} prompt tokens for input length {}",
@@ -6911,7 +6970,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     for guard in &mut execution_guards {
                         guard.disarm();
                     }
-                    return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(deferred));
+                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferred));
                 }
             }
 
@@ -6972,7 +7031,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     for guard in &mut execution_guards {
                         guard.disarm();
                     }
-                    return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(deferred));
+                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferred));
                 }
             }
         };
@@ -6991,10 +7050,29 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .zip(&capacity_probe_counts)
             .zip(logits)
         {
-            let logits = self.prefill_tensor(logits.into_full_logits()?)?;
+            let logits = logits.into_full_logits()?;
             let cache = self.cache_handle(&candidate.sequence, completed_chunk.end());
-            ordered[candidate.original_index] = Some(ExecutorPrefillCompletion::new(
-                PrefillOutput::new(logits, cache),
+            let output = if completed_chunk.is_final() {
+                PlanRuntimePrefillOutput::final_logits(
+                    candidate.slot.request_id.clone(),
+                    completed_chunk.end(),
+                    logits,
+                    cache,
+                )?
+            } else {
+                PlanRuntimePrefillOutput::intermediate(
+                    candidate.slot.request_id.clone(),
+                    completed_chunk.end(),
+                    cache,
+                )
+            };
+            output.validate_for_completion(
+                &candidate.slot.request_id,
+                *completed_chunk,
+                self.io.output_elements,
+            )?;
+            ordered[candidate.original_index] = Some(PlanRuntimePrefillCompletion::new(
+                output,
                 candidate.planned_chunk,
                 *completed_chunk,
                 *capacity_probe_count,
@@ -7045,7 +7123,145 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ordering::Relaxed,
         );
         drop(operation_guards);
-        Ok(ExecutorBatchPrefillOutcome::Completed(outputs))
+        Ok(PlanRuntimeBatchPrefillOutcome::Completed(outputs))
+    }
+
+    fn plan_runtime_prefill_input_from_legacy(
+        &self,
+        input: &PrefillInput,
+    ) -> Result<PlanRuntimePrefillInput> {
+        if input.batch_size() != 1 {
+            return Err(FerrumError::unsupported(
+                "each vNext legacy prefill input must contain exactly one sequence",
+            ));
+        }
+        let request_id = input.request_id.clone().ok_or_else(|| {
+            FerrumError::request_validation("vNext legacy prefill requires a request_id")
+        })?;
+        let tokens = common::tensor_to_tokens(&input.input_ids)?
+            .into_iter()
+            .map(TokenId::new)
+            .collect::<Vec<_>>();
+        let maximum_tokens = input.maximum_sequence_tokens.ok_or_else(|| {
+            FerrumError::request_validation("vNext legacy prefill requires maximum_sequence_tokens")
+        })?;
+        let chunk = match input.chunk {
+            Some(chunk) => chunk,
+            None => PrefillChunk::new(0, tokens.len(), tokens.len())?,
+        };
+        PlanRuntimePrefillInput::new(request_id, tokens, maximum_tokens, chunk)
+    }
+
+    fn legacy_prefill_completion(
+        &self,
+        completion: PlanRuntimePrefillCompletion,
+    ) -> Result<ExecutorPrefillCompletion> {
+        let (output, planned_chunk, completed_chunk, capacity_probe_count) =
+            completion.into_parts();
+        let (authority, product) = output.into_parts();
+        let PlanRuntimePrefillProduct::FinalLogits(logits) = product else {
+            self.discard_plan_runtime_prefill(authority)?;
+            return Err(FerrumError::unsupported(
+                "legacy vNext prefill cannot represent an intermediate typed product",
+            ));
+        };
+        let logits = match self.prefill_tensor(logits) {
+            Ok(logits) => logits,
+            Err(error) => {
+                if let Err(cleanup_error) = self.discard_plan_runtime_prefill(authority) {
+                    return Err(FerrumError::internal(format!(
+                        "{error}; exact prefill authority cleanup also failed: {cleanup_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        ExecutorPrefillCompletion::new(
+            PrefillOutput::new(logits, authority.into_cache()),
+            planned_chunk,
+            completed_chunk,
+            capacity_probe_count,
+        )
+    }
+
+    fn discard_plan_runtime_prefill_completions(
+        &self,
+        completions: impl IntoIterator<Item = PlanRuntimePrefillCompletion>,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        for completion in completions {
+            let (output, _, _, _) = completion.into_parts();
+            let (authority, _) = output.into_parts();
+            if let Err(error) = self.discard_plan_runtime_prefill(authority) {
+                failures.push(error.to_string());
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(FerrumError::internal(format!(
+                "failed to discard {} legacy-adapter prefill authorities: {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    async fn execute_legacy_prefill_with_capacity(
+        &self,
+        input: &PrefillInput,
+    ) -> Result<ExecutorPrefillOutcome> {
+        let input = self.plan_runtime_prefill_input_from_legacy(input)?;
+        match self
+            .execute_plan_runtime_prefill_with_capacity(&input)
+            .await?
+        {
+            PlanRuntimePrefillOutcome::Completed(completion) => self
+                .legacy_prefill_completion(completion)
+                .map(ExecutorPrefillOutcome::Completed),
+            PlanRuntimePrefillOutcome::Deferred(deferred) => {
+                Ok(ExecutorPrefillOutcome::Deferred(deferred))
+            }
+        }
+    }
+
+    async fn execute_legacy_prefill_batch_with_capacity(
+        &self,
+        inputs: &[PrefillInput],
+    ) -> Result<ExecutorBatchPrefillOutcome> {
+        let inputs = inputs
+            .iter()
+            .map(|input| self.plan_runtime_prefill_input_from_legacy(input))
+            .collect::<Result<Vec<_>>>()?;
+        match self
+            .execute_plan_runtime_prefill_batch_with_capacity(&inputs)
+            .await?
+        {
+            PlanRuntimeBatchPrefillOutcome::Completed(completions) => {
+                if completions.iter().any(|completion| {
+                    !matches!(
+                        completion.output().product(),
+                        PlanRuntimePrefillProduct::FinalLogits(_)
+                    )
+                }) {
+                    self.discard_plan_runtime_prefill_completions(completions)?;
+                    return Err(FerrumError::unsupported(
+                        "legacy vNext batch prefill cannot represent an intermediate typed product",
+                    ));
+                }
+                completions
+                    .into_iter()
+                    .map(|completion| self.legacy_prefill_completion(completion))
+                    .collect::<Result<Vec<_>>>()
+                    .map(ExecutorBatchPrefillOutcome::Completed)
+            }
+            PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferred) => {
+                Ok(ExecutorBatchPrefillOutcome::NotSubmitted(deferred))
+            }
+            PlanRuntimeBatchPrefillOutcome::Unsupported => {
+                Ok(ExecutorBatchPrefillOutcome::Unsupported)
+            }
+        }
     }
 
     fn metrics_snapshot(&self) -> serde_json::Value {
@@ -7307,11 +7523,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         input: ExecutorPrefillAdmission<'_>,
     ) -> Result<ExecutorPrefillAdmissionDecision> {
-        if input.input_tokens.is_empty() {
-            return Err(FerrumError::request_validation(
-                "plan-runtime vNext prefill admission requires at least one input token",
-            ));
-        }
+        input.validate()?;
         if input.maximum_sequence_tokens < input.input_tokens.len()
             || input.maximum_sequence_tokens > self.maximum_model_tokens
         {
@@ -7340,6 +7552,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             input.request_id,
             input.maximum_sequence_tokens,
             tokens,
+            input.product_prompt_tokens,
+            input.replayed_output_tokens,
             work,
         ) {
             Ok(resolution) => resolution,
@@ -7505,7 +7719,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        match self.execute_prefill_with_capacity(input).await? {
+        match self.execute_legacy_prefill_with_capacity(input).await? {
             ExecutorPrefillOutcome::Completed(completion) => {
                 let (output, _, _, _) = completion.into_parts();
                 Ok(output)
@@ -7517,11 +7731,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
-        self.execute_prefill_with_capacity(input).await
+        self.execute_legacy_prefill_with_capacity(input).await
     }
 
     async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        match self.execute_prefill_batch_with_capacity(inputs).await? {
+        match self
+            .execute_legacy_prefill_batch_with_capacity(inputs)
+            .await?
+        {
             ExecutorBatchPrefillOutcome::Completed(completions) => completions
                 .into_iter()
                 .map(|completion| {
@@ -7542,7 +7759,23 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         inputs: &[PrefillInput],
     ) -> Result<ExecutorBatchPrefillOutcome> {
-        self.execute_prefill_batch_with_capacity(inputs).await
+        self.execute_legacy_prefill_batch_with_capacity(inputs)
+            .await
+    }
+
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        self.execute_plan_runtime_prefill_with_capacity(input).await
+    }
+
+    async fn plan_runtime_batch_prefill_with_capacity(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
+        self.execute_plan_runtime_prefill_batch_with_capacity(inputs)
+            .await
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -7657,6 +7890,36 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         inputs: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
         self.execute_plan_runtime_decode_batch(inputs).await
+    }
+
+    fn discard_plan_runtime_prefill(&self, authority: PlanRuntimePrefillAuthority) -> Result<()> {
+        let handle = authority
+            .kv_cache()
+            .as_any()
+            .downcast_ref::<VNextKvCacheHandle<R>>()
+            .ok_or_else(|| {
+                FerrumError::request_validation(
+                    "vNext prefill discard received a foreign cache handle",
+                )
+            })?;
+        let sequence = handle.sequence.upgrade().ok_or_else(|| {
+            FerrumError::not_found("vNext prefill discard sequence is no longer retained")
+        })?;
+        if authority.request_id() != &sequence.request_id
+            || authority.committed_tokens() != handle.num_tokens()
+            || handle.cache_id != sequence.cache_id
+        {
+            return Err(FerrumError::request_validation(
+                "vNext prefill discard authority does not match its exact sequence",
+            ));
+        }
+        if !self.sequences.lock().discard_exact_sequence(&sequence) {
+            return Err(FerrumError::not_found(format!(
+                "vNext prefill discard authority `{}` is no longer current",
+                sequence.cache_id
+            )));
+        }
+        Ok(())
     }
 
     fn release_cache(&self, cache_id: &str) {
@@ -7779,14 +8042,16 @@ mod tests {
         product_token_mask_key, reported_allocated_bytes, resolve_reusable_execution_policy,
         resolved_sequence_fit_policy, reusable_executable_inventory_matches,
         reusable_execution_requires_eager_fallback, submission_execution_policy_for_timing,
-        token_mask_upload_required, AdmissionFitPolicy, DecodeFailureDisposition, FerrumError,
-        SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
-        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
-        VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        token_mask_upload_required, validate_sequence_completion_accounting, AdmissionFitPolicy,
+        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
+        VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics,
+        VNextProductOutputMode, VNextProductTokenMaskKey, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
+        VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
-        GreedyRepetitionPenalty, LogitsReturnPolicy, PrefillChunk, TokenSelectionMask,
+        ExecutorSequenceCompletion, GreedyRepetitionPenalty, LogitsReturnPolicy, PrefillChunk,
+        TokenSelectionMask,
     };
     use ferrum_interfaces::vnext::{
         CompletionReadbackBatchObservation, DeviceComputePathRequirement, DeviceExecutionInterval,
@@ -7795,7 +8060,7 @@ mod tests {
         DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink,
         DeviceTimingMeasurement, DeviceTimingMode, StepResourceAdmissionProfilePhase,
     };
-    use ferrum_types::TokenId;
+    use ferrum_types::{RequestId, TokenId};
 
     #[test]
     fn verification_timing_selects_typed_eager_submission_without_owning_other_paths() {
@@ -8385,5 +8650,31 @@ mod tests {
         assert_eq!(decode_output_width(248_320, 248_320).unwrap(), 248_320);
         assert!(decode_output_width(2, 248_320).is_err());
         assert!(decode_output_width(0, 248_320).is_err());
+    }
+
+    #[test]
+    fn recompute_completion_preserves_product_usage_and_replay_baseline() {
+        let request_id = RequestId::new();
+        let valid = ExecutorSequenceCompletion::new(request_id.clone(), "cache-valid".into(), 2, 3)
+            .unwrap();
+        validate_sequence_completion_accounting(&request_id, 2, 1, &valid).unwrap();
+
+        let wrong_prompt =
+            ExecutorSequenceCompletion::new(request_id.clone(), "cache-prompt".into(), 3, 3)
+                .unwrap();
+        assert!(validate_sequence_completion_accounting(&request_id, 2, 1, &wrong_prompt).is_err());
+
+        let before_replay =
+            ExecutorSequenceCompletion::new(request_id.clone(), "cache-output".into(), 2, 0)
+                .unwrap();
+        assert!(
+            validate_sequence_completion_accounting(&request_id, 2, 1, &before_replay).is_err()
+        );
+
+        let other_request =
+            ExecutorSequenceCompletion::new(RequestId::new(), "cache-other".into(), 2, 3).unwrap();
+        assert!(
+            validate_sequence_completion_accounting(&request_id, 2, 1, &other_request).is_err()
+        );
     }
 }
