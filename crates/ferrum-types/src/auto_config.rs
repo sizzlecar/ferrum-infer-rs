@@ -4,8 +4,9 @@
 //! env bundles with validated model/hardware/workload driven selections.
 
 use crate::{
-    is_sha256_digest, parse_bool_env_value, parse_usize_env_value, RuntimeConfigEffect,
-    RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
+    is_sha256_digest, parse_bool_env_value, parse_usize_env_value, AttentionExecutionPolicy,
+    ExecutionResourceAuthority, RuntimeConfigEffect, RuntimeConfigEntry, RuntimeConfigSnapshot,
+    RuntimeConfigSource, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -309,6 +310,12 @@ pub enum WorkloadPriority {
 pub struct ResolvedFerrumConfig {
     pub schema_version: u32,
     pub preset: Option<String>,
+    #[serde(default)]
+    pub execution_resource_authority: ExecutionResourceAuthority,
+    #[serde(default)]
+    pub requested_attention_policy: Option<AttentionExecutionPolicy>,
+    #[serde(default)]
+    pub compiled_attention_policy: Option<AttentionExecutionPolicy>,
     pub runtime_config: RuntimeConfigSnapshot,
     pub model_capabilities: ModelCapabilities,
     pub hardware_capabilities: HardwareCapabilities,
@@ -393,13 +400,19 @@ impl ResolvedFerrumConfig {
         let selected_kv_capacity = self.runtime_usize("FERRUM_KV_CAPACITY");
         let selected_max_batched_tokens = self.selected_usize("max_batched_tokens");
         let selected_recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
-        let selected_admission_limit =
-            effective_admission_limit(selected_max_sequences, selected_recurrent_state_max_slots);
+        let selected_admission_limit = effective_admission_limit(
+            self.execution_resource_authority,
+            selected_max_sequences,
+            selected_recurrent_state_max_slots,
+        );
+        let selected_attention_policy = self.selected_string("attention_execution_policy");
+        let selected_attention_impl = self.selected_string("attention_decode_backend");
         serde_json::json!({
             "schema_version": 1,
             "preset": self.preset,
             "env_hash": self.runtime_env_hash(),
             "backend": backend.clone(),
+            "execution_resource_authority": self.execution_resource_authority,
             "requested_gpu_devices": requested_gpu_devices.clone(),
             "selected_gpu_devices": selected_gpu_devices.clone(),
             "cuda_device_count": cuda_device_count,
@@ -411,7 +424,9 @@ impl ResolvedFerrumConfig {
             "selected_stage_bridge": selected_stage_bridge,
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
             "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
-            "selected_attention_impl": self.selected_string("attention_decode_backend"),
+            "selected_attention_impl": selected_attention_impl,
+            "selected_attention_policy": selected_attention_policy,
+            "attention_execution": self.attention_execution_document(),
             "selected_graph_mode": self.selected_graph_mode(),
             "selected_max_sequences": selected_max_sequences,
             "selected_max_model_len": selected_max_model_len,
@@ -431,8 +446,11 @@ impl ResolvedFerrumConfig {
     pub fn admission_summary_document(&self) -> serde_json::Value {
         let max_sequences = self.selected_usize("max_sequences");
         let recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
-        let effective_max_concurrent =
-            effective_admission_limit(max_sequences, recurrent_state_max_slots);
+        let effective_max_concurrent = effective_admission_limit(
+            self.execution_resource_authority,
+            max_sequences,
+            recurrent_state_max_slots,
+        );
         let kv_blocks = self.selected_usize("kv_block_count");
         let max_batched_tokens = self.selected_usize("max_batched_tokens");
         let max_model_len = self.selected_usize("max_model_len");
@@ -448,8 +466,12 @@ impl ResolvedFerrumConfig {
             "schema_version": 1,
             "backend": self.hardware_capabilities.backend,
             "model_architecture": self.model_capabilities.architecture,
+            "resource_authority": self.execution_resource_authority,
+            "source": "startup_preflight",
             "scheduler_policy": scheduler_policy,
             "effective_max_concurrent": effective_max_concurrent,
+            "maximum_active_sequences": max_sequences,
+            "maximum_scheduled_tokens": max_batched_tokens,
             "queue_depth": 0u64,
             "active_prefill": 0u64,
             "active_decode": 0u64,
@@ -458,7 +480,13 @@ impl ResolvedFerrumConfig {
             "failed_requests_total": 0u64,
             "completed_requests_total": 0u64,
             "max_sequences": max_sequences,
-            "recurrent_state_max_slots": recurrent_state_max_slots,
+            "recurrent_state_max_slots": if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine {
+                recurrent_state_max_slots
+            } else {
+                None
+            },
+            "legacy_recurrent_state_max_slots_estimate": recurrent_state_max_slots,
+            "legacy_recurrent_state_limit_applies": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
             "kv_block_count": kv_blocks,
             "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
             "kv_capacity_tokens": kv_capacity_tokens,
@@ -530,6 +558,53 @@ impl ResolvedFerrumConfig {
             return decode_graph;
         }
         self.selected_string("moe_graph_policy")
+    }
+
+    fn attention_execution_document(&self) -> serde_json::Value {
+        let compiled_policy = self
+            .compiled_attention_policy
+            .map(AttentionExecutionPolicy::as_runtime_value);
+        let requested_policy = self
+            .requested_attention_policy
+            .map(AttentionExecutionPolicy::as_runtime_value);
+        if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime {
+            return serde_json::json!({
+                "schema_version": 1,
+                "resource_authority": self.execution_resource_authority,
+                "requested_policy": null,
+                "compiled_policy": null,
+                "selection_scope": "legacy_runtime",
+                "observed_variant_source": "legacy_backend_profile",
+                "legacy_attention_keys_apply": true,
+            });
+        }
+        let native_adaptive =
+            compiled_policy == Some(AttentionExecutionPolicy::NativeAdaptive.as_runtime_value());
+        serde_json::json!({
+            "schema_version": 1,
+            "resource_authority": self.execution_resource_authority,
+            "requested_policy": requested_policy,
+            "compiled_policy": compiled_policy,
+            "selection_scope": "per_invocation",
+            "observed_variant_source": "vnext.device_native_work",
+            "legacy_attention_keys_apply": false,
+            "decode": if native_adaptive && self.hardware_capabilities.backend.eq_ignore_ascii_case("cuda") {
+                serde_json::json!({
+                    "selector": "sequence_frontier",
+                    "short_variant": "vllm_paged_attention_v1_addressed",
+                    "long_variant": "vllm_paged_attention_v2_addressed",
+                    "short_max_sequence_tokens": CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
+                })
+            } else {
+                serde_json::json!({
+                    "selector": "compiled_provider",
+                })
+            },
+            "prefill": {
+                "selector": "admitted_shape",
+                "variants_are_observed_at_runtime": true,
+            },
+        })
     }
 
     fn runtime_entry_value(&self, key: &str) -> Option<String> {
@@ -608,6 +683,7 @@ pub struct FerrumConfigBuilder {
     model: ModelCapabilities,
     hardware: HardwareCapabilities,
     workload: WorkloadProfile,
+    execution_resource_authority: ExecutionResourceAuthority,
 }
 
 impl FerrumConfigBuilder {
@@ -617,6 +693,7 @@ impl FerrumConfigBuilder {
             model: ModelCapabilities::unknown(),
             hardware: HardwareCapabilities::unknown(),
             workload: WorkloadProfile::default(),
+            execution_resource_authority: ExecutionResourceAuthority::LegacyEngine,
         }
     }
 
@@ -644,9 +721,37 @@ impl FerrumConfigBuilder {
         self
     }
 
+    pub fn with_execution_resource_authority(
+        mut self,
+        authority: ExecutionResourceAuthority,
+    ) -> Self {
+        self.execution_resource_authority = authority;
+        self
+    }
+
     pub fn resolve(self) -> Result<ResolvedFerrumConfig, AutoConfigError> {
         let mut decisions = Vec::new();
         let cuda_backend = self.is_cuda_backend();
+        let plan_runtime =
+            self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime;
+        if plan_runtime {
+            for key in [
+                "FERRUM_USE_VLLM_PAGED_ATTN",
+                "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+            ] {
+                if self.entry(key).is_some() {
+                    return Err(AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason: format!(
+                            "legacy attention control does not apply to PlanRuntime; use FERRUM_ATTENTION_POLICY=auto|portable|native-adaptive"
+                        ),
+                    });
+                }
+            }
+        }
+        let plan_attention = plan_runtime
+            .then(|| self.resolve_plan_attention_policy())
+            .transpose()?;
         // Any CUDA GPTQ/INT4 MoE model gets the vLLM-Marlin fast MoE path when
         // the kernel is compiled — not only the m3 bench preset. `ferrum run`
         // resolves with the serving-default workload (not the m3 preset), so
@@ -750,8 +855,15 @@ impl FerrumConfigBuilder {
             default_max_sequences.value,
             default_max_sequences.source,
         )?;
-        let default_recurrent_state_max_slots =
-            self.default_recurrent_state_max_slots(&max_sequences);
+        if plan_runtime && self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
+            return self.invalid(
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                "legacy engine recurrent-state slots do not control the plan runtime; use max sequences as the protocol ceiling and let dynamic resource admission defer on live capacity",
+            );
+        }
+        let default_recurrent_state_max_slots = (!plan_runtime)
+            .then(|| self.default_recurrent_state_max_slots(&max_sequences))
+            .flatten();
         let recurrent_state_max_slots = if default_recurrent_state_max_slots.is_some()
             || self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some()
         {
@@ -782,22 +894,24 @@ impl FerrumConfigBuilder {
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
         let default_prefill_first_until_active =
             self.default_prefill_first_until_active(&max_sequences);
-        self.validate_attention(
-            use_vllm_paged_attn.value,
-            fa_layout.value,
-            fa2_source.value,
-            fa2_direct_ffi.value,
-            shim_present,
-            vllm_v1_short.value,
-        )?;
-        self.validate_fa2_native_artifact(
-            fa2_native_manifest.as_ref(),
-            fa2_native_artifact.as_ref(),
-            fa2_native_source_sha256.as_ref(),
-            fa2_native_inputs_sha256.as_ref(),
-            fa2_source.value,
-            fa2_direct_ffi.value,
-        )?;
+        if !plan_runtime {
+            self.validate_attention(
+                use_vllm_paged_attn.value,
+                fa_layout.value,
+                fa2_source.value,
+                fa2_direct_ffi.value,
+                shim_present,
+                vllm_v1_short.value,
+            )?;
+            self.validate_fa2_native_artifact(
+                fa2_native_manifest.as_ref(),
+                fa2_native_artifact.as_ref(),
+                fa2_native_source_sha256.as_ref(),
+                fa2_native_inputs_sha256.as_ref(),
+                fa2_source.value,
+                fa2_direct_ffi.value,
+            )?;
+        }
         self.validate_moe(
             vllm_moe.value,
             device_route.value,
@@ -821,23 +935,34 @@ impl FerrumConfigBuilder {
         self.validate_layer_split_pipeline_mode()?;
         self.validate_sampling(greedy.value)?;
 
-        decisions.push(self.attention_prefill_decision(
-            use_vllm_paged_attn.clone(),
-            fa_layout,
-            fa2_source,
-            fa2_direct_ffi,
-        ));
-        decisions.push(self.fa2_native_artifact_decision(
-            fa2_native_manifest.as_ref(),
-            fa2_native_artifact.as_ref(),
-        ));
-        decisions.push(self.fa2_native_runtime_selection_decision(
-            fa2_native_manifest.as_ref(),
-            fa2_native_artifact.as_ref(),
-        ));
-        decisions.push(
-            self.attention_decode_decision(use_vllm_paged_attn.clone(), vllm_v1_short.clone()),
-        );
+        if let Some((_, compiled_attention)) = plan_attention.as_ref() {
+            decisions.push(self.plan_attention_execution_decision(compiled_attention));
+            decisions.push(self.plan_attention_phase_decision(
+                "attention_prefill_mixed_backend",
+                compiled_attention,
+            ));
+            decisions.push(
+                self.plan_attention_phase_decision("attention_decode_backend", compiled_attention),
+            );
+        } else {
+            decisions.push(self.attention_prefill_decision(
+                use_vllm_paged_attn.clone(),
+                fa_layout,
+                fa2_source,
+                fa2_direct_ffi,
+            ));
+            decisions.push(self.fa2_native_artifact_decision(
+                fa2_native_manifest.as_ref(),
+                fa2_native_artifact.as_ref(),
+            ));
+            decisions.push(self.fa2_native_runtime_selection_decision(
+                fa2_native_manifest.as_ref(),
+                fa2_native_artifact.as_ref(),
+            ));
+            decisions.push(
+                self.attention_decode_decision(use_vllm_paged_attn.clone(), vllm_v1_short.clone()),
+            );
+        }
         // Materialize the auto-resolved fast-path MoE knobs into the effective
         // config BEFORE moe_decision consumes them, so they reach the model
         // (which reads FERRUM_*, not the decisions). Only auto-derived values —
@@ -845,30 +970,45 @@ impl FerrumConfigBuilder {
         // non-preset path resolved FERRUM_VLLM_MOE as a decision only and the
         // model never saw it (~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B).
         let mut runtime_config = self.runtime_config.clone();
-        for (key, resolved) in [
+        let legacy_attention_values = [
             ("FERRUM_USE_VLLM_PAGED_ATTN", &use_vllm_paged_attn),
             ("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", &vllm_v1_short),
-            ("FERRUM_VLLM_MOE", &vllm_moe),
-            ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
-            ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
-            ("FERRUM_BATCHED_GRAPH", &batched_graph),
-            ("FERRUM_REUSABLE_EXECUTION", &reusable_execution),
-            ("FERRUM_UNIFIED_GRAPH", &unified_graph),
-            (
-                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
-                &unified_graph_layers_only,
-            ),
-            (
-                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
-                &unified_graph_lm_head_eager,
-            ),
-            ("FERRUM_GREEDY_ARGMAX", &greedy),
-        ] {
+        ];
+        for (key, resolved) in legacy_attention_values
+            .into_iter()
+            .filter(|_| !plan_runtime)
+            .chain([
+                ("FERRUM_VLLM_MOE", &vllm_moe),
+                ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
+                ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
+                ("FERRUM_BATCHED_GRAPH", &batched_graph),
+                ("FERRUM_REUSABLE_EXECUTION", &reusable_execution),
+                ("FERRUM_UNIFIED_GRAPH", &unified_graph),
+                (
+                    "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                    &unified_graph_layers_only,
+                ),
+                (
+                    "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                    &unified_graph_lm_head_eager,
+                ),
+                ("FERRUM_GREEDY_ARGMAX", &greedy),
+            ])
+        {
             if self.entry(key).is_none() {
                 runtime_config.upsert(
                     key,
                     if resolved.value { "1" } else { "0" },
                     RuntimeConfigSource::MemoryProfile,
+                );
+            }
+        }
+        if self.entry("FERRUM_ATTENTION_POLICY").is_none() {
+            if let Some((_, compiled_attention)) = plan_attention.as_ref() {
+                runtime_config.upsert(
+                    "FERRUM_ATTENTION_POLICY",
+                    compiled_attention.value.as_runtime_value(),
+                    RuntimeConfigSource::Default,
                 );
             }
         }
@@ -939,6 +1079,11 @@ impl FerrumConfigBuilder {
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
             preset: self.workload.preset.clone(),
+            execution_resource_authority: self.execution_resource_authority,
+            requested_attention_policy: plan_attention
+                .as_ref()
+                .map(|(requested, _)| requested.value),
+            compiled_attention_policy: plan_attention.as_ref().map(|(_, compiled)| compiled.value),
             runtime_config,
             model_capabilities: self.model.clone(),
             hardware_capabilities: self.hardware.clone(),
@@ -1566,20 +1711,22 @@ impl FerrumConfigBuilder {
                 "must be greater than zero",
             );
         }
-        if let Some(limit) = self.recurrent_state_budget_max_slots() {
-            let recurrent_slots = recurrent_state_max_slots.unwrap_or(max_sequences);
-            if recurrent_slots > limit {
-                let key = if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
-                    "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-                } else {
-                    "FERRUM_PAGED_MAX_SEQS"
-                };
-                return Err(AutoConfigError::InvalidOverride {
-                    key: key.to_string(),
-                    reason: format!(
-                        "recurrent-state slot pool exceeds the model/hardware memory budget: slots={recurrent_slots}, budget={limit}; use FERRUM_RECURRENT_STATE_MAX_SLOTS={limit}, lower --max-num-seqs, or a larger-memory GPU."
-                    ),
-                });
+        if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine {
+            if let Some(limit) = self.recurrent_state_budget_max_slots() {
+                let recurrent_slots = recurrent_state_max_slots.unwrap_or(max_sequences);
+                if recurrent_slots > limit {
+                    let key = if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
+                        "FERRUM_RECURRENT_STATE_MAX_SLOTS"
+                    } else {
+                        "FERRUM_PAGED_MAX_SEQS"
+                    };
+                    return Err(AutoConfigError::InvalidOverride {
+                        key: key.to_string(),
+                        reason: format!(
+                            "recurrent-state slot pool exceeds the model/hardware memory budget: slots={recurrent_slots}, budget={limit}; use FERRUM_RECURRENT_STATE_MAX_SLOTS={limit}, lower --max-num-seqs, or a larger-memory GPU."
+                        ),
+                    });
+                }
             }
         }
         if max_batched_tokens < max_sequences {
@@ -1652,6 +1799,127 @@ impl FerrumConfigBuilder {
                 "must be batch or overlapped",
             ),
         }
+    }
+
+    fn resolve_plan_attention_policy(
+        &self,
+    ) -> Result<
+        (
+            ResolvedValue<AttentionExecutionPolicy>,
+            ResolvedValue<AttentionExecutionPolicy>,
+        ),
+        AutoConfigError,
+    > {
+        let requested = match self.entry("FERRUM_ATTENTION_POLICY") {
+            Some(entry) => ResolvedValue {
+                value: AttentionExecutionPolicy::parse_runtime_value(&entry.effective_value)
+                    .map_err(|reason| AutoConfigError::InvalidOverride {
+                        key: "FERRUM_ATTENTION_POLICY".to_owned(),
+                        reason,
+                    })?,
+                source: auto_config_source_from_runtime(entry.source),
+                source_key: Some("FERRUM_ATTENTION_POLICY".to_owned()),
+            },
+            None => ResolvedValue {
+                value: AttentionExecutionPolicy::Auto,
+                source: AutoConfigSource::Default,
+                source_key: None,
+            },
+        };
+        // This preflight capability must match what the concrete runtime
+        // descriptor advertises. Metal currently provides the portable vNext
+        // provider; only the CUDA composition exposes native-adaptive attention.
+        let native_adaptive_supported =
+            self.is_cuda_backend() && self.hardware.compiled_features.vllm_paged_attn;
+        let compiled = requested
+            .value
+            .resolve(native_adaptive_supported)
+            .map_err(|reason| AutoConfigError::UnsupportedCombination {
+                selection: "attention_execution_policy".to_owned(),
+                reason,
+            })?;
+        Ok((
+            requested.clone(),
+            ResolvedValue {
+                value: compiled,
+                source: if requested.value == AttentionExecutionPolicy::Auto {
+                    AutoConfigSource::CompiledFeature
+                } else {
+                    requested.source
+                },
+                source_key: requested.source_key.clone(),
+            },
+        ))
+    }
+
+    fn plan_attention_execution_decision(
+        &self,
+        compiled: &ResolvedValue<AttentionExecutionPolicy>,
+    ) -> AutoConfigDecision {
+        let selected = compiled.value.as_runtime_value();
+        self.decision(
+            "attention_execution_policy",
+            selected,
+            compiled.source,
+            compiled.source_key.clone(),
+            ["native-adaptive", "portable"],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "native-adaptive",
+                        "native adaptive provider is not selected or compiled",
+                    ),
+                    ("portable", "portable provider is not selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Correctness,
+                RuntimeConfigEffect::Performance,
+            ],
+        )
+    }
+
+    fn plan_attention_phase_decision(
+        &self,
+        selection: &str,
+        compiled: &ResolvedValue<AttentionExecutionPolicy>,
+    ) -> AutoConfigDecision {
+        let selected = match (
+            self.hardware.backend.to_ascii_lowercase().as_str(),
+            compiled.value,
+        ) {
+            ("cuda", AttentionExecutionPolicy::NativeAdaptive) => "cuda_native_adaptive",
+            ("metal", AttentionExecutionPolicy::NativeAdaptive) => "metal_native_adaptive",
+            (_, AttentionExecutionPolicy::Portable) => "portable",
+            (_, AttentionExecutionPolicy::Auto) => "unresolved",
+            _ => "portable",
+        };
+        self.decision(
+            selection,
+            selected,
+            compiled.source,
+            compiled.source_key.clone(),
+            ["cuda_native_adaptive", "metal_native_adaptive", "portable"],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "cuda_native_adaptive",
+                        "CUDA native adaptive provider is not selected",
+                    ),
+                    (
+                        "metal_native_adaptive",
+                        "Metal native adaptive provider is not selected",
+                    ),
+                    ("portable", "portable provider is not selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Correctness,
+                RuntimeConfigEffect::Performance,
+            ],
+        )
     }
 
     fn attention_prefill_decision(
@@ -2391,9 +2659,13 @@ fn ceil_div(value: usize, divisor: usize) -> usize {
 }
 
 fn effective_admission_limit(
+    authority: ExecutionResourceAuthority,
     max_sequences: Option<usize>,
     recurrent_state_max_slots: Option<usize>,
 ) -> Option<usize> {
+    if authority == ExecutionResourceAuthority::PlanRuntime {
+        return max_sequences;
+    }
     match (max_sequences, recurrent_state_max_slots) {
         (Some(max_sequences), Some(recurrent_slots)) => Some(max_sequences.min(recurrent_slots)),
         (Some(max_sequences), None) => Some(max_sequences),
@@ -2878,12 +3150,173 @@ mod tests {
     }
 
     #[test]
-    fn effective_admission_limit_is_capped_by_recurrent_state_slots_when_present() {
-        assert_eq!(effective_admission_limit(Some(32), Some(16)), Some(16));
-        assert_eq!(effective_admission_limit(Some(16), Some(32)), Some(16));
-        assert_eq!(effective_admission_limit(Some(32), None), Some(32));
-        assert_eq!(effective_admission_limit(None, Some(16)), Some(16));
-        assert_eq!(effective_admission_limit(None, None), None);
+    fn effective_admission_limit_respects_resource_authority() {
+        let legacy = ExecutionResourceAuthority::LegacyEngine;
+        let plan = ExecutionResourceAuthority::PlanRuntime;
+        assert_eq!(
+            effective_admission_limit(legacy, Some(32), Some(16)),
+            Some(16)
+        );
+        assert_eq!(
+            effective_admission_limit(legacy, Some(16), Some(32)),
+            Some(16)
+        );
+        assert_eq!(effective_admission_limit(legacy, Some(32), None), Some(32));
+        assert_eq!(effective_admission_limit(legacy, None, Some(16)), Some(16));
+        assert_eq!(effective_admission_limit(legacy, None, None), None);
+        assert_eq!(
+            effective_admission_limit(plan, Some(32), Some(16)),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn plan_runtime_uses_dynamic_admission_and_typed_attention_authority() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+            .with_model_capabilities(synthetic_tight_recurrent_state_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .resolve()
+            .unwrap();
+
+        assert_eq!(
+            resolved.execution_resource_authority,
+            ExecutionResourceAuthority::PlanRuntime
+        );
+        assert_eq!(
+            resolved.requested_attention_policy,
+            Some(AttentionExecutionPolicy::Auto)
+        );
+        assert_eq!(
+            resolved.compiled_attention_policy,
+            Some(AttentionExecutionPolicy::NativeAdaptive)
+        );
+        assert!(resolved
+            .decisions
+            .iter()
+            .all(|decision| decision.selection != "recurrent_state_max_slots"));
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| !matches!(
+                entry.key.as_str(),
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS"
+                    | "FERRUM_USE_VLLM_PAGED_ATTN"
+                    | "FERRUM_VLLM_PAGED_ATTN_V1_SHORT"
+            )));
+
+        let document = resolved.effective_config_document();
+        assert_eq!(document["selected_max_sequences"], serde_json::json!(32));
+        assert_eq!(document["selected_admission_limit"], serde_json::json!(32));
+        assert_eq!(
+            document["selected_attention_policy"],
+            serde_json::json!("native-adaptive")
+        );
+        assert_eq!(
+            document["attention_execution"]["requested_policy"],
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            document["attention_execution"]["compiled_policy"],
+            serde_json::json!("native-adaptive")
+        );
+        assert_eq!(
+            document["attention_execution"]["legacy_attention_keys_apply"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            document["admission"]["resource_authority"],
+            serde_json::json!("plan_runtime")
+        );
+        assert_eq!(
+            document["admission"]["effective_max_concurrent"],
+            serde_json::json!(32)
+        );
+        assert_eq!(
+            document["admission"]["legacy_recurrent_state_limit_applies"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn plan_runtime_rejects_legacy_attention_overrides() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        for key in [
+            "FERRUM_USE_VLLM_PAGED_ATTN",
+            "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+        ] {
+            let error = FerrumConfigBuilder::new(snapshot(&[(key, "0")]))
+                .with_model_capabilities(synthetic_tight_recurrent_state_model())
+                .with_hardware_capabilities(hardware.clone())
+                .with_workload_profile(workload.clone())
+                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .resolve()
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AutoConfigError::InvalidOverride {
+                    key: rejected_key,
+                    reason,
+                } if rejected_key == key && reason.contains("FERRUM_ATTENTION_POLICY")
+            ));
+        }
+    }
+
+    #[test]
+    fn plan_runtime_rejects_legacy_recurrent_slot_override() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let error = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
+        ]))
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+        .resolve()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
+        ));
+    }
+
+    #[test]
+    fn metal_plan_runtime_preflight_matches_portable_runtime_capability() {
+        let mut hardware = HardwareCapabilities::unknown();
+        hardware.backend = "metal".to_owned();
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(synthetic_tight_recurrent_state_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .resolve()
+            .unwrap();
+
+        assert_eq!(
+            resolved.compiled_attention_policy,
+            Some(AttentionExecutionPolicy::Portable)
+        );
+        assert_eq!(
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "attention_decode_backend")
+                .map(|decision| decision.selected.as_str()),
+            Some("portable")
+        );
     }
 
     #[test]

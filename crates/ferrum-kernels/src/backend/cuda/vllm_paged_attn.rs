@@ -10,13 +10,13 @@
 //! PTX kernel which writes K/V in vLLM's layout.
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{FerrumError, Result, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use half::f16;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const VNEXT_VLLM_BLOCK_TOKENS: u64 = 16;
-pub(crate) const VNEXT_VLLM_PARTITION_TOKENS: u64 = 512;
+pub(crate) const VNEXT_VLLM_PARTITION_TOKENS: u64 = CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS;
 
 extern "C" {
     fn ferrum_vllm_paged_attention_v1_f16_h128_b16(

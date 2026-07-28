@@ -18,6 +18,7 @@ struct CompiledSubmissionWaveNodeIdentityTemplate {
     node_id: NodeId,
     operation_id: OperationId,
     provider_id: ProviderId,
+    provider_implementation_fingerprint: String,
     provider_execution_semantics: ProviderExecutionSemantics,
 }
 
@@ -242,6 +243,7 @@ impl DeferredBatchOperationIdentityRecipe {
             node.node_id.clone(),
             node.operation_id.clone(),
             node.provider_id.clone(),
+            node.provider_implementation_fingerprint.clone(),
             node.provider_execution_semantics,
             self.work_shape_fingerprint.clone(),
             participants,
@@ -381,6 +383,9 @@ impl OperationDispatch {
                     node_id: node.id().clone(),
                     operation_id: node.operation_id().clone(),
                     provider_id: node.selection().selected_provider().clone(),
+                    provider_implementation_fingerprint: node
+                        .provider_implementation_fingerprint()
+                        .to_owned(),
                     provider_execution_semantics: node.provider_execution_semantics(),
                 })
             })
@@ -397,7 +402,7 @@ impl OperationDispatch {
         }
         let fingerprint = canonical_operation_fingerprint(
             &FingerprintInput {
-                domain: "ferrum.runtime-vnext.compiled-submission-wave-identity.v1",
+                domain: "ferrum.runtime-vnext.compiled-submission-wave-identity.v2",
                 plan_id: plan.payload().plan_id(),
                 plan_hash: plan.plan_hash(),
                 device_id: plan.payload().device_id(),

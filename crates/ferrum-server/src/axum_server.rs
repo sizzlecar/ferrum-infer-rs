@@ -776,27 +776,72 @@ fn admission_health_json(
     engine_status: &EngineStatus,
     scheduler_metrics: &EngineMetrics,
     auto_config: &serde_json::Value,
+    runtime_snapshot: Option<&ferrum_types::ExecutorAdmissionSnapshot>,
+    runtime_error: Option<&str>,
 ) -> serde_json::Value {
     let configured = auto_config
         .get("admission")
         .and_then(|value| value.as_object());
-    let effective_max_concurrent = configured
+    let preflight_effective_max_concurrent = configured
         .and_then(|value| value.get("effective_max_concurrent"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or_else(|| {
-            (engine_status.active_requests + engine_status.queued_requests)
-                .max(1)
-                .try_into()
-                .unwrap_or(u64::MAX)
-        });
+        .and_then(|value| value.as_u64());
+    let effective_max_concurrent = if runtime_error.is_some() {
+        None
+    } else {
+        Some(
+            runtime_snapshot
+                .map(|snapshot| u64::from(snapshot.maximum_active_sequences()))
+                .or(preflight_effective_max_concurrent)
+                .unwrap_or_else(|| {
+                    (engine_status.active_requests + engine_status.queued_requests)
+                        .max(1)
+                        .try_into()
+                        .unwrap_or(u64::MAX)
+                }),
+        )
+    };
+    let active_sequences = runtime_error.is_none().then(|| {
+        runtime_snapshot
+            .map(|snapshot| u64::from(snapshot.active_sequences()))
+            .unwrap_or_else(|| engine_status.active_requests as u64)
+    });
+    let waiting_requests = runtime_error.is_none().then(|| {
+        runtime_snapshot
+            .map(|snapshot| u64::from(snapshot.waiting_requests()))
+            .unwrap_or_else(|| engine_status.queued_requests as u64)
+    });
     serde_json::json!({
-        "schema_version": 1,
-        "source": "startup_auto_config_and_engine_status",
+        "schema_version": 2,
+        "source": if runtime_error.is_some() {
+            "runtime_error"
+        } else if runtime_snapshot.is_some() {
+            "runtime_executor"
+        } else {
+            "startup_preflight_and_engine_status"
+        },
+        "runtime_snapshot_available": runtime_snapshot.is_some(),
+        "runtime_contract_error": runtime_error,
+        "resource_authority": runtime_snapshot
+            .and_then(|snapshot| serde_json::to_value(snapshot.resource_authority()).ok())
+            .unwrap_or(serde_json::Value::Null),
         "effective_max_concurrent": effective_max_concurrent,
-        "queue_depth": engine_status.queued_requests as u64,
-        "active_prefill": 0u64,
-        "active_decode": engine_status.active_requests as u64,
-        "current_batch_size": engine_status.active_requests as u64,
+        "maximum_active_sequences": runtime_snapshot
+            .map(|snapshot| u64::from(snapshot.maximum_active_sequences())),
+        "maximum_scheduled_tokens": runtime_snapshot
+            .map(|snapshot| snapshot.maximum_scheduled_tokens()),
+        "preflight_effective_max_concurrent": preflight_effective_max_concurrent,
+        "queue_depth": waiting_requests,
+        "active_sequences": active_sequences,
+        "active_prefill": runtime_snapshot
+            .map(|snapshot| u64::from(snapshot.active_prefill_sequences())),
+        "active_decode": runtime_snapshot
+            .map(|snapshot| u64::from(snapshot.active_decode_sequences())),
+        "current_batch_size": runtime_snapshot
+            .and_then(|snapshot| snapshot.current_batch_size())
+            .map(u64::from),
+        "capacity_blocked_requests": runtime_snapshot
+            .and_then(|snapshot| snapshot.capacity_blocked_requests())
+            .map(u64::from),
         "rejected_requests_total": 0u64,
         "failed_requests_total": scheduler_metrics.failed_requests,
         "completed_requests_total": scheduler_metrics.successful_requests,
@@ -805,37 +850,62 @@ fn admission_health_json(
             .and_then(|value| value.get("scheduler_policy"))
             .and_then(|value| value.as_str())
             .unwrap_or("unknown"),
-        "phase_detail_source": "engine_status_does_not_split_prefill_decode",
+        "phase_detail_source": if runtime_snapshot.is_some() {
+            "scheduler_request_index_single_read"
+        } else {
+            "unavailable"
+        },
     })
 }
 
 fn admission_prometheus_metrics(admission: &serde_json::Value) -> String {
-    let value = |key: &str| {
+    let snapshot_available = u8::from(
         admission
-            .get(key)
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0)
-    };
-    format!(
-        concat!(
-            "ferrum_admission_effective_max_concurrent {}\n",
-            "ferrum_admission_queue_depth {}\n",
-            "ferrum_admission_active_prefill {}\n",
-            "ferrum_admission_active_decode {}\n",
-            "ferrum_admission_current_batch_size {}\n",
-            "ferrum_admission_rejected_requests_total {}\n",
-            "ferrum_admission_failed_requests_total {}\n",
-            "ferrum_admission_completed_requests_total {}\n"
+            .get("runtime_snapshot_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    );
+    let mut output = format!("ferrum_admission_runtime_snapshot_available {snapshot_available}\n");
+    for (field, metric) in [
+        (
+            "effective_max_concurrent",
+            "ferrum_admission_effective_max_concurrent",
         ),
-        value("effective_max_concurrent"),
-        value("queue_depth"),
-        value("active_prefill"),
-        value("active_decode"),
-        value("current_batch_size"),
-        value("rejected_requests_total"),
-        value("failed_requests_total"),
-        value("completed_requests_total"),
-    )
+        (
+            "maximum_active_sequences",
+            "ferrum_admission_maximum_active_sequences",
+        ),
+        (
+            "maximum_scheduled_tokens",
+            "ferrum_admission_maximum_scheduled_tokens",
+        ),
+        ("queue_depth", "ferrum_admission_queue_depth"),
+        (
+            "capacity_blocked_requests",
+            "ferrum_admission_capacity_blocked_requests",
+        ),
+        ("active_sequences", "ferrum_admission_active_sequences"),
+        ("active_prefill", "ferrum_admission_active_prefill"),
+        ("active_decode", "ferrum_admission_active_decode"),
+        ("current_batch_size", "ferrum_admission_current_batch_size"),
+        (
+            "rejected_requests_total",
+            "ferrum_admission_rejected_requests_total",
+        ),
+        (
+            "failed_requests_total",
+            "ferrum_admission_failed_requests_total",
+        ),
+        (
+            "completed_requests_total",
+            "ferrum_admission_completed_requests_total",
+        ),
+    ] {
+        if let Some(value) = admission.get(field).and_then(serde_json::Value::as_u64) {
+            output.push_str(&format!("{metric} {value}\n"));
+        }
+    }
+    output
 }
 
 fn request_session_id(headers: &HeaderMap, request: &ChatCompletionsRequest) -> Option<String> {
@@ -4785,10 +4855,24 @@ async fn health_handler(
         .as_ref()
         .and_then(|engine| engine.lora_metrics_snapshot());
     let auto_config = auto_config_health_value(state.auto_config.as_ref());
-    let admission = admission_health_json(&engine_status, &scheduler_metrics, &auto_config);
+    let runtime_admission = match state.llm.as_ref() {
+        Some(engine) => engine.admission_snapshot(),
+        None => Ok(None),
+    };
+    let (runtime_admission_snapshot, runtime_admission_error) = match &runtime_admission {
+        Ok(snapshot) => (snapshot.as_ref(), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let admission = admission_health_json(
+        &engine_status,
+        &scheduler_metrics,
+        &auto_config,
+        runtime_admission_snapshot,
+        runtime_admission_error.as_deref(),
+    );
 
     let health = serde_json::json!({
-        "status": "healthy",
+        "status": if runtime_admission_error.is_some() { "unhealthy" } else { "healthy" },
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
         "engine": {
@@ -4845,7 +4929,21 @@ async fn metrics_handler(
     let engine_status = state.status().await;
     let scheduler_metrics = state.metrics();
     let auto_config = auto_config_health_value(state.auto_config.as_ref());
-    let admission = admission_health_json(&engine_status, &scheduler_metrics, &auto_config);
+    let runtime_admission = match state.llm.as_ref() {
+        Some(engine) => engine.admission_snapshot(),
+        None => Ok(None),
+    };
+    let (runtime_admission_snapshot, runtime_admission_error) = match &runtime_admission {
+        Ok(snapshot) => (snapshot.as_ref(), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let admission = admission_health_json(
+        &engine_status,
+        &scheduler_metrics,
+        &auto_config,
+        runtime_admission_snapshot,
+        runtime_admission_error.as_deref(),
+    );
     body.push_str(&admission_prometheus_metrics(&admission));
 
     Ok((
@@ -6221,6 +6319,108 @@ mod tests {
         assert_eq!(body["metadata"]["api_key"], "[redacted]");
     }
 
+    #[test]
+    fn admission_health_prefers_runtime_authority_over_preflight_estimate() {
+        let engine_status = EngineStatus {
+            is_ready: true,
+            loaded_models: Vec::new(),
+            active_requests: 2,
+            queued_requests: 1,
+            memory_usage: MemoryUsage {
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+                gpu_memory_bytes: None,
+                cpu_memory_bytes: None,
+                cache_memory_bytes: 0,
+                utilization_percent: 0.0,
+            },
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".to_owned(),
+        };
+        let runtime = ferrum_types::ExecutorAdmissionSnapshot::new(
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutorAdmissionLimits::new(32, 4096).unwrap(),
+            2,
+            7,
+            23,
+            None,
+            Some(3),
+        )
+        .unwrap();
+        let admission = admission_health_json(
+            &engine_status,
+            &EngineMetrics::default(),
+            &json!({
+                "admission": {
+                    "effective_max_concurrent": 16,
+                    "scheduler_policy": "continuous"
+                }
+            }),
+            Some(&runtime),
+            None,
+        );
+
+        assert_eq!(admission["source"], "runtime_executor");
+        assert_eq!(admission["runtime_snapshot_available"], true);
+        assert_eq!(admission["resource_authority"], "plan_runtime");
+        assert_eq!(admission["effective_max_concurrent"], 32);
+        assert_eq!(admission["maximum_active_sequences"], 32);
+        assert_eq!(admission["maximum_scheduled_tokens"], 4096);
+        assert_eq!(admission["preflight_effective_max_concurrent"], 16);
+        assert_eq!(admission["active_sequences"], 30);
+        assert_eq!(admission["active_prefill"], 7);
+        assert_eq!(admission["active_decode"], 23);
+        assert!(admission["current_batch_size"].is_null());
+        assert_eq!(admission["queue_depth"], 2);
+        assert_eq!(admission["capacity_blocked_requests"], 3);
+    }
+
+    #[test]
+    fn admission_health_surfaces_runtime_contract_failure_without_preflight_fallback() {
+        let engine_status = EngineStatus {
+            is_ready: true,
+            loaded_models: Vec::new(),
+            active_requests: 32,
+            queued_requests: 1,
+            memory_usage: MemoryUsage {
+                total_bytes: 0,
+                used_bytes: 0,
+                free_bytes: 0,
+                gpu_memory_bytes: None,
+                cpu_memory_bytes: None,
+                cache_memory_bytes: 0,
+                utilization_percent: 0.0,
+            },
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".to_owned(),
+        };
+        let admission = admission_health_json(
+            &engine_status,
+            &EngineMetrics::default(),
+            &json!({
+                "admission": {
+                    "effective_max_concurrent": 16,
+                    "scheduler_policy": "continuous"
+                }
+            }),
+            None,
+            Some("active phase count exceeded the runtime ceiling"),
+        );
+
+        assert_eq!(admission["source"], "runtime_error");
+        assert_eq!(admission["runtime_snapshot_available"], false);
+        assert_eq!(admission["preflight_effective_max_concurrent"], 16);
+        assert!(admission["effective_max_concurrent"].is_null());
+        assert!(admission["queue_depth"].is_null());
+        assert_eq!(
+            admission["runtime_contract_error"],
+            "active phase count exceeded the runtime ceiling"
+        );
+    }
+
     #[tokio::test]
     async fn route_health_includes_runtime_config_snapshot() {
         let response = get(router_with_stub("ok"), "/health").await;
@@ -6231,12 +6431,13 @@ mod tests {
         assert_eq!(body["auto_config"]["schema_version"], 1);
         assert!(body["auto_config"]["entries"].is_array(), "body: {body}");
         assert!(body["auto_config"]["admission"].is_object(), "body: {body}");
-        assert_eq!(body["admission"]["schema_version"], 1);
+        assert_eq!(body["admission"]["schema_version"], 2);
         assert!(body["admission"]["effective_max_concurrent"].is_number());
         assert!(body["admission"]["queue_depth"].is_number());
-        assert!(body["admission"]["active_prefill"].is_number());
-        assert!(body["admission"]["active_decode"].is_number());
-        assert!(body["admission"]["current_batch_size"].is_number());
+        assert!(body["admission"]["active_sequences"].is_number());
+        assert!(body["admission"]["active_prefill"].is_null());
+        assert!(body["admission"]["active_decode"].is_null());
+        assert!(body["admission"]["current_batch_size"].is_null());
         assert!(body["admission"]["rejected_requests_total"].is_number());
         assert!(body["admission"]["failed_requests_total"].is_number());
         assert!(body["admission"]["completed_requests_total"].is_number());
@@ -6257,16 +6458,28 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_text(response).await;
         for metric in [
+            "ferrum_admission_runtime_snapshot_available",
             "ferrum_admission_effective_max_concurrent",
             "ferrum_admission_queue_depth",
-            "ferrum_admission_active_prefill",
-            "ferrum_admission_active_decode",
-            "ferrum_admission_current_batch_size",
+            "ferrum_admission_active_sequences",
             "ferrum_admission_rejected_requests_total",
             "ferrum_admission_failed_requests_total",
             "ferrum_admission_completed_requests_total",
         ] {
             assert!(body.contains(metric), "missing {metric}:\n{body}");
+        }
+        for unavailable_metric in [
+            "ferrum_admission_maximum_active_sequences ",
+            "ferrum_admission_maximum_scheduled_tokens ",
+            "ferrum_admission_capacity_blocked_requests ",
+            "ferrum_admission_active_prefill ",
+            "ferrum_admission_active_decode ",
+            "ferrum_admission_current_batch_size ",
+        ] {
+            assert!(
+                !body.contains(unavailable_metric),
+                "unknown metric was encoded as a real value: {unavailable_metric}\n{body}"
+            );
         }
     }
 

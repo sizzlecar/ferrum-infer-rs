@@ -1,6 +1,6 @@
 use ferrum_types::{
-    CompiledKernelFeatures, FerrumConfigBuilder, HardwareCapabilities, ModelCapabilities,
-    RuntimeConfigSnapshot, WorkloadProfile,
+    CompiledKernelFeatures, ExecutionResourceAuthority, FerrumConfigBuilder, HardwareCapabilities,
+    ModelCapabilities, RuntimeConfigSnapshot, WorkloadProfile,
 };
 use serde::Serialize;
 
@@ -65,6 +65,7 @@ fn resolve_case(
         .with_model_capabilities(model)
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
+        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
         .resolve()
         .unwrap_or_else(|err| panic!("{name}: resolve failed: {err}"));
     SnapshotCase {

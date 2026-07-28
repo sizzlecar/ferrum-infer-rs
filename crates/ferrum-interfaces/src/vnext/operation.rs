@@ -3529,6 +3529,7 @@ pub struct BatchOperationNodeIdentity {
     node_id: NodeId,
     operation_id: OperationId,
     provider_id: ProviderId,
+    provider_implementation_fingerprint: String,
     provider_execution_semantics: ProviderExecutionSemantics,
     work_shape_fingerprint: String,
     participants: Vec<BatchOperationParticipantIdentity>,
@@ -3541,6 +3542,7 @@ impl BatchOperationNodeIdentity {
         node_id: NodeId,
         operation_id: OperationId,
         provider_id: ProviderId,
+        provider_implementation_fingerprint: String,
         provider_execution_semantics: ProviderExecutionSemantics,
         work_shape_fingerprint: String,
         participants: Vec<BatchOperationParticipantIdentity>,
@@ -3562,6 +3564,7 @@ impl BatchOperationNodeIdentity {
             || participants
                 .windows(2)
                 .any(|pair| pair[0].node_key() >= pair[1].node_key())
+            || !canonical_sha256(&provider_implementation_fingerprint)
             || !canonical_sha256(&work_shape_fingerprint)
         {
             return Err(invalid_operation(
@@ -3575,17 +3578,19 @@ impl BatchOperationNodeIdentity {
             node_id: &'a NodeId,
             operation_id: &'a OperationId,
             provider_id: &'a ProviderId,
+            provider_implementation_fingerprint: &'a str,
             provider_execution_semantics: ProviderExecutionSemantics,
             work_shape_fingerprint: &'a str,
             participants: &'a [BatchOperationParticipantIdentity],
         }
         let fingerprint = canonical_operation_fingerprint(
             &FingerprintInput {
-                domain: "ferrum.runtime-vnext.batch-operation-node-identity.v1",
+                domain: "ferrum.runtime-vnext.batch-operation-node-identity.v2",
                 node_index,
                 node_id: &node_id,
                 operation_id: &operation_id,
                 provider_id: &provider_id,
+                provider_implementation_fingerprint: &provider_implementation_fingerprint,
                 provider_execution_semantics,
                 work_shape_fingerprint: &work_shape_fingerprint,
                 participants: &participants,
@@ -3597,6 +3602,7 @@ impl BatchOperationNodeIdentity {
             node_id,
             operation_id,
             provider_id,
+            provider_implementation_fingerprint,
             provider_execution_semantics,
             work_shape_fingerprint,
             participants,
@@ -3618,6 +3624,10 @@ impl BatchOperationNodeIdentity {
 
     pub fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    pub fn provider_implementation_fingerprint(&self) -> &str {
+        &self.provider_implementation_fingerprint
     }
 
     pub const fn provider_execution_semantics(&self) -> ProviderExecutionSemantics {
@@ -4067,6 +4077,7 @@ mod batch_operation_identity_fingerprint_tests {
             node_id: NodeId::new(format!("node.{index}")).unwrap(),
             operation_id: OperationId::new(format!("operation.{index}")).unwrap(),
             provider_id: ProviderId::new(format!("provider.{index}")).unwrap(),
+            provider_implementation_fingerprint: std::iter::repeat_n(marker, 64).collect(),
             provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
             work_shape_fingerprint: std::iter::repeat_n(marker, 64).collect(),
             participants: Vec::new(),

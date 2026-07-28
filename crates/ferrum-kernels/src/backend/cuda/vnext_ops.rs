@@ -21,17 +21,19 @@ use ferrum_interfaces::vnext::{
     ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
     WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-    IDENTITY_WEIGHT_MATERIALIZER_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
-    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    TOKEN_EMBEDDING_OPERATION_ID,
 };
 #[cfg(feature = "vllm-moe-marlin")]
 use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
 };
+use ferrum_types::AttentionExecutionPolicy;
 use sha2::{Digest, Sha256};
 
 use super::vnext_replay::CudaCommandReplayKeyBuilder;
@@ -65,6 +67,7 @@ pub(super) const VNEXT_KV_PAGE_BYTES: u64 = 64 * 1024;
 pub fn cuda_vnext_runtime_config(
     ordinal: usize,
     device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaDeviceRuntimeConfig, VNextError> {
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
@@ -104,11 +107,18 @@ pub fn cuda_vnext_runtime_config(
         fingerprint_parts.push(include_str!("../../marlin_fp8_materializer.rs").as_bytes());
         fingerprint_parts
     };
+    let capabilities = cuda_vnext_capabilities()?;
+    let attention_execution_policy = requested_attention_policy
+        .resolve(capabilities.iter().any(|capability| {
+            capability.as_str() == DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+        }))
+        .map_err(invalid_plan)?;
     Ok(CudaDeviceRuntimeConfig {
         ordinal,
         device_id,
+        attention_execution_policy,
         runtime_implementation_fingerprint: implementation_fingerprint(&fingerprint_parts),
-        capabilities: cuda_vnext_capabilities()?,
+        capabilities,
         dynamic_storage_profiles: BTreeSet::from([
             DynamicStorageProfile::new(
                 DynamicStorageAllocator::LinearArena,
@@ -160,6 +170,14 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         capabilities.insert(CapabilityId::new(transformer::GPTQ_MARLIN_CAPABILITY_ID)?);
         capabilities
     };
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    let capabilities = {
+        let mut capabilities = capabilities;
+        capabilities.insert(CapabilityId::new(
+            DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID,
+        )?);
+        capabilities
+    };
     Ok(capabilities)
 }
 
@@ -200,7 +218,10 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new(
             runtime,
         )?),
-        Box::new(transformer::CudaCausalPagedAttentionProvider::new(runtime)?),
+        Box::new(transformer::CudaCausalPagedAttentionProvider::new(
+            runtime,
+            runtime.attention_execution_policy(),
+        )?),
     ];
     #[cfg(feature = "vllm-marlin")]
     let providers = {
@@ -236,8 +257,13 @@ pub struct CudaVNextComposition {
 }
 
 impl CudaVNextComposition {
-    pub fn create(ordinal: usize, device_id: DeviceId) -> Result<Self, CudaDeviceRuntimeError> {
-        let config = cuda_vnext_runtime_config(ordinal, device_id).map_err(contract_error)?;
+    pub fn create(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
+            .map_err(contract_error)?;
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[cfg(feature = "vllm-marlin")]

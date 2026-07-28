@@ -825,6 +825,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let startup_auto_config = startup_auto_config(
         &device,
         typed_model_capabilities,
+        if prepared_model.is_some() {
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime
+        } else {
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine
+        },
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
@@ -1291,6 +1296,7 @@ fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraS
 fn startup_auto_config(
     device: &ferrum_types::Device,
     typed_model_capabilities: Option<ModelCapabilities>,
+    execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -1335,6 +1341,7 @@ fn startup_auto_config(
         .with_model_capabilities(model)
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
+        .with_execution_resource_authority(execution_resource_authority)
         .resolve()
         .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
 }
@@ -1408,7 +1415,7 @@ pub(crate) fn runtime_preset_entries(
             ("FERRUM_MOE_GRAPH", "0"),
             ("FERRUM_VLLM_MOE", "1"),
             ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
-            ("FERRUM_USE_VLLM_PAGED_ATTN", "1"),
+            ("FERRUM_ATTENTION_POLICY", "native-adaptive"),
             ("FERRUM_PREFIX_CACHE", "0"),
         ],
         QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET => &[
@@ -2793,6 +2800,10 @@ mod tests {
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_ATTENTION_POLICY").effective_value,
+            "native-adaptive"
+        );
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "512");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);

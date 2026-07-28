@@ -1,9 +1,9 @@
 //! Configuration types for Ferrum components
 
 use crate::{
-    parse_bool_env_value, parse_path_env_value, parse_usize_env_value, DataType, Device, ModelId,
-    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RuntimeConfigSnapshot,
-    SamplingParams, SamplingPresets,
+    parse_bool_env_value, parse_path_env_value, parse_usize_env_value, AttentionExecutionPolicy,
+    DataType, Device, ModelId, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
+    RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
@@ -80,6 +80,7 @@ pub struct RuntimeKnobs {
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
+    pub attention_execution_policy: AttentionExecutionPolicy,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -160,6 +161,11 @@ impl EngineConfig {
                 "FERRUM_RECURRENT_STATE_MAX_SLOTS",
                 value,
             )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_ATTENTION_POLICY") {
+            self.runtime.attention_execution_policy =
+                AttentionExecutionPolicy::parse_runtime_value(value)
+                    .map_err(|reason| format!("FERRUM_ATTENTION_POLICY: {reason}"))?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =

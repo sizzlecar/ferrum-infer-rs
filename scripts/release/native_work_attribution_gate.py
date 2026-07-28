@@ -77,6 +77,15 @@ def event_topology(
         attributes.get("batching_form"),
         f"{context}.attributes.batching_form",
     )
+    provider_implementation_fingerprint = require_non_empty_string(
+        attributes.get("provider_implementation_fingerprint"),
+        f"{context}.attributes.provider_implementation_fingerprint",
+    )
+    if not is_hex_digest(provider_implementation_fingerprint, {64}):
+        raise ValidationError(
+            f"{context}.attributes.provider_implementation_fingerprint "
+            "must be a 64-character hex digest"
+        )
     participant_count = require_non_negative_int(
         shape.get("participant_count"),
         f"{context}.shape.participant_count",
@@ -300,6 +309,7 @@ def synthetic_event(
             "operation_id": operation_id,
             "native_op_id": native_op_id,
             "batching_form": batching_form,
+            "provider_implementation_fingerprint": "a" * 64,
         },
         "shape": {
             "participant_count": participants,

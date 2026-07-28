@@ -897,6 +897,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let startup_auto_config = run_startup_auto_config(
         &device,
         typed_model_capabilities,
+        if prepared_model.is_some() {
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime
+        } else {
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine
+        },
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -2283,6 +2288,7 @@ fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
 fn run_startup_auto_config(
     device: &ferrum_types::Device,
     typed_model_capabilities: Option<ModelCapabilities>,
+    execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
@@ -2302,6 +2308,7 @@ fn run_startup_auto_config(
         .with_model_capabilities(model)
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
+        .with_execution_resource_authority(execution_resource_authority)
         .resolve()
         .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
 }
@@ -2772,6 +2779,7 @@ mod tests {
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
             None,
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
             None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),

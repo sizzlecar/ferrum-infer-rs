@@ -250,6 +250,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
         || key.contains("SPEC_")
         || key.contains("REF_")
         || key.contains("DTYPE")
+        || key.contains("ATTENTION_POLICY")
         || key.contains("REUSABLE_EXECUTION")
     {
         effects.push(RuntimeConfigEffect::Correctness);
@@ -264,6 +265,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
         || key.contains("SCHED")
         || key.contains("BATCH")
         || key.contains("ATTN")
+        || key.contains("ATTENTION_POLICY")
         || key.contains("FLASH")
         || key.contains("CUDA")
         || key.contains("TRITON")
@@ -321,6 +323,15 @@ mod tests {
             EnvTriState::ForcedOn
         );
         assert!(parse_tri_state_env_value(Some("auto")).is_err());
+    }
+
+    #[test]
+    fn attention_policy_is_a_correctness_and_performance_input() {
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_ATTENTION_POLICY", "native-adaptive")]);
+        let entry = snapshot.entries.first().expect("attention policy entry");
+        assert!(entry.affects.contains(&RuntimeConfigEffect::Correctness));
+        assert!(entry.affects.contains(&RuntimeConfigEffect::Performance));
     }
 
     #[test]

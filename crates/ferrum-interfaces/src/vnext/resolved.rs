@@ -1,3 +1,4 @@
+use ferrum_types::AttentionExecutionPolicy;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -1012,6 +1013,7 @@ struct RuntimePolicyFingerprintPayload<'a> {
     scheduling: SchedulingDiscipline,
     memory: &'a RuntimeMemoryPolicy,
     admission: &'a AdmissionPolicy,
+    attention_execution: AttentionExecutionPolicy,
     execution_determinism: ExecutionDeterminismRequirement,
     reusable_execution: &'a Option<ReusableExecutionPolicy>,
 }
@@ -1023,6 +1025,7 @@ pub struct ResolvedRuntimePolicy {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    attention_execution: AttentionExecutionPolicy,
     execution_determinism: ExecutionDeterminismRequirement,
     reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
@@ -1036,6 +1039,7 @@ struct ResolvedRuntimePolicyWire {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    attention_execution: AttentionExecutionPolicy,
     execution_determinism: ExecutionDeterminismRequirement,
     reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
@@ -1053,6 +1057,7 @@ impl<'de> Deserialize<'de> for ResolvedRuntimePolicy {
             wire.scheduling,
             wire.memory,
             wire.admission,
+            wire.attention_execution,
             wire.execution_determinism,
             wire.reusable_execution,
         )
@@ -1074,6 +1079,7 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: RuntimeMemoryPolicy,
         admission: AdmissionPolicy,
+        attention_execution: AttentionExecutionPolicy,
         execution_determinism: ExecutionDeterminismRequirement,
         reusable_execution: Option<ReusableExecutionPolicy>,
     ) -> Result<Self, VNextError> {
@@ -1083,6 +1089,7 @@ impl ResolvedRuntimePolicy {
             version,
             &memory,
             &admission,
+            attention_execution,
             reusable_execution.as_ref(),
         )?;
         let fingerprint = Self::compute_fingerprint(
@@ -1091,6 +1098,7 @@ impl ResolvedRuntimePolicy {
             scheduling,
             &memory,
             &admission,
+            attention_execution,
             execution_determinism,
             &reusable_execution,
         )?;
@@ -1100,6 +1108,7 @@ impl ResolvedRuntimePolicy {
             scheduling,
             memory,
             admission,
+            attention_execution,
             execution_determinism,
             reusable_execution,
             fingerprint,
@@ -1111,6 +1120,7 @@ impl ResolvedRuntimePolicy {
         version: ContractVersion,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        attention_execution: AttentionExecutionPolicy,
         reusable_execution: Option<&ReusableExecutionPolicy>,
     ) -> Result<(), VNextError> {
         validate_portable_identifier("runtime_policy.policy_id", policy_id, 160)?;
@@ -1146,6 +1156,12 @@ impl ResolvedRuntimePolicy {
                 "queue depth, scheduled-token ceiling, and cancellation interval must be non-zero",
             ));
         }
+        if !attention_execution.is_resolved() {
+            return Err(invalid_plan(
+                "runtime_policy.attention_execution",
+                "attention execution policy must be resolved before plan compilation",
+            ));
+        }
         if let Some(reusable_execution) = reusable_execution {
             reusable_execution.validate()?;
             if reusable_execution.buckets().iter().any(|bucket| {
@@ -1167,6 +1183,7 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        attention_execution: AttentionExecutionPolicy,
         execution_determinism: ExecutionDeterminismRequirement,
         reusable_execution: &Option<ReusableExecutionPolicy>,
     ) -> Result<String, VNextError> {
@@ -1177,6 +1194,7 @@ impl ResolvedRuntimePolicy {
                 scheduling,
                 memory,
                 admission,
+                attention_execution,
                 execution_determinism,
                 reusable_execution,
             },
@@ -1202,6 +1220,10 @@ impl ResolvedRuntimePolicy {
 
     pub fn admission(&self) -> &AdmissionPolicy {
         &self.admission
+    }
+
+    pub const fn attention_execution(&self) -> AttentionExecutionPolicy {
+        self.attention_execution
     }
 
     pub const fn execution_determinism(&self) -> ExecutionDeterminismRequirement {
@@ -1238,6 +1260,10 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
         self.admission.maximum_scheduled_tokens
     }
 
+    fn attention_execution_policy(&self) -> AttentionExecutionPolicy {
+        self.attention_execution
+    }
+
     fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
         self.execution_determinism
     }
@@ -1256,6 +1282,7 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
             self.version,
             &self.memory,
             &self.admission,
+            self.attention_execution,
             self.reusable_execution.as_ref(),
         )?;
         let computed = Self::compute_fingerprint(
@@ -1264,6 +1291,7 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
             self.scheduling,
             &self.memory,
             &self.admission,
+            self.attention_execution,
             self.execution_determinism,
             &self.reusable_execution,
         )?;

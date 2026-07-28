@@ -3,6 +3,43 @@ mod vnext_core_contract;
 use vnext_core_contract::*;
 
 #[test]
+fn attention_provider_policy_is_sealed_into_runtime_fingerprint() {
+    let build = |attention_execution| {
+        ResolvedRuntimePolicy::new(
+            "runtime-policy.attention-test",
+            ContractVersion::new(3, 0),
+            SchedulingDiscipline::FirstReady,
+            RuntimeMemoryPolicy {
+                capacity_bytes: 4096,
+                reserve_bytes: 128,
+                maximum_active_sequences: 32,
+                dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+            },
+            serde_json::from_value(json!({
+                "maximum_queue_depth": 64,
+                "maximum_scheduled_tokens": 4096,
+                "sequence_fit_policy": "immediate_only",
+                "allow_defer": true,
+                "cancellation_check_interval_steps": 1
+            }))
+            .unwrap(),
+            attention_execution,
+            ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+            None,
+        )
+    };
+
+    let portable = build(ferrum_types::AttentionExecutionPolicy::Portable).unwrap();
+    let native = build(ferrum_types::AttentionExecutionPolicy::NativeAdaptive).unwrap();
+    assert_ne!(portable.fingerprint_str(), native.fingerprint_str());
+    assert_eq!(
+        native.attention_execution(),
+        ferrum_types::AttentionExecutionPolicy::NativeAdaptive
+    );
+    assert!(build(ferrum_types::AttentionExecutionPolicy::Auto).is_err());
+}
+
+#[test]
 fn operation_resource_contract_requires_explicit_presence_and_alignment() {
     assert!(ResourcePresenceRequirement::Required.accepts(true));
     assert!(!ResourcePresenceRequirement::Required.accepts(false));
@@ -207,6 +244,7 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         Some(reusable_execution),
     )

@@ -20,6 +20,7 @@ use ferrum_interfaces::vnext::{
     ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
+use ferrum_types::{AttentionExecutionPolicy, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use sha2::{Digest, Sha256};
 
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
@@ -72,7 +73,7 @@ const BINDING_SEQUENCE_LENGTH_OFFSET: u64 = 3 * std::mem::size_of::<i32>() as u6
 const WARP_THREADS: u32 = 32;
 const MAXIMUM_HEAD_DIM: u64 = 256;
 const VLLM_BLOCK_TOKENS: u64 = 16;
-const VLLM_PARTITION_TOKENS: u64 = 512;
+const VLLM_PARTITION_TOKENS: u64 = CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS;
 const VARLEN_DEFAULT_SHARED_LIMIT_BYTES: u64 = 48 * 1024;
 const VARLEN_STATIC_SHARED_RESERVE_BYTES: u64 = 1024;
 const VARLEN_DYNAMIC_SHARED_BUDGET_BYTES: u64 =
@@ -82,6 +83,7 @@ const VARLEN_TILED_QUERY_TOKENS: u64 = 4;
 pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider {
     descriptor: OperationProviderDescriptor,
     functions: CausalAttentionFunctions,
+    attention_policy: AttentionExecutionPolicy,
     #[cfg(feature = "vllm-marlin")]
     projection_runtime: MarlinProjectionRuntime,
 }
@@ -101,7 +103,13 @@ struct CausalAttentionFunctions {
 impl CudaCausalPagedAttentionProvider {
     pub(in crate::backend::cuda::vnext_ops) fn new(
         runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        if !attention_policy.is_resolved() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA causal attention policy must be resolved before provider construction",
+            ));
+        }
         let contract = causal_paged_attention_contract().map_err(contract_error)?;
         let capability =
             CapabilityId::new(CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID).map_err(contract_error)?;
@@ -141,6 +149,7 @@ impl CudaCausalPagedAttentionProvider {
             include_str!("../../../../../kernels/vllm_attn/ferrum_shim.h").as_bytes(),
             include_str!("../../../../../kernels/vllm_attn/include/cuda_compat.h").as_bytes(),
         ]);
+        provider_sources.push(attention_policy.as_runtime_value().as_bytes());
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint =
             implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
@@ -259,6 +268,7 @@ impl CudaCausalPagedAttentionProvider {
         Ok(Self {
             descriptor,
             functions,
+            attention_policy,
             #[cfg(feature = "vllm-marlin")]
             projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
@@ -328,7 +338,7 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
                 shape
-                    .vllm_scratch_bytes()
+                    .attention_policy_scratch_bytes(self.attention_policy)
                     .and_then(|bytes| {
                         bytes
                             .checked_add(projection.workspace_bytes()?)
@@ -375,7 +385,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         {
             return Ok(ReusableExecutionTopology::Ineligible);
         }
-        reusable_attention_topology(&request)
+        reusable_attention_topology(&request, self.attention_policy)
             .map(ReusableExecutionTopology::Dynamic)
             .map_err(invalid_plan)
     }
@@ -388,6 +398,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         encode_attention(
             &self.functions,
             self.descriptor.provider_implementation_fingerprint(),
+            self.attention_policy,
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
             invocation,
@@ -460,6 +471,7 @@ enum CausalAttentionKernelPath {
 
 impl CausalAttentionKernelPath {
     fn select(
+        attention_policy: AttentionExecutionPolicy,
         shape: CausalAttentionShape,
         active_tokens: u64,
         sequence_tokens: u64,
@@ -467,14 +479,37 @@ impl CausalAttentionKernelPath {
         if matches!(shape.kv_layout()?, CausalKvLayout::TokenMajorPages) {
             return Ok(Self::TokenMajorFallback);
         }
-        #[cfg(feature = "vllm-paged-attn-v2")]
         if active_tokens == 1 && shape.tiled_vllm_supported()? {
-            return Ok(
-                match VnextAddressedPagedAttentionKernel::for_sequence_length(sequence_tokens) {
-                    VnextAddressedPagedAttentionKernel::V1 => Self::VllmAddressedDecodeV1,
-                    VnextAddressedPagedAttentionKernel::V2 => Self::VllmAddressedDecodeV2,
-                },
-            );
+            return match attention_policy {
+                AttentionExecutionPolicy::Portable => Ok(Self::VllmAddressedFallback),
+                AttentionExecutionPolicy::NativeAdaptive => {
+                    #[cfg(feature = "vllm-paged-attn-v2")]
+                    {
+                        Ok(
+                            match VnextAddressedPagedAttentionKernel::for_sequence_length(
+                                sequence_tokens,
+                            ) {
+                                VnextAddressedPagedAttentionKernel::V1 => {
+                                    Self::VllmAddressedDecodeV1
+                                }
+                                VnextAddressedPagedAttentionKernel::V2 => {
+                                    Self::VllmAddressedDecodeV2
+                                }
+                            },
+                        )
+                    }
+                    #[cfg(not(feature = "vllm-paged-attn-v2"))]
+                    {
+                        Err(
+                            "native-adaptive causal attention requires the compiled vLLM paged-attention provider"
+                                .to_owned(),
+                        )
+                    }
+                }
+                AttentionExecutionPolicy::Auto => {
+                    Err("causal attention received an unresolved auto policy".to_owned())
+                }
+            };
         }
         let score_bytes = sequence_tokens
             .checked_mul(std::mem::size_of::<f32>() as u64)
@@ -619,6 +654,7 @@ impl CausalAttentionReplayTopology {
 
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
+    attention_policy: AttentionExecutionPolicy,
 ) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
     if request.operation_id().as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID {
         return Err("CUDA causal topology received another operation".to_owned());
@@ -630,6 +666,7 @@ fn reusable_attention_topology(
     }
 
     reusable_attention_topology_from_rows(
+        attention_policy,
         shape,
         ranges.len(),
         ranges.iter().map(|range| {
@@ -654,6 +691,7 @@ struct CausalAttentionTopologyRow {
 }
 
 fn reusable_attention_topology_from_rows<I>(
+    attention_policy: AttentionExecutionPolicy,
     shape: CausalAttentionShape,
     row_count: usize,
     rows: I,
@@ -679,8 +717,12 @@ where
         total_tokens = total_tokens
             .checked_add(row.active_tokens)
             .ok_or_else(|| "CUDA causal topology token count overflows".to_owned())?;
-        let path =
-            CausalAttentionKernelPath::select(shape, row.active_tokens, row.sequence_tokens)?;
+        let path = CausalAttentionKernelPath::select(
+            attention_policy,
+            shape,
+            row.active_tokens,
+            row.sequence_tokens,
+        )?;
         let topology = CausalAttentionReplayTopology::new(shape, path, row.sequence_tokens)?;
         let envelope = topology.envelope();
         digest.update(row.active_tokens.to_le_bytes());
@@ -879,6 +921,19 @@ impl CausalAttentionShape {
             .ok_or_else(|| "causal attention vLLM scratch size overflows".to_owned())
     }
 
+    fn attention_policy_scratch_bytes(
+        self,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<u64, String> {
+        match attention_policy {
+            AttentionExecutionPolicy::Portable => Ok(0),
+            AttentionExecutionPolicy::NativeAdaptive => self.vllm_scratch_bytes(),
+            AttentionExecutionPolicy::Auto => {
+                Err("causal attention scratch received an unresolved auto policy".to_owned())
+            }
+        }
+    }
+
     fn tiled_vllm_supported(self) -> Result<bool, String> {
         Ok(cfg!(feature = "vllm-paged-attn-v2")
             && matches!(self.kv_layout()?, CausalKvLayout::VllmBlocks16 { .. })
@@ -1010,6 +1065,7 @@ impl ScratchLayout {
         shape: CausalAttentionShape,
         total_tokens: u64,
         projection: CausalProjection,
+        attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, String> {
         if total_tokens == 0 {
             return Err("causal attention scratch cannot be sized for empty work".to_owned());
@@ -1026,7 +1082,9 @@ impl ScratchLayout {
         let query = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let context = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let projected = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
-        let vllm = if shape.vllm_scratch_bytes()? == 0 {
+        let attention_policy_scratch_bytes =
+            shape.attention_policy_scratch_bytes(attention_policy)?;
+        let vllm = if attention_policy_scratch_bytes == 0 {
             None
         } else {
             let partitions = shape.maximum_context_tokens.div_ceil(VLLM_PARTITION_TOKENS);
@@ -1054,7 +1112,7 @@ impl ScratchLayout {
             .checked_mul(total_tokens)
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         let expected = token_bytes
-            .checked_add(shape.vllm_scratch_bytes()?)
+            .checked_add(attention_policy_scratch_bytes)
             .and_then(|bytes| bytes.checked_add(projection_workspace_bytes))
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         if offset != expected {
@@ -1196,6 +1254,7 @@ struct CausalAttentionBinding {
 fn encode_attention(
     functions: &CausalAttentionFunctions,
     provider_fingerprint: &str,
+    attention_policy: AttentionExecutionPolicy,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
@@ -1228,7 +1287,7 @@ fn encode_attention(
     let program_binding = invocation.program_binding().cloned();
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens, projection)?;
+    let layout = ScratchLayout::new(shape, total_tokens, projection, attention_policy)?;
     let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
@@ -1396,7 +1455,7 @@ fn encode_attention(
         let sequence_tokens_i32 = checked_i32(source.end, "causal attention sequence token count")?;
         let table_entries_i32 =
             checked_i32(table_entries, "causal attention address-table entry count")?;
-        let path = CausalAttentionKernelPath::select(shape, tokens, source.end)?;
+        let path = CausalAttentionKernelPath::select(attention_policy, shape, tokens, source.end)?;
         let replay_topology = CausalAttentionReplayTopology::new(shape, path, source.end)?;
         let host_binding = host_storage.len();
         host_storage.push(binding_payload(
@@ -3158,10 +3217,29 @@ mod tests {
         }
     }
 
+    fn select_native_path(
+        shape: CausalAttentionShape,
+        active_tokens: u64,
+        sequence_tokens: u64,
+    ) -> Result<CausalAttentionKernelPath, String> {
+        CausalAttentionKernelPath::select(
+            AttentionExecutionPolicy::NativeAdaptive,
+            shape,
+            active_tokens,
+            sequence_tokens,
+        )
+    }
+
     #[test]
     fn scratch_estimator_and_layout_are_identical() {
         let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
-        let layout = ScratchLayout::new(shape, 17, CausalProjection::F16).unwrap();
+        let layout = ScratchLayout::new(
+            shape,
+            17,
+            CausalProjection::F16,
+            AttentionExecutionPolicy::NativeAdaptive,
+        )
+        .unwrap();
         let bindings = BindingLayout::new(shape, 3).unwrap();
         assert_eq!(
             layout.required_bytes,
@@ -3177,6 +3255,34 @@ mod tests {
             2 * shape.binding_slot_bytes().unwrap()
         );
         assert_eq!(shape.maximum_pages().unwrap(), 64);
+    }
+
+    #[test]
+    fn portable_policy_omits_native_partition_scratch() {
+        let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
+        let portable = ScratchLayout::new(
+            shape,
+            17,
+            CausalProjection::F16,
+            AttentionExecutionPolicy::Portable,
+        )
+        .unwrap();
+        let native = ScratchLayout::new(
+            shape,
+            17,
+            CausalProjection::F16,
+            AttentionExecutionPolicy::NativeAdaptive,
+        )
+        .unwrap();
+        assert!(portable.vllm.is_none());
+        assert_eq!(
+            portable.required_bytes,
+            17 * shape.scratch_bytes_per_token().unwrap()
+        );
+        assert_eq!(
+            native.required_bytes - portable.required_bytes,
+            shape.vllm_scratch_bytes().unwrap()
+        );
     }
 
     #[test]
@@ -3238,7 +3344,13 @@ mod tests {
     #[test]
     fn packed_token_offsets_follow_dense_matrix_rows_not_allocation_padding() {
         let shape = goal_shape(3, 1, 10, 128);
-        let layout = ScratchLayout::new(shape, 3, CausalProjection::F16).unwrap();
+        let layout = ScratchLayout::new(
+            shape,
+            3,
+            CausalProjection::F16,
+            AttentionExecutionPolicy::NativeAdaptive,
+        )
+        .unwrap();
         assert_eq!(
             layout
                 .token_offset(layout.query_raw, 1, shape.query_projection_features)
@@ -3303,7 +3415,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 1, 33).unwrap(),
+            select_native_path(shape, 1, 33).unwrap(),
             CausalAttentionKernelPath::TokenMajorFallback
         );
     }
@@ -3412,6 +3524,7 @@ mod tests {
         let shape = goal_shape(16, 2, 256, 4_096);
         let topology = |sequence_tokens| {
             reusable_attention_topology_from_rows(
+                AttentionExecutionPolicy::NativeAdaptive,
                 shape,
                 1,
                 std::iter::once(Ok(CausalAttentionTopologyRow {
@@ -3463,15 +3576,15 @@ mod tests {
     fn kernel_path_records_exact_native_implementation() {
         let shape = goal_shape(16, 4, 256, 32_768);
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 8, 2_048).unwrap(),
+            select_native_path(shape, 8, 2_048).unwrap(),
             CausalAttentionKernelPath::VllmAddressedVarlenTiled
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 2, 4_000).unwrap(),
+            select_native_path(shape, 2, 4_000).unwrap(),
             CausalAttentionKernelPath::VllmAddressedVarlen
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 8, 13_000).unwrap(),
+            select_native_path(shape, 8, 13_000).unwrap(),
             CausalAttentionKernelPath::VllmAddressedFallback
         );
         assert_eq!(
@@ -3479,35 +3592,52 @@ mod tests {
             "ferrum.paged_varlen_attention.vllm_q4_addressed"
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 4, 3_008).unwrap(),
+            select_native_path(shape, 4, 3_008).unwrap(),
             CausalAttentionKernelPath::VllmAddressedVarlenTiled
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 4, 3_009).unwrap(),
+            select_native_path(shape, 4, 3_009).unwrap(),
             CausalAttentionKernelPath::VllmAddressedVarlen
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 2, 12_032).unwrap(),
+            select_native_path(shape, 2, 12_032).unwrap(),
             CausalAttentionKernelPath::VllmAddressedVarlen
         );
         assert_eq!(
-            CausalAttentionKernelPath::select(shape, 2, 12_033).unwrap(),
+            select_native_path(shape, 2, 12_033).unwrap(),
             CausalAttentionKernelPath::VllmAddressedFallback
         );
 
         let oversized = goal_shape(16, 8, 256, 32_768);
         assert_eq!(
-            CausalAttentionKernelPath::select(oversized, 1, 1).unwrap(),
+            select_native_path(oversized, 1, 1).unwrap(),
             CausalAttentionKernelPath::TokenMajorFallback
         );
+    }
+
+    #[test]
+    fn portable_policy_never_selects_optional_vllm_decode() {
+        let shape = goal_shape(16, 4, 256, 32_768);
+        for sequence_tokens in [1, 512, 513, 32_768] {
+            assert_eq!(
+                CausalAttentionKernelPath::select(
+                    AttentionExecutionPolicy::Portable,
+                    shape,
+                    1,
+                    sequence_tokens,
+                )
+                .unwrap(),
+                CausalAttentionKernelPath::VllmAddressedFallback
+            );
+        }
     }
 
     #[cfg(feature = "vllm-paged-attn-v2")]
     #[test]
     fn decode_path_selects_vllm_v1_and_v2_without_runtime_env() {
         let shape = goal_shape(16, 4, 256, 32_768);
-        let v1 = CausalAttentionKernelPath::select(shape, 1, 512).unwrap();
-        let v2 = CausalAttentionKernelPath::select(shape, 1, 513).unwrap();
+        let v1 = select_native_path(shape, 1, 512).unwrap();
+        let v2 = select_native_path(shape, 1, 513).unwrap();
         assert_eq!(v1, CausalAttentionKernelPath::VllmAddressedDecodeV1);
         assert_eq!(v2, CausalAttentionKernelPath::VllmAddressedDecodeV2);
         assert_eq!(v1.operation(), COMPUTE_VLLM_DECODE_V1_OPERATION);

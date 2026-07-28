@@ -1894,6 +1894,12 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
         .collect::<Vec<_>>();
     assert_eq!(node_rows.len(), batch_identity.nodes().len());
     for (expected_index, command) in node_rows.into_iter().enumerate() {
+        let identity_node = &batch_identity.nodes()[expected_index];
+        let plan_node = &fixture.plan.payload().nodes()[expected_index];
+        assert_eq!(
+            identity_node.provider_implementation_fingerprint(),
+            plan_node.provider_implementation_fingerprint()
+        );
         assert_eq!(command.node_index(), Some(expected_index as u32));
         assert_eq!(command.native_op_id(), "test_provider");
         assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);

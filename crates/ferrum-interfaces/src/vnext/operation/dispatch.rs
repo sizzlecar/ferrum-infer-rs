@@ -811,6 +811,7 @@ impl OperationDispatch {
             node.id().clone(),
             node.operation_id().clone(),
             node.selection().selected_provider().clone(),
+            node.provider_implementation_fingerprint().to_owned(),
             node.provider_execution_semantics(),
             resources.work_shape()?.fingerprint().to_owned(),
             participant_projections,
