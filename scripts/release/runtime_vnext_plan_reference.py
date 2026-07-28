@@ -127,6 +127,18 @@ def file_ref(path: Path, artifact_root: Path) -> dict[str, Any]:
     }
 
 
+def execution_artifact_ref(
+    path: Path,
+    artifact_root: Path,
+    kind: str,
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "path": path.relative_to(artifact_root).as_posix(),
+        "sha256": sha256(path),
+    }
+
+
 def resolve_file_ref(artifact_root: Path, raw: Any, label: str) -> Path:
     require(isinstance(raw, dict), f"{label} reference must be an object")
     require(
@@ -141,7 +153,12 @@ def resolve_file_ref(artifact_root: Path, raw: Any, label: str) -> Path:
         and ".." not in Path(relative).parts,
         f"{label} reference path is invalid",
     )
-    path = (artifact_root / relative).resolve()
+    unresolved = artifact_root / relative
+    require(
+        not unresolved.is_symlink(),
+        f"{label} reference must not be a symlink",
+    )
+    path = unresolved.resolve()
     try:
         path.relative_to(artifact_root.resolve())
     except ValueError as error:
@@ -151,6 +168,53 @@ def resolve_file_ref(artifact_root: Path, raw: Any, label: str) -> Path:
         raw.get("sha256") == sha256(path)
         and raw.get("size_bytes") == path.stat().st_size,
         f"{label} reference identity mismatch",
+    )
+    return path
+
+
+def resolve_execution_artifact_ref(
+    artifact_root: Path,
+    raw: Any,
+    label: str,
+    *,
+    expected_kind: str,
+) -> Path:
+    require(isinstance(raw, dict), f"{label} artifact reference must be an object")
+    require(
+        set(raw) == {"kind", "path", "sha256"},
+        f"{label} artifact reference must contain exactly kind, path, and sha256",
+    )
+    require(
+        raw.get("kind") == expected_kind,
+        f"{label} artifact kind must be {expected_kind}",
+    )
+    relative = raw.get("path")
+    require(
+        isinstance(relative, str)
+        and relative
+        and not Path(relative).is_absolute()
+        and ".." not in Path(relative).parts,
+        f"{label} artifact reference path is invalid",
+    )
+    unresolved = artifact_root / relative
+    require(
+        not unresolved.is_symlink(),
+        f"{label} artifact reference must not be a symlink",
+    )
+    path = unresolved.resolve()
+    try:
+        path.relative_to(artifact_root.resolve())
+    except ValueError as error:
+        raise PlanReferenceError(
+            f"{label} artifact reference escapes its artifact root"
+        ) from error
+    require(
+        path.is_file() and not path.is_symlink() and path.stat().st_size > 0,
+        f"{label} artifact is missing or empty: {path}",
+    )
+    require(
+        raw.get("sha256") == sha256(path),
+        f"{label} artifact reference identity mismatch",
     )
     return path
 
@@ -261,10 +325,11 @@ def validate_release_build_receipt(
     execution_root: Path,
     execution: dict[str, Any],
 ) -> tuple[Path, dict[str, Any]]:
-    receipt_path = resolve_file_ref(
+    receipt_path = resolve_execution_artifact_ref(
         execution_root,
         execution.get("binary_build_receipt"),
         "release build receipt",
+        expected_kind="raw-json",
     )
     receipt = read_object(receipt_path, "release build receipt")
     require(
@@ -292,15 +357,17 @@ def validate_release_build_receipt(
         and dirty.get("status_short") == [],
         "release build receipt requires a clean source",
     )
-    binary_path = resolve_file_ref(
+    binary_path = resolve_execution_artifact_ref(
         execution_root,
         execution.get("binary_artifact"),
         "reference execution binary",
+        expected_kind="binary",
     )
-    build_binary_path = resolve_file_ref(
+    build_binary_path = resolve_execution_artifact_ref(
         execution_root,
         receipt.get("binary_artifact"),
         "reference build binary",
+        expected_kind="binary",
     )
     require(
         sha256(binary_path)
@@ -378,10 +445,11 @@ def capture(
     )
     validate_focused_report(focused, expected=execution)
     build_receipt_path, _ = validate_release_build_receipt(execution_root, execution)
-    effective_config_path = resolve_file_ref(
+    effective_config_path = resolve_execution_artifact_ref(
         execution_root,
         execution.get("effective_config"),
         "reference typed effective config",
+        expected_kind="raw-json",
     )
     actual_config = read_object(
         actual_effective_config_path,
@@ -740,7 +808,11 @@ def make_fixture(root: Path) -> tuple[Path, dict[str, str]]:
             "backend": BACKEND,
             "command": RELEASE_BUILD_COMMAND,
             "binary_sha256": sha256(binary),
-            "binary_artifact": file_ref(binary, execution_root),
+            "binary_artifact": execution_artifact_ref(
+                binary,
+                execution_root,
+                "binary",
+            ),
         },
     )
     effective = execution_root / "effective-config.json"
@@ -771,9 +843,21 @@ def make_fixture(root: Path) -> tuple[Path, dict[str, str]]:
             "source_tree_sha": source_tree_sha,
             "dirty_status": {"is_dirty": False, "status_short": []},
             "binary_sha256": sha256(binary),
-            "binary_artifact": file_ref(binary, execution_root),
-            "binary_build_receipt": file_ref(build_receipt, execution_root),
-            "effective_config": file_ref(effective, execution_root),
+            "binary_artifact": execution_artifact_ref(
+                binary,
+                execution_root,
+                "binary",
+            ),
+            "binary_build_receipt": execution_artifact_ref(
+                build_receipt,
+                execution_root,
+                "raw-json",
+            ),
+            "effective_config": execution_artifact_ref(
+                effective,
+                execution_root,
+                "raw-json",
+            ),
         },
     )
     focused = execution_root / "correctness/focused-c13-022-report.json"
@@ -835,7 +919,83 @@ def make_fixture(root: Path) -> tuple[Path, dict[str, str]]:
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-plan-reference-") as raw:
         root = Path(raw)
-        _, fixture = make_fixture(root)
+        execution_root, fixture = make_fixture(root)
+        execution = read_object(
+            Path(fixture["execution"]),
+            "fixture execution manifest",
+        )
+        binary_ref = execution["binary_artifact"]
+        binary_path = resolve_execution_artifact_ref(
+            execution_root,
+            binary_ref,
+            "fixture execution binary",
+            expected_kind="binary",
+        )
+        require(
+            binary_path.is_file(),
+            "typed execution artifact reference did not resolve",
+        )
+        hostile_refs = {
+            "missing-kind": (
+                {
+                    "path": binary_ref["path"],
+                    "sha256": binary_ref["sha256"],
+                },
+                "must contain exactly",
+            ),
+            "wrong-kind": (
+                {**binary_ref, "kind": "raw-json"},
+                "artifact kind must be binary",
+            ),
+            "extra-size": (
+                {**binary_ref, "size_bytes": binary_path.stat().st_size},
+                "must contain exactly",
+            ),
+            "wrong-sha": (
+                {**binary_ref, "sha256": "f" * SHA256_LENGTH},
+                "identity mismatch",
+            ),
+            "path-escape": (
+                {**binary_ref, "path": "../ferrum"},
+                "path is invalid",
+            ),
+        }
+        for name, (hostile_ref, expected_error) in hostile_refs.items():
+            try:
+                resolve_execution_artifact_ref(
+                    execution_root,
+                    hostile_ref,
+                    f"hostile {name}",
+                    expected_kind="binary",
+                )
+            except PlanReferenceError as error:
+                require(
+                    expected_error in str(error),
+                    f"{name} used an unexpected rejection: {error}",
+                )
+            else:
+                raise PlanReferenceError(f"{name} execution artifact ref was accepted")
+        symlink_path = execution_root / "symlinked-ferrum"
+        symlink_path.symlink_to(binary_path)
+        try:
+            resolve_execution_artifact_ref(
+                execution_root,
+                {
+                    "kind": "binary",
+                    "path": symlink_path.relative_to(execution_root).as_posix(),
+                    "sha256": binary_ref["sha256"],
+                },
+                "hostile symlink",
+                expected_kind="binary",
+            )
+        except PlanReferenceError as error:
+            require(
+                "must not be a symlink" in str(error),
+                f"symlink used an unexpected rejection: {error}",
+            )
+        else:
+            raise PlanReferenceError("symlinked execution artifact ref was accepted")
+
         artifact = root / "reference"
         captured = capture(
             out_root=artifact,
