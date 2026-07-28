@@ -225,6 +225,7 @@ def collect(args: argparse.Namespace) -> Path:
         "max_num_seqs": 1,
         "max_num_batched_tokens": args.max_model_len,
         "seed": args.engine_seed,
+        "language_model_only": True,
     }
 
     llm = LLM(**llm_kwargs)
