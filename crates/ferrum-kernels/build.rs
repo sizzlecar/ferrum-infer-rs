@@ -28,6 +28,8 @@ const COMPILED_FA2_NATIVE_BINARY_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_
 const CUDA_NATIVE_BUILD_CACHE_ENV: &str = "FERRUM_CUDA_NATIVE_BUILD_CACHE";
 const CUDA_NATIVE_IMPORT_DIRS_ENV: &str = "FERRUM_CUDA_NATIVE_IMPORT_DIRS";
 const CUDA_NATIVE_SIGNATURE_SCHEMA: &str = "ferrum-cuda-native-input-v2";
+const DEFAULT_NVCC_THREADS: u32 = 4;
+const MAX_NVCC_THREADS: u32 = 8;
 
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
@@ -246,6 +248,25 @@ fn cuda_native_input_signature(content_signature: &str) -> String {
 
 fn signature_hash(signature: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(signature.as_bytes()))
+}
+
+fn configured_nvcc_threads() -> String {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            println!("cargo:rerun-if-env-changed=FERRUM_NVCC_THREADS");
+            let raw = env::var("FERRUM_NVCC_THREADS")
+                .unwrap_or_else(|_| DEFAULT_NVCC_THREADS.to_string());
+            let value = raw.parse::<u32>().unwrap_or_else(|error| {
+                panic!("FERRUM_NVCC_THREADS must be an integer in 1..={MAX_NVCC_THREADS}: {error}")
+            });
+            assert!(
+                (1..=MAX_NVCC_THREADS).contains(&value),
+                "FERRUM_NVCC_THREADS must be in 1..={MAX_NVCC_THREADS}, got {value}"
+            );
+            value.to_string()
+        })
+        .clone()
 }
 
 fn emit_cuda_build_summary(
@@ -1091,7 +1112,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
     }
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
-    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
+    let nvcc_threads = configured_nvcc_threads();
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
@@ -1281,7 +1302,7 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
     }
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
-    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
+    let nvcc_threads = configured_nvcc_threads();
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
@@ -1484,7 +1505,7 @@ fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNative
     }
 
     let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
-    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
+    let nvcc_threads = configured_nvcc_threads();
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),

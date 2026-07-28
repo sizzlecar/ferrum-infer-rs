@@ -415,13 +415,14 @@ def make_build_command(
     import_dirs: Sequence[Path],
     compute_capability: str,
     cargo_jobs: int,
+    nvcc_threads: int,
 ) -> list[str]:
     return [
         "env",
         f"CARGO_TARGET_DIR={target_dir}",
         f"CARGO_BUILD_JOBS={cargo_jobs}",
         f"CUDA_COMPUTE_CAP={compute_capability}",
-        "FERRUM_NVCC_THREADS=0",
+        f"FERRUM_NVCC_THREADS={nvcc_threads}",
         f"FERRUM_CUDA_NATIVE_BUILD_CACHE={native_cache}",
         f"FERRUM_CUDA_NATIVE_IMPORT_DIRS={os.pathsep.join(map(str, import_dirs))}",
         "cargo",
@@ -572,6 +573,7 @@ def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, A
         import_dirs=import_dirs,
         compute_capability=args.compute_capability,
         cargo_jobs=args.cargo_jobs,
+        nvcc_threads=args.nvcc_threads,
     )
     source_inputs = {}
     for relative in (
@@ -596,6 +598,7 @@ def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, A
         "features": FEATURES.split(","),
         "compute_capability": args.compute_capability,
         "cargo_jobs": args.cargo_jobs,
+        "nvcc_threads": args.nvcc_threads,
         "target_dir": str(target_dir),
         "native_build_cache": str(native_cache),
         "native_import_dirs": [str(path) for path in import_dirs],
@@ -957,6 +960,18 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
 
 
 def self_test() -> None:
+    command = make_build_command(
+        target_dir=Path("/tmp/target"),
+        native_cache=Path("/tmp/native-cache"),
+        import_dirs=[Path("/tmp/release/out")],
+        compute_capability="89",
+        cargo_jobs=4,
+        nvcc_threads=4,
+    )
+    require(
+        "FERRUM_NVCC_THREADS=4" in command,
+        "typed NVCC worker bound was not written into the build command",
+    )
     clean_log = "\n".join(
         [
             "[cuda-native-build-cache] artifact=static.vllm_marlin status=imported "
@@ -1185,6 +1200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--import-target-root", type=Path, action="append", default=[])
     parser.add_argument("--compute-capability", default="89")
     parser.add_argument("--cargo-jobs", type=int, default=4)
+    parser.add_argument("--nvcc-threads", type=int, default=4)
     parser.add_argument("--wall-timeout-seconds", type=float, default=600)
     parser.add_argument("--expected-plan-hash")
     parser.add_argument("--build-manifest", type=Path)
@@ -1210,6 +1226,10 @@ def parse_args() -> argparse.Namespace:
     require(args.native_cache is not None, "--native-cache is required")
     require(args.target_dir is not None, "--target-dir is required")
     require(args.import_target_root, "--import-target-root is required")
+    require(
+        1 <= args.nvcc_threads <= 8,
+        "--nvcc-threads must be in [1, 8]",
+    )
     require(
         1 <= args.wall_timeout_seconds <= 1800,
         "--wall-timeout-seconds must be in [1, 1800]",

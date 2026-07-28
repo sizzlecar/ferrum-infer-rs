@@ -140,6 +140,37 @@ equivalence、五样本增量 p95、workspace source gate 和 canonical G07A val
 下一 paid lane 的 stop condition 是 native rebuild、build deadline、semantic hash mismatch
 或 exact `c13-022` 结果中的任意一个；在 exact case 通过前不运行 suffix 或 703 full。
 
+### 2026-07-28 Replay leaf build diagnostic
+
+Clean source `f9bb4070939eb4f318308b7446602389f89d0272` only changed CUDA replay
+Rust code and a source contract. Local bounded validation passed the replay contract
+`10/10` and the typed timing-mode unit `1/1`.
+
+The retained RTX 4090 build host then produced two distinct bounded build REJECTs:
+
+- the first release retry omitted the cached build's `FERRUM_NVCC_THREADS=4`, used
+  the old default `0`, invalidated the native signature, entered vLLM Marlin nvcc,
+  and hit the `480.020663s` deadline; peak usage was 11 processes and 43 group
+  threads, with no resource violation and complete process-group cleanup;
+- the corrected retry kept `FERRUM_NVCC_THREADS=4` and observed `nvcc=0`, proving
+  the existing native archive remained reusable, but release LTO still exceeded the
+  separate 300-second development deadline.
+
+These results do not reject the replay Rust change and do not form a CUDA feature
+PASS. They prove that a correctness iteration must use the no-LTO
+`cuda-correctness` profile and a recorded native-worker policy rather than a manual
+release command. The follow-up source change makes `--nvcc-threads` a typed
+correctness-builder argument and manifest field, defaults it to `4`, and rejects
+values outside `[1,8]` before compiler startup. `build.rs` and the legacy FA2
+diagnostic use the same bounded default. Local builder self-test and
+`ferrum-kernels --no-default-features` check pass; real CUDA `BINARY READY` remains
+the next stop condition.
+
+Vast instances `46083877` and `45897840` are both `stopped/exited`, with
+`potentially_billable=[]`. Raw remote receipts remain on retained instance
+`46083877` under `/workspace/ferrum-artifacts/g06-replay-f9bb4070/` and must be
+transferred with the next bounded reuse before any instance destruction.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。
