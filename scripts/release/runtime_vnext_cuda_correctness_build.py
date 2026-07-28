@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import bounded_command
+import runtime_vnext_plan_reference as plan_reference
 
 try:
     import tomllib
@@ -32,12 +33,16 @@ except ModuleNotFoundError:  # Python 3.10 on retained CUDA build hosts.
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE = "cuda-correctness"
-FEATURES = "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+FEATURES = ",".join(plan_reference.FEATURES)
 READY_PREFIX = "FERRUM CUDA CORRECTNESS BINARY READY"
 PLAN_READY_PREFIX = "FERRUM CUDA CORRECTNESS IMPORT INVENTORY READY"
 SEMANTIC_PASS_PREFIX = "FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS"
 SELFTEST_PASS_LINE = "FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+REFERENCE_ARTIFACT_TYPE = plan_reference.ARTIFACT_TYPE
+CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
+REFERENCE_MODEL_KEY = plan_reference.MODEL_KEY
+REFERENCE_CASE_ID = plan_reference.CASE_ID
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CORE_PTX_BLOCK_RE = re.compile(
@@ -141,6 +146,36 @@ def file_ref(path: Path, artifact_root: Path) -> dict[str, Any]:
         "sha256": sha256(path),
         "size_bytes": path.stat().st_size,
     }
+
+
+def resolve_file_ref(
+    artifact_root: Path,
+    raw: Any,
+    label: str,
+) -> Path:
+    require(isinstance(raw, dict), f"{label} reference must be an object")
+    relative = raw.get("path")
+    require(
+        isinstance(relative, str)
+        and relative
+        and not Path(relative).is_absolute()
+        and ".." not in Path(relative).parts,
+        f"{label} reference path is invalid",
+    )
+    path = (artifact_root / relative).resolve()
+    try:
+        path.relative_to(artifact_root.resolve())
+    except ValueError as error:
+        raise CorrectnessBuildError(
+            f"{label} reference escapes its artifact root"
+        ) from error
+    require(path.is_file() and not path.is_symlink(), f"{label} file is missing: {path}")
+    require(
+        raw.get("sha256") == sha256(path)
+        and raw.get("size_bytes", path.stat().st_size) == path.stat().st_size,
+        f"{label} reference identity mismatch",
+    )
+    return path
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -581,11 +616,43 @@ def artifact_root(raw: Path, source_root: Path) -> Path:
     return root
 
 
-def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, Any]:
+def import_release_plan_reference(
+    args: argparse.Namespace,
+    root: Path,
+    *,
+    source_root: Path,
+    current_identity: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        reference, imported_manifest = plan_reference.copy_validated(
+            source_manifest=args.reference_plan_manifest,
+            destination_root=root / "release-plan-reference",
+            expected_hardware_id=args.hardware_id,
+            candidate_source_git_sha=current_identity["source_git_sha"],
+            candidate_source_tree_sha=current_identity["source_tree_sha"],
+            repository_root=source_root,
+        )
+    except plan_reference.PlanReferenceError as error:
+        raise CorrectnessBuildError(str(error)) from error
+    return reference, file_ref(imported_manifest, root)
+
+
+def create_plan(
+    args: argparse.Namespace,
+    root: Path,
+    *,
+    require_clean: bool,
+) -> dict[str, Any]:
     source_root = args.source_root.expanduser().resolve()
     require((source_root / "Cargo.toml").is_file(), f"invalid source root: {source_root}")
     reject_hidden_overrides()
     identity = source_identity(source_root, require_clean=require_clean)
+    reference, reference_ref = import_release_plan_reference(
+        args,
+        root,
+        source_root=source_root,
+        current_identity=identity,
+    )
     profile = validate_profile(source_root)
     toolchain = toolchain_probe(source_root)
     import_dirs = discover_import_dirs(args.import_target_root)
@@ -629,6 +696,7 @@ def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, A
         "profile": profile,
         "features": FEATURES.split(","),
         "compute_capability": args.compute_capability,
+        "hardware_id": args.hardware_id,
         "cargo_jobs": args.cargo_jobs,
         "nvcc_threads": args.nvcc_threads,
         "native_source_policy": "cache-only",
@@ -646,7 +714,16 @@ def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, A
         "stop_condition": "first native rebuild, build failure, deadline, or runnable binary",
         "semantic_plan_contract": {
             "status": "pending-product-load",
-            "expected_c13_022_plan_hash": args.expected_plan_hash,
+            "reference_kind": REFERENCE_ARTIFACT_TYPE,
+            "reference_plan_manifest": reference_ref,
+            "reference_source_git_sha": reference["source_git_sha"],
+            "reference_source_tree_sha": reference["source_tree_sha"],
+            "reference_plan_hash": reference["plan_identity"]["plan_hash"],
+            "reference_binary_sha256": reference["binary_sha256"],
+            "reference_profile": reference["profile"],
+            "hardware_id": reference["hardware_id"],
+            "model_key": reference["scope"]["model_key"],
+            "case_id": reference["scope"]["case_id"],
             "require_exact_match_before_focused_result": True,
         },
         "limitations": [
@@ -756,7 +833,7 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
     )
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "artifact_type": "runtime-vnext-cuda-correctness-binary",
+        "artifact_type": CORRECTNESS_ARTIFACT_TYPE,
         "status": "binary-ready",
         "created_at": now_iso(),
         "source_git_sha": plan["source_git_sha"],
@@ -765,6 +842,7 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
         "profile": plan["profile"],
         "features": plan["features"],
         "compute_capability": plan["compute_capability"],
+        "hardware_id": plan["hardware_id"],
         "cargo_jobs": plan["cargo_jobs"],
         "nvcc_threads": plan["nvcc_threads"],
         "native_source_policy": plan["native_source_policy"],
@@ -804,15 +882,6 @@ def read_json_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
-def require_under(path: Path, root: Path, label: str) -> None:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError as error:
-        raise CorrectnessBuildError(
-            f"{label} must be under execution artifact root {root}: {path}"
-        ) from error
-
-
 def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     build_manifest_path = args.build_manifest.expanduser().resolve()
     execution_manifest_path = args.execution_manifest.expanduser().resolve()
@@ -830,15 +899,35 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
     execution = read_json_object(execution_manifest_path, "execution manifest")
     focused = read_json_object(focused_report_path, "focused report")
     require(
-        build.get("artifact_type") == "runtime-vnext-cuda-correctness-binary"
+        build.get("artifact_type") == CORRECTNESS_ARTIFACT_TYPE
         and build.get("status") == "binary-ready",
         "build manifest is not a CUDA correctness binary-ready artifact",
     )
     contract = build.get("semantic_plan_contract")
     require(isinstance(contract, dict), "build semantic_plan_contract is missing")
+    reference_ref = contract.get("reference_plan_manifest")
+    reference_path = resolve_file_ref(
+        build_manifest_path.parent,
+        reference_ref,
+        "build release plan reference",
+    )
+    reference = plan_reference.validate(
+        reference_path,
+        expected_hardware_id=str(build.get("hardware_id", "")),
+    )
+    reference_plan_hash = reference["plan_identity"]["plan_hash"]
     require(
-        contract.get("expected_c13_022_plan_hash") == args.expected_plan_hash,
-        "build manifest expected plan hash differs from validator input",
+        contract.get("reference_kind") == REFERENCE_ARTIFACT_TYPE
+        and contract.get("reference_plan_hash") == reference_plan_hash
+        and contract.get("reference_source_git_sha") == reference["source_git_sha"]
+        and contract.get("reference_source_tree_sha") == reference["source_tree_sha"]
+        and contract.get("reference_binary_sha256") == reference["binary_sha256"]
+        and contract.get("reference_profile") == "release"
+        and contract.get("hardware_id") == reference["hardware_id"]
+        and contract.get("model_key") == REFERENCE_MODEL_KEY
+        and contract.get("case_id") == REFERENCE_CASE_ID
+        and contract.get("require_exact_match_before_focused_result") is True,
+        "build manifest release plan reference binding is incomplete",
     )
     build_binary_ref = build.get("binary")
     require(isinstance(build_binary_ref, dict), "build binary reference is missing")
@@ -851,8 +940,8 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
     )
 
     execution_root = execution_manifest_path.parent
-    require_under(focused_report_path, execution_root, "focused report")
-    require_under(trace_path, execution_root, "scheduler trace")
+    plan_reference.require_under(focused_report_path, execution_root, "focused report")
+    plan_reference.require_under(trace_path, execution_root, "scheduler trace")
     require(
         trace_path.name.endswith(".scheduler-trace.jsonl"),
         "semantic input is not a scheduler-trace JSONL file",
@@ -875,6 +964,13 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         "semantic validation requires CUDA execution evidence",
     )
     require(
+        build.get("hardware_id")
+        == execution.get("hardware_id")
+        == focused.get("hardware_id")
+        == reference.get("hardware_id"),
+        "release reference, build, execution, and focused-report hardware identities differ",
+    )
+    require(
         execution.get("source_git_sha")
         == focused.get("source_git_sha")
         == build.get("source_git_sha"),
@@ -892,70 +988,30 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         and not focused.get("dirty_status", {}).get("is_dirty"),
         "semantic validation requires clean build and execution sources",
     )
-    scope = focused.get("scope")
+    plan_reference.validate_focused_report(focused, expected=execution)
     require(
-        isinstance(scope, dict)
-        and scope.get("kind") == "focused-diagnostic"
-        and scope.get("requested_case_ids") == ["c13-022"],
-        "focused report scope must be exactly c13-022",
+        execution.get("models_lock_sha256") == reference.get("models_lock_sha256")
+        and execution.get("model_revision") == reference.get("model_revision")
+        and plan_reference.canonical_json_sha256(execution.get("model_files"))
+        == reference.get("model_files_sha256"),
+        "release reference and correctness execution model locks differ",
+    )
+    execution_effective = resolve_file_ref(
+        execution_root,
+        execution.get("effective_config"),
+        "correctness typed effective config",
     )
     require(
-        focused.get("decision") in {"KEEP", "REJECT", "PASS"},
-        "focused report decision is missing",
+        sha256(execution_effective) == reference.get("typed_effective_config_sha256"),
+        "release reference and correctness typed effective configs differ",
     )
 
-    plan_events = []
-    for line_number, raw_line in enumerate(
-        trace_path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        if not raw_line.strip():
-            continue
-        try:
-            event = json.loads(raw_line)
-        except json.JSONDecodeError as error:
-            raise CorrectnessBuildError(
-                f"scheduler trace line {line_number} is invalid JSON: {error}"
-            ) from error
-        require(
-            isinstance(event, dict),
-            f"scheduler trace line {line_number} must be an object",
-        )
-        if event.get("phase") != "vnext.plan_built":
-            continue
-        attributes = event.get("attributes")
-        require(
-            isinstance(attributes, dict),
-            f"plan_built line {line_number} attributes are missing",
-        )
-        plan_hash = attributes.get("plan_hash")
-        require(
-            isinstance(plan_hash, str) and SHA256_RE.fullmatch(plan_hash) is not None,
-            f"plan_built line {line_number} plan_hash is invalid",
-        )
-        require(
-            attributes.get("plan_id") == f"plan/sha256/{plan_hash}",
-            f"plan_built line {line_number} plan_id does not derive from plan_hash",
-        )
-        require(
-            event.get("backend") == "actual"
-            and event.get("entrypoint") == "serve"
-            and event.get("status") == "ok"
-            and attributes.get("execution_trace_source") == "vnext",
-            f"plan_built line {line_number} is not actual vNext serve evidence",
-        )
-        plan_events.append(
-            {
-                "line_number": line_number,
-                "request_id": event.get("request_id"),
-                "model": event.get("model"),
-                "plan_hash": plan_hash,
-            }
-        )
-    require(plan_events, "scheduler trace has no vnext.plan_built events")
+    plan_events = plan_reference.plan_events_from_trace(trace_path)
     observed_hashes = sorted({event["plan_hash"] for event in plan_events})
     require(
-        observed_hashes == [args.expected_plan_hash],
-        f"scheduler trace plan hash mismatch: expected {args.expected_plan_hash}, observed {observed_hashes}",
+        observed_hashes == [reference_plan_hash],
+        "stale-plan-reference: scheduler trace plan hash mismatch: "
+        f"reference {reference_plan_hash}, observed {observed_hashes}",
     )
 
     input_dir = root / "inputs"
@@ -966,6 +1022,7 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         ("execution-manifest.json", execution_manifest_path),
         ("focused-report.json", focused_report_path),
         ("scheduler-trace.jsonl", trace_path),
+        ("release-plan-reference.json", reference_path),
     ):
         destination = input_dir / label
         shutil.copy2(source, destination)
@@ -978,7 +1035,10 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         "source_git_sha": build["source_git_sha"],
         "source_tree_sha": build["source_tree_sha"],
         "binary_sha256": build_binary_sha256,
-        "expected_plan_hash": args.expected_plan_hash,
+        "reference_plan_hash": reference_plan_hash,
+        "reference_source_git_sha": reference["source_git_sha"],
+        "reference_source_tree_sha": reference["source_tree_sha"],
+        "reference_binary_sha256": reference["binary_sha256"],
         "observed_plan_hashes": observed_hashes,
         "plan_built_event_count": len(plan_events),
         "request_ids": sorted(
@@ -1132,102 +1192,87 @@ strip = false
             f"missing native import was not classified: {missing}",
         )
 
-        plan_hash = "a" * 64
-        source_git_sha = "1" * 40
-        source_tree_sha = "2" * 40
-        binary_bytes = b"verified-cuda-correctness-binary"
+        execution_root, fixture = plan_reference.make_fixture(root)
+        execution_manifest_path = Path(fixture["execution"])
+        focused_report = Path(fixture["focused"])
+        trace = Path(fixture["trace"])
+        actual_effective_config = Path(fixture["actual"])
+        hardware_id = fixture["hardware_id"]
+        source_git_sha = fixture["source_git_sha"]
+        source_tree_sha = fixture["source_tree_sha"]
+        plan_hash = fixture["plan_hash"]
+        execution_document = read_json_object(
+            execution_manifest_path,
+            "fixture execution manifest",
+        )
+        execution_binary = plan_reference.resolve_file_ref(
+            execution_root,
+            execution_document["binary_artifact"],
+            "fixture execution binary",
+        )
+        binary_bytes = execution_binary.read_bytes()
+        reference_artifact = root / "release-plan-reference"
+        reference = plan_reference.capture(
+            out_root=reference_artifact,
+            execution_manifest_path=execution_manifest_path,
+            focused_report_path=focused_report,
+            trace_path=trace,
+            actual_effective_config_path=actual_effective_config,
+            hardware_id=hardware_id,
+        )
+        validated_reference = plan_reference.validate(
+            reference_artifact / "manifest.json",
+            expected_hardware_id=hardware_id,
+            candidate_source_git_sha=source_git_sha,
+            candidate_source_tree_sha=source_tree_sha,
+            allow_internal_fixture=True,
+        )
+        require(
+            reference == validated_reference
+            and reference["plan_identity"]["plan_hash"] == plan_hash,
+            "matching release plan reference was not captured and validated",
+        )
+
         build_artifact = root / "build-artifact"
         build_binary = build_artifact / "binary/ferrum"
         build_binary.parent.mkdir(parents=True)
         build_binary.write_bytes(binary_bytes)
+        imported_reference_root = build_artifact / "release-plan-reference"
+        shutil.copytree(reference_artifact, imported_reference_root)
+        imported_reference_manifest = imported_reference_root / "manifest.json"
+        reference_ref = file_ref(imported_reference_manifest, build_artifact)
         write_json(
             build_artifact / "manifest.json",
             {
                 "schema_version": SCHEMA_VERSION,
-                "artifact_type": "runtime-vnext-cuda-correctness-binary",
+                "artifact_type": CORRECTNESS_ARTIFACT_TYPE,
                 "status": "binary-ready",
                 "source_git_sha": source_git_sha,
                 "source_tree_sha": source_tree_sha,
                 "dirty_status": {"is_dirty": False, "status_short": []},
-                "binary": {
-                    "path": "binary/ferrum",
-                    "sha256": sha256(build_binary),
-                    "size_bytes": len(binary_bytes),
-                },
+                "hardware_id": hardware_id,
+                "binary": file_ref(build_binary, build_artifact),
                 "semantic_plan_contract": {
                     "status": "pending-product-trace-validation",
-                    "expected_c13_022_plan_hash": plan_hash,
+                    "reference_kind": REFERENCE_ARTIFACT_TYPE,
+                    "reference_plan_manifest": reference_ref,
+                    "reference_source_git_sha": source_git_sha,
+                    "reference_source_tree_sha": source_tree_sha,
+                    "reference_plan_hash": plan_hash,
+                    "reference_binary_sha256": sha256(execution_binary),
+                    "reference_profile": "release",
+                    "hardware_id": hardware_id,
+                    "model_key": REFERENCE_MODEL_KEY,
+                    "case_id": REFERENCE_CASE_ID,
+                    "require_exact_match_before_focused_result": True,
                 },
             },
-        )
-        execution_root = root / "execution"
-        execution_binary = execution_root / "build/candidate/ferrum"
-        execution_binary.parent.mkdir(parents=True)
-        execution_binary.write_bytes(binary_bytes)
-        write_json(
-            execution_root / "execution-manifest.json",
-            {
-                "schema_version": 1,
-                "backend": "cuda",
-                "source_git_sha": source_git_sha,
-                "source_tree_sha": source_tree_sha,
-                "dirty_status": {"is_dirty": False, "status_short": []},
-                "binary_sha256": sha256(execution_binary),
-                "binary_artifact": {
-                    "kind": "binary",
-                    "path": "build/candidate/ferrum",
-                    "sha256": sha256(execution_binary),
-                },
-            },
-        )
-        focused_report = execution_root / "correctness/focused-c13-022-report.json"
-        write_json(
-            focused_report,
-            {
-                "schema_version": 1,
-                "backend": "cuda",
-                "source_git_sha": source_git_sha,
-                "source_tree_sha": source_tree_sha,
-                "dirty_status": {"is_dirty": False, "status_short": []},
-                "binary_sha256": sha256(execution_binary),
-                "decision": "REJECT",
-                "scope": {
-                    "kind": "focused-diagnostic",
-                    "requested_case_ids": ["c13-022"],
-                    "requested_scenario_ids": [],
-                },
-            },
-        )
-        trace = (
-            execution_root
-            / "correctness/m2-qwen35-35b-a3b/cuda/commands/serve-01.scheduler-trace.jsonl"
-        )
-        trace.parent.mkdir(parents=True)
-        trace.write_text(
-            json.dumps(
-                {
-                    "phase": "vnext.plan_built",
-                    "backend": "actual",
-                    "entrypoint": "serve",
-                    "status": "ok",
-                    "request_id": "request.fixture",
-                    "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
-                    "attributes": {
-                        "execution_trace_source": "vnext",
-                        "plan_hash": plan_hash,
-                        "plan_id": f"plan/sha256/{plan_hash}",
-                    },
-                }
-            )
-            + "\n",
-            encoding="utf-8",
         )
         semantic_args = argparse.Namespace(
             build_manifest=build_artifact / "manifest.json",
             execution_manifest=execution_root / "execution-manifest.json",
             focused_report=focused_report,
             validate_semantic_trace=trace,
-            expected_plan_hash=plan_hash,
         )
         semantic = validate_semantic_trace(
             semantic_args, root / "semantic-validation"
@@ -1258,10 +1303,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-dir", type=Path)
     parser.add_argument("--import-target-root", type=Path, action="append", default=[])
     parser.add_argument("--compute-capability", default="89")
+    parser.add_argument("--hardware-id")
     parser.add_argument("--cargo-jobs", type=int, default=4)
     parser.add_argument("--nvcc-threads", type=int, default=4)
     parser.add_argument("--wall-timeout-seconds", type=float, default=600)
-    parser.add_argument("--expected-plan-hash")
+    parser.add_argument("--reference-plan-manifest", type=Path)
     parser.add_argument("--build-manifest", type=Path)
     parser.add_argument("--execution-manifest", type=Path)
     parser.add_argument("--focused-report", type=Path)
@@ -1273,15 +1319,24 @@ def parse_args() -> argparse.Namespace:
         return args
     require(args.out is not None, "--out is required")
     require(
-        args.expected_plan_hash is not None
-        and SHA256_RE.fullmatch(args.expected_plan_hash) is not None,
-        "--expected-plan-hash must be lowercase SHA256",
+        isinstance(args.hardware_id, str)
+        and args.hardware_id.strip() == args.hardware_id
+        and args.hardware_id,
+        "--hardware-id must be non-empty and trimmed",
     )
     if args.validate_semantic_trace is not None:
         require(args.build_manifest is not None, "--build-manifest is required")
         require(args.execution_manifest is not None, "--execution-manifest is required")
         require(args.focused_report is not None, "--focused-report is required")
+        require(
+            args.reference_plan_manifest is None and not args.plan_only,
+            "semantic trace validation consumes the build-bound reference only",
+        )
         return args
+    require(
+        args.reference_plan_manifest is not None,
+        "--reference-plan-manifest is required",
+    )
     require(args.native_cache is not None, "--native-cache is required")
     require(args.target_dir is not None, "--target-dir is required")
     require(args.import_target_root, "--import-target-root is required")
@@ -1309,7 +1364,7 @@ def main() -> int:
             validate_semantic_trace(args, root)
             print(f"{SEMANTIC_PASS_PREFIX}: {root}")
             return 0
-        plan = create_plan(args, require_clean=not args.plan_only)
+        plan = create_plan(args, root, require_clean=not args.plan_only)
         write_json(root / "plan.json", plan)
         if args.plan_only:
             require(plan["ready"], f"native import inventory is incomplete: {plan['missing_native_imports']}")
@@ -1318,7 +1373,13 @@ def main() -> int:
         run_build(args, plan, root)
         print(f"{READY_PREFIX}: {root}")
         return 0
-    except (CorrectnessBuildError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (
+        CorrectnessBuildError,
+        OSError,
+        ValueError,
+        plan_reference.PlanReferenceError,
+        subprocess.TimeoutExpired,
+    ) as error:
         print(f"FERRUM CUDA CORRECTNESS BUILD REJECT: {error}", file=sys.stderr)
         return 1
 
