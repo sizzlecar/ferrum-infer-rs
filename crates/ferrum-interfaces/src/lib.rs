@@ -38,7 +38,10 @@ pub use recurrent_state::{
     RecurrentStateManagerStats, RecurrentStateResumePolicy, RecurrentStateSpec,
     RecurrentStateTensorSpec,
 };
-pub use sampler::{LogitsProcessor, Sampler, SamplingConfig, SamplingContext};
+pub use sampler::{
+    LogitsProcessor, Sampler, SamplingConfig, SamplingContext, SamplingRng,
+    SAMPLING_RNG_ALGORITHM_ID,
+};
 pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
 pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};
 pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};

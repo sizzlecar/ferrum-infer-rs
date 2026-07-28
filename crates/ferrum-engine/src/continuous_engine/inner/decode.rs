@@ -845,7 +845,7 @@ impl EngineInner {
             // speculative rounds that share the same seed.
             seed.wrapping_add(self.iteration_count.load(Ordering::Relaxed))
         };
-        let mut rng = rand::rngs::StdRng::from_seed({
+        let mut rng = SamplingRng::from_seed_bytes({
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&rng_seed.to_le_bytes());
             seed
