@@ -161,20 +161,13 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
             crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_CUDA_GRAPH")
                 .is_some();
         if !graph_mode {
-            if let Ok(d) = candle_core::Device::new_cuda(0) {
-                if let Ok(cd) = d.as_cuda_device() {
-                    let name = cd.cuda_stream().context().name().unwrap_or_default();
-                    eprintln!("GPU 0: {name}");
-                }
+            if let Ok(name) = ferrum_kernels::cuda_device_name(0) {
+                eprintln!("GPU 0: {name}");
             }
         }
         let tp = crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_TP")
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
-                    .map(|n| n as usize)
-                    .unwrap_or(1)
-            });
+            .unwrap_or_else(|| ferrum_kernels::cuda_device_count().unwrap_or(1));
         if tp > 1 {
             eprintln!("Tensor Parallel: TP={tp}");
         }

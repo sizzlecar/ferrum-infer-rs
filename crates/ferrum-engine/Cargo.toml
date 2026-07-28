@@ -90,11 +90,16 @@ harness = false
 default = []
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "ferrum-models/accelerate"]
 cuda = [
-    "candle-core/cuda",
-    "candle-nn/cuda",
     "ferrum-models/cuda",
     "ferrum-kernels/cuda",
     "ferrum-quantization/cuda",
+]
+candle-cuda-compat = [
+    "cuda",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "ferrum-models/candle-cuda-compat",
+    "ferrum-kernels/candle-cuda-compat",
 ]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 tensor-parallel = ["cuda"]  # backward compat alias

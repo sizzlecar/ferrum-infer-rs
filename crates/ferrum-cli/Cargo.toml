@@ -93,6 +93,7 @@ interactive = [] # Enable interactive mode
 accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches PyTorch precision)
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
+candle-cuda-compat = ["cuda", "ferrum-engine/candle-cuda-compat", "ferrum-kernels/candle-cuda-compat"]
 marlin = ["cuda"]  # backward compat alias
 vllm-marlin = ["cuda", "ferrum-kernels/vllm-marlin"]  # Phase 12 — vLLM gptq_marlin port (opt-in)
 vllm-moe-marlin = ["cuda", "ferrum-kernels/vllm-moe-marlin"]  # Stage 14 — vLLM marlin_moe_wna16 port (opt-in)

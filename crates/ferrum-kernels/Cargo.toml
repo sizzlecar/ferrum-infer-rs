@@ -33,7 +33,8 @@ sha2 = "0.10"
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "dep:cudarc", "marlin", "cudarc?/nccl"]
+cuda = ["dep:cudarc", "marlin", "cudarc?/nccl"]
+candle-cuda-compat = ["cuda", "candle-core/cuda"]
 metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
 marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
 vllm-marlin = ["cuda"]  # vLLM gptq_marlin port (Phase 12). NOT enabled by default
@@ -66,4 +67,4 @@ tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already in
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files
 # under `triton_ptx/`. Regenerate with `tools/regen-triton-ptx.sh` on a
 # Linux+CUDA box that has triton-rs checked out as a sibling repo.
-triton-kernels = ["cuda"]
+triton-kernels = ["cuda", "candle-cuda-compat"]

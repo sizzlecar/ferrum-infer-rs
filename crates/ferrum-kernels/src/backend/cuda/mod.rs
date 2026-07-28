@@ -60,23 +60,33 @@ pub mod quant;
 // `ferrum_kernels::foo::*` public paths + internal `crate::foo::*`
 // references keep working unchanged.
 pub mod cublas;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod cuda_decode;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod cuda_graph;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod decode_attention;
 pub mod decode_buffers;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod fused_add_rms_norm;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod fused_silu_mul;
 pub mod gpu_paged_kv;
 pub mod marlin;
 pub mod nccl_comm;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod residual_add;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod rms_norm;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod rope;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod tp_decode;
 pub mod vnext_ops;
 mod vnext_replay;
 pub mod vnext_runtime;
 mod vnext_tool_correlation;
+#[cfg(feature = "candle-cuda-compat")]
 pub mod weight_store;
 
 // Triton kernels (only when the `triton-kernels` feature is also on —

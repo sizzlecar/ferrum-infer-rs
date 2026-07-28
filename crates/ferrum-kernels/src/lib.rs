@@ -14,6 +14,24 @@ pub fn configure_native_profile_sink(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+pub fn cuda_device_count() -> Result<usize, String> {
+    cudarc::driver::CudaContext::device_count()
+        .map_err(|error| format!("failed to query CUDA device count: {error}"))
+        .and_then(|count| {
+            usize::try_from(count)
+                .map_err(|_| format!("CUDA driver returned a negative device count: {count}"))
+        })
+}
+
+#[cfg(feature = "cuda")]
+pub fn cuda_device_name(ordinal: usize) -> Result<String, String> {
+    cudarc::driver::CudaContext::new(ordinal)
+        .map_err(|error| format!("failed to open CUDA device {ordinal}: {error}"))?
+        .name()
+        .map_err(|error| format!("failed to query CUDA device {ordinal} name: {error}"))
+}
+
 pub mod backend;
 pub mod native_ops;
 
@@ -69,30 +87,30 @@ pub(crate) mod ptx {
 
 #[cfg(feature = "cuda")]
 pub mod int8_kv;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub mod quant;
 
 #[cfg(feature = "cuda")]
-pub use backend::cuda::{
-    cublas, cuda_decode, cuda_graph, decode_buffers, gpu_paged_kv, marlin, nccl_comm, tp_decode,
-    weight_store,
-};
+pub use backend::cuda::{cublas, decode_buffers, gpu_paged_kv, marlin, nccl_comm};
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
+pub use backend::cuda::{cuda_decode, cuda_graph, tp_decode, weight_store};
+
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::decode_attention::decode_attention;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::fused_add_rms_norm::fused_add_rms_norm;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::fused_silu_mul::fused_silu_mul;
 #[cfg(feature = "cuda")]
 pub use backend::cuda::gated_delta_rule::recurrent_gated_delta_rule_f32;
 #[cfg(feature = "cuda")]
 pub use backend::cuda::linear_attention::{gated_rms_norm_f32, linear_attention_prepare_f32};
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::residual_add::residual_add;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::rms_norm::rms_norm;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::rope::rope;
 
 // Preserve `crate::triton_ptx` / `crate::triton_meta` paths for in-crate

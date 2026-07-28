@@ -90,7 +90,13 @@ default = []
 # Enable CUDA FlashAttention-2 and fused custom kernels
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-kernels/metal"]
-cuda = ["candle-nn/cuda", "ferrum-kernels/cuda"]
+cuda = ["ferrum-kernels/cuda"]
+candle-cuda-compat = [
+    "cuda",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "ferrum-kernels/candle-cuda-compat",
+]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 tensor-parallel = ["cuda"]  # backward compat alias
 # Enable integration tests

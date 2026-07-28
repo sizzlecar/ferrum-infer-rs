@@ -98,7 +98,7 @@ pub async fn execute(cmd: TtsCommand, config: CliConfig) -> Result<()> {
         )));
     }
 
-    let candle_device = select_candle_device(&cmd.backend);
+    let candle_device = select_candle_device(&cmd.backend)?;
     eprintln!("{} {:?}", "Device:".dimmed(), &candle_device);
     eprintln!("{}", "Loading TTS model...".dimmed());
 
@@ -306,47 +306,50 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
     None
 }
 
-fn select_candle_device(backend: &str) -> CandleDevice {
+fn select_candle_device(backend: &str) -> ferrum_types::Result<CandleDevice> {
     match backend.to_lowercase().as_str() {
-        "cpu" => CandleDevice::Cpu,
+        "cpu" => Ok(CandleDevice::Cpu),
         "metal" => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return CandleDevice::new_metal(0).unwrap_or(CandleDevice::Cpu);
+                return CandleDevice::new_metal(0)
+                    .map_err(|error| ferrum_types::FerrumError::device(error.to_string()));
             }
             #[allow(unreachable_code)]
             {
-                eprintln!("Metal not available, falling back to CPU");
-                CandleDevice::Cpu
+                Err(ferrum_types::FerrumError::unsupported(
+                    "Metal TTS requires a Metal-enabled Ferrum build",
+                ))
             }
         }
         "cuda" => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "candle-cuda-compat")]
             {
-                return CandleDevice::new_cuda(0).unwrap_or_else(|e| {
-                    eprintln!("CUDA unavailable ({e}), falling back to CPU");
-                    CandleDevice::Cpu
-                });
+                return CandleDevice::new_cuda(0)
+                    .map_err(|error| ferrum_types::FerrumError::device(error.to_string()));
             }
             #[allow(unreachable_code)]
             {
-                eprintln!("CUDA feature not compiled, falling back to CPU");
-                CandleDevice::Cpu
+                Err(ferrum_types::FerrumError::unsupported(
+                    "CUDA TTS requires the candle-cuda-compat feature",
+                ))
             }
         }
         "auto" | _ => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "candle-cuda-compat")]
             {
                 if let Ok(d) = CandleDevice::new_cuda(0) {
-                    return d;
+                    return Ok(d);
                 }
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return CandleDevice::new_metal(0).unwrap_or(CandleDevice::Cpu);
+                if let Ok(device) = CandleDevice::new_metal(0) {
+                    return Ok(device);
+                }
             }
             #[allow(unreachable_code)]
-            CandleDevice::Cpu
+            Ok(CandleDevice::Cpu)
         }
     }
 }

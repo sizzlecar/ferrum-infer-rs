@@ -74,7 +74,7 @@ pub async fn execute(cmd: TranscribeCommand, config: CliConfig) -> Result<()> {
         )));
     }
 
-    let candle_device = select_candle_device(&cmd.backend);
+    let candle_device = select_candle_device(&cmd.backend)?;
     eprintln!("{} {:?}", "Device:".dimmed(), &candle_device);
     eprintln!("{}", "Loading Whisper model...".dimmed());
     let executor = WhisperModelExecutor::from_path(
@@ -168,47 +168,50 @@ fn find_cached_model(cache_dir: &PathBuf, model_id: &str) -> Option<ResolvedMode
     None
 }
 
-pub fn select_candle_device(backend: &str) -> CandleDevice {
+pub fn select_candle_device(backend: &str) -> ferrum_types::Result<CandleDevice> {
     match backend.to_lowercase().as_str() {
-        "cpu" => CandleDevice::Cpu,
+        "cpu" => Ok(CandleDevice::Cpu),
         "metal" => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return CandleDevice::new_metal(0).unwrap_or(CandleDevice::Cpu);
+                return CandleDevice::new_metal(0)
+                    .map_err(|error| ferrum_types::FerrumError::device(error.to_string()));
             }
             #[allow(unreachable_code)]
             {
-                eprintln!("Metal not available, falling back to CPU");
-                CandleDevice::Cpu
+                Err(ferrum_types::FerrumError::unsupported(
+                    "Metal transcription requires a Metal-enabled Ferrum build",
+                ))
             }
         }
         "cuda" => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "candle-cuda-compat")]
             {
-                return CandleDevice::new_cuda(0).unwrap_or_else(|e| {
-                    eprintln!("CUDA unavailable ({e}), falling back to CPU");
-                    CandleDevice::Cpu
-                });
+                return CandleDevice::new_cuda(0)
+                    .map_err(|error| ferrum_types::FerrumError::device(error.to_string()));
             }
             #[allow(unreachable_code)]
             {
-                eprintln!("CUDA feature not compiled, falling back to CPU");
-                CandleDevice::Cpu
+                Err(ferrum_types::FerrumError::unsupported(
+                    "CUDA transcription requires the candle-cuda-compat feature",
+                ))
             }
         }
         "auto" | _ => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "candle-cuda-compat")]
             {
                 if let Ok(d) = CandleDevice::new_cuda(0) {
-                    return d;
+                    return Ok(d);
                 }
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return CandleDevice::new_metal(0).unwrap_or(CandleDevice::Cpu);
+                if let Ok(device) = CandleDevice::new_metal(0) {
+                    return Ok(device);
+                }
             }
             #[allow(unreachable_code)]
-            CandleDevice::Cpu
+            Ok(CandleDevice::Cpu)
         }
     }
 }
