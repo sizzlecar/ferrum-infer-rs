@@ -517,7 +517,11 @@ impl Sampler for GreedySampler {
             .iter()
             .enumerate()
             .filter(|(_, logit)| logit.is_finite())
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .reduce(|best, candidate| match candidate.1.total_cmp(best.1) {
+                std::cmp::Ordering::Greater => candidate,
+                std::cmp::Ordering::Equal if candidate.0 < best.0 => candidate,
+                _ => best,
+            })
             .map(|(idx, _)| idx)
             .ok_or_else(|| {
                 ferrum_types::FerrumError::backend("No finite logits available for sampling")
@@ -532,6 +536,32 @@ impl Sampler for GreedySampler {
 
     fn is_deterministic(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod greedy_sampler_tests {
+    use super::{GreedySampler, Sampler, SamplingRng};
+
+    #[test]
+    fn ties_choose_the_lowest_token_id() {
+        let mut rng = SamplingRng::seeded(1);
+        let token = GreedySampler
+            .sample(&[-1.0, 4.0, 4.0, f32::NAN], &mut rng)
+            .unwrap();
+        assert_eq!(token.get(), 1);
+    }
+
+    #[test]
+    fn non_finite_logits_are_never_selected() {
+        let mut rng = SamplingRng::seeded(1);
+        let token = GreedySampler
+            .sample(&[f32::NAN, f32::INFINITY, -2.0], &mut rng)
+            .unwrap();
+        assert_eq!(token.get(), 2);
+        assert!(GreedySampler
+            .sample(&[f32::NAN, f32::INFINITY], &mut rng)
+            .is_err());
     }
 }
 

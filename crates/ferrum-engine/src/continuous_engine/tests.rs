@@ -14,8 +14,9 @@ use ferrum_interfaces::{
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
         ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
-        ExecutorSequenceCompletion, ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillChunk,
-        PrefillInput, PrefillOutput, UnifiedBatch,
+        ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorStatus,
+        PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
+        PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -374,7 +375,18 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
+        let mut output = self.inner.prefill(input).await?;
+        let batch_size = input.batch_size();
+        let sequence_length = input.sequence_length();
+        let vocabulary_size = self.info().vocab_size;
+        let mut logits = vec![0.0; batch_size * sequence_length * vocabulary_size];
+        for position in 0..batch_size * sequence_length {
+            logits[position * vocabulary_size + 6] = 1.0;
+        }
+        output.logits =
+            MockTensor::from_f32(logits, &[batch_size, sequence_length, vocabulary_size])
+                .into_ref();
+        Ok(output)
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -471,6 +483,79 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             ExecutorExecutionCapacityStage::StepAdmission,
         )
         .map(ExecutorBatchDecodeOutcome::Deferred)
+    }
+
+    async fn plan_runtime_batch_decode_with_capacity(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        let deferred_behavior = matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
+                | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+                | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
+        );
+        let released = self.released_cache_count.load(Ordering::Acquire) > 0;
+        let exact_subcohort = matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+        ) && inputs.len() == 1;
+        if exact_subcohort && inputs[0].kv_cache.cache_id().ends_with("-1") {
+            return Err(FerrumError::backend(
+                "synthetic exact-subcohort decode failure",
+            ));
+        }
+        if !deferred_behavior
+            || (matches!(
+                self.behavior,
+                PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
+            ) && released)
+            || exact_subcohort
+        {
+            let mut outputs = inputs
+                .iter()
+                .map(|input| {
+                    let mut logits = vec![0.0; self.info().vocab_size];
+                    if logits.len() > 6 {
+                        logits[6] = 1.0;
+                    }
+                    PlanRuntimeDecodeOutput::new(
+                        ExecutorSamplingOutput::FullLogits(logits),
+                        Arc::clone(&input.kv_cache),
+                    )
+                })
+                .collect::<Vec<_>>();
+            match self.behavior {
+                PlanRuntimeBatchDecodeBehavior::Short => {
+                    outputs.pop();
+                }
+                PlanRuntimeBatchDecodeBehavior::WrongFirstCache => {
+                    if let Some(output) = outputs.first_mut() {
+                        output.kv_cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+                            RequestId::new(),
+                            1,
+                            1,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            return Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs));
+        }
+
+        let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
+        let observed = ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1)
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let wait_condition =
+            ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(47, vec![observed])
+                .map_err(|error| FerrumError::internal(error.to_string()))?;
+        ExecutorExecutionCapacityDeferral::new(
+            ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
+            wait_condition,
+            ExecutorExecutionCapacityStage::StepAdmission,
+        )
+        .map(PlanRuntimeBatchDecodeOutcome::Deferred)
     }
 
     fn release_cache(&self, cache_id: &str) {
@@ -3066,6 +3151,23 @@ fn plan_runtime_batch_decode_test_engine_with_trace(
     Arc<PlanRuntimeBatchDecodeTestExecutor>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
+    plan_runtime_batch_decode_test_engine_with_trace_and_factory(
+        behavior,
+        trace_path,
+        Arc::new(MockTensorFactory),
+    )
+}
+
+fn plan_runtime_batch_decode_test_engine_with_trace_and_factory(
+    behavior: PlanRuntimeBatchDecodeBehavior,
+    trace_path: Option<PathBuf>,
+    tensor_factory: Arc<dyn TensorFactory>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     config.runtime.scheduler_trace_jsonl = trace_path;
@@ -3075,7 +3177,6 @@ fn plan_runtime_batch_decode_test_engine_with_trace(
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
     let executor = Arc::new(PlanRuntimeBatchDecodeTestExecutor::new(behavior));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler.clone(),
@@ -3821,6 +3922,39 @@ async fn plan_runtime_batch_decode_rejects_changed_cache_before_state_commit() {
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
     assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
+}
+
+#[tokio::test]
+async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine_with_trace_and_factory(
+            PlanRuntimeBatchDecodeBehavior::Exact,
+            None,
+            tensor_factory,
+        );
+    let (request_ids, _, _) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+
+    engine
+        .inner
+        .run_plan_runtime_batch_decode(&request_ids)
+        .await
+        .expect("typed PlanRuntime decode must not call TensorFactory::from_slice");
+
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
+    let sequences = engine.inner.sequences.read();
+    for request_id in request_ids {
+        assert_eq!(
+            sequences
+                .get(&request_id)
+                .expect("decoded sequence must remain active")
+                .generated_tokens
+                .len(),
+            2
+        );
+    }
 }
 
 #[tokio::test]
@@ -8940,12 +9074,12 @@ fn model_decode_logits_policy_requires_full_for_structured_output() {
 }
 
 #[test]
-fn model_greedy_argmax_sentinel_accepts_masked_policy_token() {
+fn model_greedy_argmax_output_accepts_masked_policy_token_and_tracks_frequency() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,
         &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
     ));
-    let state = SequenceState::new_with_tokenizer(
+    let mut state = SequenceState::new_with_tokenizer(
         policy_request(),
         vec![TokenId::new(0)],
         Some(tokenizer.clone()),
@@ -8955,6 +9089,7 @@ fn model_greedy_argmax_sentinel_accepts_masked_policy_token() {
     state
         .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
         .unwrap();
+    assert_eq!(state.token_frequencies.get(&TokenId::new(0)), Some(&1));
     let err = state
         .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(2))
         .unwrap_err()
@@ -8971,14 +9106,14 @@ fn model_greedy_argmax_sentinel_accepts_masked_policy_token() {
 }
 
 #[test]
-fn model_greedy_argmax_sentinel_rejects_non_greedy_request() {
+fn model_greedy_argmax_output_rejects_non_greedy_request() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,
         &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
     ));
     let mut request = policy_request();
     request.sampling_params.top_p = 0.8;
-    let state =
+    let mut state =
         SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer.clone()));
 
     assert!(state

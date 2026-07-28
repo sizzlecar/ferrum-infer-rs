@@ -22,9 +22,11 @@ use ferrum_interfaces::model_executor::{
     ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
     ExecutorMemoryUsage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
     ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
-    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorSequenceCompletion,
-    ExecutorState, ExecutorStatus, LogitsReturnPolicy, MemoryRequirements,
-    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
+    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorSamplingOutput,
+    ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
+    MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput,
+    PlanRuntimeDecodeOutput, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput,
+    PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -831,7 +833,7 @@ fn product_repetition_input(
     }
 }
 
-fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<Vec<f32>> {
+fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<TokenId> {
     let token_bytes: [u8; 4] = bytes.try_into().map_err(|_| {
         FerrumError::backend(format!(
             "vNext selected-token readback contains {} bytes, expected 4",
@@ -847,7 +849,7 @@ fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<Vec<f32
             "vNext masked argmax returned invalid token {token} for vocabulary {vocabulary_size}"
         )));
     }
-    Ok(vec![token as f32])
+    Ok(TokenId::new(token))
 }
 
 fn nonterminal_completion_message(observation: &CompletionReadbackBatchObservation) -> String {
@@ -3693,7 +3695,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .with_request_id(sequence.request_id.clone())
             })
             .collect::<Vec<_>>();
-        match self.execute_decode_batch(&inputs).await? {
+        match self.execute_legacy_decode_batch(&inputs).await? {
             ExecutorBatchDecodeOutcome::Completed(outputs) => {
                 if outputs.len() != width {
                     return Err(FerrumError::internal(format!(
@@ -5493,7 +5495,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         tokens: &[u32],
         span: TokenSpanWork,
         logits_policy: &LogitsReturnPolicy,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<ExecutorSamplingOutput> {
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
             let _phase_timing = self
@@ -5529,7 +5531,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
         logits_policies: Option<&[LogitsReturnPolicy]>,
-    ) -> Result<VNextExecutionCapacityDecision<Vec<Vec<f32>>>> {
+    ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
@@ -5600,7 +5602,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
         logits_policy: Option<&LogitsReturnPolicy>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<ExecutorSamplingOutput> {
         let participant = VNextExecutionParticipant {
             sequence,
             tokens,
@@ -5620,7 +5622,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<Vec<ExecutorSamplingOutput>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
@@ -5850,7 +5852,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Err(self.abort_step(step, message).await);
         }
         let processed = (|| -> Result<(
-            Vec<Vec<f32>>,
+            Vec<ExecutorSamplingOutput>,
             u64,
             Vec<VNextCheckpointArtifactRecord>,
             Vec<VNextCheckpointProductOutputRecord>,
@@ -6196,14 +6198,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         bytes: &[u8],
         output_mode: VNextProductOutputMode,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<ExecutorSamplingOutput> {
         match output_mode {
-            VNextProductOutputMode::FullLogits => {
-                Self::decode_logits(bytes, self.io.output_element_type)
-            }
-            VNextProductOutputMode::GreedyToken => {
-                decode_selected_token(bytes, self.io.output_elements)
-            }
+            VNextProductOutputMode::FullLogits => ExecutorSamplingOutput::full_logits(
+                Self::decode_logits(bytes, self.io.output_element_type)?,
+            ),
+            VNextProductOutputMode::GreedyToken => Ok(ExecutorSamplingOutput::greedy_token(
+                decode_selected_token(bytes, self.io.output_elements)?,
+            )),
         }
     }
 
@@ -6269,44 +6271,29 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    async fn execute_decode_batch(
+    async fn execute_plan_runtime_decode_batch(
         &self,
-        inputs: &[DecodeInput],
-    ) -> Result<ExecutorBatchDecodeOutcome> {
+        inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
         let started = Instant::now();
         if inputs.is_empty() {
-            return Ok(ExecutorBatchDecodeOutcome::Completed(Vec::new()));
+            return Ok(PlanRuntimeBatchDecodeOutcome::Completed(Vec::new()));
         }
 
         let mut candidates = Vec::with_capacity(inputs.len());
         for (original_index, input) in inputs.iter().enumerate() {
-            if input.batch_size() != 1 {
-                return Err(FerrumError::unsupported(
-                    "each vNext batch-decode input must contain exactly one sequence",
-                ));
-            }
             let cache_id = input.kv_cache.cache_id();
             let sequence = self.sequence_for_cache(&cache_id)?;
-            if input
-                .request_id
-                .as_ref()
-                .is_some_and(|request_id| request_id != &sequence.request_id)
-            {
+            if input.request_id != sequence.request_id {
                 return Err(FerrumError::request_validation(
                     "vNext batch-decode request identity differs from its cache owner",
                 ));
             }
-            let next = common::tensor_to_tokens(&input.input_ids)?;
-            let [next_token] = next.as_slice() else {
-                return Err(FerrumError::request_validation(
-                    "each vNext batch-decode participant requires exactly one input token",
-                ));
-            };
             candidates.push(VNextDecodeCandidate {
                 original_index,
                 sequence,
                 cache_id,
-                next_token: *next_token,
+                next_token: input.input_token.get(),
                 logits_policy: input.logits_policy.clone(),
             });
         }
@@ -6384,7 +6371,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             match self.extend_sequence_with_capacity(&candidate.sequence, extension) {
                 Ok(VNextExecutionCapacityDecision::Ready(())) => {}
                 Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                    return Ok(ExecutorBatchDecodeOutcome::Deferred(deferred));
+                    return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred));
                 }
                 Err(error) => {
                     if DecodeFailureDisposition::from_error(&error)
@@ -6423,7 +6410,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         {
             Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
             Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                return Ok(ExecutorBatchDecodeOutcome::Deferred(deferred));
+                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred));
             }
             Err(error) => {
                 if DecodeFailureDisposition::from_error(&error)
@@ -6442,20 +6429,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 canonical_candidates.len()
             )));
         }
-
-        let logits = match logits
-            .into_iter()
-            .map(|logits| self.decode_tensor(logits))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(logits) => logits,
-            Err(error) => {
+        for (sampling_output, candidate) in logits.iter().zip(&canonical_candidates) {
+            if let Err(error) = sampling_output
+                .validate_for_policy(&candidate.logits_policy, self.io.output_elements)
+            {
                 self.abort_decode_candidates(&canonical_candidates);
                 return Err(error);
             }
-        };
+        }
+
         let mut ordered_outputs = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for (((candidate, tokens), previous_len), logits) in canonical_candidates
+        for (((candidate, tokens), previous_len), sampling_output) in canonical_candidates
             .iter()
             .zip(token_batches)
             .zip(previous_lengths)
@@ -6465,7 +6449,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 *candidate.sequence.tokens.lock() = tokens;
             }
             let cache = self.cache_handle(&candidate.sequence, previous_len + 1);
-            ordered_outputs[candidate.original_index] = Some(DecodeOutput::new(logits, cache));
+            ordered_outputs[candidate.original_index] =
+                Some(PlanRuntimeDecodeOutput::new(sampling_output, cache));
         }
 
         let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
@@ -6487,7 +6472,64 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(ExecutorBatchDecodeOutcome::Completed(outputs))
+        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
+    }
+
+    async fn execute_legacy_decode_batch(
+        &self,
+        inputs: &[DecodeInput],
+    ) -> Result<ExecutorBatchDecodeOutcome> {
+        let mut typed_inputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.batch_size() != 1 {
+                return Err(FerrumError::unsupported(
+                    "each vNext batch-decode input must contain exactly one sequence",
+                ));
+            }
+            let tokens = common::tensor_to_tokens(&input.input_ids)?;
+            let [input_token] = tokens.as_slice() else {
+                return Err(FerrumError::request_validation(
+                    "each vNext batch-decode participant requires exactly one input token",
+                ));
+            };
+            let sequence = self.sequence_for_cache(&input.kv_cache.cache_id())?;
+            let request_id = input
+                .request_id
+                .clone()
+                .unwrap_or_else(|| sequence.request_id.clone());
+            let typed = PlanRuntimeDecodeInput::new(
+                request_id,
+                TokenId::new(*input_token),
+                Arc::clone(&input.kv_cache),
+            )
+            .with_logits_policy(input.logits_policy.clone());
+            typed_inputs.push(typed);
+        }
+
+        match self
+            .execute_plan_runtime_decode_batch(&typed_inputs)
+            .await?
+        {
+            PlanRuntimeBatchDecodeOutcome::Completed(outputs) => {
+                let outputs = outputs
+                    .into_iter()
+                    .map(|output| {
+                        let legacy_values = match output.sampling_output {
+                            ExecutorSamplingOutput::FullLogits(logits) => logits,
+                            ExecutorSamplingOutput::GreedyToken(token) => {
+                                vec![token.get() as f32]
+                            }
+                        };
+                        let logits = self.decode_tensor(legacy_values)?;
+                        Ok(DecodeOutput::new(logits, output.kv_cache))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ExecutorBatchDecodeOutcome::Completed(outputs))
+            }
+            PlanRuntimeBatchDecodeOutcome::Deferred(deferred) => {
+                Ok(ExecutorBatchDecodeOutcome::Deferred(deferred))
+            }
+        }
     }
 
     async fn execute_prefill_with_capacity(
@@ -6632,7 +6674,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let logits = logits.pop().ok_or_else(|| {
             FerrumError::internal("vNext single prefill execution returned no logits")
         })?;
-        let logits = self.prefill_tensor(logits)?;
+        let logits = self.prefill_tensor(logits.into_full_logits()?)?;
         sequence
             .prefill_tokens_processed
             .store(completed_chunk.end(), Ordering::Release);
@@ -6949,7 +6991,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .zip(&capacity_probe_counts)
             .zip(logits)
         {
-            let logits = self.prefill_tensor(logits)?;
+            let logits = self.prefill_tensor(logits.into_full_logits()?)?;
             let cache = self.cache_handle(&candidate.sequence, completed_chunk.end());
             ordered[candidate.original_index] = Some(ExecutorPrefillCompletion::new(
                 PrefillOutput::new(logits, cache),
@@ -7561,11 +7603,11 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         }
         let step_span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let logits = match self
+        let sampling_output = match self
             .execute_step(&sequence, &tokens, step_span, &input.logits_policy)
             .await
         {
-            Ok(logits) => logits,
+            Ok(sampling_output) => sampling_output,
             Err(error) => {
                 if DecodeFailureDisposition::from_error(&error)
                     == DecodeFailureDisposition::AbortSequence
@@ -7576,6 +7618,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 return Err(error);
             }
         };
+        sampling_output.validate_for_policy(&input.logits_policy, self.io.output_elements)?;
         *sequence.tokens.lock() = tokens;
         self.metrics
             .decode_operations
@@ -7584,13 +7627,17 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
-        let logits = self.decode_tensor(logits)?;
+        let legacy_values = match sampling_output {
+            ExecutorSamplingOutput::FullLogits(logits) => logits,
+            ExecutorSamplingOutput::GreedyToken(token) => vec![token.get() as f32],
+        };
+        let logits = self.decode_tensor(legacy_values)?;
         let cache = self.cache_handle(&sequence, previous_len + 1);
         Ok(DecodeOutput::new(logits, cache))
     }
 
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        match self.execute_decode_batch(inputs).await? {
+        match self.execute_legacy_decode_batch(inputs).await? {
             ExecutorBatchDecodeOutcome::Completed(outputs) => Ok(outputs),
             ExecutorBatchDecodeOutcome::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
@@ -7602,7 +7649,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         inputs: &[DecodeInput],
     ) -> Result<ExecutorBatchDecodeOutcome> {
-        self.execute_decode_batch(inputs).await
+        self.execute_legacy_decode_batch(inputs).await
+    }
+
+    async fn plan_runtime_batch_decode_with_capacity(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        self.execute_plan_runtime_decode_batch(inputs).await
     }
 
     fn release_cache(&self, cache_id: &str) {
@@ -7741,6 +7795,7 @@ mod tests {
         DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink,
         DeviceTimingMeasurement, DeviceTimingMode, StepResourceAdmissionProfilePhase,
     };
+    use ferrum_types::TokenId;
 
     #[test]
     fn verification_timing_selects_typed_eager_submission_without_owning_other_paths() {
@@ -8314,10 +8369,10 @@ mod tests {
     }
 
     #[test]
-    fn selected_token_readback_rejects_sentinel_and_out_of_vocabulary_values() {
+    fn selected_token_readback_rejects_out_of_vocabulary_values() {
         assert_eq!(
             decode_selected_token(&3_u32.to_le_bytes(), 8).unwrap(),
-            [3.0]
+            TokenId::new(3)
         );
         assert!(decode_selected_token(&8_u32.to_le_bytes(), 8).is_err());
         assert!(decode_selected_token(&u32::MAX.to_le_bytes(), 8).is_err());
