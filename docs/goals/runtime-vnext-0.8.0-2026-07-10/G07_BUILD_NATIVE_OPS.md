@@ -335,6 +335,68 @@ five-sample p95. G07 remains Open pending dev/release semantic equivalence,
 the complete five-sample invalidation matrix, workspace source gate and
 canonical G07A/G07B/G07 aggregate validators.
 
+### 2026-07-29 CUDA release/correctness plan-equivalence checkpoint
+
+Clean release-reference source `5e2aaaed73984d77951d68014b919fdcc3e84bd0`,
+tree `5ff26a23b51c0161311a16f0cf4265da40397121`, ran the exact official
+`cuda,vllm-moe-marlin,vllm-paged-attn-v2` release build on Vast instance
+`46127509`, one RTX 4090 with driver `580.142` and `24564 MiB`. The bounded
+build passed in `448.366051s`; peaks were 7 processes, 35 process-group
+threads and 17 threads in one process, and cleanup confirmed the process group
+was gone. No `nvcc` or `ptxas` process ran. The release binary SHA256 was
+`e70114ed09c710eede78415e7f82c20a355ec04cc64ceff6f6e5089f6db21210`.
+
+The release binary then ran exact product `c13-022` through `ferrum serve`.
+It printed focused `KEEP` in `104.948784s`; the scheduler trace contained 17
+`vnext.plan_built` events with one plan hash,
+`96efe5ea30955542290d58ea76d4768a46c79886391cf06ffb538e16b726b586`.
+The release reference bound the official build receipt and binary, model and
+file locks, typed and actual effective configs, focused report, hardware
+identity and the complete scheduler trace.
+
+This lane also exposed two fail-closed evidence bugs instead of hiding them:
+
+- fixed-architecture Marlin always compiles `compute_80` PTX, but its cache
+  identity included the reported device capability. The canonical identity now
+  excludes that phantom input and permits only an exact one-line historical
+  signature migration; source, toolchain and payload SHA checks remain strict.
+- the semantic validator compared the whole typed-config evidence envelope,
+  which necessarily contains different release and correctness binary SHA
+  values. It now compares the exact non-empty `typed_effective_config`
+  sub-contract while retaining independent SHA binding for the release binary,
+  correctness build binary and correctness execution binary. A changed device
+  config remains a negative fixture.
+
+Clean current source `775758780baf66c3a508f8b07237035483c97410`,
+tree `135ac8a1dffa9add13b918478d46a87ec2304288`, then used the ancestor
+release reference under the checked ancestry policy. Its forced, cache-only
+`cuda-correctness` build passed in `24.897233s`, versus `448.366051s` for the
+release build on the same host. All 44 managed native artifacts were cache
+hits, native recompile count was `0`, and the runnable binary SHA256 was
+`00c4db8060e60718c63e7bd4e3267c0c03f2fbd70e08659bdcc8f64685b3bbae`.
+The current binary independently ran `c13-022` in `112.409712s` with focused
+`KEEP`; the final validator observed 17/17 exact plan hashes and printed:
+
+```text
+FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS: /workspace/ferrum-artifacts/runtime-vnext-typed-boundary-77575878-20260729-semantic-trace
+```
+
+The evidence is preserved in GitHub draft-release asset
+`runtime-vnext-g07-plan-equivalence-77575878-20260729.tar.zst`
+(asset `493152796`, `118590834` bytes), SHA256
+`b9d739bc80d05fcaf1ad679f2a9a1deaa78880035377f46eabe3822d3101b06a`.
+It was downloaded through GitHub and SHA256/zstd verified at
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-plan-equivalence-77575878-20260729`.
+Instance `46127509` was then stopped and reached `actual_status=exited`;
+inventory reported `potentially_billable=[]`.
+
+This closes the real CUDA release/correctness semantic-plan comparison and
+provides one Rust-only cache-hit iteration sample. It is not the five-sample
+p95 matrix, workspace source gate, canonical G07A PASS, G07B native-operator
+PASS, or aggregate G07 PASS. Those items remain Open and must not trigger
+another C13 or 703 sweep unless runtime-affecting source changes invalidate
+this reference.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。
