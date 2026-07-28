@@ -37,6 +37,22 @@ fn executable_cache_has_no_fence_dependency_owner() {
 }
 
 #[test]
+fn replay_identity_does_not_enable_full_profile_tool_correlation() {
+    assert!(REPLAY_SOURCE.contains(
+        "let profile_identity = timing_mode.physical_span_attribution_enabled().then(||"
+    ));
+    assert!(REPLAY_SOURCE.contains("if timing_mode.kernel_attribution_enabled()"));
+    assert!(REPLAY_SOURCE
+        .contains("profile_identity.map(|identity| Arc::clone(&identity.fingerprint))"));
+    assert!(!REPLAY_SOURCE.contains("profile_identity.map_or_else("));
+    assert!(!REPLAY_SOURCE.contains("retain_profile_identity: bool"));
+    assert!(!REPLAY_SOURCE.contains("tool_correlation: bool"));
+    assert!(RUNTIME_SOURCE.contains(
+        "if kernel_attribution {\n            vnext_tool_correlation::prepare();\n        }"
+    ));
+}
+
+#[test]
 fn causal_replay_identity_uses_a_partition_capacity_envelope() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("CausalAttentionReplayTopology"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStableDecode"));

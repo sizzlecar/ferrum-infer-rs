@@ -2315,8 +2315,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 let launched = stream.executable_cache.launch_program_segment(
                     &stream.stream,
                     invocation,
-                    physical_span_attribution,
-                    false,
+                    timing_mode,
                     logical_attribution,
                 );
                 let end = command_spans.as_ref().and_then(|_| {
@@ -2429,12 +2428,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             ))
                             .ok()
                     });
-                    let launched = stream.executable_cache.launch(
-                        &stream.stream,
-                        candidate,
-                        physical_span_attribution,
-                        kernel_attribution,
-                    );
+                    let launched =
+                        stream
+                            .executable_cache
+                            .launch(&stream.stream, candidate, timing_mode);
                     let end = command_spans.as_ref().and_then(|_| {
                         stream
                             .stream
@@ -2457,7 +2454,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 Some(candidate) if !physical_span_attribution => {
                     match stream
                         .executable_cache
-                        .launch(&stream.stream, candidate, false, false)
+                        .launch(&stream.stream, candidate, timing_mode)
                     {
                         Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
                         Ok(None) => None,
