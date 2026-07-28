@@ -4,7 +4,7 @@
 
 Open。创建于 2026-07-10。
 
-截至 2026-07-28，最新已验证并推送的 clean source checkpoint 为
+截至 2026-07-28，最近一次完整 M2 CUDA correctness 的 clean source checkpoint 为
 `b0431ca5b384a86c4e1f57406ad7267bdd3c3705`，tree 为
 `0896756c962c6d983d6d251ad2c7d5bd99f122ad`。`27dd5c7f` 将 scenario request
 manifest 绑定到实际 wire bytes，`b0431ca5` 修正 C01 negative-layout checker：
@@ -113,7 +113,25 @@ reference source 只能等于或祖先于 candidate，最终 trace plan identity
 `FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS`。这是 source/test-system
 checkpoint，不是 G07、G08B 或 CUDA hardware PASS。
 
-paid inventory 已核对：RTX 4090 实例 `46083877` 与 `45897840` 均为
+当前最新已验证并推送的 G07 clean source 为
+`ecd6d1e8739467ab290bdb64df7a12e6a9c2cde6`，tree 为
+`8e363e3b0efa90f11ffaf967f069a9ac00b77584`。正式 CUDA feature graph 已把
+Candle CUDA 隔离到显式 `candle-cuda-compat`：official graph 的 `candle-core` /
+`candle-nn` 只有 CPU `default` feature，`candle-kernels` 不存在；vNext CUDA GPU
+执行使用 `cudarc`、cuBLAS 和 Ferrum/vLLM native kernels。相同 clean source 在
+1x RTX 4090 上以 `cache-only` 构建正式 CUDA binary，用时 `471.000627s`，
+native compiler 数为 `0`，binary SHA256 为
+`a6e5059c7cab467ea8cf79b37beb102644a19dea8267d76b038ce63531b11a11`。
+这仍不是“整个 CUDA binary 零 Candle”：vNext 产品边界仍用 CPU Candle tensor
+包装 token/logits，Metal、GGUF、embedding 和多模态实现也继续依赖 Candle。
+本次 GitHub draft-release evidence asset 为
+`cuda-g07-candle-boundary-ecd6d1e8.tar.zst`（asset `492770357`），archive
+SHA256 为
+`2fed9d75c9535b5437210c42d8a7a50fb3670cc9ee9e68ba7b5ffd0ee61af5d0`。
+它是 G07 CUDA/Candle boundary 和单次 release-build diagnostic，不是五样本 p95、
+G07A、G07B 或 G07 aggregate PASS。
+
+paid inventory 已核对：当前只保留 RTX 4090 实例 `45897840`，状态为
 `cur_state=stopped`、`actual_status=exited`，`potentially_billable=[]`。M2 CUDA
 correctness lane 已关闭；除非相关源码再次变化，不再重跑 focused C13 或 703 全量。
 下一 CUDA 只允许在同一 clean SHA、同一硬件和同一 typed config 上先生成 release
