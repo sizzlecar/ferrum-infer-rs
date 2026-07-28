@@ -112,7 +112,7 @@ pub fn cuda_vnext_runtime_config(
         .resolve(capabilities.iter().any(|capability| {
             capability.as_str() == DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
         }))
-        .map_err(invalid_plan)?;
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
     Ok(CudaDeviceRuntimeConfig {
         ordinal,
         device_id,
