@@ -53,8 +53,12 @@ pub fn create_cuda_vnext_determinism_collector(
     let model_info = prepared.model_info(engine.model.model_id.clone(), device);
     let device_id = DeviceId::new(format!("device.cuda.{ordinal}"))
         .map_err(|error| FerrumError::device(error.to_string()))?;
-    let composition = CudaVNextComposition::create(ordinal, device_id)
-        .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
+    let composition = CudaVNextComposition::create(
+        ordinal,
+        device_id,
+        engine.runtime.attention_execution_policy,
+    )
+    .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
     let (runtime, operation_registry, weight_materializers, weight_materializer_id, catalog) =
         composition.into_parts();
     let executor_config =

@@ -171,6 +171,10 @@ impl DeviceRuntime for TestRuntime {
         &self.descriptor
     }
 
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
+    }
+
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error> {
         let rendezvous = self.allocation_rendezvous.lock().unwrap().clone();
         if let Some((entered, close_attempting)) = rendezvous {

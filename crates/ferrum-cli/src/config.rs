@@ -2,7 +2,9 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource, SequenceFitPolicy};
+use ferrum_types::{
+    AttentionExecutionPolicy, Result, RuntimeConfigEntry, RuntimeConfigSource, SequenceFitPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -189,6 +191,11 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_RECURRENT_STATE_MAX_SLOTS`.
     #[serde(default)]
     pub recurrent_state_max_slots: Option<usize>,
+
+    /// Attention provider-family policy for the plan runtime. Physical
+    /// V1/V2/varlen selection remains adaptive inside the compiled provider.
+    #[serde(default)]
+    pub attention_policy: Option<AttentionExecutionPolicy>,
 
     /// Scheduler/model max batched-token budget, equivalent to
     /// `FERRUM_MAX_BATCHED_TOKENS`.
@@ -381,6 +388,12 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_RECURRENT_STATE_MAX_SLOTS",
             self.recurrent_state_max_slots,
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_ATTENTION_POLICY",
+            self.attention_policy
+                .map(AttentionExecutionPolicy::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -751,6 +764,7 @@ mod tests {
             kv_capacity: Some(2048),
             paged_max_seqs: Some(64),
             recurrent_state_max_slots: Some(16),
+            attention_policy: Some(AttentionExecutionPolicy::NativeAdaptive),
             max_batched_tokens: Some(2048),
             scheduler_prefill_first_until_active: Some(16),
             scheduler_active_decode_prefill_chunk: Some(24),
@@ -795,7 +809,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 42);
+        assert_eq!(entries.len(), 43);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -820,6 +834,16 @@ mod tests {
         assert!(entry("FERRUM_RECURRENT_STATE_MAX_SLOTS")
             .affects
             .contains(&RuntimeConfigEffect::Memory));
+        assert_eq!(
+            entry("FERRUM_ATTENTION_POLICY").effective_value,
+            "native-adaptive"
+        );
+        assert!(entry("FERRUM_ATTENTION_POLICY")
+            .affects
+            .contains(&RuntimeConfigEffect::Correctness));
+        assert!(entry("FERRUM_ATTENTION_POLICY")
+            .affects
+            .contains(&RuntimeConfigEffect::Performance));
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,

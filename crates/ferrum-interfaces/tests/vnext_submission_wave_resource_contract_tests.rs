@@ -105,6 +105,7 @@ fn reusable_sequential_scratch_plan() -> (
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         Some(reusable_execution),
     )
@@ -142,6 +143,7 @@ fn reusable_token_scaled_plan() -> (
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         Some(ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap()),
     )

@@ -29,6 +29,10 @@ impl RuntimePolicy for Policy {
         4
     }
 
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
+    }
+
     fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
     }
@@ -64,6 +68,10 @@ impl DeviceRuntime for Runtime {
 
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
     }
 
     fn allocate(&self, _permit: DeviceAllocationPermit<'_>) -> Result<Buffer, io::Error> {

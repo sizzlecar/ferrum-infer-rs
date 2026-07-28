@@ -5,7 +5,7 @@
 
 use crate::{KvCacheHandle, RecurrentStateHandle, RecurrentStateSpec, TensorRef};
 use async_trait::async_trait;
-use ferrum_types::{FerrumError, ModelInfo, RequestId, Result, TokenId};
+use ferrum_types::{ExecutorAdmissionLimits, FerrumError, ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
@@ -1017,19 +1017,7 @@ impl ExecutorSequenceCompletion {
     }
 }
 
-/// Declares the authoritative runtime for request-lifetime accelerator resources.
-///
-/// This is a lifecycle boundary, not a capacity limit. `PlanRuntime` means the
-/// shared execution runtime owns admission, allocation, fences, and release;
-/// a model executor may adapt those operations but is not their owner. The
-/// engine must not reserve a second KV or recurrent-state allocation for the
-/// same request. `LegacyEngine` exists only while old executors are migrated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionResourceAuthority {
-    LegacyEngine,
-    PlanRuntime,
-}
+pub use ferrum_types::ExecutionResourceAuthority;
 
 /// Request-scoped authority selected for a capacity-pressure preemption.
 ///
@@ -2052,6 +2040,13 @@ pub trait ModelExecutor: Send + Sync {
     /// of that authority from `release_cache`.
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
         ExecutionResourceAuthority::LegacyEngine
+    }
+
+    /// Immutable admission limits compiled into this executor's runtime plan.
+    /// A PlanRuntime executor must return `Some`; legacy executors may defer to
+    /// the engine-owned scheduler and recurrent-state limits.
+    fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
+        Ok(None)
     }
 
     /// Returns the immutable product plan that owns planning, provider

@@ -4554,6 +4554,10 @@ impl VNextProfileEventContext {
                     "provider_id".to_string(),
                     serde_json::json!(node.provider_id().to_string()),
                 );
+                attributes.insert(
+                    "provider_implementation_fingerprint".to_string(),
+                    serde_json::json!(node.provider_implementation_fingerprint()),
+                );
                 let semantics = node.provider_execution_semantics();
                 attributes.insert(
                     "provider_execution_contract_version".to_string(),
@@ -5762,6 +5766,63 @@ impl InferenceEngine for ContinuousBatchEngine {
             "cached_tokens": stats.total_cached_tokens as u64,
             "hit_rate": stats.hit_rate,
         }))
+    }
+
+    fn admission_snapshot(
+        &self,
+    ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
+        let scheduler = self.inner.scheduler.admission_phase_counts();
+        let authority = self.inner.resource_composition.authority();
+        let limits = match authority {
+            ExecutionResourceAuthority::PlanRuntime => self
+                .inner
+                .model_executor
+                .admission_limits()?
+                .ok_or_else(|| {
+                    FerrumError::internal(
+                        "PlanRuntime executor did not expose its resolved admission limits",
+                    )
+                })?,
+            ExecutionResourceAuthority::LegacyEngine => {
+                let scheduler_limit = self.inner.config.scheduler.max_running_requests;
+                let maximum_active_sequences = self
+                    .inner
+                    .recurrent_state_manager()
+                    .map(|manager| scheduler_limit.min(manager.stats().total_batch_slots))
+                    .unwrap_or(scheduler_limit);
+                ferrum_types::ExecutorAdmissionLimits::new(
+                    u32::try_from(maximum_active_sequences).map_err(|_| {
+                        FerrumError::internal("legacy admission sequence limit exceeds u32")
+                    })?,
+                    u64::try_from(self.inner.config.batching.max_num_batched_tokens).map_err(
+                        |_| FerrumError::internal("legacy scheduled-token limit exceeds u64"),
+                    )?,
+                )
+                .map_err(|reason| {
+                    FerrumError::internal(format!(
+                        "legacy admission limits violated their typed contract: {reason}"
+                    ))
+                })?
+            }
+        };
+        ferrum_types::ExecutorAdmissionSnapshot::new(
+            authority,
+            limits,
+            u32::try_from(scheduler.waiting_requests)
+                .map_err(|_| FerrumError::internal("waiting request count exceeds u32"))?,
+            u32::try_from(scheduler.active_prefill_sequences)
+                .map_err(|_| FerrumError::internal("active prefill count exceeds u32"))?,
+            u32::try_from(scheduler.active_decode_sequences)
+                .map_err(|_| FerrumError::internal("active decode count exceeds u32"))?,
+            None,
+            None,
+        )
+        .map(Some)
+        .map_err(|reason| {
+            FerrumError::internal(format!(
+                "runtime admission snapshot violated its typed contract: {reason}"
+            ))
+        })
     }
 
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {

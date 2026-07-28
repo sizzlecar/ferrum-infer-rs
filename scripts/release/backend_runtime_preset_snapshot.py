@@ -118,7 +118,23 @@ def candidate_group(
     }
 
 
-def synthesize_kv_layout_group(decisions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def synthesize_kv_layout_group(
+    effective: dict[str, Any],
+    decisions: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    admission = effective.get("admission") or {}
+    if admission.get("resource_authority") == "plan_runtime":
+        return {
+            "name": "kv_layouts",
+            "selected": "paged_plan_runtime",
+            "candidates": ["paged_plan_runtime", "paged_legacy"],
+            "rejected": [
+                {
+                    "value": "paged_legacy",
+                    "reason": "PlanRuntime owns the typed KV layout and resource transaction",
+                }
+            ],
+        }
     decode = decisions.get("attention_decode_backend", {})
     selected_decode = str(decode.get("selected", "legacy_paged_decode"))
     selected = (
@@ -179,7 +195,6 @@ def build_snapshot(case: dict[str, Any]) -> dict[str, Any]:
     decisions = decision_map(effective)
     required_decisions = {
         "attention_decode_backend",
-        "fa2_native_operator_runtime_selection",
         "moe_graph_policy",
         "moe_implementation",
         "prefix_cache_policy",
@@ -193,7 +208,7 @@ def build_snapshot(case: dict[str, Any]) -> dict[str, Any]:
     groups = [
         candidate_group("attention_impls", decisions["attention_decode_backend"]),
         candidate_group("graph_modes", decisions["moe_graph_policy"]),
-        synthesize_kv_layout_group(decisions),
+        synthesize_kv_layout_group(effective, decisions),
         synthesize_kv_dtype_group(effective),
         candidate_group("moe_decode_paths", decisions["moe_implementation"]),
         candidate_group("cache_modes", decisions["prefix_cache_policy"]),
@@ -204,6 +219,7 @@ def build_snapshot(case: dict[str, Any]) -> dict[str, Any]:
         "description": case.get("description"),
         "entries": effective.get("entries"),
         "admission": effective.get("admission"),
+        "attention_execution": effective.get("attention_execution"),
         "selected": {
             "backend": effective.get("hardware_capabilities", {}).get("backend"),
             "model_architecture": effective.get("model_capabilities", {}).get("architecture"),

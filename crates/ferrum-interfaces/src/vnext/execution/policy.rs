@@ -5,6 +5,7 @@ use super::{
     VNextError,
 };
 use crate::vnext::ExecutionDeterminismRequirement;
+use ferrum_types::AttentionExecutionPolicy;
 
 /// Typed policy selected before planning. Memory capacity is part of the
 /// public policy contract so a plan cannot depend on an undocumented env var.
@@ -27,6 +28,10 @@ pub trait RuntimePolicy:
     /// not installed capacity: admission still evaluates the exact step shape
     /// against then-live backing before any provider work is encoded.
     fn maximum_scheduled_tokens(&self) -> u64;
+
+    /// Provider-family policy sealed into the plan fingerprint. Physical
+    /// kernel variants remain an invocation-time provider decision.
+    fn attention_execution_policy(&self) -> AttentionExecutionPolicy;
 
     /// Minimum repeatability and reusable-execution equivalence that every
     /// selected operation provider must prove.

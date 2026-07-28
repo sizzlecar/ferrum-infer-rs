@@ -487,6 +487,17 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub pressure_dropped_journal_entries: u64,
 }
 
+/// Admission phases observed from one read of the scheduler request index.
+///
+/// Queue counters are intentionally excluded: separate queue locks cannot
+/// produce a single-generation observation while requests change phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinuousSchedulerAdmissionCounts {
+    pub waiting_requests: usize,
+    pub active_prefill_sequences: usize,
+    pub active_decode_sequences: usize,
+}
+
 /// Continuous batching scheduler
 ///
 /// This scheduler manages requests through their lifecycle in a continuous
@@ -879,6 +890,28 @@ impl ContinuousBatchScheduler {
             pressure_last_transition_ordinal: pressure.last_transition_ordinal,
             pressure_dropped_journal_entries: pressure.dropped_journal_entries,
         }
+    }
+
+    /// Returns mutually exclusive admission phases from one authoritative map.
+    pub fn admission_phase_counts(&self) -> ContinuousSchedulerAdmissionCounts {
+        let request_index = self.request_index.read();
+        let mut counts = ContinuousSchedulerAdmissionCounts {
+            waiting_requests: 0,
+            active_prefill_sequences: 0,
+            active_decode_sequences: 0,
+        };
+        for phase in request_index.values() {
+            match phase {
+                RequestPhase::Waiting => counts.waiting_requests += 1,
+                RequestPhase::Prefilling => counts.active_prefill_sequences += 1,
+                RequestPhase::Decoding => counts.active_decode_sequences += 1,
+                RequestPhase::Completed
+                | RequestPhase::Preempted
+                | RequestPhase::Cancelled
+                | RequestPhase::AdmissionFailed => {}
+            }
+        }
+        counts
     }
 
     /// Return the scheduler phase for trace-only plan classification.
@@ -3662,6 +3695,36 @@ mod tests {
         let scheduler = ContinuousBatchScheduler::new(config);
         assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(scheduler.active_count(), 0);
+    }
+
+    #[test]
+    fn admission_phase_counts_are_mutually_exclusive_per_request() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let phases = [
+            RequestPhase::Waiting,
+            RequestPhase::Prefilling,
+            RequestPhase::Decoding,
+            RequestPhase::Decoding,
+            RequestPhase::Completed,
+            RequestPhase::Cancelled,
+        ];
+        {
+            let mut request_index = scheduler.request_index.write();
+            for phase in phases {
+                request_index.insert(RequestId::new(), phase);
+            }
+        }
+
+        let counts = scheduler.admission_phase_counts();
+        assert_eq!(counts.waiting_requests, 1);
+        assert_eq!(counts.active_prefill_sequences, 1);
+        assert_eq!(counts.active_decode_sequences, 2);
+        assert_eq!(
+            counts.waiting_requests
+                + counts.active_prefill_sequences
+                + counts.active_decode_sequences,
+            4
+        );
     }
 
     #[tokio::test]

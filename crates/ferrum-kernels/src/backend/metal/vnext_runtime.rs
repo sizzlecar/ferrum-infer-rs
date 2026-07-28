@@ -1898,6 +1898,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
         &self.descriptor
     }
 
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
+    }
+
     fn allocate(
         &self,
         permit: ferrum_interfaces::vnext::DeviceAllocationPermit<'_>,

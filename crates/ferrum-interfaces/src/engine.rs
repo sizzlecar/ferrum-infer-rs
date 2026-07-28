@@ -7,7 +7,10 @@
 //! no more inert "unsupported" stubs.
 
 use async_trait::async_trait;
-use ferrum_types::{EngineConfig, InferenceRequest, InferenceResponse, Result, StreamChunk};
+use ferrum_types::{
+    EngineConfig, ExecutorAdmissionSnapshot, InferenceRequest, InferenceResponse, Result,
+    StreamChunk,
+};
 use futures::Stream;
 use std::pin::Pin;
 
@@ -40,6 +43,12 @@ pub trait InferenceEngine: Send + Sync {
     /// fields into every modality's core metrics type.
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         None
+    }
+
+    /// Runtime-authoritative admission state. Startup sizing estimates are
+    /// intentionally not accepted through this method.
+    fn admission_snapshot(&self) -> Result<Option<ExecutorAdmissionSnapshot>> {
+        Ok(None)
     }
 
     /// Optional LoRA runtime metrics emitted by concrete LLM engines.

@@ -32,6 +32,7 @@ use ferrum_interfaces::vnext::{
     DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
     ProgramBindingNodeBinding, StreamState, VNextError,
 };
+use ferrum_types::AttentionExecutionPolicy;
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
@@ -84,6 +85,7 @@ where
 pub struct CudaDeviceRuntimeConfig {
     pub ordinal: usize,
     pub device_id: DeviceId,
+    pub attention_execution_policy: AttentionExecutionPolicy,
     pub runtime_implementation_fingerprint: String,
     pub capabilities: BTreeSet<CapabilityId>,
     pub dynamic_storage_profiles: BTreeSet<DynamicStorageProfile>,
@@ -1571,6 +1573,7 @@ struct QuarantinedSubmission {
 /// operation dispatch layers.
 pub struct CudaDeviceRuntime {
     descriptor: DeviceDescriptor,
+    attention_execution_policy: AttentionExecutionPolicy,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -1589,6 +1592,11 @@ impl fmt::Debug for CudaDeviceRuntime {
 
 impl CudaDeviceRuntime {
     pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+        if !config.attention_execution_policy.is_resolved() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA runtime requires a resolved attention execution policy",
+            ));
+        }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
         // vNext owns all cross-stream ordering through explicit commands and
@@ -1626,6 +1634,7 @@ impl CudaDeviceRuntime {
             .map_err(|_| CudaDeviceRuntimeError::contract("CUDA runtime identity exhausted"))?;
         Ok(Self {
             descriptor,
+            attention_execution_policy: config.attention_execution_policy,
             runtime_instance,
             context,
             allocation_stream,
@@ -1708,6 +1717,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    fn attention_execution_policy(&self) -> AttentionExecutionPolicy {
+        self.attention_execution_policy
     }
 
     fn allocate(

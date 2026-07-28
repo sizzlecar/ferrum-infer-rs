@@ -1227,7 +1227,9 @@ fn create_registered_vnext_executor(
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
                     ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
-                        *ordinal, device_id,
+                        *ordinal,
+                        device_id,
+                        config.engine_config.runtime.attention_execution_policy,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))

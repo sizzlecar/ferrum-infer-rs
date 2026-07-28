@@ -33,8 +33,8 @@ use ferrum_interfaces::model_executor::{
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
-    Device, EngineConfig, FerrumError, ModelInfo, RequestId, Result, SchedulingPolicy,
-    SequenceFitPolicy, TokenId,
+    AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
+    ModelInfo, RequestId, Result, SchedulingPolicy, SequenceFitPolicy, TokenId,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -61,7 +61,7 @@ pub use determinism::{
 };
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
-const POLICY_VERSION: ContractVersion = ContractVersion::new(2, 0);
+const POLICY_VERSION: ContractVersion = ContractVersion::new(3, 0);
 const UNIFORM_QUERY_REUSABLE_CLASS: &str = "execution.uniform-query-token";
 const PACKED_TOKEN_REUSABLE_CLASS: &str = "execution.single-sequence-packed-token";
 const DEFAULT_STATIC_STAGING_BYTES: u64 = 64 * 1024 * 1024;
@@ -92,6 +92,33 @@ const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFit
         SequenceFitPolicy::FullInputMustFit => AdmissionFitPolicy::FullInputMustFit,
         SequenceFitPolicy::ImmediateOnly => AdmissionFitPolicy::ImmediateOnly,
     }
+}
+
+fn resolve_runtime_attention_authority(
+    requested: AttentionExecutionPolicy,
+    native_adaptive_supported: bool,
+    installed: AttentionExecutionPolicy,
+) -> Result<AttentionExecutionPolicy> {
+    let requested = requested
+        .resolve(native_adaptive_supported)
+        .map_err(|reason| {
+            FerrumError::config(format!(
+                "invalid vNext attention execution policy: {reason}"
+            ))
+        })?;
+    if !installed.is_resolved() {
+        return Err(FerrumError::config(
+            "vNext runtime exposed unresolved auto attention policy",
+        ));
+    }
+    if requested != installed {
+        return Err(FerrumError::config(format!(
+            "vNext attention policy authority mismatch: product configuration resolves to {}, but the runtime composition installed {}",
+            requested.as_runtime_value(),
+            installed.as_runtime_value(),
+        )));
+    }
+    Ok(installed)
 }
 
 fn resolve_reusable_execution_policy(
@@ -318,6 +345,13 @@ impl VNextExecutorConfig {
         } else {
             ExecutionDeterminismRequirement::BitwiseSameRuntime
         };
+        let attention_execution = resolve_runtime_attention_authority(
+            engine.runtime.attention_execution_policy,
+            descriptor.capabilities.iter().any(|capability| {
+                capability.as_str() == DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+            }),
+            runtime.attention_execution_policy(),
+        )?;
 
         let runtime_policy = ResolvedRuntimePolicy::new(
             POLICY_ID,
@@ -338,6 +372,7 @@ impl VNextExecutorConfig {
                 allow_defer: true,
                 cancellation_check_interval_steps: DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS,
             },
+            attention_execution,
             execution_determinism,
             reusable_execution_policy,
         )
@@ -7303,7 +7338,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "sparse_repetition_participants": self.metrics.sparse_repetition_participants.load(Ordering::Relaxed),
             "sparse_repetition_token_ids_uploaded": self.metrics.sparse_repetition_token_ids_uploaded.load(Ordering::Relaxed),
         });
-        serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "schema": "ferrum.runtime-vnext.executor-trace.v1",
             "model_id": self.info.model_id.to_string(),
             "family_fingerprint": self.family_fingerprint,
@@ -7375,7 +7410,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "startup_preparation": serde_json::to_value(&*self.startup_preparation.lock())
                 .unwrap_or_else(|error| serde_json::json!({"state": "serialization_failed", "message": error.to_string()})),
             "last_failure": self.metrics.last_failure.lock().clone(),
-        })
+        });
+        snapshot
+            .as_object_mut()
+            .expect("vNext executor snapshot is an object")
+            .insert(
+                "attention_execution_policy".to_owned(),
+                serde_json::json!(self.policy.attention_execution()),
+            );
+        snapshot
     }
 }
 
@@ -7432,6 +7475,19 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
         ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
+        ExecutorAdmissionLimits::new(
+            self.policy.memory().maximum_active_sequences,
+            self.policy.admission().maximum_scheduled_tokens,
+        )
+        .map(Some)
+        .map_err(|reason| {
+            FerrumError::internal(format!(
+                "resolved vNext admission limits violated their typed contract: {reason}"
+            ))
+        })
     }
 
     fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {
@@ -8040,14 +8096,14 @@ mod tests {
         decode_output_width, decode_selected_token, nonterminal_completion_message,
         normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
         product_token_mask_key, reported_allocated_bytes, resolve_reusable_execution_policy,
-        resolved_sequence_fit_policy, reusable_executable_inventory_matches,
-        reusable_execution_requires_eager_fallback, submission_execution_policy_for_timing,
-        token_mask_upload_required, validate_sequence_completion_accounting, AdmissionFitPolicy,
-        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics,
-        VNextProductOutputMode, VNextProductTokenMaskKey, VNextReusableExecutionDescriptor,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
-        VNextWaveTimingSink,
+        resolve_runtime_attention_authority, resolved_sequence_fit_policy,
+        reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
+        submission_execution_policy_for_timing, token_mask_upload_required,
+        validate_sequence_completion_accounting, AdmissionFitPolicy, DecodeFailureDisposition,
+        FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
+        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSequenceCompletion, GreedyRepetitionPenalty, LogitsReturnPolicy, PrefillChunk,
@@ -8060,7 +8116,32 @@ mod tests {
         DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink,
         DeviceTimingMeasurement, DeviceTimingMode, StepResourceAdmissionProfilePhase,
     };
-    use ferrum_types::{RequestId, TokenId};
+    use ferrum_types::{AttentionExecutionPolicy, RequestId, TokenId};
+
+    #[test]
+    fn runtime_attention_authority_rejects_plan_provider_drift() {
+        assert_eq!(
+            resolve_runtime_attention_authority(
+                AttentionExecutionPolicy::Auto,
+                true,
+                AttentionExecutionPolicy::NativeAdaptive,
+            )
+            .unwrap(),
+            AttentionExecutionPolicy::NativeAdaptive
+        );
+        assert!(resolve_runtime_attention_authority(
+            AttentionExecutionPolicy::Auto,
+            true,
+            AttentionExecutionPolicy::Portable,
+        )
+        .is_err());
+        assert!(resolve_runtime_attention_authority(
+            AttentionExecutionPolicy::Portable,
+            false,
+            AttentionExecutionPolicy::Auto,
+        )
+        .is_err());
+    }
 
     #[test]
     fn verification_timing_selects_typed_eager_submission_without_owning_other_paths() {

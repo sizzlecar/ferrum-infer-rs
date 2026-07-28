@@ -78,6 +78,10 @@ impl DeviceRuntime for TestRuntime {
         &self.descriptor
     }
 
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
+    }
+
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error> {
         let request = permit.into_request();
         Ok(TestBuffer {

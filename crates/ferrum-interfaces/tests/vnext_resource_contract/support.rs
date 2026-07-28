@@ -450,6 +450,7 @@ pub(crate) fn policy_with_memory_id(
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        ferrum_types::AttentionExecutionPolicy::Portable,
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         None,
     )
@@ -717,6 +718,10 @@ impl DeviceRuntime for TestRuntime {
         } else {
             &self.descriptor
         }
+    }
+
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
     }
 
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error> {

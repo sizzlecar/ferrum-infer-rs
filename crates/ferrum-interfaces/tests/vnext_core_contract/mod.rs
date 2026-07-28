@@ -828,6 +828,10 @@ impl DeviceRuntime for PlanningTestRuntime {
         })
     }
 
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
+    }
+
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error> {
         let request = permit.into_request();
         Ok(BufferDescriptor {
@@ -1217,6 +1221,7 @@ pub(crate) fn policy_with_tokens(
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         None,
     )
@@ -1248,6 +1253,10 @@ impl RuntimePolicy for AdversarialRuntimePolicy {
 
     fn maximum_scheduled_tokens(&self) -> u64 {
         self.maximum_scheduled_tokens
+    }
+
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
     }
 
     fn execution_determinism_requirement(&self) -> ExecutionDeterminismRequirement {

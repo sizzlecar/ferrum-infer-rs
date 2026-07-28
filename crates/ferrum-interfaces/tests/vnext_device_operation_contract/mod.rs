@@ -825,6 +825,7 @@ fn policy_with_reusable_execution_determinism_and_storage(
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        ferrum_types::AttentionExecutionPolicy::Portable,
         execution_determinism,
         reusable_execution,
     )
@@ -1343,6 +1344,10 @@ impl DeviceRuntime for TestRuntime {
         } else {
             &self.descriptor
         }
+    }
+
+    fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
+        ferrum_types::AttentionExecutionPolicy::Portable
     }
 
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error> {

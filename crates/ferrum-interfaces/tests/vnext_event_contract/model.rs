@@ -330,6 +330,7 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        ferrum_types::AttentionExecutionPolicy::Portable,
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         None,
     )

@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use ferrum_types::AttentionExecutionPolicy;
+
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
@@ -16,6 +18,10 @@ use super::{
 /// Backend-neutral device capability for an explicit cold-path reusable
 /// executable preparation lifecycle.
 pub const DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID: &str = "capability.device.reusable_execution.v1";
+/// Backend-neutral declaration that a composition can compile a native
+/// invocation-adaptive attention provider.
+pub const DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID: &str =
+    "capability.device.native_adaptive_attention.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -2912,6 +2918,10 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn descriptor(&self) -> &DeviceDescriptor;
+
+    /// Resolved attention provider-family policy installed by this runtime
+    /// composition. `Auto` is never valid after composition.
+    fn attention_execution_policy(&self) -> AttentionExecutionPolicy;
 
     /// Allocates only after the resource transaction has authorized the exact
     /// request. `DeviceAllocationPermit` has no public constructor and borrows
