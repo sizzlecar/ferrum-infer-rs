@@ -21,7 +21,7 @@ use ferrum_interfaces::vnext::{
     DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionSegment, ElementType,
+    DeviceReusableExecutionSegment, DeviceTimingMode, ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -474,8 +474,7 @@ impl CudaExecutableSegment {
         &mut self,
         stream: &CudaStream,
         last_used: u64,
-        retain_profile_identity: bool,
-        tool_correlation: bool,
+        timing_mode: DeviceTimingMode,
     ) -> Result<(Option<Arc<str>>, Option<Arc<[u32]>>), CudaReplayError> {
         if !self.uploaded {
             return Err(CudaReplayError {
@@ -484,19 +483,21 @@ impl CudaExecutableSegment {
                 eager_fallback_safe: false,
             });
         }
-        debug_assert!(!tool_correlation || retain_profile_identity);
-        let profile_identity = retain_profile_identity.then(|| {
+        let profile_identity = timing_mode.physical_span_attribution_enabled().then(|| {
             self.profile_identity
                 .get_or_init(|| CudaExecutableProfileIdentity::new(self.key))
         });
-        let status = profile_identity.map_or_else(
-            || unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) },
-            |identity| {
-                correlate_replay_launch(&identity.nvtx_label, || unsafe {
-                    sys::cuGraphLaunch(self.executable, stream.cu_stream())
-                })
-            },
-        );
+        // Replay retains the executable identity for physical spans; only full
+        // kernel attribution may load and enter external tool correlation.
+        let status = if timing_mode.kernel_attribution_enabled() {
+            let identity = profile_identity
+                .expect("CUDA kernel attribution retains a replay profile identity");
+            correlate_replay_launch(&identity.nvtx_label, || unsafe {
+                sys::cuGraphLaunch(self.executable, stream.cu_stream())
+            })
+        } else {
+            unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) }
+        };
         if status != sys::CUresult::CUDA_SUCCESS {
             return Err(CudaReplayError::cuda(
                 "launch reusable executable",
@@ -507,7 +508,8 @@ impl CudaExecutableSegment {
         self.last_used = last_used;
         Ok((
             profile_identity.map(|identity| Arc::clone(&identity.fingerprint)),
-            tool_correlation
+            timing_mode
+                .kernel_attribution_enabled()
                 .then(|| self.command_graph_node_counts.as_ref().map(Arc::clone))
                 .flatten(),
         ))
@@ -1012,8 +1014,7 @@ impl CudaExecutableCache {
         &mut self,
         stream: &CudaStream,
         invocation: &DeviceReusableExecutionInvocation,
-        retain_profile_identity: bool,
-        tool_correlation: bool,
+        timing_mode: DeviceTimingMode,
         retain_logical_attribution: bool,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let Some(program) = self.programs.get(invocation.program_id()) else {
@@ -1058,7 +1059,7 @@ impl CudaExecutableCache {
             });
         };
         let (profile_fingerprint, reusable_graph_node_counts) =
-            entry.launch(stream, now, retain_profile_identity, tool_correlation)?;
+            entry.launch(stream, now, timing_mode)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint: profile_fingerprint.or(sealed_fingerprint),
             reusable_graph_node_counts,
@@ -1115,15 +1116,14 @@ impl CudaExecutableCache {
         &mut self,
         stream: &CudaStream,
         candidate: &CudaExecutableCandidate,
-        retain_profile_identity: bool,
-        tool_correlation: bool,
+        timing_mode: DeviceTimingMode,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let now = self.tick();
         let Some(entry) = self.entries.get_mut(&candidate.key) else {
             return Ok(None);
         };
         let (reusable_executable_fingerprint, reusable_graph_node_counts) =
-            entry.launch(stream, now, retain_profile_identity, tool_correlation)?;
+            entry.launch(stream, now, timing_mode)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,
