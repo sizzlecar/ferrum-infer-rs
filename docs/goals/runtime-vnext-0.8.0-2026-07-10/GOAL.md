@@ -232,6 +232,34 @@ archive SHA256 为
 失败分类为 full-profile overcollection；后续只采最小请求数并在 attribution 命中后立即
 停止。实例已确认 `stopped/exited`，无 paid/transitional sibling。
 
+clean、已推送 source `e2136178627d86ed9b520778f41138dcb37772d2`
+随后完成 CUDA causal-attention packed shared work：RMSNorm、Q/K/V、output projection
+与 residual 不再按 participant 重复。当前 official-feature release build 用时
+`448.616s`，binary SHA256 为
+`e2e09bee9e5ea3f801772c8f60ee6dda6c3cd358e76e0496e4f35d8d80ae7953`；
+精确父提交 `7f8ff122` 的同配置 release build 用时 `442.695s`，binary SHA256 为
+`e70114ed09c710eede78415e7f82c20a355ec04cc64ceff6f6e5089f6db21210`。
+CUDA focused tests `15/15 + 3/3`、C03/C05/C06/C17 产品用例 `9/9` 和短 c32
+`32/32` 均通过。
+
+最小 full profile 的 `80/80` causal compute events 全部为 packed，participants 覆盖
+`2/30/32`，V1、varlen-q4 和 mixed path 均满足 dispatch `6 + 3P`、transfer `0`，
+三个 validator 分别打印 `FERRUM NATIVE WORK ATTRIBUTION PASS`。同机、同配置、
+profile-off random `64/32` c32 单变量 A/B 为 `106.287877 -> 116.038538 tok/s`
+（`+9.1738%`），双方均 `64/64`、零错误。因此代码与真实产品消费结论为 KEEP，
+但 G09 仍为 REJECT：仅一次 repeat、无 CI/同机 vLLM，且比另一台 4090 的历史
+`155.138143 tok/s` checkpoint 低 `25.20%`，未授权 full sweep。
+
+本轮同时暴露新的 G03/G06 blocker：typed effective config 报告 V2 与 admission `16`，
+真实 native work 却执行 V1/varlen/mixed 并达到 participant `32`。下一步必须让 compiled
+kernel-selection policy、effective config 和 physical admission 共享同一 typed authority，
+之后才允许继续付费性能验证。compact archive SHA256 为
+`0bf70cb8e308695e958f03a079611902d030b083018f248807aaa757f094db1c`；
+付费 host 到 GitHub 的 push 在 `133.402s` 超时，未使用 SCP，archive 与
+`578,812,941` raw bytes 由 SHA256 绑定并保留在 stopped instance `46127509`。
+本次 paid window 为 `54m54s`、约 `$0.3558`，未超过 `$0.58` cap；实例
+`46127509` 和 `45897840` 均为 `stopped/exited`，`potentially_billable=[]`。
+
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
 为准。G00-G10 继续定义最终能力与验收维度；S0-S7 定义实际生产纵切顺序。修订不降低本文件的

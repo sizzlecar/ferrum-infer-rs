@@ -1809,6 +1809,83 @@ request count and terminate as soon as the validator has eligible events.
 Instance `45319871` is verified `stopped/exited`, with zero paid or transitional
 sibling.
 
+### 2026-07-29 Packed Causal-Attention c32 Checkpoint
+
+Commit `0d4158b2146b886b4db59f9008607ce3eafbcd00` moves the CUDA
+causal-attention RMSNorm, Q/K/V projections, output projection, and residual
+add from a participant loop into one packed physical token region. Commit
+`e2136178627d86ed9b520778f41138dcb37772d2` adds the affine native-work
+dispatch contract required by variable participant counts. Both commits are
+clean and pushed.
+
+The current official-feature release build completed in `448.615960s` with
+binary SHA256
+`e2e09bee9e5ea3f801772c8f60ee6dda6c3cd358e76e0496e4f35d8d80ae7953`.
+The exact pre-change parent `7f8ff12233d07ac16f4cd908be5895e59f4b4ae6`
+was rebuilt on the same instance with the same release features and cache-only
+native policy in `442.694729s`. Its binary SHA256 was
+`e70114ed09c710eede78415e7f82c20a355ec04cc64ceff6f6e5089f6db21210`,
+identical to the existing release reference, so this comparison does not mix
+release and correctness profiles.
+
+Correctness preceded profiling and performance:
+
+- CUDA causal-attention focused unit tests passed `15/15`;
+- vLLM paged-attention dispatcher tests passed `3/3`;
+- exact C03/C05/C06/C17 `run`/`serve`/stream/Unicode product cases passed
+  `9/9` and printed `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`;
+- the short c32 product trace completed `32/32`, generated exactly two output
+  tokens per request, and reported zero request or stream-quality errors.
+
+The bounded full profile contained `99,294` events, including `4,274`
+native-work events and `140` causal-attention operation events. The `60`
+invocation-binding events remain participant-local by design. All `80/80`
+compute events were packed, transferred zero bytes through device commands,
+and satisfied `physical_compute_dispatch_count = 6 + 3 * participant_count`:
+
+| native path | events | observed participants | result |
+|---|---:|---|---|
+| addressed paged-attention V1 | 20 | `2`, `30` | PASS |
+| addressed varlen-q4 | 40 | `2`, `32` | PASS |
+| mixed native paths | 20 | `30`, `32` | PASS |
+
+Each native path printed its own
+`FERRUM NATIVE WORK ATTRIBUTION PASS` line. This closes the production
+consumption and participant-loop fallback risk for the packed causal candidate.
+
+The same RTX 4090 then ran one profile-off random `64/32` c32 sample with
+`64` requests, `4` warmups, seed `9271`, and the same benchmark client:
+
+| metric | exact pre-change | packed causal | delta |
+|---|---:|---:|---:|
+| output throughput | `106.287877 tok/s` | `116.038538 tok/s` | `+9.1738%` |
+| completed | `64/64` | `64/64` | unchanged |
+| request/quality errors | `0` | `0` | unchanged |
+
+The code decision is
+`KEEP_PACKED_CAUSAL_NATIVE_ATTRIBUTION_AND_SAME_HOST_GAIN`. It is not a G09
+PASS: the run has one repeat and no confidence interval or same-host vLLM row,
+and remains `25.20%` below the `155.138143 tok/s` historical other-host
+checkpoint. That historical row is not a formal same-hardware comparator, but
+the miss still prevents authorizing a broad performance sweep.
+
+The trace also exposed a G03/G06 observability blocker. Effective config
+reported `selected_attention_impl=vllm_paged_attn_v2` and effective admission
+`16`, while physical events used V1, varlen-q4, and mixed paths and reached
+participant count `32`. Before another paid performance run, compiled
+causal-attention selection, effective config, and physical-wave admission must
+share one typed authority; a profile that cannot predict the executing path is
+not acceptable evidence.
+
+The compact archive SHA256 is
+`0bf70cb8e308695e958f03a079611902d030b083018f248807aaa757f094db1c`.
+GitHub push from the paid host timed out after `133.402s` with no transfer, so
+the compact archive and the `578,812,941` raw profile/trace bytes remain on
+retained instance `46127509`, bound by per-file SHA256. No SCP was used. The
+paid window was `54m54s`, approximately `$0.3558` at `$0.388889/h`, within the
+declared 90-minute / `$0.58` cap. Instances `46127509` and `45897840` are both
+verified `stopped/exited`; `potentially_billable=[]`.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：
