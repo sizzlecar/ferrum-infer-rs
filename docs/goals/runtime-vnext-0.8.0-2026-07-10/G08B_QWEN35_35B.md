@@ -1560,6 +1560,61 @@ hash, and smokes the resulting binary. The next GPU action may then run only
 contract, continue the unexecuted suffix, and perform one canonical 703 run at
 the milestone. A failed focused case must not restart the full matrix.
 
+### 2026-07-28 C13 History Sensitivity and Sampling Reference Boundary
+
+Clean source `addaf7969a9eef0a7875a1386ce1c6e78ebc0213`, binary SHA256
+`8ab352b00b7bc7a3c7a8e1d6824c5433484d95afb08294d942b5ffb7b4b7c7df`,
+captured the exact C13 prompt twice while changing only the final tool result
+from `21` to `99`. Both prompts contain 61 tokens. Their full-logits vectors
+have different SHA256 values, differ in `248,157/248,320` F16 elements, have
+cosine `0.9262496435`, relative L2 `0.3805838912`, and top-20 overlap `13/20`.
+The artifact classification is:
+
+```text
+KEEP: The product prefill and logits materially depend on the tool-result tokens; tool history is not dropped before model execution.
+```
+
+The GitHub evidence branch is
+`artifact/runtime-vnext-c13-sensitivity-addaf796-20260728`, artifact commit
+`13da606bc52b1ac1b4086ed75c9356c1a49e5fea`. This excludes history loss but
+does not make the response semantically correct, so the matrix remains
+`404/703`.
+
+Commit `e4371583f231c8b92ee6e9ca727e9ab54bfd8828` then made seeded request
+sampling explicit: all product paths use a typed ChaCha12 generator with
+algorithm id `chacha12-rand-core-pcg32-u64-v1`; the top-p boundary retains the
+minimal prefix whose cumulative probability reaches `p`; and top-k plus top-p
+sorts only finite candidates. The captured C13 vector is a source-level replay
+test. Interfaces sampler tests pass `17/17`, engine sampling/pipeline focused
+tests pass, and the sampler crate passes `53/53`. Commit
+`f46bece7cd3a7f38c491f550358c7a543ffcc25a` separately canonicalizes structured
+const-object regex generation so workspace feature unification cannot change
+the output contract. Neither source result is a CUDA matrix PASS.
+
+The remaining single-variable diagnostic compares pre-processor logits, not
+seeded sampled tokens. vLLM and Ferrum use different seeded sampling algorithms;
+requiring identical token realization would be an invalid oracle. The checked-in
+collector `runtime_vnext_c13_vllm_reference.py` requires the exact model and
+tokenizer revisions, a clean pinned vLLM checkout, the byte-identical checked-in
+`scripts/release/configs/runtime_vnext_c13_022_reference.json` request, the
+61-token count, and
+token span fingerprint
+`38cdf236189f6b93770ff50c0b231ce640b3577199b51e90311c6883dc7580ed`.
+`runtime_vnext_c13_logits_reference.py` verifies both raw-vector SHA256 values
+and clean Ferrum/vLLM provenance, then records argmax, top-20 overlap, C13
+nucleus Jaccard, centered cosine, affine residual, and Jensen-Shannon distance.
+It emits diagnostic `KEEP_REFERENCE_ALIGNMENT`,
+`REJECT_MODEL_EXECUTION_DIVERGENCE`, or `INCONCLUSIVE_NUMERICAL_DRIFT`; none is
+a formal G08B PASS.
+
+The next paid action must reuse the retained one-RTX-4090 instance if its cache
+is intact, collect exactly one vLLM first-token raw-logits reference, compare it
+with the existing Ferrum checkpoint, save the artifact through GitHub, and stop
+billing. If reference alignment is KEEP, C13 work returns to sampling/oracle
+semantics. If it is REJECT, the next source change must target the first
+numerically divergent model boundary. No full 703 run is allowed before exact
+`c13-022` and the affected C13 contract pass.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

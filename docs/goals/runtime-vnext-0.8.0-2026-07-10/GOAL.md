@@ -4,9 +4,15 @@
 
 Open。创建于 2026-07-10。
 
-截至 2026-07-28，最新已验证 clean source checkpoint 为
-`9b318ea9aa66e7a2c28348d6149a0bc925d146c6`；该提交只修改 G07
-构建/验证基础设施，当前产品 runtime 代码基线仍是
+截至 2026-07-28，最新已验证并推送的 clean source checkpoint 为
+`f46bece7cd3a7f38c491f550358c7a543ffcc25a`。其中
+`e4371583f231c8b92ee6e9ca727e9ab54bfd8828` 把请求级 seeded sampling 固化为
+显式 `ChaCha12Rng` 合约，修正 top-p 最小前缀边界并避免 top-k 后再次排序完整词表；
+`f46bece7` 修复 `serde_json/preserve_order` feature unification 导致 structured const
+regex 随依赖图变化的问题。本地有界验证为 interfaces sampler `17/17`、
+engine sampling/pipeline focused PASS、sampler crate `53/53`。这些是 source
+checkpoint，不是新的 CUDA matrix evidence。最新实际 CUDA 模型执行证据仍来自
+`addaf7969a9eef0a7875a1386ce1c6e78ebc0213`，exact C13 REJECT 来自
 `7ae12059f4d8fa37ee5ba7c28c97198b2d0d7bf4`。正式 G00-G10 PASS 仍为
 `0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前有效的 M2 CUDA
 correctness 进度为 `404/703`：canonical runner 的第 `405` 个 case `c13-022`
@@ -36,6 +42,25 @@ bitwise oracle。对 batch-1 finite/unique top-k route 的 host 枚举也证明 
 Marlin metadata 在 consumed prefix 等价；非有限 router logits 的 duplicate route 仍需
 独立 invariant/test，但没有证据表明它解释当前请求。当前首要未决边界是 decode 期间的
 数值/token 分叉，而不是产品输入丢失。
+
+clean source `addaf796` 的 tool-result sensitivity capture 进一步把 calculator result
+从 `21` 改为 `99`：两次 prompt 都是 `61` tokens，但 full-logits SHA 不同，
+`248,157/248,320` 个 F16 值变化，cosine `0.9262496`、relative L2 `0.3805839`，
+top-20 只重合 `13/20`。因此“runtime 在模型执行前丢掉 tool-result history”已被真实
+CUDA 证据排除。artifact 位于 GitHub branch
+`artifact/runtime-vnext-c13-sensitivity-addaf796-20260728` commit
+`13da606bc52b1ac1b4086ed75c9356c1a49e5fea`；它是诊断 KEEP，不是 C13 PASS。
+
+下一判定边界改为同一 `61`-token fingerprint
+`38cdf236189f6b93770ff50c0b231ce640b3577199b51e90311c6883dc7580ed`
+下的 Ferrum/vLLM 采样前 raw-logits 对照。`seed=9271` 不要求两个实现选择相同 token：
+vLLM 使用请求级 PyTorch generator 和 exponential-noise race，Ferrum 使用版本化
+ChaCha12 inverse-CDF；两者分布可等价而 seeded realization 不同。只有 raw-logits
+argmax、top-20/nucleus overlap、centered cosine 和 affine residual 能判定模型执行是否
+偏离参考。该诊断由
+`runtime_vnext_c13_vllm_reference.py` 和
+`runtime_vnext_c13_logits_reference.py` 生成来源绑定 artifact；未取得该结论前禁止
+修改模型 kernel 或为了通过 C13 更换 RNG。
 
 本轮尝试构建“旧基线 + deterministic alignment”和“当前源码强制 generic MoE”两个
 诊断二进制，分别在 `720s + 360s` 的 native compile continuation 和 `360s` 的 release

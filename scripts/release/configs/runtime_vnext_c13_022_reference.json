@@ -1,0 +1,45 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": true
+  },
+  "messages": [
+    {
+      "content": "Use the calculator.",
+      "role": "user"
+    },
+    {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"expression\":\"7*3\"}",
+            "name": "calculator"
+          },
+          "id": "call-1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "21",
+      "role": "tool",
+      "tool_call_id": "call-1"
+    }
+  ],
+  "metadata": {
+    "g00_case_id": "c13-022",
+    "g00_ordinal": 22,
+    "g00_scenario_id": "C13",
+    "g00_variant": "tool-result"
+  },
+  "min_p": 0.0,
+  "model": "m2-qwen35-35b-a3b",
+  "presence_penalty": 1.5,
+  "repetition_penalty": 1.0,
+  "seed": 9271,
+  "stop": [],
+  "temperature": 1.0,
+  "top_k": 20,
+  "top_p": 0.95
+}
