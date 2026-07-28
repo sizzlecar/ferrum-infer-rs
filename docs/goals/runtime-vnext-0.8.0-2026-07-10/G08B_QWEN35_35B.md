@@ -1591,7 +1591,8 @@ tests pass, and the sampler crate passes `53/53`. Commit
 const-object regex generation so workspace feature unification cannot change
 the output contract. Neither source result is a CUDA matrix PASS.
 
-The remaining single-variable diagnostic compares pre-processor logits, not
+The single-variable diagnostic defined at that checkpoint compares
+pre-processor logits, not
 seeded sampled tokens. vLLM and Ferrum use different seeded sampling algorithms;
 requiring identical token realization would be an invalid oracle. The checked-in
 collector `runtime_vnext_c13_vllm_reference.py` requires the exact model and
@@ -1607,13 +1608,50 @@ It emits diagnostic `KEEP_REFERENCE_ALIGNMENT`,
 `REJECT_MODEL_EXECUTION_DIVERGENCE`, or `INCONCLUSIVE_NUMERICAL_DRIFT`; none is
 a formal G08B PASS.
 
-The next paid action must reuse the retained one-RTX-4090 instance if its cache
-is intact, collect exactly one vLLM first-token raw-logits reference, compare it
-with the existing Ferrum checkpoint, save the artifact through GitHub, and stop
-billing. If reference alignment is KEEP, C13 work returns to sampling/oracle
-semantics. If it is REJECT, the next source change must target the first
-numerically divergent model boundary. No full 703 run is allowed before exact
-`c13-022` and the affected C13 contract pass.
+### 2026-07-28 Raw-Logits KEEP and C13 v2 Contract Reset
+
+The raw-logits boundary is now closed as `KEEP_REFERENCE_ALIGNMENT`. Ferrum
+clean source `7ae12059f4d8fa37ee5ba7c28c97198b2d0d7bf4` and vLLM clean source
+`33c4f3551ce9b4dc75864f16c40496d8d64f8e9d` used the same model revision
+`3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b`, tokenizer revision
+`59d61f3ce65a6d9863b86d2e96597125219dc754`, 61-token prompt, and token-span
+fingerprint. Both argmax values are token `760`; top-20 overlap is `0.95`,
+nucleus Jaccard is `1.0`, centered cosine is `0.9910251391`, and affine
+relative L2 is `0.1336756283`. The validator printed:
+
+```text
+FERRUM C13 LOGITS REFERENCE KEEP: /workspace/ferrum-artifacts/runtime-vnext-c13-vllm-reference-4ff1a5d9-20260728/comparison
+```
+
+The GitHub evidence branch is
+`artifact/runtime-vnext-c13-vllm-reference-4ff1a5d9-20260728`, artifact commit
+`e1cdc94c525feb9ed4297c1034731f1331eeb7a5`. This closes historical first-token
+model-execution divergence as the blocker; it is not a G08B correctness PASS.
+
+Clean source `9e51a9dc317e9a1a5ebb9eaa4f825372c5197ea5` replaces the weak repeated
+C13 v1 corpus with `c13-tool-result-continuation-v2`. M2 now has exactly 40
+distinct expressions, results, receipts, tool-call IDs, messages, and full
+request hashes. Every request carries the calculator schema and
+`tool_choice=auto`; the final assistant response must terminate naturally,
+must not repeat a tool call or serialize history, and must include both the
+exact result and an opaque receipt available only in the tool-result message.
+The runner keeps the historical request isolated under
+`g00-legacy-baseline-v1`; only `g08-model-matrix-v1` uses C13 v2.
+
+The bounded full validator fixture completed in `185.520352s`, peaked at two
+processes and four threads, recorded no violation, and printed:
+
+```text
+FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS
+```
+
+Because the old `404/703` count included 21 C13 v1 cases whose evidence
+identity has changed, reusable M2 CUDA correctness is now `383/703`. Those 21
+cases are stale, not newly failed. The next paid CUDA stop condition is the new
+focused `c13-022` request, `238 - 66 -> 172`, plus its case-specific receipt.
+On PASS, run the complete 40-case C13 v2 scenario and then the unexecuted
+suffix. Do not run the complete 703 matrix until those focused stages pass.
+Instance `45897840` remains `stopped/exited`.
 
 ## Metal Matrix Workflow
 

@@ -5,22 +5,23 @@
 Open。创建于 2026-07-10。
 
 截至 2026-07-28，最新已验证并推送的 clean source checkpoint 为
-`f46bece7cd3a7f38c491f550358c7a543ffcc25a`。其中
+`9e51a9dc317e9a1a5ebb9eaa4f825372c5197ea5`。其中
 `e4371583f231c8b92ee6e9ca727e9ab54bfd8828` 把请求级 seeded sampling 固化为
 显式 `ChaCha12Rng` 合约，修正 top-p 最小前缀边界并避免 top-k 后再次排序完整词表；
 `f46bece7` 修复 `serde_json/preserve_order` feature unification 导致 structured const
-regex 随依赖图变化的问题。本地有界验证为 interfaces sampler `17/17`、
-engine sampling/pipeline focused PASS、sampler crate `53/53`。这些是 source
-checkpoint，不是新的 CUDA matrix evidence。最新实际 CUDA 模型执行证据仍来自
-`addaf7969a9eef0a7875a1386ce1c6e78ebc0213`，exact C13 REJECT 来自
-`7ae12059f4d8fa37ee5ba7c28c97198b2d0d7bf4`。正式 G00-G10 PASS 仍为
-`0/11`，三主模型 x 双后端 fresh correctness matrix 仍为 `0/6`。当前有效的 M2 CUDA
-correctness 进度为 `404/703`：canonical runner 的第 `405` 个 case `c13-022`
-仍以 `c13-contract-violation` 停止，后续 `298` 个 case 尚未执行，不能记为失败。
-请求已携带 calculator tool call 和 tool result `21`，产品响应却要求用户提供算式。
-该结果是当前产品正确性 blocker，不是正式 PASS，也不能由 2026-07-23 的 stale
-`6fa8e215` 703/703 artifact 替代。C09 `60/60` 和 C12 `40/40` 已在前置
-current-SHA focused/canonical evidence 中关闭，不再是当前 blocker。
+regex 随依赖图变化的问题；`4ff1a5d9` 隔离 historical C13 raw-logits reference；
+`9e51a9dc` 把 C13 升级为版本化的 `c13-tool-result-continuation-v2`。本地
+bounded validator fixture 用时 `185.520352s`，峰值 `2` processes / `4` threads，
+无 violation，并打印
+`FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS`。这些是 source/test-system
+checkpoint，不是新的 CUDA matrix evidence。
+
+正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh correctness matrix 仍为
+`0/6`。当前可复用的 M2 CUDA correctness 进度更正为 `383/703`。旧 `404/703`
+包含 historical C13 v1 的前 21 个重复 case；C13 v2 重定义了同名 case 的请求和
+证据身份，因此这 21 个结果不能继承。它们不是新失败，只是 stale。C09 `60/60` 和
+C12 `40/40` 仍由 current-SHA evidence 关闭；下一未验证边界是新 C13 v2，而不是继续
+追逐旧 `7*3 -> 21` seeded 文本。
 
 `7ae12059` 已修复 MoE pair alignment 的跨运行顺序漂移。相同 clean source、相同
 binary SHA256
@@ -40,7 +41,7 @@ source/artifact audit 已证伪 rendered prompt、tool history、template/source
 旧 `6fa8e215` 使用 nondeterministic atomic MoE ordering，因此其单次 C13 PASS 不能作为
 bitwise oracle。对 batch-1 finite/unique top-k route 的 host 枚举也证明 direct 和 generic
 Marlin metadata 在 consumed prefix 等价；非有限 router logits 的 duplicate route 仍需
-独立 invariant/test，但没有证据表明它解释当前请求。当前首要未决边界是 decode 期间的
+独立 invariant/test，但没有证据表明它解释当前请求。当时首要未决边界是 decode 期间的
 数值/token 分叉，而不是产品输入丢失。
 
 clean source `addaf796` 的 tool-result sensitivity capture 进一步把 calculator result
@@ -51,16 +52,20 @@ CUDA 证据排除。artifact 位于 GitHub branch
 `artifact/runtime-vnext-c13-sensitivity-addaf796-20260728` commit
 `13da606bc52b1ac1b4086ed75c9356c1a49e5fea`；它是诊断 KEEP，不是 C13 PASS。
 
-下一判定边界改为同一 `61`-token fingerprint
+同一 historical `61`-token fingerprint
 `38cdf236189f6b93770ff50c0b231ce640b3577199b51e90311c6883dc7580ed`
-下的 Ferrum/vLLM 采样前 raw-logits 对照。`seed=9271` 不要求两个实现选择相同 token：
+下的 Ferrum/vLLM 采样前 raw-logits 对照已经完成。`seed=9271` 不要求两个实现选择相同 token：
 vLLM 使用请求级 PyTorch generator 和 exponential-noise race，Ferrum 使用版本化
 ChaCha12 inverse-CDF；两者分布可等价而 seeded realization 不同。只有 raw-logits
 argmax、top-20/nucleus overlap、centered cosine 和 affine residual 能判定模型执行是否
-偏离参考。该诊断由
-`runtime_vnext_c13_vllm_reference.py` 和
-`runtime_vnext_c13_logits_reference.py` 生成来源绑定 artifact；未取得该结论前禁止
-修改模型 kernel 或为了通过 C13 更换 RNG。
+偏离参考。结果为 `KEEP_REFERENCE_ALIGNMENT`：双方 argmax 均为 token `760`，
+top-20 overlap `0.95`、nucleus Jaccard `1.0`、centered cosine
+`0.9910251391`、affine relative L2 `0.1336756283`，全部满足预注册 KEEP 阈值。
+validator 打印
+`FERRUM C13 LOGITS REFERENCE KEEP: .../comparison`。GitHub evidence branch 为
+`artifact/runtime-vnext-c13-vllm-reference-4ff1a5d9-20260728`，artifact commit
+`e1cdc94c525feb9ed4297c1034731f1331eeb7a5`。因此 historical C13 的首 token
+model execution 不再是当前 blocker，不得继续为它修改 kernel 或更换 RNG。
 
 本轮尝试构建“旧基线 + deterministic alignment”和“当前源码强制 generic MoE”两个
 诊断二进制，分别在 `720s + 360s` 的 native compile continuation 和 `360s` 的 release
@@ -80,16 +85,17 @@ key 绑定 source/header SHA256、SM、CUDA headers、`nvcc`/host compiler/archi
 `vnext.plan_built` hash 精确等于
 `54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`，
 validator 才能打印 semantic trace PASS。该 source checkpoint 的本地聚焦测试已通过，
-但远端 CUDA binary-ready、semantic trace 和 exact `c13-022` 仍未运行，因此 correctness
-进度仍是 `404/703`，G07A/G08B 均保持 Open。
+但新 C13 v2 的真实 CUDA product-path correctness 尚未运行，因此 correctness
+进度为 `383/703`，G07A/G08B 均保持 Open。
 
 当前只保留 RTX 4090 实例 `45897840`，已确认
 `cur_state=stopped`、`actual_status=exited`，没有 paid/transitional sibling。下一次
-paid CUDA work 必须先有本地/plan-only 构建证据和明确的单变量预测，只运行 exact
-`c13-022`。修复后的执行顺序固定为 exact replay `c13-022`、C13
-affected-contract、尚未执行的 C13-C16/C18/C20 suffix scenarios，最后只运行一次
-canonical 703 和 `vnext-g08b-cuda` validator。禁止输出过滤、模型名特判、降低 C13
-oracle 或因单个失败重跑完整 703。
+paid CUDA work 只运行新 contract 的 focused `c13-022`：请求为
+`238 - 66 -> 172`，并要求回传只存在于 tool result 中的逐 case opaque receipt。
+focused PASS 后运行完整 C13 v2 affected-contract，再继续 C13-C16/C18/C20 suffix；
+只有这些里程碑通过后才运行一次 canonical 703 和 `vnext-g08b-cuda` validator。
+historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充新 C13 replay。
+禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑完整 703。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
