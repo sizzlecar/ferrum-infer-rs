@@ -5,23 +5,24 @@
 Open。创建于 2026-07-10。
 
 截至 2026-07-28，最新已验证并推送的 clean source checkpoint 为
-`9e51a9dc317e9a1a5ebb9eaa4f825372c5197ea5`。其中
-`e4371583f231c8b92ee6e9ca727e9ab54bfd8828` 把请求级 seeded sampling 固化为
-显式 `ChaCha12Rng` 合约，修正 top-p 最小前缀边界并避免 top-k 后再次排序完整词表；
-`f46bece7` 修复 `serde_json/preserve_order` feature unification 导致 structured const
-regex 随依赖图变化的问题；`4ff1a5d9` 隔离 historical C13 raw-logits reference；
-`9e51a9dc` 把 C13 升级为版本化的 `c13-tool-result-continuation-v2`。本地
-bounded validator fixture 用时 `185.520352s`，峰值 `2` processes / `4` threads，
-无 violation，并打印
-`FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS`。这些是 source/test-system
-checkpoint，不是新的 CUDA matrix evidence。
+`b0431ca5b384a86c4e1f57406ad7267bdd3c3705`，tree 为
+`0896756c962c6d983d6d251ad2c7d5bd99f122ad`。`27dd5c7f` 将 scenario request
+manifest 绑定到实际 wire bytes，`b0431ca5` 修正 C01 negative-layout checker：
+typed resolver 必须在读取 weight 前以非零状态拒绝，并且错误必须携带测试注入的
+unknown architecture/model_type identity；通用 `unsupported architecture/layout`
+仍会被 mutation test 拒绝，不能用弱化 oracle 冒充修复。本地 bounded self-test
+用时 `173.578729s`，峰值 `2` processes / `4` threads，无 violation、cleanup 成功，
+并打印 `FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS`。
 
-正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh correctness matrix 仍为
-`0/6`。当前可复用的 M2 CUDA correctness 进度更正为 `383/703`。旧 `404/703`
-包含 historical C13 v1 的前 21 个重复 case；C13 v2 重定义了同名 case 的请求和
-证据身份，因此这 21 个结果不能继承。它们不是新失败，只是 stale。C09 `60/60` 和
-C12 `40/40` 仍由 current-SHA evidence 关闭；下一未验证边界是新 C13 v2，而不是继续
-追逐旧 `7*3 -> 21` seeded 文本。
+clean `b0431ca5` 的 M2 Qwen3.5-35B-A3B-GPTQ CUDA canonical correctness 已完成
+`703/703`，C01-C21 共 `21` 个 scenario 全部通过；正式 checkpoint 和 unified gate
+分别打印
+`FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS: /workspace/ferrum-artifacts/cuda-703-b0431ca5/gate-vnext-g08b-cuda`
+与
+`FERRUM GATE vnext-g08b-cuda PASS: /workspace/ferrum-artifacts/cuda-703-b0431ca5/gate-vnext-g08b-cuda`。
+这使三主模型 x 双后端 fresh correctness matrix 从 `0/6` 前进到 `1/6`。正式
+G00-G10 总目标 PASS 仍为 `0/11`；G08B 整体也仍为 Open，因为 Metal correctness、
+CUDA/Metal performance、legacy/reference parity 和其余验收项尚未关闭。
 
 `7ae12059` 已修复 MoE pair alignment 的跨运行顺序漂移。相同 clean source、相同
 binary SHA256
@@ -84,18 +85,18 @@ key 绑定 source/header SHA256、SM、CUDA headers、`nvcc`/host compiler/archi
 三份 manifest 的 source 与 binary SHA256 一致，并且实际 `ferrum serve` trace 中所有
 `vnext.plan_built` hash 精确等于
 `54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`，
-validator 才能打印 semantic trace PASS。该 source checkpoint 的本地聚焦测试已通过，
-但新 C13 v2 的真实 CUDA product-path correctness 尚未运行，因此 correctness
-进度为 `383/703`，G07A/G08B 均保持 Open。
+validator 才能打印 semantic trace PASS。该 source checkpoint 的本地聚焦测试已通过；
+在 `b0431ca5` 上复用同一 native cache 的 CUDA binary rebuild 约 `6s` 完成，证明
+correctness 开发构建不再必然等待完整 native rebuild。G07A 的 semantic trace、p95
+和 workspace gate 仍须按其正式验收单独关闭，不能由 G08B correctness PASS 代替。
 
-当前只保留 RTX 4090 实例 `45897840`，已确认
-`cur_state=stopped`、`actual_status=exited`，没有 paid/transitional sibling。下一次
-paid CUDA work 只运行新 contract 的 focused `c13-022`：请求为
-`238 - 66 -> 172`，并要求回传只存在于 tool result 中的逐 case opaque receipt。
-focused PASS 后运行完整 C13 v2 affected-contract，再继续 C13-C16/C18/C20 suffix；
-只有这些里程碑通过后才运行一次 canonical 703 和 `vnext-g08b-cuda` validator。
-historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充新 C13 replay。
-禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑完整 703。
+paid inventory 已核对：RTX 4090 实例 `46083877` 与 `45897840` 均为
+`cur_state=stopped`、`actual_status=exited`，`potentially_billable=[]`。M2 CUDA
+correctness lane 已关闭；除非相关源码再次变化，不再重跑 focused C13 或 703 全量。
+下一 CUDA 主线是验证并决定是否合入 `diagnostic/g06-replay-correlation` 的 clean
+commit `7191abc1`，随后继续剩余模型/后端 correctness 和 exact-precision
+performance。historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充
+当前 C13 replay；禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑全量。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
