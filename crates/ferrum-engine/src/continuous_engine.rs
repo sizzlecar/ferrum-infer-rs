@@ -23,7 +23,8 @@ use ferrum_interfaces::{
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorSamplingOutput, ExecutorSequenceCompletion,
         GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, PlanRuntimeBatchDecodeOutcome,
-        PlanRuntimeDecodeInput, TokenSelectionMask,
+        PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput, PlanRuntimePrefillInput,
+        PlanRuntimePrefillOutcome, PlanRuntimePrefillProduct, TokenSelectionMask,
     },
     sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
     vnext::{

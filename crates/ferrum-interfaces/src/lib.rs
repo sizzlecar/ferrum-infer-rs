@@ -31,8 +31,10 @@ pub use model_executor::{
     ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
     ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
     ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorSamplingOutput,
-    ModelExecutor, PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
-    PrefillInput, PrefillOutput,
+    ModelExecutor, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
+    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
+    PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
+    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PrefillInput, PrefillOutput,
 };
 pub use recurrent_state::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,

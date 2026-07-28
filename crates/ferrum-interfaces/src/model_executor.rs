@@ -711,6 +711,55 @@ impl PlanRuntimeDecodeInput {
     }
 }
 
+/// Tensor-free prefill input for an executor with plan-runtime resource
+/// authority.
+///
+/// The complete prompt remains immutable across chunk retries so scheduler
+/// offsets and executor sequence identity cannot drift. Physical KV and
+/// recurrent resources remain opaque executor-owned state.
+#[derive(Debug, Clone)]
+pub struct PlanRuntimePrefillInput {
+    pub request_id: RequestId,
+    pub input_tokens: Arc<[TokenId]>,
+    pub maximum_sequence_tokens: usize,
+    pub chunk: PrefillChunk,
+}
+
+impl PlanRuntimePrefillInput {
+    pub fn new(
+        request_id: RequestId,
+        input_tokens: impl Into<Arc<[TokenId]>>,
+        maximum_sequence_tokens: usize,
+        chunk: PrefillChunk,
+    ) -> Result<Self> {
+        let input_tokens = input_tokens.into();
+        if input_tokens.is_empty() {
+            return Err(FerrumError::request_validation(
+                "plan-runtime prefill requires at least one input token",
+            ));
+        }
+        if chunk.total_prompt_tokens() != input_tokens.len() {
+            return Err(FerrumError::request_validation(format!(
+                "plan-runtime prefill chunk declares {} prompt tokens for input length {}",
+                chunk.total_prompt_tokens(),
+                input_tokens.len()
+            )));
+        }
+        if maximum_sequence_tokens < input_tokens.len() {
+            return Err(FerrumError::request_validation(format!(
+                "plan-runtime sequence ceiling {maximum_sequence_tokens} does not cover prompt length {}",
+                input_tokens.len()
+            )));
+        }
+        Ok(Self {
+            request_id,
+            input_tokens,
+            maximum_sequence_tokens,
+            chunk,
+        })
+    }
+}
+
 /// Output from decode phase
 #[derive(Debug, Clone)]
 pub struct DecodeOutput {
@@ -758,6 +807,155 @@ impl PlanRuntimeDecodeOutput {
             sampling_output,
             kv_cache,
         }
+    }
+}
+
+/// Product state emitted by one completed plan-runtime prefill chunk.
+#[derive(Debug)]
+pub enum PlanRuntimePrefillProduct {
+    /// An intermediate chunk updates executor-owned state but is not sampleable.
+    Intermediate,
+    /// A final chunk returns the complete vocabulary row to the engine.
+    FinalLogits(Vec<f32>),
+}
+
+/// Exact executor-owned authority advanced by one prefill completion.
+#[derive(Debug)]
+pub struct PlanRuntimePrefillAuthority {
+    request_id: RequestId,
+    committed_tokens: usize,
+    kv_cache: Arc<dyn KvCacheHandle>,
+}
+
+impl PlanRuntimePrefillAuthority {
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub const fn committed_tokens(&self) -> usize {
+        self.committed_tokens
+    }
+
+    pub fn kv_cache(&self) -> &Arc<dyn KvCacheHandle> {
+        &self.kv_cache
+    }
+
+    pub fn into_cache(self) -> Arc<dyn KvCacheHandle> {
+        self.kv_cache
+    }
+}
+
+/// Tensor-free prefill output bound to one request and committed KV extent.
+#[derive(Debug)]
+pub struct PlanRuntimePrefillOutput {
+    authority: PlanRuntimePrefillAuthority,
+    product: PlanRuntimePrefillProduct,
+}
+
+impl PlanRuntimePrefillOutput {
+    pub fn intermediate(
+        request_id: RequestId,
+        committed_tokens: usize,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> Self {
+        Self {
+            authority: PlanRuntimePrefillAuthority {
+                request_id,
+                committed_tokens,
+                kv_cache,
+            },
+            product: PlanRuntimePrefillProduct::Intermediate,
+        }
+    }
+
+    pub fn final_logits(
+        request_id: RequestId,
+        committed_tokens: usize,
+        logits: Vec<f32>,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> Result<Self> {
+        if logits.is_empty() {
+            return Err(FerrumError::backend(
+                "plan-runtime final prefill returned empty logits",
+            ));
+        }
+        Ok(Self {
+            authority: PlanRuntimePrefillAuthority {
+                request_id,
+                committed_tokens,
+                kv_cache,
+            },
+            product: PlanRuntimePrefillProduct::FinalLogits(logits),
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        self.authority.request_id()
+    }
+
+    pub const fn committed_tokens(&self) -> usize {
+        self.authority.committed_tokens()
+    }
+
+    pub fn product(&self) -> &PlanRuntimePrefillProduct {
+        &self.product
+    }
+
+    pub fn kv_cache(&self) -> &Arc<dyn KvCacheHandle> {
+        self.authority.kv_cache()
+    }
+
+    pub fn validate_for_completion(
+        &self,
+        expected_request_id: &RequestId,
+        completed_chunk: PrefillChunk,
+        vocabulary_size: usize,
+    ) -> Result<()> {
+        if self.request_id() != expected_request_id {
+            return Err(FerrumError::backend(format!(
+                "plan runtime returned prefill output for request {}, expected {expected_request_id}",
+                self.request_id()
+            )));
+        }
+        if self.committed_tokens() != completed_chunk.end() {
+            return Err(FerrumError::backend(format!(
+                "plan runtime returned prefill extent {}, expected {}",
+                self.committed_tokens(),
+                completed_chunk.end()
+            )));
+        }
+        if self.kv_cache().num_tokens() != self.committed_tokens() {
+            return Err(FerrumError::backend(format!(
+                "plan runtime prefill cache `{}` reports {} tokens for committed extent {}",
+                self.kv_cache().cache_id(),
+                self.kv_cache().num_tokens(),
+                self.committed_tokens()
+            )));
+        }
+        match (&self.product, completed_chunk.is_final()) {
+            (PlanRuntimePrefillProduct::Intermediate, false) => Ok(()),
+            (PlanRuntimePrefillProduct::FinalLogits(logits), true)
+                if logits.len() == vocabulary_size =>
+            {
+                Ok(())
+            }
+            (PlanRuntimePrefillProduct::FinalLogits(logits), true) => {
+                Err(FerrumError::backend(format!(
+                    "plan runtime returned {} final prefill logits for vocabulary {vocabulary_size}",
+                    logits.len()
+                )))
+            }
+            (PlanRuntimePrefillProduct::Intermediate, true) => Err(FerrumError::backend(
+                "plan runtime returned an intermediate product for a final prefill chunk",
+            )),
+            (PlanRuntimePrefillProduct::FinalLogits(_), false) => Err(FerrumError::backend(
+                "plan runtime returned final logits for an intermediate prefill chunk",
+            )),
+        }
+    }
+
+    pub fn into_parts(self) -> (PlanRuntimePrefillAuthority, PlanRuntimePrefillProduct) {
+        (self.authority, self.product)
     }
 }
 
@@ -1096,6 +1294,10 @@ pub struct ExecutorPrefillAdmission<'a> {
     pub request_id: &'a RequestId,
     pub input_tokens: &'a [TokenId],
     pub maximum_sequence_tokens: usize,
+    /// Prompt tokens reported in the final product usage.
+    pub product_prompt_tokens: usize,
+    /// Already-committed output tokens replayed as part of a recompute input.
+    pub replayed_output_tokens: usize,
 }
 
 impl<'a> ExecutorPrefillAdmission<'a> {
@@ -1108,7 +1310,100 @@ impl<'a> ExecutorPrefillAdmission<'a> {
             request_id,
             input_tokens,
             maximum_sequence_tokens,
+            product_prompt_tokens: input_tokens.len(),
+            replayed_output_tokens: 0,
         }
+    }
+
+    /// Construct admission for a product request whose execution context may
+    /// include output tokens replayed after preemption.
+    pub fn for_product_request(
+        request_id: &'a RequestId,
+        input_tokens: &'a [TokenId],
+        maximum_sequence_tokens: usize,
+        product_prompt_tokens: usize,
+        replayed_output_tokens: usize,
+    ) -> Result<Self> {
+        let admission = Self {
+            request_id,
+            input_tokens,
+            maximum_sequence_tokens,
+            product_prompt_tokens,
+            replayed_output_tokens,
+        };
+        admission.validate()?;
+        Ok(admission)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.input_tokens.is_empty() {
+            return Err(FerrumError::request_validation(
+                "executor prefill admission requires at least one execution-context token",
+            ));
+        }
+        if self.product_prompt_tokens == 0 {
+            return Err(FerrumError::request_validation(
+                "executor prefill admission requires at least one product prompt token",
+            ));
+        }
+        let execution_context_tokens = self
+            .product_prompt_tokens
+            .checked_add(self.replayed_output_tokens)
+            .ok_or_else(|| {
+                FerrumError::request_validation(
+                    "executor prefill product token accounting exceeds usize",
+                )
+            })?;
+        if execution_context_tokens != self.input_tokens.len() {
+            return Err(FerrumError::request_validation(format!(
+                "executor prefill execution context has {} tokens but product accounting declares {} prompt + {} replayed output",
+                self.input_tokens.len(),
+                self.product_prompt_tokens,
+                self.replayed_output_tokens
+            )));
+        }
+        if self.maximum_sequence_tokens < execution_context_tokens {
+            return Err(FerrumError::request_validation(format!(
+                "executor prefill sequence ceiling {} does not cover execution context {execution_context_tokens}",
+                self.maximum_sequence_tokens
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod executor_prefill_admission_tests {
+    use super::ExecutorPrefillAdmission;
+    use ferrum_types::{RequestId, TokenId};
+
+    #[test]
+    fn product_accounting_distinguishes_replayed_output_from_prompt() {
+        let request_id = RequestId::new();
+        let tokens = [1, 2, 3, 4, 5]
+            .into_iter()
+            .map(TokenId::new)
+            .collect::<Vec<_>>();
+
+        let admission =
+            ExecutorPrefillAdmission::for_product_request(&request_id, &tokens, 8, 3, 2)
+                .expect("recompute accounting must be accepted");
+
+        assert_eq!(admission.product_prompt_tokens, 3);
+        assert_eq!(admission.replayed_output_tokens, 2);
+    }
+
+    #[test]
+    fn product_accounting_rejects_context_drift_and_short_ceiling() {
+        let request_id = RequestId::new();
+        let tokens = [1, 2, 3].into_iter().map(TokenId::new).collect::<Vec<_>>();
+
+        assert!(
+            ExecutorPrefillAdmission::for_product_request(&request_id, &tokens, 3, 2, 0).is_err()
+        );
+        assert!(
+            ExecutorPrefillAdmission::for_product_request(&request_id, &tokens, 2, 2, 1).is_err()
+        );
     }
 }
 
@@ -1350,6 +1645,101 @@ pub enum PlanRuntimeBatchDecodeOutcome {
     Deferred(ExecutorExecutionCapacityDeferral),
 }
 
+/// Capacity-aware result for one tensor-free plan-runtime prefill frontier.
+pub struct PlanRuntimePrefillCompletion {
+    output: PlanRuntimePrefillOutput,
+    planned_chunk: PrefillChunk,
+    completed_chunk: PrefillChunk,
+    capacity_probe_count: u32,
+}
+
+impl PlanRuntimePrefillCompletion {
+    pub fn new(
+        output: PlanRuntimePrefillOutput,
+        planned_chunk: PrefillChunk,
+        completed_chunk: PrefillChunk,
+        capacity_probe_count: u32,
+    ) -> Result<Self> {
+        validate_prefill_completion_shape(planned_chunk, completed_chunk, capacity_probe_count)?;
+        Ok(Self {
+            output,
+            planned_chunk,
+            completed_chunk,
+            capacity_probe_count,
+        })
+    }
+
+    pub fn exact(output: PlanRuntimePrefillOutput, chunk: PrefillChunk) -> Self {
+        Self {
+            output,
+            planned_chunk: chunk,
+            completed_chunk: chunk,
+            capacity_probe_count: 0,
+        }
+    }
+
+    pub const fn planned_chunk(&self) -> PrefillChunk {
+        self.planned_chunk
+    }
+
+    pub const fn completed_chunk(&self) -> PrefillChunk {
+        self.completed_chunk
+    }
+
+    pub const fn capacity_probe_count(&self) -> u32 {
+        self.capacity_probe_count
+    }
+
+    pub fn output(&self) -> &PlanRuntimePrefillOutput {
+        &self.output
+    }
+
+    pub fn validate_for(
+        &self,
+        expected_request_id: &RequestId,
+        expected_planned_chunk: PrefillChunk,
+        vocabulary_size: usize,
+    ) -> Result<()> {
+        if self.planned_chunk != expected_planned_chunk {
+            return Err(FerrumError::backend(format!(
+                "plan runtime completed prefill frontier {:?}, expected {:?}",
+                self.planned_chunk.range(),
+                expected_planned_chunk.range()
+            )));
+        }
+        validate_prefill_completion_shape(
+            self.planned_chunk,
+            self.completed_chunk,
+            self.capacity_probe_count,
+        )?;
+        self.output.validate_for_completion(
+            expected_request_id,
+            self.completed_chunk,
+            vocabulary_size,
+        )
+    }
+
+    pub fn into_parts(self) -> (PlanRuntimePrefillOutput, PrefillChunk, PrefillChunk, u32) {
+        (
+            self.output,
+            self.planned_chunk,
+            self.completed_chunk,
+            self.capacity_probe_count,
+        )
+    }
+}
+
+pub enum PlanRuntimePrefillOutcome {
+    Completed(PlanRuntimePrefillCompletion),
+    Deferred(ExecutorExecutionCapacityDeferral),
+}
+
+pub enum PlanRuntimeBatchPrefillOutcome {
+    Completed(Vec<PlanRuntimePrefillCompletion>),
+    NotSubmitted(ExecutorExecutionCapacityDeferral),
+    Unsupported,
+}
+
 /// Capacity-aware result for one planned prefill frontier.
 ///
 /// `Deferred` is only legal before provider encode or device submission. The
@@ -1369,19 +1759,7 @@ impl ExecutorPrefillCompletion {
         completed_chunk: PrefillChunk,
         capacity_probe_count: u32,
     ) -> Result<Self> {
-        if completed_chunk.tokens_processed() != planned_chunk.tokens_processed()
-            || completed_chunk.total_prompt_tokens() != planned_chunk.total_prompt_tokens()
-            || completed_chunk.tokens_to_process() > planned_chunk.tokens_to_process()
-        {
-            return Err(ferrum_types::FerrumError::internal(
-                "completed prefill chunk is not a non-empty prefix of its planned chunk",
-            ));
-        }
-        if completed_chunk != planned_chunk && capacity_probe_count == 0 {
-            return Err(ferrum_types::FerrumError::internal(
-                "partial prefill completion requires a failed capacity probe",
-            ));
-        }
+        validate_prefill_completion_shape(planned_chunk, completed_chunk, capacity_probe_count)?;
         Ok(Self {
             output,
             planned_chunk,
@@ -1419,6 +1797,27 @@ impl ExecutorPrefillCompletion {
             self.capacity_probe_count,
         )
     }
+}
+
+fn validate_prefill_completion_shape(
+    planned_chunk: PrefillChunk,
+    completed_chunk: PrefillChunk,
+    capacity_probe_count: u32,
+) -> Result<()> {
+    if completed_chunk.tokens_processed() != planned_chunk.tokens_processed()
+        || completed_chunk.total_prompt_tokens() != planned_chunk.total_prompt_tokens()
+        || completed_chunk.tokens_to_process() > planned_chunk.tokens_to_process()
+    {
+        return Err(ferrum_types::FerrumError::internal(
+            "completed prefill chunk is not a non-empty prefix of its planned chunk",
+        ));
+    }
+    if completed_chunk != planned_chunk && capacity_probe_count == 0 {
+        return Err(ferrum_types::FerrumError::internal(
+            "partial prefill completion requires a failed capacity probe",
+        ));
+    }
+    Ok(())
 }
 
 pub enum ExecutorPrefillOutcome {
@@ -1870,6 +2269,42 @@ pub trait ModelExecutor: Send + Sync {
         _inputs: &[PrefillInput],
     ) -> Result<ExecutorBatchPrefillOutcome> {
         Ok(ExecutorBatchPrefillOutcome::Unsupported)
+    }
+
+    /// Tensor-free prefill for executors that declare
+    /// [`ExecutionResourceAuthority::PlanRuntime`].
+    ///
+    /// The default fails closed because adapting through [`PrefillInput`]
+    /// would silently restore a host tensor boundary.
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        _input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        Err(FerrumError::unsupported(
+            "tensor-free plan-runtime prefill is not implemented",
+        ))
+    }
+
+    /// Attempt one physical tensor-free prefill batch.
+    ///
+    /// `Unsupported` is an optimization fallback to the typed single-request
+    /// method. `NotSubmitted` proves that no participant reached provider
+    /// encode or device submission.
+    async fn plan_runtime_batch_prefill_with_capacity(
+        &self,
+        _inputs: &[PlanRuntimePrefillInput],
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
+        Ok(PlanRuntimeBatchPrefillOutcome::Unsupported)
+    }
+
+    /// Discard an exact prefill authority after engine-side validation,
+    /// sampling, or scheduler commit fails.
+    ///
+    /// Plan runtimes should override this to remove both retained-prefill and
+    /// active state by the exact opaque handle, not by a reusable request id.
+    fn discard_plan_runtime_prefill(&self, authority: PlanRuntimePrefillAuthority) -> Result<()> {
+        self.release_cache(&authority.kv_cache().cache_id());
+        Ok(())
     }
 
     /// Execute decode phase (generate next token)

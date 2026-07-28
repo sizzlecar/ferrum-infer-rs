@@ -215,13 +215,19 @@ impl EngineInner {
         request: &InferenceRequest,
         capture_trace: bool,
     ) -> ExecutorPrefillProbeResult {
-        let Some((input_tokens, maximum_sequence_tokens)) =
-            self.sequences.read().get(&request.id).map(|sequence| {
-                (
-                    sequence.prefill_context_tokens(),
-                    sequence.model_maximum_sequence_tokens(),
-                )
-            })
+        let Some((
+            input_tokens,
+            maximum_sequence_tokens,
+            product_prompt_tokens,
+            replayed_output_tokens,
+        )) = self.sequences.read().get(&request.id).map(|sequence| {
+            (
+                sequence.prefill_context_tokens(),
+                sequence.model_maximum_sequence_tokens(),
+                sequence.input_tokens.len(),
+                sequence.generated_tokens.len(),
+            )
+        })
         else {
             let error = FerrumError::internal(format!(
                 "request {} reached typed admission before its sequence state was published",
@@ -238,6 +244,27 @@ impl EngineInner {
                 maintenance: None,
             };
         };
+        let admission = match ExecutorPrefillAdmission::for_product_request(
+            &request.id,
+            &input_tokens,
+            maximum_sequence_tokens,
+            product_prompt_tokens,
+            replayed_output_tokens,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return ExecutorPrefillProbeResult {
+                    trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
+                        request_id: request.id.clone(),
+                        input_token_count: Some(input_tokens.len()),
+                        maximum_sequence_tokens: Some(maximum_sequence_tokens),
+                        evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
+                    }),
+                    outcome: AdmissionProbeOutcome::Faulted(error),
+                    maintenance: None,
+                };
+            }
+        };
         let capture_admission_trace = |evidence| {
             capture_trace.then(|| ExecutorPrefillAdmissionTrace {
                 request_id: request.id.clone(),
@@ -246,13 +273,7 @@ impl EngineInner {
                 evidence,
             })
         };
-        match self
-            .model_executor
-            .try_admit_prefill(ExecutorPrefillAdmission::new(
-                &request.id,
-                &input_tokens,
-                maximum_sequence_tokens,
-            )) {
+        match self.model_executor.try_admit_prefill(admission) {
             Ok(ExecutorPrefillAdmissionDecision::Admitted(receipt)) => ExecutorPrefillProbeResult {
                 trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Admitted(
                     receipt.clone(),
@@ -340,6 +361,18 @@ impl EngineInner {
                 maintenance: None,
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_executor_prefill_admission_for_test(
+        &self,
+        request: &InferenceRequest,
+    ) -> bool {
+        matches!(
+            self.probe_executor_prefill_admission(request, false)
+                .outcome,
+            AdmissionProbeOutcome::Admitted(_)
+        )
     }
 
     fn write_executor_scheduler_profile_event(
