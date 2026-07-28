@@ -29,6 +29,8 @@ class ExpectedWork:
     native_op_id: str | None
     min_participants: int
     exact_compute_dispatches: int | None
+    compute_dispatch_base: int | None
+    compute_dispatches_per_participant: int | None
     exact_transfer_commands: int | None
     min_matching_events: int
     require_all_eligible: bool
@@ -108,7 +110,7 @@ def mismatch_reasons(
     (
         native_op_id,
         batching_form,
-        _participant_count,
+        participant_count,
         _token_count,
         compute_dispatches,
         transfer_commands,
@@ -123,6 +125,17 @@ def mismatch_reasons(
         and compute_dispatches != expected.exact_compute_dispatches
     ):
         reasons.append(f"compute_dispatches={compute_dispatches}")
+    if expected.compute_dispatch_base is not None:
+        assert expected.compute_dispatches_per_participant is not None
+        expected_dispatches = (
+            expected.compute_dispatch_base
+            + expected.compute_dispatches_per_participant * participant_count
+        )
+        if compute_dispatches != expected_dispatches:
+            reasons.append(
+                f"compute_dispatches={compute_dispatches}"
+                f"(expected={expected_dispatches},participants={participant_count})"
+            )
     if (
         expected.exact_transfer_commands is not None
         and transfer_commands != expected.exact_transfer_commands
@@ -250,6 +263,10 @@ def validate_profile(path: Path, expected: ExpectedWork) -> dict[str, Any]:
             "batching_form": expected.batching_form,
             "min_participants": expected.min_participants,
             "exact_compute_dispatches": expected.exact_compute_dispatches,
+            "compute_dispatch_base": expected.compute_dispatch_base,
+            "compute_dispatches_per_participant": (
+                expected.compute_dispatches_per_participant
+            ),
             "exact_transfer_commands": expected.exact_transfer_commands,
             "min_matching_events": expected.min_matching_events,
             "require_all_eligible": expected.require_all_eligible,
@@ -300,6 +317,8 @@ def run_selftest() -> None:
         batching_form="packed",
         min_participants=2,
         exact_compute_dispatches=10,
+        compute_dispatch_base=None,
+        compute_dispatches_per_participant=None,
         exact_transfer_commands=2,
         min_matching_events=1,
         require_all_eligible=True,
@@ -357,6 +376,70 @@ def run_selftest() -> None:
         else:
             raise ValidationError("self-test failing fixture unexpectedly passed")
 
+        affine = ExpectedWork(
+            operation_id="operation.causal_paged_attention",
+            native_op_id="vnext.causal_attention.vllm_paged_attention_v1_addressed",
+            batching_form="packed",
+            min_participants=2,
+            exact_compute_dispatches=None,
+            compute_dispatch_base=6,
+            compute_dispatches_per_participant=3,
+            exact_transfer_commands=0,
+            min_matching_events=2,
+            require_all_eligible=True,
+        )
+        affine_profile = root / "affine.jsonl"
+        affine_profile.write_text(
+            "".join(
+                json.dumps(event, sort_keys=True) + "\n"
+                for event in [
+                    synthetic_event(
+                        operation_id=affine.operation_id,
+                        native_op_id=affine.native_op_id or "",
+                        batching_form="packed",
+                        participants=4,
+                        compute_dispatches=18,
+                        transfer_commands=0,
+                    ),
+                    synthetic_event(
+                        operation_id=affine.operation_id,
+                        native_op_id=affine.native_op_id or "",
+                        batching_form="packed",
+                        participants=32,
+                        compute_dispatches=102,
+                        transfer_commands=0,
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        affine_summary = validate_profile(affine_profile, affine)
+        if affine_summary["counts"]["matching_events"] != 2:
+            raise ValidationError("self-test affine fixture did not produce two matches")
+
+        affine_bad = root / "affine-bad.jsonl"
+        affine_bad.write_text(
+            json.dumps(
+                synthetic_event(
+                    operation_id=affine.operation_id,
+                    native_op_id=affine.native_op_id or "",
+                    batching_form="packed",
+                    participants=4,
+                    compute_dispatches=19,
+                    transfer_commands=0,
+                ),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            validate_profile(affine_bad, affine)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test invalid affine fixture unexpectedly passed")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -366,6 +449,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batching-form")
     parser.add_argument("--min-participants", type=int, default=2)
     parser.add_argument("--exact-compute-dispatches", type=int)
+    parser.add_argument("--compute-dispatch-base", type=int)
+    parser.add_argument("--compute-dispatches-per-participant", type=int)
     parser.add_argument("--exact-transfer-commands", type=int)
     parser.add_argument("--min-matching-events", type=int, default=1)
     parser.add_argument("--require-all-eligible", action="store_true")
@@ -399,6 +484,8 @@ def main() -> int:
             "min_participants",
             "min_matching_events",
             "exact_compute_dispatches",
+            "compute_dispatch_base",
+            "compute_dispatches_per_participant",
             "exact_transfer_commands",
         ):
             value = getattr(args, label)
@@ -408,6 +495,22 @@ def main() -> int:
             raise ValidationError("--min-participants must be at least 1")
         if args.min_matching_events == 0:
             raise ValidationError("--min-matching-events must be at least 1")
+        affine_dispatch = (
+            args.compute_dispatch_base is not None
+            or args.compute_dispatches_per_participant is not None
+        )
+        if affine_dispatch and (
+            args.compute_dispatch_base is None
+            or args.compute_dispatches_per_participant is None
+        ):
+            raise ValidationError(
+                "--compute-dispatch-base and "
+                "--compute-dispatches-per-participant must be provided together"
+            )
+        if affine_dispatch and args.exact_compute_dispatches is not None:
+            raise ValidationError(
+                "--exact-compute-dispatches cannot be combined with affine dispatch constraints"
+            )
 
         expected = ExpectedWork(
             operation_id=args.operation_id,
@@ -415,6 +518,10 @@ def main() -> int:
             batching_form=args.batching_form,
             min_participants=args.min_participants,
             exact_compute_dispatches=args.exact_compute_dispatches,
+            compute_dispatch_base=args.compute_dispatch_base,
+            compute_dispatches_per_participant=(
+                args.compute_dispatches_per_participant
+            ),
             exact_transfer_commands=args.exact_transfer_commands,
             min_matching_events=args.min_matching_events,
             require_all_eligible=args.require_all_eligible,
