@@ -260,6 +260,81 @@ same-hardware release-reference plus correctness-profile product comparison,
 followed by the five-sample build timing matrix and canonical G07 validator.
 G07B's cold Candle native dependency remains open.
 
+### 2026-07-28 Candle CUDA boundary and scheduler-neutral native cache identity
+
+Clean pushed source `ecd6d1e8739467ab290bdb64df7a12e6a9c2cde6`, tree
+`8e363e3b0efa90f11ffaf967f069a9ac00b77584`, closes the cold Candle CUDA
+dependency from the official vNext CUDA feature graph:
+
+- the official `cuda,vllm-moe-marlin,vllm-paged-attn-v2` graph resolves
+  `candle-core` and `candle-nn` with CPU `default` only, and does not resolve
+  `candle-kernels`;
+- an explicit `candle-cuda-compat` feature preserves the legacy CUDA tensor
+  modules and proves that Candle CUDA can only re-enter through an intentional
+  compatibility request;
+- the official cudarc feature set declares `std,dynamic-linking` directly
+  rather than relying on Candle feature unification to select a link strategy;
+- the boundary validator printed
+  `FERRUM RUNTIME VNEXT CUDA CANDLE BOUNDARY PASS: /workspace/ferrum-artifacts/runtime-vnext-g07-candle-boundary-ecd6d1e8-20260728/dependency-graph-r2`.
+
+The first real official build then found that `FERRUM_NVCC_THREADS` was part of
+the static-library content identity. That was incorrect: nvcc worker count is a
+scheduler policy, not an ABI, source, flag, or output-content input. The final
+implementation:
+
+- removes worker count from the canonical Marlin, MoE Marlin and paged-attention
+  identities while continuing to pass bounded `--threads` to nvcc;
+- accepts only enumerated historical full content/toolchain signatures for
+  shared-cache promotion;
+- keeps weak legacy metadata/stamp signatures confined to explicitly configured
+  import directories;
+- restores and verifies the historical payload before publishing it under the
+  canonical identity, and requires promoted SHA256 and size to remain exact.
+
+On retained instance `45897840`, exactly one RTX 4090 with driver `580.126.20`
+and `24564 MiB`, the bounded official command was:
+
+```text
+env CARGO_TARGET_DIR=/workspace/ferrum-infer-rs/target \
+  CARGO_BUILD_JOBS=4 CUDA_COMPUTE_CAP=89 FERRUM_NVCC_THREADS=4 \
+  FERRUM_CUDA_NATIVE_BUILD_CACHE=/workspace/ferrum-native-build-cache \
+  FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only \
+  cargo build --release --locked --jobs 4 -p ferrum-cli --bin ferrum \
+  --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+```
+
+It completed with `rc=0` in `471.000627s` (`7m50s`). This is below the
+`15min` ceiling but retained the Cargo target, so it is an official-feature
+incremental release build and cannot count as a clean-release timing sample.
+The bounded receipt observed peaks of `5` processes, `35` process-group threads
+and `17` threads in one process, no violation, and complete process-group
+cleanup. All three heavy archives printed `status=promoted` followed by
+`reason=promoted-compatible-native-build-cache`; actual native compiler
+executions were `0`. The binary printed `ferrum 0.7.7`, had SHA256
+`a6e5059c7cab467ea8cf79b37beb102644a19dea8267d76b038ce63531b11a11`,
+and its dynamic dependency scan contained CUDA/cuBLAS but no Python, Torch or
+vLLM runtime dependency.
+
+The exact dependency and build evidence is saved in GitHub draft-release asset
+`cuda-g07-candle-boundary-ecd6d1e8.tar.zst` (asset `492770357`, asset SHA256
+`2fed9d75c9535b5437210c42d8a7a50fb3670cc9ee9e68ba7b5ffd0ee61af5d0`) and
+was downloaded and SHA256/zstd verified at
+`/Users/chejinxuan/ferrum-artifacts/github/cuda-g07-candle-boundary-ecd6d1e8-20260728`.
+After evidence capture, instance `45897840` reached
+`cur_state=stopped`, `actual_status=exited`; account inventory reported
+`potentially_billable=[]`.
+
+This proves that the official vNext CUDA **GPU execution graph** no longer
+depends on Candle CUDA; it does not prove that the full product binary is
+Candle-free. `vnext_executor` still creates CPU Candle tensors at the product
+token/logit adapter boundary, and Metal, GGUF, embedding, audio and multimodal
+implementations still use Candle. Replacing those host/API adapters is a
+separate dependency cleanup and must not be confused with CUDA kernel
+execution. This checkpoint is also one release-build sample, not the required
+five-sample p95. G07 remains Open pending dev/release semantic equivalence,
+the complete five-sample invalidation matrix, workspace source gate and
+canonical G07A/G07B/G07 aggregate validators.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。
