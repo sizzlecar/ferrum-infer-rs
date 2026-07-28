@@ -51,6 +51,29 @@ except ModuleNotFoundError:
         SessionCase,
     )
 
+try:
+    from runtime_vnext_c13_contract import (
+        CASE_COUNT as C13_CASE_COUNT,
+        CONTRACT_ID as C13_CONTRACT_ID,
+        C13ContractError,
+        case_contract as c13_case_contract,
+        request_evidence as c13_request_evidence,
+        self_test as self_test_c13_contract,
+        validate_request as validate_c13_request,
+        validate_response as validate_c13_response,
+    )
+except ModuleNotFoundError:
+    from scripts.release.runtime_vnext_c13_contract import (
+        CASE_COUNT as C13_CASE_COUNT,
+        CONTRACT_ID as C13_CONTRACT_ID,
+        C13ContractError,
+        case_contract as c13_case_contract,
+        request_evidence as c13_request_evidence,
+        self_test as self_test_c13_contract,
+        validate_request as validate_c13_request,
+        validate_response as validate_c13_response,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = Path(__file__).resolve()
@@ -59,6 +82,13 @@ ACTIVE_TIMELINE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_active_timelin
 ACTIVE_TIMELINE_REPO_PATH = ACTIVE_TIMELINE_PATH.relative_to(REPO_ROOT).as_posix()
 JSONL_SESSION_PATH = REPO_ROOT / "scripts/release/jsonl_product_session.py"
 JSONL_SESSION_REPO_PATH = JSONL_SESSION_PATH.relative_to(REPO_ROOT).as_posix()
+C13_CONTRACT_PATH = REPO_ROOT / "scripts/release/runtime_vnext_c13_contract.py"
+C13_CONTRACT_REPO_PATH = C13_CONTRACT_PATH.relative_to(REPO_ROOT).as_posix()
+RUNNER_DEPENDENCIES = (
+    (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
+    (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
+    (C13_CONTRACT_PATH, C13_CONTRACT_REPO_PATH),
+)
 EXPECTATIONS_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json"
 EXPECTATIONS_REPO_PATH = EXPECTATIONS_PATH.relative_to(REPO_ROOT).as_posix()
 FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
@@ -655,10 +685,7 @@ def canonical_runner_identity() -> dict[str, Any]:
     require(checked_in == RUNNER_PATH.read_bytes(), "scenario runner differs from its checked-in blob")
     dependencies = []
     for index, (path, repo_path) in enumerate(
-        (
-            (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
-            (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
-        )
+        RUNNER_DEPENDENCIES
     ):
         dependency_blob_sha = require_git_sha(
             git_text(["rev-parse", f"HEAD:{repo_path}"]),
@@ -700,10 +727,7 @@ def internal_fixture_runner_identity() -> dict[str, Any]:
                 "git_blob_sha": "0" * 40,
                 "sha256": file_sha256(file_path),
             }
-            for file_path, path in (
-                (ACTIVE_TIMELINE_PATH, ACTIVE_TIMELINE_REPO_PATH),
-                (JSONL_SESSION_PATH, JSONL_SESSION_REPO_PATH),
-            )
+            for file_path, path in RUNNER_DEPENDENCIES
         ],
         "dirty_status": {"is_dirty": False, "status_short": []},
         "internal_fixture": True,
@@ -1016,9 +1040,9 @@ def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[
     require(runner.get("sha256") == expected_sha256, "scenario_report runner SHA256 mismatch")
     require(file_sha256(RUNNER_PATH) == expected_sha256, "scenario_report runner does not match the current gate contract")
     dependencies = require_list(runner.get("dependencies"), "scenario_report.runner.dependencies")
-    expected_dependencies = (
-        (ACTIVE_TIMELINE_REPO_PATH, ACTIVE_TIMELINE_PATH),
-        (JSONL_SESSION_REPO_PATH, JSONL_SESSION_PATH),
+    expected_dependencies = tuple(
+        (repo_path, local_path)
+        for local_path, repo_path in RUNNER_DEPENDENCIES
     )
     require(
         len(dependencies) == len(expected_dependencies),
@@ -1224,6 +1248,34 @@ def minimum_case_count(scenario_id: str, model_key: str) -> int:
     return fixed[scenario_id]
 
 
+def expected_c13_case_count(model_key: str) -> int:
+    return 60 if model_key == "m3-qwen3-30b-a3b" else 40
+
+
+def validate_c13_case_count(model_key: str, count: int) -> None:
+    expected = expected_c13_case_count(model_key)
+    require(
+        count == expected,
+        f"scenario C13 case_count must be exactly {expected}",
+    )
+
+
+def expected_c13_joint_partition(
+    model_key: str,
+) -> dict[tuple[str | None, str], int]:
+    if model_key == "m3-qwen3-30b-a3b":
+        return {
+            ("P_NO_THINKING", "tool-result"): 30,
+            ("P_THINKING", "tool-result"): 10,
+            ("P_THINKING", "soft-think"): 10,
+            ("P_THINKING", "soft-no-think"): 10,
+        }
+    return {
+        ("P_NO_THINKING", "tool-result"): 20,
+        ("P_THINKING", "tool-result"): 20,
+    }
+
+
 def required_variants(scenario_id: str, model_key: str) -> tuple[dict[str, int], bool]:
     variants: dict[str, dict[str, int]] = {
         "C01": {"config-resolution": 5, "template-byte": 5, "special-token-eos": 5, "unknown-fail-closed": 5},
@@ -1282,7 +1334,13 @@ ZERO_ASSERTIONS: dict[str, set[str]] = {
 }
 
 
-def validate_assertions(scenario_id: str, raw: Any, *, case_count: int) -> None:
+def validate_assertions(
+    scenario_id: str,
+    raw: Any,
+    *,
+    case_count: int,
+    execution_contract_name: str,
+) -> None:
     assertions = require_object(raw, f"scenario {scenario_id}.assertions")
     require(assertions.get("bad_output_count") == 0, f"scenario {scenario_id} bad_output_count must be 0")
     require(assertions.get("resource_final_state") == "released", f"scenario {scenario_id} resource final state must be released")
@@ -1308,6 +1366,24 @@ def validate_assertions(scenario_id: str, raw: Any, *, case_count: int) -> None:
         require(assertions.get("tool_success_count") == case_count, f"{scenario_id} tool coverage incomplete")
         if scenario_id == "C12":
             require(assertions.get("paired_c11_equivalence_count") == case_count, "C12 paired C11 equivalence coverage incomplete")
+        if (
+            scenario_id == "C13"
+            and execution_contract_name == G08_EXECUTION_CONTRACT
+        ):
+            require(assertions.get("contract_id") == C13_CONTRACT_ID, "C13 contract id mismatch")
+            for field in (
+                "distinct_prompt_count",
+                "distinct_messages_count",
+                "distinct_request_count",
+                "distinct_expression_count",
+                "distinct_result_count",
+                "distinct_receipt_count",
+                "distinct_tool_call_id_count",
+            ):
+                require(
+                    assertions.get(field) == case_count,
+                    f"C13 {field} must equal case_count",
+                )
     elif scenario_id == "C14":
         require(assertions.get("valid_json_count") == case_count, "C14 valid schema count incomplete")
         require(assertions.get("distinct_schema_count") == case_count and assertions.get("distinct_prompt_count") == case_count, "C14 schemas/prompts are not materially distinct")
@@ -1509,7 +1585,12 @@ def validate_case_output(
     actual_config: dict[str, Any] | None = None,
     artifact_root: Path | None = None,
     require_c18_resource_balance: bool = False,
+    execution_contract_name: str = LEGACY_EXECUTION_CONTRACT,
 ) -> None:
+    require(
+        execution_contract_name in EXECUTION_CONTRACTS,
+        f"{label} execution contract is invalid",
+    )
     stdout_text = stdout_path.read_text(encoding="utf-8")
     require(not any(marker in stdout_text.lower() for marker in BLOCKER_MARKERS), f"{label} stdout contains bad output")
     if entrypoint == "run":
@@ -1978,7 +2059,52 @@ def validate_case_output(
             arguments = json.loads(require_string(function.get("arguments"), f"{label}.tool arguments"))
             require(arguments == {"city": "Paris"}, f"{label} returned invalid tool arguments")
         elif scenario_id == "C13":
-            require("21" in content, f"{label} did not incorporate the tool result")
+            require(
+                len(exchanges) == 1 and len(responses) == 1,
+                f"{label} C13 must contain exactly one request/response exchange",
+            )
+            if execution_contract_name == LEGACY_EXECUTION_CONTRACT:
+                require(
+                    "21" in content,
+                    f"{label} did not incorporate the legacy tool result",
+                )
+                return
+            require(input_document is not None, f"{label} C13 input evidence is missing")
+            case_id = require_string(
+                observed.get("case_id"),
+                f"{label}.observed.case_id",
+            )
+            match = re.fullmatch(r"c13-([0-9]{3})", case_id)
+            require(match is not None, f"{label} C13 case id is invalid")
+            ordinal = int(match.group(1))
+            try:
+                contract = validate_c13_request(
+                    input_document,
+                    ordinal=ordinal,
+                    variant=variant,
+                )
+                choice = require_object(
+                    require_list(
+                        final_response.get("choices"),
+                        f"{label}.choices",
+                    )[0],
+                    f"{label}.choice",
+                )
+                validate_c13_response(
+                    message,
+                    finish_reason=choice.get("finish_reason"),
+                    contract=contract,
+                )
+            except C13ContractError as error:
+                raise ScenarioError(f"{label} {error}") from error
+            for field, expected_value in c13_request_evidence(
+                input_document,
+                contract=contract,
+            ).items():
+                require(
+                    observed.get(field) == expected_value,
+                    f"{label} C13 observed {field} is not bound to input evidence",
+                )
         elif scenario_id in {"C14", "C15"}:
             parsed = json.loads(content)
             require(isinstance(parsed, dict), f"{label} structured output is not an object")
@@ -2330,6 +2456,10 @@ def validate_case_evidence(
                 "model_key": expected["model_key"],
             },
             expected["model_key"],
+            execution_contract_name=expected.get(
+                "execution_contract",
+                LEGACY_EXECUTION_CONTRACT,
+            ),
         )
         require(input_document == expected_payload, f"case {case_id} persisted input differs from generated scenario contract")
     elif scenario_id == "C03":
@@ -2628,6 +2758,10 @@ def validate_case_evidence(
                 expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
                 == G08_EXECUTION_CONTRACT
             ),
+            execution_contract_name=expected.get(
+                "execution_contract",
+                LEGACY_EXECUTION_CONTRACT,
+            ),
         )
     )
     if case["status"] == "pass":
@@ -2671,6 +2805,8 @@ def validate_scenario(
     require(scenario.get("status") in {"pass", "known-fail", "blocked"}, f"scenario {expected_id} status invalid")
     reject_forbidden_markers(scenario, f"scenario {expected_id}", allow_internal_fixture=bool(expected["allow_internal_fixture"]))
     count = require_count(scenario.get("case_count"), f"scenario {expected_id}.case_count", minimum=minimum_case_count(expected_id, expected["model_key"]))
+    if expected_id == "C13":
+        validate_c13_case_count(expected["model_key"], count)
     passed_count = require_count(scenario.get("passed_count"), f"scenario {expected_id}.passed_count")
     known_failed_count = require_count(scenario.get("known_failed_count", 0), f"scenario {expected_id}.known_failed_count")
     blocked_count = require_count(scenario.get("blocked_count", 0), f"scenario {expected_id}.blocked_count")
@@ -2733,7 +2869,15 @@ def validate_scenario(
     else:
         require("concurrency_cells" not in scenario, f"scenario {expected_id} must not fabricate concurrency cells")
     if scenario["status"] == "pass":
-        validate_assertions(expected_id, scenario.get("assertions"), case_count=count)
+        validate_assertions(
+            expected_id,
+            scenario.get("assertions"),
+            case_count=count,
+            execution_contract_name=expected.get(
+                "execution_contract",
+                LEGACY_EXECUTION_CONTRACT,
+            ),
+        )
     else:
         assertions = require_object(scenario.get("assertions"), f"scenario {expected_id}.assertions")
         require(assertions.get("expected_failure_count") == known_failed_count + blocked_count, f"scenario {expected_id} expected failure count mismatch")
@@ -2859,6 +3003,83 @@ def validate_scenario(
     elif expected_id == "C07":
         conversation_ids = [row["observed"].get("conversation_id") for row in case_rows]
         require(len(set(conversation_ids)) == 6 and all(row["observed"].get("history_turn_count") == 5 for row in case_rows), "C07 conversation identity/history corpus is incomplete")
+    elif expected_id == "C13":
+        partition: dict[tuple[str | None, str], int] = {}
+        for row in case_rows:
+            key = (row["preset"], row["variant"])
+            partition[key] = partition.get(key, 0) + 1
+        require(
+            partition == expected_c13_joint_partition(expected["model_key"]),
+            "C13 preset/variant joint partition mismatch",
+        )
+        if (
+            expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT)
+            == G08_EXECUTION_CONTRACT
+        ):
+            expected_evidence_rows = []
+            for row in case_rows:
+                try:
+                    contract = validate_c13_request(
+                        row["input_document"],
+                        ordinal=row["ordinal"],
+                        variant=row["variant"],
+                    )
+                except C13ContractError as error:
+                    raise ScenarioError(
+                        f"case {row['case_id']} C13 input contract is invalid: {error}"
+                    ) from error
+                expected_evidence_rows.append(
+                    c13_request_evidence(
+                        row["input_document"],
+                        contract=contract,
+                    )
+                )
+            for row, expected_evidence in zip(
+                case_rows,
+                expected_evidence_rows,
+                strict=True,
+            ):
+                for field, expected_value in expected_evidence.items():
+                    require(
+                        row["observed"].get(field) == expected_value,
+                        f"case {row['case_id']} C13 observed {field} mismatch",
+                    )
+            distinct_fields = {
+                "distinct_prompt_count": "c13_prompt_sha256",
+                "distinct_messages_count": "c13_messages_sha256",
+                "distinct_request_count": "c13_request_sha256",
+                "distinct_expression_count": "expression",
+                "distinct_result_count": "expected_tool_result",
+                "distinct_receipt_count": "expected_tool_receipt",
+                "distinct_tool_call_id_count": "tool_call_id",
+            }
+            require(
+                all(
+                    row["observed"].get("contract_id") == C13_CONTRACT_ID
+                    for row in case_rows
+                ),
+                "C13 cases do not all use the versioned contract",
+            )
+            for assertion_field, observed_field in distinct_fields.items():
+                values = [row["observed"].get(observed_field) for row in case_rows]
+                require(
+                    None not in values and len(set(values)) == count,
+                    f"C13 {observed_field} values are not all materially distinct",
+                )
+            if scenario["status"] == "pass":
+                assertions = require_object(
+                    scenario.get("assertions"),
+                    "scenario C13.assertions",
+                )
+                for assertion_field in distinct_fields:
+                    require(
+                        assertions.get(assertion_field) == count,
+                        f"C13 {assertion_field} is not derived from case evidence",
+                    )
+                require(
+                    assertions.get("contract_id") == C13_CONTRACT_ID,
+                    "C13 assertion contract id mismatch",
+                )
     elif expected_id == "C14":
         schema_hashes = [row["observed"].get("strict_schema_sha256") for row in case_rows]
         prompt_hashes = [row["observed"].get("strict_prompt_sha256") for row in case_rows]
@@ -4201,7 +4422,37 @@ def derived_c14_category(schema: dict[str, Any], label: str) -> str:
     raise ScenarioError(f"{label} does not derive one material C14 constraint category")
 
 
-def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
+def legacy_c13_messages() -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "Use the calculator."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"7*3"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "21"},
+    ]
+
+
+def case_http_payload(
+    case: dict[str, Any],
+    model_key: str,
+    *,
+    execution_contract_name: str = LEGACY_EXECUTION_CONTRACT,
+) -> dict[str, Any]:
+    require(
+        execution_contract_name in EXECUTION_CONTRACTS,
+        f"unsupported execution contract {execution_contract_name!r}",
+    )
     scenario_id = case["scenario_id"]
     variant = case["variant"]
     marker = expected_case_text(case)
@@ -4299,15 +4550,17 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
             payload["metadata"]["g00_reference_contract"] = "C11"
             payload["metadata"]["g00_reference_case_id"] = f"c11-{int(case['ordinal']):03d}"
     elif scenario_id == "C13":
-        payload["messages"] = [
-            {"role": "user", "content": "Use the calculator."},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "calculator", "arguments": "{\"expression\":\"7*3\"}"}}],
-            },
-            {"role": "tool", "tool_call_id": "call-1", "content": "21"},
-        ]
+        if execution_contract_name == G08_EXECUTION_CONTRACT:
+            contract = c13_case_contract(
+                int(case["ordinal"]),
+                variant=variant,
+            )
+            payload["metadata"]["g00_contract_id"] = C13_CONTRACT_ID
+            payload["messages"] = contract.messages()
+            payload["tools"] = contract.tools()
+            payload["tool_choice"] = "auto"
+        else:
+            payload["messages"] = legacy_c13_messages()
     elif scenario_id == "C14":
         strict_prompt, strict_schema, _ = strict_schema_case(case)
         payload["messages"] = [{"role": "user", "content": strict_prompt}]
@@ -6572,9 +6825,14 @@ def serve_case_request(
     scheduler_trace_path: Path,
     effective_config_path: Path,
     require_c18_resource_balance: bool,
+    execution_contract_name: str,
 ) -> tuple[list[str], dict[str, Any], Path, Path, Path, Path, dict[str, Any]]:
     case_id = case["case_id"]
-    payload = case_http_payload(case, case["model_key"])
+    payload = case_http_payload(
+        case,
+        case["model_key"],
+        execution_contract_name=execution_contract_name,
+    )
     recovery_payload: dict[str, Any] | None = None
     if case["scenario_id"] == "C09":
         recovery_payload = copy.deepcopy(payload)
@@ -6861,6 +7119,19 @@ def serve_case_request(
         "server_pgid": server.pgid,
     }
     observed: dict[str, Any] = {"case_id": case_id, "expected_marker": expected_case_text(case)}
+    if (
+        case["scenario_id"] == "C13"
+        and execution_contract_name == G08_EXECUTION_CONTRACT
+    ):
+        observed.update(
+            c13_request_evidence(
+                payload,
+                contract=c13_case_contract(
+                    int(case["ordinal"]),
+                    variant=case["variant"],
+                ),
+            )
+        )
     if case["scenario_id"] == "C07":
         observed.update({"conversation_id": f"conversation-{case_id}", "history_turn_count": 5})
     if case["scenario_id"] == "C14":
@@ -6947,6 +7218,7 @@ def classify_execution_outcome(
     actual_config_path: Path,
     artifact_root: Path,
     require_c18_resource_balance: bool,
+    execution_contract_name: str,
 ) -> tuple[str, str | None, str | None]:
     if returncode != 0:
         stderr_text = (stdout_path.parent / "stderr.log").read_text(encoding="utf-8", errors="replace").lower()
@@ -6954,6 +7226,7 @@ def classify_execution_outcome(
             return "blocked", "legacy-model-backend-unsupported", "product command reported unsupported model/backend"
         return "blocked", "product-command-failed", f"product command returned {returncode}"
     transcript = read_json(transcript_path) if transcript_path is not None else None
+    actual_config = read_json(actual_config_path)
     output_error = capture_case_output_error(
         lambda: validate_case_output(
             case["scenario_id"],
@@ -6964,9 +7237,10 @@ def classify_execution_outcome(
             observed,
             f"case {case['case_id']}",
             input_document=read_json(input_path),
-            actual_config=read_json(actual_config_path),
+            actual_config=actual_config,
             artifact_root=artifact_root,
             require_c18_resource_balance=require_c18_resource_balance,
+            execution_contract_name=execution_contract_name,
         )
     )
     if output_error is not None:
@@ -7586,6 +7860,7 @@ def execute_manifest(
                     scheduler_trace_path=active_serve_session["scheduler_trace"],
                     effective_config_path=active_serve_session["config"],
                     require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
+                    execution_contract_name=contract,
                 )
                 actual_config = active_serve_session["config"]
                 execution_process_receipt = invocation_process_receipt
@@ -7607,7 +7882,12 @@ def execute_manifest(
             elif row["entrypoint"] == "serve":
                 require(active_serve_session is not None, "failed serve session metadata missing")
                 input_path = case_root / "input.json"
-                write_json(input_path, case_http_payload(row, manifest["model_key"]))
+                startup_payload = case_http_payload(
+                    row,
+                    manifest["model_key"],
+                    execution_contract_name=contract,
+                )
+                write_json(input_path, startup_payload)
                 stdout_path = case_root / "stdout.log"
                 stderr_path = case_root / "stderr.log"
                 stdout_path.write_text("serve process unavailable\n", encoding="utf-8")
@@ -7619,6 +7899,19 @@ def execute_manifest(
                 argv = ["curl", "--request", "POST", row["case_id"], base_url + "/v1/chat/completions"]
                 envelope = {"id": f"exec-{row['case_id']}", "mode": "in-process-http", "argv": argv, "pid": os.getpid(), "pgid": os.getpgid(0), "started_at": now, "finished_at": iso_now(), "started_monotonic_ns": now_ns, "finished_monotonic_ns": time.monotonic_ns(), "duration_sec": max(1e-6, (time.monotonic_ns() - now_ns) / 1e9), "returncode": 69}
                 observed = {"case_id": row["case_id"], "expected_marker": expected_case_text(row)}
+                if (
+                    row["scenario_id"] == "C13"
+                    and contract == G08_EXECUTION_CONTRACT
+                ):
+                    observed.update(
+                        c13_request_evidence(
+                            startup_payload,
+                            contract=c13_case_contract(
+                                int(row["ordinal"]),
+                                variant=row["variant"],
+                            ),
+                        )
+                    )
                 execution_process_receipt = invocation_process_receipt
                 product_process_receipt = None
                 child_environment = sanitized_child_environment()
@@ -7640,6 +7933,7 @@ def execute_manifest(
                 actual_config_path=actual_config,
                 artifact_root=root,
                 require_c18_resource_balance=(contract == G08_EXECUTION_CONTRACT),
+                execution_contract_name=contract,
             )
             expectation = row["expectation"]
             expectation_error: str | None = None
@@ -8099,6 +8393,34 @@ def execute_manifest(
         blocked = sum(case["status"] == "blocked" for case in results)
         status = "blocked" if blocked else "known-fail" if known else "pass"
         assertions = selftest_assertions(scenario_id, len(results)) if status == "pass" else {"expected_failure_count": known + blocked, "unexpected_count": 0}
+        if (
+            scenario_id == "C13"
+            and status == "pass"
+            and contract == G08_EXECUTION_CONTRACT
+        ):
+            distinct_fields = {
+                "distinct_prompt_count": "c13_prompt_sha256",
+                "distinct_messages_count": "c13_messages_sha256",
+                "distinct_request_count": "c13_request_sha256",
+                "distinct_expression_count": "expression",
+                "distinct_result_count": "expected_tool_result",
+                "distinct_receipt_count": "expected_tool_receipt",
+                "distinct_tool_call_id_count": "tool_call_id",
+            }
+            assertions.update(
+                {
+                    "contract_id": C13_CONTRACT_ID,
+                    **{
+                        assertion_field: len(
+                            {
+                                case["observed"].get(observed_field)
+                                for case in results
+                            }
+                        )
+                        for assertion_field, observed_field in distinct_fields.items()
+                    },
+                }
+            )
         if scenario_id == "C09" and status == "pass":
             assertions.update(
                 {
@@ -9554,7 +9876,12 @@ class Handler(BaseHTTPRequestHandler):
             message = {"role": "assistant", "content": None, "tool_calls": [{"id": f"call-{case_id}", "type": "function", "function": {"name": "lookup_weather", "arguments": "{\"city\":\"Paris\"}"}}]}
             finish = "tool_calls"
         elif scenario == "C13":
-            message["content"] = "The tool result is 21."
+            tool_messages = [
+                item
+                for item in payload.get("messages", [])
+                if item.get("role") == "tool"
+            ]
+            message["content"] = f"The tool result is {tool_messages[-1]['content']}."
         elif scenario == "C14":
             prompt = payload["messages"][0]["content"]
             message["content"] = prompt.split(": return exactly this schema-valid object: ", 1)[1]
@@ -10538,7 +10865,302 @@ def self_test_stream_pair_contracts() -> None:
         )
 
 
+def self_test_c13_runner_contract() -> None:
+    payloads: list[dict[str, Any]] = []
+    cases: list[dict[str, Any]] = []
+    for ordinal in range(1, C13_CASE_COUNT + 1):
+        variant = (
+            "tool-result"
+            if ordinal <= 40
+            else "soft-think"
+            if ordinal <= 50
+            else "soft-no-think"
+        )
+        case = {
+            "case_id": f"c13-{ordinal:03d}",
+            "scenario_id": "C13",
+            "ordinal": ordinal,
+            "variant": variant,
+            "preset": "P_NO_THINKING" if ordinal <= 30 else "P_THINKING",
+        }
+        payload = case_http_payload(
+            case,
+            "m3-qwen3-30b-a3b",
+            execution_contract_name=G08_EXECUTION_CONTRACT,
+        )
+        contract = validate_c13_request(
+            payload,
+            ordinal=ordinal,
+            variant=variant,
+        )
+        require(
+            contract.evidence()["c13_messages_sha256"]
+            == canonical_json_sha256(payload["messages"]),
+            f"C13 case {ordinal} message digest is not canonical",
+        )
+        require(
+            payload.get("tools") == contract.tools()
+            and payload.get("tool_choice") == "auto",
+            f"C13 case {ordinal} did not preserve the real tool-loop contract",
+        )
+        if variant == "soft-think":
+            require(
+                contract.user_prompt.endswith("/think"),
+                f"C13 case {ordinal} did not render /think",
+            )
+        if variant == "soft-no-think":
+            require(
+                contract.user_prompt.endswith("/no_think"),
+                f"C13 case {ordinal} did not render /no_think",
+            )
+        cases.append(case)
+        payloads.append(payload)
+
+    for field in (
+        "expression",
+        "expected_tool_result",
+        "expected_tool_receipt",
+        "tool_call_id",
+        "c13_prompt_sha256",
+        "c13_messages_sha256",
+        "c13_request_sha256",
+    ):
+        values = [
+            c13_request_evidence(
+                payload,
+                contract=c13_case_contract(
+                    ordinal,
+                    variant=cases[ordinal - 1]["variant"],
+                ),
+            )[field]
+            for ordinal, payload in enumerate(payloads, start=1)
+        ]
+        require(
+            len(set(values)) == C13_CASE_COUNT,
+            f"C13 self-test corpus field {field} is not materially distinct",
+        )
+
+    partition: dict[tuple[str | None, str], int] = {}
+    for case in cases:
+        key = (case["preset"], case["variant"])
+        partition[key] = partition.get(key, 0) + 1
+    require(
+        partition == expected_c13_joint_partition("m3-qwen3-30b-a3b"),
+        "C13 self-test joint preset/variant partition drifted",
+    )
+    swapped_partition = dict(partition)
+    swapped_partition[("P_THINKING", "soft-no-think")] -= 1
+    swapped_partition[("P_NO_THINKING", "soft-no-think")] = 1
+    require(
+        swapped_partition != expected_c13_joint_partition("m3-qwen3-30b-a3b"),
+        "C13 joint partition mutation was not observable",
+    )
+    for model_key, invalid_count in (
+        ("m1-qwen35-4b", 41),
+        ("m2-qwen35-35b-a3b", 41),
+        ("m3-qwen3-30b-a3b", 61),
+    ):
+        try:
+            validate_c13_case_count(model_key, invalid_count)
+        except ScenarioError:
+            pass
+        else:
+            raise AssertionError(
+                f"C13 accepted invalid {model_key} case count {invalid_count}"
+            )
+
+    legacy_payload = case_http_payload(
+        cases[21],
+        "m3-qwen3-30b-a3b",
+        execution_contract_name=LEGACY_EXECUTION_CONTRACT,
+    )
+    require(
+        legacy_payload["messages"] == legacy_c13_messages()
+        and "g00_contract_id" not in legacy_payload["metadata"]
+        and "tools" not in legacy_payload
+        and "tool_choice" not in legacy_payload,
+        "C13 v2 leaked into the frozen legacy execution contract",
+    )
+
+    ordinal = 22
+    contract = c13_case_contract(ordinal, variant="tool-result")
+    payload = payloads[ordinal - 1]
+    observed = {
+        "case_id": contract.case_id,
+        "expected_marker": f"G00-{contract.case_id}-OK",
+        **c13_request_evidence(payload, contract=contract),
+    }
+
+    def transcript_for(
+        request: dict[str, Any],
+        message: dict[str, Any],
+        *,
+        finish_reason: str = "stop",
+    ) -> dict[str, Any]:
+        return {
+            "case_id": contract.case_id,
+            "exchanges": [
+                {
+                    "request": request,
+                    "status": 200,
+                    "response": {
+                        "id": f"chatcmpl-{contract.case_id}",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": message,
+                                "finish_reason": finish_reason,
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 32,
+                            "completion_tokens": 6,
+                            "total_tokens": 38,
+                        },
+                    },
+                }
+            ],
+        }
+
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-c13-contract-") as tmp:
+        stdout_path = Path(tmp) / "stdout.log"
+        stdout_path.write_text("{}\n", encoding="utf-8")
+        valid_message = {
+            "role": "assistant",
+            "content": (
+                f"The tool result is {contract.expected_result}; "
+                f"receipt {contract.expected_receipt}."
+            ),
+        }
+        validate_case_output(
+            "C13",
+            "tool-result",
+            "serve",
+            stdout_path,
+            transcript_for(payload, valid_message),
+            observed,
+            "C13 runner positive fixture",
+            input_document=payload,
+            execution_contract_name=G08_EXECUTION_CONTRACT,
+        )
+        validate_case_output(
+            "C13",
+            "tool-result",
+            "serve",
+            stdout_path,
+            transcript_for(
+                legacy_payload,
+                {"role": "assistant", "content": "The tool result is 21."},
+            ),
+            {
+                "case_id": contract.case_id,
+                "expected_marker": f"G00-{contract.case_id}-OK",
+            },
+            "C13 frozen legacy fixture",
+            input_document=legacy_payload,
+            execution_contract_name=LEGACY_EXECUTION_CONTRACT,
+        )
+
+        invalid_fixtures: list[
+            tuple[str, dict[str, Any], dict[str, Any], str]
+        ] = []
+        tampered_payload = copy.deepcopy(payload)
+        tampered_payload["messages"][0]["content"] = "Use the calculator."
+        invalid_fixtures.append(
+            (
+                "tampered request",
+                tampered_payload,
+                valid_message,
+                "messages differ",
+            )
+        )
+        invalid_fixtures.append(
+            (
+                "missing result",
+                payload,
+                {
+                    "role": "assistant",
+                    "content": "Please provide an expression.",
+                },
+                "did not incorporate tool result",
+            )
+        )
+        invalid_fixtures.append(
+            (
+                "duplicate tool call",
+                payload,
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"The result is {contract.expected_result}; "
+                        f"receipt {contract.expected_receipt}."
+                    ),
+                    "tool_calls": [
+                        {
+                            "id": "duplicate",
+                            "type": "function",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                "repeated a tool call",
+            )
+        )
+        for fixture_name, request, message, marker in invalid_fixtures:
+            failure = capture_case_output_error(
+                lambda request=request, message=message: validate_case_output(
+                    "C13",
+                    "tool-result",
+                    "serve",
+                    stdout_path,
+                    transcript_for(request, message),
+                    observed,
+                    f"C13 runner {fixture_name} fixture",
+                    input_document=request,
+                    execution_contract_name=G08_EXECUTION_CONTRACT,
+                )
+            )
+            require(
+                isinstance(failure, ScenarioError)
+                and marker in str(failure),
+                f"C13 runner accepted {fixture_name}: {failure}",
+            )
+
+        smuggled = transcript_for(
+            payload,
+            {"role": "assistant", "content": "Please provide an expression."},
+        )
+        smuggled["exchanges"].append(
+            transcript_for(payload, valid_message)["exchanges"][0]
+        )
+        smuggled_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C13",
+                "tool-result",
+                "serve",
+                stdout_path,
+                smuggled,
+                observed,
+                "C13 runner smuggled response fixture",
+                input_document=payload,
+                execution_contract_name=G08_EXECUTION_CONTRACT,
+            )
+        )
+        require(
+            isinstance(smuggled_failure, ScenarioError)
+            and "exactly one request/response exchange"
+            in str(smuggled_failure),
+            f"C13 runner accepted a smuggled second response: {smuggled_failure}",
+        )
+
+
 def self_test() -> int:
+    self_test_c13_contract()
+    self_test_c13_runner_contract()
     self_test_c18_trace_scope()
     self_test_stream_pair_contracts()
     validate_c17_markers()
@@ -11259,6 +11881,13 @@ def self_test() -> int:
             report_path=out,
             allow_internal_fixture=True,
             require_current_output_path=True,
+        )
+        expect_reject(
+            report,
+            root,
+            "missing-runner-dependency",
+            lambda value: value["runner"]["dependencies"].pop(),
+            "internal fixture runner identity mismatch",
         )
         try:
             validate_report_document(report, root, report_path=out)
