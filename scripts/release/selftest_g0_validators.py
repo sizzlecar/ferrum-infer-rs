@@ -24,6 +24,12 @@ RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_ti
 RUNTIME_VNEXT_CUDA_CORRECTNESS_BUILD = (
     REPO_ROOT / "scripts/release/runtime_vnext_cuda_correctness_build.py"
 )
+RUNTIME_VNEXT_C13_VLLM_REFERENCE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_c13_vllm_reference.py"
+)
+RUNTIME_VNEXT_C13_LOGITS_REFERENCE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_c13_logits_reference.py"
+)
 JSONL_PRODUCT_SESSION = REPO_ROOT / "scripts/release/jsonl_product_session.py"
 RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
 RUNTIME_VNEXT_EXPECTATION_AMENDMENT = REPO_ROOT / "scripts/release/runtime_vnext_expectation_amendment.py"
@@ -432,6 +438,25 @@ def test_runtime_vnext_cuda_correctness_build_selftest() -> None:
     )
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_c13_reference_selftests() -> None:
+    collector = run(
+        [sys.executable, str(RUNTIME_VNEXT_C13_VLLM_REFERENCE), "--self-test"]
+    )
+    require(collector.returncode == 0, collector.stderr or collector.stdout)
+    require(
+        "FERRUM C13 VLLM RAW LOGITS REFERENCE PASS" in collector.stdout,
+        collector.stdout,
+    )
+    comparator = run(
+        [sys.executable, str(RUNTIME_VNEXT_C13_LOGITS_REFERENCE), "--self-test"]
+    )
+    require(comparator.returncode == 0, comparator.stderr or comparator.stdout)
+    require(
+        "FERRUM C13 LOGITS REFERENCE SELF-TEST PASS" in comparator.stdout,
+        comparator.stdout,
+    )
 
 
 def test_jsonl_product_session_selftest() -> None:
@@ -1087,6 +1112,7 @@ def main() -> int:
     test_runtime_vnext_hardware_probe_selftest()
     test_runtime_vnext_build_timing_selftest()
     test_runtime_vnext_cuda_correctness_build_selftest()
+    test_runtime_vnext_c13_reference_selftests()
     test_jsonl_product_session_selftest()
     test_runtime_vnext_baseline_scenarios_selftest()
     test_runtime_vnext_expectation_amendment_selftest()
