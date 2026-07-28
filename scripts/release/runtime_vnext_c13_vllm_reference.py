@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect a provenance-bound vLLM raw-logits reference for one C13 request."""
+"""Collect a vLLM raw-logits reference for the historical C13 failure."""
 
 from __future__ import annotations
 
@@ -24,10 +24,12 @@ COLLECTOR_ID = "ferrum.runtime-vnext.c13-vllm-raw-logits.v1"
 TOKEN_SPAN_DOMAIN = b"ferrum.runtime-vnext.token-span-work.v3\0"
 PASS_LINE = "FERRUM C13 VLLM RAW LOGITS REFERENCE PASS"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-C13_REQUEST = (
+HISTORICAL_C13_REQUEST = (
     REPO_ROOT / "scripts/release/configs/runtime_vnext_c13_022_reference.json"
 )
-C13_REQUEST_SHA256 = "fa92ee4502f97a2d020d9c3d1123be53d2e0825410d6fe0321c19654eddb419e"
+HISTORICAL_C13_REQUEST_SHA256 = (
+    "fa92ee4502f97a2d020d9c3d1123be53d2e0825410d6fe0321c19654eddb419e"
+)
 
 
 class ReferenceError(RuntimeError):
@@ -159,8 +161,8 @@ def collect(args: argparse.Namespace) -> Path:
     snapshot_revision(model_path, args.model_revision, "model")
     snapshot_revision(tokenizer_path, args.tokenizer_revision, "tokenizer")
     require(
-        sha256_file(request_path) == C13_REQUEST_SHA256,
-        "request does not match the checked-in canonical c13-022 input",
+        sha256_file(request_path) == HISTORICAL_C13_REQUEST_SHA256,
+        "request does not match the checked-in historical c13-022 failure input",
     )
     request = load_object(request_path)
     messages = request.get("messages")
@@ -358,10 +360,14 @@ def collect(args: argparse.Namespace) -> Path:
 
 
 def self_test() -> None:
-    require(C13_REQUEST.is_file(), "checked-in canonical c13-022 request is missing")
     require(
-        sha256_file(C13_REQUEST) == C13_REQUEST_SHA256,
-        "checked-in canonical c13-022 request SHA256 drifted",
+        HISTORICAL_C13_REQUEST.is_file(),
+        "checked-in historical c13-022 failure request is missing",
+    )
+    require(
+        sha256_file(HISTORICAL_C13_REQUEST)
+        == HISTORICAL_C13_REQUEST_SHA256,
+        "checked-in historical c13-022 failure request SHA256 drifted",
     )
     expected = "4bb2e94bd2076d0f6f2663ccdbf7e63abc4bc809462d5f940f1132cfdeccddeb"
     require(
