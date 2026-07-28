@@ -23,7 +23,13 @@ OUT_SO="${OUT_SO:-/workspace/libferrum_fa2_source_shim.so}"
 BUILD_DIR="${BUILD_DIR:-/tmp/ferrum-fa2-source-shim-build}"
 CUDA_ROOT="${CUDA_ROOT:-/usr/local/cuda}"
 CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-89}"
-NVCC_THREADS="${FERRUM_NVCC_THREADS:-0}"
+NVCC_THREADS="${FERRUM_NVCC_THREADS:-4}"
+
+if [[ ! "$NVCC_THREADS" =~ ^[0-9]+$ ]] ||
+   (( NVCC_THREADS < 1 || NVCC_THREADS > 8 )); then
+  echo "FERRUM_NVCC_THREADS must be an integer in [1, 8]" >&2
+  exit 1
+fi
 
 if [[ -z "$FA_SRC_DIR" ]]; then
   echo "FA_SRC_DIR must point at a FlashAttention source checkout for this legacy diagnostic" >&2
