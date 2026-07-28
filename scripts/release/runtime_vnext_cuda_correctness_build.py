@@ -9,6 +9,7 @@ evidence can do that.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -882,6 +883,16 @@ def read_json_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def read_typed_effective_config(path: Path, label: str) -> dict[str, Any]:
+    document = read_json_object(path, label)
+    typed = document.get("typed_effective_config")
+    require(
+        isinstance(typed, dict) and typed,
+        f"{label} typed_effective_config must be a non-empty JSON object",
+    )
+    return typed
+
+
 def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     build_manifest_path = args.build_manifest.expanduser().resolve()
     execution_manifest_path = args.execution_manifest.expanduser().resolve()
@@ -1005,8 +1016,20 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         "correctness typed effective config",
         expected_kind="raw-json",
     )
+    reference_effective = plan_reference.resolve_file_ref(
+        reference_path.parent,
+        reference["inputs"]["typed-effective-config.json"],
+        "release reference typed effective config",
+    )
     require(
-        sha256(execution_effective) == reference.get("typed_effective_config_sha256"),
+        read_typed_effective_config(
+            execution_effective,
+            "correctness typed effective config",
+        )
+        == read_typed_effective_config(
+            reference_effective,
+            "release reference typed effective config",
+        ),
         "release reference and correctness typed effective configs differ",
     )
 
@@ -1127,6 +1150,62 @@ def self_test() -> None:
 
     with tempfile.TemporaryDirectory(prefix="ferrum-cuda-correctness-build-") as raw:
         root = Path(raw)
+        release_effective = root / "release-effective.json"
+        correctness_effective = root / "correctness-effective.json"
+        typed_config = {
+            "composition_contract": "resolved-model-plan-vnext",
+            "run": {"backend": "cuda", "gpu_devices": [0]},
+            "serve": {
+                "backend": "cuda",
+                "gpu_devices": [0],
+                "served_model_name": REFERENCE_MODEL_KEY,
+            },
+        }
+        write_json(
+            release_effective,
+            {
+                "binary_sha256": "a" * 64,
+                "typed_effective_config": typed_config,
+            },
+        )
+        write_json(
+            correctness_effective,
+            {
+                "binary_sha256": "b" * 64,
+                "typed_effective_config": typed_config,
+            },
+        )
+        require(
+            read_typed_effective_config(
+                release_effective,
+                "release effective fixture",
+            )
+            == read_typed_effective_config(
+                correctness_effective,
+                "correctness effective fixture",
+            ),
+            "binary identity leaked into the typed effective config contract",
+        )
+        changed_typed_config = copy.deepcopy(typed_config)
+        changed_typed_config["serve"]["gpu_devices"] = [1]
+        write_json(
+            correctness_effective,
+            {
+                "binary_sha256": "b" * 64,
+                "typed_effective_config": changed_typed_config,
+            },
+        )
+        require(
+            read_typed_effective_config(
+                release_effective,
+                "release effective fixture",
+            )
+            != read_typed_effective_config(
+                correctness_effective,
+                "changed correctness effective fixture",
+            ),
+            "typed effective config drift was normalized away",
+        )
         source = root / "source"
         source.mkdir()
         (source / "Cargo.toml").write_text(
@@ -1205,6 +1284,27 @@ strip = false
         source_git_sha = fixture["source_git_sha"]
         source_tree_sha = fixture["source_tree_sha"]
         plan_hash = fixture["plan_hash"]
+        fixture_effective = execution_root / "effective-config.json"
+        write_json(
+            fixture_effective,
+            {
+                "schema_version": 1,
+                "execution_contract": plan_reference.EXECUTION_CONTRACT,
+                "typed_effective_config": typed_config,
+            },
+        )
+        fixture_execution = read_json_object(
+            execution_manifest_path,
+            "fixture execution manifest",
+        )
+        fixture_execution["effective_config"] = (
+            plan_reference.execution_artifact_ref(
+                fixture_effective,
+                execution_root,
+                "raw-json",
+            )
+        )
+        write_json(execution_manifest_path, fixture_execution)
         execution_document = read_json_object(
             execution_manifest_path,
             "fixture execution manifest",
