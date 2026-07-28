@@ -9,7 +9,6 @@ import json
 import os
 import subprocess
 import tempfile
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -150,17 +149,37 @@ def validate_compat_graph(metadata: dict[str, Any]) -> dict[str, Any]:
     return {name: rows[name] for name in (*WORKSPACE_PACKAGES, *CANDLE_PACKAGES)}
 
 
-def validate_feature_declarations(source_root: Path) -> dict[str, Any]:
-    manifests = {
-        "ferrum-kernels": source_root / "crates/ferrum-kernels/Cargo.toml",
-        "ferrum-models": source_root / "crates/ferrum-models/Cargo.toml",
-        "ferrum-engine": source_root / "crates/ferrum-engine/Cargo.toml",
-        "ferrum-cli": source_root / "crates/ferrum-cli/Cargo.toml",
-    }
+def validate_feature_declarations(
+    source_root: Path, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    packages = metadata.get("packages")
+    require(isinstance(packages, list), "cargo metadata packages must be a list")
+    by_name: dict[str, dict[str, Any]] = {}
+    for package in packages:
+        require(isinstance(package, dict), "cargo metadata package must be an object")
+        name = package.get("name")
+        if name not in WORKSPACE_PACKAGES:
+            continue
+        require(name not in by_name, f"cargo metadata contains duplicate workspace package {name}")
+        by_name[name] = package
+
     result = {}
-    for name, path in manifests.items():
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-        features = data.get("features")
+    for name in WORKSPACE_PACKAGES:
+        package = by_name.get(name)
+        require(package is not None, f"cargo metadata is missing workspace package {name}")
+        manifest_path = package.get("manifest_path")
+        require(
+            isinstance(manifest_path, str) and manifest_path,
+            f"{name} cargo metadata is missing manifest_path",
+        )
+        path = Path(manifest_path).resolve()
+        try:
+            relative_manifest = path.relative_to(source_root)
+        except ValueError as error:
+            raise BoundaryError(
+                f"{name} manifest escapes source root: {manifest_path}"
+            ) from error
+        features = package.get("features")
         require(isinstance(features, dict), f"{name} manifest is missing features")
         cuda = features.get("cuda")
         compat = features.get("candle-cuda-compat")
@@ -178,7 +197,7 @@ def validate_feature_declarations(source_root: Path) -> dict[str, Any]:
             f"{name}/candle-cuda-compat does not forward a CUDA compatibility feature",
         )
         result[name] = {
-            "manifest": path.relative_to(source_root).as_posix(),
+            "manifest": relative_manifest.as_posix(),
             "cuda": cuda,
             "candle_cuda_compat": compat,
         }
@@ -258,7 +277,7 @@ def run_gate(source_root: Path, out: Path, allow_dirty: bool) -> None:
         "official_graph": validate_official_graph(official),
         "compat_features": [*CUDA_RELEASE_FEATURES, "candle-cuda-compat"],
         "compat_graph": validate_compat_graph(compat),
-        "feature_declarations": validate_feature_declarations(source_root),
+        "feature_declarations": validate_feature_declarations(source_root, official),
     }
     report_path = out / "report.json"
     write_json(report_path, report)
@@ -286,8 +305,21 @@ def fake_metadata(*, compat: bool) -> dict[str, Any]:
         names.append("candle-kernels")
     for index, name in enumerate(names):
         package_id = f"{name} 1.0.0 (path+file:///fixture/{index})"
+        declared_features: dict[str, list[str]] = {}
+        if name in WORKSPACE_PACKAGES:
+            declared_features = {
+                "cuda": ["dep:cudarc"],
+                "candle-cuda-compat": ["cuda", "candle-core/cuda"],
+            }
         packages.append(
-            {"id": package_id, "name": name, "version": "1.0.0", "source": None}
+            {
+                "id": package_id,
+                "name": name,
+                "version": "1.0.0",
+                "source": None,
+                "manifest_path": f"/fixture/crates/{name}/Cargo.toml",
+                "features": declared_features,
+            }
         )
         features = ["default"]
         if name in WORKSPACE_PACKAGES:
@@ -303,8 +335,10 @@ def fake_metadata(*, compat: bool) -> dict[str, Any]:
 
 
 def self_test() -> None:
-    validate_official_graph(fake_metadata(compat=False))
+    official = fake_metadata(compat=False)
+    validate_official_graph(official)
     validate_compat_graph(fake_metadata(compat=True))
+    validate_feature_declarations(Path("/fixture"), official)
     bad = fake_metadata(compat=False)
     candle_core = next(
         node for node in bad["resolve"]["nodes"] if node["id"].startswith("candle-core ")
@@ -333,6 +367,22 @@ def self_test() -> None:
         require("candle-kernels" in str(error), f"unexpected compat mutation error: {error}")
     else:
         raise AssertionError("missing compat Candle kernels unexpectedly passed")
+    bad_declaration = fake_metadata(compat=False)
+    kernels_package = next(
+        package
+        for package in bad_declaration["packages"]
+        if package["name"] == "ferrum-kernels"
+    )
+    kernels_package["features"]["cuda"].append("candle-core/cuda")
+    try:
+        validate_feature_declarations(Path("/fixture"), bad_declaration)
+    except BoundaryError as error:
+        require(
+            "directly enables Candle CUDA" in str(error),
+            f"unexpected declaration mutation error: {error}",
+        )
+    else:
+        raise AssertionError("Candle CUDA feature declaration mutation unexpectedly passed")
     print(SELFTEST_PASS)
 
 
