@@ -23,6 +23,40 @@ const ENTRY_LOCK_WAIT: Duration = Duration::from_secs(30);
 const ENTRY_LOCK_POLL: Duration = Duration::from_millis(25);
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 
+/// Accept a legacy signature only when removing one obsolete numeric field
+/// makes every remaining line exactly equal to the canonical signature.
+pub fn legacy_signature_matches_without_numeric_line(
+    legacy: &str,
+    canonical: &str,
+    line_prefix: &str,
+) -> bool {
+    if line_prefix.is_empty()
+        || line_prefix.contains('\n')
+        || canonical
+            .split('\n')
+            .any(|line| line.starts_with(line_prefix))
+    {
+        return false;
+    }
+
+    let mut removed = 0_u8;
+    let mut retained = Vec::new();
+    for line in legacy.split('\n') {
+        let Some(value) = line.strip_prefix(line_prefix) else {
+            retained.push(line);
+            continue;
+        };
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        removed = removed.saturating_add(1);
+        if removed != 1 {
+            return false;
+        }
+    }
+    removed == 1 && retained == canonical.split('\n').collect::<Vec<_>>()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeBuildArtifactSpec {
     artifact_id: String,
@@ -864,6 +898,47 @@ mod tests {
                 reason: "entry-absent"
             }
         );
+    }
+
+    #[test]
+    fn legacy_numeric_signature_field_can_be_removed_exactly_once() {
+        let canonical = "label=marlin\nflag=arch=compute_80\nsource=abc\ntoolchain=def";
+        for compute_capability in ["80", "89", "120"] {
+            let legacy = format!(
+                "label=marlin\nflag=arch=compute_80\n\
+                 flag=reported_compute_cap={compute_capability}\n\
+                 source=abc\ntoolchain=def"
+            );
+            assert!(legacy_signature_matches_without_numeric_line(
+                &legacy,
+                canonical,
+                "flag=reported_compute_cap=",
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_numeric_signature_migration_rejects_other_drift() {
+        let canonical = "label=marlin\nflag=arch=compute_80\nsource=abc\ntoolchain=def";
+        let hostile = [
+            "label=marlin\nflag=arch=compute_80\nsource=abc\ntoolchain=def",
+            "label=marlin\nflag=arch=compute_80\nflag=reported_compute_cap=\nsource=abc\ntoolchain=def",
+            "label=marlin\nflag=arch=compute_80\nflag=reported_compute_cap=sm_89\nsource=abc\ntoolchain=def",
+            "label=marlin\nflag=arch=compute_80\nflag=reported_compute_cap=80\nflag=reported_compute_cap=89\nsource=abc\ntoolchain=def",
+            "label=marlin\nflag=arch=compute_80\nflag=reported_compute_cap=89\nsource=tampered\ntoolchain=def",
+        ];
+        for legacy in hostile {
+            assert!(!legacy_signature_matches_without_numeric_line(
+                legacy,
+                canonical,
+                "flag=reported_compute_cap=",
+            ));
+        }
+        assert!(!legacy_signature_matches_without_numeric_line(
+            "label=marlin\nflag=reported_compute_cap=89\nsource=abc",
+            "label=marlin\nflag=reported_compute_cap=89\nsource=abc",
+            "flag=reported_compute_cap=",
+        ));
     }
 
     #[test]

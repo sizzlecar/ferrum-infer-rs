@@ -21,6 +21,21 @@ fn native_artifact_identity_excludes_nvcc_worker_parallelism() {
 }
 
 #[test]
+fn fixed_arch_marlin_identity_excludes_reported_device_capability() {
+    let compile_marlin = BUILD_SCRIPT_SOURCE
+        .split("fn compile_marlin(")
+        .nth(1)
+        .expect("build script must define compile_marlin")
+        .split("\nfn ")
+        .next()
+        .expect("compile_marlin must have a bounded body");
+    assert!(compile_marlin.contains("\"arch=compute_80\""));
+    assert!(!compile_marlin.contains("format!(\"reported_compute_cap="));
+    assert!(compile_marlin.contains("Some(\"flag=reported_compute_cap=\")"));
+    assert!(BUILD_SCRIPT_SOURCE.contains("legacy_signature_matches_without_numeric_line"));
+}
+
+#[test]
 fn causal_pages_are_fence_dependencies_not_captured_regions() {
     let retained = [
         "compute_fence_dependencies",
