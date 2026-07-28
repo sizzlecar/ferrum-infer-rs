@@ -83,20 +83,45 @@ key 绑定 source/header SHA256、SM、CUDA headers、`nvcc`/host compiler/archi
 `quant_utils_stub.cuh` 也已进入 invalidation closure。构建阶段只能打印
 `FERRUM CUDA CORRECTNESS BINARY READY`，不能形成 PASS；只有 build/execution/focused
 三份 manifest 的 source 与 binary SHA256 一致，并且实际 `ferrum serve` trace 中所有
-`vnext.plan_built` hash 精确等于
-`54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`，
-validator 才能打印 semantic trace PASS。该 source checkpoint 的本地聚焦测试已通过；
+`vnext.plan_built` hash 精确等于经审计的 release reference，validator 才能打印 semantic
+trace PASS。该 source checkpoint 的本地聚焦测试已通过；
 在 `b0431ca5` 上复用同一 native cache 的 CUDA binary rebuild 约 `6s` 完成，证明
 correctness 开发构建不再必然等待完整 native rebuild。G07A 的 semantic trace、p95
 和 workspace gate 仍须按其正式验收单独关闭，不能由 G08B correctness PASS 代替。
 
+`54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`
+现在只保留为旧源码的 historical release reference。`f9bb4070` 修改了被 CUDA runtime
+implementation fingerprint 覆盖的 replay/runtime 源码；clean `645a4371` 的实际
+`c13-022` 产品请求通过并打印 focused `KEEP`，其唯一 plan hash 为
+`96efe5ea30955542290d58ea76d4768a46c79886391cf06ffb538e16b726b586`。
+旧 semantic validator 因仍携带 `54963e...` 而 REJECT；这证明旧 reference 已 stale，
+不表示该产品请求发生 correctness 回归。证据通过 GitHub draft-release asset
+`cuda-c13-022-645a4371.tar.zst` 保存，archive SHA256 为
+`c4f3a4ffe7e068c6ca8b025e44b09ed6d601eec80dae73e25bad0db0997a22e5`。
+
+clean、已推送 source `fae4f6e777a2b6538f9382af9aa74ee8196ca21c`
+新增独立 `runtime_vnext_plan_reference.py`：reference capture 必须绑定 clean
+source/tree、M2 model revision 与文件锁、typed/actual effective config、固定硬件、
+官方 release build receipt、release binary SHA256、focused report 和真实 scheduler
+trace。correctness build 不再接受裸 plan hash，而是复制并再次验证完整 reference；
+reference source 只能等于或祖先于 candidate，最终 trace plan identity 仍必须精确相等。
+伪造 plan identity、同步伪造 `plan_id`、更新外层文件哈希后把 build mode 改成 debug
+均被负例拒绝。完整场景自测在
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-plan-reference-local-20260728/baseline-selftest-r2`
+用时 `177.685141s`，峰值 `3` processes / `34` group threads /
+`17` per-process threads，无 violation、进程组清理成功，并打印
+`FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS`。这是 source/test-system
+checkpoint，不是 G07、G08B 或 CUDA hardware PASS。
+
 paid inventory 已核对：RTX 4090 实例 `46083877` 与 `45897840` 均为
 `cur_state=stopped`、`actual_status=exited`，`potentially_billable=[]`。M2 CUDA
 correctness lane 已关闭；除非相关源码再次变化，不再重跑 focused C13 或 703 全量。
-下一 CUDA 主线是验证并决定是否合入 `diagnostic/g06-replay-correlation` 的 clean
-commit `7191abc1`，随后继续剩余模型/后端 correctness 和 exact-precision
-performance。historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充
-当前 C13 replay；禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑全量。
+下一 CUDA 只允许在同一 clean SHA、同一硬件和同一 typed config 上先生成 release
+reference，再用 `cuda-correctness` binary 重放 exact `c13-022`；stop condition 是 native
+rebuild、build deadline、reference REJECT、plan mismatch 或 focused result。该对照关闭后
+再继续 G06 replay correlation、剩余模型/后端 correctness 和 exact-precision
+performance。historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充当前
+C13 replay；禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑全量。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
