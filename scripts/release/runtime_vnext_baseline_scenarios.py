@@ -304,9 +304,13 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def json_document_bytes(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_bytes(json_document_bytes(value))
 
 
 def iso_now() -> str:
@@ -2642,6 +2646,38 @@ def validate_case_evidence(
     require(checks.get("execution_envelope") is True and checks.get("model_binding") is True, f"case {case_id} execution/model checks failed")
     require(checks.get("scenario_oracle") is (case["status"] == "pass"), f"case {case_id} scenario oracle status mismatch")
     transcript = resolved.get("http_transcript", (Path(), None))[1]
+    if entrypoint == "serve" and (
+        not expected["allow_internal_fixture"] or envelope_ref is not None
+    ):
+        transcript_object = require_object(
+            transcript, f"case {case_id}.http_transcript"
+        )
+        exchanges = require_list(
+            transcript_object.get("exchanges"),
+            f"case {case_id}.http_transcript.exchanges",
+        )
+        require(exchanges, f"case {case_id} HTTP transcript has no exchanges")
+        for index, exchange_raw in enumerate(exchanges):
+            validate_http_exchange_request_body(
+                exchange_raw,
+                f"case {case_id}.exchange[{index}]",
+            )
+        if scenario_id != "C18":
+            bound_exchange = (
+                exchanges[-1]
+                if (
+                    scenario_id in {"C06", "C12", "C17"}
+                    or (scenario_id == "C21" and variant == "serve-stream")
+                )
+                else exchanges[0]
+            )
+            require(
+                require_object(
+                    bound_exchange, f"case {case_id}.bound_exchange"
+                ).get("request_body_sha256")
+                == file_sha256(resolved["input"][0]),
+                f"case {case_id} transmitted request bytes differ from persisted input",
+            )
     if scenario_id in {"C09", "C18"} and (not expected["allow_internal_fixture"] or envelope_ref is not None):
         transcript_object = require_object(transcript, f"case {case_id}.http_transcript")
         trace_rows = scheduler_trace_rows_for_status(
@@ -4682,7 +4718,7 @@ def http_exchange(
     *,
     read_chunk_size: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    data = json_document_bytes(payload)
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions",
         data=data,
@@ -4718,6 +4754,8 @@ def http_exchange(
     finished = iso_now()
     exchange = {
         "request": payload,
+        "request_body_sha256": hashlib.sha256(data).hexdigest(),
+        "request_body_bytes": len(data),
         "status": status,
         "response_headers": headers,
         "response": parse_http_body(body),
@@ -4733,6 +4771,35 @@ def http_exchange(
         exchange["utf8_split_boundary_count"] = split_boundaries
         exchange["wire_sha256"] = hashlib.sha256(b"".join(wire_chunks)).hexdigest()
     return exchange, {"started_at": started, "finished_at": finished, "started_monotonic_ns": start_ns, "finished_monotonic_ns": finish_ns}
+
+
+def validate_http_exchange_request_body(raw: Any, label: str) -> bytes:
+    exchange = require_object(raw, label)
+    request_payload = require_object(exchange.get("request"), f"{label}.request")
+    request_bytes = json_document_bytes(request_payload)
+    require(
+        exchange.get("request_body_sha256")
+        == hashlib.sha256(request_bytes).hexdigest(),
+        f"{label} request body SHA mismatch",
+    )
+    require(
+        exchange.get("request_body_bytes") == len(request_bytes),
+        f"{label} request body length mismatch",
+    )
+    return request_bytes
+
+
+def refresh_http_transcript_request_body_bindings(transcript: dict[str, Any]) -> None:
+    for index, exchange_raw in enumerate(
+        require_list(transcript.get("exchanges"), "HTTP transcript exchanges")
+    ):
+        exchange = require_object(exchange_raw, f"HTTP transcript exchange[{index}]")
+        request_payload = require_object(
+            exchange.get("request"), f"HTTP transcript exchange[{index}].request"
+        )
+        request_bytes = json_document_bytes(request_payload)
+        exchange["request_body_sha256"] = hashlib.sha256(request_bytes).hexdigest()
+        exchange["request_body_bytes"] = len(request_bytes)
 
 
 def http_get_json(url: str, timeout_sec: float) -> tuple[int, dict[str, Any]]:
@@ -5951,7 +6018,7 @@ def aborted_http_exchange(
     trace_offset: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     parsed = urllib.parse.urlsplit(base_url)
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    body = json_document_bytes(payload)
     request = (
         f"POST /v1/chat/completions HTTP/1.1\r\nHost: {parsed.hostname}\r\nContent-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
@@ -6008,6 +6075,8 @@ def aborted_http_exchange(
     finished_ns = time.monotonic_ns()
     exchange = {
         "request": payload,
+        "request_body_sha256": hashlib.sha256(body).hexdigest(),
+        "request_body_bytes": len(body),
         "status": 499,
         "status_source": "runner_client_abort",
         "response_headers": {},
@@ -10434,6 +10503,7 @@ def persist_transcript_mutation(
     transcript: dict[str, Any],
 ) -> None:
     transcript_path = root / case["artifacts"]["http_transcript"]["path"]
+    refresh_http_transcript_request_body_bindings(transcript)
     write_json(transcript_path, transcript)
     update_ref_sha(case["artifacts"]["http_transcript"], root)
     update_ref_sha(envelope["http_transcript"], root)
@@ -11158,9 +11228,96 @@ def self_test_c13_runner_contract() -> None:
         )
 
 
+def self_test_http_request_byte_binding() -> None:
+    case = {
+        "case_id": "c13-038",
+        "scenario_id": "C13",
+        "ordinal": 38,
+        "variant": "tool-result",
+        "preset": "P_THINKING",
+    }
+    payload = case_http_payload(
+        case,
+        "m2-qwen35-35b-a3b",
+        execution_contract_name=G08_EXECUTION_CONTRACT,
+    )
+    request_bytes = json_document_bytes(payload)
+    require(
+        hashlib.sha256(request_bytes).hexdigest()
+        == "3bf53c8f9b72b97cf1f572125a98ec4da0182be3f057f18b46e589afbd40b0e6",
+        "C13-038 canonical request bytes drifted",
+    )
+    captured: dict[str, bytes | None] = {}
+
+    class FakeResponse:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def read(self, *_: Any) -> bytes:
+            return b'{"choices":[]}'
+
+    original_urlopen = urllib.request.urlopen
+
+    def capture_urlopen(
+        request: urllib.request.Request,
+        *,
+        timeout: float,
+    ) -> FakeResponse:
+        captured["data"] = request.data
+        require(timeout == 7.0, "HTTP client timeout binding drifted")
+        return FakeResponse()
+
+    urllib.request.urlopen = capture_urlopen
+    try:
+        observed_exchange, _ = http_exchange(
+            "http://127.0.0.1:1",
+            payload,
+            7.0,
+        )
+    finally:
+        urllib.request.urlopen = original_urlopen
+    require(
+        captured.get("data") == request_bytes,
+        "HTTP client did not transmit the canonical request bytes",
+    )
+    require(
+        validate_http_exchange_request_body(
+            observed_exchange, "captured HTTP request byte binding fixture"
+        )
+        == request_bytes,
+        "HTTP transcript did not bind the transmitted request bytes",
+    )
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-request-bytes-") as tmp:
+        input_path = Path(tmp) / "input.json"
+        write_json(input_path, payload)
+        require(
+            input_path.read_bytes() == request_bytes,
+            "persisted input bytes differ from transmitted request bytes",
+        )
+    tampered = copy.deepcopy(observed_exchange)
+    tampered["request_body_sha256"] = "0" * 64
+    failure = capture_case_output_error(
+        lambda: validate_http_exchange_request_body(
+            tampered, "tampered request byte binding fixture"
+        )
+    )
+    require(
+        isinstance(failure, ScenarioError)
+        and "request body SHA mismatch" in str(failure),
+        f"request byte binding validator accepted a forged digest: {failure}",
+    )
+
+
 def self_test() -> int:
     self_test_c13_contract()
     self_test_c13_runner_contract()
+    self_test_http_request_byte_binding()
     self_test_c18_trace_scope()
     self_test_stream_pair_contracts()
     validate_c17_markers()
