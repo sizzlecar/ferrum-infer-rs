@@ -947,9 +947,12 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         "semantic input is not a scheduler-trace JSONL file",
     )
     execution_binary_ref = execution.get("binary_artifact")
-    require(isinstance(execution_binary_ref, dict), "execution binary_artifact is missing")
-    execution_binary = execution_root / str(execution_binary_ref.get("path", ""))
-    require(execution_binary.is_file(), f"execution binary is missing: {execution_binary}")
+    execution_binary = plan_reference.resolve_execution_artifact_ref(
+        execution_root,
+        execution_binary_ref,
+        "correctness execution binary",
+        expected_kind="binary",
+    )
     execution_binary_sha256 = sha256(execution_binary)
     require(
         execution_binary_sha256
@@ -996,10 +999,11 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         == reference.get("model_files_sha256"),
         "release reference and correctness execution model locks differ",
     )
-    execution_effective = resolve_file_ref(
+    execution_effective = plan_reference.resolve_execution_artifact_ref(
         execution_root,
         execution.get("effective_config"),
         "correctness typed effective config",
+        expected_kind="raw-json",
     )
     require(
         sha256(execution_effective) == reference.get("typed_effective_config_sha256"),
@@ -1205,10 +1209,11 @@ strip = false
             execution_manifest_path,
             "fixture execution manifest",
         )
-        execution_binary = plan_reference.resolve_file_ref(
+        execution_binary = plan_reference.resolve_execution_artifact_ref(
             execution_root,
             execution_document["binary_artifact"],
             "fixture execution binary",
+            expected_kind="binary",
         )
         binary_bytes = execution_binary.read_bytes()
         reference_artifact = root / "release-plan-reference"
