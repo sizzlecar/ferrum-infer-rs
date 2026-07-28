@@ -27,6 +27,12 @@ WORKSPACE_PACKAGES = (
     "ferrum-kernels",
 )
 CANDLE_PACKAGES = ("candle-core", "candle-nn", "candle-kernels")
+CUDARC_LINK_FEATURES = {
+    "dynamic-loading",
+    "fallback-dynamic-loading",
+    "dynamic-linking",
+    "static-linking",
+}
 
 
 class BoundaryError(RuntimeError):
@@ -107,6 +113,63 @@ def package_rows(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return rows
 
 
+def resolved_dependency_features(
+    metadata: dict[str, Any], package_name: str, dependency_name: str
+) -> list[str]:
+    packages = {
+        package["id"]: package
+        for package in metadata.get("packages", [])
+        if isinstance(package, dict) and isinstance(package.get("id"), str)
+    }
+    package_ids = [
+        package_id
+        for package_id, package in packages.items()
+        if package.get("name") == package_name and package.get("source") is None
+    ]
+    require(
+        len(package_ids) == 1,
+        f"expected one workspace package {package_name}, got {len(package_ids)}",
+    )
+    resolve = metadata.get("resolve")
+    require(isinstance(resolve, dict), "cargo metadata is missing resolve")
+    nodes = resolve.get("nodes")
+    require(isinstance(nodes, list), "cargo metadata resolve.nodes must be a list")
+    nodes_by_id = {
+        node["id"]: node
+        for node in nodes
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    package_node = nodes_by_id.get(package_ids[0])
+    require(package_node is not None, f"resolved graph is missing {package_name}")
+    dependencies = package_node.get("deps")
+    require(
+        isinstance(dependencies, list),
+        f"resolved graph dependencies must be a list for {package_name}",
+    )
+    matches = [
+        dependency
+        for dependency in dependencies
+        if isinstance(dependency, dict) and dependency.get("name") == dependency_name
+    ]
+    require(
+        len(matches) == 1,
+        f"expected one resolved {package_name} dependency {dependency_name}, got {len(matches)}",
+    )
+    dependency_id = matches[0].get("pkg")
+    dependency_node = nodes_by_id.get(dependency_id)
+    require(
+        dependency_node is not None,
+        f"resolved graph is missing dependency node {dependency_id}",
+    )
+    features = dependency_node.get("features")
+    require(
+        isinstance(features, list)
+        and all(isinstance(feature, str) for feature in features),
+        f"resolved dependency features must be strings for {dependency_name}",
+    )
+    return sorted(features)
+
+
 def validate_official_graph(metadata: dict[str, Any]) -> dict[str, Any]:
     rows = package_rows(metadata)
     for name in WORKSPACE_PACKAGES:
@@ -129,7 +192,22 @@ def validate_official_graph(metadata: dict[str, Any]) -> dict[str, Any]:
     require("cuda" in kernels, "official CUDA graph is missing ferrum-kernels/cuda")
     for feature in ("vllm-moe-marlin", "vllm-paged-attn-v2"):
         require(feature in kernels, f"official CUDA graph is missing ferrum-kernels/{feature}")
-    return {name: rows[name] for name in (*WORKSPACE_PACKAGES, "candle-core", "candle-nn")}
+    cudarc_features = resolved_dependency_features(
+        metadata, "ferrum-kernels", "cudarc"
+    )
+    link_features = sorted(CUDARC_LINK_FEATURES.intersection(cudarc_features))
+    require(
+        link_features == ["dynamic-linking"],
+        "official CUDA graph must resolve exactly cudarc/dynamic-linking, "
+        f"got {link_features}",
+    )
+    require("std" in cudarc_features, "official CUDA graph must resolve cudarc/std")
+    result = {
+        name: rows[name]
+        for name in (*WORKSPACE_PACKAGES, "candle-core", "candle-nn")
+    }
+    result["ferrum-kernels"]["cudarc_features"] = cudarc_features
+    return result
 
 
 def validate_compat_graph(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -196,11 +274,47 @@ def validate_feature_declarations(
             any("candle-cuda-compat" in item or "/cuda" in item for item in compat),
             f"{name}/candle-cuda-compat does not forward a CUDA compatibility feature",
         )
+        cudarc_features = None
+        if name == "ferrum-kernels":
+            dependencies = package.get("dependencies")
+            require(
+                isinstance(dependencies, list),
+                "ferrum-kernels cargo metadata dependencies must be a list",
+            )
+            cudarc_dependencies = [
+                dependency
+                for dependency in dependencies
+                if isinstance(dependency, dict)
+                and dependency.get("name") == "cudarc"
+                and dependency.get("kind") is None
+            ]
+            require(
+                len(cudarc_dependencies) == 1,
+                "ferrum-kernels must declare exactly one normal cudarc dependency",
+            )
+            declared = cudarc_dependencies[0].get("features")
+            require(
+                isinstance(declared, list)
+                and all(isinstance(feature, str) for feature in declared),
+                "ferrum-kernels cudarc dependency features must be strings",
+            )
+            cudarc_features = sorted(declared)
+            require(
+                CUDARC_LINK_FEATURES.intersection(cudarc_features)
+                == {"dynamic-linking"},
+                "ferrum-kernels must directly declare exactly cudarc/dynamic-linking",
+            )
+            require(
+                "std" in cudarc_features,
+                "ferrum-kernels must directly declare cudarc/std",
+            )
         result[name] = {
             "manifest": relative_manifest.as_posix(),
             "cuda": cuda,
             "candle_cuda_compat": compat,
         }
+        if cudarc_features is not None:
+            result[name]["cudarc_features"] = cudarc_features
     return result
 
 
@@ -300,17 +414,30 @@ def run_gate(source_root: Path, out: Path, allow_dirty: bool) -> None:
 def fake_metadata(*, compat: bool) -> dict[str, Any]:
     packages = []
     nodes = []
-    names = [*WORKSPACE_PACKAGES, "candle-core", "candle-nn"]
+    names = [*WORKSPACE_PACKAGES, "candle-core", "candle-nn", "cudarc"]
     if compat:
         names.append("candle-kernels")
+    package_ids = {
+        name: f"{name} 1.0.0 (path+file:///fixture/{index})"
+        for index, name in enumerate(names)
+    }
     for index, name in enumerate(names):
-        package_id = f"{name} 1.0.0 (path+file:///fixture/{index})"
+        package_id = package_ids[name]
         declared_features: dict[str, list[str]] = {}
+        dependencies: list[dict[str, Any]] = []
         if name in WORKSPACE_PACKAGES:
             declared_features = {
                 "cuda": ["dep:cudarc"],
                 "candle-cuda-compat": ["cuda", "candle-core/cuda"],
             }
+        if name == "ferrum-kernels":
+            dependencies.append(
+                {
+                    "name": "cudarc",
+                    "kind": None,
+                    "features": ["std", "driver", "dynamic-linking"],
+                }
+            )
         packages.append(
             {
                 "id": package_id,
@@ -319,6 +446,7 @@ def fake_metadata(*, compat: bool) -> dict[str, Any]:
                 "source": None,
                 "manifest_path": f"/fixture/crates/{name}/Cargo.toml",
                 "features": declared_features,
+                "dependencies": dependencies,
             }
         )
         features = ["default"]
@@ -330,7 +458,12 @@ def fake_metadata(*, compat: bool) -> dict[str, Any]:
             features.extend(["vllm-moe-marlin", "vllm-paged-attn-v2"])
         if compat and name in ("candle-core", "candle-nn"):
             features.append("cuda")
-        nodes.append({"id": package_id, "features": features})
+        if name == "cudarc":
+            features.extend(["std", "driver", "dynamic-linking"])
+        dependencies = []
+        if name == "ferrum-kernels":
+            dependencies.append({"name": "cudarc", "pkg": package_ids["cudarc"]})
+        nodes.append({"id": package_id, "features": features, "deps": dependencies})
     return {"packages": packages, "resolve": {"nodes": nodes}}
 
 
@@ -383,6 +516,20 @@ def self_test() -> None:
         )
     else:
         raise AssertionError("Candle CUDA feature declaration mutation unexpectedly passed")
+    bad_link = fake_metadata(compat=False)
+    cudarc_node = next(
+        node for node in bad_link["resolve"]["nodes"] if node["id"].startswith("cudarc ")
+    )
+    cudarc_node["features"].append("dynamic-loading")
+    try:
+        validate_official_graph(bad_link)
+    except BoundaryError as error:
+        require(
+            "exactly cudarc/dynamic-linking" in str(error),
+            f"unexpected cudarc link mutation error: {error}",
+        )
+    else:
+        raise AssertionError("conflicting cudarc link strategy unexpectedly passed")
     print(SELFTEST_PASS)
 
 
