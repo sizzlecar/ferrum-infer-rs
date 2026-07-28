@@ -113,7 +113,7 @@ reference source 只能等于或祖先于 candidate，最终 trace plan identity
 `FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS`。这是 source/test-system
 checkpoint，不是 G07、G08B 或 CUDA hardware PASS。
 
-当前最新已验证并推送的 G07 clean source 为
+此前 G07 CUDA/Candle boundary 的 clean source 为
 `ecd6d1e8739467ab290bdb64df7a12e6a9c2cde6`，tree 为
 `8e363e3b0efa90f11ffaf967f069a9ac00b77584`。正式 CUDA feature graph 已把
 Candle CUDA 隔离到显式 `candle-cuda-compat`：official graph 的 `candle-core` /
@@ -131,15 +131,33 @@ SHA256 为
 它是 G07 CUDA/Candle boundary 和单次 release-build diagnostic，不是五样本 p95、
 G07A、G07B 或 G07 aggregate PASS。
 
-paid inventory 已核对：当前只保留 RTX 4090 实例 `45897840`，状态为
-`cur_state=stopped`、`actual_status=exited`，`potentially_billable=[]`。M2 CUDA
-correctness lane 已关闭；除非相关源码再次变化，不再重跑 focused C13 或 703 全量。
-下一 CUDA 只允许在同一 clean SHA、同一硬件和同一 typed config 上先生成 release
-reference，再用 `cuda-correctness` binary 重放 exact `c13-022`；stop condition 是 native
-rebuild、build deadline、reference REJECT、plan mismatch 或 focused result。该对照关闭后
-再继续 G06 replay correlation、剩余模型/后端 correctness 和 exact-precision
-performance。historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充当前
-C13 replay；禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑全量。
+当前最新已验证并推送的 G07 clean source 为
+`775758780baf66c3a508f8b07237035483c97410`，tree 为
+`135ac8a1dffa9add13b918478d46a87ec2304288`。同一 RTX 4090 上，正式 release
+reference build 在 clean ancestor `5e2aaaed` 用时 `448.366051s`，binary SHA256
+为 `e70114ed09c710eede78415e7f82c20a355ec04cc64ceff6f6e5089f6db21210`；
+current `cuda-correctness` cache-only build 用时 `24.897233s`，44 个 native artifact
+全部 cache hit、native recompile `0`，binary SHA256 为
+`00c4db8060e60718c63e7bd4e3267c0c03f2fbd70e08659bdcc8f64685b3bbae`。
+两者分别执行 exact `c13-022` 并得到 focused `KEEP`；current trace 的 17/17 个
+`vnext.plan_built` event 均精确等于 release reference
+`96efe5ea30955542290d58ea76d4768a46c79886391cf06ffb538e16b726b586`，最终打印
+`FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS`。
+
+证据保存在 GitHub draft-release asset
+`runtime-vnext-g07-plan-equivalence-77575878-20260729.tar.zst`
+（asset `493152796`，SHA256
+`b9d739bc80d05fcaf1ad679f2a9a1deaa78880035377f46eabe3822d3101b06a`），并已通过
+GitHub 下载到本机完成 SHA256/zstd 复验。这关闭 G07A 的真实 release/correctness
+semantic-plan 对照和一个 Rust-only cache-hit 样本；五样本 p95、workspace source gate、
+canonical G07A/G07B/G07 validator 仍未完成，因此 G07 仍为 Open。
+
+paid inventory 已核对：RTX 4090 实例 `46127509` 与 `45897840` 均为
+`cur_state=stopped`、`actual_status=exited`，`potentially_billable=[]`。在 runtime-affecting
+source 变化前不再重跑 focused C13 或 703 全量；G07 下一步转为五样本 invalidation timing、
+workspace source gate 和 canonical validator，CUDA 主模型工作继续剩余正确性/性能 lane。
+historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充当前 C13 replay；
+禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑全量。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
