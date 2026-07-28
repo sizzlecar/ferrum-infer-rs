@@ -1645,13 +1645,63 @@ processes and four threads, recorded no violation, and printed:
 FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS
 ```
 
-Because the old `404/703` count included 21 C13 v1 cases whose evidence
-identity has changed, reusable M2 CUDA correctness is now `383/703`. Those 21
-cases are stale, not newly failed. The next paid CUDA stop condition is the new
-focused `c13-022` request, `238 - 66 -> 172`, plus its case-specific receipt.
-On PASS, run the complete 40-case C13 v2 scenario and then the unexecuted
-suffix. Do not run the complete 703 matrix until those focused stages pass.
-Instance `45897840` remains `stopped/exited`.
+At this intermediate checkpoint, the old `404/703` count included 21 C13 v1
+cases whose evidence identity had changed, so reusable M2 CUDA correctness was
+reset to `383/703`. Those 21 cases were stale, not newly failed. The staged
+stop conditions were focused `c13-022`, complete C13 v2, the unexecuted suffix,
+and only then one complete 703 matrix. The next checkpoint records completion
+of that sequence and supersedes this progress count and machine state.
+
+## CUDA Correctness Checkpoint - 2026-07-28
+
+Clean source `b0431ca5b384a86c4e1f57406ad7267bdd3c3705`, source tree
+`0896756c962c6d983d6d251ad2c7d5bd99f122ad`, and release binary SHA256
+`632424ea329ca77844c0abde1981ad23bf8653caf840b987c408fe5373c1ee2a`
+completed the current M2 CUDA correctness lane on one RTX 4090.
+
+The only checker change after the first canonical attempt was a focused C01
+false-negative fix. A typed-resolver rejection now passes only when the product
+returns nonzero before weight read/effective config, preserves the unreadable weight
+sentinel, and names the exact injected unknown architecture or `model_type`.
+A mutation containing only generic `unsupported architecture/layout` remains
+rejected. The bounded local self-test passed in `173.578729s`, peaked at two
+processes/four threads, recorded no violation, and cleaned up its process group.
+
+Staged CUDA validation completed before the canonical sweep:
+
+- C13 v2 affected contract: `40/40 pass`;
+- C14/C15/C16/C18/C20 suffix: `224/224 pass`;
+- exact C01 negative-layout reproducer: `1/1 pass`;
+- complete C01 affected contract: `20/20 pass`.
+
+The canonical C01-C21 matrix then completed `703/703 pass` across all 21 scenarios
+with unexpected/error/known-fail/blocked counts `0`. Bounded duration was
+`1876.444209s`; peaks were two processes, 99 process-group threads, and 66 threads
+in one process, with no bounded-command violation and no surviving process group.
+The canonical runner and formal gate printed:
+
+```text
+FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS PASS: /workspace/ferrum-artifacts/cuda-703-b0431ca5/correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json
+FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS: /workspace/ferrum-artifacts/cuda-703-b0431ca5/gate-vnext-g08b-cuda
+FERRUM GATE vnext-g08b-cuda PASS: /workspace/ferrum-artifacts/cuda-703-b0431ca5/gate-vnext-g08b-cuda
+```
+
+Evidence was transferred through the draft, non-release
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-7f42d59302dfb4a7b1e2).
+The canonical archive `cuda-703-b0431ca5.tar.zst` has SHA256
+`c433c0de6b38f6259c4b89e8a7812f9f77c0696824f3a6cf0942f9e428ceed8b`;
+the focused C01 triage archive has SHA256
+`2739c275549cd25c47b89e49b3d16131e6e23413816a60c740d0a3a36f4e9a3d`.
+Both archives were downloaded from GitHub, SHA-verified, zstd-verified, and
+round-trip inspected locally under
+`/Users/chejinxuan/ferrum-artifacts/github/cuda-703-b0431ca5-20260728/`.
+
+Vast instances `46083877` and `45897840` are both confirmed `stopped/exited`; the
+final inventory contains `potentially_billable=[]`. This closes the current M2 CUDA
+correctness lane and advances the three-model/two-backend fresh correctness matrix
+to `1/6`. It does not close G08B overall: Metal correctness, CUDA/Metal performance,
+legacy/reference parity, mutation coverage, legacy removal, and the final aggregate
+gate remain open.
 
 ## Metal Matrix Workflow
 
