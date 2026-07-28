@@ -114,12 +114,35 @@ fn enum_pattern(values: &[Value]) -> Result<String> {
 }
 
 fn literal_pattern(value: &Value, keyword: &str) -> Result<String> {
-    // Serialise the value exactly as it would appear in JSON output, then
-    // escape regex metacharacters without changing the JSON representation.
-    let literal = serde_json::to_string(value).map_err(|e| {
+    // Keep constrained output independent of serde_json's workspace-unified
+    // `preserve_order` feature. A canonical key order also bounds object const
+    // to one compact, semantically valid JSON representation.
+    let canonical = canonical_json_literal(value);
+    let literal = serde_json::to_string(&canonical).map_err(|e| {
         FerrumError::invalid_request(format!("{keyword} value not JSON-serialisable: {e}"))
     })?;
     Ok(regex_escape(&literal))
+}
+
+fn canonical_json_literal(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(canonical_json_literal)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::with_capacity(values.len());
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_literal(&values[key]));
+            }
+            Value::Object(canonical)
+        }
+        value => value.clone(),
+    }
 }
 
 fn array_pattern(node: &Value) -> Result<String> {
@@ -343,6 +366,18 @@ mod tests {
         assert!(!re.is_match(r#"{"count":2, "kind":"ok","ready":true}"#));
         assert!(!re.is_match(r#"{"kind":"ok","count":2,"ready":true}"#));
         assert!(!re.is_match(r#"{"count":3,"kind":"ok","ready":true}"#));
+    }
+
+    #[test]
+    fn object_const_pattern_is_independent_of_schema_key_order() {
+        let left =
+            schema_to_regex(r#"{"const":{"kind":"ok","nested":{"z":1,"a":2},"ready":true}}"#)
+                .unwrap();
+        let right =
+            schema_to_regex(r#"{"const":{"ready":true,"nested":{"a":2,"z":1},"kind":"ok"}}"#)
+                .unwrap();
+
+        assert_eq!(left, right);
     }
 
     #[test]
