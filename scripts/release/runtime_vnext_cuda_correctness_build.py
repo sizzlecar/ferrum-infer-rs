@@ -766,6 +766,8 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
         "features": plan["features"],
         "compute_capability": plan["compute_capability"],
         "cargo_jobs": plan["cargo_jobs"],
+        "nvcc_threads": plan["nvcc_threads"],
+        "native_source_policy": plan["native_source_policy"],
         "target_dir": plan["target_dir"],
         "native_build_cache": plan["native_build_cache"],
         "native_import_dirs": plan["native_import_dirs"],
@@ -774,6 +776,10 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
         "target_preparation": target_preparation,
         "compiler_artifacts": current_binary_artifacts,
         "native_build_signal": native_signal,
+        "plan": file_ref(root / "plan.json", root),
+        "native_build_signal_artifact": file_ref(
+            build_dir / "native-build-signal.json", root
+        ),
         "semantic_plan_contract": {
             **plan["semantic_plan_contract"],
             "status": "pending-product-trace-validation",

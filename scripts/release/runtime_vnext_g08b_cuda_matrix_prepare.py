@@ -27,6 +27,7 @@ G08B_SERVED_MODEL_NAME = "m2-qwen35-35b-a3b"
 BUILD_DIR = Path("build/candidate")
 BUILD_RECEIPT_REL = BUILD_DIR / "candidate-build-receipt.json"
 BUILD_BINARY_REL = BUILD_DIR / "ferrum"
+CUDA_CORRECTNESS_IMPORT_REL = BUILD_DIR / "cuda-correctness-artifact"
 MODELS_LOCK_REL = Path("models.lock.json")
 EXECUTION_MANIFEST_REL = Path("execution-manifest.json")
 BUILD_ENV_KEYS = (
@@ -434,6 +435,93 @@ def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
     return receipt_path
 
 
+def bind_cuda_correctness_artifact(
+    root: Path,
+    *,
+    correctness_build_manifest: Path,
+    hardware_id: str,
+    spec: BackendSpec,
+) -> Path:
+    require(spec.backend == "cuda", "CUDA correctness artifact binding is CUDA-only")
+    require(
+        hardware_id.strip() == hardware_id and hardware_id,
+        "hardware id must be non-empty and trimmed",
+    )
+    receipt_path = root / BUILD_RECEIPT_REL
+    import_root = root / CUDA_CORRECTNESS_IMPORT_REL
+    require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
+    require(not import_root.exists(), f"CUDA correctness import already exists: {import_root}")
+    source_manifest = correctness_build_manifest.expanduser().resolve()
+    require(source_manifest.is_file(), f"CUDA correctness build manifest is missing: {source_manifest}")
+    before = source_observation(spec)
+    matrix.validate_cuda_correctness_build_artifact(
+        source_manifest,
+        expected={
+            "source_git_sha": before["source_git_sha"],
+            "source_tree_sha": before["source_tree_sha"],
+        },
+        allow_internal_fixture=False,
+    )
+    shutil.copytree(source_manifest.parent, import_root, symlinks=False)
+    copied_manifest = import_root / source_manifest.relative_to(source_manifest.parent)
+    imported, binary_path, binary_sha = matrix.validate_cuda_correctness_build_artifact(
+        copied_manifest,
+        expected={
+            "source_git_sha": before["source_git_sha"],
+            "source_tree_sha": before["source_tree_sha"],
+        },
+        allow_internal_fixture=False,
+    )
+    require(
+        imported["native_source_policy"] == "cache-only",
+        "imported CUDA correctness artifact is not cache-only",
+    )
+    probes = {
+        name: capture_probe(root, name, argv)
+        for name, argv in spec.probe_commands.items()
+    }
+    after = source_observation(spec)
+    require(after == before, "candidate source changed during CUDA correctness artifact binding")
+    binary_ref = matrix.existing_artifact_ref(root, binary_path, "binary")
+    require(binary_ref["sha256"] == binary_sha, "imported CUDA correctness binary SHA drift")
+    receipt = {
+        "schema_version": matrix.SCHEMA_VERSION,
+        "artifact_type": matrix.CANDIDATE_BUILD_RECEIPT_TYPE,
+        "status": "pass",
+        "execution_contract": matrix.G08_EXECUTION_CONTRACT,
+        **before,
+        "hardware_id": hardware_id,
+        "backend": "cuda",
+        "build_mode": matrix.CUDA_CORRECTNESS_BUILD_MODE,
+        "bound_at": matrix.iso_now(),
+        "source_observations": {"before": before, "after": after},
+        "binary_artifact": binary_ref,
+        "binary_sha256": binary_sha,
+        "correctness_build_manifest": matrix.existing_artifact_ref(
+            root,
+            copied_manifest,
+            "raw-json",
+        ),
+        "probe_artifacts": probes,
+    }
+    write_json(receipt_path, receipt)
+    matrix.validate_candidate_build_receipt(
+        root,
+        matrix.existing_artifact_ref(root, receipt_path, "raw-json"),
+        expected={
+            "source_git_sha": before["source_git_sha"],
+            "source_tree_sha": before["source_tree_sha"],
+            "hardware_id": hardware_id,
+            "backend": "cuda",
+            "binary_sha256": binary_sha,
+            "binary_path": binary_path,
+        },
+        allow_internal_fixture=False,
+    )
+    print(f"FERRUM RUNTIME VNEXT G08B CUDA CORRECTNESS BUILD BOUND: {receipt_path}")
+    return receipt_path
+
+
 def materialize_exact(path: Path, payload: bytes, label: str) -> None:
     if path.exists():
         require(path.is_file() and path.read_bytes() == payload, f"existing {label} differs from the canonical bytes")
@@ -653,13 +741,23 @@ def parse_args(
     )
     build_parser.add_argument("--artifact-root", required=True)
     build_parser.add_argument("--hardware-id", required=True)
+    bind_parser = subparsers.add_parser(
+        "bind-correctness",
+        help="import and bind a cache-only CUDA correctness binary",
+    )
+    bind_parser.add_argument("--artifact-root", required=True)
+    bind_parser.add_argument("--correctness-build-manifest", required=True)
+    bind_parser.add_argument("--hardware-id", required=True)
     manifest_parser = subparsers.add_parser("manifest", help="validate model snapshots and write the execution manifest")
     manifest_parser.add_argument("--artifact-root", required=True)
     manifest_parser.add_argument("--model-dir", required=True)
     manifest_parser.add_argument("--semantic-source-root", required=True)
     manifest_parser.add_argument("--port", type=int, default=18080)
     args = parser.parse_args()
-    require(args.self_test or args.command is not None, "choose --self-test, build, or manifest")
+    require(
+        args.self_test or args.command is not None,
+        "choose --self-test, build, bind-correctness, or manifest",
+    )
     require(not (args.self_test and args.command is not None), "--self-test cannot be combined with a command")
     return args
 
@@ -685,6 +783,13 @@ def main(
                 artifact_root(args.artifact_root),
                 args.hardware_id,
                 spec,
+            )
+        elif args.command == "bind-correctness":
+            bind_cuda_correctness_artifact(
+                artifact_root(args.artifact_root),
+                correctness_build_manifest=Path(args.correctness_build_manifest),
+                hardware_id=args.hardware_id,
+                spec=spec,
             )
         elif args.command == "manifest":
             prepare_manifest(

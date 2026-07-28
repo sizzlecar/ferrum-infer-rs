@@ -108,6 +108,44 @@ LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
 EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
+CUDA_CORRECTNESS_BUILD_MODE = "cuda-correctness-cache-only"
+CUDA_CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
+CUDA_CORRECTNESS_FEATURES = [
+    "cuda",
+    "vllm-moe-marlin",
+    "vllm-paged-attn-v2",
+]
+CUDA_CORRECTNESS_PROFILE = {
+    "name": "cuda-correctness",
+    "settings": {
+        "inherits": "release",
+        "lto": False,
+        "codegen-units": 16,
+        "incremental": True,
+        "strip": False,
+    },
+    "inherited_opt_level": 3,
+    "semantic_delta_from_release": [
+        "lto",
+        "codegen-units",
+        "incremental",
+        "strip",
+    ],
+}
+CUDA_CORRECTNESS_COMMAND_TAIL = [
+    "cargo",
+    "build",
+    "--profile",
+    "cuda-correctness",
+    "-p",
+    "ferrum-cli",
+    "--bin",
+    "ferrum",
+    "--features",
+    "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
+    "--message-format=json-render-diagnostics",
+    "-vv",
+]
 CANDIDATE_BUILD_COMMANDS = {
     "cuda": [
         "cargo",
@@ -826,6 +864,402 @@ def validate_source_identity(
     return contract
 
 
+def validate_plain_artifact_ref(
+    root: Path,
+    raw: Any,
+    label: str,
+    *,
+    allow_empty: bool = False,
+) -> Path:
+    ref = require_object(raw, label)
+    require(
+        set(ref) == {"path", "sha256", "size_bytes"},
+        f"{label} must contain exactly path, sha256, and size_bytes",
+    )
+    path = artifact_path(root, ref.get("path"), f"{label}.path")
+    require(path.is_file(), f"{label} missing artifact: {path}")
+    expected_size = require_count(ref.get("size_bytes"), f"{label}.size_bytes")
+    require(path.stat().st_size == expected_size, f"{label} size mismatch")
+    require(allow_empty or expected_size > 0, f"{label} artifact is empty")
+    expected_sha = require_sha256(ref.get("sha256"), f"{label}.sha256")
+    require(file_sha256(path) == expected_sha, f"{label} SHA256 mismatch")
+    return path
+
+
+def validate_cuda_correctness_build_command(
+    raw: Any,
+    manifest: dict[str, Any],
+) -> list[str]:
+    command = require_list(raw, "CUDA correctness build command")
+    require(
+        all(isinstance(part, str) and part for part in command),
+        "CUDA correctness build command must contain non-empty strings",
+    )
+    require(command and command[0] == "env", "CUDA correctness build command must start with env")
+    try:
+        cargo_index = command.index("cargo", 1)
+    except ValueError as exc:
+        raise ScenarioError("CUDA correctness build command is missing cargo") from exc
+    env_rows = command[1:cargo_index]
+    require(env_rows, "CUDA correctness build command is missing its typed environment")
+    environment: dict[str, str] = {}
+    for row in env_rows:
+        require("=" in row, f"CUDA correctness build environment row is invalid: {row!r}")
+        key, value = row.split("=", 1)
+        require(key and value and key not in environment, f"CUDA correctness build environment row is invalid: {row!r}")
+        environment[key] = value
+    required_keys = {
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_JOBS",
+        "CUDA_COMPUTE_CAP",
+        "FERRUM_NVCC_THREADS",
+        "FERRUM_CUDA_NATIVE_BUILD_CACHE",
+        "FERRUM_CUDA_NATIVE_IMPORT_DIRS",
+        "FERRUM_CUDA_NATIVE_SOURCE_POLICY",
+    }
+    require(
+        set(environment) == required_keys,
+        "CUDA correctness build command contains missing or hidden environment controls",
+    )
+    require(
+        command[cargo_index:] == CUDA_CORRECTNESS_COMMAND_TAIL,
+        "CUDA correctness build command tail is not canonical",
+    )
+    require(
+        environment["FERRUM_CUDA_NATIVE_SOURCE_POLICY"] == "cache-only",
+        "CUDA correctness build command is not cache-only",
+    )
+    require(
+        Path(environment["CARGO_TARGET_DIR"]).is_absolute()
+        and environment["CARGO_TARGET_DIR"] == manifest.get("target_dir"),
+        "CUDA correctness target directory binding mismatch",
+    )
+    require(
+        Path(environment["FERRUM_CUDA_NATIVE_BUILD_CACHE"]).is_absolute()
+        and environment["FERRUM_CUDA_NATIVE_BUILD_CACHE"]
+        == manifest.get("native_build_cache"),
+        "CUDA correctness native cache binding mismatch",
+    )
+    import_dirs = environment["FERRUM_CUDA_NATIVE_IMPORT_DIRS"].split(os.pathsep)
+    require(
+        import_dirs
+        and all(value and Path(value).is_absolute() for value in import_dirs)
+        and import_dirs == manifest.get("native_import_dirs"),
+        "CUDA correctness native import directory binding mismatch",
+    )
+    require(
+        environment["CARGO_BUILD_JOBS"] == str(manifest.get("cargo_jobs")),
+        "CUDA correctness Cargo job count binding mismatch",
+    )
+    require(
+        environment["CUDA_COMPUTE_CAP"] == manifest.get("compute_capability"),
+        "CUDA correctness compute capability binding mismatch",
+    )
+    require(
+        environment["FERRUM_NVCC_THREADS"] == str(manifest.get("nvcc_threads")),
+        "CUDA correctness nvcc thread count binding mismatch",
+    )
+    return command
+
+
+def validate_cuda_correctness_bounded_receipt(
+    root: Path,
+    raw_ref: Any,
+    *,
+    label: str,
+    expected_command: list[str],
+    stdout_ref: Any,
+    stderr_ref: Any,
+    max_wall_seconds: float,
+) -> dict[str, Any]:
+    receipt_path = validate_plain_artifact_ref(root, raw_ref, f"{label} receipt")
+    receipt = read_json(receipt_path)
+    require(
+        receipt.get("schema") == "ferrum.bounded-command-receipt.v1",
+        f"{label} receipt schema mismatch",
+    )
+    require(receipt.get("command") == expected_command, f"{label} command mismatch")
+    require(
+        receipt.get("status") == "pass"
+        and receipt.get("rc") == 0
+        and receipt.get("reason") == "command_completed",
+        f"{label} did not pass",
+    )
+    require(
+        receipt.get("sampling_error_count") == 0
+        and receipt.get("sampling_errors") == []
+        and receipt.get("violation") is None,
+        f"{label} contains bounded-command sampling or resource violations",
+    )
+    termination = require_object(receipt.get("termination"), f"{label}.termination")
+    require(
+        termination.get("signals") == [] and termination.get("errors") == [],
+        f"{label} required termination recovery",
+    )
+    cleanup = require_object(receipt.get("cleanup"), f"{label}.cleanup")
+    require(cleanup.get("process_group_gone") is True, f"{label} process group was not cleaned up")
+    limits = require_object(receipt.get("limits"), f"{label}.limits")
+    wall_timeout = limits.get("wall_timeout_seconds")
+    require(
+        isinstance(wall_timeout, (int, float))
+        and not isinstance(wall_timeout, bool)
+        and 0 < float(wall_timeout) <= max_wall_seconds,
+        f"{label} wall timeout is unsafe",
+    )
+    require(
+        require_count(limits.get("max_processes"), f"{label}.max_processes", minimum=1) <= 64
+        and require_count(
+            limits.get("max_group_threads"),
+            f"{label}.max_group_threads",
+            minimum=1,
+        )
+        <= 256
+        and require_count(
+            limits.get("max_per_process_threads"),
+            f"{label}.max_per_process_threads",
+            minimum=1,
+        )
+        <= 64,
+        f"{label} process/thread limits are unsafe",
+    )
+    require_count(receipt.get("successful_samples"), f"{label}.successful_samples", minimum=1)
+    for stream, ref in (("stdout", stdout_ref), ("stderr", stderr_ref)):
+        path = validate_plain_artifact_ref(
+            root,
+            ref,
+            f"{label} {stream}",
+            allow_empty=True,
+        )
+        identity = require_object(receipt.get(stream), f"{label}.{stream}")
+        require(
+            identity.get("sha256") == file_sha256(path)
+            and identity.get("size_bytes") == path.stat().st_size,
+            f"{label} {stream} receipt binding mismatch",
+        )
+    return receipt
+
+
+def validate_cuda_correctness_build_artifact(
+    manifest_path: Path,
+    *,
+    expected: dict[str, Any],
+    allow_internal_fixture: bool,
+) -> tuple[dict[str, Any], Path, str]:
+    manifest_path = manifest_path.resolve()
+    require(manifest_path.is_file(), f"CUDA correctness build manifest is missing: {manifest_path}")
+    root = manifest_path.parent
+    manifest = read_json(manifest_path)
+    require(manifest.get("schema_version") == 3, "CUDA correctness build schema_version mismatch")
+    require(
+        manifest.get("artifact_type") == CUDA_CORRECTNESS_ARTIFACT_TYPE,
+        "CUDA correctness build artifact_type mismatch",
+    )
+    require(manifest.get("status") == "binary-ready", "CUDA correctness build is not binary-ready")
+    for key in ("source_git_sha", "source_tree_sha"):
+        require(
+            manifest.get(key) == expected.get(key),
+            f"CUDA correctness build {key} mismatch",
+        )
+    dirty = require_object(manifest.get("dirty_status"), "CUDA correctness build dirty_status")
+    require(
+        dirty.get("is_dirty") is False and dirty.get("status_short") == [],
+        "CUDA correctness build source must be clean",
+    )
+    if not allow_internal_fixture:
+        require(
+            manifest["source_git_sha"] == git_text(["rev-parse", "HEAD"])
+            and manifest["source_tree_sha"] == git_text(["rev-parse", "HEAD^{tree}"]),
+            "CUDA correctness build is not bound to the current clean source",
+        )
+    require(manifest.get("profile") == CUDA_CORRECTNESS_PROFILE, "CUDA correctness profile drift")
+    require(manifest.get("features") == CUDA_CORRECTNESS_FEATURES, "CUDA correctness feature set drift")
+    require(
+        manifest.get("native_source_policy") == "cache-only",
+        "CUDA correctness build did not enforce cache-only native sources",
+    )
+    require(
+        1 <= require_count(manifest.get("cargo_jobs"), "CUDA correctness cargo_jobs", minimum=1) <= 16,
+        "CUDA correctness Cargo job count is unsafe",
+    )
+    require(
+        1 <= require_count(manifest.get("nvcc_threads"), "CUDA correctness nvcc_threads", minimum=1) <= 8,
+        "CUDA correctness nvcc thread count is unsafe",
+    )
+    require(
+        re.fullmatch(
+            r"[0-9]{2,3}",
+            require_string(
+                manifest.get("compute_capability"),
+                "CUDA correctness compute_capability",
+            ),
+        )
+        is not None,
+        "CUDA correctness compute capability is invalid",
+    )
+    plan_path = validate_plain_artifact_ref(root, manifest.get("plan"), "CUDA correctness plan")
+    plan = read_json(plan_path)
+    require(
+        plan.get("schema_version") == 3
+        and plan.get("artifact_type") == "runtime-vnext-cuda-correctness-build-plan"
+        and plan.get("status") == "import-inventory-ready"
+        and plan.get("ready") is True
+        and plan.get("missing_native_imports") == [],
+        "CUDA correctness plan was not import-inventory-ready",
+    )
+    for key in (
+        "source_git_sha",
+        "source_tree_sha",
+        "dirty_status",
+        "profile",
+        "features",
+        "compute_capability",
+        "cargo_jobs",
+        "nvcc_threads",
+        "native_source_policy",
+        "target_dir",
+        "native_build_cache",
+        "native_import_dirs",
+        "semantic_plan_contract",
+    ):
+        expected_value = (
+            {
+                **manifest["semantic_plan_contract"],
+                "status": "pending-product-load",
+            }
+            if key == "semantic_plan_contract"
+            else manifest.get(key)
+        )
+        require(plan.get(key) == expected_value, f"CUDA correctness plan {key} binding mismatch")
+    build_command = validate_cuda_correctness_build_command(plan.get("build_command"), manifest)
+    binary_path = validate_plain_artifact_ref(root, manifest.get("binary"), "CUDA correctness binary")
+    require(os.access(binary_path, os.X_OK), "CUDA correctness binary is not executable")
+    binary_sha = file_sha256(binary_path)
+    if "binary_sha256" in expected:
+        require(binary_sha == expected["binary_sha256"], "CUDA correctness binary SHA mismatch")
+    if "binary_path" in expected:
+        require(binary_path == expected["binary_path"], "CUDA correctness binary path mismatch")
+    native_signal_path = validate_plain_artifact_ref(
+        root,
+        manifest.get("native_build_signal_artifact"),
+        "CUDA correctness native build signal",
+    )
+    native_signal = read_json(native_signal_path)
+    require(
+        native_signal == manifest.get("native_build_signal"),
+        "CUDA correctness native signal file differs from the manifest",
+    )
+    for key in (
+        "managed_native_recompile_count",
+        "unmanaged_native_recompile_count",
+        "native_recompile_count",
+    ):
+        require(native_signal.get(key) == 0, f"CUDA correctness {key} must be zero")
+    for key in (
+        "rebuilt_native_artifacts",
+        "rejected_native_artifacts",
+        "native_compiler_lines",
+        "unmanaged_native_build_scripts",
+        "direct_nvcc_invocations",
+    ):
+        require(native_signal.get(key) == [], f"CUDA correctness {key} must be empty")
+    inventory = require_list(
+        plan.get("native_import_inventory"),
+        "CUDA correctness native import inventory",
+    )
+    expected_native_ids = {
+        require_string(
+            require_object(row, "CUDA correctness native import row").get("artifact_id"),
+            "CUDA correctness native import artifact_id",
+        )
+        for row in inventory
+    }
+    require(expected_native_ids, "CUDA correctness native import inventory is empty")
+    observed_events = [
+        require_object(row, "CUDA correctness native cache event")
+        for row in require_list(
+            native_signal.get("cache_events"),
+            "CUDA correctness native cache events",
+        )
+    ]
+    require(
+        {row.get("artifact_id") for row in observed_events} == expected_native_ids
+        and len(observed_events) == len(expected_native_ids),
+        "CUDA correctness native cache event set is incomplete or duplicated",
+    )
+    for row in observed_events:
+        require(
+            row.get("status") in {"cache_hit", "imported"}
+            and SHA256_RE.fullmatch(str(row.get("sha256", ""))) is not None,
+            "CUDA correctness native cache event is invalid",
+        )
+    validate_cuda_correctness_bounded_receipt(
+        root,
+        manifest.get("build_receipt"),
+        label="CUDA correctness build",
+        expected_command=build_command,
+        stdout_ref=manifest.get("build_stdout"),
+        stderr_ref=manifest.get("build_stderr"),
+        max_wall_seconds=900.0,
+    )
+    compiler_artifacts = [
+        require_object(row, "CUDA correctness compiler artifact")
+        for row in require_list(
+            manifest.get("compiler_artifacts"),
+            "CUDA correctness compiler artifacts",
+        )
+    ]
+    require(
+        any(
+            row.get("target_name") == "ferrum"
+            and "bin" in row.get("target_kind", [])
+            and row.get("fresh") is False
+            for row in compiler_artifacts
+        ),
+        "CUDA correctness build lacks a non-fresh ferrum compiler artifact",
+    )
+    smoke_receipt_path = validate_plain_artifact_ref(
+        root,
+        manifest.get("smoke_receipt"),
+        "CUDA correctness smoke receipt",
+    )
+    smoke_receipt = read_json(smoke_receipt_path)
+    smoke_command = require_list(smoke_receipt.get("command"), "CUDA correctness smoke command")
+    require(
+        len(smoke_command) == 2
+        and Path(smoke_command[0]).name == "ferrum"
+        and smoke_command[1] == "--version",
+        "CUDA correctness smoke command is not ferrum --version",
+    )
+    validate_cuda_correctness_bounded_receipt(
+        root,
+        manifest.get("smoke_receipt"),
+        label="CUDA correctness smoke",
+        expected_command=smoke_command,
+        stdout_ref=manifest.get("smoke_stdout"),
+        stderr_ref=manifest.get("smoke_stderr"),
+        max_wall_seconds=30.0,
+    )
+    semantic = require_object(
+        manifest.get("semantic_plan_contract"),
+        "CUDA correctness semantic plan contract",
+    )
+    require(
+        semantic.get("status") == "pending-product-trace-validation"
+        and semantic.get("require_exact_match_before_focused_result") is True
+        and SHA256_RE.fullmatch(str(semantic.get("expected_c13_022_plan_hash", "")))
+        is not None,
+        "CUDA correctness semantic plan contract is incomplete",
+    )
+    require(
+        manifest.get("pass_line") is None
+        and require_string(manifest.get("ready_line"), "CUDA correctness ready_line").startswith(
+            "FERRUM CUDA CORRECTNESS BINARY READY: "
+        ),
+        "CUDA correctness binary readiness was confused with semantic PASS",
+    )
+    return manifest, binary_path, binary_sha
+
+
 def validate_candidate_build_receipt(
     root: Path,
     raw: Any,
@@ -857,6 +1291,91 @@ def validate_candidate_build_receipt(
     backend = require_string(expected.get("backend"), "candidate build expected backend")
     require(backend in CANDIDATE_BUILD_COMMANDS, "candidate build expected backend is unsupported")
     require(receipt.get("backend") == backend, "candidate build receipt backend mismatch")
+    build_mode = receipt.get("build_mode", "release")
+    if build_mode == CUDA_CORRECTNESS_BUILD_MODE:
+        require(backend == "cuda", "CUDA correctness build binding is CUDA-only")
+        source_observations = require_object(
+            receipt.get("source_observations"),
+            "CUDA correctness binding source_observations",
+        )
+        require(
+            set(source_observations) == {"before", "after"}
+            and all(
+                source_observations.get(phase)
+                == {
+                    "source_git_sha": receipt["source_git_sha"],
+                    "source_tree_sha": receipt["source_tree_sha"],
+                    "dirty_status": {"is_dirty": False, "status_short": []},
+                }
+                for phase in ("before", "after")
+            ),
+            "CUDA correctness binding source observations changed",
+        )
+        parse_timestamp(receipt.get("bound_at"), "CUDA correctness binding bound_at")
+        require(
+            "command" not in receipt
+            and "bounded_receipt" not in receipt
+            and "stdout" not in receipt
+            and "stderr" not in receipt,
+            "CUDA correctness binding must not impersonate a canonical release build",
+        )
+        binary_path, _, _ = validate_artifact_ref(
+            root,
+            receipt.get("binary_artifact"),
+            "CUDA correctness bound binary",
+            allowed_kinds={"binary"},
+        )
+        binary_sha = require_sha256(
+            receipt.get("binary_sha256"),
+            "CUDA correctness bound binary_sha256",
+        )
+        require(
+            file_sha256(binary_path) == binary_sha == expected.get("binary_sha256"),
+            "CUDA correctness bound binary SHA mismatch",
+        )
+        if "binary_path" in expected:
+            require(binary_path == expected["binary_path"], "CUDA correctness bound binary path mismatch")
+        correctness_manifest_path, _, _ = validate_artifact_ref(
+            root,
+            receipt.get("correctness_build_manifest"),
+            "CUDA correctness build manifest",
+            allowed_kinds={"raw-json"},
+        )
+        _, nested_binary_path, nested_binary_sha = validate_cuda_correctness_build_artifact(
+            correctness_manifest_path,
+            expected={
+                "source_git_sha": receipt["source_git_sha"],
+                "source_tree_sha": receipt["source_tree_sha"],
+                "binary_sha256": binary_sha,
+                "binary_path": binary_path,
+            },
+            allow_internal_fixture=allow_internal_fixture,
+        )
+        require(
+            nested_binary_path == binary_path and nested_binary_sha == binary_sha,
+            "CUDA correctness binding does not reference the manifest binary",
+        )
+        probes = require_object(
+            receipt.get("probe_artifacts"),
+            "CUDA correctness binding probe_artifacts",
+        )
+        require(
+            set(probes) == CANDIDATE_BUILD_PROBES["cuda"],
+            "CUDA correctness binding probe artifact set mismatch",
+        )
+        for name, ref in probes.items():
+            probe_path, _, _ = validate_artifact_ref(
+                root,
+                ref,
+                f"CUDA correctness binding probe {name}",
+                allowed_kinds={"runtime-log"},
+            )
+            require(
+                probe_path.read_text(encoding="utf-8", errors="strict").strip(),
+                f"CUDA correctness binding probe {name} is empty",
+            )
+        return receipt, receipt_path, file_sha256(receipt_path), binary_path
+    require(build_mode == "release", "candidate build mode is unsupported")
     build_command = CANDIDATE_BUILD_COMMANDS[backend]
     require(receipt.get("command") == build_command, "candidate build command is not canonical")
     require(receipt.get("returncode") == 0, "candidate build returncode must be 0")
