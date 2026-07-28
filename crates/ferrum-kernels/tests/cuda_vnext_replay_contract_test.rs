@@ -181,6 +181,30 @@ fn recurrent_attention_packs_wave_projections_and_keeps_exact_qkvzba() {
 }
 
 #[test]
+fn causal_attention_packs_shared_wave_projections_and_residual() {
+    let token_offset = CAUSAL_ATTENTION_SOURCE
+        .split("fn token_offset(")
+        .nth(1)
+        .expect("CUDA causal attention must define packed token offsets")
+        .split("\n    }")
+        .next()
+        .expect("packed token offset helper must have a bounded body");
+
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("struct PackedCausalAttentionLaunch"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("fn enqueue_packed_attention("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("super::shared_token_region("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("DeviceBatchingForm::Packed"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("fn physical_dispatch_count("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("validate_packed_token_ranges("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(".boolean(packed_enabled)"));
+    assert!(token_offset.contains("width"));
+    assert!(token_offset.contains(".checked_mul(ElementType::F16.size_bytes())"));
+    assert!(!token_offset.contains("aligned_bytes("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("\"packed causal attention Q GEMM\""));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("\"packed causal attention output GEMM\""));
+}
+
+#[test]
 fn single_token_moe_router_materializes_marlin_blocks_without_generic_align() {
     assert!(MOE_PROVIDER_SOURCE.contains("MoeRoutingPlan::SingleTokenDirectMarlin"));
     assert!(MOE_PROVIDER_SOURCE.contains("launch_single_token_router"));

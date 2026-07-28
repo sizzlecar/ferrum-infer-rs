@@ -1073,6 +1073,18 @@ impl ScratchLayout {
             vllm,
         })
     }
+
+    fn token_offset(self, base: u64, token_start: u64, width: u64) -> Result<u64, String> {
+        base.checked_add(
+            width
+                .checked_mul(ElementType::F16.size_bytes())
+                .ok_or_else(|| "causal attention token scratch stride overflows".to_owned())?
+                .checked_mul(token_start)
+                .ok_or_else(|| "causal attention token scratch offset overflows".to_owned())?,
+        )
+        .filter(|offset| *offset < self.required_bytes)
+        .ok_or_else(|| "causal attention token scratch range is invalid".to_owned())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1150,6 +1162,12 @@ struct CausalAttentionLaunch {
     input_region: usize,
     output_region: usize,
     binding_offset: u64,
+    packed_token_start: u64,
+    packed_query_raw: u64,
+    packed_key_raw: u64,
+    packed_value_raw: u64,
+    packed_query: u64,
+    packed_context: u64,
     tokens: u64,
     tokens_i32: i32,
     sequence_tokens: u64,
@@ -1157,6 +1175,14 @@ struct CausalAttentionLaunch {
     table_entries_i32: i32,
     replay_topology: CausalAttentionReplayTopology,
     path: CausalAttentionKernelPath,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackedCausalAttentionLaunch {
+    input_region: usize,
+    output_region: usize,
+    tokens: u64,
+    tokens_i32: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1265,6 +1291,33 @@ fn encode_attention(
         },
     };
 
+    let packed = if input_shared && output_shared && invocation.participants().len() > 1 {
+        let input_region = compute_regions.len();
+        compute_regions.push(super::shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        let output_region = compute_regions.len();
+        compute_regions.push(super::shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            total_tokens,
+        )?);
+        Some(PackedCausalAttentionLaunch {
+            input_region,
+            output_region,
+            tokens: total_tokens,
+            tokens_i32: checked_i32(total_tokens, "packed causal attention token count")?,
+        })
+    } else {
+        None
+    };
+
     let mut binding_regions = vec![compute_regions[shared.binding].clone()];
     let mut compute_fence_dependencies = Vec::new();
     let mut host_storage = Vec::with_capacity(invocation.participants().len());
@@ -1278,36 +1331,46 @@ fn encode_attention(
     {
         let tokens = token_range.immediate_tokens();
         let source = token_range.source_token_range();
-        let packed = token_range.immediate_token_range();
+        let packed_range = token_range.immediate_token_range();
         if source.end > token_range.full_input_tokens()
             || token_range.full_input_tokens() > shape.maximum_context_tokens
         {
             return Err("causal attention token range exceeds its admitted context".to_owned());
         }
-        let input_region = compute_regions.len();
-        compute_regions.push(contiguous_token_region(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-            ElementType::F16,
-            if input_shared {
-                packed.start
-            } else {
-                source.start
-            },
-            tokens,
-        )?);
-        let output_region = compute_regions.len();
-        compute_regions.push(contiguous_token_region(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-            ElementType::F16,
-            if output_shared {
-                packed.start
-            } else {
-                source.start
-            },
-            tokens,
-        )?);
+        let input_region = if let Some(packed) = packed {
+            packed.input_region
+        } else {
+            let input_region = compute_regions.len();
+            compute_regions.push(contiguous_token_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+                ElementType::F16,
+                if input_shared {
+                    packed_range.start
+                } else {
+                    source.start
+                },
+                tokens,
+            )?);
+            input_region
+        };
+        let output_region = if let Some(packed) = packed {
+            packed.output_region
+        } else {
+            let output_region = compute_regions.len();
+            compute_regions.push(contiguous_token_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+                ElementType::F16,
+                if output_shared {
+                    packed_range.start
+                } else {
+                    source.start
+                },
+                tokens,
+            )?);
+            output_region
+        };
 
         let first_page_region = binding_regions.len();
         let state = binding(participant.bindings(), ResolvedValueRole::Input, 8)?;
@@ -1358,6 +1421,32 @@ fn encode_attention(
             input_region,
             output_region,
             binding_offset,
+            packed_token_start: packed_range.start,
+            packed_query_raw: layout.token_offset(
+                layout.query_raw,
+                packed_range.start,
+                shape.query_projection_features,
+            )?,
+            packed_key_raw: layout.token_offset(
+                layout.key_raw,
+                packed_range.start,
+                shape.kv_features,
+            )?,
+            packed_value_raw: layout.token_offset(
+                layout.value_raw,
+                packed_range.start,
+                shape.kv_features,
+            )?,
+            packed_query: layout.token_offset(
+                layout.query,
+                packed_range.start,
+                shape.query_features,
+            )?,
+            packed_context: layout.token_offset(
+                layout.context,
+                packed_range.start,
+                shape.query_features,
+            )?,
             tokens,
             tokens_i32,
             sequence_tokens: source.end,
@@ -1366,6 +1455,14 @@ fn encode_attention(
             replay_topology,
             path,
         });
+    }
+    if packed.is_some() {
+        validate_packed_token_ranges(
+            launches
+                .iter()
+                .map(|launch| (launch.packed_token_start, launch.tokens)),
+            total_tokens,
+        )?;
     }
 
     let participant_count = u32::try_from(invocation.participants().len())
@@ -1428,10 +1525,12 @@ fn encode_attention(
         .filter(|path| launches.iter().all(|launch| launch.path == *path))
         .map(CausalAttentionKernelPath::operation)
         .unwrap_or(COMPUTE_MIXED_OPERATION);
-    let compute_dispatch_count = launches
-        .iter()
-        .map(|launch| 7 + launch.path.attention_dispatch_count() + u64::from(shape.output_gate))
-        .sum();
+    let packed_enabled = packed.is_some();
+    let compute_dispatch_count = physical_dispatch_count(
+        launches.iter().map(|launch| launch.path),
+        shape.output_gate,
+        packed_enabled,
+    );
     let replay_key = launches
         .iter()
         .all(|launch| launch.replay_topology.is_partition_stable())
@@ -1457,6 +1556,17 @@ fn encode_attention(
                     .boolean(shape.rope_interleaved)
                     .boolean(shape.output_gate)
                     .u64(total_tokens)
+                    .boolean(packed_enabled)
+                    .u64(
+                        packed
+                            .map(|launch| launch.input_region as u64)
+                            .unwrap_or(u64::MAX),
+                    )
+                    .u64(
+                        packed
+                            .map(|launch| launch.output_region as u64)
+                            .unwrap_or(u64::MAX),
+                    )
                     .u64(layout.required_bytes)
                     .u64(layout.projection_workspace.unwrap_or(u64::MAX))
                     .u64(layout.normalized)
@@ -1478,6 +1588,12 @@ fn encode_attention(
                     .u64(launch.input_region as u64)
                     .u64(launch.output_region as u64)
                     .u64(launch.binding_offset)
+                    .u64(launch.packed_token_start)
+                    .u64(launch.packed_query_raw)
+                    .u64(launch.packed_key_raw)
+                    .u64(launch.packed_value_raw)
+                    .u64(launch.packed_query)
+                    .u64(launch.packed_context)
                     .u64(launch.tokens)
                     .i32(launch.tokens_i32)
                     .u64(replay_envelope.sequence_capacity_tokens)
@@ -1488,16 +1604,23 @@ fn encode_attention(
         });
 
     let functions = functions.clone();
-    let enqueue_compute = move |stream: &CudaStream,
-                                blas: &CudaBlas,
-                                regions: &[CudaBufferRegion]| {
-        for launch in &launches {
-            enqueue_attention(
-                stream, blas, &functions, projection, shape, cuda, layout, shared, *launch, regions,
-            )?;
-        }
-        Ok(())
-    };
+    let enqueue_compute =
+        move |stream: &CudaStream, blas: &CudaBlas, regions: &[CudaBufferRegion]| {
+            if let Some(packed) = packed {
+                enqueue_packed_attention(
+                    stream, blas, &functions, projection, shape, cuda, layout, shared, packed,
+                    &launches, regions,
+                )?;
+            } else {
+                for launch in &launches {
+                    enqueue_attention(
+                        stream, blas, &functions, projection, shape, cuda, layout, shared, *launch,
+                        regions,
+                    )?;
+                }
+            }
+            Ok(())
+        };
     let compute_command = match replay_key {
         Some(replay_key) => {
             CudaDeviceCommand::replayable_operation_with_blas_and_fence_dependencies(
@@ -1517,7 +1640,13 @@ fn encode_attention(
     }
     .and_then(|command| {
         command.with_work_attribution(
-            DeviceBatchingForm::ParticipantLoop,
+            if packed_enabled {
+                DeviceBatchingForm::Packed
+            } else if participant_count == 1 {
+                DeviceBatchingForm::Scalar
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
             participant_count,
             total_tokens,
             compute_dispatch_count,
@@ -1531,6 +1660,43 @@ fn encode_attention(
         binding_command,
         has_compiled_program_slot,
     ))
+}
+
+fn physical_dispatch_count(
+    paths: impl IntoIterator<Item = CausalAttentionKernelPath>,
+    output_gate: bool,
+    packed: bool,
+) -> u64 {
+    paths
+        .into_iter()
+        .fold(if packed { 6 } else { 0 }, |total, path| {
+            total.saturating_add(
+                (if packed { 1 } else { 7 })
+                    + path.attention_dispatch_count()
+                    + u64::from(output_gate),
+            )
+        })
+}
+
+fn validate_packed_token_ranges(
+    ranges: impl IntoIterator<Item = (u64, u64)>,
+    total_tokens: u64,
+) -> Result<(), String> {
+    let mut next_token = 0_u64;
+    for (token_start, tokens) in ranges {
+        if tokens == 0 || token_start != next_token {
+            return Err(
+                "packed causal attention token ranges are not one canonical dense span".to_owned(),
+            );
+        }
+        next_token = next_token
+            .checked_add(tokens)
+            .ok_or_else(|| "packed causal attention token range overflows".to_owned())?;
+    }
+    if next_token != total_tokens {
+        return Err("packed causal attention token ranges do not cover the work shape".to_owned());
+    }
+    Ok(())
 }
 
 fn encode_reusable_attention_bindings(
@@ -1686,6 +1852,165 @@ fn enqueue_bindings(
         })?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_packed_attention(
+    stream: &CudaStream,
+    blas: &CudaBlas,
+    functions: &CausalAttentionFunctions,
+    projection: CausalProjection,
+    logical: CausalAttentionShape,
+    cuda: CudaCausalAttentionShape,
+    layout: ScratchLayout,
+    shared: SharedRegions,
+    packed: PackedCausalAttentionLaunch,
+    launches: &[CausalAttentionLaunch],
+    regions: &[CudaBufferRegion],
+) -> Result<(), CudaDeviceRuntimeError> {
+    let scratch = &regions[shared.scratch];
+    if scratch.length_bytes() < layout.required_bytes {
+        return Err(CudaDeviceRuntimeError::contract(
+            "packed causal attention scratch is smaller than its admitted estimate",
+        ));
+    }
+    let scratch_base = scratch.device_ptr();
+    let binding = &regions[shared.binding];
+    let input = regions[packed.input_region].device_ptr();
+    let output = regions[packed.output_region].device_ptr();
+    let normalized = scratch_pointer(scratch_base, layout.normalized)?;
+    let query_raw = scratch_pointer(scratch_base, layout.query_raw)?;
+    let key_raw = scratch_pointer(scratch_base, layout.key_raw)?;
+    let value_raw = scratch_pointer(scratch_base, layout.value_raw)?;
+    let context = scratch_pointer(scratch_base, layout.context)?;
+    let projected = scratch_pointer(scratch_base, layout.projected)?;
+
+    launch_rms_norm(
+        stream,
+        &functions.rms_norm,
+        input,
+        regions[shared.input_norm].device_ptr(),
+        normalized,
+        packed.tokens,
+        cuda.hidden_size,
+        cuda.epsilon,
+    )?;
+    for (weight, destination, out_features, operation) in [
+        (
+            shared.query_weight,
+            query_raw,
+            cuda.query_projection_features,
+            "packed causal attention Q GEMM",
+        ),
+        (
+            shared.key_weight,
+            key_raw,
+            cuda.kv_features,
+            "packed causal attention K GEMM",
+        ),
+        (
+            shared.value_weight,
+            value_raw,
+            cuda.kv_features,
+            "packed causal attention V GEMM",
+        ),
+    ] {
+        launch_causal_projection(
+            stream,
+            blas,
+            projection,
+            weight,
+            normalized,
+            destination,
+            scratch,
+            layout,
+            regions,
+            packed.tokens_i32,
+            out_features,
+            cuda.hidden_size,
+            operation,
+        )?;
+    }
+
+    for launch in launches {
+        let control = scratch_pointer(binding.device_ptr(), launch.binding_offset)?;
+        let page_table = control.checked_add(BINDING_CONTROL_BYTES).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("packed causal attention page-table pointer overflows")
+        })?;
+        let participant_query_raw = scratch_pointer(scratch_base, launch.packed_query_raw)?;
+        let participant_key_raw = scratch_pointer(scratch_base, launch.packed_key_raw)?;
+        let participant_value_raw = scratch_pointer(scratch_base, launch.packed_value_raw)?;
+        let participant_query = scratch_pointer(scratch_base, launch.packed_query)?;
+        let participant_context = scratch_pointer(scratch_base, launch.packed_context)?;
+
+        launch_prepare(
+            stream,
+            &functions.prepare,
+            participant_query_raw,
+            participant_key_raw,
+            participant_value_raw,
+            regions[shared.query_norm].device_ptr(),
+            regions[shared.key_norm].device_ptr(),
+            participant_query,
+            control,
+            page_table,
+            *launch,
+            cuda,
+            i32::from(launch.path.uses_vllm_layout()),
+        )?;
+        launch_selected_attention(
+            stream,
+            functions,
+            participant_query,
+            participant_query_raw,
+            control,
+            page_table,
+            participant_context,
+            *launch,
+            cuda,
+            layout,
+            scratch_base,
+        )?;
+        if logical.output_gate {
+            launch_attention_gate(
+                stream,
+                &functions.attention_gate,
+                participant_context,
+                participant_query_raw,
+                *launch,
+                cuda,
+            )?;
+        }
+    }
+
+    launch_causal_projection(
+        stream,
+        blas,
+        projection,
+        shared.output_weight,
+        context,
+        projected,
+        scratch,
+        layout,
+        regions,
+        packed.tokens_i32,
+        cuda.hidden_size,
+        cuda.query_features,
+        "packed causal attention output GEMM",
+    )?;
+    let elements = packed
+        .tokens
+        .checked_mul(logical.hidden_size)
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("packed causal residual size overflows"))?;
+    launch_residual(
+        stream,
+        &functions.residual_add,
+        &functions.residual_add_inplace,
+        input,
+        projected,
+        output,
+        elements,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2886,6 +3211,48 @@ mod tests {
             SemanticValue::Unsigned(2048),
         );
         assert!(CausalAttentionShape::from_attributes(&invalid).is_err());
+    }
+
+    #[test]
+    fn packed_dispatch_count_keeps_only_sequence_local_work_per_participant() {
+        let v1 = CausalAttentionKernelPath::VllmAddressedDecodeV1;
+        let v2 = CausalAttentionKernelPath::VllmAddressedDecodeV2;
+
+        assert_eq!(physical_dispatch_count([v1], false, false), 8);
+        assert_eq!(physical_dispatch_count([v1; 4], false, false), 32);
+        assert_eq!(physical_dispatch_count([v1; 4], false, true), 14);
+        assert_eq!(physical_dispatch_count([v2; 4], true, false), 40);
+        assert_eq!(physical_dispatch_count([v2; 4], true, true), 22);
+        assert_eq!(physical_dispatch_count([v1; 32], true, true), 102);
+        assert_eq!(physical_dispatch_count([v2; 32], true, true), 134);
+    }
+
+    #[test]
+    fn packed_token_ranges_require_one_dense_canonical_span() {
+        assert!(validate_packed_token_ranges([(0, 3), (3, 1), (4, 8)], 12).is_ok());
+        assert!(validate_packed_token_ranges([(0, 3), (4, 8)], 12).is_err());
+        assert!(validate_packed_token_ranges([(0, 3), (3, 0), (3, 9)], 12).is_err());
+        assert!(validate_packed_token_ranges([(0, 3), (3, 8)], 12).is_err());
+    }
+
+    #[test]
+    fn packed_token_offsets_follow_dense_matrix_rows_not_allocation_padding() {
+        let shape = goal_shape(3, 1, 10, 128);
+        let layout = ScratchLayout::new(shape, 3, CausalProjection::F16).unwrap();
+        assert_eq!(
+            layout
+                .token_offset(layout.query_raw, 1, shape.query_projection_features)
+                .unwrap(),
+            layout.query_raw + 60
+        );
+        assert_eq!(
+            aligned_bytes(
+                shape.query_projection_features,
+                ElementType::F16.size_bytes()
+            )
+            .unwrap(),
+            64
+        );
     }
 
     #[test]
