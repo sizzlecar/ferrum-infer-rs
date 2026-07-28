@@ -4209,7 +4209,8 @@ def validate_c01_negative_probe(
     probe = require_object(raw, f"{label}.negative_probe")
     require(probe.get("contract") == "unsupported-architecture-layout-fail-closed", f"{label} negative probe contract mismatch")
     require(probe.get("fixture_id") == f"unknown-layout-{ordinal:03d}", f"{label} negative fixture identity mismatch")
-    require(probe.get("unknown_architecture") == f"G00UnsupportedArchitecture{ordinal:03d}", f"{label} negative architecture is not ordinal-specific")
+    unknown_architecture = f"G00UnsupportedArchitecture{ordinal:03d}"
+    require(probe.get("unknown_architecture") == unknown_architecture, f"{label} negative architecture is not ordinal-specific")
     config_probe = require_object(resolution_probe.get("config"), f"{label}.resolution_probe.config")
     require(probe.get("base_config_sha256") == config_probe.get("locked_sha256"), f"{label} negative fixture is not derived from the locked semantic config")
     environment = validate_sanitized_environment(probe.get("environment"), f"{label}.negative_probe.environment")
@@ -4225,7 +4226,8 @@ def validate_c01_negative_probe(
     target = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
     architectures = require_list(target.get("architectures"), f"{label}.negative.config.architectures")
     require(architectures == [probe["unknown_architecture"]], f"{label} negative config architecture mismatch")
-    require(target.get("model_type") == f"g00_unsupported_layout_{ordinal:03d}", f"{label} negative config layout mismatch")
+    unknown_model_type = f"g00_unsupported_layout_{ordinal:03d}"
+    require(target.get("model_type") == unknown_model_type, f"{label} negative config layout mismatch")
     marker = require_object(config.get("g00_negative_fixture"), f"{label}.negative.config.g00_negative_fixture")
     require(marker == {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}, f"{label} negative config marker mismatch")
     tokenizer_path, _, _ = validate_artifact_ref(root, artifacts["tokenizer"], f"{label}.negative.tokenizer", allowed_kinds={"raw-json"})
@@ -4262,10 +4264,13 @@ def validate_c01_negative_probe(
     stdout_text = stdout_path.read_text(encoding="utf-8", errors="strict").lower()
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="strict").lower()
     combined = stdout_text + "\n" + stderr_text
-    require("unsupported" in combined and ("architecture" in combined or "layout" in combined), f"{label} negative probe lacks exact unsupported architecture/layout evidence")
     require(
-        "implicit architecture fallback is forbidden" in combined,
-        f"{label} negative probe lacks the registry fail-closed error",
+        "unsupported" in combined
+        and (
+            unknown_architecture.lower() in combined
+            or unknown_model_type.lower() in combined
+        ),
+        f"{label} negative probe lacks exact unsupported architecture/layout identity evidence",
     )
     forbidden = (
         "missing weight",
@@ -12654,8 +12659,21 @@ def self_test() -> int:
             update_ref_sha(negative["artifacts"]["stderr"], mutation_root)
             negative["fixture_manifest_sha256"] = canonical_json_sha256(negative["artifacts"])
             persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
-            expect_execution_report_reject(mutation_root, candidate, "lacks exact unsupported architecture/layout evidence")
+            expect_execution_report_reject(mutation_root, candidate, "lacks exact unsupported architecture/layout identity evidence")
             rejected_mutations.add("c01-wrong-negative-failure-class")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-generic-negative-class") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0, case_index=15)
+            envelope = read_json(envelope_path)
+            input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
+            negative = require_object(input_document.get("negative_probe"), "C01 mutation negative probe")
+            negative_stderr = mutation_root / negative["artifacts"]["stderr"]["path"]
+            negative_stderr.write_text("unsupported architecture/layout\n", encoding="utf-8")
+            update_ref_sha(negative["artifacts"]["stderr"], mutation_root)
+            negative["fixture_manifest_sha256"] = canonical_json_sha256(negative["artifacts"])
+            persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
+            expect_execution_report_reject(mutation_root, candidate, "lacks exact unsupported architecture/layout identity evidence")
+            rejected_mutations.add("c01-generic-negative-failure-class")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-negative-tokenizer") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0, case_index=15)
@@ -13168,6 +13186,7 @@ def self_test() -> int:
             "post-c09-case-old-process-binding",
             "c01-missing-resolution-probe",
             "c01-fallback-action",
+            "c01-generic-negative-failure-class",
             "c01-negative-tokenizer-drift",
             "c01-pass-architecture-mismatch",
             "c01-wrong-negative-failure-class",
