@@ -43,6 +43,11 @@ except ModuleNotFoundError:
     )
 
 try:
+    import runtime_vnext_plan_reference as plan_reference
+except ModuleNotFoundError:
+    from scripts.release import runtime_vnext_plan_reference as plan_reference
+
+try:
     from jsonl_product_session import JsonlProductSession, JsonlSessionError, SessionCase
 except ModuleNotFoundError:
     from scripts.release.jsonl_product_session import (
@@ -110,11 +115,11 @@ EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
 CUDA_CORRECTNESS_BUILD_MODE = "cuda-correctness-cache-only"
 CUDA_CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
-CUDA_CORRECTNESS_FEATURES = [
-    "cuda",
-    "vllm-moe-marlin",
-    "vllm-paged-attn-v2",
-]
+CUDA_CORRECTNESS_SCHEMA_VERSION = 4
+CUDA_RELEASE_PLAN_REFERENCE_TYPE = plan_reference.ARTIFACT_TYPE
+CUDA_RELEASE_PLAN_REFERENCE_CASE = plan_reference.CASE_ID
+CUDA_RELEASE_PLAN_REFERENCE_MODEL = plan_reference.MODEL_KEY
+CUDA_CORRECTNESS_FEATURES = list(plan_reference.FEATURES)
 CUDA_CORRECTNESS_PROFILE = {
     "name": "cuda-correctness",
     "settings": {
@@ -147,20 +152,7 @@ CUDA_CORRECTNESS_COMMAND_TAIL = [
     "-vv",
 ]
 CANDIDATE_BUILD_COMMANDS = {
-    "cuda": [
-        "cargo",
-        "build",
-        "--release",
-        "--locked",
-        "--jobs",
-        "4",
-        "-p",
-        "ferrum-cli",
-        "--bin",
-        "ferrum",
-        "--features",
-        "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
-    ],
+    "cuda": list(plan_reference.RELEASE_BUILD_COMMAND),
     "metal": [
         "cargo",
         "build",
@@ -232,6 +224,7 @@ C18_TRACE_SCOPE_SELFTEST_PASS_LINE = (
 )
 C18_PRODUCT_REQUEST_PREFIX = "request.product."
 C18_FIXTURE_TRACE_START_UNIX_NS = 1_700_000_000_000_000_000
+C18_CLIENT_WORKER_LIMIT = 32
 CHILD_ENV_ALLOWLIST = frozenset(
     {
         "CUDA_HOME",
@@ -1039,6 +1032,34 @@ def validate_cuda_correctness_bounded_receipt(
     return receipt
 
 
+def validate_cuda_release_plan_reference(
+    root: Path,
+    raw: Any,
+    *,
+    expected_hardware_id: str,
+    candidate_source_git_sha: str,
+    candidate_source_tree_sha: str,
+    allow_internal_fixture: bool,
+) -> tuple[dict[str, Any], Path]:
+    manifest_path = validate_plain_artifact_ref(
+        root,
+        raw,
+        "CUDA release plan reference manifest",
+    )
+    try:
+        reference = plan_reference.validate(
+            manifest_path,
+            expected_hardware_id=expected_hardware_id,
+            candidate_source_git_sha=candidate_source_git_sha,
+            candidate_source_tree_sha=candidate_source_tree_sha,
+            repository_root=REPO_ROOT,
+            allow_internal_fixture=allow_internal_fixture,
+        )
+    except plan_reference.PlanReferenceError as error:
+        raise ScenarioError(str(error)) from error
+    return reference, manifest_path
+
+
 def validate_cuda_correctness_build_artifact(
     manifest_path: Path,
     *,
@@ -1049,7 +1070,10 @@ def validate_cuda_correctness_build_artifact(
     require(manifest_path.is_file(), f"CUDA correctness build manifest is missing: {manifest_path}")
     root = manifest_path.parent
     manifest = read_json(manifest_path)
-    require(manifest.get("schema_version") == 3, "CUDA correctness build schema_version mismatch")
+    require(
+        manifest.get("schema_version") == CUDA_CORRECTNESS_SCHEMA_VERSION,
+        "CUDA correctness build schema_version mismatch",
+    )
     require(
         manifest.get("artifact_type") == CUDA_CORRECTNESS_ARTIFACT_TYPE,
         "CUDA correctness build artifact_type mismatch",
@@ -1099,7 +1123,7 @@ def validate_cuda_correctness_build_artifact(
     plan_path = validate_plain_artifact_ref(root, manifest.get("plan"), "CUDA correctness plan")
     plan = read_json(plan_path)
     require(
-        plan.get("schema_version") == 3
+        plan.get("schema_version") == CUDA_CORRECTNESS_SCHEMA_VERSION
         and plan.get("artifact_type") == "runtime-vnext-cuda-correctness-build-plan"
         and plan.get("status") == "import-inventory-ready"
         and plan.get("ready") is True
@@ -1113,6 +1137,7 @@ def validate_cuda_correctness_build_artifact(
         "profile",
         "features",
         "compute_capability",
+        "hardware_id",
         "cargo_jobs",
         "nvcc_threads",
         "native_source_policy",
@@ -1243,11 +1268,38 @@ def validate_cuda_correctness_build_artifact(
         manifest.get("semantic_plan_contract"),
         "CUDA correctness semantic plan contract",
     )
+    reference, reference_path = validate_cuda_release_plan_reference(
+        root,
+        semantic.get("reference_plan_manifest"),
+        expected_hardware_id=require_string(
+            manifest.get("hardware_id"),
+            "CUDA correctness hardware_id",
+        ),
+        candidate_source_git_sha=manifest["source_git_sha"],
+        candidate_source_tree_sha=manifest["source_tree_sha"],
+        allow_internal_fixture=allow_internal_fixture,
+    )
+    reference_identity = require_object(
+        reference.get("plan_identity"),
+        "CUDA release plan reference identity",
+    )
     require(
         semantic.get("status") == "pending-product-trace-validation"
+        and semantic.get("reference_kind") == CUDA_RELEASE_PLAN_REFERENCE_TYPE
+        and semantic.get("reference_source_git_sha")
+        == reference.get("source_git_sha")
+        and semantic.get("reference_source_tree_sha")
+        == reference.get("source_tree_sha")
+        and semantic.get("reference_plan_hash")
+        == reference_identity.get("plan_hash")
+        and semantic.get("reference_binary_sha256")
+        == reference.get("binary_sha256")
+        and semantic.get("reference_profile") == "release"
+        and semantic.get("hardware_id") == reference.get("hardware_id")
+        and semantic.get("model_key") == CUDA_RELEASE_PLAN_REFERENCE_MODEL
+        and semantic.get("case_id") == CUDA_RELEASE_PLAN_REFERENCE_CASE
         and semantic.get("require_exact_match_before_focused_result") is True
-        and SHA256_RE.fullmatch(str(semantic.get("expected_c13_022_plan_hash", "")))
-        is not None,
+        and reference_path.is_file(),
         "CUDA correctness semantic plan contract is incomplete",
     )
     require(
@@ -5487,6 +5539,14 @@ def required_active_floor(model_key: str, backend: str, requested_concurrency: i
     return min(requested_concurrency, floor)
 
 
+def c18_client_worker_count(requested_concurrency: int) -> int:
+    require(
+        1 <= requested_concurrency <= C18_CLIENT_WORKER_LIMIT,
+        "C18 requested concurrency exceeds the bounded client worker limit",
+    )
+    return C18_CLIENT_WORKER_LIMIT
+
+
 def c18_request_identities(case_id: str, requested_concurrency: int) -> list[dict[str, Any]]:
     identities: list[dict[str, Any]] = []
     for index in range(requested_concurrency):
@@ -7545,7 +7605,9 @@ def serve_case_request(
         concurrent_payloads = [
             c18_request_payload(payload, identity) for identity in concurrency_identities
         ]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=requested) as pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=c18_client_worker_count(requested)
+        ) as pool:
             futures = [
                 pool.submit(http_exchange, base_url, concurrent_payload, timeout_sec)
                 for concurrent_payload in concurrent_payloads
@@ -11838,10 +11900,52 @@ def self_test_http_request_byte_binding() -> None:
     )
 
 
+def self_test_cuda_release_plan_reference_adapter() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="runtime-vnext-release-plan-reference-"
+    ) as tmp:
+        root = Path(tmp)
+        _, fixture = plan_reference.make_fixture(root)
+        artifact = root / "reference"
+        plan_reference.capture(
+            out_root=artifact,
+            execution_manifest_path=Path(fixture["execution"]),
+            focused_report_path=Path(fixture["focused"]),
+            trace_path=Path(fixture["trace"]),
+            actual_effective_config_path=Path(fixture["actual"]),
+            hardware_id=fixture["hardware_id"],
+        )
+        validated, manifest_path = validate_cuda_release_plan_reference(
+            artifact,
+            plan_reference.file_ref(artifact / "manifest.json", artifact),
+            expected_hardware_id=fixture["hardware_id"],
+            candidate_source_git_sha=fixture["source_git_sha"],
+            candidate_source_tree_sha=fixture["source_tree_sha"],
+            allow_internal_fixture=True,
+        )
+        require(
+            validated["plan_identity"]["plan_hash"] == fixture["plan_hash"]
+            and manifest_path == (artifact / "manifest.json").resolve(),
+            "CUDA release plan reference adapter did not preserve its identity",
+        )
+
+
 def self_test() -> int:
     self_test_c13_contract()
     self_test_c13_runner_contract()
     self_test_http_request_byte_binding()
+    self_test_cuda_release_plan_reference_adapter()
+    require(
+        c18_client_worker_count(C18_CLIENT_WORKER_LIMIT)
+        == C18_CLIENT_WORKER_LIMIT,
+        "C18 bounded client worker count drift",
+    )
+    try:
+        c18_client_worker_count(C18_CLIENT_WORKER_LIMIT + 1)
+    except ScenarioError:
+        pass
+    else:
+        raise AssertionError("C18 client worker limit accepted an oversized request")
     self_test_c18_trace_scope()
     self_test_stream_pair_contracts()
     validate_c17_markers()
