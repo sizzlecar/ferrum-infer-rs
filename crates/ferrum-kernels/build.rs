@@ -5,8 +5,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ferrum_native_ops::{
-    NativeBuildArtifactCache, NativeBuildArtifactLookup, NativeBuildArtifactSpec,
-    NativeOperatorResolveRequest, NativeOperatorResolver,
+    legacy_signature_matches_without_numeric_line, NativeBuildArtifactCache,
+    NativeBuildArtifactLookup, NativeBuildArtifactSpec, NativeOperatorResolveRequest,
+    NativeOperatorResolver,
 };
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
@@ -680,13 +681,22 @@ fn artifact_stamp_matches(
     signature: &str,
     cache_promotion_signatures: &[&str],
     import_migration_signatures: &[&str],
+    obsolete_numeric_line_prefix: Option<&str>,
 ) -> bool {
     fs::read_to_string(stamp).is_ok_and(|existing| {
-        existing == signature
-            || cache_promotion_signatures
-                .iter()
-                .chain(import_migration_signatures)
-                .any(|candidate| existing == **candidate)
+        std::iter::once(signature)
+            .chain(
+                cache_promotion_signatures
+                    .iter()
+                    .chain(import_migration_signatures)
+                    .copied(),
+            )
+            .any(|candidate| {
+                existing == candidate
+                    || obsolete_numeric_line_prefix.is_some_and(|prefix| {
+                        legacy_signature_matches_without_numeric_line(&existing, candidate, prefix)
+                    })
+            })
     })
 }
 
@@ -726,6 +736,30 @@ fn restore_cuda_build_artifact(
     signature: &str,
     cache_promotion_signatures: &[&str],
     import_migration_signatures: &[&str],
+) -> Option<String> {
+    restore_cuda_build_artifact_with_import_migration(
+        config,
+        out_dir,
+        artifact_id,
+        file_name,
+        stamp_file_name,
+        signature,
+        cache_promotion_signatures,
+        import_migration_signatures,
+        None,
+    )
+}
+
+fn restore_cuda_build_artifact_with_import_migration(
+    config: Option<&CudaNativeBuildCache>,
+    out_dir: &Path,
+    artifact_id: &str,
+    file_name: &str,
+    stamp_file_name: &str,
+    signature: &str,
+    cache_promotion_signatures: &[&str],
+    import_migration_signatures: &[&str],
+    obsolete_numeric_line_prefix: Option<&str>,
 ) -> Option<String> {
     let config = config?;
     let spec = NativeBuildArtifactSpec::new(artifact_id, file_name, signature)
@@ -803,6 +837,7 @@ source_signature_sha256={} target_signature_sha256={} sha256={}",
                 signature,
                 cache_promotion_signatures,
                 import_migration_signatures,
+                obsolete_numeric_line_prefix,
             )
         {
             continue;
@@ -1815,12 +1850,11 @@ fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuild
         return;
     }
 
-    // Determine compute capability: use CUDA_COMPUTE_CAP env or default to 80
-    let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "80".to_string());
+    // This kernel always emits compute_80 PTX, so runtime device capability is
+    // not an output-affecting cache input.
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         "arch=compute_80".to_string(),
-        format!("reported_compute_cap={compute_cap}"),
         "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr -Xcompiler -fPIC".to_string(),
     ];
     let legacy_signature =
@@ -1854,7 +1888,7 @@ fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuild
             return;
         }
         CacheState::Stale(reason) => {
-            if let Some(cache_reason) = restore_cuda_build_artifact(
+            if let Some(cache_reason) = restore_cuda_build_artifact_with_import_migration(
                 native_build_cache,
                 out_dir,
                 "static.marlin",
@@ -1867,6 +1901,7 @@ fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuild
                     &metadata_hash_signature,
                     &metadata_signature,
                 ],
+                Some("flag=reported_compute_cap="),
             ) {
                 emit_cuda_build_summary(
                     "marlin",
@@ -1921,7 +1956,7 @@ fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuild
                         &lib_file,
                     );
                     emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
-                    eprintln!("Marlin kernel compiled successfully (sm_{compute_cap})");
+                    eprintln!("Marlin kernel compiled successfully (compute_80 PTX)");
                     emit_cuda_build_summary(
                         "marlin",
                         "built",
