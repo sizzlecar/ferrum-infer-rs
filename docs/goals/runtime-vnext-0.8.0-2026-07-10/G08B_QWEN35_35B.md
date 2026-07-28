@@ -1703,6 +1703,42 @@ to `1/6`. It does not close G08B overall: Metal correctness, CUDA/Metal performa
 legacy/reference parity, mutation coverage, legacy removal, and the final aggregate
 gate remain open.
 
+## Post-Canonical Exact Replay and Plan Reference Audit
+
+Clean source `645a43717a49032c5a2d8fa57ee0f9f2d9f9c671` used the cache-only
+`cuda-correctness` builder after the canonical 703 checkpoint. Binary SHA256
+`66d86d9f94fbd9a3aeecb0a819eed82e7e8f7b3e18b11ecc61aeb83ef03890cb`
+ran exact `c13-022`; the case status was `pass`, the focused decision was
+`KEEP`, and the product trace emitted only
+`96efe5ea30955542290d58ea76d4768a46c79886391cf06ffb538e16b726b586`.
+The product artifact therefore did not regress. The separate semantic validator
+REJECTed because its build manifest still expected historical hash
+`54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`.
+
+The two hashes belong to different implementation fingerprints:
+`f9bb4070` changed runtime/replay source intentionally covered by the canonical
+plan identity. Model revision and file lock, typed config, operation/provider
+sets and hardware identity remained stable. The REJECT is classified
+`stale-plan-reference`, not `correctness-failure` or `nondeterministic-plan`.
+Evidence was transferred through GitHub as
+`cuda-c13-022-645a4371.tar.zst`, SHA256
+`c4f3a4ffe7e068c6ca8b025e44b09ed6d601eec80dae73e25bad0db0997a22e5`,
+and independently extracted under
+`/Users/chejinxuan/ferrum-artifacts/github/cuda-c13-022-645a4371-20260728/`.
+
+Clean pushed commit `fae4f6e777a2b6538f9382af9aa74ee8196ca21c` removes the
+user-supplied expected hash from the correctness build. A release-profile
+reference must now be captured from actual M2 product execution and bind source,
+model, config, hardware, build receipt, release binary and trace; the
+correctness artifact imports and revalidates the complete reference before
+running. Local positive and hostile self-tests plus the complete scenario
+self-test pass, but no new CUDA hardware PASS is claimed.
+
+The next paid CUDA action is limited to one same-clean-SHA release reference and
+one correctness-profile exact `c13-022` comparison on the retained cached 4090.
+Native compilation, deadline, reference validation failure, plan mismatch or the
+focused result is the stop condition. It must not restart the 703 sweep.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

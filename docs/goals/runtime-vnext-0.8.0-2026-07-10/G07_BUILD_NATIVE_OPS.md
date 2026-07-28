@@ -213,6 +213,53 @@ replace that dependency with a signed Candle PTX/`libmoe.a` native artifact
 resolver or remove Candle CUDA from the vNext production feature graph; the
 five-sample timing matrix and canonical G07 validators remain outstanding.
 
+### 2026-07-28 Release plan reference provenance checkpoint
+
+Clean source `645a43717a49032c5a2d8fa57ee0f9f2d9f9c671` reused the retained native
+cache and produced a runnable `cuda-correctness` binary in approximately
+`20.1s` with no native compiler execution. Exact product `c13-022` printed
+focused `KEEP`; its scheduler trace contained one canonical plan hash:
+`96efe5ea30955542290d58ea76d4768a46c79886391cf06ffb538e16b726b586`.
+The previous semantic check REJECTed only because the build plan still embedded
+the old release hash
+`54963e9ddc468d44eaf72227c603a0f64d19e1f151de58e41fa33fdd402cc09d`.
+
+Source and trace audit classified this as a stale oracle, not nondeterministic
+execution. Commit `f9bb4070` intentionally changed CUDA runtime/replay source
+covered by the implementation fingerprint; effective config, model lock,
+operation set and provider selection did not drift. A plan identity that includes
+implementation provenance must change in that situation, so a manually carried
+hash cannot prove release/development equivalence.
+
+Clean pushed commit `fae4f6e777a2b6538f9382af9aa74ee8196ca21c` replaces the naked hash
+with a portable release-plan reference artifact. Capture and validation bind:
+
+- clean source commit/tree and ancestry policy;
+- exact official release command, release build receipt and binary SHA256;
+- hardware identity, model revision, model-file lock and models-lock digest;
+- typed and actual effective configs;
+- focused `c13-022` product report and actual vNext scheduler trace.
+
+The correctness build imports the complete reference under its own artifact
+root and revalidates every referenced file before compilation. Semantic
+validation consumes only that build-bound reference. Reference ancestry permits
+an unrelated newer candidate, but the candidate product trace must still match
+the recorded plan identity exactly; implementation drift therefore fails closed.
+The module self-test rejects a structurally consistent forged plan identity and
+a forged debug build receipt even after the attacker updates the enclosing file
+reference.
+
+The complete scenario self-test printed
+`FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS` under bounded execution in
+`177.685141s`; peaks were 3 processes, 34 process-group threads and 17 threads
+in one process, with zero violation and complete cleanup. The same change adds
+an independent C18 client worker cap of 32 before the first thread spawn.
+
+This remains a source/test checkpoint. G07A still requires one same-clean-SHA,
+same-hardware release-reference plus correctness-profile product comparison,
+followed by the five-sample build timing matrix and canonical G07 validator.
+G07B's cold Candle native dependency remains open.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。

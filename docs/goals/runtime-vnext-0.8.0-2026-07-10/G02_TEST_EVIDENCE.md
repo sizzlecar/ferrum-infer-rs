@@ -177,6 +177,31 @@ case 全部 kill 时才算 1/16。G00 冻结 concrete case 总数 `M`；后续�
 - H16：CUDA vNext 只验证 reusable executable inventory，不验证相同初态下 eager/replay 的
   declared outputs、KV/recurrent post-state，导致 provider 的 replay-equivalent 声明无数值证据。
 
+## 2026-07-28 Plan Reference Authenticity Checkpoint
+
+Commit `fae4f6e777a2b6538f9382af9aa74ee8196ca21c` removes the CUDA
+correctness builder's user-supplied plan hash. A shared release-plan reference
+validator now requires a complete, hash-bound artifact containing the clean
+source/tree, official release build receipt and binary, hardware identity,
+model lock, typed/actual effective config, focused product report and actual
+vNext scheduler trace. The correctness artifact copies and revalidates this
+reference; the semantic checker cannot accept a second unbound copy of the
+expected hash.
+
+Hostile self-tests update both forged `plan_hash` and derived `plan_id`, and
+separately mutate the release build mode to `debug` while recomputing the
+enclosing file reference. Both fail closed. The new validator is registered in
+`selftest_g0_validators.py`; omitted top-level wiring is therefore detectable.
+
+The same checkpoint bounds the C18 HTTP client pool independently at 32 workers
+before the first spawn and rejects larger requested concurrency. The complete
+scenario self-test ran under `bounded_command.py` in `177.685141s`, with peaks
+of 3 processes, 34 process-group threads and 17 threads in one process, zero
+violations and complete process-group cleanup. It printed both the C18 trace
+scope and G00 scenarios exact PASS lines. This does not complete G02: the full
+historical mutation matrix, gate graph, planner recall/precision and PR p95
+criteria remain open.
+
 ## Gate graph
 
 - 顶层 self-test 必须机器枚举所有注册子 gate；漏接线数量为 `0`。
