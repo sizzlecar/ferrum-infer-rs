@@ -1366,6 +1366,7 @@ fn policy_request() -> InferenceRequest {
         session_id: None,
         created_at: chrono::Utc::now(),
         api_request: None,
+        evidence_request: Default::default(),
         metadata: HashMap::new(),
     }
 }
@@ -2516,11 +2517,18 @@ async fn process_batch_unified_forwards_prefill_logits_policy() {
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
-    let mut request = policy_request();
+    let mut request = policy_request().with_prompt_token_evidence();
     request.sampling_params.max_tokens = 1;
 
     let response = engine.infer(request).await.unwrap();
     assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(
+        response
+            .execution_evidence
+            .expect("prompt-token evidence was explicitly requested")
+            .prompt_token_ids,
+        vec![TokenId::new(5)]
+    );
 
     let captured = captured.lock().expect("capture mutex poisoned");
     assert_eq!(captured.len(), 1);
@@ -6122,6 +6130,7 @@ fn test_sequence_state() {
         session_id: None,
         created_at: chrono::Utc::now(),
         api_request: None,
+        evidence_request: Default::default(),
         metadata: HashMap::new(),
     };
 

@@ -558,6 +558,7 @@ mod tests {
             session_id: None,
             created_at: chrono::Utc::now(),
             api_request: None,
+            evidence_request: Default::default(),
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -849,6 +850,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             metadata: std::collections::HashMap::new(),
             api_response: None,
+            execution_evidence: None,
         };
 
         let result = scheduler.complete(request_id, &response).await;
