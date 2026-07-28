@@ -8,6 +8,22 @@ use std::collections::HashMap;
 pub const PROMPT_TOKENS_METADATA_KEY: &str = "ferrum_prompt_tokens";
 pub const DEFAULT_MAX_TOKENS_METADATA_KEY: &str = "ferrum_default_max_tokens";
 
+/// Explicit request for execution evidence that is expensive or sensitive to retain.
+///
+/// The default keeps the inference hot path unchanged. Product entrypoints opt in
+/// only when the user enables a diagnostic artifact such as a request replay dump.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceEvidenceRequest {
+    #[serde(default)]
+    pub capture_prompt_token_ids: bool,
+}
+
+/// Evidence captured at the engine execution boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceExecutionEvidence {
+    pub prompt_token_ids: Vec<TokenId>,
+}
+
 /// Inference request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -34,6 +50,10 @@ pub struct InferenceRequest {
     /// request boundary for API features such as tools and response formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_request: Option<ApiRequest>,
+    /// Explicitly requested execution evidence. Disabled by default so normal
+    /// inference does not retain or copy prompt token IDs after completion.
+    #[serde(default)]
+    pub evidence_request: InferenceEvidenceRequest,
     /// Additional metadata
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -671,6 +691,7 @@ impl InferenceRequest {
             session_id: None,
             created_at: Utc::now(),
             api_request: None,
+            evidence_request: InferenceEvidenceRequest::default(),
             metadata: HashMap::new(),
         }
     }
@@ -711,6 +732,12 @@ impl InferenceRequest {
         self
     }
 
+    /// Request prompt-token evidence from the execution boundary.
+    pub fn with_prompt_token_evidence(mut self) -> Self {
+        self.evidence_request.capture_prompt_token_ids = true;
+        self
+    }
+
     /// Add metadata
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata.insert(key.into(), value);
@@ -742,6 +769,9 @@ pub struct InferenceResponse {
     /// this without overloading plain text or ad hoc metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_response: Option<ApiResponse>,
+    /// Optional engine-boundary evidence requested by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_evidence: Option<InferenceExecutionEvidence>,
 }
 
 /// Streaming response chunk
@@ -766,6 +796,9 @@ pub struct StreamChunk {
     /// can return native tool/function-call payloads without reparsing text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_response: Option<ApiResponse>,
+    /// Optional engine-boundary evidence, emitted on the final chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_evidence: Option<InferenceExecutionEvidence>,
 }
 
 /// Batch request for processing multiple requests together

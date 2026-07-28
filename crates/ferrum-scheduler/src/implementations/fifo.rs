@@ -379,6 +379,7 @@ mod tests {
             session_id: None,
             created_at: chrono::Utc::now(),
             api_request: None,
+            evidence_request: Default::default(),
             metadata: std::collections::HashMap::new(),
         }
     }

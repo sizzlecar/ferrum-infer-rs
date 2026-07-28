@@ -25,13 +25,14 @@ use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngin
 use ferrum_types::{
     has_unclosed_thinking_block, parse_reasoning_response,
     parse_reasoning_response_started_in_think, EngineMetrics, EngineStatus, FerrumConfigBuilder,
-    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceRequest, InferenceResponse,
-    ModelId, ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
-    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
-    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
-    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
+    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
+    InferenceRequest, InferenceResponse, ModelId, ParsedReasoningResponse, Priority,
+    ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint,
+    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, RuntimeConfigSnapshot,
+    SamplingParams, StructuredOutputStart, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG,
+    THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -1060,6 +1061,9 @@ async fn chat_completions_handler(
     )
     .map_err(server_error_from_ferrum_error)?;
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
+    if state.request_dump_dir.is_some() {
+        inference_request.evidence_request.capture_prompt_token_ids = true;
+    }
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
@@ -1297,6 +1301,37 @@ fn write_chat_request_completion_replay_bundle(
     fs::write(bundle_dir.join("output_text.txt"), output_text_body)
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn write_chat_prompt_token_evidence(
+    request_dump_dir: Option<&Path>,
+    request_id: &str,
+    model: &str,
+    execution_evidence: Option<&InferenceExecutionEvidence>,
+) -> std::result::Result<(), String> {
+    let (Some(root), Some(evidence)) = (request_dump_dir, execution_evidence) else {
+        return Ok(());
+    };
+    let bundle_dir = root.join(request_id);
+    fs::create_dir_all(&bundle_dir).map_err(|err| err.to_string())?;
+    let prompt_token_ids = evidence
+        .prompt_token_ids
+        .iter()
+        .map(|token| token.get())
+        .collect::<Vec<_>>();
+    write_json_value(
+        &bundle_dir.join("prompt_token_ids.json"),
+        &serde_json::json!({
+            "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            "request_id": request_id,
+            "model": model,
+            "tokenizer_or_model": model,
+            "token_ids": prompt_token_ids,
+            "token_count": evidence.prompt_token_ids.len(),
+            "unavailable_reason": null,
+            "sanitized": true
+        }),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2270,6 +2305,14 @@ async fn handle_chat_completions_stream(
                     }
 
                     if chunk.finish_reason.is_some() {
+                        if let Err(err) = write_chat_prompt_token_evidence(
+                            request_dump_dir.as_ref().map(|root| root.as_path()),
+                            &replay_request_id,
+                            &profile_request_model,
+                            chunk.execution_evidence.as_ref(),
+                        ) {
+                            warn!("failed to write chat stream prompt-token evidence: {}", err);
+                        }
                         let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
                         let mut parsed_final = if started_in_think {
                             parse_reasoning_response_started_in_think(&current_text)
@@ -2591,8 +2634,17 @@ async fn handle_chat_completions_sync(
                 finish_reason,
                 usage,
                 api_response,
+                execution_evidence,
                 ..
             } = output;
+            if let Err(err) = write_chat_prompt_token_evidence(
+                state.request_dump_dir.as_ref().map(|root| root.as_path()),
+                &replay_request_id,
+                &profile_request_model,
+                execution_evidence.as_ref(),
+            ) {
+                warn!("failed to write chat prompt-token evidence: {}", err);
+            }
 
             // OpenAI stop strings mark a boundary and are not included in the
             // returned completion. Hard structured formats are never repaired
@@ -3043,6 +3095,7 @@ fn convert_chat_request_with_template_model(
         session_id: None,
         created_at: chrono::Utc::now(),
         api_request: Some(ferrum_types::ApiRequest::Chat(api_chat)),
+        evidence_request: Default::default(),
         metadata,
     })
 }
@@ -4103,6 +4156,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
                 response_format: None,
             },
         )),
+        evidence_request: Default::default(),
         metadata: if request.max_tokens.is_none() {
             HashMap::from([(
                 DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
@@ -5533,6 +5587,11 @@ mod tests {
             &self,
             request: InferenceRequest,
         ) -> ferrum_types::Result<InferenceResponse> {
+            let execution_evidence = request.evidence_request.capture_prompt_token_ids.then(|| {
+                InferenceExecutionEvidence {
+                    prompt_token_ids: vec![TokenId::new(101), TokenId::new(202), TokenId::new(303)],
+                }
+            });
             Ok(InferenceResponse {
                 request_id: request.id,
                 text: self.text.clone(),
@@ -5543,6 +5602,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
                 api_response: self.api_response.clone(),
+                execution_evidence,
             })
         }
 
@@ -5552,6 +5612,11 @@ mod tests {
         ) -> ferrum_types::Result<
             Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
         > {
+            let execution_evidence = request.evidence_request.capture_prompt_token_ids.then(|| {
+                InferenceExecutionEvidence {
+                    prompt_token_ids: vec![TokenId::new(101), TokenId::new(202), TokenId::new(303)],
+                }
+            });
             if let Some(drop_notify) = self.pending_stream_drop_notify.as_ref() {
                 return Ok(Box::pin(PendingDropStream {
                     drop_notify: Arc::clone(drop_notify),
@@ -5578,6 +5643,9 @@ mod tests {
                         api_response: is_final_text_chunk
                             .then(|| self.api_response.clone())
                             .flatten(),
+                        execution_evidence: is_final_text_chunk
+                            .then(|| execution_evidence.clone())
+                            .flatten(),
                     }));
                 }
                 if self.stream_final_chunk_separate {
@@ -5590,6 +5658,7 @@ mod tests {
                         created_at: chrono::Utc::now(),
                         metadata: HashMap::new(),
                         api_response: self.api_response.clone(),
+                        execution_evidence,
                     }));
                 }
                 return Ok(Box::pin(stream::iter(stream_chunks)));
@@ -5604,6 +5673,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
                 api_response: self.api_response.clone(),
+                execution_evidence,
             };
             Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
         }
@@ -5651,6 +5721,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
                 api_response: None,
+                execution_evidence: None,
             })
         }
 
@@ -5670,6 +5741,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
                 api_response: None,
+                execution_evidence: None,
             };
             Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
         }
@@ -5917,6 +5989,11 @@ mod tests {
             .as_str()
             .expect("request id")
             .to_string();
+        let prompt_tokens = read_json_file(bundle.join("prompt_token_ids.json"));
+        assert_eq!(prompt_tokens["request_id"], request_id);
+        assert_eq!(prompt_tokens["token_ids"], json!([101, 202, 303]));
+        assert_eq!(prompt_tokens["token_count"], 3);
+        assert!(prompt_tokens["unavailable_reason"].is_null());
         let output_tokens = read_json_file(bundle.join("output_token_ids.json"));
         assert_eq!(output_tokens["request_id"], request_id);
         assert_eq!(output_tokens["token_ids"], json!(expected_token_ids));

@@ -3608,6 +3608,7 @@ mod tests {
             session_id: None,
             created_at: chrono::Utc::now(),
             api_request: None,
+            evidence_request: Default::default(),
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -4115,6 +4116,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             metadata: Default::default(),
             api_response: None,
+            execution_evidence: None,
         };
         scheduler
             .complete(blocked_id.clone(), &response)
@@ -5444,6 +5446,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             metadata: Default::default(),
             api_response: None,
+            execution_evidence: None,
         };
         scheduler
             .complete(first_ids[2].clone(), &response)
@@ -5917,6 +5920,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             metadata: Default::default(),
             api_response: None,
+            execution_evidence: None,
         };
         scheduler
             .complete(first_ids[1].clone(), &response)
@@ -6013,6 +6017,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             metadata: Default::default(),
             api_response: None,
+            execution_evidence: None,
         };
         scheduler.complete(progressed_id, &response).await.unwrap();
 
@@ -6637,6 +6642,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             metadata: Default::default(),
             api_response: None,
+            execution_evidence: None,
         };
         scheduler
             .complete(first_ids[0].clone(), &response)

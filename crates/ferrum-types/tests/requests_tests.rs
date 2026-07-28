@@ -135,6 +135,7 @@ fn inference_response_can_carry_structured_chat_tool_call() {
             },
             finish_reason: Some("tool_calls".to_string()),
         })),
+        execution_evidence: None,
     };
 
     let Some(ApiResponse::Chat(chat)) = response.api_response.as_ref() else {
@@ -172,6 +173,7 @@ fn stream_chunk_can_carry_structured_chat_tool_call() {
             },
             finish_reason: Some("tool_calls".to_string()),
         })),
+        execution_evidence: None,
     };
 
     let Some(ApiResponse::Chat(chat)) = chunk.api_response.as_ref() else {

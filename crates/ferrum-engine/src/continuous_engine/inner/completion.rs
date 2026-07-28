@@ -184,6 +184,7 @@ impl EngineInner {
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
                 api_response: None,
+                execution_evidence: None,
             };
             if tx.send(Ok(chunk)).await.is_ok() {
                 // A bounded channel send often completes immediately, so a
@@ -402,6 +403,14 @@ impl EngineInner {
                     .unwrap_or_default();
                 let api_response =
                     ferrum_types::api_response_from_generated_text(&seq.original_request, &text);
+                let prompt_token_count = seq.input_tokens.len();
+                let execution_evidence = seq
+                    .original_request
+                    .evidence_request
+                    .capture_prompt_token_ids
+                    .then(|| InferenceExecutionEvidence {
+                        prompt_token_ids: std::mem::take(&mut seq.input_tokens),
+                    });
 
                 // TPOT histogram (PLAYBOOK § 7 definition):
                 //   tpot = (e2e − ttft) / (output_tokens − 1)
@@ -421,11 +430,12 @@ impl EngineInner {
                     text,
                     tokens: seq.generated_tokens.clone(),
                     finish_reason,
-                    usage: TokenUsage::new(seq.input_tokens.len(), seq.generated_tokens.len()),
+                    usage: TokenUsage::new(prompt_token_count, seq.generated_tokens.len()),
                     latency_ms: seq.start_time.elapsed().as_millis() as u64,
                     created_at: chrono::Utc::now(),
                     metadata: HashMap::new(),
                     api_response,
+                    execution_evidence,
                 };
 
                 let completion_resources = seq.take_completion_resources();
@@ -486,6 +496,7 @@ impl EngineInner {
                     created_at: chrono::Utc::now(),
                     metadata: HashMap::new(),
                     api_response: response.api_response.clone(),
+                    execution_evidence: response.execution_evidence.clone(),
                 };
                 let _ = tx.send(Ok(final_chunk)).await;
             }

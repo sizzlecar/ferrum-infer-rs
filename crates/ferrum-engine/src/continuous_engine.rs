@@ -52,11 +52,11 @@ use ferrum_scheduler::vnext::{
 };
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
-    InferenceRequest, InferenceResponse, ObservabilityProfileDetail, Priority, ProfileEntrypoint,
-    ProfileError, ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent,
-    Result, SamplingParams, StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-    PROMPT_TOKENS_METADATA_KEY,
+    InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
+    Priority, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
+    ResourceAction, ResourceTraceEvent, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};

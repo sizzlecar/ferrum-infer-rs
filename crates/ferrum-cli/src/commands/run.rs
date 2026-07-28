@@ -1035,6 +1035,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             session_id: None,
             created_at: Utc::now(),
             api_request: None,
+            evidence_request: Default::default(),
             metadata,
         };
         let profile_request_id = request.id.to_string();
@@ -1336,6 +1337,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     session_id: None,
                     created_at: Utc::now(),
                     api_request: None,
+                    evidence_request: Default::default(),
                     metadata,
                 };
 

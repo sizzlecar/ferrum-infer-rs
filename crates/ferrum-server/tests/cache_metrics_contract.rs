@@ -97,6 +97,7 @@ impl LlmInferenceEngine for StubLlm {
             created_at: chrono::Utc::now(),
             metadata: HashMap::new(),
             api_response: None,
+            execution_evidence: None,
         })
     }
 
@@ -114,6 +115,7 @@ impl LlmInferenceEngine for StubLlm {
             created_at: chrono::Utc::now(),
             metadata: HashMap::new(),
             api_response: None,
+            execution_evidence: None,
         };
         Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
     }
