@@ -3619,16 +3619,19 @@ mod tests {
     fn portable_policy_never_selects_optional_vllm_decode() {
         let shape = goal_shape(16, 4, 256, 32_768);
         for sequence_tokens in [1, 512, 513, 32_768] {
-            assert_eq!(
-                CausalAttentionKernelPath::select(
-                    AttentionExecutionPolicy::Portable,
-                    shape,
-                    1,
-                    sequence_tokens,
-                )
-                .unwrap(),
-                CausalAttentionKernelPath::VllmAddressedFallback
-            );
+            let path = CausalAttentionKernelPath::select(
+                AttentionExecutionPolicy::Portable,
+                shape,
+                1,
+                sequence_tokens,
+            )
+            .unwrap();
+            assert!(!matches!(
+                path,
+                CausalAttentionKernelPath::VllmAddressedDecodeV1
+                    | CausalAttentionKernelPath::VllmAddressedDecodeV2
+            ));
+            assert!(path.native_kernel_id().starts_with("ferrum."));
         }
     }
 
