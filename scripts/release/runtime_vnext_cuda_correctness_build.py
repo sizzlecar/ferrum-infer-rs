@@ -37,7 +37,7 @@ READY_PREFIX = "FERRUM CUDA CORRECTNESS BINARY READY"
 PLAN_READY_PREFIX = "FERRUM CUDA CORRECTNESS IMPORT INVENTORY READY"
 SEMANTIC_PASS_PREFIX = "FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS"
 SELFTEST_PASS_LINE = "FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CORE_PTX_BLOCK_RE = re.compile(
@@ -82,6 +82,7 @@ FORBIDDEN_OVERRIDE_KEYS = (
     "NVCC_PREPEND_FLAGS",
     "NVCC_APPEND_FLAGS",
 )
+UNMANAGED_CUDA_BUILD_PACKAGES = ("candle-kernels",)
 
 
 class CorrectnessBuildError(RuntimeError):
@@ -425,6 +426,7 @@ def make_build_command(
         f"FERRUM_NVCC_THREADS={nvcc_threads}",
         f"FERRUM_CUDA_NATIVE_BUILD_CACHE={native_cache}",
         f"FERRUM_CUDA_NATIVE_IMPORT_DIRS={os.pathsep.join(map(str, import_dirs))}",
+        "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only",
         "cargo",
         "build",
         "--profile",
@@ -472,12 +474,42 @@ def parse_native_build_log(log: str) -> dict[str, Any]:
         for line in log.splitlines()
         if re.search(r"\[(?:vllm-marlin|vllm-moe-marlin|vllm-paged-attn-v2)\]\s+compiling", line)
     ]
+    rejected = [row for row in summaries if row["status"] == "rejected"]
+    unmanaged_build_scripts = []
+    direct_nvcc_invocations = []
+    for line in log.splitlines():
+        stripped = line.strip()
+        if "Running `" not in stripped:
+            continue
+        if re.search(r"(?:^|[\s/])nvcc(?:\s|`|$)", stripped):
+            direct_nvcc_invocations.append(stripped)
+        if not stripped.endswith("/build-script-build`"):
+            continue
+        for package in UNMANAGED_CUDA_BUILD_PACKAGES:
+            if (
+                f"CARGO_PKG_NAME={package}" in stripped
+                or f"CARGO_PKG_NAME='{package}'" in stripped
+            ):
+                unmanaged_build_scripts.append(
+                    {"package": package, "command": stripped}
+                )
+                break
+    managed_recompile_count = len(rebuilt) + len(compiler_lines)
+    unmanaged_recompile_count = len(unmanaged_build_scripts) + len(
+        direct_nvcc_invocations
+    )
     return {
         "cache_events": cache_events,
         "build_summaries": summaries,
         "rebuilt_native_artifacts": rebuilt,
+        "rejected_native_artifacts": rejected,
         "native_compiler_lines": compiler_lines,
-        "native_recompile_count": len(rebuilt) + len(compiler_lines),
+        "unmanaged_native_build_scripts": unmanaged_build_scripts,
+        "direct_nvcc_invocations": direct_nvcc_invocations,
+        "managed_native_recompile_count": managed_recompile_count,
+        "unmanaged_native_recompile_count": unmanaged_recompile_count,
+        "native_recompile_count": managed_recompile_count
+        + unmanaged_recompile_count,
     }
 
 
@@ -599,6 +631,7 @@ def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, A
         "compute_capability": args.compute_capability,
         "cargo_jobs": args.cargo_jobs,
         "nvcc_threads": args.nvcc_threads,
+        "native_source_policy": "cache-only",
         "target_dir": str(target_dir),
         "native_build_cache": str(native_cache),
         "native_import_dirs": [str(path) for path in import_dirs],
@@ -617,7 +650,7 @@ def create_plan(args: argparse.Namespace, *, require_clean: bool) -> dict[str, A
             "require_exact_match_before_focused_result": True,
         },
         "limitations": [
-            "inventory readiness does not prove that legacy OUT_DIR stamps match current inputs",
+            "inventory providers are candidates; exact signatures are resolved fail-closed by the build script",
             "binary readiness does not prove product execution-plan equivalence",
         ],
     }
@@ -652,13 +685,18 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
             term_grace_seconds=2.0,
         ),
     )
+    stdout_text = (
+        build_stdout.read_text(encoding="utf-8") if build_stdout.is_file() else ""
+    )
+    stderr_text = (
+        build_stderr.read_text(encoding="utf-8") if build_stderr.is_file() else ""
+    )
+    native_signal = parse_native_build_log(stdout_text + "\n" + stderr_text)
+    write_json(build_dir / "native-build-signal.json", native_signal)
     require(
         wrapper_rc == 0 and receipt.get("status") == "pass" and receipt.get("rc") == 0,
         f"bounded CUDA correctness build failed: {build_receipt}",
     )
-    stdout_text = build_stdout.read_text(encoding="utf-8")
-    stderr_text = build_stderr.read_text(encoding="utf-8")
-    native_signal = parse_native_build_log(stdout_text + "\n" + stderr_text)
     require(
         native_signal["native_recompile_count"] == 0,
         "CUDA correctness build compiled native PTX/TU instead of reusing signed outputs",
@@ -972,6 +1010,10 @@ def self_test() -> None:
         "FERRUM_NVCC_THREADS=4" in command,
         "typed NVCC worker bound was not written into the build command",
     )
+    require(
+        "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only" in command,
+        "cache-only native source policy was not written into the build command",
+    )
     clean_log = "\n".join(
         [
             "[cuda-native-build-cache] artifact=static.vllm_marlin status=imported "
@@ -987,6 +1029,17 @@ def self_test() -> None:
         f"reason=missing-lib elapsed_ms=1 inputs_hash=sha256:{'b' * 64}"
     )
     require(rebuilt["native_recompile_count"] == 1, "native rebuild was not rejected")
+    unmanaged = parse_native_build_log(
+        "     Running `CARGO_PKG_NAME=candle-kernels "
+        "OUT_DIR=/tmp/candle/out /tmp/candle/build-script-build`"
+    )
+    require(
+        unmanaged["unmanaged_native_recompile_count"] == 1
+        and unmanaged["native_recompile_count"] == 1
+        and unmanaged["unmanaged_native_build_scripts"][0]["package"]
+        == "candle-kernels",
+        "unmanaged Candle CUDA build-script execution was not rejected",
+    )
     compiler_log = json.dumps(
         {
             "reason": "compiler-artifact",

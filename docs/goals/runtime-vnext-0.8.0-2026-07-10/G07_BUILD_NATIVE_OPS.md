@@ -166,10 +166,52 @@ diagnostic use the same bounded default. Local builder self-test and
 `ferrum-kernels --no-default-features` check pass; real CUDA `BINARY READY` remains
 the next stop condition.
 
+### 2026-07-28 Correctness-profile native inventory REJECT
+
+Clean source `60efb84c3d234c8b77ee25154f650d8ab3a94ffa` used the typed
+`cuda-correctness` builder on retained RTX 4090 instance `46083877`. Plan-only
+found every expected Ferrum PTX/archive filename and printed inventory readiness,
+but the bounded build exposed two independent contract failures:
+
+- `static.marlin` existed in the release OUT_DIR, but its stamp was not compatible
+  with the exact correctness-profile signature. The build silently fell through
+  to nvcc, rebuilt it in `3838ms`, and published a new cache entry.
+- `candle-kernels 0.9.2` is outside the Ferrum native inventory. Its non-fresh
+  build script unconditionally compiled Candle PTX and `libmoe.a`, while the old
+  parser counted only Ferrum `[cuda-build-summary]` events.
+
+The lane was stopped at the declared first-native-recompile condition after
+`164.682216s`; the bounded receipt recorded peaks of 49 processes, 102
+process-group threads, and 33 threads in one process, with no resource violation
+and complete process-group cleanup. Decision:
+`REJECT/third_party_candle_and_static_marlin_native_compile_escaped_plan_inventory`.
+
+The follow-up makes correctness builds fail closed:
+
+- `FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only` is a typed build policy. Any
+  exact Ferrum artifact miss now emits a rejected build summary and fails before
+  starting its compiler; the default source-build policy remains `allow`.
+- the validator records `native-build-signal.json` even when Cargo fails and
+  counts actual execution of known unmanaged CUDA build scripts, including
+  Candle, in addition to Ferrum summaries and visible nvcc commands;
+- inventory readiness now means candidate files exist. Exact compatibility is
+  resolved by the same Rust build-script signature implementation under the
+  cache-only policy, rather than duplicated in Python.
+
+The downloaded diagnostic bundle is independently SHA256- and zstd-verified at
+`/Users/chejinxuan/ferrum-artifacts/github/cuda-g06-g07-diagnostics-60efb84c-20260728/verification.json`.
+The GitHub draft-release asset is
+`cuda-g06-g07-diagnostics-60efb84c.tar.zst` (asset `492570669`, SHA256
+`2267c0a438aeef2190f85bc9be32a4dcc24c2e8ebc1f9e9a136bb47d58d849dd`).
 Vast instances `46083877` and `45897840` are both `stopped/exited`, with
-`potentially_billable=[]`. Raw remote receipts remain on retained instance
-`46083877` under `/workspace/ferrum-artifacts/g06-replay-f9bb4070/` and must be
-transferred with the next bounded reuse before any instance destruction.
+`potentially_billable=[]`.
+
+This is not G07A or G07B PASS. A warm target can now prove that a Rust-only edit
+does not invoke native compilers without allowing a hidden fallback, but the cold
+graph still contains Candle's source-building CUDA dependency. G07B must either
+replace that dependency with a signed Candle PTX/`libmoe.a` native artifact
+resolver or remove Candle CUDA from the vNext production feature graph; the
+five-sample timing matrix and canonical G07 validators remain outstanding.
 
 ## 验收
 
