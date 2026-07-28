@@ -577,15 +577,17 @@ fn ferrum_device_to_candle(device: Device) -> Result<candle_core::Device> {
     match device {
         Device::CPU => Ok(candle_core::Device::Cpu),
         Device::CUDA(id) => {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "candle-cuda-compat")]
             {
                 candle_core::Device::new_cuda(id as usize)
                     .map_err(|e| ferrum_types::FerrumError::backend(e.to_string()))
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "candle-cuda-compat"))]
             {
                 let _ = id;
-                Err(ferrum_types::FerrumError::unsupported("CUDA not enabled"))
+                Err(ferrum_types::FerrumError::unsupported(
+                    "legacy Candle CUDA tensors require the candle-cuda-compat feature",
+                ))
             }
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]

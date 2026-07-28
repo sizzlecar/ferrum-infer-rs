@@ -83,7 +83,7 @@ pub async fn execute(cmd: EmbedCommand, config: CliConfig) -> Result<()> {
     let mut config_manager = ConfigManager::new();
     let model_def = config_manager.load_from_path(&source.local_path).await?;
 
-    let device = crate::commands::transcribe::select_candle_device(&cmd.backend);
+    let device = crate::commands::transcribe::select_candle_device(&cmd.backend)?;
     eprintln!("{} {:?}", "Device:".dimmed(), &device);
     let is_clip = model_def.architecture == ferrum_models::Architecture::Clip;
 

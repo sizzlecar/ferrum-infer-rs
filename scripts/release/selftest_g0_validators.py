@@ -27,6 +27,9 @@ RUNTIME_VNEXT_CUDA_CORRECTNESS_BUILD = (
 RUNTIME_VNEXT_PLAN_REFERENCE = (
     REPO_ROOT / "scripts/release/runtime_vnext_plan_reference.py"
 )
+RUNTIME_VNEXT_CUDA_CANDLE_BOUNDARY = (
+    REPO_ROOT / "scripts/release/runtime_vnext_cuda_candle_boundary.py"
+)
 RUNTIME_VNEXT_C13_VLLM_REFERENCE = (
     REPO_ROOT / "scripts/release/runtime_vnext_c13_vllm_reference.py"
 )
@@ -448,6 +451,17 @@ def test_runtime_vnext_plan_reference_selftest() -> None:
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require(
         "FERRUM CUDA RELEASE PLAN REFERENCE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_cuda_candle_boundary_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_CUDA_CANDLE_BOUNDARY), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT CUDA CANDLE BOUNDARY SELFTEST PASS" in ok.stdout,
         ok.stdout,
     )
 
@@ -1125,6 +1139,7 @@ def main() -> int:
     test_runtime_vnext_build_timing_selftest()
     test_runtime_vnext_cuda_correctness_build_selftest()
     test_runtime_vnext_plan_reference_selftest()
+    test_runtime_vnext_cuda_candle_boundary_selftest()
     test_runtime_vnext_c13_reference_selftests()
     test_jsonl_product_session_selftest()
     test_runtime_vnext_baseline_scenarios_selftest()

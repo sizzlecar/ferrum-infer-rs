@@ -913,7 +913,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
         Some(ferrum_models::Architecture::Whisper) => {
             println!("{}", "Initializing Whisper ASR engine...".dimmed());
-            let candle_device = to_candle_device(&device);
+            let candle_device = to_candle_device(&device)?;
             let executor = ferrum_models::WhisperModelExecutor::from_path(
                 &source.local_path.to_string_lossy(),
                 candle_device,
@@ -943,7 +943,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let model_path = source.local_path.to_string_lossy().to_string();
             let mut executors = Vec::with_capacity(n_slots);
             for i in 0..n_slots {
-                let candle_device = to_candle_device(&device);
+                let candle_device = to_candle_device(&device)?;
                 let executor = ferrum_models::TtsModelExecutor::from_path(
                     &model_path,
                     candle_device,
@@ -2202,17 +2202,21 @@ impl RuntimePresetInferenceRule {
 // `run` / `serve` / `bench`. Use `crate::source_resolver::find_cached_model`
 // / `crate::source_resolver::detect_format` directly.
 
-fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
+fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candle_core::Device> {
     match device {
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        ferrum_types::Device::Metal => {
-            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
-        }
-        #[cfg(feature = "cuda")]
-        ferrum_types::Device::CUDA(id) => {
-            candle_core::Device::new_cuda(*id as usize).unwrap_or(candle_core::Device::Cpu)
-        }
-        _ => candle_core::Device::Cpu,
+        ferrum_types::Device::Metal => candle_core::Device::new_metal(0)
+            .map_err(|error| ferrum_types::FerrumError::device(error.to_string())),
+        #[cfg(feature = "candle-cuda-compat")]
+        ferrum_types::Device::CUDA(id) => candle_core::Device::new_cuda(*id as usize)
+            .map_err(|error| ferrum_types::FerrumError::device(error.to_string())),
+        ferrum_types::Device::CUDA(_) => Err(ferrum_types::FerrumError::unsupported(
+            "this Candle-backed server architecture requires the candle-cuda-compat feature",
+        )),
+        ferrum_types::Device::ROCm(_) => Err(ferrum_types::FerrumError::unsupported(
+            "ROCm is not supported",
+        )),
+        _ => Ok(candle_core::Device::Cpu),
     }
 }
 

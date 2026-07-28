@@ -136,8 +136,15 @@ impl TensorLike for CandleTensorWrapper {
     fn to_device(&self, device: &Device) -> Result<ferrum_interfaces::TensorRef> {
         let candle_device = match device {
             Device::CPU => candle_core::Device::Cpu,
+            #[cfg(feature = "candle-cuda-compat")]
             Device::CUDA(id) => candle_core::Device::new_cuda(*id)
                 .map_err(|e| FerrumError::device(format!("CUDA device error: {}", e)))?,
+            #[cfg(not(feature = "candle-cuda-compat"))]
+            Device::CUDA(_) => {
+                return Err(FerrumError::unsupported(
+                    "legacy Candle CUDA tensor transfer requires the candle-cuda-compat feature",
+                ));
+            }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             Device::Metal => candle_core::Device::new_metal(0)
                 .map_err(|e| FerrumError::device(format!("Metal device error: {}", e)))?,

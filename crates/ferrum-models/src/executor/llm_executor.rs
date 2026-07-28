@@ -167,20 +167,24 @@ fn next_unified_decode_prof_call() -> u64 {
 /// Used when materialising KV cache handles so downstream readers see
 /// the real backend the model runs on (Metal / CUDA / CPU) rather than
 /// a hard-coded CPU placeholder.
-fn ferrum_device_to_candle(d: &ferrum_types::Device) -> candle_core::Device {
+fn ferrum_device_to_candle(d: &ferrum_types::Device) -> ferrum_types::Result<candle_core::Device> {
     match d {
-        ferrum_types::Device::CPU => candle_core::Device::Cpu,
-        #[cfg(feature = "cuda")]
-        ferrum_types::Device::CUDA(i) => {
-            candle_core::Device::new_cuda(*i as usize).unwrap_or(candle_core::Device::Cpu)
-        }
-        #[cfg(not(feature = "cuda"))]
-        ferrum_types::Device::CUDA(_) => candle_core::Device::Cpu,
+        ferrum_types::Device::CPU => Ok(candle_core::Device::Cpu),
+        #[cfg(feature = "candle-cuda-compat")]
+        ferrum_types::Device::CUDA(i) => candle_core::Device::new_cuda(*i as usize)
+            .map_err(|error| FerrumError::device(format!("CUDA device error: {error}"))),
+        #[cfg(not(feature = "candle-cuda-compat"))]
+        ferrum_types::Device::CUDA(_) => Err(FerrumError::unsupported(
+            "legacy Candle CUDA executor requires the candle-cuda-compat feature",
+        )),
         #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
-        ferrum_types::Device::Metal => {
-            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
-        }
-        _ => candle_core::Device::Cpu,
+        ferrum_types::Device::Metal => candle_core::Device::new_metal(0)
+            .map_err(|error| FerrumError::device(format!("Metal device error: {error}"))),
+        #[cfg(all(any(target_os = "macos", target_os = "ios"), not(feature = "metal")))]
+        ferrum_types::Device::Metal => Err(FerrumError::unsupported(
+            "legacy Candle Metal executor requires the metal feature",
+        )),
+        ferrum_types::Device::ROCm(_) => Err(FerrumError::unsupported("ROCm is not supported")),
     }
 }
 
@@ -653,7 +657,7 @@ impl ModelExecutor for LlmExecutor {
         // `KvCacheHandle::device()` sees Metal/CUDA/CPU matching the
         // model's real location. The logits `Tensor` still wraps CPU data
         // because `B::to_vec` already moved it off-device.
-        let candle_device = ferrum_device_to_candle(&self.info.device);
+        let candle_device = ferrum_device_to_candle(&self.info.device)?;
 
         // Split the flat logits into per-position tensors, each wrapped
         // with a handle whose seq_len reflects the positions written so

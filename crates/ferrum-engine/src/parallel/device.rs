@@ -330,36 +330,27 @@ impl DeviceManager {
 
     #[cfg(feature = "cuda")]
     fn detect_cuda_devices(&self) -> Result<Vec<DeviceInfo>> {
-        // Use candle to probe CUDA device availability
-        let mut devices = Vec::new();
-        for idx in 0..8 {
-            match candle_core::Device::new_cuda(idx) as std::result::Result<candle_core::Device, _>
-            {
-                Ok(dev) => {
-                    let name = format!("CUDA Device {}", idx);
-                    devices.push(DeviceInfo {
-                        device: Device::CUDA(idx),
-                        name,
-                        capability: DeviceCapability {
-                            // candle probing does not expose CUDA properties here yet.
-                            compute_capability: (0, 0),
-                            total_memory: 0,
-                            unified_memory: false,
-                            ..DeviceCapability::default()
-                        },
-                        used_memory: 0,
-                        is_available: true,
-                        utilization: 0.0,
-                    });
-                    let _ = dev; // keep device alive for probe
-                }
-                Err(_) => break, // no more devices
-            }
-        }
-        if devices.is_empty() {
+        let count = ferrum_kernels::cuda_device_count()
+            .map_err(|error| FerrumError::device(format!("CUDA probe failed: {error}")))?;
+        if count == 0 {
             Err(FerrumError::unsupported("No CUDA devices found"))
         } else {
-            Ok(devices)
+            Ok((0..count)
+                .map(|idx| DeviceInfo {
+                    device: Device::CUDA(idx),
+                    name: ferrum_kernels::cuda_device_name(idx)
+                        .unwrap_or_else(|_| format!("CUDA Device {idx}")),
+                    capability: DeviceCapability {
+                        compute_capability: (0, 0),
+                        total_memory: 0,
+                        unified_memory: false,
+                        ..DeviceCapability::default()
+                    },
+                    used_memory: 0,
+                    is_available: true,
+                    utilization: 0.0,
+                })
+                .collect())
         }
     }
 }

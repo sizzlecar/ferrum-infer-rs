@@ -300,9 +300,7 @@ pub fn format_layer_split_plan(stages: &[CudaLayerSplitStage]) -> String {
 
 #[cfg(feature = "cuda")]
 fn available_cuda_device_count() -> Result<usize> {
-    candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
-        .map(|count| count as usize)
-        .map_err(|err| FerrumError::device(format!("failed to query CUDA device count: {err}")))
+    ferrum_kernels::cuda_device_count().map_err(FerrumError::device)
 }
 
 #[cfg(not(feature = "cuda"))]

@@ -1461,8 +1461,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // Determine device
         let candle_device = match &config.device {
             Device::CPU => CandleDevice::Cpu,
+            #[cfg(feature = "candle-cuda-compat")]
             Device::CUDA(id) => CandleDevice::new_cuda(*id)
                 .map_err(|e| FerrumError::device(format!("CUDA error: {}", e)))?,
+            #[cfg(not(feature = "candle-cuda-compat"))]
+            Device::CUDA(_) => {
+                return Err(FerrumError::unsupported(
+                    "legacy CUDA registry path requires the candle-cuda-compat feature; \
+                     migrated CUDA models must use the vNext product path",
+                ));
+            }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             Device::Metal => CandleDevice::new_metal(0)
                 .map_err(|e| FerrumError::device(format!("Metal error: {}", e)))?,
