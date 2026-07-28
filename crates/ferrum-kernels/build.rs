@@ -31,6 +31,7 @@ const CUDA_NATIVE_SOURCE_POLICY_ENV: &str = "FERRUM_CUDA_NATIVE_SOURCE_POLICY";
 const CUDA_NATIVE_SIGNATURE_SCHEMA: &str = "ferrum-cuda-native-input-v2";
 const DEFAULT_NVCC_THREADS: u32 = 4;
 const MAX_NVCC_THREADS: u32 = 8;
+const HISTORICAL_NVCC_THREAD_VALUES: std::ops::RangeInclusive<u32> = 0..=MAX_NVCC_THREADS;
 
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
@@ -585,6 +586,24 @@ fn content_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) ->
     lines.join("\n")
 }
 
+fn historical_nvcc_scheduler_signatures(
+    label: &str,
+    deps: &[&str],
+    canonical_flags: &[String],
+) -> Vec<String> {
+    HISTORICAL_NVCC_THREAD_VALUES
+        .map(|threads| {
+            let mut historical_flags = canonical_flags.to_vec();
+            historical_flags.insert(2, format!("threads={threads}"));
+            cuda_native_input_signature(&content_static_lib_signature(
+                label,
+                deps,
+                &historical_flags,
+            ))
+        })
+        .collect()
+}
+
 fn metadata_hash_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -> String {
     let mut lines = Vec::with_capacity(2 + deps.len() + flags.len());
     lines.push(format!("label={label}"));
@@ -656,11 +675,17 @@ fn configured_cuda_native_build_cache() -> Option<CudaNativeBuildCache> {
     Some(CudaNativeBuildCache { cache, import_dirs })
 }
 
-fn artifact_stamp_matches(stamp: &Path, signature: &str, migration_signatures: &[&str]) -> bool {
+fn artifact_stamp_matches(
+    stamp: &Path,
+    signature: &str,
+    cache_promotion_signatures: &[&str],
+    import_migration_signatures: &[&str],
+) -> bool {
     fs::read_to_string(stamp).is_ok_and(|existing| {
         existing == signature
-            || migration_signatures
+            || cache_promotion_signatures
                 .iter()
+                .chain(import_migration_signatures)
                 .any(|candidate| existing == **candidate)
     })
 }
@@ -699,7 +724,8 @@ fn restore_cuda_build_artifact(
     file_name: &str,
     stamp_file_name: &str,
     signature: &str,
-    migration_signatures: &[&str],
+    cache_promotion_signatures: &[&str],
+    import_migration_signatures: &[&str],
 ) -> Option<String> {
     let config = config?;
     let spec = NativeBuildArtifactSpec::new(artifact_id, file_name, signature)
@@ -726,11 +752,58 @@ sha256={} entry={}",
         NativeBuildArtifactLookup::Miss { .. } => {}
     }
 
+    for migration_signature in cache_promotion_signatures {
+        let migration_spec =
+            NativeBuildArtifactSpec::new(artifact_id, file_name, *migration_signature)
+                .unwrap_or_else(|error| {
+                    panic!("invalid CUDA build artifact migration identity: {error}")
+                });
+        let migrated = match config
+            .cache
+            .restore(&migration_spec, &destination)
+            .unwrap_or_else(|error| {
+                panic!("failed to restore CUDA build artifact migration {artifact_id}: {error}")
+            }) {
+            NativeBuildArtifactLookup::Hit(receipt) => receipt,
+            NativeBuildArtifactLookup::Miss { .. } => continue,
+        };
+        let published = config
+            .cache
+            .publish(&spec, &destination)
+            .unwrap_or_else(|error| {
+                panic!("failed to promote CUDA build artifact migration {artifact_id}: {error}")
+            });
+        assert_eq!(
+            published.artifact_sha256, migrated.artifact_sha256,
+            "promoted CUDA build artifact hash drifted"
+        );
+        assert_eq!(
+            published.artifact_size_bytes, migrated.artifact_size_bytes,
+            "promoted CUDA build artifact size drifted"
+        );
+        fs::write(out_dir.join(stamp_file_name), signature).unwrap_or_else(|error| {
+            panic!("failed to write promoted CUDA build artifact stamp: {error}")
+        });
+        eprintln!(
+            "[cuda-native-build-cache] artifact={artifact_id} status=promoted \
+source_signature_sha256={} target_signature_sha256={} sha256={}",
+            migration_spec.input_signature_sha256(),
+            spec.input_signature_sha256(),
+            published.artifact_sha256,
+        );
+        return Some("promoted-compatible-native-build-cache".to_string());
+    }
+
     for import_dir in &config.import_dirs {
         let import_artifact = import_dir.join(file_name);
         let import_stamp = import_dir.join(stamp_file_name);
         if !import_artifact.is_file()
-            || !artifact_stamp_matches(&import_stamp, signature, migration_signatures)
+            || !artifact_stamp_matches(
+                &import_stamp,
+                signature,
+                cache_promotion_signatures,
+                import_migration_signatures,
+            )
         {
             continue;
         }
@@ -1046,6 +1119,7 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     &file_name,
                     &stamp_file_name,
                     &signature,
+                    &[],
                     &[&legacy_signature],
                 ) {
                     emit_cuda_build_summary(
@@ -1163,7 +1237,6 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
-        format!("threads={nvcc_threads}"),
         "-Ikernels/vllm_attn".to_string(),
         "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
             .to_string(),
@@ -1188,6 +1261,8 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
     let legacy_signature = static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
     let content_signature = content_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
     let signature = cuda_native_input_signature(&content_signature);
+    let scheduler_migration_signatures =
+        historical_nvcc_scheduler_signatures("vllm-paged-attn-v2", &deps, &flags);
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
@@ -1213,6 +1288,10 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
             return;
         }
         CacheState::Stale(reason) => {
+            let cache_promotion_signatures = scheduler_migration_signatures
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             if let Some(cache_reason) = restore_cuda_build_artifact(
                 native_build_cache,
                 out_dir,
@@ -1220,6 +1299,7 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
                 "libvllm_paged_attn.a",
                 "libvllm_paged_attn.stamp",
                 &signature,
+                &cache_promotion_signatures,
                 &[
                     &legacy_signature,
                     &metadata_hash_signature,
@@ -1354,7 +1434,6 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
-        format!("threads={nvcc_threads}"),
         "-Ikernels/vllm_marlin_moe".to_string(),
         "-DMARLIN_NAMESPACE_NAME=marlin_moe_wna16".to_string(),
         "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
@@ -1369,6 +1448,8 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
     let legacy_signature = static_lib_signature("vllm-moe-marlin", &deps, &flags);
     let content_signature = content_static_lib_signature("vllm-moe-marlin", &deps, &flags);
     let signature = cuda_native_input_signature(&content_signature);
+    let scheduler_migration_signatures =
+        historical_nvcc_scheduler_signatures("vllm-moe-marlin", &deps, &flags);
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("vllm-moe-marlin", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-moe-marlin", &deps, &flags);
@@ -1394,6 +1475,10 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
             return;
         }
         CacheState::Stale(reason) => {
+            let cache_promotion_signatures = scheduler_migration_signatures
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             if let Some(cache_reason) = restore_cuda_build_artifact(
                 native_build_cache,
                 out_dir,
@@ -1401,6 +1486,7 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNa
                 "libvllm_moe_marlin.a",
                 "libvllm_moe_marlin.stamp",
                 &signature,
+                &cache_promotion_signatures,
                 &[
                     &legacy_signature,
                     &metadata_hash_signature,
@@ -1558,7 +1644,6 @@ fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNative
     let flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
-        format!("threads={nvcc_threads}"),
         "-Ivllm_marlin".to_string(),
         "-DMARLIN_NAMESPACE_NAME=marlin".to_string(),
         "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
@@ -1573,6 +1658,8 @@ fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNative
     let legacy_signature = static_lib_signature("vllm-marlin", &deps, &flags);
     let content_signature = content_static_lib_signature("vllm-marlin", &deps, &flags);
     let signature = cuda_native_input_signature(&content_signature);
+    let scheduler_migration_signatures =
+        historical_nvcc_scheduler_signatures("vllm-marlin", &deps, &flags);
     let metadata_hash_signature = metadata_hash_static_lib_signature("vllm-marlin", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-marlin", &deps, &flags);
     let build_start = Instant::now();
@@ -1597,6 +1684,10 @@ fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNative
             return;
         }
         CacheState::Stale(reason) => {
+            let cache_promotion_signatures = scheduler_migration_signatures
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             if let Some(cache_reason) = restore_cuda_build_artifact(
                 native_build_cache,
                 out_dir,
@@ -1604,6 +1695,7 @@ fn compile_vllm_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNative
                 "libvllm_marlin.a",
                 "libvllm_marlin.stamp",
                 &signature,
+                &cache_promotion_signatures,
                 &[
                     &legacy_signature,
                     &metadata_hash_signature,
@@ -1769,6 +1861,7 @@ fn compile_marlin(out_dir: &PathBuf, native_build_cache: Option<&CudaNativeBuild
                 "libmarlin.a",
                 "libmarlin.stamp",
                 &signature,
+                &[],
                 &[
                     &legacy_signature,
                     &metadata_hash_signature,

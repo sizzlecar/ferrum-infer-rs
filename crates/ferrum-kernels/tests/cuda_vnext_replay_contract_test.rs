@@ -9,6 +9,16 @@ const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_att
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
 const MOE_PROVIDER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer/moe.rs");
 const MOE_ROUTER_KERNEL_SOURCE: &str = include_str!("../kernels/moe_router.cu");
+const BUILD_SCRIPT_SOURCE: &str = include_str!("../build.rs");
+
+#[test]
+fn native_artifact_identity_excludes_nvcc_worker_parallelism() {
+    assert!(BUILD_SCRIPT_SOURCE.contains("historical_nvcc_scheduler_signatures"));
+    assert!(BUILD_SCRIPT_SOURCE.contains("status=promoted"));
+    assert!(!BUILD_SCRIPT_SOURCE.contains("format!(\"threads={nvcc_threads}\")"));
+    assert!(BUILD_SCRIPT_SOURCE.contains("\"--threads\","));
+    assert!(BUILD_SCRIPT_SOURCE.contains("nvcc_threads.as_str()"));
+}
 
 #[test]
 fn causal_pages_are_fence_dependencies_not_captured_regions() {
