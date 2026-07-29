@@ -4,6 +4,40 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-07-30，当前 clean、已推送 source
+`02a2ef072eadadee77cd9f825d7d6ad985112433`，tree
+`2b8deda6b8310420d17961274ef137a1abf84d7c`。`a1d92aaf` 修复 structured-output
+合法 token 不收敛，`02a2ef07` 将临时 backing pressure 从终止错误改为携带 blocker
+的 typed deferral，并由 engine 缩批、释放 workspace 后等待重试。
+
+相同 source 的 M2 Metal canonical correctness 已完成 `702/702 pass`，21 个
+scenario 全部通过；正式 validator 打印：
+
+```text
+FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX PASS: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-g08b-metal-full-02a2ef07-20260730/gate-vnext-g08b-metal
+FERRUM GATE vnext-g08b-metal PASS: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-g08b-metal-full-02a2ef07-20260730/gate-vnext-g08b-metal
+```
+
+由于上述共享生产代码晚于 `2ba731e2` 的 CUDA `703/703` checkpoint，当前 source
+没有立刻重跑全量 CUDA。按 G02 staged policy，仅执行
+`c03-001/c05-001/c06-001/c13-022/c15-063/c18-001/c18-002/c18-003`；
+真实 `ferrum run`/`serve` 为 `8/8 pass`，focused report 打印
+`FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`。bounded duration 为
+`185.072369s`，峰值为 `2` processes、`83` group threads、`66` per-process
+threads，无 violation，进程组清理成功。证据保存在 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-2bca46f9154f90ab4f50)，
+archive SHA256 为
+`79314b77f3ebf6dffd9234d8629d8b84fa5fd78f00809ddc775b94c171666230`，
+并已从 GitHub 下载后通过 SHA256、`zstd -t`、required-member 和 summary 复验。
+Vast instance `46217231` 已确认 `stopped/exited`，最终
+`potentially_billable=[]`。
+
+这不是 CUDA `703` 正式 PASS，也不把双后端验证改成逐修复全量乒乓回归。当前 fresh
+formal correctness matrix 仍为 `1/6`（M2 Metal）；M2 CUDA 当前 source 只有
+affected `KEEP`，完整 `703` 只在下一次 runtime source freeze 执行。G00-G10 总目标
+PASS 仍为 `0/11`。下一条关键路径回到 G07 五样本 invalidation timing、workspace
+source gate 和 canonical validator；Metal 性能继续遵守 owner 的空闲主机约束。
+
 截至 2026-07-29，clean、已推送 source
 `2ba731e2bb70dc09763f8582c8b67b8b7e42ac77`，tree
 `4a2b83d28bc04b87001a9b80bac589ba19db28fe` 已修复 partial reusable program

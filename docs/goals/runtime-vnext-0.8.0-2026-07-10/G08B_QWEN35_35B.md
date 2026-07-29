@@ -1852,3 +1852,66 @@ and `serve`, C18 cells `c1/c4/c16`, typed active floor `4`, active duty-cycle
 `>=0.80`, and zero error/OOM/leak counters. Focused artifacts and reports from a
 different source SHA, binary SHA256, model lock, model revision, hardware id, or
 effective config cannot satisfy this checkpoint.
+
+## Post-Shared-Fix Dual-Backend Checkpoint - 2026-07-30
+
+Clean pushed source `02a2ef072eadadee77cd9f825d7d6ad985112433`,
+tree `2b8deda6b8310420d17961274ef137a1abf84d7c`, contains two shared
+production fixes after the `2ba731e2` CUDA matrix:
+
+- `a1d92aaf` bounds repeated legal grammar tokens without masking the only legal
+  candidate, fixing the C15 non-converging structured-output path;
+- `02a2ef07` represents bounded backing pressure as typed deferral with blockers.
+  The engine shrinks or falls back, releases unsubmitted workspace, and waits for
+  capacity instead of converting temporary pressure into terminal exhaustion.
+
+The complete M2 Metal matrix then passed `702/702` cases and all 21 scenarios.
+The candidate binary SHA256 was
+`d3fadab6c6d247e79cc6724189e898becd14daf8d9e92c0e09e09195050b53f9`.
+The bounded matrix took `5830.704692s`, peaked at two processes, 33 group
+threads and 17 threads in one process, recorded no violation, and cleaned up
+its process group. Both former failing cases, `c15-063` and `c18-003`, passed.
+The formal gate printed:
+
+```text
+FERRUM RUNTIME VNEXT G08B METAL MODEL MATRIX PASS: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-g08b-metal-full-02a2ef07-20260730/gate-vnext-g08b-metal
+FERRUM GATE vnext-g08b-metal PASS: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-g08b-metal-full-02a2ef07-20260730/gate-vnext-g08b-metal
+```
+
+CUDA validation followed the staged G02 policy rather than rerunning 703 cases.
+One RTX 4090 built the exact official-feature candidate in `1936.208041s`;
+binary SHA256 was
+`5b2c5a4f85006612be98447938cf1ef339a952ed9db8564fabcc24d13eacd78e`.
+The locked 19 weight files and six semantic files passed `25/25` SHA256 checks.
+Real `ferrum run` and `ferrum serve` then passed these eight affected sentinels:
+
+```text
+c03-001 c05-001 c06-001 c13-022
+c15-063 c18-001 c18-002 c18-003
+```
+
+The focused runner printed
+`FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`; its bounded execution took
+`185.072369s`, peaked at two processes, 83 group threads and 66 threads in one
+process, and left no process group. The first real launch exposed only an outer
+watchdog mismatch: the product used 65 threads while the wrapper allowed 64.
+Raising the observation bound to 80 changed no product configuration; the
+successful run peaked at 66, below that independent bound. Panic/OOM/bad-token
+log scanning passed.
+
+Evidence is preserved in the draft, non-release
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-2bca46f9154f90ab4f50).
+The archive is `57,841,638` bytes with SHA256
+`79314b77f3ebf6dffd9234d8629d8b84fa5fd78f00809ddc775b94c171666230`.
+It was downloaded through GitHub and passed SHA256, `zstd -t`, required-member,
+and validation-summary checks under
+`/Users/chejinxuan/ferrum-artifacts/github/runtime-vnext-cuda-affected-02a2ef07-20260730/`.
+Vast instance `46217231` is `stopped/exited`; final inventory reports
+`potentially_billable=[]`.
+
+This closes the current-source M2 Metal correctness checkpoint and confirms the
+shared fixes on affected CUDA product paths. It does not create a current-source
+CUDA 703 PASS or complete G08B. The next full CUDA matrix is deferred to the next
+runtime source freeze; G07 timing/source gates, both-backend performance,
+legacy/reference parity, legacy removal, mutations, and the G08B aggregate remain
+open.
