@@ -5162,6 +5162,22 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         self.program_binding.as_ref()
     }
 
+    /// Attaches the command that refreshes this provider's invocation-scoped
+    /// binding workspace. A compiled slot moves the command into the
+    /// non-aliasing wave prelude; without that authority it remains adjacent
+    /// to the eager compute command.
+    pub fn attach_binding_command<C>(
+        &self,
+        operation: EncodedDeviceOperation<C>,
+        command: C,
+    ) -> EncodedDeviceOperation<C> {
+        if self.program_binding.is_some() {
+            operation.with_program_binding(command)
+        } else {
+            operation.with_dynamic_binding(command)
+        }
+    }
+
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
         self.work_shape().participant_token_ranges()
     }
