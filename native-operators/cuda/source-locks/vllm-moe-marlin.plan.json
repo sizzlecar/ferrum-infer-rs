@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_moe_marlin",
+  "source_package": {
+    "kind": "ferrum-git-tree",
+    "revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+    "sha256": "aceb676f31599cbd33794243f483f90e7c604b74dd00cc387d70e9c3b595b252"
+  },
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "26b999c71ab28ae9708329003007979530638f79",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    {
+      "path": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+      "sha256": "e8e61d18a34ec211f865003180837cb638a901d0f378d85ab1fabbc2c73eb2a6"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/ops.cu",
+      "sha256": "e028776eff53fa88d748b8f8fefbb5a14a12f6c47a62276a032be8920629e79a"
+    }
+  ],
+  "headers": [
+    {
+      "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+      "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/kernel.h",
+      "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/marlin_template.h",
+      "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+      "sha256": "8d8de7ec568d47928ff2f4fc833e8365d6afe46ab16b07fdf524a6dc5a1ddf95"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+      "sha256": "02c99b24fde6c1ab0179dfa27034c7ef6ae7b1bd5654b767e4c196dc8ee12a86"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+      "sha256": "bd0e545afa3ecc23fbf919f50826219832258ce81d31d118a30b350e5cb9699a"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+      "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
+    }
+  ],
+  "include_dirs": [
+    "kernels/vllm_marlin_moe"
+  ],
+  "defines": [
+    "MARLIN_NAMESPACE_NAME=marlin_moe_wna16"
+  ],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-Xcompiler",
+    "-fPIC",
+    "-Xcompiler",
+    "-fvisibility=default"
+  ],
+  "architecture": "device_compute_capability",
+  "archive_file": "libvllm_moe_marlin.a"
+}

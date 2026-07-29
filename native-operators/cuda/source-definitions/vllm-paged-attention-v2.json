@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_paged_attention_v2",
+  "source_package_kind": "ferrum-git-tree",
+  "source_package_revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "bc150f50299199599673614f80d12a196f377655",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    "kernels/vllm_attn/launcher.cu"
+  ],
+  "headers": [
+    "kernels/vllm_attn/attention_dtypes.h",
+    "kernels/vllm_attn/attention_generic.cuh",
+    "kernels/vllm_attn/attention_kernels.cuh",
+    "kernels/vllm_attn/attention_utils.cuh",
+    "kernels/vllm_attn/dtype_bfloat16.cuh",
+    "kernels/vllm_attn/dtype_float16.cuh",
+    "kernels/vllm_attn/dtype_float32.cuh",
+    "kernels/vllm_attn/dtype_fp8.cuh",
+    "kernels/vllm_attn/ferrum_shim.h",
+    "kernels/vllm_attn/include/cuda_compat.h",
+    "kernels/vllm_attn/quant_utils_stub.cuh"
+  ],
+  "include_dirs": [
+    "kernels/vllm_attn"
+  ],
+  "defines": [],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-Xcompiler",
+    "-fPIC"
+  ],
+  "architecture": "device_compute_capability",
+  "archive_file": "libvllm_paged_attn.a"
+}

@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_marlin",
+  "source_package": {
+    "kind": "ferrum-git-tree",
+    "revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+    "sha256": "5b6c74405d61f6744889e2d2594d905bf797aced96e4f315c31fc82b81d34132"
+  },
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "88d34c6409e9fb3c7b8ca0c04756f061d2099eb1",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    {
+      "path": "vllm_marlin/gptq_marlin_repack.cu",
+      "sha256": "fc675bbe27ebea4634eddc490ceed35855c63b7191b5cb081c6c592de477f91e"
+    },
+    {
+      "path": "vllm_marlin/marlin.cu",
+      "sha256": "7ea8ceaede5e4126e34b62ae2ac8fe6c42364be804a5327d4d66618fcbda4721"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu",
+      "sha256": "cdfdd5de248c4f6c200942c157f3c51790e9277198b1411ccbbf3c5949ef18ec"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu",
+      "sha256": "8174c138706abad2104648c5d031681c9a743b28781f2c1504ed6cfaddf9abb7"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
+      "sha256": "5ecc2ae9f2e9d6555f75782111196eaec639fd3b364b2c57de814f0ecd986868"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+      "sha256": "236e0552f2dd3b2c92256a5a52b9067830cda6ac1f222c775faa4348eb7f6276"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu",
+      "sha256": "1c5c5b34eff5d56756b3b4ba17751fc47da985d71397a3785e8787e010cf1c5a"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_fe2m1f_float16.cu",
+      "sha256": "1fb62a3780709d94d1c0aae4666b26e3c71470caec0d4e2b2b07b5b0fb355619"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_fe4m3fn_float16.cu",
+      "sha256": "47c62a8c5f7efde2f9b52db9b30a9256d396195dcbc466c4b927c3bbc2f627b9"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_u4_float16.cu",
+      "sha256": "9d872b27c8e6f005c4849f1f8bc1099b4b28d3f50e106cfdb8f088d7f52d5484"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_u4b8_float16.cu",
+      "sha256": "03c1f1bdf29125281102b5640d480aba85697ffa162ecc250bddf00cfd9c60d7"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_u8b128_float16.cu",
+      "sha256": "6d977da332cccf1eec0641e8bd5d4f6915f84a52012c07e88e5c3d3087073e05"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu",
+      "sha256": "dabc4919f1a0857816b20a8201610b6e55c3aee3b658c241a4755e44ff59994f"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4_float16.cu",
+      "sha256": "afc118fd11c77d085338d76057d1833dac47b614234fd4971b5b5b7eca8b6221"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4b8_bfloat16.cu",
+      "sha256": "756a4787c09460ea8538009ae5e6be720dabf41698075c1642b4c19955b235ce"
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4b8_float16.cu",
+      "sha256": "d635d4de863a75d1a9d267cd7bf36136411970fac715be912e20183d5ac1fd08"
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu",
+      "sha256": "3709fe7e297dfd0862506ce2cc6e2972c5b1ee96353820a49979cb63511885f8"
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4_bfloat16.cu",
+      "sha256": "a23794a65d079e1a2528ffaa4ebc6bf26f5e13d0eb4312a68c5f71a26569ba9c"
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4_float16.cu",
+      "sha256": "3877851ad4f179e22ffd86b5c44ec8afe971450781d866738a22b5047f094e4b"
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
+      "sha256": "17208293e1a5e6c509dcd3b73884ed7afae40ee4da8cf418e87f48ad50194427"
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu",
+      "sha256": "2344f66ca73ed4003347fce695bc236c8fa236a04d9acf82b475eab27a9f8beb"
+    }
+  ],
+  "headers": [
+    {
+      "path": "vllm_marlin/dequant.h",
+      "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+    },
+    {
+      "path": "vllm_marlin/ferrum_marlin_ffi.h",
+      "sha256": "56d69698efb288c9d4b30bbe5627baa96fbf76c069a2578b71689e7696a29606"
+    },
+    {
+      "path": "vllm_marlin/kernel.h",
+      "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+    },
+    {
+      "path": "vllm_marlin/kernel_selector.h",
+      "sha256": "e6519b39ab932372629296e5e13efa5a79d5735bc8a4dc23b7ca97619d3df425"
+    },
+    {
+      "path": "vllm_marlin/marlin.cuh",
+      "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+    },
+    {
+      "path": "vllm_marlin/marlin_dtypes.cuh",
+      "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+    },
+    {
+      "path": "vllm_marlin/marlin_mma.h",
+      "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+    },
+    {
+      "path": "vllm_marlin/marlin_template.h",
+      "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+    },
+    {
+      "path": "vllm_marlin/scalar_type.hpp",
+      "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+    },
+    {
+      "path": "vllm_marlin/torch_stubs.h",
+      "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+    }
+  ],
+  "include_dirs": [
+    "vllm_marlin"
+  ],
+  "defines": [
+    "MARLIN_NAMESPACE_NAME=marlin"
+  ],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-Xcompiler",
+    "-fPIC",
+    "-Xcompiler",
+    "-fvisibility=default"
+  ],
+  "architecture": "device_compute_capability",
+  "archive_file": "libvllm_marlin.a"
+}

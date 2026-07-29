@@ -1,5 +1,7 @@
 //! Isolated packaging and set assembly for source-built native operators.
 
+pub mod source_build;
+
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
@@ -23,6 +25,8 @@ use thiserror::Error;
 
 pub const NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION: u32 = 1;
 pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+pub use source_build::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorPackageSpec {
@@ -106,6 +110,11 @@ pub enum NativeOperatorBuilderError {
     Resolve(#[from] ferrum_native_ops::NativeOperatorResolveError),
     #[error("native operator artifact-set validation failed: {0}")]
     ArtifactSet(#[from] ferrum_native_ops::NativeOperatorArtifactSetError),
+    #[error("native operator source build rejected: receipt={receipt_path} reason={reason}")]
+    SourceBuildRejected {
+        receipt_path: PathBuf,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, NativeOperatorBuilderError>;

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ferrum_native_ops_builder::{
-    assemble_native_operator_set, package_native_operator, NativeOperatorPackageRequest,
-    NativeOperatorSetRequest,
+    assemble_native_operator_set, lock_native_operator_source_definition, package_native_operator,
+    run_native_operator_source_build, NativeOperatorPackageRequest, NativeOperatorSetRequest,
+    NativeOperatorSourceBuildRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -16,6 +17,36 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    LockSource {
+        #[arg(long)]
+        definition: PathBuf,
+        #[arg(long)]
+        source_root: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    SourceBuild {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        source_root: PathBuf,
+        #[arg(long)]
+        compute_capability: String,
+        #[arg(long)]
+        builder_sha: String,
+        #[arg(long)]
+        nvcc: PathBuf,
+        #[arg(long)]
+        ccbin: PathBuf,
+        #[arg(long)]
+        ar: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        nvcc_threads: u32,
+        #[arg(long)]
+        plan_only: bool,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Package {
         #[arg(long)]
         spec: PathBuf,
@@ -53,6 +84,44 @@ fn main() {
 
 fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
     match cli.command {
+        Command::LockSource {
+            definition,
+            source_root,
+            out,
+        } => {
+            lock_native_operator_source_definition(&definition, &source_root, &out)?;
+            println!("FERRUM NATIVE SOURCE LOCK READY: {}", out.display());
+        }
+        Command::SourceBuild {
+            plan,
+            source_root,
+            compute_capability,
+            builder_sha,
+            nvcc,
+            ccbin,
+            ar,
+            nvcc_threads,
+            plan_only,
+            out,
+        } => {
+            run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+                plan_path: plan,
+                source_root,
+                output_dir: out.clone(),
+                compute_capability,
+                builder_sha,
+                nvcc_path: nvcc,
+                ccbin_path: ccbin,
+                ar_path: ar,
+                nvcc_threads,
+                plan_only,
+            })?;
+            let kind = if plan_only { "PLAN" } else { "BUILD" };
+            println!(
+                "FERRUM NATIVE SOURCE {kind} READY: {}",
+                out.join("source-build.receipt.json").display()
+            );
+        }
         Command::Package {
             spec,
             source_root,

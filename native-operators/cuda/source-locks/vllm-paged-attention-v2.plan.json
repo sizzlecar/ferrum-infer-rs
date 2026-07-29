@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_paged_attention_v2",
+  "source_package": {
+    "kind": "ferrum-git-tree",
+    "revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+    "sha256": "c8c7e5a8063162c2959e29122f1a88ccb14ac7789e8447199d14608d5dfac428"
+  },
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "bc150f50299199599673614f80d12a196f377655",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    {
+      "path": "kernels/vllm_attn/launcher.cu",
+      "sha256": "19cdd5472b11b7a950a38f71ec00191acfdff93bc8dc967ca863288870911ca6"
+    }
+  ],
+  "headers": [
+    {
+      "path": "kernels/vllm_attn/attention_dtypes.h",
+      "sha256": "adbf81937188baa7a4215e51dd4f3ae7ce74f92a90b54f7cdf783d96ea483d53"
+    },
+    {
+      "path": "kernels/vllm_attn/attention_generic.cuh",
+      "sha256": "a9eed8b72c93948c71c90784eaacddf6dafd229cdf12f5df0ce1f05cd21aa41e"
+    },
+    {
+      "path": "kernels/vllm_attn/attention_kernels.cuh",
+      "sha256": "2981b1b970e94e7f617d11df20f6b484a54f6774bd8a31e63556f68c2c8a509a"
+    },
+    {
+      "path": "kernels/vllm_attn/attention_utils.cuh",
+      "sha256": "20403e8453b68be65a7855d0516efc3310c46cff8dc46b5514c856492adf0c78"
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_bfloat16.cuh",
+      "sha256": "eb5118767d89e5f9de1bf6953ab5cd0e80cdb3040c2bb9001130d1b2ccb92e43"
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_float16.cuh",
+      "sha256": "fb6eb4daeb98fc1c4eeb6ea55ebb7f76d2fb725e17c1cab63e5f4b1c4298dbe2"
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_float32.cuh",
+      "sha256": "5d9b84448e6886650f7456606cddc812f0d9a014ef17ed98a92e24b5d4464e00"
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_fp8.cuh",
+      "sha256": "01861d5426d41213a1b8c5c9f8ea0cb7a02e5bc93f48a52c25adc7515b265255"
+    },
+    {
+      "path": "kernels/vllm_attn/ferrum_shim.h",
+      "sha256": "2136d3f4473ff16195d199e69b9e91136ac7ba37c8ba35233bbcf9655ee9db9e"
+    },
+    {
+      "path": "kernels/vllm_attn/include/cuda_compat.h",
+      "sha256": "959bc9e0e73e020d777530b18bf12160d35cc4eb976335955395729700b2f975"
+    },
+    {
+      "path": "kernels/vllm_attn/quant_utils_stub.cuh",
+      "sha256": "cb3bb3d40f972dd2649d42536c26c767f68dfb5c09ba9d4856299a888af12f17"
+    }
+  ],
+  "include_dirs": [
+    "kernels/vllm_attn"
+  ],
+  "defines": [],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-Xcompiler",
+    "-fPIC"
+  ],
+  "architecture": "device_compute_capability",
+  "archive_file": "libvllm_paged_attn.a"
+}

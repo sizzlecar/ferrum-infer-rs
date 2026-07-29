@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.marlin",
+  "source_package_kind": "ferrum-git-tree",
+  "source_package_revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/IST-DASLab/marlin.git",
+      "revision": "1f25790bdd49fba53106164a24666dade68d7c90",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    "kernels/marlin_cuda_kernel.cu"
+  ],
+  "headers": [],
+  "include_dirs": [],
+  "defines": [],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "-Xcompiler",
+    "-fPIC"
+  ],
+  "architecture": "compute80_ptx",
+  "archive_file": "libmarlin.a"
+}
