@@ -1587,6 +1587,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-native-ops-builder"
+version = "0.7.7"
+dependencies = [
+ "clap",
+ "ferrum-native-ops",
+ "ferrum-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ferrum-quantization"
 version = "0.7.7"
 dependencies = [

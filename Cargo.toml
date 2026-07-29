@@ -12,6 +12,7 @@ members = [
 
     # Native operator ABI + artifact resolver (no third-party kernel sources)
     "crates/ferrum-native-ops",
+    "crates/ferrum-native-ops-builder",
     
     # Unified compute kernels (CUDA/Metal/CPU) — Backend<B> trait stack
     # plus the fused-transformer module (formerly ferrum-attention).

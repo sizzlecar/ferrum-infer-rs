@@ -41,6 +41,12 @@ impl CudaNativeBuildUnit {
         }
     }
 
+    pub fn from_artifact_operator(operator: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|unit| unit.artifact_operator() == operator)
+    }
+
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
             Self::Marlin => &["marlin_cuda", "marlin_cuda_moe"],

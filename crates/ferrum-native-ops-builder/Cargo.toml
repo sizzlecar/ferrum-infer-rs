@@ -1,0 +1,18 @@
+[package]
+name = "ferrum-native-ops-builder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Isolated source-build and packaging tools for Ferrum native operators"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+ferrum-native-ops = { workspace = true }
+ferrum-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tempfile = "3.8"
+thiserror = { workspace = true }
