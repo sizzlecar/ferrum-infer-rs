@@ -399,35 +399,47 @@ this reference.
 
 ### 2026-07-30 source/package provenance checkpoint
 
-Clean pushed source `a11b5e58b268a4b68ace820c6837b8d7c946a35e`, tree
-`de06fb2388f1b26a47cd99ecf45a13c3169fd5e2`, closes the local
-source-build-to-package evidence gap. Package specs can no longer self-report
-source package, input hash or build summary and can no longer accept an
-arbitrary archive. The packager requires a terminal PASS source-build receipt
-and its locked plan, then mechanically verifies:
+Clean pushed production source `e229ccadeb852a9198a26f5d21eecc61c543ff7f`,
+tree `5618341821cf41ff41d504c9534416c4b608989b`, closes the local
+source-build-to-package-to-runtime evidence chain. Package specs can no longer
+self-report source package, input hash or build summary and can no longer
+accept an arbitrary archive. Artifact-set assembly also requires caller-owned
+SHA256 pins for every package receipt and for the G03 catalog; it does not
+derive its trust anchor from the package being verified. The packager and
+assembler mechanically verify:
 
 - exact operator and single built compute capability;
 - locked source inventory, plan/source package/input hashes, deterministic
   environment, tool identities, command lines and object cache keys;
-- source archive SHA256, exact non-metadata archive members and every member's
-  object SHA256 before the descriptor is appended;
+- source and final archive SHA256, exact non-metadata member sets and every
+  member's SHA256, size and ELF/Mach-O/COFF ABI identity;
+- descriptor/source object compatibility by actual format/class/endianness/
+  machine rather than raw compiler-target spelling;
 - absolute descriptor compiler/archiver identities, cleared deterministic
-  package environment, exact package commands and non-empty logs.
+  package environment, exact package commands and non-empty logs;
+- package spec/source receipt/plan/manifest semantic projection during
+  assembly, including build summary, exports, operation bindings, licenses,
+  toolkit/runtime and external catalog pin.
 
-The package copies the source receipt, plan and command logs into its
-provenance tree. Artifact-set schema v2 carries and re-hashes those files plus
-the package receipt and package build logs during every load. Negative tests
-reject a forged archive member even when the outer archive pin is updated, and
-reject tampered package receipt/log files.
+The package copies its spec plus source receipt, plan, command logs and
+licenses into its provenance tree. Artifact-set schema v3 carries and
+re-hashes those files plus the manifest, package receipt and package build
+logs during every load. Negative tests reject coherent provenance edits
+against an external receipt pin, stale source semantics even after an outer
+pin is updated, a replaced final member with updated manifest/binary pins,
+mixed object ABIs, false-success archiver output and tampered manifest/spec/
+license/log evidence. Source object names use fixed eight-digit indices so a
+101+ TU build keeps deterministic lexical archive order.
 
 Bounded local evidence is under
-`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-package-provenance-20260730`:
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-final-provenance-20260730`:
 
-- `builder-lib-final-1`: `17/17` pass in `11.956794s`, peak 4 processes /
-  7 process-group threads / 3 per-process threads;
-- `native-ops-lib-final-1`: `23/23` pass in `1.035972s`, peak 2 processes /
-  5 process-group threads / 3 per-process threads;
-- `builder-check-final-2`: all-targets check PASS in `0.531351s`.
+- `builder-lib-final-2`: `23/23` pass in `17.771347s`, peak 4 processes /
+  21 process-group threads / 15 per-process threads;
+- `native-ops-lib-final-2`: `23/23` pass in `2.315004s`, peak 4 processes /
+  15 process-group threads / 10 per-process threads;
+- `builder-check-final-2`: all-targets check PASS in `0.982159s`, peak
+  3 processes / 14 process-group threads / 7 per-process threads.
 
 All bounded receipts report no violation and complete process-group cleanup.
 This is a source/test checkpoint, not G07A, G07B or aggregate G07 PASS.
