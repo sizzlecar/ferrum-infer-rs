@@ -5836,23 +5836,24 @@ impl OperationPlanningRegistry for OperationPlanningHandle<'_> {
 ///
 /// `Static` means every captured choice and address is already bound by the
 /// immutable plan and lane identity. `Dynamic` contributes an opaque
-/// provider-owned fingerprint. `Ineligible` means at least one captured
-/// boundary lacks reusable address authority, so core must use normal encoding
-/// for the complete wave.
+/// provider-owned fingerprint. `EagerBoundary` means this node lacks reusable
+/// address authority and must remain outside resident segments. It does not
+/// veto reusable segments owned by other nodes in the same wave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReusableExecutionTopology {
     Static,
     Dynamic(DeviceReusableExecutionTopologyFingerprint),
-    Ineligible,
+    EagerBoundary,
 }
 
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
     /// Publishes the provider-private compute topology that must match a
-    /// resident reusable program. Static topology and capture ineligibility are
+    /// resident reusable program. Static topology and an eager boundary are
     /// intentionally distinct states: a provider may never silently turn a
-    /// submission-scoped address into resident state.
+    /// submission-scoped address into resident state, while one eager node must
+    /// not disable safe resident segments elsewhere in the wave.
     ///
     /// This declaration is intentionally required. A new provider cannot
     /// silently inherit a static topology after adding shape-dependent kernel

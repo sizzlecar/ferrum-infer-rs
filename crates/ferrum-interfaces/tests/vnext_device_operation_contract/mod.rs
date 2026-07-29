@@ -530,7 +530,7 @@ pub(crate) enum ProviderBehavior {
     Success,
     SplitPhases,
     ProgramBinding,
-    ProgramBindingIneligible,
+    ProgramBindingFirstNodeEagerBoundary,
     ScratchOverwrite,
     ScratchZeroed,
     WrongIdentity,
@@ -539,7 +539,10 @@ pub(crate) enum ProviderBehavior {
 
 impl ProviderBehavior {
     fn uses_program_binding(self) -> bool {
-        matches!(self, Self::ProgramBinding | Self::ProgramBindingIneligible)
+        matches!(
+            self,
+            Self::ProgramBinding | Self::ProgramBindingFirstNodeEagerBoundary
+        )
     }
 }
 
@@ -625,8 +628,10 @@ impl OperationProvider<TestRuntime> for TestProvider {
     ) -> Result<ReusableExecutionTopology, VNextError> {
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::ProgramBinding => {}
-            ProviderBehavior::ProgramBindingIneligible => {
-                return Ok(ReusableExecutionTopology::Ineligible);
+            ProviderBehavior::ProgramBindingFirstNodeEagerBoundary
+                if request.node_id().as_str() == "node.main" =>
+            {
+                return Ok(ReusableExecutionTopology::EagerBoundary);
             }
             _ => return Ok(ReusableExecutionTopology::Static),
         }
@@ -714,7 +719,8 @@ impl OperationProvider<TestRuntime> for TestProvider {
                     .with_dynamic_binding(TestCommand::DynamicBinding)
                     .with_result_binding(TestCommand::ResultBinding))
             }
-            ProviderBehavior::ProgramBinding | ProviderBehavior::ProgramBindingIneligible => {
+            ProviderBehavior::ProgramBinding
+            | ProviderBehavior::ProgramBindingFirstNodeEagerBoundary => {
                 Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
                     .with_program_binding(TestCommand::ProgramBinding))
             }

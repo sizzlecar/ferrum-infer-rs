@@ -285,7 +285,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider
                 .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
                 .is_none()
         {
-            return Ok(ReusableExecutionTopology::Ineligible);
+            return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         reusable_attention_topology(&request)
             .map(ReusableExecutionTopology::Dynamic)

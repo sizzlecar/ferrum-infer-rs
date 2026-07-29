@@ -621,6 +621,13 @@ fn reusable_execution_requires_eager_fallback(
         || preparation.capacity_deferred_executables() != 0
 }
 
+fn reusable_execution_program_catalog_is_usable(
+    preparation: DeviceReusableExecutionPreparation,
+    prepared_programs: usize,
+) -> bool {
+    preparation.resident_executables() == 0 || prepared_programs != 0
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum VNextStartupPreparationState {
@@ -4047,6 +4054,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
         let prepared_programs = catalog_by_id.len();
+        if !reusable_execution_program_catalog_is_usable(device_preparation, prepared_programs) {
+            return Err(FerrumError::internal(format!(
+                "vNext reusable execution sealed {} resident executable segments but registered no typed programs",
+                device_preparation.resident_executables()
+            )));
+        }
         self.reusable_execution_catalog
             .set(VNextReusableExecutionCatalog {
                 lane_epoch: catalog_epoch,
@@ -8097,13 +8110,14 @@ mod tests {
         normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
         product_token_mask_key, reported_allocated_bytes, resolve_reusable_execution_policy,
         resolve_runtime_attention_authority, resolved_sequence_fit_policy,
-        reusable_executable_inventory_matches, reusable_execution_requires_eager_fallback,
-        submission_execution_policy_for_timing, token_mask_upload_required,
-        validate_sequence_completion_accounting, AdmissionFitPolicy, DecodeFailureDisposition,
-        FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
-        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
-        VNextProductTokenMaskKey, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        reusable_executable_inventory_matches, reusable_execution_program_catalog_is_usable,
+        reusable_execution_requires_eager_fallback, submission_execution_policy_for_timing,
+        token_mask_upload_required, validate_sequence_completion_accounting, AdmissionFitPolicy,
+        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
+        VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics,
+        VNextProductOutputMode, VNextProductTokenMaskKey, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
+        VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSequenceCompletion, GreedyRepetitionPenalty, LogitsReturnPolicy, PrefillChunk,
@@ -8336,6 +8350,17 @@ mod tests {
 
         assert!(!reusable_execution_requires_eager_fallback(prepared));
         assert!(!reusable_executable_inventory_matches(prepared, drifted));
+    }
+
+    #[test]
+    fn resident_reusable_segments_require_a_typed_program_catalog() {
+        let plan = DeviceReusableExecutionPlan::new(4).unwrap();
+        let resident = DeviceReusableExecutionPreparation::ready(plan, 2, 0, 2, 2, 0).unwrap();
+        let eager_only = DeviceReusableExecutionPreparation::ready(plan, 0, 0, 0, 0, 0).unwrap();
+
+        assert!(!reusable_execution_program_catalog_is_usable(resident, 0));
+        assert!(reusable_execution_program_catalog_is_usable(resident, 1));
+        assert!(reusable_execution_program_catalog_is_usable(eager_only, 0));
     }
 
     #[test]
