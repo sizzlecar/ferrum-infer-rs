@@ -9155,6 +9155,156 @@ fn model_decode_argmax_mask_uses_model_vocab_for_extended_stop_tokens() {
     );
 }
 
+fn response_completion_tokenizer() -> Arc<dyn Tokenizer + Send + Sync> {
+    Arc::new(PolicyTokenizer::new(
+        8,
+        &[
+            ("reason", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("<eos>", 3),
+            ("<pad>", 4),
+            ("END", 5),
+            ("\n", 6),
+            ("answer", 7),
+        ],
+    ))
+}
+
+fn response_completion_request() -> InferenceRequest {
+    let mut request = policy_request();
+    request.sampling_params.response_completion_boundary =
+        ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload("END".to_string());
+    request
+}
+
+#[test]
+fn response_completion_boundary_masks_eos_until_delimiter_and_payload() {
+    let tokenizer = response_completion_tokenizer();
+    let mut state = SequenceState::new_with_tokenizer(
+        response_completion_request(),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    for token_id in [0u32, 5, 6, 7] {
+        let mut logits = vec![f32::NEG_INFINITY; 8];
+        logits[3] = 100.0;
+        logits[token_id as usize] = 10.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(token_id));
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        state.generated_tokens.push(token);
+    }
+
+    let mut eos_logits = vec![f32::NEG_INFINITY; 8];
+    eos_logits[3] = 100.0;
+    let eos = state
+        .sample_with_processors_with_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(eos, TokenId::new(3));
+}
+
+#[test]
+fn response_completion_boundary_updates_greedy_mask_at_phase_transition() {
+    let tokenizer = response_completion_tokenizer();
+    let mut state = SequenceState::new_with_tokenizer(
+        response_completion_request(),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(initial_mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("completion boundary must preserve model-side greedy argmax");
+    };
+    assert_eq!(initial_mask.valid_token_mask[3], 0);
+    assert!(state
+        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
+        .unwrap_err()
+        .to_string()
+        .contains("before satisfying the response completion boundary"));
+
+    for token_id in [0u32, 5, 6, 7] {
+        let token = TokenId::new(token_id);
+        state
+            .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), token)
+            .unwrap();
+        state.generated_tokens.push(token);
+    }
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(completed_mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("completed boundary must retain model-side greedy argmax");
+    };
+    assert_eq!(completed_mask.valid_token_mask[3], 1);
+    assert_ne!(completed_mask.fingerprint, initial_mask.fingerprint);
+    state
+        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
+        .unwrap();
+}
+
+#[test]
+fn response_completion_boundary_preserves_explicit_user_stop() {
+    let tokenizer = response_completion_tokenizer();
+    let mut request = response_completion_request();
+    request.sampling_params.stop_sequences = vec!["reason".to_string()];
+    let mut state = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 8];
+    logits[0] = 10.0;
+    logits[3] = 100.0;
+    let token = state
+        .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(token, TokenId::new(0));
+    state.generated_tokens.push(token);
+    assert_eq!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::Stop)
+    );
+}
+
+#[test]
+fn response_completion_boundary_preserves_ignore_eos() {
+    let tokenizer = response_completion_tokenizer();
+    let mut request = response_completion_request();
+    request
+        .metadata
+        .insert("ferrum_ignore_eos".to_string(), serde_json::json!(true));
+    let mut state = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("ignore_eos must retain model-side greedy argmax");
+    };
+    assert_eq!(mask.valid_token_mask[3], 1);
+    state
+        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
+        .unwrap();
+    state.generated_tokens.push(TokenId::new(3));
+    assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
+}
+
 #[test]
 fn model_decode_logits_policy_keeps_repetition_penalty_on_greedy_argmax_path() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(

@@ -29,10 +29,10 @@ use ferrum_types::{
     InferenceRequest, InferenceResponse, ModelId, ParsedReasoningResponse, Priority,
     ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint,
     ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, RuntimeConfigSnapshot,
-    SamplingParams, StructuredOutputStart, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
-    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG,
-    THINK_START_TAG,
+    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
+    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
+    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -3132,6 +3132,11 @@ fn convert_chat_request_with_template_model(
     } else {
         StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
     };
+    let response_completion_boundary = if has_unclosed_thinking_block(&prompt) {
+        ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+    } else {
+        ResponseCompletionBoundary::Immediate
+    };
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
@@ -3158,6 +3163,7 @@ fn convert_chat_request_with_template_model(
             mirostat: None,
             response_format,
             structured_output_start,
+            response_completion_boundary,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -4214,6 +4220,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
             mirostat: None,
             response_format: ferrum_types::ResponseFormat::Text,
             structured_output_start: StructuredOutputStart::Immediate,
+            response_completion_boundary: ResponseCompletionBoundary::Immediate,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal,
@@ -10732,6 +10739,32 @@ mod tests {
         assert_eq!(
             internal.sampling_params.structured_output_start,
             StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
+        );
+        assert_eq!(
+            internal.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+        );
+    }
+
+    #[test]
+    fn response_completion_contract_is_set_on_text_thinking_template() {
+        let request = chat_request(json!({}));
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
+            "thinking-test-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert thinking text request");
+
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::Immediate
+        );
+        assert_eq!(
+            internal.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
         );
     }
 

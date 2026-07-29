@@ -28,6 +28,35 @@ fn sampling_params_validate_checks() {
     let mut p = SamplingParams::default();
     p.min_p = Some(1.1);
     assert!(p.validate().is_err());
+
+    let mut p = SamplingParams::default();
+    p.response_completion_boundary =
+        ResponseCompletionBoundary::AfterDelimiterAndPayload(String::new());
+    assert!(p.validate().is_err());
+}
+
+#[test]
+fn response_completion_boundary_is_backward_compatible_and_round_trips() {
+    let mut legacy = serde_json::to_value(SamplingParams::default()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("response_completion_boundary");
+    let decoded: SamplingParams = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        decoded.response_completion_boundary,
+        ResponseCompletionBoundary::Immediate
+    );
+
+    let mut params = SamplingParams::default();
+    params.response_completion_boundary =
+        ResponseCompletionBoundary::AfterDelimiterAndPayload("</think>".to_string());
+    let decoded: SamplingParams =
+        serde_json::from_value(serde_json::to_value(params).unwrap()).unwrap();
+    assert_eq!(
+        decoded.response_completion_boundary,
+        ResponseCompletionBoundary::AfterDelimiterAndPayload("</think>".to_string())
+    );
 }
 
 #[test]

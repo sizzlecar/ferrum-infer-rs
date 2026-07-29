@@ -10,9 +10,9 @@ use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, Promp
 use ferrum_types::{
     has_unclosed_thinking_block, parse_reasoning_response_for_prompt, FerrumConfigBuilder,
     FerrumError, FinishReason, InferenceRequest, InferenceResponse, ModelCapabilities, Priority,
-    RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage, WorkloadProfile,
-    DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG, THINK_START_TAG,
+    RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage,
+    WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG, THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1828,6 +1828,14 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
     }
 }
 
+fn sampling_params_for_prompt(mut sampling_params: SamplingParams, prompt: &str) -> SamplingParams {
+    if has_unclosed_thinking_block(prompt) {
+        sampling_params.response_completion_boundary =
+            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string());
+    }
+    sampling_params
+}
+
 fn build_chat_template_options(
     cmd: &RunCommand,
     model_template: Option<&ModelChatTemplate>,
@@ -1873,9 +1881,10 @@ fn build_run_prompt_plan(
             )));
         }
 
+        let sampling_params = sampling_params_for_prompt(base_sampling, &prompt);
         return Ok(RunPromptPlan {
             prompt,
-            sampling_params: base_sampling,
+            sampling_params,
             prompt_token_ids: prompt_tokenization.token_ids,
             prompt_tokens,
             kv_capacity: budget.kv_capacity,
@@ -1899,9 +1908,10 @@ fn build_run_prompt_plan(
         let prompt_tokens = prompt_tokenization.token_count;
 
         let Some(kv_capacity) = budget.kv_capacity else {
+            let sampling_params = sampling_params_for_prompt(base_sampling, &prompt);
             return Ok(RunPromptPlan {
                 prompt,
-                sampling_params: base_sampling,
+                sampling_params,
                 prompt_token_ids: prompt_tokenization.token_ids,
                 prompt_tokens,
                 kv_capacity: None,
@@ -1911,9 +1921,10 @@ fn build_run_prompt_plan(
             });
         };
         let Some(prompt_tokens) = prompt_tokens else {
+            let sampling_params = sampling_params_for_prompt(base_sampling, &prompt);
             return Ok(RunPromptPlan {
                 prompt,
-                sampling_params: base_sampling,
+                sampling_params,
                 prompt_token_ids: prompt_tokenization.token_ids,
                 prompt_tokens: None,
                 kv_capacity: Some(kv_capacity),
@@ -1933,6 +1944,7 @@ fn build_run_prompt_plan(
             } else {
                 None
             };
+            let sampling_params = sampling_params_for_prompt(sampling_params, &prompt);
             return Ok(RunPromptPlan {
                 prompt,
                 sampling_params,
@@ -3073,6 +3085,33 @@ mod tests {
         assert!(params.stop_sequences.contains(&"\n".to_string()));
         assert!(params.stop_sequences.contains(&"END".to_string()));
         assert!(!params.stop_sequences.contains(&String::new()));
+    }
+
+    #[test]
+    fn response_completion_contract_is_set_on_run_prompt_plan() {
+        let cmd = test_run_cmd();
+        let budget = whitespace_budget(8192);
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
+            "thinking-test-template",
+        );
+        let plan = build_run_prompt_plan(
+            &[],
+            "demo",
+            None,
+            "tinyllama",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            &cmd,
+            &budget,
+        )
+        .unwrap();
+
+        assert!(has_unclosed_thinking_block(&plan.prompt));
+        assert_eq!(
+            plan.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+        );
     }
 
     #[test]

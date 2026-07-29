@@ -55,9 +55,10 @@ use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
     InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
     Priority, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
-    ResourceAction, ResourceTraceEvent, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
-    DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
+    ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary, Result, SamplingParams,
+    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
@@ -303,24 +304,30 @@ fn resolve_stop_conditions(
     params: &SamplingParams,
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     ignore_eos: bool,
-) -> (HashSet<u32>, Vec<String>) {
-    let mut ids: HashSet<u32> = HashSet::new();
+) -> (Vec<u32>, HashSet<u32>, Vec<String>) {
+    let mut model_eos_token_ids = Vec::new();
     let mut text_seqs: Vec<String> = Vec::new();
 
     if let Some(tok) = tokenizer {
         if !ignore_eos {
             if let Some(eos) = tok.special_tokens().eos_token {
-                ids.insert(eos.get());
+                model_eos_token_ids.push(eos.get());
             }
             for extra in &tok.special_tokens().extra_eos_tokens {
-                ids.insert(extra.get());
+                model_eos_token_ids.push(extra.get());
             }
             for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
                 if let Some(t) = tok.token_id(name) {
-                    ids.insert(t.get());
+                    model_eos_token_ids.push(t.get());
                 }
             }
         }
+    }
+    model_eos_token_ids.sort_unstable();
+    model_eos_token_ids.dedup();
+    let mut ids: HashSet<u32> = model_eos_token_ids.iter().copied().collect();
+
+    if let Some(tok) = tokenizer {
         for stop_seq in &params.stop_sequences {
             if !stop_seq.is_empty() {
                 text_seqs.push(stop_seq.clone());
@@ -337,7 +344,136 @@ fn resolve_stop_conditions(
             text_seqs.push(stop_seq.clone());
         }
     }
-    (ids, text_seqs)
+    (model_eos_token_ids, ids, text_seqs)
+}
+
+#[derive(Debug)]
+enum ResponseCompletionState {
+    Satisfied,
+    AwaitingDelimiter {
+        tokens: Vec<u32>,
+        failure: Vec<usize>,
+        matched: usize,
+    },
+    AwaitingPayload,
+}
+
+impl ResponseCompletionState {
+    fn compile(
+        boundary: &ResponseCompletionBoundary,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        model_eos_token_ids: &[u32],
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let ResponseCompletionBoundary::AfterDelimiterAndPayload(delimiter) = boundary else {
+            return Ok(Self::Satisfied);
+        };
+        if model_eos_token_ids.is_empty() {
+            return Ok(Self::Satisfied);
+        }
+        let tokenizer = tokenizer.ok_or_else(|| {
+            FerrumError::config("response completion boundary requires a tokenizer")
+        })?;
+        let tokens = if let Some(token) = tokenizer.token_id(delimiter) {
+            vec![token.get()]
+        } else {
+            tokenizer
+                .encode(delimiter, false)?
+                .into_iter()
+                .map(TokenId::get)
+                .collect::<Vec<_>>()
+        };
+        if tokens.is_empty() {
+            return Err(FerrumError::invalid_request(format!(
+                "response completion delimiter {delimiter:?} did not tokenize"
+            )));
+        }
+        if max_tokens <= tokens.len() {
+            return Err(FerrumError::invalid_request(format!(
+                "response completion requires max_tokens greater than its {}-token delimiter",
+                tokens.len()
+            )));
+        }
+        if let Some(token) = tokens
+            .iter()
+            .find(|token| model_eos_token_ids.contains(token))
+        {
+            return Err(FerrumError::invalid_request(format!(
+                "response completion delimiter token {token} conflicts with model EOS"
+            )));
+        }
+        let failure = delimiter_failure_table(&tokens);
+        Ok(Self::AwaitingDelimiter {
+            tokens,
+            failure,
+            matched: 0,
+        })
+    }
+
+    fn allows_model_eos(&self) -> bool {
+        matches!(self, Self::Satisfied)
+    }
+
+    /// Advance the boundary with one accepted token. Delimiter matching is
+    /// allocation-free; incremental decoding is needed only for the short
+    /// post-delimiter interval before the first payload token.
+    fn observe(
+        &mut self,
+        previous_tokens: &[TokenId],
+        token: TokenId,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    ) -> Result<bool> {
+        match self {
+            Self::Satisfied => Ok(false),
+            Self::AwaitingDelimiter {
+                tokens,
+                failure,
+                matched,
+            } => {
+                let token_id = token.get();
+                while *matched > 0 && tokens[*matched] != token_id {
+                    *matched = failure[*matched - 1];
+                }
+                if tokens[*matched] == token_id {
+                    *matched += 1;
+                }
+                if *matched == tokens.len() {
+                    *self = Self::AwaitingPayload;
+                }
+                Ok(false)
+            }
+            Self::AwaitingPayload => {
+                let tokenizer = tokenizer.ok_or_else(|| {
+                    FerrumError::config("response completion boundary lost its tokenizer")
+                })?;
+                let delta = tokenizer.decode_incremental(previous_tokens, token)?;
+                if delta
+                    .chars()
+                    .any(|character| !character.is_whitespace() && character != '\u{FFFD}')
+                {
+                    *self = Self::Satisfied;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+fn delimiter_failure_table(tokens: &[u32]) -> Vec<usize> {
+    let mut failure = vec![0usize; tokens.len()];
+    let mut matched = 0usize;
+    for index in 1..tokens.len() {
+        while matched > 0 && tokens[matched] != tokens[index] {
+            matched = failure[matched - 1];
+        }
+        if tokens[matched] == tokens[index] {
+            matched += 1;
+        }
+        failure[index] = matched;
+    }
+    failure
 }
 
 fn resolve_sampling_token_constraints(
@@ -762,6 +898,12 @@ pub struct SequenceState {
     /// `<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`), and one-token encodings of
     /// `sampling_params.stop_sequences`.
     pub stop_token_ids: HashSet<u32>,
+    /// Model-owned EOS ids, kept separate from user stop conditions so a
+    /// response-completion boundary can delay only model termination.
+    pub model_eos_token_ids: Vec<u32>,
+    /// Request-local compiled completion boundary. The common satisfied path
+    /// is one enum comparison per token.
+    response_completion_state: ResponseCompletionState,
     /// Token IDs that should never be sampled as normal output. Used for
     /// tokenizer/model vocab holes such as Qwen3's reserved tail IDs and
     /// literal `<unk` / `<unk>` pieces.
@@ -1156,8 +1298,15 @@ impl SequenceState {
             .get("ferrum_ignore_eos")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let (stop_token_ids, stop_text_seqs) =
+        let (model_eos_token_ids, stop_token_ids, stop_text_seqs) =
             resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
+        let response_completion_state = ResponseCompletionState::compile(
+            &request.sampling_params.response_completion_boundary,
+            tokenizer.as_deref(),
+            &model_eos_token_ids,
+            request.sampling_params.max_tokens,
+        )?;
+        let completion_boundary_open = !response_completion_state.allows_model_eos();
         let structured_output_processor = shared_structured_factory
             .or(local_structured_factory.as_ref())
             .map(|factory| {
@@ -1195,7 +1344,7 @@ impl SequenceState {
             }
         }
         let empty_initial_forbidden = HashSet::new();
-        let argmax_token_mask = tokenizer.as_deref().map(|tok| {
+        let mut argmax_token_mask = tokenizer.as_deref().map(|tok| {
             build_argmax_token_mask(
                 tok,
                 model_vocab_size,
@@ -1205,7 +1354,7 @@ impl SequenceState {
                 &allowed_extended_token_ids,
             )
         });
-        let initial_argmax_token_mask = if initial_forbidden_token_ids.is_empty() {
+        let mut initial_argmax_token_mask = if initial_forbidden_token_ids.is_empty() {
             None
         } else {
             tokenizer.as_deref().map(|tok| {
@@ -1219,6 +1368,14 @@ impl SequenceState {
                 )
             })
         };
+        if completion_boundary_open {
+            if let Some(mask) = &mut argmax_token_mask {
+                mask.set_tokens_validity(&model_eos_token_ids, false);
+            }
+            if let Some(mask) = &mut initial_argmax_token_mask {
+                mask.set_tokens_validity(&model_eos_token_ids, false);
+            }
+        }
         Ok(Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -1245,6 +1402,8 @@ impl SequenceState {
             draft_kv: None,
             token_frequencies: HashMap::new(),
             stop_token_ids,
+            model_eos_token_ids,
+            response_completion_state,
             forbidden_token_ids,
             initial_forbidden_token_ids,
             tokenizer_base_vocab_size,
@@ -1694,6 +1853,30 @@ impl SequenceState {
         }
     }
 
+    fn accept_response_completion_token(
+        &mut self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> Result<()> {
+        if !self.response_completion_state.allows_model_eos()
+            && self.model_eos_token_ids.contains(&token.get())
+        {
+            return Err(FerrumError::model(format!(
+                "model selected EOS token {} before satisfying the response completion boundary",
+                token.get()
+            )));
+        }
+        let boundary_satisfied =
+            self.response_completion_state
+                .observe(&self.generated_tokens, token, tokenizer)?;
+        if boundary_satisfied {
+            if let Some(mask) = &mut self.argmax_token_mask {
+                mask.set_tokens_validity(&self.model_eos_token_ids, true);
+            }
+        }
+        Ok(())
+    }
+
     pub fn accept_model_greedy_argmax_token(
         &mut self,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
@@ -1743,6 +1926,7 @@ impl SequenceState {
             )));
         }
 
+        self.accept_response_completion_token(tokenizer, token)?;
         *self.token_frequencies.entry(token).or_insert(0) += 1;
         Ok(())
     }
@@ -1897,6 +2081,13 @@ impl SequenceState {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
         }
+        if !self.response_completion_state.allows_model_eos() {
+            for &token_id in &self.model_eos_token_ids {
+                if let Some(logit) = logits.get_mut(token_id as usize) {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
 
         for &token_id in &self.forbidden_token_ids {
             if required_structured_delimiter_token_id == Some(token_id) {
@@ -1984,6 +2175,7 @@ impl SequenceState {
             }
         };
 
+        self.accept_response_completion_token(tokenizer, token)?;
         // Update frequency tracking
         *self.token_frequencies.entry(token).or_insert(0) += 1;
 
