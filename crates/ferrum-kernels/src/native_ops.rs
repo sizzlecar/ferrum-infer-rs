@@ -5,29 +5,44 @@
 //! entrypoints must pass typed manifest/artifact choices into this layer.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use ferrum_native_ops::{
     NativeOperatorArtifactFormat, NativeOperatorResolveError, NativeOperatorResolveRequest,
     NativeOperatorResolver,
 };
 use ferrum_types::{
-    resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
-    NativeOperatorRequirement,
+    resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorBinding,
+    NativeOperatorLinkage, NativeOperatorRequirement,
 };
+
+pub use ferrum_types::CompiledNativeOperatorIdentity as CompiledNativeOperatorArtifact;
 
 pub const FA2_NATIVE_OPERATOR: &str = "fa2";
 
+pub fn compiled_native_operator_artifacts() -> &'static [CompiledNativeOperatorArtifact] {
+    static COMPILED: OnceLock<Vec<CompiledNativeOperatorArtifact>> = OnceLock::new();
+    COMPILED
+        .get_or_init(|| {
+            serde_json::from_str(
+                option_env!("FERRUM_COMPILED_NATIVE_OPERATOR_SET_JSON").unwrap_or("[]"),
+            )
+            .expect("build.rs emitted invalid native operator inventory JSON")
+        })
+        .as_slice()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFa2NativeOperatorArtifact {
-    pub manifest_path: &'static str,
-    pub artifact_path: &'static str,
-    pub source_package_sha256: &'static str,
-    pub inputs_sha256: &'static str,
-    pub binary_sha256: &'static str,
+    pub manifest_path: String,
+    pub artifact_path: String,
+    pub source_package_sha256: String,
+    pub inputs_sha256: String,
+    pub binary_sha256: String,
 }
 
 pub fn compiled_fa2_native_operator_artifact_linked() -> bool {
-    option_env!("FERRUM_FA2_NATIVE_ARTIFACT_COMPILE") == Some("linked")
+    compiled_fa2_native_operator_artifact().is_some()
 }
 
 pub fn compiled_fa2_native_operator_artifact_state() -> &'static str {
@@ -36,11 +51,11 @@ pub fn compiled_fa2_native_operator_artifact_state() -> &'static str {
 
 pub fn compiled_fa2_native_operator_artifact() -> Option<CompiledFa2NativeOperatorArtifact> {
     Some(CompiledFa2NativeOperatorArtifact {
-        manifest_path: option_env!("FERRUM_COMPILED_FA2_NATIVE_MANIFEST")?,
-        artifact_path: option_env!("FERRUM_COMPILED_FA2_NATIVE_ARTIFACT")?,
-        source_package_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_SOURCE_SHA256")?,
-        inputs_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_INPUTS_SHA256")?,
-        binary_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256")?,
+        manifest_path: option_env!("FERRUM_COMPILED_FA2_NATIVE_MANIFEST")?.to_string(),
+        artifact_path: option_env!("FERRUM_COMPILED_FA2_NATIVE_ARTIFACT")?.to_string(),
+        source_package_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_SOURCE_SHA256")?.to_string(),
+        inputs_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_INPUTS_SHA256")?.to_string(),
+        binary_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256")?.to_string(),
     })
 }
 
@@ -92,7 +107,10 @@ impl NativeOperatorArtifactSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeOperatorRuntimeSelection {
+    pub schema_version: u32,
     pub operator: String,
+    pub operator_abi_version: String,
+    pub ferrum_native_abi_version: String,
     pub backend: NativeOperatorBackend,
     pub compute_capability: Option<String>,
     pub linkage: NativeOperatorLinkage,
@@ -101,6 +119,10 @@ pub struct NativeOperatorRuntimeSelection {
     pub binary_sha256: String,
     pub source_package_sha256: String,
     pub inputs_sha256: String,
+    pub g03_catalog_sha256: Option<String>,
+    pub abi_contract_sha256: Option<String>,
+    pub descriptor_export: Option<String>,
+    pub operation_bindings: Vec<NativeOperatorBinding>,
     pub artifact_format: NativeOperatorArtifactFormat,
     pub archive_members: Vec<String>,
     pub required_exports: Vec<String>,
@@ -133,6 +155,11 @@ pub fn resolve_native_operator_artifact(
             .binary_sha256
             .clone()
             .or_else(|| Some(resolved.artifact_sha256.clone())),
+        g03_catalog_sha256: resolved.manifest.g03_catalog_sha256.clone(),
+        abi_contract_sha256: resolved.manifest.abi_contract_sha256.clone(),
+        descriptor_export: resolved.manifest.descriptor_export.clone(),
+        required_exports: resolved.manifest.exports.clone(),
+        operation_bindings: Some(resolved.manifest.operation_bindings.clone()),
     };
     if requirement.source_package_sha256.is_none() {
         requirement.source_package_sha256 = Some(resolved.manifest.source_package.sha256.clone());
@@ -144,7 +171,10 @@ pub fn resolve_native_operator_artifact(
         .map_err(NativeOperatorResolveError::ManifestInvalid)?;
 
     Ok(NativeOperatorRuntimeSelection {
+        schema_version: resolved.manifest.schema_version,
         operator: resolved.manifest.operator.clone(),
+        operator_abi_version: resolved.manifest.operator_abi_version.clone(),
+        ferrum_native_abi_version: resolved.manifest.ferrum_native_abi_version.clone(),
         backend: resolved.manifest.backend,
         compute_capability: spec.compute_capability.clone(),
         linkage: resolved.manifest.linkage,
@@ -153,6 +183,10 @@ pub fn resolve_native_operator_artifact(
         binary_sha256: resolved.artifact_sha256,
         source_package_sha256: resolved.manifest.source_package.sha256,
         inputs_sha256: resolved.manifest.inputs_sha256,
+        g03_catalog_sha256: resolved.manifest.g03_catalog_sha256,
+        abi_contract_sha256: resolved.manifest.abi_contract_sha256,
+        descriptor_export: resolved.manifest.descriptor_export,
+        operation_bindings: resolved.manifest.operation_bindings,
         artifact_format: resolved.binary_validation.format,
         archive_members: resolved.binary_validation.archive_members,
         required_exports: resolved.binary_validation.required_exports,

@@ -1,9 +1,14 @@
 //! Native operator artifact manifest types.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
-pub const NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const FERRUM_NATIVE_OPERATOR_ABI_VERSION: &str = "1";
+pub const LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_FERRUM_NATIVE_OPERATOR_ABI_VERSION: &str = "1";
+pub const FERRUM_NATIVE_OPERATOR_ABI_VERSION: &str = "2";
+pub const DEFAULT_NATIVE_OPERATOR_ABI_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +40,17 @@ pub struct NativeOperatorBuildSummary {
     pub host_compiler: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeOperatorBinding {
+    pub operation_id: String,
+    pub operation_contract_version: u32,
+    pub provider_id: String,
+    pub provider_version: u32,
+    pub provider_implementation_fingerprint: String,
+    #[serde(default)]
+    pub entrypoints: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorManifest {
     pub schema_version: u32,
@@ -51,10 +67,36 @@ pub struct NativeOperatorManifest {
     pub binary_sha256: String,
     pub linkage: NativeOperatorLinkage,
     #[serde(default)]
+    pub g03_catalog_sha256: Option<String>,
+    #[serde(default)]
+    pub abi_contract_sha256: Option<String>,
+    #[serde(default)]
+    pub descriptor_export: Option<String>,
+    #[serde(default)]
+    pub operation_bindings: Vec<NativeOperatorBinding>,
+    #[serde(default)]
     pub exports: Vec<String>,
     #[serde(default)]
     pub license_files: Vec<String>,
     pub build_summary: NativeOperatorBuildSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledNativeOperatorIdentity {
+    pub schema_version: u32,
+    pub operator: String,
+    pub operator_abi_version: String,
+    pub ferrum_native_abi_version: String,
+    pub backend: NativeOperatorBackend,
+    pub linkage: NativeOperatorLinkage,
+    pub g03_catalog_sha256: Option<String>,
+    pub abi_contract_sha256: Option<String>,
+    pub descriptor_export: Option<String>,
+    pub operation_bindings: Vec<NativeOperatorBinding>,
+    pub exports: Vec<String>,
+    pub source_package_sha256: String,
+    pub inputs_sha256: String,
+    pub binary_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +109,11 @@ pub struct NativeOperatorRequirement {
     pub source_package_sha256: Option<String>,
     pub inputs_sha256: Option<String>,
     pub binary_sha256: Option<String>,
+    pub g03_catalog_sha256: Option<String>,
+    pub abi_contract_sha256: Option<String>,
+    pub descriptor_export: Option<String>,
+    pub required_exports: Vec<String>,
+    pub operation_bindings: Option<Vec<NativeOperatorBinding>>,
 }
 
 impl NativeOperatorRequirement {
@@ -74,12 +121,17 @@ impl NativeOperatorRequirement {
         Self {
             operator: operator.into(),
             backend: NativeOperatorBackend::Cuda,
-            operator_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
+            operator_abi_version: DEFAULT_NATIVE_OPERATOR_ABI_VERSION.to_string(),
             ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
             compute_capability: Some(compute_capability.into()),
             source_package_sha256: None,
             inputs_sha256: None,
             binary_sha256: None,
+            g03_catalog_sha256: None,
+            abi_contract_sha256: None,
+            descriptor_export: None,
+            required_exports: Vec::new(),
+            operation_bindings: None,
         }
     }
 }
@@ -90,13 +142,21 @@ pub struct NativeOperatorResolution {
     pub backend: NativeOperatorBackend,
     pub linkage: NativeOperatorLinkage,
     pub binary_sha256: String,
+    pub g03_catalog_sha256: Option<String>,
+    pub abi_contract_sha256: Option<String>,
 }
 
 impl NativeOperatorManifest {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.schema_version != NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION {
+        if ![
+            LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+            NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+        ]
+        .contains(&self.schema_version)
+        {
             return Err(format!(
-                "schema_version must be {NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION}"
+                "schema_version must be {LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION} or \
+                 {NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION}"
             ));
         }
         require_non_empty("operator", &self.operator)?;
@@ -124,19 +184,170 @@ impl NativeOperatorManifest {
                 }
             }
         }
+        match self.schema_version {
+            LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION => self.validate_legacy_v1()?,
+            NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION => self.validate_v2()?,
+            _ => unreachable!("schema version checked above"),
+        }
+        Ok(())
+    }
+
+    fn validate_legacy_v1(&self) -> std::result::Result<(), String> {
+        if self.ferrum_native_abi_version != LEGACY_FERRUM_NATIVE_OPERATOR_ABI_VERSION {
+            return Err(format!(
+                "legacy schema v1 requires ferrum_native_abi_version={LEGACY_FERRUM_NATIVE_OPERATOR_ABI_VERSION}"
+            ));
+        }
         if !self
             .exports
             .iter()
             .any(|export| export == "ferrum_native_op_init")
         {
-            return Err("exports must include ferrum_native_op_init".to_string());
+            return Err("legacy schema v1 exports must include ferrum_native_op_init".to_string());
         }
         if !self
             .exports
             .iter()
             .any(|export| export == "ferrum_native_op_descriptor")
         {
-            return Err("exports must include ferrum_native_op_descriptor".to_string());
+            return Err(
+                "legacy schema v1 exports must include ferrum_native_op_descriptor".to_string(),
+            );
+        }
+        if self.g03_catalog_sha256.is_some()
+            || self.abi_contract_sha256.is_some()
+            || self.descriptor_export.is_some()
+            || !self.operation_bindings.is_empty()
+        {
+            return Err("legacy schema v1 must not contain schema v2 identity fields".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_v2(&self) -> std::result::Result<(), String> {
+        let catalog_sha256 = self
+            .g03_catalog_sha256
+            .as_deref()
+            .ok_or_else(|| "schema v2 requires g03_catalog_sha256".to_string())?;
+        require_sha256("g03_catalog_sha256", catalog_sha256)?;
+        let abi_contract_sha256 = self
+            .abi_contract_sha256
+            .as_deref()
+            .ok_or_else(|| "schema v2 requires abi_contract_sha256".to_string())?;
+        require_sha256("abi_contract_sha256", abi_contract_sha256)?;
+
+        require_sorted_unique_symbols("exports", &self.exports)?;
+        let descriptor_export = self
+            .descriptor_export
+            .as_deref()
+            .ok_or_else(|| "schema v2 requires descriptor_export".to_string())?;
+        require_native_symbol("descriptor_export", descriptor_export)?;
+        if matches!(
+            descriptor_export,
+            "ferrum_native_op_init" | "ferrum_native_op_descriptor"
+        ) {
+            return Err(
+                "schema v2 descriptor_export must be namespaced per native operator".to_string(),
+            );
+        }
+        if !self
+            .exports
+            .iter()
+            .any(|export| export == descriptor_export)
+        {
+            return Err("schema v2 exports must include descriptor_export".to_string());
+        }
+        if self.operation_bindings.is_empty() {
+            return Err("schema v2 requires at least one operation_binding".to_string());
+        }
+        if self.license_files.is_empty() {
+            return Err("schema v2 requires at least one license_files entry".to_string());
+        }
+        if self.license_files.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.license_files.iter().any(|path| {
+                path.is_empty()
+                    || path.starts_with('/')
+                    || path.split('/').any(|component| component == "..")
+            })
+        {
+            return Err(
+                "schema v2 license_files must be sorted, unique, non-empty relative paths"
+                    .to_string(),
+            );
+        }
+        if !is_git_oid(&self.build_summary.builder_sha) {
+            return Err(
+                "schema v2 build_summary.builder_sha must be a lowercase 40- or 64-hex git object id"
+                    .to_string(),
+            );
+        }
+        if self.backend == NativeOperatorBackend::Cuda {
+            require_non_empty(
+                "cuda_toolkit",
+                self.cuda_toolkit.as_deref().unwrap_or_default(),
+            )?;
+            require_non_empty(
+                "cuda_runtime_min",
+                self.cuda_runtime_min.as_deref().unwrap_or_default(),
+            )?;
+            require_non_empty(
+                "build_summary.nvcc_version",
+                self.build_summary
+                    .nvcc_version
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
+        }
+
+        let mut previous_key: Option<(&str, &str)> = None;
+        let mut keys = BTreeSet::new();
+        for (index, binding) in self.operation_bindings.iter().enumerate() {
+            let label = format!("operation_bindings[{index}]");
+            require_contract_identifier(
+                &format!("{label}.operation_id"),
+                &binding.operation_id,
+                "operation.",
+            )?;
+            require_contract_identifier(
+                &format!("{label}.provider_id"),
+                &binding.provider_id,
+                "provider.",
+            )?;
+            if binding.operation_contract_version == 0 {
+                return Err(format!(
+                    "{label}.operation_contract_version must be positive"
+                ));
+            }
+            if binding.provider_version == 0 {
+                return Err(format!("{label}.provider_version must be positive"));
+            }
+            require_sha256(
+                &format!("{label}.provider_implementation_fingerprint"),
+                &binding.provider_implementation_fingerprint,
+            )?;
+            require_sorted_unique_symbols(&format!("{label}.entrypoints"), &binding.entrypoints)?;
+            for entrypoint in &binding.entrypoints {
+                if !self.exports.iter().any(|export| export == entrypoint) {
+                    return Err(format!(
+                        "{label}.entrypoints contains {entrypoint}, which is missing from exports"
+                    ));
+                }
+            }
+            let key = (binding.operation_id.as_str(), binding.provider_id.as_str());
+            if let Some(previous) = previous_key {
+                if previous >= key {
+                    return Err(
+                        "operation_bindings must be sorted and unique by operation_id/provider_id"
+                            .to_string(),
+                    );
+                }
+            }
+            if !keys.insert((binding.operation_id.clone(), binding.provider_id.clone())) {
+                return Err(
+                    "operation_bindings contains a duplicate operation/provider".to_string()
+                );
+            }
+            previous_key = Some(key);
         }
         Ok(())
     }
@@ -197,11 +408,51 @@ pub fn resolve_native_operator_manifest(
     if let Some(expected) = requirement.binary_sha256.as_deref() {
         require_expected_sha256("binary_sha256", &manifest.binary_sha256, expected)?;
     }
+    if let Some(expected) = requirement.g03_catalog_sha256.as_deref() {
+        require_expected_optional_sha256(
+            "g03_catalog_sha256",
+            manifest.g03_catalog_sha256.as_deref(),
+            expected,
+        )?;
+    }
+    if let Some(expected) = requirement.abi_contract_sha256.as_deref() {
+        require_expected_optional_sha256(
+            "abi_contract_sha256",
+            manifest.abi_contract_sha256.as_deref(),
+            expected,
+        )?;
+    }
+    if let Some(expected) = requirement.descriptor_export.as_deref() {
+        if manifest.descriptor_export.as_deref() != Some(expected) {
+            return Err(format!(
+                "descriptor_export mismatch: manifest={:?} expected={expected}",
+                manifest.descriptor_export
+            ));
+        }
+    }
+    for required_export in &requirement.required_exports {
+        if !manifest
+            .exports
+            .iter()
+            .any(|export| export == required_export)
+        {
+            return Err(format!(
+                "required export is missing from manifest: {required_export}"
+            ));
+        }
+    }
+    if let Some(expected) = requirement.operation_bindings.as_ref() {
+        if &manifest.operation_bindings != expected {
+            return Err("operation_bindings mismatch".to_string());
+        }
+    }
     Ok(NativeOperatorResolution {
         operator: manifest.operator.clone(),
         backend: manifest.backend,
         linkage: manifest.linkage,
         binary_sha256: manifest.binary_sha256.clone(),
+        g03_catalog_sha256: manifest.g03_catalog_sha256.clone(),
+        abi_contract_sha256: manifest.abi_contract_sha256.clone(),
     })
 }
 
@@ -237,8 +488,77 @@ fn require_expected_sha256(
     }
 }
 
+fn require_expected_optional_sha256(
+    field: &str,
+    actual: Option<&str>,
+    expected: &str,
+) -> std::result::Result<(), String> {
+    let actual = actual.ok_or_else(|| format!("{field} is missing"))?;
+    require_expected_sha256(field, actual, expected)
+}
+
+fn require_sorted_unique_symbols(
+    field: &str,
+    symbols: &[String],
+) -> std::result::Result<(), String> {
+    if symbols.is_empty() {
+        return Err(format!("{field} must be non-empty"));
+    }
+    let mut previous: Option<&str> = None;
+    for symbol in symbols {
+        require_native_symbol(field, symbol)?;
+        if previous.is_some_and(|value| value >= symbol.as_str()) {
+            return Err(format!("{field} must be sorted and unique"));
+        }
+        previous = Some(symbol);
+    }
+    Ok(())
+}
+
+fn require_native_symbol(field: &str, value: &str) -> std::result::Result<(), String> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("{field} must be non-empty"));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Err(format!(
+            "{field} contains an invalid native symbol: {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_contract_identifier(
+    field: &str,
+    value: &str,
+    prefix: &str,
+) -> std::result::Result<(), String> {
+    if !value.starts_with(prefix)
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "{field} must start with {prefix} and contain only canonical identifier characters"
+        ));
+    }
+    Ok(())
+}
+
 pub fn is_sha256_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -254,7 +574,7 @@ mod tests {
             schema_version: NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
             operator: "fa2".to_string(),
             operator_abi_version: "1".to_string(),
-            ferrum_native_abi_version: "1".to_string(),
+            ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
             backend: NativeOperatorBackend::Cuda,
             cuda_toolkit: Some("12.4".to_string()),
             cuda_runtime_min: Some("12.4".to_string()),
@@ -267,13 +587,24 @@ mod tests {
             inputs_sha256: digest('b'),
             binary_sha256: digest('c'),
             linkage: NativeOperatorLinkage::Static,
+            g03_catalog_sha256: Some(digest('d')),
+            abi_contract_sha256: Some(digest('e')),
+            descriptor_export: Some("ferrum_native_fa2_descriptor_v2".to_string()),
+            operation_bindings: vec![NativeOperatorBinding {
+                operation_id: "operation.causal_paged_attention".to_string(),
+                operation_contract_version: 1,
+                provider_id: "provider.cuda.fa2".to_string(),
+                provider_version: 1,
+                provider_implementation_fingerprint: digest('f'),
+                entrypoints: vec!["ferrum_native_fa2_execute_v1".to_string()],
+            }],
             exports: vec![
-                "ferrum_native_op_init".to_string(),
-                "ferrum_native_op_descriptor".to_string(),
+                "ferrum_native_fa2_descriptor_v2".to_string(),
+                "ferrum_native_fa2_execute_v1".to_string(),
             ],
             license_files: vec!["LICENSE".to_string()],
             build_summary: NativeOperatorBuildSummary {
-                builder_sha: "builder".to_string(),
+                builder_sha: digest('7'),
                 elapsed_ms: 1,
                 nvcc_version: Some("12.4".to_string()),
                 host_compiler: "clang".to_string(),
@@ -300,6 +631,11 @@ mod tests {
         requirement.source_package_sha256 = Some(digest('a'));
         requirement.inputs_sha256 = Some(digest('b'));
         requirement.binary_sha256 = Some(digest('c'));
+        requirement.g03_catalog_sha256 = Some(digest('d'));
+        requirement.abi_contract_sha256 = Some(digest('e'));
+        requirement.descriptor_export = Some("ferrum_native_fa2_descriptor_v2".to_string());
+        requirement.required_exports = vec!["ferrum_native_fa2_execute_v1".to_string()];
+        requirement.operation_bindings = Some(manifest().operation_bindings);
 
         let resolution = resolve_native_operator_manifest(Some(&manifest()), &requirement).unwrap();
         assert_eq!(resolution.operator, "fa2");
@@ -320,5 +656,32 @@ mod tests {
 
         let wrong_operator = NativeOperatorRequirement::cuda("dummy", "sm_89");
         assert!(resolve_native_operator_manifest(Some(&manifest()), &wrong_operator).is_err());
+    }
+
+    #[test]
+    fn schema_v2_rejects_legacy_shared_descriptor_symbols() {
+        let mut invalid = manifest();
+        invalid.descriptor_export = Some("ferrum_native_op_descriptor".to_string());
+        invalid.exports = vec![
+            "ferrum_native_fa2_execute_v1".to_string(),
+            "ferrum_native_op_descriptor".to_string(),
+        ];
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_schema_v1_remains_read_only_compatible() {
+        let mut legacy = manifest();
+        legacy.schema_version = LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION;
+        legacy.ferrum_native_abi_version = LEGACY_FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string();
+        legacy.g03_catalog_sha256 = None;
+        legacy.abi_contract_sha256 = None;
+        legacy.descriptor_export = None;
+        legacy.operation_bindings.clear();
+        legacy.exports = vec![
+            "ferrum_native_op_init".to_string(),
+            "ferrum_native_op_descriptor".to_string(),
+        ];
+        legacy.validate().unwrap();
     }
 }

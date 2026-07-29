@@ -29,6 +29,7 @@ libc = "0.2"
 bindgen_cuda = "0.1.6"
 ferrum-native-ops = { workspace = true }
 ferrum-types = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.10"
 
 [features]
