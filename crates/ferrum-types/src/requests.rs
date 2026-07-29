@@ -258,14 +258,17 @@ pub struct ApiStreamOptions {
     pub include_usage: Option<bool>,
 }
 
+const MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE: usize = 32;
+
 pub fn api_response_from_generated_text(
     request: &InferenceRequest,
     text: &str,
+    finish_reason: FinishReason,
 ) -> Option<ApiResponse> {
     let ApiRequest::Chat(chat_request) = request.api_request.as_ref()? else {
         return None;
     };
-    chat_api_response_from_generated_text(chat_request, text).map(ApiResponse::Chat)
+    chat_api_response_from_generated_text(chat_request, text, finish_reason).map(ApiResponse::Chat)
 }
 
 pub fn chat_api_may_emit_tool_or_function_call(chat_request: &ApiChatRequest) -> bool {
@@ -277,7 +280,12 @@ pub fn chat_api_may_emit_tool_or_function_call(chat_request: &ApiChatRequest) ->
 pub fn chat_api_response_from_generated_text(
     chat_request: &ApiChatRequest,
     text: &str,
+    finish_reason: FinishReason,
 ) -> Option<ApiChatResponse> {
+    if !matches!(finish_reason, FinishReason::Stop | FinishReason::EOS) {
+        return None;
+    }
+
     if !chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request) {
         if let Some(tool_calls) = parse_tool_calls_from_generated_text(text, chat_request) {
             return Some(ApiChatResponse {
@@ -336,28 +344,47 @@ fn parse_tool_calls_from_generated_text(
 ) -> Option<Vec<ApiToolCall>> {
     if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
         if let Some(calls) = parse_function_parameter_xml_tool_calls(text, chat_request) {
-            return Some(calls);
+            return validate_parsed_tool_calls(calls);
         }
     }
 
     let value = parse_json_value_from_generated_text(text)?;
     if let Some(calls) = value.get("tool_calls").and_then(|value| value.as_array()) {
+        if calls.len() > MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
+            return None;
+        }
         let parsed = calls
             .iter()
             .enumerate()
-            .filter_map(|(index, value)| parse_tool_call_value(value, index, chat_request))
-            .collect::<Vec<_>>();
-        return (!parsed.is_empty()).then_some(parsed);
+            .map(|(index, value)| parse_tool_call_value(value, index, chat_request))
+            .collect::<Option<Vec<_>>>()?;
+        return validate_parsed_tool_calls(parsed);
     }
     if let Some(tool_call) = value.get("tool_call") {
-        return parse_tool_call_value(tool_call, 0, chat_request).map(|call| vec![call]);
+        return parse_tool_call_value(tool_call, 0, chat_request)
+            .and_then(|call| validate_parsed_tool_calls(vec![call]));
     }
     if let Some(tool_call) = parse_wrapped_tool_call_value(&value, 0, chat_request) {
-        return Some(vec![tool_call]);
+        return validate_parsed_tool_calls(vec![tool_call]);
     }
     parse_tool_call_value(&value, 0, chat_request)
         .or_else(|| parse_forced_tool_arguments_value(&value, 0, chat_request))
-        .map(|call| vec![call])
+        .and_then(|call| validate_parsed_tool_calls(vec![call]))
+}
+
+fn validate_parsed_tool_calls(calls: Vec<ApiToolCall>) -> Option<Vec<ApiToolCall>> {
+    if calls.is_empty() || calls.len() > MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
+        return None;
+    }
+    for (index, call) in calls.iter().enumerate() {
+        if calls[..index].iter().any(|previous| {
+            previous.function.name == call.function.name
+                && previous.function.arguments == call.function.arguments
+        }) {
+            return None;
+        }
+    }
+    Some(calls)
 }
 
 fn parse_function_parameter_xml_tool_calls(
@@ -372,38 +399,46 @@ fn parse_function_parameter_xml_tool_calls(
     let mut remaining = text;
     let mut calls = Vec::new();
     while let Some(tool_start) = remaining.find(TOOL_START) {
+        if calls.len() == MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
+            return None;
+        }
         remaining = &remaining[tool_start + TOOL_START.len()..];
-        let tool_end = remaining.find(TOOL_END).unwrap_or(remaining.len());
+        let tool_end = remaining.find(TOOL_END)?;
         let block = &remaining[..tool_end];
-        remaining = if tool_end < remaining.len() {
-            &remaining[tool_end + TOOL_END.len()..]
-        } else {
-            ""
-        };
+        remaining = &remaining[tool_end + TOOL_END.len()..];
 
         let Some(function_start) = block.find(FUNCTION_START) else {
-            continue;
+            return None;
         };
+        if !block[..function_start].trim().is_empty() {
+            return None;
+        }
         let function = &block[function_start + FUNCTION_START.len()..];
         let Some(name_end) = function.find('>') else {
-            continue;
+            return None;
         };
         let name = function[..name_end].trim();
         if !api_tool_name_allowed(chat_request, name) {
-            continue;
+            return None;
         }
         let arguments_end = function[name_end + 1..]
             .find(FUNCTION_END)
-            .map(|offset| name_end + 1 + offset)
-            .unwrap_or(function.len());
+            .map(|offset| name_end + 1 + offset)?;
+        if !function[arguments_end + FUNCTION_END.len()..]
+            .trim()
+            .is_empty()
+        {
+            return None;
+        }
         let arguments =
-            parse_function_parameter_xml_arguments(&function[name_end + 1..arguments_end]);
+            parse_function_parameter_xml_arguments(&function[name_end + 1..arguments_end])?;
+        let arguments = serde_json::to_string(&arguments).ok()?;
         calls.push(ApiToolCall {
             id: format!("call_{}", calls.len()),
             tool_type: "function".to_string(),
             function: ApiFunctionCall {
                 name: name.to_string(),
-                arguments: serde_json::to_string(&arguments).ok()?,
+                arguments,
             },
         });
     }
@@ -413,7 +448,7 @@ fn parse_function_parameter_xml_tool_calls(
 
 fn parse_function_parameter_xml_arguments(
     text: &str,
-) -> serde_json::Map<String, serde_json::Value> {
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     const PARAMETER_START: &str = "<parameter=";
     const PARAMETER_END: &str = "</parameter>";
 
@@ -422,27 +457,24 @@ fn parse_function_parameter_xml_arguments(
     while let Some(parameter_start) = remaining.find(PARAMETER_START) {
         remaining = &remaining[parameter_start + PARAMETER_START.len()..];
         let Some(name_end) = remaining.find('>') else {
-            break;
+            return None;
         };
         let name = remaining[..name_end].trim();
         remaining = &remaining[name_end + 1..];
-        let value_end = remaining
-            .find(PARAMETER_END)
-            .or_else(|| remaining.find(PARAMETER_START))
-            .unwrap_or(remaining.len());
-        if !name.is_empty() {
-            arguments.insert(
-                name.to_string(),
-                serde_json::Value::String(remaining[..value_end].trim().to_string()),
-            );
+        if name.is_empty() {
+            return None;
         }
-        remaining = if remaining[value_end..].starts_with(PARAMETER_END) {
-            &remaining[value_end + PARAMETER_END.len()..]
-        } else {
-            &remaining[value_end..]
-        };
+        let value_end = remaining.find(PARAMETER_END)?;
+        if arguments.contains_key(name) {
+            return None;
+        }
+        arguments.insert(
+            name.to_string(),
+            serde_json::Value::String(remaining[..value_end].trim().to_string()),
+        );
+        remaining = &remaining[value_end + PARAMETER_END.len()..];
     }
-    arguments
+    Some(arguments)
 }
 
 fn parse_wrapped_tool_call_value(

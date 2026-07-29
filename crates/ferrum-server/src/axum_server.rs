@@ -2375,6 +2375,9 @@ async fn handle_chat_completions_stream(
                     }
 
                     if chunk.finish_reason.is_some() {
+                        let terminal_finish_reason = chunk
+                            .finish_reason
+                            .expect("finish_reason presence checked above");
                         if let Err(err) = write_chat_prompt_token_evidence(
                             request_dump_dir.as_ref().map(|root| root.as_path()),
                             &replay_request_id,
@@ -2393,18 +2396,22 @@ async fn handle_chat_completions_stream(
                             &openai_request,
                             &parsed_final.content,
                         );
-                        let structured_chat_response = match chunk.api_response.as_ref() {
-                            Some(ferrum_types::ApiResponse::Chat(response)) => {
-                                Some(response.clone())
-                            }
-                            _ if buffer_structured_api_stream => {
-                                chat_api_response_from_parsed_generated_text(
-                                    &stream_api_request,
-                                    &parsed_final,
-                                )
-                            }
-                            _ => None,
-                        };
+                        let structured_chat_response =
+                            finish_reason_allows_structured_api_response(terminal_finish_reason)
+                                .then(|| match chunk.api_response.as_ref() {
+                                    Some(ferrum_types::ApiResponse::Chat(response)) => {
+                                        Some(response.clone())
+                                    }
+                                    _ if buffer_structured_api_stream => {
+                                        chat_api_response_from_parsed_generated_text(
+                                            &stream_api_request,
+                                            &parsed_final,
+                                            terminal_finish_reason,
+                                        )
+                                    }
+                                    _ => None,
+                                })
+                                .flatten();
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             if let Err(e) =
@@ -2738,15 +2745,22 @@ async fn handle_chat_completions_sync(
                 function_call: None,
             };
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
-            let structured_chat_response = match api_response.as_ref() {
-                Some(ferrum_types::ApiResponse::Chat(chat_response)) => Some(chat_response.clone()),
-                _ => match request_chat_api.as_ref() {
-                    Some(chat_request) => {
-                        chat_api_response_from_parsed_generated_text(chat_request, &parsed)
-                    }
-                    _ => None,
-                },
-            };
+            let structured_chat_response =
+                finish_reason_allows_structured_api_response(finish_reason)
+                    .then(|| match api_response.as_ref() {
+                        Some(ferrum_types::ApiResponse::Chat(chat_response)) => {
+                            Some(chat_response.clone())
+                        }
+                        _ => match request_chat_api.as_ref() {
+                            Some(chat_request) => chat_api_response_from_parsed_generated_text(
+                                chat_request,
+                                &parsed,
+                                finish_reason,
+                            ),
+                            _ => None,
+                        },
+                    })
+                    .flatten();
             if let Some(chat_response) = structured_chat_response.as_ref() {
                 if let Err(error) =
                     validate_structured_tool_response(&openai_request, chat_response)
@@ -3404,16 +3418,29 @@ fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
 fn chat_api_response_from_parsed_generated_text(
     chat_request: &ferrum_types::ApiChatRequest,
     parsed: &ParsedReasoningResponse,
+    finish_reason: FinishReason,
 ) -> Option<ferrum_types::ApiChatResponse> {
     parsed
         .reasoning
         .as_deref()
         .and_then(|reasoning| {
-            ferrum_types::chat_api_response_from_generated_text(chat_request, reasoning)
+            ferrum_types::chat_api_response_from_generated_text(
+                chat_request,
+                reasoning,
+                finish_reason,
+            )
         })
         .or_else(|| {
-            ferrum_types::chat_api_response_from_generated_text(chat_request, &parsed.content)
+            ferrum_types::chat_api_response_from_generated_text(
+                chat_request,
+                &parsed.content,
+                finish_reason,
+            )
         })
+}
+
+fn finish_reason_allows_structured_api_response(finish_reason: FinishReason) -> bool {
+    matches!(finish_reason, FinishReason::Stop | FinishReason::EOS)
 }
 
 fn log_required_tool_choice_failure(
@@ -5191,6 +5218,7 @@ mod tests {
         stream_final_chunk_separate: bool,
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
+        finish_reason: FinishReason,
         lora_metrics: Option<Value>,
         pending_stream_drop_notify: Option<Arc<Notify>>,
         shutdown_count: AtomicUsize,
@@ -5207,6 +5235,7 @@ mod tests {
                 stream_final_chunk_separate: false,
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
+                finish_reason: FinishReason::Stop,
                 lora_metrics: None,
                 pending_stream_drop_notify: None,
                 shutdown_count: AtomicUsize::new(0),
@@ -5240,6 +5269,18 @@ mod tests {
         fn with_api_response(text: &str, api_response: ferrum_types::ApiResponse) -> Self {
             Self {
                 api_response: Some(api_response),
+                ..Self::new(text)
+            }
+        }
+
+        fn with_api_response_and_finish_reason(
+            text: &str,
+            api_response: ferrum_types::ApiResponse,
+            finish_reason: FinishReason,
+        ) -> Self {
+            Self {
+                api_response: Some(api_response),
+                finish_reason,
                 ..Self::new(text)
             }
         }
@@ -5701,7 +5742,7 @@ mod tests {
                 request_id: request.id,
                 text: self.text.clone(),
                 tokens: vec![TokenId::new(11), TokenId::new(12)],
-                finish_reason: FinishReason::Stop,
+                finish_reason: self.finish_reason,
                 usage: TokenUsage::new(7, 2),
                 latency_ms: 1,
                 created_at: chrono::Utc::now(),
@@ -5739,7 +5780,7 @@ mod tests {
                         request_id: request_id.clone(),
                         text: text.clone(),
                         token: Some(TokenId::new(11 + index as u32)),
-                        finish_reason: is_final_text_chunk.then_some(FinishReason::Stop),
+                        finish_reason: is_final_text_chunk.then_some(self.finish_reason),
                         usage: is_final_text_chunk
                             .then(|| self.stream_usage.clone())
                             .flatten(),
@@ -5758,7 +5799,7 @@ mod tests {
                         request_id,
                         text: String::new(),
                         token: None,
-                        finish_reason: Some(FinishReason::Stop),
+                        finish_reason: Some(self.finish_reason),
                         usage: self.stream_usage.clone(),
                         created_at: chrono::Utc::now(),
                         metadata: HashMap::new(),
@@ -5773,7 +5814,7 @@ mod tests {
                 request_id: request.id,
                 text: self.text.clone(),
                 token: Some(TokenId::new(11)),
-                finish_reason: Some(FinishReason::Stop),
+                finish_reason: Some(self.finish_reason),
                 usage: self.stream_usage.clone(),
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
@@ -5930,6 +5971,40 @@ mod tests {
     ) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_api_response(text, api_response)))
             .build_router()
+    }
+
+    fn router_with_stub_api_response_and_finish_reason(
+        text: &str,
+        api_response: ferrum_types::ApiResponse,
+        finish_reason: FinishReason,
+    ) -> Router {
+        AxumServer::from_llm(Arc::new(StubLlm::with_api_response_and_finish_reason(
+            text,
+            api_response,
+            finish_reason,
+        )))
+        .build_router()
+    }
+
+    fn weather_tool_api_response() -> ferrum_types::ApiResponse {
+        ferrum_types::ApiResponse::Chat(ferrum_types::ApiChatResponse {
+            message: ferrum_types::ApiChatMessage {
+                role: ferrum_types::ApiMessageRole::Assistant,
+                content: String::new(),
+                name: None,
+                tool_calls: vec![ferrum_types::ApiToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: ferrum_types::ApiFunctionCall {
+                        name: "weather".to_string(),
+                        arguments: "{\"city\":\"Paris\"}".to_string(),
+                    },
+                }],
+                tool_call_id: None,
+                function_call: None,
+            },
+            finish_reason: Some("tool_calls".to_string()),
+        })
     }
 
     fn router_with_stub_without_stream_usage(text: &str) -> Router {
@@ -6827,6 +6902,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_preserves_length_over_structured_tool_response() {
+        let generated = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
+        let response = post_json(
+            router_with_stub_api_response_and_finish_reason(
+                generated,
+                weather_tool_api_response(),
+                FinishReason::Length,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert_eq!(body["choices"][0]["message"]["content"], generated);
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+    }
+
+    #[tokio::test]
     async fn route_chat_serializes_generated_tool_call_json_when_engine_returns_text_only() {
         let response = post_json(
             router_with_stub(
@@ -7562,6 +7665,41 @@ mod tests {
         assert!(
             !body.contains("raw text that should not stream"),
             "structured api_response should suppress raw generated text in tool-call stream: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_preserves_length_over_structured_tool_response() {
+        let generated = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
+        let response = post_json(
+            router_with_stub_api_response_and_finish_reason(
+                generated,
+                weather_tool_api_response(),
+                FinishReason::Length,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather tool."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"length""#),
+            "stream must preserve the engine terminal reason: {body}"
+        );
+        assert!(
+            !body.contains(r#""finish_reason":"tool_calls""#),
+            "length must not be relabeled as tool_calls: {body}"
         );
     }
 
