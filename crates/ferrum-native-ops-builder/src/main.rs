@@ -43,6 +43,8 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         nvcc_threads: u32,
         #[arg(long)]
+        object_cache: PathBuf,
+        #[arg(long)]
         plan_only: bool,
         #[arg(long)]
         out: PathBuf,
@@ -101,6 +103,7 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
             ccbin,
             ar,
             nvcc_threads,
+            object_cache,
             plan_only,
             out,
         } => {
@@ -114,6 +117,7 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
                 ccbin_path: ccbin,
                 ar_path: ar,
                 nvcc_threads,
+                object_cache_dir: object_cache,
                 plan_only,
             })?;
             let kind = if plan_only { "PLAN" } else { "BUILD" };
