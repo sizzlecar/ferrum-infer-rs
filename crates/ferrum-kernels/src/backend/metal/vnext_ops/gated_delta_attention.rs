@@ -34,9 +34,9 @@ use super::linear::{
 };
 use super::primitives::{dispatch_residual_add_at, dispatch_rms_norm_at, MetalPrimitivePipelines};
 use super::{
-    binding, checked_u32, contiguous_bindings, contiguous_region, contiguous_token_region,
-    ensure_invocation, f16_contiguous, implementation_fingerprint, invalid_plan,
-    provider_descriptor, provider_failure, rational_attribute, shared_full_region,
+    authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
+    contiguous_token_region, ensure_invocation, f16_contiguous, implementation_fingerprint,
+    invalid_plan, provider_descriptor, provider_failure, rational_attribute, shared_full_region,
     shared_scratch_region, shared_token_region, token_binding_is_shared, unsigned_attribute,
     DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
     Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
@@ -308,22 +308,24 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if request
-            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
-            .is_none()
-            || request
-                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+        authorize_reusable_topology(self.descriptor.execution_semantics(), || {
+            if request
+                .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
                 .is_none()
-        {
-            return Ok(ReusableExecutionTopology::EagerBoundary);
-        }
-        reusable_attention_topology(
-            &request,
-            self.execution_capabilities,
-            self.execution_cost_model,
-        )
-        .map(ReusableExecutionTopology::Dynamic)
-        .map_err(invalid_plan)
+                || request
+                    .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+                    .is_none()
+            {
+                return Ok(ReusableExecutionTopology::EagerBoundary);
+            }
+            reusable_attention_topology(
+                &request,
+                self.execution_capabilities,
+                self.execution_cost_model,
+            )
+            .map(ReusableExecutionTopology::Dynamic)
+            .map_err(invalid_plan)
+        })
     }
 
     fn encode_selected(
