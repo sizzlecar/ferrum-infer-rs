@@ -30,10 +30,10 @@ use super::weights::{
     resolve_weight, MetalResolvedWeight, MetalResolvedWeightComponent, MetalResolvedWeightLayout,
 };
 use super::{
-    binding, checked_u32, contiguous_bindings, ensure_invocation, f16_contiguous,
-    implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
-    shared_scratch_region, shared_token_region, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID,
-    Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
+    authorize_reusable_topology, binding, checked_u32, contiguous_bindings, ensure_invocation,
+    f16_contiguous, implementation_fingerprint, invalid_plan, provider_descriptor,
+    provider_failure, shared_scratch_region, shared_token_region, GGUF_NATIVE_BLOCK_FORMAT_ID,
+    Q4_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("moe.metal");
@@ -169,7 +169,9 @@ impl OperationProvider<MetalDeviceRuntime> for MetalRoutedSharedSwiGluMoeProvide
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        authorize_reusable_topology(self.descriptor.execution_semantics(), || {
+            Ok(ReusableExecutionTopology::Static)
+        })
     }
 
     fn encode_selected(

@@ -13,8 +13,9 @@ use ferrum_interfaces::vnext::{
     DynamicStorageView, ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope,
     OperationContract, OperationFailure, OperationInvocation, OperationProvider,
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    OperationRuntimeRegistry, ProfilePhase, ProviderExecutionSemantics, ProviderId,
+    ProviderReplayEquivalence, ProviderStorageBindingRequirement, QuantizationFormatId,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     SemanticValue, VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
@@ -316,6 +317,16 @@ pub(crate) fn provider_descriptor(
         estimator_fingerprint,
     )
     .map_err(contract_error)
+}
+
+pub(crate) fn authorize_reusable_topology(
+    semantics: ProviderExecutionSemantics,
+    candidate: impl FnOnce() -> Result<ReusableExecutionTopology, VNextError>,
+) -> Result<ReusableExecutionTopology, VNextError> {
+    match semantics.replay_equivalence() {
+        ProviderReplayEquivalence::Ineligible => Ok(ReusableExecutionTopology::EagerBoundary),
+        ProviderReplayEquivalence::BitwiseEagerEquivalent => candidate(),
+    }
 }
 
 pub(crate) fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
@@ -735,6 +746,7 @@ mod tests {
         RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
         TOKEN_EMBEDDING_OPERATION_ID,
     };
+    use std::cell::Cell;
 
     #[test]
     fn partial_composition_advertises_only_installed_operation_capabilities() {
@@ -763,5 +775,29 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn eager_only_semantics_cannot_publish_reusable_topology() {
+        let candidate_called = Cell::new(false);
+        let topology =
+            authorize_reusable_topology(ProviderExecutionSemantics::bitwise_eager_only(), || {
+                candidate_called.set(true);
+                Ok(ReusableExecutionTopology::Static)
+            })
+            .expect("eager boundary");
+        assert!(matches!(topology, ReusableExecutionTopology::EagerBoundary));
+        assert!(!candidate_called.get());
+
+        let topology = authorize_reusable_topology(
+            ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            || {
+                candidate_called.set(true);
+                Ok(ReusableExecutionTopology::Static)
+            },
+        )
+        .expect("authorized reusable topology");
+        assert!(matches!(topology, ReusableExecutionTopology::Static));
+        assert!(candidate_called.get());
     }
 }

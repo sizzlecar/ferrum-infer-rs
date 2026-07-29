@@ -32,12 +32,12 @@ use super::linear::{
 };
 use super::primitives::{dispatch_residual_add_at, dispatch_rms_norm_at, MetalPrimitivePipelines};
 use super::{
-    binding, checked_u32, contract_error, ensure_invocation, f16_contiguous,
-    implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
-    rational_attribute, shared_binding_region, shared_full_region, shared_scratch_region,
-    shared_token_region, token_binding_is_shared, unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID,
-    GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID,
-    VALUE_ALIGNMENT_BYTES, VNEXT_KV_PAGE_BYTES,
+    authorize_reusable_topology, binding, checked_u32, contract_error, ensure_invocation,
+    f16_contiguous, implementation_fingerprint, invalid_plan, provider_descriptor,
+    provider_failure, rational_attribute, shared_binding_region, shared_full_region,
+    shared_scratch_region, shared_token_region, token_binding_is_shared, unsigned_attribute,
+    DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
+    Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, VALUE_ALIGNMENT_BYTES, VNEXT_KV_PAGE_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("causal_attention.metal");
@@ -278,18 +278,20 @@ impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if request
-            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
-            .is_none()
-            || request
-                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+        authorize_reusable_topology(self.descriptor.execution_semantics(), || {
+            if request
+                .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
                 .is_none()
-        {
-            return Ok(ReusableExecutionTopology::EagerBoundary);
-        }
-        reusable_attention_topology(&request)
-            .map(ReusableExecutionTopology::Dynamic)
-            .map_err(invalid_plan)
+                || request
+                    .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+                    .is_none()
+            {
+                return Ok(ReusableExecutionTopology::EagerBoundary);
+            }
+            reusable_attention_topology(&request)
+                .map(ReusableExecutionTopology::Dynamic)
+                .map_err(invalid_plan)
+        })
     }
 
     fn encode_selected(
