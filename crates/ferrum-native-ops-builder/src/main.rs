@@ -55,17 +55,19 @@ enum Command {
         #[arg(long)]
         source_root: PathBuf,
         #[arg(long)]
-        input_archive: PathBuf,
+        source_build_receipt: PathBuf,
+        #[arg(long)]
+        source_build_plan: PathBuf,
         #[arg(long)]
         g03_catalog: PathBuf,
         #[arg(long)]
         abi_contract: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        #[arg(long, default_value = "cc")]
-        cc: String,
-        #[arg(long, default_value = "ar")]
-        ar: String,
+        #[arg(long)]
+        cc: PathBuf,
+        #[arg(long)]
+        ar: PathBuf,
     },
     AssembleSet {
         #[arg(long, required = true)]
@@ -129,7 +131,8 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
         Command::Package {
             spec,
             source_root,
-            input_archive,
+            source_build_receipt,
+            source_build_plan,
             g03_catalog,
             abi_contract,
             out,
@@ -139,7 +142,8 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
             package_native_operator(&NativeOperatorPackageRequest {
                 spec_path: spec,
                 source_root,
-                input_archive,
+                source_build_receipt_path: source_build_receipt,
+                source_build_plan_path: source_build_plan,
                 g03_catalog_path: g03_catalog,
                 abi_contract_path: abi_contract,
                 output_dir: out.clone(),

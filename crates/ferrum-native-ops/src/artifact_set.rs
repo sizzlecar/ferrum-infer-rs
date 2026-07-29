@@ -10,6 +10,7 @@ use ferrum_types::{
     FERRUM_NATIVE_OPERATOR_ABI_VERSION, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
     ResolvedNativeOperator,
 };
 
-pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 1;
+pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorArtifactSetLock {
@@ -36,6 +37,12 @@ pub struct NativeOperatorArtifactLock {
     pub ferrum_native_abi_version: String,
     pub source_package_sha256: String,
     pub inputs_sha256: String,
+    pub source_build_receipt: NativeOperatorEvidenceFile,
+    pub source_build_plan: NativeOperatorEvidenceFile,
+    pub source_build_logs: Vec<NativeOperatorEvidenceFile>,
+    pub source_archive_sha256: String,
+    pub package_receipt: NativeOperatorEvidenceFile,
+    pub package_build_logs: Vec<NativeOperatorEvidenceFile>,
     pub binary_sha256: String,
     pub abi_contract_sha256: String,
     pub descriptor_export: String,
@@ -43,6 +50,13 @@ pub struct NativeOperatorArtifactLock {
     pub operation_bindings: Vec<NativeOperatorBinding>,
     #[serde(default)]
     pub system_libraries: Vec<NativeOperatorSystemLibrary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeOperatorEvidenceFile {
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -181,6 +195,40 @@ impl NativeOperatorArtifactSetLock {
                 &artifact_lock.artifact_path,
                 &artifact_lock.operator,
             )?;
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
+                "source_build_receipt",
+                &artifact_lock.source_build_receipt,
+            )?;
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
+                "source_build_plan",
+                &artifact_lock.source_build_plan,
+            )?;
+            for evidence in &artifact_lock.source_build_logs {
+                verify_evidence_file(
+                    &canonical_root,
+                    &artifact_lock.operator,
+                    "source_build_log",
+                    evidence,
+                )?;
+            }
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
+                "package_receipt",
+                &artifact_lock.package_receipt,
+            )?;
+            for evidence in &artifact_lock.package_build_logs {
+                verify_evidence_file(
+                    &canonical_root,
+                    &artifact_lock.operator,
+                    "package_build_log",
+                    evidence,
+                )?;
+            }
             let mut request = NativeOperatorResolveRequest::new(
                 artifact_lock.operator.clone(),
                 artifact_lock.backend,
@@ -321,6 +369,7 @@ impl NativeOperatorArtifactSetLock {
             for (field, digest) in [
                 ("source_package_sha256", &artifact.source_package_sha256),
                 ("inputs_sha256", &artifact.inputs_sha256),
+                ("source_archive_sha256", &artifact.source_archive_sha256),
                 ("binary_sha256", &artifact.binary_sha256),
                 ("abi_contract_sha256", &artifact.abi_contract_sha256),
             ] {
@@ -330,6 +379,49 @@ impl NativeOperatorArtifactSetLock {
                         artifact.operator
                     )));
                 }
+            }
+            validate_evidence_file(
+                &artifact.operator,
+                "source_build_receipt",
+                &artifact.source_build_receipt,
+            )?;
+            validate_evidence_file(
+                &artifact.operator,
+                "source_build_plan",
+                &artifact.source_build_plan,
+            )?;
+            if artifact.source_build_logs.is_empty()
+                || artifact
+                    .source_build_logs
+                    .windows(2)
+                    .any(|pair| pair[0].path >= pair[1].path)
+            {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.source_build_logs must be sorted, unique, and non-empty",
+                    artifact.operator
+                )));
+            }
+            for evidence in &artifact.source_build_logs {
+                validate_evidence_file(&artifact.operator, "source_build_log", evidence)?;
+            }
+            validate_evidence_file(
+                &artifact.operator,
+                "package_receipt",
+                &artifact.package_receipt,
+            )?;
+            if artifact.package_build_logs.is_empty()
+                || artifact
+                    .package_build_logs
+                    .windows(2)
+                    .any(|pair| pair[0].path >= pair[1].path)
+            {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.package_build_logs must be sorted, unique, and non-empty",
+                    artifact.operator
+                )));
+            }
+            for evidence in &artifact.package_build_logs {
+                validate_evidence_file(&artifact.operator, "package_build_log", evidence)?;
             }
             if artifact.required_exports.is_empty() {
                 return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
@@ -439,6 +531,52 @@ fn resolve_locked_path(
         )));
     }
     Ok(canonical)
+}
+
+fn validate_evidence_file(
+    operator: &str,
+    field: &str,
+    evidence: &NativeOperatorEvidenceFile,
+) -> Result<(), NativeOperatorArtifactSetError> {
+    validate_relative_path(&evidence.path)?;
+    if !is_sha256_digest(&evidence.sha256) || evidence.size_bytes == 0 {
+        return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+            "{operator}.{field} must record a non-empty file and lowercase sha256"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_evidence_file(
+    root: &Path,
+    operator: &str,
+    field: &str,
+    evidence: &NativeOperatorEvidenceFile,
+) -> Result<(), NativeOperatorArtifactSetError> {
+    let path = resolve_locked_path(root, &evidence.path, operator)?;
+    let bytes = fs::read(&path).map_err(|source| NativeOperatorArtifactSetError::LockRead {
+        path: path.clone(),
+        source,
+    })?;
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_sha256 != evidence.sha256 {
+        return Err(NativeOperatorArtifactSetError::PinMismatch {
+            operator: operator.to_string(),
+            field: format!("{field}.sha256"),
+            expected: evidence.sha256.clone(),
+            actual: actual_sha256,
+        });
+    }
+    if actual_size != evidence.size_bytes {
+        return Err(NativeOperatorArtifactSetError::PinMismatch {
+            operator: operator.to_string(),
+            field: format!("{field}.size_bytes"),
+            expected: evidence.size_bytes.to_string(),
+            actual: actual_size.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn require_pin(
@@ -602,6 +740,21 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
+        let receipt_path = dir.join("source-build.receipt.json");
+        let plan_path = dir.join("source-build.plan.json");
+        let log_path = dir.join("source-build.log");
+        let package_receipt_path = dir.join("package.receipt.json");
+        let package_log_path = dir.join("package-build.log");
+        fs::write(&receipt_path, "{\"status\":\"pass\"}\n").unwrap();
+        fs::write(&plan_path, "{\"schema_version\":2}\n").unwrap();
+        fs::write(&log_path, "source build complete\n").unwrap();
+        fs::write(&package_receipt_path, "{\"status\":\"pass\"}\n").unwrap();
+        fs::write(&package_log_path, "package build complete\n").unwrap();
+        let evidence = |path: &Path| NativeOperatorEvidenceFile {
+            path: format!("{operator}/{}", path.file_name().unwrap().to_string_lossy()),
+            sha256: digest_bytes(&fs::read(path).unwrap()),
+            size_bytes: fs::metadata(path).unwrap().len(),
+        };
         NativeOperatorArtifactLock {
             operator: operator.to_string(),
             backend: NativeOperatorBackend::Cuda,
@@ -611,6 +764,12 @@ mod tests {
             ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
             source_package_sha256,
             inputs_sha256,
+            source_build_receipt: evidence(&receipt_path),
+            source_build_plan: evidence(&plan_path),
+            source_build_logs: vec![evidence(&log_path)],
+            source_archive_sha256: digest('8'),
+            package_receipt: evidence(&package_receipt_path),
+            package_build_logs: vec![evidence(&package_log_path)],
             binary_sha256,
             abi_contract_sha256,
             descriptor_export: descriptor,
@@ -686,5 +845,40 @@ mod tests {
             error,
             NativeOperatorArtifactSetError::StaticSymbolCollision { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_tampered_package_provenance_files() {
+        for field in ["package_receipt", "package_build_log"] {
+            let dir = temp_dir(field);
+            let artifact = write_artifact(
+                dir.path(),
+                "alpha",
+                "operation.alpha",
+                "provider.cuda.alpha",
+                None,
+            );
+            let evidence = if field == "package_receipt" {
+                &artifact.package_receipt
+            } else {
+                &artifact.package_build_logs[0]
+            };
+            let evidence_path = dir.path().join(&evidence.path);
+            fs::write(&evidence_path, format!("tampered {field}\n")).unwrap();
+            let lock = NativeOperatorArtifactSetLock {
+                schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
+                g03_catalog_sha256: digest('9'),
+                artifacts: vec![artifact],
+            };
+            let lock_path = dir.path().join("native-operators.lock.json");
+            fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+            let error = NativeOperatorArtifactSetLock::load_and_resolve(&lock_path, Some("sm_89"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                NativeOperatorArtifactSetError::PinMismatch { .. }
+            ));
+        }
     }
 }

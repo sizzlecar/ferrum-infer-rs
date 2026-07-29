@@ -773,6 +773,177 @@ fn validate_plan(plan: &NativeOperatorSourceBuildPlan) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn verify_source_build_receipt_against_plan(
+    receipt: &NativeOperatorSourceBuildReceipt,
+    plan_path: &Path,
+    source_root: &Path,
+) -> Result<NativeOperatorSourceBuildPlan> {
+    require_file(plan_path)?;
+    let plan: NativeOperatorSourceBuildPlan = read_json(plan_path)?;
+    validate_plan(&plan)?;
+    let plan_sha256 = sha256_file(plan_path)?;
+    if receipt.plan_sha256 != plan_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt plan_sha256 mismatch: expected={plan_sha256} actual={}",
+            receipt.operator, receipt.plan_sha256
+        )));
+    }
+    if receipt.operator != plan.operator || receipt.source_package != plan.source_package {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt does not match its locked plan identity",
+            receipt.operator
+        )));
+    }
+    let canonical_source_root =
+        source_root
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: source_root.to_path_buf(),
+                source,
+            })?;
+    validate_locked_source_tree(&canonical_source_root, &plan)?;
+
+    let expected_architecture =
+        architecture_argument(plan.architecture, &receipt.compute_capability);
+    if receipt.architecture_argument != expected_architecture {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build architecture argument differs from its plan: expected={expected_architecture} actual={}",
+            receipt.operator, receipt.architecture_argument
+        )));
+    }
+    let toolchain = receipt.toolchain.as_ref().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt is missing toolchain provenance",
+            receipt.operator
+        ))
+    })?;
+    let expected_environment = effective_environment_for_tool_paths([
+        toolchain.nvcc.path.as_str(),
+        toolchain.host_compiler.path.as_str(),
+        toolchain.archiver.path.as_str(),
+    ])?;
+    if receipt.effective_environment != expected_environment {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build effective environment differs from the deterministic policy",
+            receipt.operator
+        )));
+    }
+    let expected_inputs_sha256 = build_inputs_sha256(
+        &plan_sha256,
+        &plan.source_package.sha256,
+        &expected_architecture,
+        &expected_environment,
+        Some(toolchain),
+        plan_path,
+    )?;
+    if receipt.inputs_sha256 != expected_inputs_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build inputs_sha256 mismatch: expected={expected_inputs_sha256} actual={}",
+            receipt.operator, receipt.inputs_sha256
+        )));
+    }
+    let object_specs = build_object_cache_specs(
+        &plan,
+        &expected_architecture,
+        toolchain,
+        &expected_environment,
+    )?;
+    if receipt.commands.len() != plan.translation_units.len() + 1 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build command count differs from its plan",
+            receipt.operator
+        )));
+    }
+    for (index, ((translation_unit, object_spec), command)) in plan
+        .translation_units
+        .iter()
+        .zip(object_specs.iter())
+        .zip(receipt.commands.iter())
+        .enumerate()
+    {
+        let expected_object_file = object_file_name(index, translation_unit);
+        if command.translation_unit.as_deref() != Some(translation_unit.path.as_str())
+            || command.object_cache_key.as_deref() != Some(object_spec.input_signature_sha256())
+            || command
+                .object_file
+                .as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                != Some(std::ffi::OsStr::new(&expected_object_file))
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build object identity for {} differs from its plan",
+                receipt.operator, translation_unit.path
+            )));
+        }
+        let mut expected_argv = vec![
+            toolchain.nvcc.path.clone(),
+            "-c".to_string(),
+            translation_unit.path.clone(),
+            "-o".to_string(),
+            expected_object_file.clone(),
+            expected_architecture.clone(),
+            "-ccbin".to_string(),
+            toolchain.host_compiler.path.clone(),
+        ];
+        expected_argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
+        expected_argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));
+        expected_argv.extend(nvcc_policy_flags(&plan.nvcc_policy));
+        expected_argv.push("--threads".to_string());
+        expected_argv.push(receipt.nvcc_threads.to_string());
+        let mut actual_argv = command.argv.clone();
+        if let Some(output) = actual_argv.get_mut(4) {
+            *output = Path::new(output)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+        }
+        if actual_argv != expected_argv {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build argv for {} differs from its locked plan",
+                receipt.operator, translation_unit.path
+            )));
+        }
+    }
+    let archive_command = receipt.commands.last().expect("command count checked");
+    let actual_archive_argv = archive_command
+        .argv
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if index >= 2 {
+                Path::new(value)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                value.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut expected_archive_argv = vec![
+        toolchain.archiver.path.clone(),
+        "rcs".to_string(),
+        plan.archive_file.clone(),
+    ];
+    expected_archive_argv.extend(
+        plan.translation_units
+            .iter()
+            .enumerate()
+            .map(|(index, translation_unit)| object_file_name(index, translation_unit)),
+    );
+    if actual_archive_argv != expected_archive_argv
+        || receipt.archive_file.as_deref() != Some(plan.archive_file.as_str())
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build archive command differs from its locked plan",
+            receipt.operator
+        )));
+    }
+    Ok(plan)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_common(
     operator: &str,
@@ -956,7 +1127,7 @@ fn resolve_toolchain(
     })
 }
 
-fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
+pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
     require_file(path)?;
     let canonical = path
         .canonicalize()
@@ -1039,6 +1210,10 @@ fn effective_build_environment(
             request.ar_path.to_str().unwrap_or(""),
         ]
     };
+    effective_environment_for_tool_paths(tool_paths)
+}
+
+fn effective_environment_for_tool_paths(tool_paths: [&str; 3]) -> Result<BTreeMap<String, String>> {
     let mut path_entries = tool_paths
         .iter()
         .filter_map(|path| Path::new(path).parent())
@@ -1434,7 +1609,8 @@ mod tests {
         fs::create_dir_all(source_root.join("kernels")).unwrap();
         fs::write(
             source_root.join("kernels/marlin.cu"),
-            "int marlin_cuda(void) { return 0; }\n",
+            "int marlin_cuda(void) { return 0; }\n\
+             int marlin_cuda_moe(void) { return 0; }\n",
         )
         .unwrap();
         fs::write(source_root.join("kernels/marlin.h"), "#define MARLIN 1\n").unwrap();
@@ -1653,8 +1829,8 @@ mod tests {
 
         let cached_output_dir = root.path().join("cached-build");
         let cached_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
-            plan_path,
-            source_root,
+            plan_path: plan_path.clone(),
+            source_root: source_root.clone(),
             output_dir: cached_output_dir.clone(),
             compute_capability: "sm_89".to_string(),
             builder_sha: "8".repeat(40),
@@ -1689,6 +1865,73 @@ mod tests {
             receipt.inputs_sha256, cached_receipt.inputs_sha256,
             "worker-count and provenance commit changes are not output-content inputs"
         );
+
+        fs::write(source_root.join("LICENSE"), "fixture license\n").unwrap();
+        let package_spec = crate::NativeOperatorPackageSpec {
+            schema_version: crate::NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
+            operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
+            operator_abi_version: "1".to_string(),
+            backend: ferrum_types::NativeOperatorBackend::Cuda,
+            compute_capabilities: vec!["sm_89".to_string()],
+            operation_bindings: vec![ferrum_types::NativeOperatorBinding {
+                operation_id: "operation.dense_linear".to_string(),
+                operation_contract_version: 1,
+                provider_id: "provider.cuda.dense_linear.f16.marlin".to_string(),
+                provider_version: 1,
+                provider_implementation_fingerprint: "a".repeat(64),
+                entrypoints: CudaNativeBuildUnit::Marlin
+                    .required_exports()
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            }],
+            required_exports: CudaNativeBuildUnit::Marlin
+                .required_exports()
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            license_files: vec![crate::NativeOperatorLicenseInput {
+                source_path: "LICENSE".to_string(),
+                output_path: "licenses/LICENSE".to_string(),
+            }],
+            cuda_toolkit: Some("12.4".to_string()),
+            cuda_runtime_min: Some("12.4".to_string()),
+            system_libraries: vec![
+                ferrum_native_ops::NativeOperatorSystemLibrary::CudaRuntime,
+                ferrum_native_ops::NativeOperatorSystemLibrary::StdCxx,
+            ],
+        };
+        let package_spec_path = root.path().join("package-spec.json");
+        write_json(&package_spec_path, &package_spec).unwrap();
+        let catalog_path = root.path().join("operation-catalog.json");
+        let abi_path = root.path().join("native-abi.json");
+        fs::write(&catalog_path, "{\"schema\":1}\n").unwrap();
+        fs::write(&abi_path, "{\"ferrum_native_abi\":2}\n").unwrap();
+        let package_output = root.path().join("package");
+
+        let package_receipt =
+            crate::package_native_operator(&crate::NativeOperatorPackageRequest {
+                spec_path: package_spec_path,
+                source_root,
+                source_build_receipt_path: output_dir.join("source-build.receipt.json"),
+                source_build_plan_path: plan_path,
+                g03_catalog_path: catalog_path,
+                abi_contract_path: abi_path,
+                output_dir: package_output.clone(),
+                cc: PathBuf::from("/usr/bin/cc"),
+                ar: PathBuf::from("/usr/bin/ar"),
+            })
+            .unwrap();
+
+        assert_eq!(
+            package_receipt.source_build_plan.sha256,
+            receipt.plan_sha256
+        );
+        assert_eq!(
+            package_receipt.source_archive_sha256,
+            receipt.archive_sha256.unwrap()
+        );
+        assert!(package_output.join("package.receipt.json").is_file());
     }
 
     #[test]
