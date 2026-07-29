@@ -1,12 +1,16 @@
 //! Locked, independently runnable native source-build plans.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ferrum_native_ops::CudaNativeBuildUnit;
+use ferrum_native_ops::{
+    CudaNativeBuildUnit, NativeBuildArtifactCache, NativeBuildArtifactLookup,
+    NativeBuildArtifactSpec,
+};
 use ferrum_types::{is_sha256_digest, NativeOperatorSourcePackage};
 use serde::{Deserialize, Serialize};
 
@@ -15,9 +19,10 @@ use super::{
     write_json, NativeOperatorBuilderError, Result,
 };
 
-pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 1;
-pub const NATIVE_OPERATOR_SOURCE_BUILD_PLAN_SCHEMA_VERSION: u32 = 1;
-pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_SOURCE_BUILD_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 1;
 pub const MAX_NVCC_THREADS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +36,7 @@ pub struct NativeOperatorSourceDefinition {
     pub headers: Vec<String>,
     pub include_dirs: Vec<String>,
     pub defines: Vec<String>,
-    pub nvcc_flags: Vec<String>,
+    pub nvcc_policy: NativeOperatorNvccPolicy,
     pub architecture: NativeOperatorCudaArchitecture,
     pub archive_file: String,
 }
@@ -53,7 +58,7 @@ pub struct NativeOperatorSourceBuildPlan {
     pub headers: Vec<NativeOperatorSourceFileLock>,
     pub include_dirs: Vec<String>,
     pub defines: Vec<String>,
-    pub nvcc_flags: Vec<String>,
+    pub nvcc_policy: NativeOperatorNvccPolicy,
     pub architecture: NativeOperatorCudaArchitecture,
     pub archive_file: String,
 }
@@ -71,6 +76,29 @@ pub enum NativeOperatorCudaArchitecture {
     Compute80Ptx,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorCppStandard {
+    Cpp17,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorOptimization {
+    O3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorNvccPolicy {
+    pub cpp_standard: NativeOperatorCppStandard,
+    pub optimization: NativeOperatorOptimization,
+    pub use_fast_math: bool,
+    pub relaxed_constexpr: bool,
+    pub extended_lambda: bool,
+    pub host_position_independent_code: bool,
+    pub host_default_visibility: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeOperatorSourceBuildRequest {
     pub plan_path: PathBuf,
@@ -82,6 +110,7 @@ pub struct NativeOperatorSourceBuildRequest {
     pub ccbin_path: PathBuf,
     pub ar_path: PathBuf,
     pub nvcc_threads: u32,
+    pub object_cache_dir: PathBuf,
     pub plan_only: bool,
 }
 
@@ -97,9 +126,13 @@ pub struct NativeOperatorSourceBuildReceipt {
     pub compute_capability: String,
     pub architecture_argument: String,
     pub nvcc_threads: u32,
+    pub object_cache_root: String,
     pub toolchain: Option<NativeOperatorSourceBuildToolchain>,
+    pub effective_environment: BTreeMap<String, String>,
     pub inputs_sha256: String,
     pub commands: Vec<NativeOperatorSourceBuildCommand>,
+    pub compiled_translation_units: Vec<String>,
+    pub cache_hit_translation_units: Vec<String>,
     pub archive_file: Option<String>,
     pub archive_sha256: Option<String>,
     pub started_unix_ms: u64,
@@ -132,11 +165,29 @@ pub struct NativeOperatorToolIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorSourceBuildCommand {
     pub translation_unit: Option<String>,
+    pub working_directory: String,
     pub argv: Vec<String>,
+    pub object_file: Option<String>,
     pub stdout_log: String,
     pub stderr_log: String,
+    pub object_cache_key: Option<String>,
+    pub object_cache_status: Option<NativeOperatorSourceObjectCacheStatus>,
+    pub object_cache_entry: Option<String>,
+    pub object_sha256: Option<String>,
+    pub compiler_executed: bool,
     pub elapsed_ms: Option<u64>,
     pub return_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorSourceObjectCacheStatus {
+    Plan,
+    Pending,
+    Hit,
+    Miss,
+    Published,
+    Rejected,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,11 +202,25 @@ struct NativeOperatorSourceInventoryIdentity<'a> {
 struct NativeOperatorBuildInputIdentity<'a> {
     plan_sha256: &'a str,
     source_package_sha256: &'a str,
-    builder_sha: &'a str,
-    compute_capability: &'a str,
+    builder_contract_version: u32,
     architecture_argument: &'a str,
-    nvcc_threads: u32,
+    effective_environment: &'a BTreeMap<String, String>,
     toolchain: Option<&'a NativeOperatorSourceBuildToolchain>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeOperatorObjectInputIdentity<'a> {
+    schema_version: u32,
+    operator: &'a str,
+    translation_unit: &'a NativeOperatorSourceFileLock,
+    headers: &'a [NativeOperatorSourceFileLock],
+    include_dirs: &'a [String],
+    defines: &'a [String],
+    nvcc_policy: &'a NativeOperatorNvccPolicy,
+    architecture_argument: &'a str,
+    builder_contract_version: u32,
+    effective_environment: &'a BTreeMap<String, String>,
+    toolchain: &'a NativeOperatorSourceBuildToolchain,
 }
 
 pub fn lock_native_operator_source_definition(
@@ -227,7 +292,7 @@ pub fn lock_native_operator_source_definition(
         headers,
         include_dirs: definition.include_dirs,
         defines: definition.defines,
-        nvcc_flags: definition.nvcc_flags,
+        nvcc_policy: definition.nvcc_policy,
         architecture: definition.architecture,
         archive_file: definition.archive_file,
     };
@@ -256,10 +321,14 @@ pub fn run_native_operator_source_build(
             "source build output_dir must be absolute".to_string(),
         ));
     }
-    if !request.plan_only
-        && [&request.nvcc_path, &request.ccbin_path, &request.ar_path]
-            .iter()
-            .any(|path| !path.is_absolute())
+    if !request.object_cache_dir.is_absolute() {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "source build object_cache_dir must be absolute".to_string(),
+        ));
+    }
+    if [&request.nvcc_path, &request.ccbin_path, &request.ar_path]
+        .iter()
+        .any(|path| !path.is_absolute())
     {
         return Err(NativeOperatorBuilderError::Invalid(
             "source build tool paths must be absolute".to_string(),
@@ -318,13 +387,12 @@ pub fn run_native_operator_source_build(
             Err(error) => (None, Some(error.to_string())),
         }
     };
+    let effective_environment = effective_build_environment(request, toolchain.as_ref())?;
     let inputs_sha256 = build_inputs_sha256(
         &plan_sha256,
         &plan.source_package.sha256,
-        &request.builder_sha,
-        &request.compute_capability,
         &architecture_argument,
-        request.nvcc_threads,
+        &effective_environment,
         toolchain.as_ref(),
         &receipt_path,
     )?;
@@ -336,6 +404,7 @@ pub fn run_native_operator_source_build(
         &objects_dir,
         &logs_dir,
         toolchain.as_ref(),
+        &effective_environment,
     );
     let initial_log = if request.plan_only {
         b"plan-only: command was not executed\n".as_slice()
@@ -371,9 +440,13 @@ pub fn run_native_operator_source_build(
         compute_capability: request.compute_capability.clone(),
         architecture_argument,
         nvcc_threads: request.nvcc_threads,
+        object_cache_root: request.object_cache_dir.display().to_string(),
         toolchain,
+        effective_environment,
         inputs_sha256,
         commands: commands.clone(),
+        compiled_translation_units: Vec::new(),
+        cache_hit_translation_units: Vec::new(),
         archive_file: None,
         archive_sha256: None,
         started_unix_ms,
@@ -393,14 +466,102 @@ pub fn run_native_operator_source_build(
             format!("toolchain_preflight_failed:{error}"),
         );
     }
+    let object_cache = match NativeBuildArtifactCache::new(&request.object_cache_dir) {
+        Ok(cache) => cache,
+        Err(error) => {
+            receipt.elapsed_ms = millis(started.elapsed());
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("object_cache_init_failed:{error}"),
+            );
+        }
+    };
+    let object_specs = match build_object_cache_specs(
+        &plan,
+        &receipt.architecture_argument,
+        receipt
+            .toolchain
+            .as_ref()
+            .expect("actual source build has a resolved toolchain"),
+        &receipt.effective_environment,
+    ) {
+        Ok(specs) => specs,
+        Err(error) => {
+            receipt.elapsed_ms = millis(started.elapsed());
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("object_cache_spec_failed:{error}"),
+            );
+        }
+    };
+    for (command, spec) in commands.iter_mut().zip(object_specs.iter()) {
+        command.object_cache_key = Some(spec.input_signature_sha256().to_string());
+    }
+    receipt.commands = commands.clone();
     receipt.failure_class = Some("build_incomplete".to_string());
     write_json(&receipt_path, &receipt)?;
 
     for index in 0..plan.translation_units.len() {
+        let translation_unit = &plan.translation_units[index];
+        let object_path = PathBuf::from(
+            commands[index]
+                .object_file
+                .as_deref()
+                .expect("translation-unit command has an object file"),
+        );
         let command_started = Instant::now();
+        match object_cache.restore(&object_specs[index], &object_path) {
+            Ok(NativeBuildArtifactLookup::Hit(cache_receipt)) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Hit);
+                commands[index].object_cache_entry =
+                    Some(cache_receipt.cache_entry.display().to_string());
+                commands[index].object_sha256 = Some(cache_receipt.artifact_sha256);
+                commands[index].elapsed_ms = Some(millis(command_started.elapsed()));
+                append_command_stream(
+                    &request.output_dir.join(&commands[index].stdout_log),
+                    b"object-cache-hit: compiler was not executed\n",
+                )?;
+                receipt
+                    .cache_hit_translation_units
+                    .push(translation_unit.path.clone());
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                write_json(&receipt_path, &receipt)?;
+                continue;
+            }
+            Ok(NativeBuildArtifactLookup::Miss { reason }) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Miss);
+                append_command_stream(
+                    &request.output_dir.join(&commands[index].stdout_log),
+                    format!("object-cache-miss: {reason}\n").as_bytes(),
+                )?;
+            }
+            Err(error) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                return reject_source_build(
+                    &receipt_path,
+                    &mut receipt,
+                    format!("object_cache_restore_failed:{index}:{error}"),
+                );
+            }
+        }
         let stdout_path = request.output_dir.join(&commands[index].stdout_log);
         let stderr_path = request.output_dir.join(&commands[index].stderr_log);
-        let status = match run_logged_command(&commands[index].argv, &stdout_path, &stderr_path) {
+        commands[index].compiler_executed = true;
+        let status = match run_logged_command(
+            &commands[index].argv,
+            &stdout_path,
+            &stderr_path,
+            &commands[index].working_directory,
+            &receipt.effective_environment,
+        ) {
             Ok(status) => status,
             Err(error) => {
                 append_command_stream(&stderr_path, format!("spawn failed: {error}\n").as_bytes())?;
@@ -415,6 +576,9 @@ pub fn run_native_operator_source_build(
         };
         commands[index].elapsed_ms = Some(millis(command_started.elapsed()));
         commands[index].return_code = status.code();
+        receipt
+            .compiled_translation_units
+            .push(translation_unit.path.clone());
         receipt.commands = commands.clone();
         receipt.elapsed_ms = millis(started.elapsed());
         if !status.success() {
@@ -424,6 +588,36 @@ pub fn run_native_operator_source_build(
                 format!("nvcc_translation_unit_{index}_failed"),
             );
         }
+        if let Err(error) = require_file(&object_path) {
+            commands[index].object_cache_status =
+                Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+            receipt.commands = commands.clone();
+            receipt.elapsed_ms = millis(started.elapsed());
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("compiled_object_missing:{index}:{error}"),
+            );
+        }
+        let cache_receipt = match object_cache.publish(&object_specs[index], &object_path) {
+            Ok(cache_receipt) => cache_receipt,
+            Err(error) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                return reject_source_build(
+                    &receipt_path,
+                    &mut receipt,
+                    format!("object_cache_publish_failed:{index}:{error}"),
+                );
+            }
+        };
+        commands[index].object_cache_status =
+            Some(NativeOperatorSourceObjectCacheStatus::Published);
+        commands[index].object_cache_entry = Some(cache_receipt.cache_entry.display().to_string());
+        commands[index].object_sha256 = Some(cache_receipt.artifact_sha256);
+        receipt.commands = commands.clone();
         write_json(&receipt_path, &receipt)?;
     }
 
@@ -438,6 +632,8 @@ pub fn run_native_operator_source_build(
         &archive_command.argv,
         &archive_stdout_path,
         &archive_stderr_path,
+        &archive_command.working_directory,
+        &receipt.effective_environment,
     ) {
         Ok(status) => status,
         Err(error) => {
@@ -463,8 +659,24 @@ pub fn run_native_operator_source_build(
     }
 
     let archive_path = request.output_dir.join(&plan.archive_file);
-    require_file(&archive_path)?;
-    receipt.archive_sha256 = Some(sha256_file(&archive_path)?);
+    if let Err(error) = require_file(&archive_path) {
+        return reject_source_build(
+            &receipt_path,
+            &mut receipt,
+            format!("archive_output_missing:{error}"),
+        );
+    }
+    let archive_sha256 = match sha256_file(&archive_path) {
+        Ok(sha256) => sha256,
+        Err(error) => {
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("archive_output_hash_failed:{error}"),
+            );
+        }
+    };
+    receipt.archive_sha256 = Some(archive_sha256);
     receipt.archive_file = Some(plan.archive_file);
     receipt.status = NativeOperatorSourceBuildStatus::Pass;
     receipt.failure_class = None;
@@ -486,7 +698,6 @@ fn validate_definition(definition: &NativeOperatorSourceDefinition) -> Result<()
         &definition.headers,
         &definition.include_dirs,
         &definition.defines,
-        &definition.nvcc_flags,
         &definition.archive_file,
     )?;
     if definition.source_package_kind.trim().is_empty()
@@ -522,7 +733,6 @@ fn validate_plan(plan: &NativeOperatorSourceBuildPlan) -> Result<()> {
         &headers,
         &plan.include_dirs,
         &plan.defines,
-        &plan.nvcc_flags,
         &plan.archive_file,
     )?;
     if plan.source_package.kind.trim().is_empty()
@@ -571,7 +781,6 @@ fn validate_common(
     headers: &[String],
     include_dirs: &[String],
     defines: &[String],
-    nvcc_flags: &[String],
     archive_file: &str,
 ) -> Result<()> {
     symbol_slug(operator)?;
@@ -627,23 +836,6 @@ fn validate_common(
     {
         return Err(NativeOperatorBuilderError::Invalid(
             "defines must be sorted, unique, non-empty single arguments".to_string(),
-        ));
-    }
-    if nvcc_flags.is_empty()
-        || nvcc_flags.iter().any(|flag| {
-            flag.is_empty()
-                || matches!(
-                    flag.as_str(),
-                    "-c" | "-o" | "--threads" | "-arch" | "--gpu-architecture" | "-ccbin"
-                )
-                || flag.starts_with("-arch=")
-                || flag.starts_with("--gpu-architecture=")
-                || flag.starts_with("-I")
-                || flag.starts_with("-D")
-        })
-    {
-        return Err(NativeOperatorBuilderError::Invalid(
-            "nvcc_flags must be non-empty and must not override typed source/arch/include/define/output/thread/compiler arguments".to_string(),
         ));
     }
     validate_relative_path(archive_file)?;
@@ -774,6 +966,10 @@ fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
         })?;
     let output = Command::new(&canonical)
         .arg("--version")
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .output()
         .map_err(|source| NativeOperatorBuilderError::Io {
             path: canonical.clone(),
@@ -805,20 +1001,17 @@ fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
 fn build_inputs_sha256(
     plan_sha256: &str,
     source_package_sha256: &str,
-    builder_sha: &str,
-    compute_capability: &str,
     architecture_argument: &str,
-    nvcc_threads: u32,
+    effective_environment: &BTreeMap<String, String>,
     toolchain: Option<&NativeOperatorSourceBuildToolchain>,
     receipt_path: &Path,
 ) -> Result<String> {
     let identity = NativeOperatorBuildInputIdentity {
         plan_sha256,
         source_package_sha256,
-        builder_sha,
-        compute_capability,
+        builder_contract_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
         architecture_argument,
-        nvcc_threads,
+        effective_environment,
         toolchain,
     };
     let bytes =
@@ -829,6 +1022,127 @@ fn build_inputs_sha256(
     Ok(sha256_bytes(&bytes))
 }
 
+fn effective_build_environment(
+    request: &NativeOperatorSourceBuildRequest,
+    toolchain: Option<&NativeOperatorSourceBuildToolchain>,
+) -> Result<BTreeMap<String, String>> {
+    let tool_paths = if let Some(toolchain) = toolchain {
+        [
+            toolchain.nvcc.path.as_str(),
+            toolchain.host_compiler.path.as_str(),
+            toolchain.archiver.path.as_str(),
+        ]
+    } else {
+        [
+            request.nvcc_path.to_str().unwrap_or(""),
+            request.ccbin_path.to_str().unwrap_or(""),
+            request.ar_path.to_str().unwrap_or(""),
+        ]
+    };
+    let mut path_entries = tool_paths
+        .iter()
+        .filter_map(|path| Path::new(path).parent())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    path_entries.extend(["/bin".to_string(), "/usr/bin".to_string()]);
+    path_entries.sort();
+    path_entries.dedup();
+    if path_entries.iter().any(|path| path.is_empty()) {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "source build tool paths must have parent directories".to_string(),
+        ));
+    }
+    let mut environment = BTreeMap::new();
+    environment.insert("LANG".to_string(), "C".to_string());
+    environment.insert("LC_ALL".to_string(), "C".to_string());
+    environment.insert("PATH".to_string(), path_entries.join(":"));
+    environment.insert("SOURCE_DATE_EPOCH".to_string(), "0".to_string());
+    environment.insert("TMPDIR".to_string(), "/tmp".to_string());
+    environment.insert("TZ".to_string(), "UTC".to_string());
+    environment.insert("ZERO_AR_DATE".to_string(), "1".to_string());
+    Ok(environment)
+}
+
+fn build_object_cache_specs(
+    plan: &NativeOperatorSourceBuildPlan,
+    architecture_argument: &str,
+    toolchain: &NativeOperatorSourceBuildToolchain,
+    effective_environment: &BTreeMap<String, String>,
+) -> Result<Vec<NativeBuildArtifactSpec>> {
+    plan.translation_units
+        .iter()
+        .enumerate()
+        .map(|(index, translation_unit)| {
+            let identity = NativeOperatorObjectInputIdentity {
+                schema_version: 1,
+                operator: &plan.operator,
+                translation_unit,
+                headers: &plan.headers,
+                include_dirs: &plan.include_dirs,
+                defines: &plan.defines,
+                nvcc_policy: &plan.nvcc_policy,
+                architecture_argument,
+                builder_contract_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
+                effective_environment,
+                toolchain,
+            };
+            let input_signature = serde_json::to_string(&identity).map_err(|source| {
+                NativeOperatorBuilderError::Json {
+                    path: PathBuf::from("<object-cache-input>"),
+                    source,
+                }
+            })?;
+            NativeBuildArtifactSpec::new(
+                format!("{}.object.{index:02}", plan.operator),
+                object_file_name(index, translation_unit),
+                input_signature,
+            )
+            .map_err(NativeOperatorBuilderError::from)
+        })
+        .collect()
+}
+
+fn object_file_name(index: usize, translation_unit: &NativeOperatorSourceFileLock) -> String {
+    let stem = Path::new(&translation_unit.path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("translation_unit");
+    format!(
+        "{index:02}_{}_{}.o",
+        safe_component(stem),
+        &translation_unit.sha256[..8]
+    )
+}
+
+fn nvcc_policy_flags(policy: &NativeOperatorNvccPolicy) -> Vec<String> {
+    let mut flags = vec![
+        match policy.cpp_standard {
+            NativeOperatorCppStandard::Cpp17 => "-std=c++17",
+        }
+        .to_string(),
+        match policy.optimization {
+            NativeOperatorOptimization::O3 => "-O3",
+        }
+        .to_string(),
+    ];
+    if policy.use_fast_math {
+        flags.push("--use_fast_math".to_string());
+    }
+    if policy.relaxed_constexpr {
+        flags.push("--expt-relaxed-constexpr".to_string());
+    }
+    if policy.extended_lambda {
+        flags.push("--expt-extended-lambda".to_string());
+    }
+    if policy.host_position_independent_code {
+        flags.extend(["-Xcompiler".to_string(), "-fPIC".to_string()]);
+    }
+    if policy.host_default_visibility {
+        flags.extend(["-Xcompiler".to_string(), "-fvisibility=default".to_string()]);
+    }
+    flags
+}
+
 fn build_commands(
     request: &NativeOperatorSourceBuildRequest,
     plan: &NativeOperatorSourceBuildPlan,
@@ -837,6 +1151,7 @@ fn build_commands(
     objects_dir: &Path,
     logs_dir: &Path,
     toolchain: Option<&NativeOperatorSourceBuildToolchain>,
+    _effective_environment: &BTreeMap<String, String>,
 ) -> Vec<NativeOperatorSourceBuildCommand> {
     let nvcc_path = toolchain
         .map(|toolchain| toolchain.nvcc.path.as_str())
@@ -854,40 +1169,40 @@ fn build_commands(
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("translation_unit");
-        let object_name = format!(
-            "{index:02}_{}_{}.o",
-            safe_component(stem),
-            &translation_unit.sha256[..8]
-        );
+        let object_name = object_file_name(index, translation_unit);
         let object_path = objects_dir.join(object_name);
         object_paths.push(object_path.clone());
         let mut argv = vec![
             nvcc_path.to_string(),
             "-c".to_string(),
-            source_root
-                .join(&translation_unit.path)
-                .display()
-                .to_string(),
+            translation_unit.path.clone(),
             "-o".to_string(),
             object_path.display().to_string(),
             architecture_argument.to_string(),
             "-ccbin".to_string(),
             ccbin_path.to_string(),
         ];
-        argv.extend(
-            plan.include_dirs
-                .iter()
-                .map(|path| format!("-I{}", source_root.join(path).display())),
-        );
+        argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
         argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));
-        argv.extend(plan.nvcc_flags.iter().cloned());
+        argv.extend(nvcc_policy_flags(&plan.nvcc_policy));
         argv.push("--threads".to_string());
         argv.push(request.nvcc_threads.to_string());
         commands.push(NativeOperatorSourceBuildCommand {
             translation_unit: Some(translation_unit.path.clone()),
+            working_directory: source_root.display().to_string(),
             argv,
+            object_file: Some(object_path.display().to_string()),
             stdout_log: relative_log(logs_dir, &format!("{index:02}-{stem}.stdout.log")),
             stderr_log: relative_log(logs_dir, &format!("{index:02}-{stem}.stderr.log")),
+            object_cache_key: None,
+            object_cache_status: Some(if request.plan_only {
+                NativeOperatorSourceObjectCacheStatus::Plan
+            } else {
+                NativeOperatorSourceObjectCacheStatus::Pending
+            }),
+            object_cache_entry: None,
+            object_sha256: None,
+            compiler_executed: false,
             elapsed_ms: None,
             return_code: None,
         });
@@ -901,9 +1216,16 @@ fn build_commands(
     archive_argv.extend(object_paths.iter().map(|path| path.display().to_string()));
     commands.push(NativeOperatorSourceBuildCommand {
         translation_unit: None,
+        working_directory: source_root.display().to_string(),
         argv: archive_argv,
+        object_file: None,
         stdout_log: relative_log(logs_dir, "archive.stdout.log"),
         stderr_log: relative_log(logs_dir, "archive.stderr.log"),
+        object_cache_key: None,
+        object_cache_status: None,
+        object_cache_entry: None,
+        object_sha256: None,
+        compiler_executed: false,
         elapsed_ms: None,
         return_code: None,
     });
@@ -914,6 +1236,8 @@ fn run_logged_command(
     argv: &[String],
     stdout_path: &Path,
     stderr_path: &Path,
+    working_directory: &str,
+    effective_environment: &BTreeMap<String, String>,
 ) -> Result<ExitStatus> {
     let (program, args) = argv.split_first().ok_or_else(|| {
         NativeOperatorBuilderError::Invalid("source build command is empty".to_string())
@@ -922,13 +1246,9 @@ fn run_logged_command(
     let stderr = append_command_file(stderr_path)?;
     Command::new(program)
         .args(args)
-        .env_remove("NVCC_PREPEND_FLAGS")
-        .env_remove("NVCC_APPEND_FLAGS")
-        .env_remove("CUDAFE_FLAGS")
-        .env_remove("CPPFLAGS")
-        .env_remove("CXXFLAGS")
-        .env_remove("LDFLAGS")
-        .env("ZERO_AR_DATE", "1")
+        .current_dir(working_directory)
+        .env_clear()
+        .envs(effective_environment)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .status()
@@ -1095,12 +1415,15 @@ mod tests {
             headers: vec!["kernels/marlin.h".to_string()],
             include_dirs: vec!["kernels".to_string()],
             defines: vec!["FERRUM_FIXTURE=1".to_string()],
-            nvcc_flags: vec![
-                "-O3".to_string(),
-                "-Xcompiler".to_string(),
-                "-fPIC".to_string(),
-                "-std=c++17".to_string(),
-            ],
+            nvcc_policy: NativeOperatorNvccPolicy {
+                cpp_standard: NativeOperatorCppStandard::Cpp17,
+                optimization: NativeOperatorOptimization::O3,
+                use_fast_math: false,
+                relaxed_constexpr: false,
+                extended_lambda: false,
+                host_position_independent_code: true,
+                host_default_visibility: false,
+            },
             architecture: NativeOperatorCudaArchitecture::Compute80Ptx,
             archive_file: "libmarlin.a".to_string(),
         }
@@ -1120,16 +1443,14 @@ mod tests {
         (source_root, definition_path)
     }
 
-    fn write_fake_nvcc(root: &Path, required_receipt: &Path) -> PathBuf {
+    fn write_fake_nvcc(root: &Path) -> (PathBuf, PathBuf) {
         let path = root.join("fake-nvcc");
+        let counter = root.join("fake-nvcc-compile-count");
         fs::write(
             &path,
             format!(
                 "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo 'fake nvcc 12.4'; exit 0; fi\n\
-             test -s '{}'\n\
-             grep -q '\"status\": \"reject\"' '{}'\n\
-             grep -q '\"failure_class\": \"build_incomplete\"' '{}'\n\
              src=''\n\
              out=''\n\
              while [ \"$#\" -gt 0 ]; do\n\
@@ -1139,17 +1460,21 @@ mod tests {
                  *) shift ;;\n\
                esac\n\
              done\n\
+             build_dir=$(dirname \"$(dirname \"$out\")\")\n\
+             receipt=\"$build_dir/source-build.receipt.json\"\n\
+             test -s \"$receipt\"\n\
+             grep -q '\"status\": \"reject\"' \"$receipt\"\n\
+             grep -q '\"failure_class\": \"build_incomplete\"' \"$receipt\"\n\
+             printf 'compile\\n' >> '{}'\n\
              exec /usr/bin/cc -x c -c \"$src\" -o \"$out\"\n",
-                required_receipt.display(),
-                required_receipt.display(),
-                required_receipt.display()
+                counter.display()
             ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
-        path
+        (path, counter)
     }
 
     #[test]
@@ -1190,6 +1515,7 @@ mod tests {
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
             nvcc_threads: 4,
+            object_cache_dir: root.path().join("object-cache"),
             plan_only: true,
         })
         .unwrap_err();
@@ -1215,6 +1541,7 @@ mod tests {
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
             nvcc_threads: 4,
+            object_cache_dir: root.path().join("object-cache"),
             plan_only: true,
         })
         .unwrap();
@@ -1255,6 +1582,7 @@ mod tests {
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
             nvcc_threads: 4,
+            object_cache_dir: root.path().join("object-cache"),
             plan_only: false,
         })
         .unwrap_err();
@@ -1287,18 +1615,20 @@ mod tests {
         let plan_path = root.path().join("source-build.plan.json");
         lock_native_operator_source_definition(&definition_path, &source_root, &plan_path).unwrap();
         let output_dir = root.path().join("build");
-        let fake_nvcc = write_fake_nvcc(root.path(), &output_dir.join("source-build.receipt.json"));
+        let (fake_nvcc, compile_counter) = write_fake_nvcc(root.path());
+        let object_cache_dir = root.path().join("object-cache");
 
         let receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
-            plan_path,
-            source_root,
+            plan_path: plan_path.clone(),
+            source_root: source_root.clone(),
             output_dir: output_dir.clone(),
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
-            nvcc_path: fake_nvcc,
+            nvcc_path: fake_nvcc.clone(),
             ccbin_path: PathBuf::from("/usr/bin/cc"),
             ar_path: PathBuf::from("/usr/bin/ar"),
             nvcc_threads: 2,
+            object_cache_dir: object_cache_dir.clone(),
             plan_only: false,
         })
         .unwrap();
@@ -1308,6 +1638,8 @@ mod tests {
         assert!(is_sha256_digest(receipt.archive_sha256.as_deref().unwrap()));
         assert!(output_dir.join("libmarlin.a").is_file());
         assert!(output_dir.join("source-build.receipt.json").is_file());
+        assert_eq!(receipt.compiled_translation_units, ["kernels/marlin.cu"]);
+        assert!(receipt.cache_hit_translation_units.is_empty());
         assert!(receipt.commands.iter().all(|command| {
             [
                 output_dir.join(&command.stdout_log),
@@ -1318,5 +1650,120 @@ mod tests {
                 fs::read_to_string(path).is_ok_and(|content| content.contains("execution-start"))
             })
         }));
+
+        let cached_output_dir = root.path().join("cached-build");
+        let cached_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+            plan_path,
+            source_root,
+            output_dir: cached_output_dir.clone(),
+            compute_capability: "sm_89".to_string(),
+            builder_sha: "8".repeat(40),
+            nvcc_path: fake_nvcc,
+            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            ar_path: PathBuf::from("/usr/bin/ar"),
+            nvcc_threads: 8,
+            object_cache_dir,
+            plan_only: false,
+        })
+        .unwrap();
+
+        assert!(cached_receipt.compiled_translation_units.is_empty());
+        assert_eq!(
+            cached_receipt.cache_hit_translation_units,
+            ["kernels/marlin.cu"]
+        );
+        assert!(!cached_receipt.commands[0].compiler_executed);
+        assert_eq!(
+            cached_receipt.commands[0].object_cache_status,
+            Some(NativeOperatorSourceObjectCacheStatus::Hit)
+        );
+        assert_eq!(
+            fs::read_to_string(compile_counter).unwrap().lines().count(),
+            1
+        );
+        assert_eq!(
+            receipt.archive_sha256, cached_receipt.archive_sha256,
+            "worker-count changes must not change the object or archive"
+        );
+        assert_eq!(
+            receipt.inputs_sha256, cached_receipt.inputs_sha256,
+            "worker-count and provenance commit changes are not output-content inputs"
+        );
+    }
+
+    #[test]
+    fn changing_one_translation_unit_recompiles_only_that_unit() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, _) = write_fixture(root.path());
+        fs::write(
+            source_root.join("kernels/other.cu"),
+            "int other_cuda(void) { return 1; }\n",
+        )
+        .unwrap();
+        let mut source_definition = definition();
+        source_definition.translation_units = vec![
+            "kernels/marlin.cu".to_string(),
+            "kernels/other.cu".to_string(),
+        ];
+        let definition_path = root.path().join("two-tu-definition.json");
+        write_json(&definition_path, &source_definition).unwrap();
+        let first_plan_path = root.path().join("first.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &first_plan_path)
+            .unwrap();
+        let (fake_nvcc, compile_counter) = write_fake_nvcc(root.path());
+        let object_cache_dir = root.path().join("object-cache");
+
+        let first_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+            plan_path: first_plan_path,
+            source_root: source_root.clone(),
+            output_dir: root.path().join("first-build"),
+            compute_capability: "sm_89".to_string(),
+            builder_sha: "7".repeat(40),
+            nvcc_path: fake_nvcc.clone(),
+            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            ar_path: PathBuf::from("/usr/bin/ar"),
+            nvcc_threads: 2,
+            object_cache_dir: object_cache_dir.clone(),
+            plan_only: false,
+        })
+        .unwrap();
+        assert_eq!(first_receipt.compiled_translation_units.len(), 2);
+        assert!(first_receipt.cache_hit_translation_units.is_empty());
+
+        fs::write(
+            source_root.join("kernels/other.cu"),
+            "int other_cuda(void) { return 2; }\n",
+        )
+        .unwrap();
+        let second_plan_path = root.path().join("second.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &second_plan_path)
+            .unwrap();
+        let second_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+            plan_path: second_plan_path,
+            source_root,
+            output_dir: root.path().join("second-build"),
+            compute_capability: "sm_89".to_string(),
+            builder_sha: "8".repeat(40),
+            nvcc_path: fake_nvcc,
+            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            ar_path: PathBuf::from("/usr/bin/ar"),
+            nvcc_threads: 4,
+            object_cache_dir,
+            plan_only: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            second_receipt.compiled_translation_units,
+            ["kernels/other.cu"]
+        );
+        assert_eq!(
+            second_receipt.cache_hit_translation_units,
+            ["kernels/marlin.cu"]
+        );
+        assert_eq!(
+            fs::read_to_string(compile_counter).unwrap().lines().count(),
+            3
+        );
     }
 }

@@ -110,6 +110,8 @@ pub enum NativeOperatorBuilderError {
     Resolve(#[from] ferrum_native_ops::NativeOperatorResolveError),
     #[error("native operator artifact-set validation failed: {0}")]
     ArtifactSet(#[from] ferrum_native_ops::NativeOperatorArtifactSetError),
+    #[error("native build artifact cache failed: {0}")]
+    BuildCache(#[from] ferrum_native_ops::NativeBuildArtifactCacheError),
     #[error("native operator source build rejected: receipt={receipt_path} reason={reason}")]
     SourceBuildRejected {
         receipt_path: PathBuf,
@@ -756,10 +758,33 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
             source,
         })?;
     bytes.push(b'\n');
-    fs::write(path, bytes).map_err(|source| NativeOperatorBuilderError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    let parent = path.parent().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "JSON output has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let mut temporary =
+        NamedTempFile::new_in(parent).map_err(|source| NativeOperatorBuilderError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .as_file_mut()
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file_mut().flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist(path)
+        .map_err(|error| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source: error.error,
+        })?;
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
