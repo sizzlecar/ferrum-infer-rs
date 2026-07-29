@@ -530,10 +530,29 @@ def materialize_exact(path: Path, payload: bytes, label: str) -> None:
     path.write_bytes(payload)
 
 
-def normalized_model_arg(path: Path) -> Path:
-    # Preserve the locked filename for Hugging Face snapshot symlinks. The
-    # downstream validator follows the file only when hashing its contents.
-    return path.expanduser().absolute()
+def normalized_model_arg(
+    path: Path,
+    *,
+    weight_format: str,
+    weight_files: Mapping[str, str],
+) -> Path:
+    # A GGUF lane binds one exact quantization file. Passing its snapshot
+    # directory would make the product resolver treat that directory as an
+    # unknown model source and fall through to a remote repository lookup.
+    # Preserve the locked snapshot filename instead of guessing among GGUFs.
+    normalized = path.expanduser().absolute()
+    if normalized.is_dir() and weight_format.startswith("gguf_"):
+        require(
+            len(weight_files) == 1,
+            "GGUF execution requires exactly one locked weight file",
+        )
+        relative_path = Path(next(iter(weight_files)))
+        require(
+            relative_path.suffix.lower() == ".gguf",
+            "GGUF execution lock does not name a .gguf file",
+        )
+        return normalized / relative_path
+    return normalized
 
 
 def prepare_manifest(
@@ -564,9 +583,13 @@ def prepare_manifest(
         build_receipt.get("backend") == spec.backend,
         f"candidate build backend is not {spec.backend.upper()}",
     )
-    model_dir = normalized_model_arg(model_dir)
-    semantic_source_root = semantic_source_root.expanduser().resolve()
     sources = checked_lock["sources"]
+    model_dir = normalized_model_arg(
+        model_dir,
+        weight_format=sources["weight_format"],
+        weight_files=sources["weight_files"],
+    )
+    semantic_source_root = semantic_source_root.expanduser().resolve()
     effective_path = (
         root
         / f"correctness/{spec.model_key}/{spec.backend}/effective-config.json"
@@ -664,11 +687,25 @@ def self_test(spec: BackendSpec) -> None:
         snapshot_file = root / "snapshots/revision/Model-Q4_K_S.gguf"
         snapshot_file.parent.mkdir(parents=True)
         snapshot_file.symlink_to(blob)
-        normalized_snapshot = normalized_model_arg(snapshot_file)
+        normalized_snapshot = normalized_model_arg(
+            snapshot_file,
+            weight_format=spec.weight_format,
+            weight_files={"Model-Q4_K_S.gguf": matrix.file_sha256(blob)},
+        )
         require(
             normalized_snapshot.name == snapshot_file.name
             and normalized_snapshot.is_symlink(),
             "model argument normalization resolved away the HF snapshot filename",
+        )
+        normalized_snapshot_root = normalized_model_arg(
+            snapshot_file.parent,
+            weight_format="gguf_q4_k_s",
+            weight_files={"Model-Q4_K_S.gguf": matrix.file_sha256(blob)},
+        )
+        require(
+            normalized_snapshot_root == snapshot_file.absolute()
+            and normalized_snapshot_root.is_symlink(),
+            "GGUF snapshot directory did not bind the exact locked weight file",
         )
         manifest = matrix.make_execution_fixture_manifest(root)
         lock_path = root / manifest["models_lock"]["path"]
