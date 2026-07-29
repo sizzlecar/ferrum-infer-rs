@@ -11,9 +11,20 @@ from typing import Any
 
 
 CONTRACT_ID = "c13-tool-result-continuation-v2"
+SAMPLING_CONTRACT_ID = "c13-deterministic-semantic-correctness-v1"
 CASE_COUNT = 60
 TOOL_NAME = "calculator"
 VALID_VARIANTS = frozenset({"tool-result", "soft-think", "soft-no-think"})
+DETERMINISTIC_SAMPLING = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "seed": 9271,
+    "stop": [],
+}
 
 
 class C13ContractError(ValueError):
@@ -204,6 +215,7 @@ def validate_request(
         "g00_scenario_id": "C13",
         "g00_ordinal": ordinal,
         "g00_contract_id": CONTRACT_ID,
+        "g00_sampling_contract": SAMPLING_CONTRACT_ID,
     }
     for key, expected in expected_metadata.items():
         if metadata.get(key) != expected:
@@ -229,6 +241,19 @@ def validate_request(
         raise C13ContractError(
             f"{contract.case_id} tool_choice must be 'auto'"
         )
+    for key, expected in DETERMINISTIC_SAMPLING.items():
+        observed = request.get(key)
+        if isinstance(observed, bool) or observed != expected:
+            raise C13ContractError(
+                f"{contract.case_id} deterministic sampling {key} mismatch: "
+                f"expected {expected!r}, observed {observed!r}"
+            )
+    frequency_penalty = request.get("frequency_penalty", 0.0)
+    if isinstance(frequency_penalty, bool) or frequency_penalty != 0.0:
+        raise C13ContractError(
+            f"{contract.case_id} deterministic sampling frequency_penalty "
+            f"must be zero, observed {frequency_penalty!r}"
+        )
     return contract
 
 
@@ -239,6 +264,7 @@ def request_evidence(
 ) -> dict[str, Any]:
     return {
         **contract.evidence(),
+        "sampling_contract_id": SAMPLING_CONTRACT_ID,
         "c13_request_sha256": hashlib.sha256(
             json.dumps(
                 request,
@@ -361,10 +387,12 @@ def self_test() -> None:
             "g00_variant": sample.variant,
             "g00_ordinal": sample.ordinal,
             "g00_contract_id": CONTRACT_ID,
+            "g00_sampling_contract": SAMPLING_CONTRACT_ID,
         },
         "messages": sample.messages(),
         "tools": sample.tools(),
         "tool_choice": "auto",
+        **DETERMINISTIC_SAMPLING,
     }
     assert (
         validate_request(
@@ -385,6 +413,30 @@ def self_test() -> None:
         finish_reason="stop",
         contract=sample,
     )
+
+    for field, invalid in (
+        ("temperature", 1.0),
+        ("presence_penalty", 1.5),
+        ("top_k", 20),
+        ("g00_sampling_contract", "official-stochastic"),
+    ):
+        invalid_request = json.loads(json.dumps(request))
+        if field == "g00_sampling_contract":
+            invalid_request["metadata"][field] = invalid
+        else:
+            invalid_request[field] = invalid
+        try:
+            validate_request(
+                invalid_request,
+                ordinal=sample.ordinal,
+                variant=sample.variant,
+            )
+        except C13ContractError:
+            pass
+        else:
+            raise AssertionError(
+                f"C13 invalid sampling field was accepted: {field}"
+            )
 
     for message, finish_reason, marker in (
         (
