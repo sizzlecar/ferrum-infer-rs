@@ -10199,6 +10199,8 @@ fn structured_output_terminal_error_reports_privacy_safe_lexical_progress() {
         "{error}"
     );
     assert!(error.contains("trailing_identical_tokens=3"), "{error}");
+    assert!(error.contains("liveness_identical_token_limit="), "{error}");
+    assert!(error.contains("liveness_interventions=0"), "{error}");
     assert!(!error.contains(r#"{"value":12777"#), "{error}");
 }
 

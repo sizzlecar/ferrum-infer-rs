@@ -26,6 +26,7 @@ const MAX_CACHED_GRAMMARS: usize = 64;
 const AUTO_STRUCTURED_RESERVE_DIVISOR: usize = 2;
 const MIN_AUTO_STRUCTURED_RESERVE_TOKENS: usize = 32;
 const MAX_AUTO_STRUCTURED_RESERVE_TOKENS: usize = 1024;
+const MAX_IDENTICAL_TOKEN_RUN: usize = MAX_AUTO_STRUCTURED_RESERVE_TOKENS / 2;
 
 /// Immutable per-request output budget used when a structured grammar starts
 /// after a reasoning delimiter.
@@ -60,6 +61,24 @@ impl StructuredOutputBudgetPlan {
             boundary_token_count,
             structured_reserve_tokens,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StructuredOutputLivenessPolicy {
+    max_identical_token_run: usize,
+}
+
+impl StructuredOutputLivenessPolicy {
+    fn for_request(max_output_tokens: usize, budget: Option<StructuredOutputBudgetPlan>) -> Self {
+        let guaranteed_structured_tokens = budget
+            .map(|plan| plan.structured_reserve_tokens)
+            .unwrap_or(max_output_tokens);
+        Self {
+            max_identical_token_run: guaranteed_structured_tokens
+                .div_ceil(2)
+                .clamp(1, MAX_IDENTICAL_TOKEN_RUN),
+        }
     }
 }
 
@@ -280,6 +299,7 @@ impl StructuredOutputFactory {
         };
 
         let grammar_start = matches!(activation, Activation::Active).then_some(0);
+        let liveness = StructuredOutputLivenessPolicy::for_request(max_output_tokens, budget);
         Ok(Some(StructuredOutputProcessor {
             state: Mutex::new(ProcessorState {
                 matcher,
@@ -289,11 +309,16 @@ impl StructuredOutputFactory {
                 boundary_forced: false,
                 boundary_start: None,
                 grammar_start,
+                trailing_grammar_token_id: None,
+                trailing_identical_token_count: 0,
+                liveness_intervention_count: 0,
+                last_liveness_intervention_at: None,
             }),
             vocab_size: self.vocab_size,
             defined_token_ids: Arc::clone(&self.defined_token_ids),
             json_token_classes: Arc::clone(&self.json_token_classes),
             budget,
+            liveness,
         }))
     }
 }
@@ -327,6 +352,7 @@ pub struct StructuredOutputProcessor {
     defined_token_ids: Arc<[bool]>,
     json_token_classes: Arc<[StructuredOutputTokenClass]>,
     budget: Option<StructuredOutputBudgetPlan>,
+    liveness: StructuredOutputLivenessPolicy,
 }
 
 /// Typed phase returned after applying a structured-output constraint.
@@ -360,6 +386,7 @@ pub enum StructuredOutputTokenClass {
 pub struct StructuredOutputMaskOutcome {
     pub phase: StructuredOutputPhase,
     pub accepting: bool,
+    pub liveness_intervention: bool,
     /// Exact delimiter token authorized for the next sampling step while the
     /// processor is waiting to activate. The engine uses this typed grant to
     /// avoid rejecting an intentionally hidden special token during output
@@ -384,6 +411,8 @@ pub struct StructuredOutputProgress {
     pub trailing_token_class_count: usize,
     pub trailing_token_id: Option<u32>,
     pub trailing_identical_token_count: usize,
+    pub liveness_identical_token_limit: usize,
+    pub liveness_intervention_count: usize,
     pub accepting: bool,
 }
 
@@ -407,6 +436,10 @@ struct ProcessorState {
     boundary_forced: bool,
     boundary_start: Option<usize>,
     grammar_start: Option<usize>,
+    trailing_grammar_token_id: Option<u32>,
+    trailing_identical_token_count: usize,
+    liveness_intervention_count: usize,
+    last_liveness_intervention_at: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -489,6 +522,7 @@ impl StructuredOutputProcessor {
                     StructuredOutputPhase::WaitingForDelimiter
                 },
                 accepting: false,
+                liveness_intervention: false,
                 required_delimiter_token_id: Some(required_delimiter_token),
             });
         }
@@ -524,9 +558,31 @@ impl StructuredOutputProcessor {
                 "structured-output grammar has no legal finite token",
             ));
         }
+        let liveness_intervention = if !accepting
+            && state.trailing_identical_token_count >= self.liveness.max_identical_token_run
+        {
+            state
+                .trailing_grammar_token_id
+                .and_then(|token| logits.get_mut(token as usize))
+                .is_some_and(|logit| {
+                    if logit.is_finite() && finite_allowed > 1 {
+                        *logit = f32::NEG_INFINITY;
+                        if state.last_liveness_intervention_at != Some(generated.len()) {
+                            state.liveness_intervention_count += 1;
+                            state.last_liveness_intervention_at = Some(generated.len());
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                })
+        } else {
+            false
+        };
         Ok(StructuredOutputMaskOutcome {
             phase: StructuredOutputPhase::EnforcingGrammar,
             accepting,
+            liveness_intervention,
             required_delimiter_token_id: None,
         })
     }
@@ -656,6 +712,8 @@ impl StructuredOutputProcessor {
             trailing_token_class_count,
             trailing_token_id,
             trailing_identical_token_count,
+            liveness_identical_token_limit: self.liveness.max_identical_token_run,
+            liveness_intervention_count: state.liveness_intervention_count,
             accepting,
         })
     }
@@ -671,6 +729,10 @@ impl StructuredOutputProcessor {
         state.boundary_forced = false;
         state.boundary_start = None;
         state.grammar_start = matches!(state.initial_activation, Activation::Active).then_some(0);
+        state.trailing_grammar_token_id = None;
+        state.trailing_identical_token_count = 0;
+        state.liveness_intervention_count = 0;
+        state.last_liveness_intervention_at = None;
         Ok(())
     }
 }
@@ -760,6 +822,8 @@ fn advance_state(
             state.grammar_start = Some(grammar_start);
             state.activation = Activation::Active;
             state.consumed = grammar_start;
+            state.trailing_grammar_token_id = None;
+            state.trailing_identical_token_count = 0;
         } else {
             state.consumed = generated.len();
             return Ok(());
@@ -782,6 +846,12 @@ fn advance_state(
                 token.get()
             ))
         })?;
+        if state.trailing_grammar_token_id == Some(token.get()) {
+            state.trailing_identical_token_count += 1;
+        } else {
+            state.trailing_grammar_token_id = Some(token.get());
+            state.trailing_identical_token_count = 1;
+        }
     }
     state.consumed = generated.len();
     Ok(())
@@ -951,6 +1021,73 @@ mod tests {
         }
     }
 
+    struct MergedObjectTokenizer {
+        inner: ByteTokenizer,
+    }
+
+    impl MergedObjectTokenizer {
+        const OBJECT: u32 = 256;
+        const EOS: u32 = 257;
+
+        fn new() -> Self {
+            let mut inner = ByteTokenizer::new();
+            inner.token_text[EOS as usize] = "{}".to_string();
+            inner.token_text.push("<eos>".to_string());
+            inner.special.eos_token = Some(TokenId::new(Self::EOS));
+            Self { inner }
+        }
+    }
+
+    impl Tokenizer for MergedObjectTokenizer {
+        fn encode(&self, text: &str, add_special: bool) -> Result<Vec<TokenId>> {
+            self.inner.encode(text, add_special)
+        }
+
+        fn decode(&self, tokens: &[TokenId], skip_special: bool) -> Result<String> {
+            let mut decoded = String::new();
+            for token in tokens {
+                match token.get() {
+                    Self::OBJECT => decoded.push_str("{}"),
+                    Self::EOS if skip_special => {}
+                    Self::EOS => decoded.push_str("<eos>"),
+                    _ => decoded.push_str(&self.inner.decode(&[*token], skip_special)?),
+                }
+            }
+            Ok(decoded)
+        }
+
+        fn decode_incremental(&self, _prev: &[TokenId], next: TokenId) -> Result<String> {
+            self.decode(&[next], true)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.inner.token_text.len()
+        }
+
+        fn special_tokens(&self) -> &SpecialTokens {
+            &self.inner.special
+        }
+
+        fn token_id(&self, text: &str) -> Option<TokenId> {
+            (text == "{}")
+                .then(|| TokenId::new(Self::OBJECT))
+                .or_else(|| self.inner.token_id(text))
+        }
+
+        fn token_text(&self, token_id: TokenId) -> Option<&str> {
+            self.inner.token_text(token_id)
+        }
+
+        fn info(&self) -> TokenizerInfo {
+            TokenizerInfo {
+                vocab_size: self.vocab_size(),
+                max_token_length: Some(2),
+                model_name: Some("merged-object-test".to_string()),
+                ..self.inner.info()
+            }
+        }
+    }
+
     fn factory() -> StructuredOutputFactory {
         StructuredOutputFactory::new(Arc::new(ByteTokenizer::new())).unwrap()
     }
@@ -1068,6 +1205,129 @@ mod tests {
         processor.mask_logits(&mut logits, &generated).unwrap();
         assert!(logits[EOS as usize].is_finite());
         assert!(!logits[b'x' as usize].is_finite());
+    }
+
+    #[test]
+    fn json_object_accepts_a_complete_root_from_one_merged_token() {
+        let processor = StructuredOutputFactory::new(Arc::new(MergedObjectTokenizer::new()))
+            .unwrap()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let generated = vec![TokenId::new(MergedObjectTokenizer::OBJECT)];
+        let terminals = HashSet::from([MergedObjectTokenizer::EOS]);
+
+        let progress = processor
+            .progress_with_terminals(&generated, &terminals)
+            .unwrap();
+        assert!(progress.accepting);
+
+        let mut logits = vec![0.0; MergedObjectTokenizer::EOS as usize + 1];
+        let outcome = processor
+            .mask_logits_with_terminals(&mut logits, &generated, &terminals, &HashSet::new())
+            .unwrap();
+        assert!(outcome.accepting);
+        assert!(!logits[MergedObjectTokenizer::OBJECT as usize].is_finite());
+        assert!(logits[MergedObjectTokenizer::EOS as usize].is_finite());
+    }
+
+    #[test]
+    fn json_object_breaks_an_unbounded_identical_token_run_when_closure_is_legal() {
+        let processor = StructuredOutputFactory::new(Arc::new(MergedObjectTokenizer::new()))
+            .unwrap()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::Immediate,
+                64,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated =
+            br#"{"marker":""#.iter().map(|byte| TokenId::new(*byte as u32)).collect::<Vec<_>>();
+        generated.extend(std::iter::repeat_n(
+            TokenId::new(MergedObjectTokenizer::OBJECT),
+            32,
+        ));
+
+        let mut logits = vec![0.0; MergedObjectTokenizer::EOS as usize + 1];
+        let outcome = processor
+            .mask_logits_with_terminals(
+                &mut logits,
+                &generated,
+                &HashSet::from([MergedObjectTokenizer::EOS]),
+                &HashSet::new(),
+            )
+            .unwrap();
+
+        assert!(!outcome.accepting);
+        assert!(outcome.liveness_intervention);
+        assert!(!logits[MergedObjectTokenizer::OBJECT as usize].is_finite());
+        assert!(logits[b'"' as usize].is_finite());
+
+        generated.extend([TokenId::new(b'"' as u32), TokenId::new(b'}' as u32)]);
+        let progress = processor
+            .progress_with_terminals(&generated, &HashSet::from([MergedObjectTokenizer::EOS]))
+            .unwrap();
+        assert!(progress.accepting);
+        assert_eq!(progress.liveness_identical_token_limit, 32);
+        assert_eq!(progress.liveness_intervention_count, 1);
+    }
+
+    #[test]
+    fn structured_liveness_guard_preserves_the_only_finite_grammar_candidate() {
+        let processor = StructuredOutputFactory::new(Arc::new(MergedObjectTokenizer::new()))
+            .unwrap()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::Immediate,
+                64,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated =
+            br#"{"marker":""#.iter().map(|byte| TokenId::new(*byte as u32)).collect::<Vec<_>>();
+        generated.extend(std::iter::repeat_n(
+            TokenId::new(MergedObjectTokenizer::OBJECT),
+            32,
+        ));
+        let mut logits = vec![f32::NEG_INFINITY; MergedObjectTokenizer::EOS as usize + 1];
+        logits[MergedObjectTokenizer::OBJECT as usize] = 0.0;
+
+        let outcome = processor
+            .mask_logits_with_terminals(
+                &mut logits,
+                &generated,
+                &HashSet::from([MergedObjectTokenizer::EOS]),
+                &HashSet::new(),
+            )
+            .unwrap();
+
+        assert!(!outcome.liveness_intervention);
+        assert!(logits[MergedObjectTokenizer::OBJECT as usize].is_finite());
+    }
+
+    #[test]
+    fn structured_liveness_limit_is_derived_from_the_guaranteed_result_budget() {
+        let budget = StructuredOutputBudgetPlan::automatic(4096, 1).unwrap();
+        assert_eq!(budget.structured_reserve_tokens, 1024);
+        assert_eq!(
+            StructuredOutputLivenessPolicy::for_request(4096, Some(budget)).max_identical_token_run,
+            512
+        );
+        assert_eq!(
+            StructuredOutputLivenessPolicy::for_request(64, None).max_identical_token_run,
+            32
+        );
     }
 
     #[test]
