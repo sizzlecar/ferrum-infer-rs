@@ -2,6 +2,9 @@
 mod resource_support;
 mod vnext_core_contract;
 
+use ferrum_interfaces::model_executor::{
+    ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+};
 use ferrum_interfaces::vnext::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -617,6 +620,24 @@ fn released_reusable_lane_slot_wakes_capacity_waiter_and_retries_without_growth(
         StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("a busy exact-shape slot with no resident spare must defer"),
     };
+    let execution_deferral = ExecutorExecutionCapacityDeferral::from_backing(
+        deferred.evidence(),
+        ExecutorExecutionCapacityStage::SubmissionWave,
+    )
+    .unwrap();
+    assert_eq!(
+        execution_deferral.stage(),
+        ExecutorExecutionCapacityStage::SubmissionWave
+    );
+    assert!(execution_deferral.shortfalls().is_empty());
+    assert_eq!(
+        execution_deferral.backing_blockers(),
+        deferred.evidence().blockers()
+    );
+    assert_eq!(
+        execution_deferral.wait_condition(),
+        deferred.evidence().wait_condition()
+    );
     let waiter = deferred.register_waiter().unwrap();
     assert!(!waiter.recheck().unwrap().changed_since_registration());
 

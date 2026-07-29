@@ -4564,13 +4564,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ))
     }
 
-    fn backing_deferred(scope: &str, deferred: &DynamicBackingDeferred) -> FerrumError {
-        FerrumError::resource_exhausted(format!(
-            "vNext {scope} remains deferred after bounded backing maintenance: {:?}",
-            deferred.blockers()
-        ))
-    }
-
     fn try_admit_sequence(
         &self,
         request_id: RequestIdentity,
@@ -4725,7 +4718,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(Self::deferred("sequence extension", &deferred));
                     }
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::deferred("sequence extension", &deferred));
+                        return ExecutorExecutionCapacityDeferral::from_pending_maintenance(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::SequenceExtension,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -4745,10 +4742,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred(
-                            "sequence extension",
+                        return ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
-                        ));
+                            ExecutorExecutionCapacityStage::SequenceExtension,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = deferred
@@ -4923,7 +4921,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(Self::deferred("step admission", &deferred));
                     }
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::deferred("step admission", &deferred));
+                        return ExecutorExecutionCapacityDeferral::from_pending_maintenance(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::StepAdmission,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -4943,10 +4945,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred(
-                            "step admission",
+                        return ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
-                        ));
+                            ExecutorExecutionCapacityStage::StepAdmission,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = deferred
@@ -5054,7 +5057,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(Self::deferred("submission wave", &deferred));
                     }
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::deferred("submission wave", &deferred));
+                        return ExecutorExecutionCapacityDeferral::from_pending_maintenance(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::SubmissionWave,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -5074,10 +5081,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred(
-                            "submission wave",
+                        return ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
-                        ));
+                            ExecutorExecutionCapacityStage::SubmissionWave,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = deferred

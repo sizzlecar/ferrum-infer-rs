@@ -322,10 +322,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             {
                 StepSubmissionWaveAdmissionDecision::Prepared(wave) => return Ok(wave),
                 StepSubmissionWaveAdmissionDecision::Deferred(deferred) => {
-                    if deferred.action() != DeferredAction::AwaitBackingGrowth
-                        || backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS
-                    {
+                    if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("determinism submission wave", &deferred));
+                    }
+                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                        let deferred = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::SubmissionWave,
+                        )?;
+                        return Err(Self::execution_capacity_error(&deferred));
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -342,10 +347,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
                 StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => {
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred(
-                            "determinism submission wave",
+                        let deferred = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
-                        ));
+                            ExecutorExecutionCapacityStage::SubmissionWave,
+                        )?;
+                        return Err(Self::execution_capacity_error(&deferred));
                     }
                     backing_attempts += 1;
                     let outcome = deferred

@@ -452,6 +452,7 @@ impl EngineInner {
                         "stage": deferral.stage(),
                         "wait_condition": deferral.wait_condition(),
                         "shortfalls": deferral.shortfalls(),
+                        "backing_blockers": deferral.backing_blockers(),
                         "reason": "minimum_frontier_has_no_external_releaser",
                         "scheduler": self.scheduler.trace_snapshot(),
                     }));
@@ -501,6 +502,8 @@ impl EngineInner {
                     "stage": deferral.stage(),
                     "observed": observed,
                     "wait_condition": deferral.wait_condition(),
+                    "shortfalls": deferral.shortfalls(),
+                    "backing_blockers": deferral.backing_blockers(),
                     "scheduler": self.scheduler.trace_snapshot(),
                 }));
                 return Ok(());
@@ -761,8 +764,24 @@ impl EngineInner {
                 workspace_lease.release();
                 completions
             }
-            PlanRuntimeBatchPrefillOutcome::NotSubmitted(_)
-            | PlanRuntimeBatchPrefillOutcome::Unsupported => {
+            PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral) => {
+                self.write_scheduler_trace_event(serde_json::json!({
+                    "event": "scheduler_batch_prefill_execution_capacity_defer",
+                    "request_ids": work
+                        .iter()
+                        .map(|item| item.request_id.to_string())
+                        .collect::<Vec<_>>(),
+                    "stage": deferral.stage(),
+                    "observed": deferral.observed(),
+                    "wait_condition": deferral.wait_condition(),
+                    "shortfalls": deferral.shortfalls(),
+                    "backing_blockers": deferral.backing_blockers(),
+                    "scheduler": self.scheduler.trace_snapshot(),
+                }));
+                drop(workspace_lease);
+                return Ok(false);
+            }
+            PlanRuntimeBatchPrefillOutcome::Unsupported => {
                 drop(workspace_lease);
                 return Ok(false);
             }
