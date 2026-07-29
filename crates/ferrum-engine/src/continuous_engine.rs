@@ -63,6 +63,8 @@ use ferrum_types::{
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -97,6 +99,10 @@ const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
 const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
+const TOKEN_TRACE_PROMPT_PREFIX_LIMIT: usize = 64;
+const TOKEN_TRACE_PROMPT_TAIL_LIMIT: usize = 128;
+const TOKEN_TRACE_GENERATED_PREFIX_LIMIT: usize = 256;
+const TOKEN_TRACE_GENERATED_TAIL_LIMIT: usize = 32;
 const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
 const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
     "<think>",
@@ -844,6 +850,92 @@ fn contains_replacement_char_mojibake(text: &str) -> bool {
 // ────────────────────────────────────────────────────────────────────────────
 // Sequence state
 // ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SequenceTokenTraceEvidence {
+    schema_version: u32,
+    token_encoding: &'static str,
+    prompt_token_count: usize,
+    prompt_token_sha256: String,
+    prompt_token_prefix: Vec<u32>,
+    prompt_token_tail: Vec<u32>,
+    generated_token_count: usize,
+    generated_token_sha256: String,
+    generated_token_prefix: Vec<u32>,
+    generated_token_tail: Vec<u32>,
+    sampling_rng_algorithm: &'static str,
+    sampling_seed: Option<u64>,
+    sampler: String,
+    processors: Vec<String>,
+    max_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<usize>,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+}
+
+impl SequenceTokenTraceEvidence {
+    fn capture(sequence: &SequenceState) -> Self {
+        Self {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            token_encoding: "u32-le-v1",
+            prompt_token_count: sequence.input_tokens.len(),
+            prompt_token_sha256: token_ids_sha256(&sequence.input_tokens),
+            prompt_token_prefix: token_id_prefix(
+                &sequence.input_tokens,
+                TOKEN_TRACE_PROMPT_PREFIX_LIMIT,
+            ),
+            prompt_token_tail: token_id_tail(&sequence.input_tokens, TOKEN_TRACE_PROMPT_TAIL_LIMIT),
+            generated_token_count: sequence.generated_tokens.len(),
+            generated_token_sha256: token_ids_sha256(&sequence.generated_tokens),
+            generated_token_prefix: token_id_prefix(
+                &sequence.generated_tokens,
+                TOKEN_TRACE_GENERATED_PREFIX_LIMIT,
+            ),
+            generated_token_tail: token_id_tail(
+                &sequence.generated_tokens,
+                TOKEN_TRACE_GENERATED_TAIL_LIMIT,
+            ),
+            sampling_rng_algorithm: SamplingRng::algorithm_id(),
+            sampling_seed: sequence.sampling_params.seed,
+            sampler: sequence.sampling_plan.sampler.name().to_string(),
+            processors: sequence
+                .sampling_plan
+                .processor_chain
+                .processor_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            max_tokens: sequence.sampling_params.max_tokens,
+            temperature: sequence.sampling_params.temperature,
+            top_p: sequence.sampling_params.top_p,
+            top_k: sequence.sampling_params.top_k,
+            repetition_penalty: sequence.sampling_params.repetition_penalty,
+            presence_penalty: sequence.sampling_params.presence_penalty,
+            frequency_penalty: sequence.sampling_params.frequency_penalty,
+        }
+    }
+}
+
+fn token_ids_sha256(tokens: &[TokenId]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ferrum-token-ids:u32-le-v1\0");
+    for token in tokens {
+        digest.update(token.get().to_le_bytes());
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn token_id_prefix(tokens: &[TokenId], limit: usize) -> Vec<u32> {
+    tokens.iter().take(limit).map(|token| token.get()).collect()
+}
+
+fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
+    let start = tokens.len().saturating_sub(limit);
+    tokens[start..].iter().map(|token| token.get()).collect()
+}
 
 /// State of a running sequence in the continuous batch.
 #[derive(Debug)]
