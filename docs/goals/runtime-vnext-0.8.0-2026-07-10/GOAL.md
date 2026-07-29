@@ -4,6 +4,38 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-07-29，clean、已推送 source
+`2ba731e2bb70dc09763f8582c8b67b8b7e42ac77`，tree
+`4a2b83d28bc04b87001a9b80bac589ba19db28fe` 已修复 partial reusable program
+边界：request-lifetime embedding/logits 保持 eager，中间 5 个 lane-stable CUDA
+segments 保持 resident/direct；单个不稳定边界不再错误否决整条 wave。真实
+`run`/`serve` 启动得到 `prepared_programs=5`，聚焦 C02/C05/C06 为 `60/60 pass`，
+direct fallback 为 `0`。
+
+相同 clean source 的 M2 Qwen3.5-35B-A3B-GPTQ CUDA canonical correctness 已重新完成
+`703/703 pass`，21 个 scenario 的 known-fail/blocked/error/unexpected 均为 `0`。
+bounded duration 为 `2590.064111s`，峰值为 `3` processes、`85` process-group
+threads 和 `52` per-process threads，无 violation，进程组清理成功。C18 typed
+admission cap 与 observed max-active 均为 `16`，active duty-cycle 为
+`0.9635368787`；request slot、model cache 和 backend workspace 的资源事务全部平衡，
+leak/underflow 为 `0`。正式 validator 打印：
+
+```text
+FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS: /workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-full-2ba731e2-20260729-r1/gate-vnext-g08b-cuda
+FERRUM GATE vnext-g08b-cuda PASS: /workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-full-2ba731e2-20260729-r1/gate-vnext-g08b-cuda
+```
+
+证据通过 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-aa32bc08b2eb70787bea)
+保存；重组 archive SHA256 为
+`cf588945f13d4ee9cd58228725f1f20ccf21f463873b9d07c93abe4b37e0bf07`，
+已从 GitHub 回下载并通过分段/整体 SHA256、`zstd -t` 和 tar member 复验。Vast
+实例 `45897840` 已确认 `stopped/exited`，最终 `potentially_billable=[]`。
+这刷新而不增加 M2 CUDA cell，三主模型 x 双后端 fresh correctness matrix 仍为
+`1/6`，G00-G10 总目标 PASS 仍为 `0/11`。下一条开发关键路径仍在 S4/G08B：
+M2 Metal correctness；按 owner 2026-07-29 决定，工作软件占用资源期间不采集
+Metal 性能证据。
+
 截至 2026-07-28，最近一次完整 M2 CUDA correctness 的 clean source checkpoint 为
 `b0431ca5b384a86c4e1f57406ad7267bdd3c3705`，tree 为
 `0896756c962c6d983d6d251ad2c7d5bd99f122ad`。`27dd5c7f` 将 scenario request
