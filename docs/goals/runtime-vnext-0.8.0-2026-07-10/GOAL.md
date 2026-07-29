@@ -4,14 +4,16 @@
 
 Open。创建于 2026-07-10。
 
-截至 2026-07-30，当前分支最新 clean、已推送 source
-`a11b5e58b268a4b68ace820c6837b8d7c946a35e`，tree
-`de06fb2388f1b26a47cd99ecf45a13c3169fd5e2`。该 G07 checkpoint 将 native package
-输入从任意 archive 收紧为 terminal PASS source-build receipt + locked plan，机械重算
-source/plan/input/cache/command identity，逐项核对 archive object SHA256，并把 source/package
-receipt、plan、toolchain 和非空日志贯穿到 schema v2 artifact lock。bounded builder
-`17/17`、native-ops `23/23` 及 builder all-targets check 均通过；证据根目录为
-`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-package-provenance-20260730`。
+截至 2026-07-30，当前分支最新 clean、已推送的 production-source checkpoint 为
+`e229ccadeb852a9198a26f5d21eecc61c543ff7f`，tree
+`5618341821cf41ff41d504c9534416c4b608989b`。该 G07 checkpoint 将 native package
+输入从任意 archive 收紧为 terminal PASS source-build receipt + locked plan，并要求
+artifact-set 调用方从 package 外部提供逐 receipt SHA256 和 G03 catalog SHA256。
+packager/assembler 机械重算 source/plan/input/cache/command identity，逐项核对 source
+和 final archive object SHA256/size/ABI identity，并把 package spec、source/package
+receipt、plan、manifest、license、toolchain 和非空日志贯穿到 schema v3 artifact lock。
+bounded builder `23/23`、native-ops `23/23` 及 builder all-targets check 均通过；证据根目录为
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-final-provenance-20260730`。
 这仍不是 G07 PASS；depfile/CUDA toolkit 子工具 provenance、固定 RTX 4090
 source-build→package→resolve→link/load、五样本 p95、workspace source gate 和三个
 canonical validator 仍未完成。
@@ -45,7 +47,7 @@ Vast instance `46217231` 已确认 `stopped/exited`，最终
 `potentially_billable=[]`。
 
 这不是 CUDA `703` 正式 PASS，也不把双后端验证改成逐修复全量乒乓回归。已登记的
-formal correctness matrix 仍为 `1/6`（M2 Metal），但当前 `a11b5e58` 尚无同 SHA
+formal correctness matrix 仍为 `1/6`（M2 Metal），但当前 `e229ccad` 尚无同 SHA
 完整双后端证据；M2 CUDA 在 `02a2ef07` 只有 affected `KEEP`。完整 `703` 只在下一次
 runtime source freeze 执行。G00-G10 总目标 PASS 仍为 `0/11`。下一条关键路径先关闭
 G07 depfile/toolchain provenance、固定硬件链、五样本 invalidation timing、workspace
