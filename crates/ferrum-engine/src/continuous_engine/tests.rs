@@ -9258,7 +9258,65 @@ fn response_completion_tokenizer() -> Arc<dyn Tokenizer + Send + Sync> {
 fn response_completion_request() -> InferenceRequest {
     let mut request = policy_request();
     request.sampling_params.response_completion_boundary =
-        ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload("END".to_string());
+        ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter: "END".to_string(),
+            alternate_envelope: None,
+        };
+    request
+}
+
+fn response_completion_tool_tokenizer() -> Arc<dyn Tokenizer + Send + Sync> {
+    Arc::new(PolicyTokenizer::new(
+        10,
+        &[
+            ("reason", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("<eos>", 3),
+            ("<pad>", 4),
+            ("END", 5),
+            ("\n", 6),
+            ("<tool_call>", 7),
+            ("</tool_call>", 8),
+            ("answer", 9),
+        ],
+    ))
+}
+
+fn response_completion_multitoken_tool_tokenizer() -> Arc<dyn Tokenizer + Send + Sync> {
+    Arc::new(PolicyTokenizer::new(
+        12,
+        &[
+            ("reason", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("<eos>", 3),
+            ("<pad>", 4),
+            ("END", 5),
+            ("\\n", 6),
+            ("OPEN", 7),
+            ("START", 8),
+            ("CLOSE", 9),
+            ("FINISH", 10),
+            ("answer", 11),
+        ],
+    ))
+}
+
+fn response_completion_tool_request(tool_choice: ferrum_types::ApiToolChoice) -> InferenceRequest {
+    let mut request = policy_tool_request(
+        ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+        tool_choice,
+    );
+    let alternate_envelope = request
+        .api_request
+        .as_ref()
+        .and_then(ferrum_types::ApiRequest::generated_response_envelope);
+    request.sampling_params.response_completion_boundary =
+        ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter: "END".to_string(),
+            alternate_envelope,
+        };
     request
 }
 
@@ -9289,6 +9347,275 @@ fn response_completion_boundary_masks_eos_until_delimiter_and_payload() {
         .sample_with_processors_with_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
         .unwrap();
     assert_eq!(eos, TokenId::new(3));
+}
+
+#[test]
+fn response_completion_boundary_accepts_complete_typed_tool_envelope() {
+    let tokenizer = response_completion_tool_tokenizer();
+    let mut state = SequenceState::new_with_tokenizer(
+        response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("auto".to_string())),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    for token_id in [7u32, 0, 8] {
+        let mut logits = vec![f32::NEG_INFINITY; 10];
+        logits[3] = 100.0;
+        logits[token_id as usize] = 10.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(token_id));
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        state.generated_tokens.push(token);
+    }
+
+    assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("completed tool envelope must retain model-side greedy argmax");
+    };
+    assert_eq!(mask.valid_token_mask[3], 1);
+
+    let mut second_envelope_logits = vec![f32::NEG_INFINITY; 10];
+    second_envelope_logits[3] = 10.0;
+    second_envelope_logits[7] = 100.0;
+    let second_open = state
+        .sample_with_processors_with_tokenizer(
+            &mut second_envelope_logits,
+            Some(tokenizer.as_ref()),
+        )
+        .unwrap();
+    assert_eq!(
+        second_open,
+        TokenId::new(7),
+        "completion capability must not force-stop a legal following envelope"
+    );
+    state.generated_tokens.push(second_open);
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(open_mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("open second envelope must retain model-side greedy argmax");
+    };
+    assert_eq!(open_mask.valid_token_mask[3], 0);
+
+    for token_id in [0u32, 8] {
+        let mut logits = vec![f32::NEG_INFINITY; 10];
+        logits[3] = 100.0;
+        logits[token_id as usize] = 10.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(token_id));
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        state.generated_tokens.push(token);
+    }
+
+    let mut eos_logits = vec![f32::NEG_INFINITY; 10];
+    eos_logits[3] = 100.0;
+    let eos = state
+        .sample_with_processors_with_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(eos, TokenId::new(3));
+    state.generated_tokens.push(eos);
+    assert!(matches!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::Stop | FinishReason::EOS)
+    ));
+}
+
+#[test]
+fn response_completion_boundary_keeps_eos_masked_inside_tool_after_reasoning_close() {
+    let tokenizer = response_completion_tool_tokenizer();
+    let mut state = SequenceState::new_with_tokenizer(
+        response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("auto".to_string())),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    for token_id in [5u32, 6, 7, 0] {
+        let mut logits = vec![f32::NEG_INFINITY; 10];
+        logits[3] = 100.0;
+        logits[token_id as usize] = 10.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(token_id));
+        assert_eq!(
+            logits[3],
+            f32::NEG_INFINITY,
+            "EOS must remain masked until the opened tool envelope closes"
+        );
+        state.generated_tokens.push(token);
+    }
+
+    let mut close_logits = vec![f32::NEG_INFINITY; 10];
+    close_logits[3] = 100.0;
+    close_logits[8] = 10.0;
+    let close = state
+        .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(close, TokenId::new(8));
+    assert_eq!(close_logits[3], f32::NEG_INFINITY);
+    state.generated_tokens.push(close);
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("completed tool envelope must retain model-side greedy argmax");
+    };
+    assert_eq!(mask.valid_token_mask[3], 1);
+}
+
+#[test]
+fn response_completion_boundary_tracks_multitoken_envelope_without_false_payload() {
+    let tokenizer = response_completion_multitoken_tool_tokenizer();
+    let mut request =
+        response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("auto".to_string()));
+    let ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload {
+        alternate_envelope: Some(envelope),
+        ..
+    } = &mut request.sampling_params.response_completion_boundary
+    else {
+        panic!("tool request must carry its typed completion envelope");
+    };
+    envelope.open_token_text = "OPEN START".to_string();
+    envelope.close_token_text = "CLOSE FINISH".to_string();
+    let mut state = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    for token_id in [5u32, 7, 8, 0, 9, 10] {
+        let mut logits = vec![f32::NEG_INFINITY; 12];
+        logits[3] = 100.0;
+        logits[token_id as usize] = 10.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(token_id));
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        state.generated_tokens.push(token);
+    }
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("completed multi-token envelope must retain model-side greedy argmax");
+    };
+    assert_eq!(mask.valid_token_mask[3], 1);
+}
+
+#[test]
+fn response_completion_boundary_rejects_tool_envelopes_beyond_typed_limit() {
+    let tokenizer = response_completion_tool_tokenizer();
+    let mut request =
+        response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("auto".to_string()));
+    let ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload {
+        alternate_envelope: Some(envelope),
+        ..
+    } = &mut request.sampling_params.response_completion_boundary
+    else {
+        panic!("tool request must carry its typed completion envelope");
+    };
+    envelope.max_envelopes = 1;
+    let mut state = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    for token_id in [7u32, 0, 8] {
+        let mut logits = vec![f32::NEG_INFINITY; 10];
+        logits[token_id as usize] = 100.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        state.generated_tokens.push(token);
+    }
+
+    let mut repeated_open = vec![f32::NEG_INFINITY; 10];
+    repeated_open[7] = 100.0;
+    let error = state
+        .sample_with_processors_with_tokenizer(&mut repeated_open, Some(tokenizer.as_ref()))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("1-envelope protocol limit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn response_completion_boundary_rejects_unopened_or_disabled_tool_envelope() {
+    let tokenizer = response_completion_tool_tokenizer();
+    let mut unopened = SequenceState::new_with_tokenizer(
+        response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("auto".to_string())),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+    let mut close_logits = vec![f32::NEG_INFINITY; 10];
+    close_logits[3] = 100.0;
+    close_logits[8] = 10.0;
+    let close = unopened
+        .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(close, TokenId::new(8));
+    assert_eq!(close_logits[3], f32::NEG_INFINITY);
+    unopened.generated_tokens.push(close);
+
+    let mut still_blocked = vec![f32::NEG_INFINITY; 10];
+    still_blocked[3] = 100.0;
+    still_blocked[0] = 10.0;
+    let fallback = unopened
+        .sample_with_processors_with_tokenizer(&mut still_blocked, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(fallback, TokenId::new(0));
+    assert_eq!(still_blocked[3], f32::NEG_INFINITY);
+
+    let mut disabled = SequenceState::new_with_tokenizer(
+        response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("none".to_string())),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+    for token_id in [7u32, 0, 8] {
+        let mut logits = vec![f32::NEG_INFINITY; 10];
+        logits[3] = 100.0;
+        logits[token_id as usize] = 10.0;
+        let token = disabled
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(token_id));
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        disabled.generated_tokens.push(token);
+    }
+}
+
+#[test]
+fn token_sequence_matcher_handles_overlaps_reuse_and_empty_input() {
+    assert!(TokenSequenceMatcher::new(Vec::new(), "empty matcher").is_err());
+
+    let mut matcher = TokenSequenceMatcher::new(vec![1, 2, 1], "overlapping matcher").unwrap();
+    assert!(!matcher.observe(1));
+    assert!(!matcher.observe(2));
+    assert!(matcher.observe(1));
+    assert!(
+        !matcher.observe(2),
+        "successful matches must retain their KMP overlap"
+    );
+    assert!(matcher.observe(1));
+    matcher.reset();
+    assert!(matcher.is_at_boundary());
 }
 
 #[test]

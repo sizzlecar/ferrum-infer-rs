@@ -30,8 +30,21 @@ fn sampling_params_validate_checks() {
     assert!(p.validate().is_err());
 
     let mut p = SamplingParams::default();
-    p.response_completion_boundary =
-        ResponseCompletionBoundary::AfterDelimiterAndPayload(String::new());
+    p.response_completion_boundary = ResponseCompletionBoundary::AfterDelimiterAndPayload {
+        delimiter: String::new(),
+        alternate_envelope: None,
+    };
+    assert!(p.validate().is_err());
+
+    let mut p = SamplingParams::default();
+    p.response_completion_boundary = ResponseCompletionBoundary::AfterDelimiterAndPayload {
+        delimiter: "</think>".to_string(),
+        alternate_envelope: Some(ResponseCompletionEnvelope {
+            open_token_text: "<tool_call>".to_string(),
+            close_token_text: "</tool_call>".to_string(),
+            max_envelopes: 0,
+        }),
+    };
     assert!(p.validate().is_err());
 }
 
@@ -48,14 +61,44 @@ fn response_completion_boundary_is_backward_compatible_and_round_trips() {
         ResponseCompletionBoundary::Immediate
     );
 
+    let mut legacy_boundary = serde_json::to_value(SamplingParams::default()).unwrap();
+    legacy_boundary.as_object_mut().unwrap().insert(
+        "response_completion_boundary".to_string(),
+        serde_json::json!({
+            "mode": "after_delimiter_and_payload",
+            "delimiter": "</think>"
+        }),
+    );
+    let decoded: SamplingParams = serde_json::from_value(legacy_boundary).unwrap();
+    assert_eq!(
+        decoded.response_completion_boundary,
+        ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter: "</think>".to_string(),
+            alternate_envelope: None,
+        }
+    );
+
     let mut params = SamplingParams::default();
-    params.response_completion_boundary =
-        ResponseCompletionBoundary::AfterDelimiterAndPayload("</think>".to_string());
+    params.response_completion_boundary = ResponseCompletionBoundary::AfterDelimiterAndPayload {
+        delimiter: "</think>".to_string(),
+        alternate_envelope: Some(ResponseCompletionEnvelope {
+            open_token_text: "<tool_call>".to_string(),
+            close_token_text: "</tool_call>".to_string(),
+            max_envelopes: 32,
+        }),
+    };
     let decoded: SamplingParams =
         serde_json::from_value(serde_json::to_value(params).unwrap()).unwrap();
     assert_eq!(
         decoded.response_completion_boundary,
-        ResponseCompletionBoundary::AfterDelimiterAndPayload("</think>".to_string())
+        ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter: "</think>".to_string(),
+            alternate_envelope: Some(ResponseCompletionEnvelope {
+                open_token_text: "<tool_call>".to_string(),
+                close_token_text: "</tool_call>".to_string(),
+                max_envelopes: 32,
+            }),
+        }
     );
 }
 

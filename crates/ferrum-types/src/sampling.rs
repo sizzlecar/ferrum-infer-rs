@@ -53,8 +53,9 @@ pub struct SamplingParams {
     /// tokens may terminate generation.
     ///
     /// This is independent of structured-output grammar activation: ordinary
-    /// text, tool calls, and structured responses all need a complete
-    /// reasoning-to-payload transition when the rendered prompt opens one.
+    /// text and structured responses need a complete reasoning-to-payload
+    /// transition when the rendered prompt opens one. A complete lexical
+    /// response envelope, such as a tool call, is an alternate terminal path.
     #[serde(default)]
     pub response_completion_boundary: ResponseCompletionBoundary,
 }
@@ -71,16 +72,32 @@ pub enum StructuredOutputStart {
     AfterDelimiter(String),
 }
 
+/// A lexical response envelope that can complete an otherwise pending response.
+///
+/// This describes only token boundaries. The product/API layer remains
+/// responsible for validating the enclosed payload after generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseCompletionEnvelope {
+    pub open_token_text: String,
+    pub close_token_text: String,
+    pub max_envelopes: usize,
+}
+
 /// Typed model-EOS boundary for product response completion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(tag = "mode", content = "delimiter", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ResponseCompletionBoundary {
     /// Model EOS may terminate any generated token.
     #[default]
     Immediate,
     /// Model EOS remains unavailable until the exact delimiter token sequence
-    /// and at least one subsequent non-whitespace payload token are emitted.
-    AfterDelimiterAndPayload(String),
+    /// and at least one subsequent non-whitespace payload token are emitted,
+    /// or until a configured alternate envelope is complete.
+    AfterDelimiterAndPayload {
+        delimiter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alternate_envelope: Option<ResponseCompletionEnvelope>,
+    },
 }
 
 /// Response format for structured output. Mirrors OpenAI's
@@ -202,14 +219,28 @@ impl SamplingParams {
                 ));
             }
         }
-        if matches!(
-            &self.response_completion_boundary,
-            ResponseCompletionBoundary::AfterDelimiterAndPayload(delimiter)
-                if delimiter.is_empty()
-        ) {
-            return Err(FerrumError::invalid_request(
-                "response completion delimiter must not be empty".to_string(),
-            ));
+        if let ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter,
+            alternate_envelope,
+        } = &self.response_completion_boundary
+        {
+            if delimiter.is_empty() {
+                return Err(FerrumError::invalid_request(
+                    "response completion delimiter must not be empty".to_string(),
+                ));
+            }
+            if let Some(envelope) = alternate_envelope {
+                if envelope.open_token_text.is_empty() || envelope.close_token_text.is_empty() {
+                    return Err(FerrumError::invalid_request(
+                        "response completion envelope tokens must not be empty".to_string(),
+                    ));
+                }
+                if envelope.max_envelopes == 0 {
+                    return Err(FerrumError::invalid_request(
+                        "response completion envelope limit must be greater than zero".to_string(),
+                    ));
+                }
+            }
         }
         Ok(())
     }

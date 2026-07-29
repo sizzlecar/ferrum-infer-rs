@@ -1831,7 +1831,10 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
 fn sampling_params_for_prompt(mut sampling_params: SamplingParams, prompt: &str) -> SamplingParams {
     if has_unclosed_thinking_block(prompt) {
         sampling_params.response_completion_boundary =
-            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string());
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: None,
+            };
     }
     sampling_params
 }
@@ -3110,7 +3113,10 @@ mod tests {
         assert!(has_unclosed_thinking_block(&plan.prompt));
         assert_eq!(
             plan.sampling_params.response_completion_boundary,
-            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: None,
+            }
         );
     }
 
