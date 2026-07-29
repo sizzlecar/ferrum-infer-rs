@@ -88,6 +88,17 @@ impl DecodeCache {
     }
 }
 
+fn decoded_incremental_delta(previous_text: &str, full_text: &str) -> Result<String> {
+    full_text
+        .strip_prefix(previous_text)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::tokenizer(
+                "Incremental decode changed the previously emitted text prefix",
+            )
+        })
+}
+
 impl HuggingFaceTokenizer {
     /// Create new HuggingFace tokenizer
     pub async fn new(tokenizer: HfTokenizer) -> Result<Self> {
@@ -260,20 +271,19 @@ impl Tokenizer for HuggingFaceTokenizer {
     }
 
     fn decode_incremental(&self, prev: &[TokenId], next: TokenId) -> Result<String> {
-        // Check cache first
-        if let Some(cached_prev) = self.decode_cache.read().get(prev) {
+        // Clone under the read lock so the guard is released before this
+        // request inserts the extended sequence under the write lock.
+        let cached_prev = { self.decode_cache.read().get(prev).cloned() };
+        if let Some(cached_prev) = cached_prev {
             let mut all_tokens = prev.to_vec();
             all_tokens.push(next);
             let full_text = self.decode(&all_tokens, true)?;
 
-            // Cache the new sequence
-            {
-                let mut cache = self.decode_cache.write();
-                cache.insert(all_tokens, full_text.clone());
-            }
+            self.decode_cache
+                .write()
+                .insert(all_tokens, full_text.clone());
 
-            // Return only the delta
-            return Ok(full_text[cached_prev.len()..].to_string());
+            return decoded_incremental_delta(&cached_prev, &full_text);
         }
 
         // No cache hit, decode both
@@ -296,7 +306,7 @@ impl Tokenizer for HuggingFaceTokenizer {
             cache.insert(all_tokens, full_text.clone());
         }
 
-        Ok(full_text[prev_text.len()..].to_string())
+        decoded_incremental_delta(&prev_text, &full_text)
     }
 
     fn vocab_size(&self) -> usize {
@@ -364,8 +374,8 @@ impl IncrementalTokenizer for HuggingFaceTokenizer {
         // Decode all tokens
         let full_text = self.decode(&state.tokens, true)?;
 
-        // Calculate delta
-        let delta = full_text[state.text.len()..].to_string();
+        // Calculate delta before updating the append-only decoded prefix.
+        let delta = decoded_incremental_delta(&state.text, &full_text)?;
 
         // Update state
         state.text = full_text;
@@ -705,6 +715,56 @@ mod tests {
 
         // 应该已经清理了一些旧条目
         assert!(cache.cache.len() <= 2);
+    }
+
+    #[test]
+    fn incremental_delta_rejects_a_rewritten_prefix() {
+        assert!(decoded_incremental_delta("stable", "changed").is_err());
+    }
+
+    #[tokio::test]
+    async fn incremental_decode_cache_hit_after_thinking_whitespace_does_not_deadlock() {
+        use tokenizers::models::bpe::{Vocab, BPE};
+        use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+
+        let vocab: Vocab = [
+            ("</think>".to_string(), 0),
+            ("\n".to_string(), 1),
+            ("payload".to_string(), 2),
+            ("<unk>".to_string(), 3),
+        ]
+        .into_iter()
+        .collect();
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        let mut hf_tokenizer = HfTokenizer::new(bpe);
+        hf_tokenizer.add_special_tokens(&[AddedToken::from("</think>", true)]);
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        let delimiter = tokenizer.token_id("</think>").unwrap();
+        let whitespace = tokenizer.token_id("\n").unwrap();
+        let payload = tokenizer.token_id("payload").unwrap();
+        let delimiter_prefix = vec![delimiter];
+        let whitespace_prefix = vec![delimiter, whitespace];
+
+        assert_eq!(
+            tokenizer
+                .decode_incremental(&delimiter_prefix, whitespace)
+                .unwrap(),
+            "\n"
+        );
+        assert!(tokenizer
+            .decode_cache
+            .read()
+            .get(&whitespace_prefix)
+            .is_some());
+        let payload_delta = tokenizer
+            .decode_incremental(&whitespace_prefix, payload)
+            .unwrap();
+        assert_eq!(payload_delta.trim_start(), "payload");
     }
 
     #[test]
