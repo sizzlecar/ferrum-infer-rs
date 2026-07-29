@@ -3147,7 +3147,10 @@ fn convert_chat_request_with_template_model(
         StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
     };
     let response_completion_boundary = if has_unclosed_thinking_block(&prompt) {
-        ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+        ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter: THINK_END_TAG.to_string(),
+            alternate_envelope: api_chat.generated_response_envelope(),
+        }
     } else {
         ResponseCompletionBoundary::Immediate
     };
@@ -10880,7 +10883,10 @@ mod tests {
         );
         assert_eq!(
             internal.sampling_params.response_completion_boundary,
-            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: None,
+            }
         );
     }
 
@@ -10902,7 +10908,47 @@ mod tests {
         );
         assert_eq!(
             internal.sampling_params.response_completion_boundary,
-            ResponseCompletionBoundary::AfterDelimiterAndPayload(THINK_END_TAG.to_string())
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: None,
+            }
+        );
+    }
+
+    #[test]
+    fn thinking_tool_request_compiles_typed_envelope_into_completion_contract() {
+        let request = chat_request(json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            }]
+        }));
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
+            "thinking-tool-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert thinking tool request");
+
+        assert_eq!(
+            internal.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: Some(ferrum_types::ResponseCompletionEnvelope {
+                    open_token_text: "<tool_call>".to_string(),
+                    close_token_text: "</tool_call>".to_string(),
+                    max_envelopes: 32,
+                }),
+            }
         );
     }
 

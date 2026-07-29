@@ -233,6 +233,42 @@ fn api_response_after_stop(request: &InferenceRequest, text: &str) -> Option<Api
 }
 
 #[test]
+fn typed_tool_envelope_is_exposed_only_for_an_enabled_xml_protocol() {
+    let xml_request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let envelope = xml_request
+        .api_request
+        .as_ref()
+        .and_then(ApiRequest::generated_response_envelope)
+        .expect("enabled XML tool protocol must expose its response envelope");
+    assert_eq!(envelope.open_token_text, "<tool_call>");
+    assert_eq!(envelope.close_token_text, "</tool_call>");
+    assert_eq!(envelope.max_envelopes, 32);
+
+    let json_request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::Json,
+    );
+    assert!(json_request
+        .api_request
+        .as_ref()
+        .and_then(ApiRequest::generated_response_envelope)
+        .is_none());
+
+    let disabled_request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("none".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    assert!(disabled_request
+        .api_request
+        .as_ref()
+        .and_then(ApiRequest::generated_response_envelope)
+        .is_none());
+}
+
+#[test]
 fn function_parameter_xml_becomes_structured_chat_response() {
     let request = chat_request_with_tool_protocol(
         Some(ApiToolChoice::Mode("auto".to_string())),

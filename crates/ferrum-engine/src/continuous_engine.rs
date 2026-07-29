@@ -354,24 +354,212 @@ fn resolve_stop_conditions(
 }
 
 #[derive(Debug)]
-enum ResponseCompletionState {
-    Satisfied,
-    AwaitingDelimiter {
-        tokens: Vec<u32>,
-        failure: Vec<usize>,
-        matched: usize,
-    },
+struct TokenSequenceMatcher {
+    tokens: Vec<u32>,
+    failure: Vec<usize>,
+    matched: usize,
+}
+
+impl TokenSequenceMatcher {
+    fn new(tokens: Vec<u32>, label: &str) -> Result<Self> {
+        if tokens.is_empty() {
+            return Err(FerrumError::config(format!(
+                "{label} requires at least one token"
+            )));
+        }
+        let failure = delimiter_failure_table(&tokens);
+        Ok(Self {
+            tokens,
+            failure,
+            matched: 0,
+        })
+    }
+
+    fn observe(&mut self, token_id: u32) -> bool {
+        if self.matched == self.tokens.len() {
+            self.matched = self.failure[self.matched - 1];
+        }
+        while self.matched > 0 && self.tokens[self.matched] != token_id {
+            self.matched = self.failure[self.matched - 1];
+        }
+        if self.tokens[self.matched] == token_id {
+            self.matched += 1;
+        }
+        let completed = self.matched == self.tokens.len();
+        if completed {
+            self.matched = self.failure[self.matched - 1];
+        }
+        completed
+    }
+
+    fn reset(&mut self) {
+        self.matched = 0;
+    }
+
+    fn is_at_boundary(&self) -> bool {
+        self.matched == 0
+    }
+
+    fn is_partial(&self) -> bool {
+        self.matched > 0
+    }
+}
+
+#[derive(Debug)]
+enum DelimitedPayloadCompletionState {
+    AwaitingDelimiter(TokenSequenceMatcher),
     AwaitingPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopePrefixEffect {
+    Clear,
+    Pending,
+    Rejected,
+}
+
+impl DelimitedPayloadCompletionState {
+    fn observe(
+        &mut self,
+        previous_tokens: &[TokenId],
+        token: TokenId,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        envelope_prefix: EnvelopePrefixEffect,
+    ) -> Result<bool> {
+        match self {
+            Self::AwaitingDelimiter(matcher) => {
+                if matcher.observe(token.get()) {
+                    *self = Self::AwaitingPayload;
+                }
+                Ok(false)
+            }
+            Self::AwaitingPayload => {
+                match envelope_prefix {
+                    EnvelopePrefixEffect::Pending => return Ok(false),
+                    EnvelopePrefixEffect::Rejected => return Ok(true),
+                    EnvelopePrefixEffect::Clear => {}
+                }
+                let tokenizer = tokenizer.ok_or_else(|| {
+                    FerrumError::config("response completion boundary lost its tokenizer")
+                })?;
+                let delta = tokenizer.decode_incremental(previous_tokens, token)?;
+                Ok(delta
+                    .chars()
+                    .any(|character| !character.is_whitespace() && character != '\u{FFFD}'))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseEnvelopePhase {
+    AwaitingOpen,
+    AwaitingClose,
+}
+
+#[derive(Debug)]
+struct ResponseEnvelopeCompletionState {
+    open: TokenSequenceMatcher,
+    close: TokenSequenceMatcher,
+    phase: ResponseEnvelopePhase,
+    completed_envelopes: usize,
+    max_envelopes: usize,
+}
+
+impl ResponseEnvelopeCompletionState {
+    fn observe(&mut self, token_id: u32) -> Result<()> {
+        match self.phase {
+            ResponseEnvelopePhase::AwaitingOpen => {
+                if self.open.observe(token_id) {
+                    if self.completed_envelopes == self.max_envelopes {
+                        return Err(FerrumError::invalid_format(format!(
+                            "generated response exceeded its {}-envelope protocol limit",
+                            self.max_envelopes
+                        )));
+                    }
+                    self.phase = ResponseEnvelopePhase::AwaitingClose;
+                    self.close.reset();
+                }
+            }
+            ResponseEnvelopePhase::AwaitingClose => {
+                if self.close.observe(token_id) {
+                    self.completed_envelopes += 1;
+                    self.phase = ResponseEnvelopePhase::AwaitingOpen;
+                    self.open.reset();
+                    self.close.reset();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn allows_model_eos(&self) -> bool {
+        self.completed_envelopes > 0
+            && self.phase == ResponseEnvelopePhase::AwaitingOpen
+            && self.open.is_at_boundary()
+    }
+
+    fn has_committed_to_envelope_path(&self) -> bool {
+        self.phase == ResponseEnvelopePhase::AwaitingClose || self.completed_envelopes > 0
+    }
+
+    fn opener_is_partial(&self) -> bool {
+        self.phase == ResponseEnvelopePhase::AwaitingOpen && self.open.is_partial()
+    }
+}
+
+#[derive(Debug)]
+enum ResponseCompletionState {
+    Satisfied,
+    Pending {
+        delimited_payload: DelimitedPayloadCompletionState,
+        alternate_envelope: Option<ResponseEnvelopeCompletionState>,
+    },
+}
+
 impl ResponseCompletionState {
+    fn compile_token_sequence(
+        text: &str,
+        label: &str,
+        tokenizer: &(dyn Tokenizer + Send + Sync),
+        model_eos_token_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        let tokens = if let Some(token) = tokenizer.token_id(text) {
+            vec![token.get()]
+        } else {
+            tokenizer
+                .encode(text, false)?
+                .into_iter()
+                .map(TokenId::get)
+                .collect::<Vec<_>>()
+        };
+        if tokens.is_empty() {
+            return Err(FerrumError::invalid_request(format!(
+                "{label} {text:?} did not tokenize"
+            )));
+        }
+        if let Some(token) = tokens
+            .iter()
+            .find(|token| model_eos_token_ids.contains(token))
+        {
+            return Err(FerrumError::invalid_request(format!(
+                "{label} token {token} conflicts with model EOS"
+            )));
+        }
+        Ok(tokens)
+    }
+
     fn compile(
         boundary: &ResponseCompletionBoundary,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         model_eos_token_ids: &[u32],
         max_tokens: usize,
     ) -> Result<Self> {
-        let ResponseCompletionBoundary::AfterDelimiterAndPayload(delimiter) = boundary else {
+        let ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter,
+            alternate_envelope,
+        } = boundary
+        else {
             return Ok(Self::Satisfied);
         };
         if model_eos_token_ids.is_empty() {
@@ -380,90 +568,124 @@ impl ResponseCompletionState {
         let tokenizer = tokenizer.ok_or_else(|| {
             FerrumError::config("response completion boundary requires a tokenizer")
         })?;
-        let tokens = if let Some(token) = tokenizer.token_id(delimiter) {
-            vec![token.get()]
-        } else {
-            tokenizer
-                .encode(delimiter, false)?
-                .into_iter()
-                .map(TokenId::get)
-                .collect::<Vec<_>>()
-        };
-        if tokens.is_empty() {
-            return Err(FerrumError::invalid_request(format!(
-                "response completion delimiter {delimiter:?} did not tokenize"
-            )));
-        }
-        if max_tokens <= tokens.len() {
+        let delimiter_tokens = Self::compile_token_sequence(
+            delimiter,
+            "response completion delimiter",
+            tokenizer,
+            model_eos_token_ids,
+        )?;
+        if max_tokens <= delimiter_tokens.len() {
             return Err(FerrumError::invalid_request(format!(
                 "response completion requires max_tokens greater than its {}-token delimiter",
-                tokens.len()
+                delimiter_tokens.len()
             )));
         }
-        if let Some(token) = tokens
-            .iter()
-            .find(|token| model_eos_token_ids.contains(token))
-        {
-            return Err(FerrumError::invalid_request(format!(
-                "response completion delimiter token {token} conflicts with model EOS"
-            )));
-        }
-        let failure = delimiter_failure_table(&tokens);
-        Ok(Self::AwaitingDelimiter {
-            tokens,
-            failure,
-            matched: 0,
+        let alternate_envelope = alternate_envelope
+            .as_ref()
+            .map(|envelope| -> Result<ResponseEnvelopeCompletionState> {
+                if envelope.max_envelopes == 0 {
+                    return Err(FerrumError::invalid_request(
+                        "response completion envelope limit must be greater than zero",
+                    ));
+                }
+                Ok(ResponseEnvelopeCompletionState {
+                    open: TokenSequenceMatcher::new(
+                        Self::compile_token_sequence(
+                            &envelope.open_token_text,
+                            "response completion envelope opener",
+                            tokenizer,
+                            model_eos_token_ids,
+                        )?,
+                        "response completion envelope opener",
+                    )?,
+                    close: TokenSequenceMatcher::new(
+                        Self::compile_token_sequence(
+                            &envelope.close_token_text,
+                            "response completion envelope closer",
+                            tokenizer,
+                            model_eos_token_ids,
+                        )?,
+                        "response completion envelope closer",
+                    )?,
+                    phase: ResponseEnvelopePhase::AwaitingOpen,
+                    completed_envelopes: 0,
+                    max_envelopes: envelope.max_envelopes,
+                })
+            })
+            .transpose()?;
+        Ok(Self::Pending {
+            delimited_payload: DelimitedPayloadCompletionState::AwaitingDelimiter(
+                TokenSequenceMatcher::new(delimiter_tokens, "response completion delimiter")?,
+            ),
+            alternate_envelope,
         })
     }
 
     fn allows_model_eos(&self) -> bool {
-        matches!(self, Self::Satisfied)
+        match self {
+            Self::Satisfied => true,
+            Self::Pending {
+                alternate_envelope, ..
+            } => alternate_envelope
+                .as_ref()
+                .is_some_and(ResponseEnvelopeCompletionState::allows_model_eos),
+        }
     }
 
-    /// Advance the boundary with one accepted token. Delimiter matching is
-    /// allocation-free; incremental decoding is needed only for the short
-    /// post-delimiter interval before the first payload token.
+    /// Advance the completion protocol with one accepted token. Matchers are
+    /// allocation-free after request construction.
     fn observe(
         &mut self,
         previous_tokens: &[TokenId],
         token: TokenId,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
-    ) -> Result<bool> {
-        match self {
-            Self::Satisfied => Ok(false),
-            Self::AwaitingDelimiter {
-                tokens,
-                failure,
-                matched,
+    ) -> Result<Option<bool>> {
+        let allowed_before = self.allows_model_eos();
+        let payload_completed = match self {
+            Self::Satisfied => return Ok(None),
+            Self::Pending {
+                delimited_payload,
+                alternate_envelope,
             } => {
-                let token_id = token.get();
-                while *matched > 0 && tokens[*matched] != token_id {
-                    *matched = failure[*matched - 1];
-                }
-                if tokens[*matched] == token_id {
-                    *matched += 1;
-                }
-                if *matched == tokens.len() {
-                    *self = Self::AwaitingPayload;
-                }
-                Ok(false)
-            }
-            Self::AwaitingPayload => {
-                let tokenizer = tokenizer.ok_or_else(|| {
-                    FerrumError::config("response completion boundary lost its tokenizer")
-                })?;
-                let delta = tokenizer.decode_incremental(previous_tokens, token)?;
-                if delta
-                    .chars()
-                    .any(|character| !character.is_whitespace() && character != '\u{FFFD}')
-                {
-                    *self = Self::Satisfied;
-                    Ok(true)
+                if let Some(envelope) = alternate_envelope {
+                    let committed_before = envelope.has_committed_to_envelope_path();
+                    let opener_was_partial = envelope.opener_is_partial();
+                    envelope.observe(token.get())?;
+                    let committed_after = envelope.has_committed_to_envelope_path();
+                    let opener_is_partial = envelope.opener_is_partial();
+
+                    if committed_before || committed_after {
+                        false
+                    } else {
+                        let envelope_prefix = if opener_is_partial {
+                            EnvelopePrefixEffect::Pending
+                        } else if opener_was_partial {
+                            EnvelopePrefixEffect::Rejected
+                        } else {
+                            EnvelopePrefixEffect::Clear
+                        };
+                        delimited_payload.observe(
+                            previous_tokens,
+                            token,
+                            tokenizer,
+                            envelope_prefix,
+                        )?
+                    }
                 } else {
-                    Ok(false)
+                    delimited_payload.observe(
+                        previous_tokens,
+                        token,
+                        tokenizer,
+                        EnvelopePrefixEffect::Clear,
+                    )?
                 }
             }
+        };
+        if payload_completed {
+            *self = Self::Satisfied;
         }
+        let allowed_after = self.allows_model_eos();
+        Ok((allowed_before != allowed_after).then_some(allowed_after))
     }
 }
 
@@ -1958,12 +2180,15 @@ impl SequenceState {
                 token.get()
             )));
         }
-        let boundary_satisfied =
+        let model_eos_availability =
             self.response_completion_state
                 .observe(&self.generated_tokens, token, tokenizer)?;
-        if boundary_satisfied {
+        if let Some(allows_model_eos) = model_eos_availability {
             if let Some(mask) = &mut self.argmax_token_mask {
-                mask.set_tokens_validity(&self.model_eos_token_ids, true);
+                mask.set_tokens_validity(&self.model_eos_token_ids, allows_model_eos);
+            }
+            if let Some(mask) = &mut self.initial_argmax_token_mask {
+                mask.set_tokens_validity(&self.model_eos_token_ids, allows_model_eos);
             }
         }
         Ok(())

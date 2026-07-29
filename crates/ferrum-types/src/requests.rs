@@ -1,6 +1,9 @@
 //! Request and response types for inference
 
-use crate::{ids::*, models::TokenUsage, FinishReason, Priority, SamplingParams, TokenId};
+use crate::{
+    ids::*, models::TokenUsage, FinishReason, Priority, ResponseCompletionEnvelope, SamplingParams,
+    TokenId,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -192,6 +195,18 @@ impl ApiToolCallProtocol {
             Self::FunctionParameterXml => &["<tool_call>", "</tool_call>"],
         }
     }
+
+    /// Lexical envelope that may satisfy a pending response boundary.
+    pub fn generated_response_envelope(self) -> Option<ResponseCompletionEnvelope> {
+        match self {
+            Self::Json => None,
+            Self::FunctionParameterXml => Some(ResponseCompletionEnvelope {
+                open_token_text: "<tool_call>".to_string(),
+                close_token_text: "</tool_call>".to_string(),
+                max_envelopes: MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE,
+            }),
+        }
+    }
 }
 
 impl ApiChatRequest {
@@ -203,6 +218,14 @@ impl ApiChatRequest {
         }
         self.tool_call_protocol.generated_control_token_texts()
     }
+
+    /// Alternate complete response envelope available to this request.
+    pub fn generated_response_envelope(&self) -> Option<ResponseCompletionEnvelope> {
+        if self.tools.is_empty() || api_tool_choice_is_none(self) {
+            return None;
+        }
+        self.tool_call_protocol.generated_response_envelope()
+    }
 }
 
 impl ApiRequest {
@@ -210,6 +233,13 @@ impl ApiRequest {
         match self {
             Self::Chat(request) => request.generated_control_token_texts(),
             Self::Completion(_) => &[],
+        }
+    }
+
+    pub fn generated_response_envelope(&self) -> Option<ResponseCompletionEnvelope> {
+        match self {
+            Self::Chat(request) => request.generated_response_envelope(),
+            Self::Completion(_) => None,
         }
     }
 }
