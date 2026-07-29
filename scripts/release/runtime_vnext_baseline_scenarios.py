@@ -60,6 +60,7 @@ try:
     from runtime_vnext_c13_contract import (
         CASE_COUNT as C13_CASE_COUNT,
         CONTRACT_ID as C13_CONTRACT_ID,
+        SAMPLING_CONTRACT_ID as C13_SAMPLING_CONTRACT_ID,
         C13ContractError,
         case_contract as c13_case_contract,
         request_evidence as c13_request_evidence,
@@ -71,6 +72,7 @@ except ModuleNotFoundError:
     from scripts.release.runtime_vnext_c13_contract import (
         CASE_COUNT as C13_CASE_COUNT,
         CONTRACT_ID as C13_CONTRACT_ID,
+        SAMPLING_CONTRACT_ID as C13_SAMPLING_CONTRACT_ID,
         C13ContractError,
         case_contract as c13_case_contract,
         request_evidence as c13_request_evidence,
@@ -1946,6 +1948,11 @@ def validate_assertions(
             and execution_contract_name == G08_EXECUTION_CONTRACT
         ):
             require(assertions.get("contract_id") == C13_CONTRACT_ID, "C13 contract id mismatch")
+            require(
+                assertions.get("sampling_contract_id")
+                == C13_SAMPLING_CONTRACT_ID,
+                "C13 sampling contract id mismatch",
+            )
             for field in (
                 "distinct_prompt_count",
                 "distinct_messages_count",
@@ -3667,6 +3674,14 @@ def validate_scenario(
                 ),
                 "C13 cases do not all use the versioned contract",
             )
+            require(
+                all(
+                    row["observed"].get("sampling_contract_id")
+                    == C13_SAMPLING_CONTRACT_ID
+                    for row in case_rows
+                ),
+                "C13 cases do not all use deterministic semantic sampling",
+            )
             for assertion_field, observed_field in distinct_fields.items():
                 values = [row["observed"].get(observed_field) for row in case_rows]
                 require(
@@ -3686,6 +3701,11 @@ def validate_scenario(
                 require(
                     assertions.get("contract_id") == C13_CONTRACT_ID,
                     "C13 assertion contract id mismatch",
+                )
+                require(
+                    assertions.get("sampling_contract_id")
+                    == C13_SAMPLING_CONTRACT_ID,
+                    "C13 assertion sampling contract id mismatch",
                 )
     elif expected_id == "C14":
         schema_hashes = [row["observed"].get("strict_schema_sha256") for row in case_rows]
@@ -4388,7 +4408,7 @@ def preset_values(model_key: str, preset: str | None) -> dict[str, Any]:
     return copy.deepcopy(require_object(presets.get(preset), f"generation preset {model_key}.{preset}"))
 
 
-DETERMINISTIC_PARITY_SAMPLING_KEYS = (
+DETERMINISTIC_SAMPLING_KEYS = (
     "temperature",
     "top_p",
     "top_k",
@@ -4401,12 +4421,12 @@ DETERMINISTIC_PARITY_SAMPLING_KEYS = (
 )
 
 
-def apply_deterministic_parity_sampling(
+def apply_deterministic_sampling(
     payload: dict[str, Any],
     model_key: str,
 ) -> None:
     deterministic = preset_values(model_key, "P_DETERMINISTIC")
-    for key in DETERMINISTIC_PARITY_SAMPLING_KEYS:
+    for key in DETERMINISTIC_SAMPLING_KEYS:
         if key in deterministic:
             payload[key] = copy.deepcopy(deterministic[key])
         else:
@@ -5102,8 +5122,19 @@ def case_http_payload(
         # C11/C12 retain the selected thinking mode and output budget, while
         # their exact stream-parity comparison uses the goal's deterministic
         # sampling vector. Official stochastic sampling remains covered by C21.
-        apply_deterministic_parity_sampling(payload, model_key)
+        apply_deterministic_sampling(payload, model_key)
         payload["metadata"]["g00_sampling_contract"] = "deterministic-stream-parity"
+    elif (
+        scenario_id == "C13"
+        and execution_contract_name == G08_EXECUTION_CONTRACT
+    ):
+        # C13 is an exact semantic correctness contract. Keep the selected
+        # thinking/template mode and output budget, but remove stochastic
+        # realization from the result/receipt/no-duplicate-call oracle.
+        apply_deterministic_sampling(payload, model_key)
+        payload["metadata"][
+            "g00_sampling_contract"
+        ] = C13_SAMPLING_CONTRACT_ID
     if scenario_id in {"C06", "C12", "C17"} or (scenario_id == "C21" and variant == "serve-stream"):
         payload.update({"stream": True, "stream_options": {"include_usage": True}})
     if scenario_id == "C06":
@@ -9065,6 +9096,7 @@ def execute_manifest(
             assertions.update(
                 {
                     "contract_id": C13_CONTRACT_ID,
+                    "sampling_contract_id": C13_SAMPLING_CONTRACT_ID,
                     **{
                         assertion_field: len(
                             {
@@ -11559,6 +11591,22 @@ def self_test_c13_runner_contract() -> None:
             and payload.get("tool_choice") == "auto",
             f"C13 case {ordinal} did not preserve the real tool-loop contract",
         )
+        deterministic = preset_values(
+            "m3-qwen3-30b-a3b",
+            "P_DETERMINISTIC",
+        )
+        require(
+            all(
+                payload.get(key) == deterministic.get(key)
+                for key in DETERMINISTIC_SAMPLING_KEYS
+            ),
+            f"C13 case {ordinal} lost deterministic semantic sampling",
+        )
+        require(
+            payload["metadata"].get("g00_sampling_contract")
+            == C13_SAMPLING_CONTRACT_ID,
+            f"C13 case {ordinal} lost its sampling contract",
+        )
         if variant == "soft-think":
             require(
                 contract.user_prompt.endswith("/think"),
@@ -11731,6 +11779,16 @@ def self_test_c13_runner_contract() -> None:
                 "messages differ",
             )
         )
+        stochastic_payload = copy.deepcopy(payload)
+        stochastic_payload["temperature"] = 1.0
+        invalid_fixtures.append(
+            (
+                "stochastic semantic request",
+                stochastic_payload,
+                valid_message,
+                "deterministic sampling temperature mismatch",
+            )
+        )
         invalid_fixtures.append(
             (
                 "missing result",
@@ -11830,7 +11888,7 @@ def self_test_http_request_byte_binding() -> None:
     request_bytes = json_document_bytes(payload)
     require(
         hashlib.sha256(request_bytes).hexdigest()
-        == "3bf53c8f9b72b97cf1f572125a98ec4da0182be3f057f18b46e589afbd40b0e6",
+        == "243c9820ea83bc2cc306cb3286b61ace2f66b247f0c50e946c2e84f905d51517",
         "C13-038 canonical request bytes drifted",
     )
     captured: dict[str, bytes | None] = {}
@@ -13026,7 +13084,7 @@ def self_test() -> int:
                     require(
                         all(
                             pair_payload.get(key) == deterministic.get(key)
-                            for key in DETERMINISTIC_PARITY_SAMPLING_KEYS
+                            for key in DETERMINISTIC_SAMPLING_KEYS
                         ),
                         f"{model_key} {scenario_id}/{preset_name} lost deterministic parity sampling",
                     )
@@ -13049,6 +13107,37 @@ def self_test() -> int:
                 require(
                     paired_payloads[0] == paired_payloads[1],
                     f"{model_key} C11/C12 {preset_name} parity payloads differ",
+                )
+                c13_case = {
+                    **next(
+                        row
+                        for row in planned_rows
+                        if row["scenario_id"] == "C13"
+                        and row["preset"] == preset_name
+                    ),
+                    "model_key": model_key,
+                }
+                c13_payload = case_http_payload(
+                    c13_case,
+                    model_key,
+                    execution_contract_name=G08_EXECUTION_CONTRACT,
+                )
+                require(
+                    all(
+                        c13_payload.get(key) == deterministic.get(key)
+                        for key in DETERMINISTIC_SAMPLING_KEYS
+                    ),
+                    f"{model_key} C13/{preset_name} lost deterministic semantic sampling",
+                )
+                require(
+                    c13_payload.get("chat_template_kwargs")
+                    == {"enable_thinking": thinking_enabled},
+                    f"{model_key} C13/{preset_name} lost its thinking mode",
+                )
+                require(
+                    c13_payload["metadata"].get("g00_sampling_contract")
+                    == C13_SAMPLING_CONTRACT_ID,
+                    f"{model_key} C13/{preset_name} lost its sampling contract",
                 )
             official_tool_case = {
                 **next(
