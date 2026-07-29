@@ -988,10 +988,11 @@ impl OperationDispatch {
     /// Derives the exact reusable-program identity for the current wave without
     /// materializing device buffers or entering dispatch.
     ///
-    /// Provider topology remains opaque. Core binds each dynamic row to its
+    /// Provider topology remains opaque. Core binds each topology row to its
     /// immutable node/provider position before aggregating it, so two providers
-    /// cannot accidentally alias the same program variant. One ineligible
-    /// provider vetoes resident reuse for the complete wave.
+    /// cannot accidentally alias the same program variant. Eager boundaries
+    /// remain part of the program identity while resident segments on either
+    /// side stay eligible for typed reuse.
     pub fn reusable_execution_program_id_for_wave<R>(
         providers: &[BoundOperationProvider<'_, R>],
         resolved: &dyn ExecutablePlanView,
@@ -1055,19 +1056,20 @@ impl OperationDispatch {
                 wave.step_resources().backing_slices(),
             )?;
             let declared = node.provider_execution_semantics().replay_equivalence();
-            let dynamic_topology = match (
+            let topology = provider.provider().reusable_execution_topology(request)?;
+            let (topology_kind, topology_bytes) = match (
                 declared,
-                provider.provider().reusable_execution_topology(request)?,
+                &topology,
             ) {
                 (
                     ProviderReplayEquivalence::BitwiseEagerEquivalent,
                     ReusableExecutionTopology::Static,
-                ) => None,
+                ) => (0_u8, &[][..]),
                 (
                     ProviderReplayEquivalence::BitwiseEagerEquivalent,
                     ReusableExecutionTopology::Dynamic(topology),
-                ) => Some(topology),
-                (_, ReusableExecutionTopology::Ineligible) => return Ok(None),
+                ) => (1_u8, &topology.as_bytes()[..]),
+                (_, ReusableExecutionTopology::EagerBoundary) => (2_u8, &[][..]),
                 (
                     ProviderReplayEquivalence::Ineligible,
                     ReusableExecutionTopology::Static | ReusableExecutionTopology::Dynamic(_),
@@ -1078,9 +1080,6 @@ impl OperationDispatch {
                     )))
                 }
             };
-            let (topology_kind, topology_bytes) = dynamic_topology
-                .as_ref()
-                .map_or((0_u8, &[][..]), |topology| (1_u8, topology.as_bytes()));
             let wave_node_index = u64::try_from(wave_node_index)
                 .map_err(|_| invalid_operation("reusable topology wave node index exceeds u64"))?;
             let plan_node_index = u64::try_from(plan_node_index)

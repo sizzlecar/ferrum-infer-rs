@@ -1197,7 +1197,7 @@ fn reusable_token_topology(
             .binding_reusable_address_scope(role, ordinal)?
             .is_none()
         {
-            return Ok(ReusableExecutionTopology::Ineligible);
+            return Ok(ReusableExecutionTopology::EagerBoundary);
         }
     }
 

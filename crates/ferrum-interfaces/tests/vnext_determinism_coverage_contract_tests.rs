@@ -130,7 +130,7 @@ fn coverage_registry_rejects_reused_models_and_foreign_catalogs() {
 
     let foreign = fixture_with_determinism_provider_behavior(
         true,
-        ProviderBehavior::ProgramBindingIneligible,
+        ProviderBehavior::ProgramBindingFirstNodeEagerBoundary,
     );
     let mut foreign_registry =
         ExecutionDeterminismCoverageRegistry::from_catalog(&foreign.resolved.parts().capabilities)

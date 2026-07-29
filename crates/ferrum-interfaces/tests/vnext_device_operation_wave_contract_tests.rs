@@ -2453,6 +2453,99 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
 }
 
 #[test]
+fn eager_boundary_preserves_adjacent_direct_segment_execution() {
+    let (fixture, sequence, session, batch, step) =
+        setup_with_fixture(fixture_with_provider_behavior(
+            false,
+            ProviderBehavior::ProgramBindingFirstNodeEagerBoundary,
+        ));
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(providers.len(), 2);
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("an eager boundary must retain typed partial program authority");
+    let program = DeviceReusableExecutionProgram::new(
+        program_id,
+        vec![DeviceReusableExecutionSegment::new(0, 1, 2, 1).unwrap()],
+        vec![1],
+    )
+    .unwrap();
+
+    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        &program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(trace.program_binding_coalesce_calls, 1);
+        assert_eq!(trace.program_binding_input_counts, vec![2]);
+        assert_eq!(trace.submitted_command_counts, vec![3]);
+        assert_eq!(
+            trace.submitted_commands,
+            vec![vec![
+                TestCommand::CoalescedProgramBinding,
+                TestCommand::Provider,
+                TestCommand::ReusableExecution,
+            ]]
+        );
+        assert_eq!(trace.submitted_reusable_captures, vec![None]);
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::Adaptive]
+        );
+    }
+    {
+        let trace = fixture.provider_trace.lock().unwrap();
+        assert_eq!(trace.encode_calls, 1);
+        assert_eq!(trace.reusable_binding_encode_calls, 1);
+        assert_eq!(trace.program_binding_slots.len(), 2);
+    }
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding),
@@ -2619,18 +2712,18 @@ fn reusable_topology_states_cannot_alias_resident_program_authority() {
     .expect("static topology must retain the base reusable program identity");
     assert_ne!(dynamic_program_id, static_program_id);
 
-    *fixture.provider_behavior.lock().unwrap() = ProviderBehavior::ProgramBindingIneligible;
-    assert!(
-        OperationDispatch::reusable_execution_program_id_for_wave(
-            &providers,
-            &fixture.resolved,
-            &wave,
-            &lane,
-        )
-        .unwrap()
-        .is_none(),
-        "one ineligible provider must veto resident reuse for the complete wave"
-    );
+    *fixture.provider_behavior.lock().unwrap() =
+        ProviderBehavior::ProgramBindingFirstNodeEagerBoundary;
+    let eager_boundary_program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("an eager node boundary must preserve partial reusable program authority");
+    assert_ne!(eager_boundary_program_id, dynamic_program_id);
+    assert_ne!(eager_boundary_program_id, static_program_id);
 
     drop(providers);
     drop(wave);
