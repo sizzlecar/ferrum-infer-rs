@@ -720,10 +720,11 @@ impl OperationProvider<TestRuntime> for TestProvider {
                     .with_result_binding(TestCommand::ResultBinding))
             }
             ProviderBehavior::ProgramBinding
-            | ProviderBehavior::ProgramBindingFirstNodeEagerBoundary => {
-                Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
-                    .with_program_binding(TestCommand::ProgramBinding))
-            }
+            | ProviderBehavior::ProgramBindingFirstNodeEagerBoundary => Ok(invocation
+                .attach_binding_command(
+                    EncodedDeviceOperation::compute(TestCommand::Provider),
+                    TestCommand::ProgramBinding,
+                )),
             ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed => Ok(
                 EncodedDeviceOperation::compute(TestCommand::ScratchProvider),
             ),

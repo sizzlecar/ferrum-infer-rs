@@ -1090,7 +1090,10 @@ fn encode_attention(
     )
     .map_err(|error| error.to_string())?;
 
-    Ok(EncodedDeviceOperation::compute(compute_command).with_dynamic_binding(binding_command))
+    Ok(invocation.attach_binding_command(
+        EncodedDeviceOperation::compute(compute_command),
+        binding_command,
+    ))
 }
 
 fn physical_dispatch_count(participant_count: usize, packed: bool) -> u64 {
