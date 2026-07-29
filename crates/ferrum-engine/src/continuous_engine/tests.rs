@@ -5846,6 +5846,7 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     let mut config = EngineConfig::default();
     config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
     config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Run);
+    config.runtime.profile_detail = ObservabilityProfileDetail::Replay;
     config.kv_cache.max_blocks = 128;
     let engine = test_continuous_engine_with_config(config);
 
@@ -5889,6 +5890,13 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
         .iter()
         .find(|event| event.phase == "engine_request_close")
         .expect("request-close timeline event");
+    let terminal_evidence = events
+        .iter()
+        .find(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "engine_sequence_terminal_evidence"
+        })
+        .expect("completion token evidence must be traced in replay mode");
     for event in [request_open, request_close] {
         assert!(event
             .attributes
@@ -5920,6 +5928,18 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     );
     assert_eq!(
         request_close.attributes["scheduler_snapshot"]["completed_total"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        terminal_evidence.attributes["termination"],
+        serde_json::json!("completed")
+    );
+    assert_eq!(
+        terminal_evidence.attributes["finish_reason"],
+        serde_json::json!("length")
+    );
+    assert_eq!(
+        terminal_evidence.shape["generated_token_count"],
         serde_json::json!(1)
     );
 
@@ -6461,6 +6481,45 @@ fn test_sequence_state() {
     assert!(state.recurrent_state.is_none());
 }
 
+#[test]
+fn sequence_terminal_token_trace_is_bounded_and_stable() {
+    let request = policy_request();
+    let prompt = (0..300).map(TokenId::new).collect::<Vec<_>>();
+    let mut state = SequenceState::new(request, prompt);
+    state.generated_tokens = (1_000..1_400).map(TokenId::new).collect();
+
+    let first = SequenceTokenTraceEvidence::capture(&state);
+    let second = SequenceTokenTraceEvidence::capture(&state);
+
+    assert_eq!(first, second);
+    assert_eq!(first.prompt_token_count, 300);
+    assert_eq!(
+        first.prompt_token_prefix.len(),
+        TOKEN_TRACE_PROMPT_PREFIX_LIMIT
+    );
+    assert_eq!(first.prompt_token_prefix.first(), Some(&0));
+    assert_eq!(first.prompt_token_tail.len(), TOKEN_TRACE_PROMPT_TAIL_LIMIT);
+    assert_eq!(first.prompt_token_tail.first(), Some(&172));
+    assert_eq!(first.prompt_token_tail.last(), Some(&299));
+    assert_eq!(first.generated_token_count, 400);
+    assert_eq!(
+        first.generated_token_prefix.len(),
+        TOKEN_TRACE_GENERATED_PREFIX_LIMIT
+    );
+    assert_eq!(first.generated_token_prefix.first(), Some(&1_000));
+    assert_eq!(first.generated_token_prefix.last(), Some(&1_255));
+    assert_eq!(
+        first.generated_token_tail.len(),
+        TOKEN_TRACE_GENERATED_TAIL_LIMIT
+    );
+    assert_eq!(first.generated_token_tail.first(), Some(&1_368));
+    assert_eq!(first.generated_token_tail.last(), Some(&1_399));
+
+    state.generated_tokens[0] = TokenId::new(2_000);
+    let changed = SequenceTokenTraceEvidence::capture(&state);
+    assert_ne!(first.generated_token_sha256, changed.generated_token_sha256);
+}
+
 #[tokio::test]
 async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(
@@ -6512,6 +6571,7 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
     let mut config = EngineConfig::default();
     config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
     config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Serve);
+    config.runtime.profile_detail = ObservabilityProfileDetail::Replay;
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
@@ -6561,6 +6621,7 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
     drop(stream_receiver);
 
     let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    sequence.generated_tokens = vec![TokenId::new(10), TokenId::new(11), TokenId::new(12)];
     sequence.stream_sender = Some(stream_sender);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     let mut request_slot = RequestSlotLease::open(&engine.inner, request_id.clone());
@@ -6601,6 +6662,13 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
                 && event.phase == "engine_client_disconnect_released"
         })
         .expect("disconnect release must be traced");
+    let terminal_evidence = events
+        .iter()
+        .find(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "engine_sequence_terminal_evidence"
+        })
+        .expect("disconnect token evidence must be traced in replay mode");
     assert_eq!(
         detected.attributes.get("terminal_state"),
         Some(&serde_json::json!("pending_release"))
@@ -6623,6 +6691,22 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
     assert_eq!(
         released.attributes["scheduler_snapshot"]["cancelled_total"],
         serde_json::json!(1)
+    );
+    assert_eq!(
+        terminal_evidence.attributes["termination"],
+        serde_json::json!("client_disconnected")
+    );
+    assert_eq!(
+        terminal_evidence.shape["prompt_token_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        terminal_evidence.shape["generated_token_count"],
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        terminal_evidence.attributes["token_trace"]["generated_token_prefix"],
+        serde_json::json!([10, 11, 12])
     );
     assert!(!events.iter().any(|event| {
         event.request_id == request_id.to_string()

@@ -54,6 +54,59 @@ impl SequenceState {
 }
 
 impl EngineInner {
+    fn capture_sequence_terminal_token_trace(
+        &self,
+        sequence: &SequenceState,
+    ) -> Option<SequenceTokenTraceEvidence> {
+        (self.scheduler_trace_jsonl.is_some()
+            && self.config.runtime.profile_detail.diagnostic_only())
+        .then(|| SequenceTokenTraceEvidence::capture(sequence))
+    }
+
+    fn write_sequence_terminal_token_trace(
+        &self,
+        request_id: &RequestId,
+        termination: &str,
+        finish_reason: Option<FinishReason>,
+        evidence: Option<&SequenceTokenTraceEvidence>,
+    ) {
+        let Some(evidence) = evidence else {
+            return;
+        };
+        let mut attributes = BTreeMap::from([
+            ("termination".to_string(), serde_json::json!(termination)),
+            (
+                "token_trace".to_string(),
+                serde_json::to_value(evidence).expect("typed sequence token trace must serialize"),
+            ),
+        ]);
+        if let Some(finish_reason) = finish_reason {
+            attributes.insert(
+                "finish_reason".to_string(),
+                serde_json::json!(finish_reason_trace_name(finish_reason)),
+            );
+        }
+        self.write_executor_scheduler_profile_event(
+            request_id,
+            "engine_sequence_terminal_evidence",
+            ProfileEventKind::Instant,
+            ProfileStatus::DiagnosticOnly,
+            None,
+            BTreeMap::from([
+                (
+                    "prompt_token_count".to_string(),
+                    serde_json::json!(evidence.prompt_token_count),
+                ),
+                (
+                    "generated_token_count".to_string(),
+                    serde_json::json!(evidence.generated_token_count),
+                ),
+            ]),
+            attributes,
+            None,
+        );
+    }
+
     // ── stream helper ──────────────────────────────────────────────────
 
     pub(super) fn stop_reason_for_request(&self, request_id: &RequestId) -> Option<FinishReason> {
@@ -219,13 +272,20 @@ impl EngineInner {
 
     async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
         let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
-        let completion_resources = {
+        let (completion_resources, terminal_token_trace) = {
             let mut sequences = self.sequences.write();
             let Some(mut sequence) = sequences.remove(request_id) else {
                 return Ok(());
             };
-            sequence.take_completion_resources()
+            let terminal_token_trace = self.capture_sequence_terminal_token_trace(&sequence);
+            (sequence.take_completion_resources(), terminal_token_trace)
         };
+        self.write_sequence_terminal_token_trace(
+            request_id,
+            "client_disconnected",
+            None,
+            terminal_token_trace.as_ref(),
+        );
         let physical_resources_present = !completion_resources.physical.is_empty();
         let request_slot_present = completion_resources.request_slot.is_some();
         self.write_executor_scheduler_profile_event(
@@ -386,7 +446,14 @@ impl EngineInner {
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
     ) -> Result<()> {
-        let (response, stream_sender, response_sender, completion_resources, terminal_error) = {
+        let (
+            response,
+            stream_sender,
+            response_sender,
+            completion_resources,
+            terminal_error,
+            terminal_token_trace,
+        ) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
                 let terminal_error = explicit_terminal_error
@@ -397,6 +464,7 @@ impl EngineInner {
                 } else {
                     finish_reason
                 };
+                let terminal_token_trace = self.capture_sequence_terminal_token_trace(&seq);
                 let text = self
                     .tokenizer
                     .decode(&seq.generated_tokens, true)
@@ -448,11 +516,18 @@ impl EngineInner {
                     seq.response_sender.take(),
                     completion_resources,
                     terminal_error,
+                    terminal_token_trace,
                 )
             } else {
                 return Ok(());
             }
         };
+        self.write_sequence_terminal_token_trace(
+            request_id,
+            "completed",
+            Some(response.finish_reason),
+            terminal_token_trace.as_ref(),
+        );
 
         if self.model_executor.execution_resource_authority()
             == ExecutionResourceAuthority::PlanRuntime
@@ -513,5 +588,16 @@ impl EngineInner {
         );
 
         Ok(())
+    }
+}
+
+fn finish_reason_trace_name(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Length => "length",
+        FinishReason::Stop => "stop",
+        FinishReason::EOS => "eos",
+        FinishReason::Cancelled => "cancelled",
+        FinishReason::Error => "error",
+        FinishReason::ContentFilter => "content_filter",
     }
 }
