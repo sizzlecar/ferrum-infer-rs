@@ -39,6 +39,7 @@ struct PlanRuntimeAdmissionTestExecutor {
     maintenance_calls: AtomicU64,
     prefill_calls: AtomicU64,
     batch_prefill_calls: AtomicU64,
+    defer_batch_prefill_once: AtomicBool,
 }
 
 struct PlanRuntimeChunkedPrefillTestExecutor {
@@ -657,6 +658,7 @@ impl PlanRuntimeAdmissionTestExecutor {
             maintenance_calls: AtomicU64::new(0),
             prefill_calls: AtomicU64::new(0),
             batch_prefill_calls: AtomicU64::new(0),
+            defer_batch_prefill_once: AtomicBool::new(false),
         }
     }
 
@@ -672,6 +674,14 @@ impl PlanRuntimeAdmissionTestExecutor {
             inner: MockModelExecutor::new(vocab_size, latency, Duration::ZERO),
             ..Self::new(vocab_size)
         }
+    }
+
+    fn new_with_batch_prefill_deferral(vocab_size: usize) -> Self {
+        let executor = Self::new(vocab_size);
+        executor
+            .defer_batch_prefill_once
+            .store(true, Ordering::Release);
+        executor
     }
 
     fn capacity_epochs(&self) -> ExecutorAdmissionEpochs {
@@ -846,6 +856,14 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         inputs: &[PrefillInput],
     ) -> Result<ExecutorBatchPrefillOutcome> {
         self.batch_prefill_calls.fetch_add(1, Ordering::Relaxed);
+        if self.defer_batch_prefill_once.swap(false, Ordering::AcqRel) {
+            return ExecutorExecutionCapacityDeferral::new(
+                self.capacity_epochs(),
+                self.capacity_wait_condition(),
+                ExecutorExecutionCapacityStage::SubmissionWave,
+            )
+            .map(ExecutorBatchPrefillOutcome::NotSubmitted);
+        }
         let mut completions = Vec::with_capacity(inputs.len());
         for input in inputs {
             let request_id = input
@@ -4292,6 +4310,83 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
         assert!(sequence.model_cache_id().is_some());
+    }
+}
+
+#[tokio::test]
+async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 2;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        128,
+        &[("test", 5), ("ok", 6), ("generated", 42)],
+    ));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_batch_prefill_deferral(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+
+    let mut request_ids = Vec::new();
+    for prompt in ["test", "ok"] {
+        let mut request = policy_request();
+        request.prompt = prompt.to_string();
+        request.sampling_params.max_tokens = 2;
+        request
+            .metadata
+            .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
+        scheduler.submit(request.clone()).await.unwrap();
+        let tokens = tokenizer.encode(&request.prompt, true).unwrap();
+        let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request.clone(),
+            tokens.clone(),
+            Some(Arc::clone(&tokenizer)),
+            Some(128),
+        );
+        executor
+            .try_admit_prefill(ExecutorPrefillAdmission::new(
+                &request.id,
+                &tokens,
+                sequence.model_maximum_sequence_tokens(),
+            ))
+            .unwrap();
+        request_ids.push(request.id.clone());
+        engine
+            .inner
+            .sequences
+            .write()
+            .insert(request.id.clone(), sequence);
+    }
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("two admitted prefills should form one scheduler cohort");
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 2);
+    assert!(executor
+        .retained
+        .lock()
+        .expect("retained admission mutex poisoned")
+        .is_empty());
+    let sequences = engine.inner.sequences.read();
+    for request_id in request_ids {
+        let sequence = sequences
+            .get(&request_id)
+            .expect("deferred batch participant must survive per-request fallback");
+        assert!(sequence.prefill_complete);
+        assert_eq!(sequence.generated_tokens.len(), 1);
     }
 }
 

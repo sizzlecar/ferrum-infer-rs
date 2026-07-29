@@ -1530,6 +1530,7 @@ pub struct ExecutorExecutionCapacityDeferral {
     wait_condition: crate::vnext::CapacityWaitCondition,
     stage: ExecutorExecutionCapacityStage,
     shortfalls: Vec<crate::vnext::CapacityShortfall>,
+    backing_blockers: Vec<crate::vnext::DynamicBackingBlocker>,
 }
 
 impl ExecutorExecutionCapacityDeferral {
@@ -1548,6 +1549,7 @@ impl ExecutorExecutionCapacityDeferral {
             wait_condition,
             stage,
             shortfalls: Vec::new(),
+            backing_blockers: Vec::new(),
         })
     }
 
@@ -1566,6 +1568,45 @@ impl ExecutorExecutionCapacityDeferral {
             stage,
         )?;
         result.shortfalls = deferred.blockers().to_vec();
+        Ok(result)
+    }
+
+    /// Export an unresolved logical backing-growth decision after the
+    /// executor's bounded in-call maintenance attempts are exhausted.
+    ///
+    /// This remains a pre-submit scheduling deferral. The bound controls only
+    /// how much allocator maintenance one executor call may perform; it must
+    /// not turn temporary capacity pressure into a terminal request failure.
+    pub fn from_pending_maintenance(
+        deferred: &crate::vnext::AdmissionDeferred,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if deferred.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
+            return Err(ferrum_types::FerrumError::internal(
+                "pending execution maintenance must await backing growth",
+            ));
+        }
+        let mut result = Self::new(
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
+            stage,
+        )?;
+        result.shortfalls = deferred.blockers().to_vec();
+        Ok(result)
+    }
+
+    /// Export unresolved physical backing pressure without discarding its
+    /// exact pool/domain evidence.
+    pub fn from_backing(
+        deferred: &crate::vnext::DynamicBackingDeferred,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        let mut result = Self::new(
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
+            stage,
+        )?;
+        result.backing_blockers = deferred.blockers().to_vec();
         Ok(result)
     }
 
@@ -1599,6 +1640,10 @@ impl ExecutorExecutionCapacityDeferral {
 
     pub fn shortfalls(&self) -> &[crate::vnext::CapacityShortfall] {
         &self.shortfalls
+    }
+
+    pub fn backing_blockers(&self) -> &[crate::vnext::DynamicBackingBlocker] {
+        &self.backing_blockers
     }
 
     /// Return a strictly smaller, capacity-informed prefill width.
