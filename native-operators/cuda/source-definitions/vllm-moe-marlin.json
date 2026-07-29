@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_moe_marlin",
+  "source_package_kind": "ferrum-git-tree",
+  "source_package_revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "26b999c71ab28ae9708329003007979530638f79",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+    "kernels/vllm_marlin_moe/ops.cu"
+  ],
+  "headers": [
+    "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+    "kernels/vllm_marlin_moe/kernel.h",
+    "kernels/vllm_marlin_moe/marlin_template.h",
+    "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+    "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+    "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+    "kernels/vllm_marlin_moe/vllm_torch_shim.h"
+  ],
+  "include_dirs": [
+    "kernels/vllm_marlin_moe"
+  ],
+  "defines": [
+    "MARLIN_NAMESPACE_NAME=marlin_moe_wna16"
+  ],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-Xcompiler",
+    "-fPIC",
+    "-Xcompiler",
+    "-fvisibility=default"
+  ],
+  "architecture": "device_compute_capability",
+  "archive_file": "libvllm_moe_marlin.a"
+}

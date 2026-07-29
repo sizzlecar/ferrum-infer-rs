@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_marlin",
+  "source_package_kind": "ferrum-git-tree",
+  "source_package_revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "88d34c6409e9fb3c7b8ca0c04756f061d2099eb1",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    "vllm_marlin/gptq_marlin_repack.cu",
+    "vllm_marlin/marlin.cu",
+    "vllm_marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_float16_fe2m1f_float16.cu",
+    "vllm_marlin/sm80_kernel_float16_fe4m3fn_float16.cu",
+    "vllm_marlin/sm80_kernel_float16_u4_float16.cu",
+    "vllm_marlin/sm80_kernel_float16_u4b8_float16.cu",
+    "vllm_marlin/sm80_kernel_float16_u8b128_float16.cu",
+    "vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_s8_u4_float16.cu",
+    "vllm_marlin/sm80_kernel_s8_u4b8_bfloat16.cu",
+    "vllm_marlin/sm80_kernel_s8_u4b8_float16.cu",
+    "vllm_marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu",
+    "vllm_marlin/sm89_kernel_fe4m3fn_u4_bfloat16.cu",
+    "vllm_marlin/sm89_kernel_fe4m3fn_u4_float16.cu",
+    "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
+    "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu"
+  ],
+  "headers": [
+    "vllm_marlin/dequant.h",
+    "vllm_marlin/ferrum_marlin_ffi.h",
+    "vllm_marlin/kernel.h",
+    "vllm_marlin/kernel_selector.h",
+    "vllm_marlin/marlin.cuh",
+    "vllm_marlin/marlin_dtypes.cuh",
+    "vllm_marlin/marlin_mma.h",
+    "vllm_marlin/marlin_template.h",
+    "vllm_marlin/scalar_type.hpp",
+    "vllm_marlin/torch_stubs.h"
+  ],
+  "include_dirs": [
+    "vllm_marlin"
+  ],
+  "defines": [
+    "MARLIN_NAMESPACE_NAME=marlin"
+  ],
+  "nvcc_flags": [
+    "-std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-Xcompiler",
+    "-fPIC",
+    "-Xcompiler",
+    "-fvisibility=default"
+  ],
+  "architecture": "device_compute_capability",
+  "archive_file": "libvllm_marlin.a"
+}
