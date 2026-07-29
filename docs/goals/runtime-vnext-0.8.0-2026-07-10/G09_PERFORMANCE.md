@@ -1886,6 +1886,37 @@ paid window was `54m54s`, approximately `$0.3558` at `$0.388889/h`, within the
 declared 90-minute / `$0.58` cap. Instances `46127509` and `45897840` are both
 verified `stopped/exited`; `potentially_billable=[]`.
 
+### Current-HEAD partial reusable program c1 checkpoint
+
+Clean source `2ba731e2bb70dc09763f8582c8b67b8b7e42ac77` tested the single
+predeclared hypothesis that request-lifetime eager boundaries must not discard
+lane-stable resident middle segments. Correctness preceded measurement:
+`ferrum run`, streaming `ferrum serve`, focused C02/C05/C06 `60/60`, and the
+complete M2 CUDA matrix `703/703` passed. The product registered five prepared
+programs and reported zero direct fallbacks or catalog misses.
+
+The same RTX 4090 then ran the exact c1 command and workload used for clean
+parent checkpoint `5b429449`, with 100 completed requests in each of three
+repeats, zero errors, and usage-token counting:
+
+| source | c1 mean output throughput | repeats | CV |
+|---|---:|---|---:|
+| `5b429449` | `52.5936247709 tok/s` | historical same-host row | n/a |
+| `2ba731e2` | `65.0106000737 tok/s` | `63.3246`, `68.4462`, `63.2610` | `4.57695%` |
+
+The same-hardware delta is `+23.609278%`, so the scoped decision is
+`KEEP_PARTIAL_REUSABLE_PROGRAM`. This is a development checkpoint, not a G09
+PASS: it covers only M2 CUDA c1, has no c4/c16/c32 ABBA-BAAB, confidence-bound
+legacy/vLLM comparison, TTFT/TPOT gate, or three-model/two-backend matrix.
+
+The comparison is included in the GitHub round-tripped archive
+`runtime-vnext-g08b-cuda-2ba731e2-20260729.tar.zst`, SHA256
+`cf588945f13d4ee9cd58228725f1f20ccf21f463873b9d07c93abe4b37e0bf07`,
+under `runtime-vnext-partial-program-2ba731e2-20260729/serve/bench-c1/`.
+Per the owner decision on 2026-07-29, no Metal performance measurement is
+valid while work applications consume host resources; the next Metal action
+is correctness-only, and performance is deferred until the machine is idle.
+
 ### M3 Qwen3-30B historical floors
 
 保留两套独立 random `256/128` 向量：

@@ -1765,6 +1765,71 @@ diagnostic. It does not advance the formal `1/6` correctness matrix or close
 G08B; the next broad CUDA matrix is deferred to the next source-freeze
 milestone rather than restarted after each focused change.
 
+## Current-HEAD Partial Reusable Program CUDA Checkpoint - 2026-07-29
+
+Clean pushed source `2ba731e2bb70dc09763f8582c8b67b8b7e42ac77`, tree
+`4a2b83d28bc04b87001a9b80bac589ba19db28fe`, fixes a core reusable-program
+ownership error exposed after the authority checkpoint. Qwen3.5 embedding
+token IDs and logits output have request lifetime and cannot publish a
+lane-stable resident address. The previous topology contract upgraded either
+node's ineligibility into a whole-wave veto, even though five middle CUDA
+segments were lane-stable and the dispatcher already supported eager gaps.
+
+`ReusableExecutionTopology::EagerBoundary` now preserves that distinction:
+request-lifetime boundary nodes remain eager and cannot be mislabeled static,
+while safe resident segments owned by other nodes remain reusable. Startup
+also fails closed when resident executables exist but no prepared program is
+registered. The change is provider-generic and includes CUDA and Metal
+topology contracts; it adds no model name, GPU name, precision, or hidden-env
+branch.
+
+Local bounded topology, mixed eager/direct dispatch, startup-invariant,
+determinism-coverage, Metal check, and workspace check receipts passed.
+The official-feature CUDA binary has SHA256
+`502afbb239b5e36ece3bcddb377da80dd9cb813b1c334f58dfa0874991bcd67a`.
+Real product evidence then established:
+
+- `ferrum run` multi-turn output and streaming `ferrum serve` usage/`[DONE]`
+  passed with bad-output scans clean;
+- startup registered `prepared_programs=5`;
+- a focused C02/C05/C06 matrix passed `60/60`;
+- after the scoped benchmark, direct counters reported `10,266` waves and
+  segments, `0` direct fallbacks, and `0` catalog misses.
+
+The source-freeze canonical C01-C21 matrix completed `703/703 pass` across all
+21 scenarios. Known-fail, blocked, error, and unexpected counts are all `0`.
+The bounded runner completed in `2590.064111s`, peaked at `3` processes,
+`85` process-group threads and `52` threads in one process, recorded no
+violation, and cleaned up its process group. C18 validated dynamic runtime
+behavior with typed admission cap `16`, observed max-active `16`, active
+duty-cycle `0.9635368787`, and balanced request-slot/model-cache/workspace
+reserve/commit/release counts; leak and underflow counts are `0`. The runner
+and unified gate printed:
+
+```text
+FERRUM RUNTIME VNEXT G08 MODEL MATRIX SCENARIOS PASS: /workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-full-2ba731e2-20260729-r1/correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json
+FERRUM RUNTIME VNEXT G08B CUDA MODEL MATRIX PASS: /workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-full-2ba731e2-20260729-r1/gate-vnext-g08b-cuda
+FERRUM GATE vnext-g08b-cuda PASS: /workspace/ferrum-artifacts/runtime-vnext-g08b-cuda-full-2ba731e2-20260729-r1/gate-vnext-g08b-cuda
+```
+
+The canonical, focused, and c1 diagnostic artifacts are preserved in the draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-aa32bc08b2eb70787bea).
+The split assets reassemble to
+`runtime-vnext-g08b-cuda-2ba731e2-20260729.tar.zst`, size `167,436,132`
+bytes, SHA256
+`cf588945f13d4ee9cd58228725f1f20ccf21f463873b9d07c93abe4b37e0bf07`.
+All parts were downloaded from GitHub and their individual hashes, the
+reassembled hash, `zstd -t`, and required tar members were verified under
+`/Users/chejinxuan/ferrum-artifacts/github/runtime-vnext-g08b-cuda-2ba731e2-20260729/`.
+Vast instance `45897840` is `stopped/exited`; the final inventory has
+`potentially_billable=[]`.
+
+This refreshes the existing M2 CUDA correctness cell and leaves the global
+matrix at `1/6`; it does not close G08B. The next development lane is the same
+M2 program on Metal with the formal 702-case correctness gate. Per the owner
+decision on 2026-07-29, Metal performance evidence is deferred until the host
+is otherwise idle and must not use the current work-loaded machine state.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint
