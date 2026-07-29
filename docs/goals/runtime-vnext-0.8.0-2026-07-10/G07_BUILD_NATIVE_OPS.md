@@ -397,6 +397,44 @@ PASS, or aggregate G07 PASS. Those items remain Open and must not trigger
 another C13 or 703 sweep unless runtime-affecting source changes invalidate
 this reference.
 
+### 2026-07-30 source/package provenance checkpoint
+
+Clean pushed source `a11b5e58b268a4b68ace820c6837b8d7c946a35e`, tree
+`de06fb2388f1b26a47cd99ecf45a13c3169fd5e2`, closes the local
+source-build-to-package evidence gap. Package specs can no longer self-report
+source package, input hash or build summary and can no longer accept an
+arbitrary archive. The packager requires a terminal PASS source-build receipt
+and its locked plan, then mechanically verifies:
+
+- exact operator and single built compute capability;
+- locked source inventory, plan/source package/input hashes, deterministic
+  environment, tool identities, command lines and object cache keys;
+- source archive SHA256, exact non-metadata archive members and every member's
+  object SHA256 before the descriptor is appended;
+- absolute descriptor compiler/archiver identities, cleared deterministic
+  package environment, exact package commands and non-empty logs.
+
+The package copies the source receipt, plan and command logs into its
+provenance tree. Artifact-set schema v2 carries and re-hashes those files plus
+the package receipt and package build logs during every load. Negative tests
+reject a forged archive member even when the outer archive pin is updated, and
+reject tampered package receipt/log files.
+
+Bounded local evidence is under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-package-provenance-20260730`:
+
+- `builder-lib-final-1`: `17/17` pass in `11.956794s`, peak 4 processes /
+  7 process-group threads / 3 per-process threads;
+- `native-ops-lib-final-1`: `23/23` pass in `1.035972s`, peak 2 processes /
+  5 process-group threads / 3 per-process threads;
+- `builder-check-final-2`: all-targets check PASS in `0.531351s`.
+
+All bounded receipts report no violation and complete process-group cleanup.
+This is a source/test checkpoint, not G07A, G07B or aggregate G07 PASS.
+Dependency depfiles, CUDA toolkit/subtool provenance, one fixed-RTX-4090
+source-build-to-link/load chain, the five-sample timing matrix, workspace
+source gate and canonical validators remain Open.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。
