@@ -7,6 +7,7 @@
 pub mod abi;
 pub mod artifact_set;
 pub mod build_cache;
+pub mod build_unit;
 pub mod manifest;
 pub mod registry;
 pub mod resolver;
@@ -14,6 +15,7 @@ pub mod resolver;
 pub use abi::*;
 pub use artifact_set::*;
 pub use build_cache::*;
+pub use build_unit::*;
 pub use manifest::*;
 pub use registry::*;
 pub use resolver::*;

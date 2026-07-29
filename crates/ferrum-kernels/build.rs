@@ -6,9 +6,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ferrum_native_ops::{
-    legacy_signature_matches_without_numeric_line, load_manifest, NativeBuildArtifactCache,
-    NativeBuildArtifactLookup, NativeBuildArtifactSpec, NativeOperatorArtifactSetLock,
-    NativeOperatorResolveRequest, NativeOperatorResolver, NativeOperatorSystemLibrary,
+    legacy_signature_matches_without_numeric_line, load_manifest, CudaNativeBuildUnit,
+    NativeBuildArtifactCache, NativeBuildArtifactLookup, NativeBuildArtifactSpec,
+    NativeOperatorArtifactSetLock, NativeOperatorResolveRequest, NativeOperatorResolver,
+    NativeOperatorSystemLibrary, ResolvedCudaNativeBuildCoverage,
 };
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
@@ -411,14 +412,39 @@ fn native_dynamic_link_name(path: &Path) -> String {
     );
 }
 
-fn link_native_operator_artifact_set() -> bool {
+fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
+    [
+        ("CARGO_FEATURE_MARLIN", CudaNativeBuildUnit::Marlin),
+        ("CARGO_FEATURE_VLLM_MARLIN", CudaNativeBuildUnit::VllmMarlin),
+        (
+            "CARGO_FEATURE_VLLM_MOE_MARLIN",
+            CudaNativeBuildUnit::VllmMoeMarlin,
+        ),
+        (
+            "CARGO_FEATURE_VLLM_PAGED_ATTN_V2",
+            CudaNativeBuildUnit::VllmPagedAttentionV2,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(feature, unit)| env::var_os(feature).is_some().then_some(unit))
+    .collect()
+}
+
+fn reject_incomplete_native_artifact_set(lock_path: &Path, error: &dyn std::fmt::Display) -> ! {
+    panic!(
+        "native operator artifact set {} does not cover the active CUDA build graph: {error}",
+        lock_path.display()
+    )
+}
+
+fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage> {
     let start = Instant::now();
     let feature_enabled = env::var_os(NATIVE_OP_ARTIFACT_FEATURE_ENV).is_some();
     println!("cargo:rerun-if-env-changed={NATIVE_OP_ARTIFACT_FEATURE_ENV}");
     let lock_path = optional_non_empty_env(NATIVE_OPERATOR_SET_LOCK_ENV);
     let Some(lock_path) = lock_path else {
         println!("cargo:rustc-env={COMPILED_NATIVE_OPERATOR_SET_JSON_ENV}=[]");
-        return false;
+        return None;
     };
     if !feature_enabled {
         panic!("{NATIVE_OPERATOR_SET_LOCK_ENV} requires --features native-op-artifact");
@@ -447,6 +473,12 @@ fn link_native_operator_artifact_set() -> bool {
                     lock_path.display()
                 )
             });
+    let required_build_units = required_cuda_native_build_units();
+    let build_coverage =
+        match ResolvedCudaNativeBuildCoverage::resolve(&resolved_set, required_build_units) {
+            Ok(coverage) => coverage,
+            Err(error) => reject_incomplete_native_artifact_set(&lock_path, &error),
+        };
 
     let cuda_root = cuda_root_from_env();
     if let Some(cuda_root) = cuda_root.as_ref() {
@@ -531,13 +563,18 @@ fn link_native_operator_artifact_set() -> bool {
         "manifest-v2-set-validated",
         start.elapsed(),
         &format!(
-            "lock={}:catalog={}:operators={}",
+            "lock={}:catalog={}:operators={}:build_units={}",
             resolved_set.lock_path.display(),
             resolved_set.g03_catalog_sha256,
-            resolved_set.artifacts.len()
+            resolved_set.artifacts.len(),
+            build_coverage
+                .iter()
+                .map(CudaNativeBuildUnit::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
     );
-    true
+    Some(build_coverage)
 }
 
 fn link_fa2_native_operator_artifact() {
@@ -1071,7 +1108,8 @@ fn emit_cuda_static_link(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    if !link_native_operator_artifact_set() {
+    let native_artifact_coverage = link_native_operator_artifact_set();
+    if native_artifact_coverage.is_none() {
         link_fa2_native_operator_artifact();
     }
 
@@ -1093,14 +1131,40 @@ fn main() {
     // Compile Marlin INT4xFP16 kernel separately (uses runtime API, not PTX).
     // Only when "marlin" feature is enabled. Requires SM >= 8.0 (Ampere).
     if env::var_os("CARGO_FEATURE_MARLIN").is_some() {
-        compile_marlin(&out_dir_clone, native_build_cache.as_ref());
+        if native_artifact_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.contains(CudaNativeBuildUnit::Marlin))
+        {
+            emit_cuda_build_summary(
+                "marlin",
+                "artifact",
+                "native-operator-artifact-set",
+                Duration::ZERO,
+                CudaNativeBuildUnit::Marlin.artifact_operator(),
+            );
+        } else {
+            compile_marlin(&out_dir_clone, native_build_cache.as_ref());
+        }
     }
 
     // vLLM gptq_marlin port (Phase 12). Heavier C++ template instantiations
     // than the IST-DASLab port — compile time ~30 min on first build. Opt-in
     // via `--features vllm-marlin`.
     if env::var_os("CARGO_FEATURE_VLLM_MARLIN").is_some() {
-        compile_vllm_marlin(&out_dir_clone, native_build_cache.as_ref());
+        if native_artifact_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.contains(CudaNativeBuildUnit::VllmMarlin))
+        {
+            emit_cuda_build_summary(
+                "vllm_marlin",
+                "artifact",
+                "native-operator-artifact-set",
+                Duration::ZERO,
+                CudaNativeBuildUnit::VllmMarlin.artifact_operator(),
+            );
+        } else {
+            compile_vllm_marlin(&out_dir_clone, native_build_cache.as_ref());
+        }
     }
 
     // vLLM moe_marlin_wna16 port (Stage 14). Vendored from
@@ -1108,7 +1172,20 @@ fn main() {
     // many template instantiations via COMMON_GET_IF macros — compile
     // time ~15-20 min on first build. Opt-in via `--features vllm-moe-marlin`.
     if env::var_os("CARGO_FEATURE_VLLM_MOE_MARLIN").is_some() {
-        compile_vllm_moe_marlin(&out_dir_clone, native_build_cache.as_ref());
+        if native_artifact_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.contains(CudaNativeBuildUnit::VllmMoeMarlin))
+        {
+            emit_cuda_build_summary(
+                "vllm_moe_marlin",
+                "artifact",
+                "native-operator-artifact-set",
+                Duration::ZERO,
+                CudaNativeBuildUnit::VllmMoeMarlin.artifact_operator(),
+            );
+        } else {
+            compile_vllm_moe_marlin(&out_dir_clone, native_build_cache.as_ref());
+        }
     }
 
     // vLLM paged_attention_v2 port (2026-05-12). Vendored from vllm v0.20.2
@@ -1117,7 +1194,20 @@ fn main() {
     // Builds a static lib of the single (HEAD=128, BLOCK=16, FP16, no-FP8,
     // no-blocksparse) instantiation — ~1-2 min compile.
     if env::var_os("CARGO_FEATURE_VLLM_PAGED_ATTN_V2").is_some() {
-        compile_vllm_paged_attn(&out_dir_clone, native_build_cache.as_ref());
+        if native_artifact_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.contains(CudaNativeBuildUnit::VllmPagedAttentionV2))
+        {
+            emit_cuda_build_summary(
+                "vllm_paged_attn",
+                "artifact",
+                "native-operator-artifact-set",
+                Duration::ZERO,
+                CudaNativeBuildUnit::VllmPagedAttentionV2.artifact_operator(),
+            );
+        } else {
+            compile_vllm_paged_attn(&out_dir_clone, native_build_cache.as_ref());
+        }
     }
 
     // Legacy compatibility switch. The source-linked FA2 path has moved out of
