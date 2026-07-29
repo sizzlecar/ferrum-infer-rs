@@ -228,6 +228,10 @@ fn chat_request_with_tool_protocol(
     ))
 }
 
+fn api_response_after_stop(request: &InferenceRequest, text: &str) -> Option<ApiResponse> {
+    api_response_from_generated_text(request, text, FinishReason::Stop)
+}
+
 #[test]
 fn function_parameter_xml_becomes_structured_chat_response() {
     let request = chat_request_with_tool_protocol(
@@ -245,7 +249,7 @@ c
 </function>
 </tool_call>"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected XML tool call");
     };
     assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
@@ -265,7 +269,101 @@ fn function_parameter_xml_rejects_undeclared_tool() {
     let text =
         r#"<tool_call><function=calendar><parameter=date>today</parameter></function></tool_call>"#;
 
-    assert!(api_response_from_generated_text(&request, text).is_none());
+    assert!(api_response_after_stop(&request, text).is_none());
+}
+
+#[test]
+fn structured_tool_response_requires_a_successful_terminal_reason() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let text =
+        r#"<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"#;
+
+    for finish_reason in [
+        FinishReason::Length,
+        FinishReason::Cancelled,
+        FinishReason::Error,
+        FinishReason::ContentFilter,
+    ] {
+        assert!(
+            api_response_from_generated_text(&request, text, finish_reason).is_none(),
+            "{finish_reason:?} must remain authoritative"
+        );
+    }
+}
+
+#[test]
+fn function_parameter_xml_rejects_incomplete_blocks() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    for text in [
+        "<tool_call><function=weather><parameter=city>Paris</parameter></function>",
+        "<tool_call><function=weather><parameter=city>Paris</parameter></tool_call>",
+        "<tool_call><function=weather><parameter=city>Paris</function></tool_call>",
+    ] {
+        assert!(
+            api_response_after_stop(&request, text).is_none(),
+            "incomplete XML must fail closed: {text}"
+        );
+    }
+}
+
+#[test]
+fn function_parameter_xml_rejects_duplicate_or_unbounded_calls() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let call = |city: &str| {
+        format!(
+            "<tool_call><function=weather><parameter=city>{city}</parameter></function></tool_call>"
+        )
+    };
+    let duplicate = format!("{}{}", call("Paris"), call("Paris"));
+    assert!(api_response_after_stop(&request, &duplicate).is_none());
+
+    let too_many = (0..33)
+        .map(|index| call(&format!("city-{index}")))
+        .collect::<String>();
+    assert!(api_response_after_stop(&request, &too_many).is_none());
+}
+
+#[test]
+fn generated_tool_call_json_rejects_partial_duplicate_or_unbounded_calls() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let call = |city: &str| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "arguments": {"city": city, "unit": "c"}
+            }
+        })
+    };
+
+    let duplicate = json!({"tool_calls": [call("Paris"), call("Paris")]}).to_string();
+    assert!(api_response_after_stop(&request, &duplicate).is_none());
+
+    let partial = json!({
+        "tool_calls": [
+            call("Paris"),
+            {"type": "function", "function": {"name": "undeclared", "arguments": {}}}
+        ]
+    })
+    .to_string();
+    assert!(api_response_after_stop(&request, &partial).is_none());
+
+    let too_many = json!({
+        "tool_calls": (0..33)
+            .map(|index| call(&format!("city-{index}")))
+            .collect::<Vec<_>>()
+    })
+    .to_string();
+    assert!(api_response_after_stop(&request, &too_many).is_none());
 }
 
 #[test]
@@ -281,7 +379,7 @@ fn function_parameter_xml_protocol_keeps_forced_json_arguments_fallback() {
     );
 
     let Some(ApiResponse::Chat(response)) =
-        api_response_from_generated_text(&request, r#"{"city":"Paris","unit":"c"}"#)
+        api_response_after_stop(&request, r#"{"city":"Paris","unit":"c"}"#)
     else {
         panic!("expected forced JSON argument fallback");
     };
@@ -293,7 +391,7 @@ fn generated_tool_call_json_becomes_structured_chat_response() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":{"city":"Paris"}}}]}"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected structured chat tool response");
     };
 
@@ -311,7 +409,7 @@ fn qwen3_function_parameters_json_becomes_structured_tool_call() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"function":"weather","parameters":{"city":"深圳","unit":"c"}}"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected structured chat tool response");
     };
 
@@ -328,7 +426,7 @@ fn qwen3_function_object_with_top_level_parameters_keeps_arguments() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"function":{"name":"weather"},"parameters":{"city":"北京","unit":"c"}}"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected structured chat tool response");
     };
 
@@ -342,7 +440,7 @@ fn llama_auto_tool_wrapper_becomes_structured_tool_call() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"auto":{"tool":"weather","parameters":{"city":"beijing","unit":"c"}}}<|reserved_special_token_55|>"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected llama auto/tool wrapper to map to a structured tool call");
     };
 
@@ -359,7 +457,7 @@ fn single_auto_tool_bare_arguments_json_becomes_structured_tool_call() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"city":"深圳","unit":"c"}"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected bare arguments to map to the only available tool");
     };
 
@@ -391,7 +489,7 @@ fn multi_auto_tool_bare_arguments_json_does_not_guess_tool() {
         },
     });
 
-    assert!(api_response_from_generated_text(&request, r#"{"city":"深圳","unit":"c"}"#).is_none());
+    assert!(api_response_after_stop(&request, r#"{"city":"深圳","unit":"c"}"#).is_none());
 }
 
 #[test]
@@ -415,7 +513,7 @@ fn multi_required_tool_bare_arguments_json_does_not_bind_the_first_tool() {
     });
 
     assert!(
-        api_response_from_generated_text(&request, r#"{"city":"Paris","unit":"c"}"#)
+        api_response_after_stop(&request, r#"{"city":"Paris","unit":"c"}"#)
             .is_none(),
         "tool_choice=required permits any declared tool, so bare arguments must not be assigned to the first tool"
     );
@@ -426,7 +524,7 @@ fn tool_choice_none_keeps_generated_text_unstructured() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("none".to_string())));
     let text = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
 
-    assert!(api_response_from_generated_text(&request, text).is_none());
+    assert!(api_response_after_stop(&request, text).is_none());
 }
 
 #[test]
@@ -434,7 +532,7 @@ fn unregistered_tool_name_keeps_generated_text_unstructured() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"name":"calendar","arguments":{"city":"Paris"}}"#;
 
-    assert!(api_response_from_generated_text(&request, text).is_none());
+    assert!(api_response_after_stop(&request, text).is_none());
 }
 
 #[test]
@@ -476,13 +574,10 @@ fn forced_tool_choice_accepts_only_selected_tool() {
         }),
     );
 
-    assert!(
-        api_response_from_generated_text(&request, r#"{"name":"calendar","arguments":{}}"#)
-            .is_none()
-    );
+    assert!(api_response_after_stop(&request, r#"{"name":"calendar","arguments":{}}"#).is_none());
 
     let Some(ApiResponse::Chat(response)) =
-        api_response_from_generated_text(&request, r#"{"name":"weather","arguments":{}}"#)
+        api_response_after_stop(&request, r#"{"name":"weather","arguments":{}}"#)
     else {
         panic!("expected selected tool call");
     };
@@ -513,7 +608,7 @@ fn generated_legacy_function_call_json_becomes_structured_chat_response() {
 {"function_call":{"name":"weather","arguments":{"city":"Paris"}}}
 ```"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected structured legacy function response");
     };
 
@@ -553,13 +648,13 @@ fn forced_legacy_function_call_accepts_only_selected_function() {
         }),
     );
 
-    assert!(api_response_from_generated_text(
+    assert!(api_response_after_stop(
         &request,
         r#"{"function_call":{"name":"calendar","arguments":{}}}"#
     )
     .is_none());
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(
         &request,
         r#"{"function_call":{"name":"weather","arguments":{}}}"#,
     ) else {
@@ -599,7 +694,7 @@ fn legacy_function_call_still_parses_when_tools_are_present() {
     );
     let text = r#"{"function_call":{"name":"legacy_weather","arguments":{"city":"Paris"}}}"#;
 
-    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
         panic!("expected structured legacy function response");
     };
 

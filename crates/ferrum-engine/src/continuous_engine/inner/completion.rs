@@ -401,8 +401,11 @@ impl EngineInner {
                     .tokenizer
                     .decode(&seq.generated_tokens, true)
                     .unwrap_or_default();
-                let api_response =
-                    ferrum_types::api_response_from_generated_text(&seq.original_request, &text);
+                let api_response = ferrum_types::api_response_from_generated_text(
+                    &seq.original_request,
+                    &text,
+                    finish_reason,
+                );
                 let prompt_token_count = seq.input_tokens.len();
                 let execution_evidence = seq
                     .original_request
