@@ -26,7 +26,7 @@ use tempfile::{Builder as TempBuilder, NamedTempFile};
 use thiserror::Error;
 
 pub const NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 3;
 
 pub use source_build::*;
 
@@ -57,12 +57,16 @@ pub struct NativeOperatorLicenseInput {
 pub struct NativeOperatorPackageReceipt {
     pub schema_version: u32,
     pub operator: String,
+    pub package_spec: NativeOperatorEvidenceFile,
     pub source_build_receipt: NativeOperatorEvidenceFile,
     pub source_build_plan: NativeOperatorEvidenceFile,
     pub source_build_logs: Vec<NativeOperatorEvidenceFile>,
     pub source_archive_sha256: String,
     pub source_archive_members: Vec<NativeOperatorArchiveMemberEvidence>,
     pub source_archive_verification: NativeOperatorEvidenceFile,
+    pub descriptor_object: NativeOperatorArchiveMemberEvidence,
+    pub final_archive_members: Vec<NativeOperatorArchiveMemberEvidence>,
+    pub final_archive_verification: NativeOperatorEvidenceFile,
     pub manifest_file: String,
     pub artifact_file: String,
     pub manifest_sha256: String,
@@ -70,6 +74,7 @@ pub struct NativeOperatorPackageReceipt {
     pub g03_catalog_sha256: String,
     pub abi_contract_sha256: String,
     pub descriptor_export: String,
+    pub license_files: Vec<NativeOperatorEvidenceFile>,
     pub system_libraries: Vec<NativeOperatorSystemLibrary>,
     pub package_toolchain: NativeOperatorPackageToolchain,
     pub package_environment: BTreeMap<String, String>,
@@ -80,6 +85,7 @@ pub struct NativeOperatorPackageReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorPackageToolchain {
     pub descriptor_compiler: NativeOperatorToolIdentity,
+    pub descriptor_target: String,
     pub archiver: NativeOperatorToolIdentity,
 }
 
@@ -97,6 +103,8 @@ pub struct NativeOperatorPackageCommand {
 pub struct NativeOperatorArchiveMemberEvidence {
     pub member: String,
     pub sha256: String,
+    pub size_bytes: u64,
+    pub object_identity: NativeOperatorObjectIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +123,8 @@ pub struct NativeOperatorPackageRequest {
 #[derive(Debug, Clone)]
 pub struct NativeOperatorSetRequest {
     pub receipt_paths: Vec<PathBuf>,
+    pub expected_receipt_sha256: Vec<String>,
+    pub expected_g03_catalog_sha256: String,
     pub output_lock_path: PathBuf,
     pub compute_capability: String,
 }
@@ -173,7 +183,8 @@ pub fn package_native_operator(
             request.output_dir.clone(),
         ));
     }
-    let spec: NativeOperatorPackageSpec = read_json(&request.spec_path)?;
+    let (spec, spec_sha256): (NativeOperatorPackageSpec, String) =
+        read_json_with_sha256(&request.spec_path)?;
     validate_package_spec(&spec)?;
     let source_root =
         request
@@ -197,6 +208,7 @@ pub fn package_native_operator(
     )?;
     let package_toolchain = NativeOperatorPackageToolchain {
         descriptor_compiler: tool_identity(&request.cc)?,
+        descriptor_target: compiler_target(&request.cc)?,
         archiver: tool_identity(&request.ar)?,
     };
     let package_environment = package_build_environment(&package_toolchain)?;
@@ -225,6 +237,17 @@ pub fn package_native_operator(
             path: output_parent.to_path_buf(),
             source,
         })?;
+    let package_spec = copy_evidence_file(
+        &request.spec_path,
+        staging.path(),
+        "provenance/package.spec.json",
+    )?;
+    if package_spec.sha256 != spec_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package spec changed while packaging",
+            spec.operator
+        )));
+    }
     let source_build_receipt = copy_evidence_file(
         &request.source_build_receipt_path,
         staging.path(),
@@ -266,12 +289,15 @@ pub fn package_native_operator(
             spec.operator, source_build.source_archive_sha256
         )));
     }
-    let (source_archive_members, source_archive_verification) = verify_source_archive_members(
+    let source_archive_expected = source_archive_member_expectations(&source_build.receipt)?;
+    let (source_archive_members, source_archive_verification) = verify_archive_members(
         &artifact_path,
-        &source_build.receipt,
+        &source_build.receipt.operator,
+        &source_archive_expected,
         &package_toolchain.archiver.path,
         staging.path(),
         &package_environment,
+        "build-logs/source-archive-verify.log",
     )?;
 
     let descriptor_source = staging.path().join("descriptor.c");
@@ -307,6 +333,12 @@ pub fn package_native_operator(
         "build-logs/descriptor-compile.stderr.log",
         &package_environment,
     )?;
+    let descriptor_object_evidence =
+        archive_member_evidence_file("descriptor.o", &descriptor_object)?;
+    let mut final_archive_expected = source_archive_members.clone();
+    final_archive_expected.push(descriptor_object_evidence.clone());
+    final_archive_expected.sort_by(|left, right| left.member.cmp(&right.member));
+    validate_archive_member_evidence(&spec.operator, &final_archive_expected)?;
     let descriptor_archive = run_package_command(
         &package_toolchain.archiver.path,
         vec![
@@ -319,8 +351,20 @@ pub fn package_native_operator(
         "build-logs/descriptor-archive.stderr.log",
         &package_environment,
     )?;
+    let (final_archive_members, final_archive_verification) = verify_archive_members(
+        &artifact_path,
+        &spec.operator,
+        &final_archive_expected,
+        &package_toolchain.archiver.path,
+        staging.path(),
+        &package_environment,
+        "build-logs/final-archive-verify.log",
+    )?;
     let package_commands = vec![descriptor_compile, descriptor_archive];
-    let mut package_build_logs = vec![source_archive_verification.clone()];
+    let mut package_build_logs = vec![
+        source_archive_verification.clone(),
+        final_archive_verification.clone(),
+    ];
     package_build_logs.extend(
         package_commands
             .iter()
@@ -331,19 +375,14 @@ pub fn package_native_operator(
     package_build_logs.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut license_files = Vec::with_capacity(spec.license_files.len());
+    let mut license_evidence = Vec::with_capacity(spec.license_files.len());
     for license in &spec.license_files {
         let source = resolve_relative_file(&source_root, &license.source_path)?;
-        let destination = staging.path().join(&license.output_path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|source| NativeOperatorBuilderError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        fs::copy(&source, &destination).map_err(|source| NativeOperatorBuilderError::Io {
-            path: destination,
-            source,
-        })?;
+        license_evidence.push(copy_evidence_file(
+            &source,
+            staging.path(),
+            &license.output_path,
+        )?);
         license_files.push(license.output_path.clone());
     }
 
@@ -370,7 +409,7 @@ pub fn package_native_operator(
         operation_bindings: spec.operation_bindings.clone(),
         exports: exports.clone(),
         license_files,
-        build_summary: source_build.build_summary,
+        build_summary: source_build.build_summary.clone(),
     };
     manifest
         .validate()
@@ -397,13 +436,17 @@ pub fn package_native_operator(
     let manifest_sha256 = sha256_file(&manifest_path)?;
     let receipt = NativeOperatorPackageReceipt {
         schema_version: NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION,
-        operator: spec.operator,
+        operator: spec.operator.clone(),
+        package_spec,
         source_build_receipt,
         source_build_plan,
         source_build_logs,
-        source_archive_sha256: source_build.source_archive_sha256,
+        source_archive_sha256: source_build.source_archive_sha256.clone(),
         source_archive_members,
         source_archive_verification,
+        descriptor_object: descriptor_object_evidence,
+        final_archive_members,
+        final_archive_verification,
         manifest_file,
         artifact_file,
         manifest_sha256,
@@ -411,12 +454,25 @@ pub fn package_native_operator(
         g03_catalog_sha256,
         abi_contract_sha256,
         descriptor_export,
-        system_libraries: spec.system_libraries,
+        license_files: license_evidence,
+        system_libraries: spec.system_libraries.clone(),
         package_toolchain,
         package_environment,
         package_commands,
         package_build_logs,
     };
+    validate_package_receipt(&receipt)?;
+    let source_plan = verify_source_build_receipt_against_plan_portable(
+        &source_build.receipt,
+        &source_build.plan_path,
+    )?;
+    validate_package_semantic_links(
+        &receipt,
+        &spec,
+        &source_build.receipt,
+        &source_plan,
+        &manifest,
+    )?;
     write_json(&staging.path().join(receipt_file), &receipt)?;
     fs::remove_file(&descriptor_source).map_err(|source| NativeOperatorBuilderError::Io {
         path: descriptor_source,
@@ -483,11 +539,28 @@ fn load_source_build_for_package(
         )));
     }
 
-    let toolchain = receipt
-        .toolchain
-        .as_ref()
-        .expect("validated PASS receipt has toolchain");
-    let build_summary = NativeOperatorBuildSummary {
+    let build_summary = source_build_summary(&receipt)?;
+
+    Ok(ValidatedSourceBuildForPackage {
+        receipt,
+        receipt_sha256,
+        plan_path: plan_path.to_path_buf(),
+        archive_path,
+        source_archive_sha256,
+        build_summary,
+    })
+}
+
+fn source_build_summary(
+    receipt: &NativeOperatorSourceBuildReceipt,
+) -> Result<NativeOperatorBuildSummary> {
+    let toolchain = receipt.toolchain.as_ref().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "{} PASS source-build receipt is missing toolchain provenance",
+            receipt.operator
+        ))
+    })?;
+    Ok(NativeOperatorBuildSummary {
         builder_sha: receipt.builder_sha.clone(),
         elapsed_ms: receipt.elapsed_ms,
         nvcc_version: Some(normalize_tool_version(&toolchain.nvcc.version)),
@@ -497,15 +570,6 @@ fn load_source_build_for_package(
             toolchain.host_compiler.sha256,
             normalize_tool_version(&toolchain.host_compiler.version)
         ),
-    };
-
-    Ok(ValidatedSourceBuildForPackage {
-        receipt,
-        receipt_sha256,
-        plan_path: plan_path.to_path_buf(),
-        archive_path,
-        source_archive_sha256,
-        build_summary,
     })
 }
 
@@ -631,6 +695,15 @@ fn validate_source_build_for_package(
             )));
         }
     }
+    if toolchain.host_target.trim().is_empty()
+        || toolchain.host_target.len() > 256
+        || toolchain.host_target.chars().any(char::is_whitespace)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build host target identity is invalid",
+            receipt.operator
+        )));
+    }
 
     if receipt.commands.len() < 2 {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -679,6 +752,8 @@ fn validate_source_build_for_package(
                 .object_sha256
                 .as_deref()
                 .is_some_and(is_sha256_digest)
+            || command.object_size_bytes.is_none_or(|size| size == 0)
+            || command.object_identity.is_none()
             || command
                 .object_cache_entry
                 .as_deref()
@@ -690,6 +765,13 @@ fn validate_source_build_for_package(
                 receipt.operator
             )));
         }
+        validate_native_object_identity(
+            command
+                .object_identity
+                .as_ref()
+                .expect("validated object identity"),
+            translation_unit,
+        )?;
         match command.object_cache_status {
             Some(NativeOperatorSourceObjectCacheStatus::Hit)
                 if !command.compiler_executed && command.return_code.is_none() =>
@@ -715,6 +797,8 @@ fn validate_source_build_for_package(
         || archive_command.object_cache_status.is_some()
         || archive_command.object_cache_key.is_some()
         || archive_command.object_sha256.is_some()
+        || archive_command.object_size_bytes.is_some()
+        || archive_command.object_identity.is_some()
         || archive_command.return_code != Some(0)
         || archive_command.elapsed_ms.is_none()
     {
@@ -854,25 +938,9 @@ fn evidence_file_at(package_root: &Path, relative: &str) -> Result<NativeOperato
     })
 }
 
-fn verify_source_archive_members(
-    archive_path: &Path,
+fn source_archive_member_expectations(
     receipt: &NativeOperatorSourceBuildReceipt,
-    archiver: &str,
-    package_root: &Path,
-    environment: &BTreeMap<String, String>,
-) -> Result<(
-    Vec<NativeOperatorArchiveMemberEvidence>,
-    NativeOperatorEvidenceFile,
-)> {
-    let archive_file = archive_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| {
-            NativeOperatorBuilderError::Invalid(format!(
-                "source archive has no UTF-8 file name: {}",
-                archive_path.display()
-            ))
-        })?;
+) -> Result<Vec<NativeOperatorArchiveMemberEvidence>> {
     let translation_unit_commands = receipt
         .commands
         .get(..receipt.commands.len().saturating_sub(1))
@@ -908,20 +976,87 @@ fn verify_source_archive_members(
                     receipt.operator
                 ))
             })?;
-            Ok((member, sha256))
+            let size_bytes = command
+                .object_size_bytes
+                .filter(|size| *size > 0)
+                .ok_or_else(|| {
+                    NativeOperatorBuilderError::Invalid(format!(
+                        "{} source-build command is missing object_size_bytes: {member}",
+                        receipt.operator
+                    ))
+                })?;
+            let object_identity = command.object_identity.clone().ok_or_else(|| {
+                NativeOperatorBuilderError::Invalid(format!(
+                    "{} source-build command is missing object_identity: {member}",
+                    receipt.operator
+                ))
+            })?;
+            validate_native_object_identity(&object_identity, &member)?;
+            Ok(NativeOperatorArchiveMemberEvidence {
+                member,
+                sha256,
+                size_bytes,
+                object_identity,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
-    if expected.is_empty()
-        || expected
-            .windows(2)
-            .any(|pair| pair[0].0.as_str() >= pair[1].0.as_str())
-    {
-        return Err(NativeOperatorBuilderError::Invalid(format!(
-            "{} source-build archive members must be sorted, unique, and non-empty",
-            receipt.operator
-        )));
-    }
+    validate_archive_member_evidence(&receipt.operator, &expected)?;
+    Ok(expected)
+}
 
+fn verify_archive_members(
+    archive_path: &Path,
+    operator: &str,
+    expected: &[NativeOperatorArchiveMemberEvidence],
+    archiver: &str,
+    package_root: &Path,
+    environment: &BTreeMap<String, String>,
+    verification_log: &str,
+) -> Result<(
+    Vec<NativeOperatorArchiveMemberEvidence>,
+    NativeOperatorEvidenceFile,
+)> {
+    validate_relative_path(verification_log)?;
+    let (evidence, log) = inspect_archive_members(
+        archive_path,
+        operator,
+        expected,
+        archiver,
+        package_root,
+        environment,
+    )?;
+    let verification_path = package_root.join(verification_log);
+    if let Some(parent) = verification_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NativeOperatorBuilderError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(&verification_path, log).map_err(|source| NativeOperatorBuilderError::Io {
+        path: verification_path,
+        source,
+    })?;
+    Ok((evidence, evidence_file_at(package_root, verification_log)?))
+}
+
+fn inspect_archive_members(
+    archive_path: &Path,
+    operator: &str,
+    expected: &[NativeOperatorArchiveMemberEvidence],
+    archiver: &str,
+    package_root: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<(Vec<NativeOperatorArchiveMemberEvidence>, String)> {
+    validate_archive_member_evidence(operator, expected)?;
+    let archive_file = archive_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "native archive has no UTF-8 file name: {}",
+                archive_path.display()
+            ))
+        })?;
     let list_output = Command::new(archiver)
         .args(["t", archive_file])
         .current_dir(package_root)
@@ -946,8 +1081,7 @@ fn verify_source_archive_members(
     let raw_listed = std::str::from_utf8(&list_output.stdout)
         .map_err(|_| {
             NativeOperatorBuilderError::Invalid(format!(
-                "{} source archive member list is not UTF-8",
-                receipt.operator
+                "{operator} native archive member list is not UTF-8"
             ))
         })?
         .lines()
@@ -962,25 +1096,25 @@ fn verify_source_archive_members(
         .collect::<Vec<_>>();
     let expected_names = expected
         .iter()
-        .map(|(member, _)| member.clone())
+        .map(|evidence| evidence.member.clone())
         .collect::<Vec<_>>();
     if listed != expected_names {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "{} source archive members differ from source-build receipt: expected={expected_names:?} actual={listed:?}",
-            receipt.operator
+            "{operator} native archive members differ from expected evidence: expected={expected_names:?} actual={listed:?}"
         )));
     }
 
     let mut evidence = Vec::with_capacity(expected.len());
     let mut log = format!(
         "operator={}\narchive={archive_file}\narchive_sha256={}\nargv={} t {archive_file}\nraw_members={}\nmembers={}\n",
-        receipt.operator,
+        operator,
         sha256_file(archive_path)?,
         archiver,
         raw_listed.join(","),
         expected_names.join(",")
     );
-    for (member, expected_sha256) in expected {
+    for expected_member in expected {
+        let member = &expected_member.member;
         let output = Command::new(archiver)
             .args(["p", archive_file, &member])
             .current_dir(package_root)
@@ -1003,34 +1137,90 @@ fn verify_source_archive_members(
             });
         }
         let actual_sha256 = sha256_bytes(&output.stdout);
-        if actual_sha256 != expected_sha256 {
+        let actual_size = u64::try_from(output.stdout.len()).unwrap_or(u64::MAX);
+        let object_identity = native_object_identity_bytes(&output.stdout, member)?;
+        if actual_sha256 != expected_member.sha256
+            || actual_size != expected_member.size_bytes
+            || object_identity != expected_member.object_identity
+        {
             return Err(NativeOperatorBuilderError::Invalid(format!(
-                "{} source archive member hash mismatch: member={member} expected={expected_sha256} actual={actual_sha256}",
-                receipt.operator
+                "{operator} native archive member evidence mismatch: member={member} expected_sha256={} actual_sha256={actual_sha256} expected_size={} actual_size={actual_size} expected_identity={:?} actual_identity={object_identity:?}",
+                expected_member.sha256,
+                expected_member.size_bytes,
+                expected_member.object_identity
             )));
         }
         log.push_str(&format!(
-            "argv={archiver} p {archive_file} {member}\nmember={member} sha256={actual_sha256} size_bytes={}\n",
-            output.stdout.len()
+            "argv={archiver} p {archive_file} {member}\nmember={member} sha256={actual_sha256} size_bytes={actual_size} object_identity={object_identity:?}\n"
         ));
         evidence.push(NativeOperatorArchiveMemberEvidence {
-            member,
+            member: member.clone(),
             sha256: actual_sha256,
+            size_bytes: actual_size,
+            object_identity,
         });
     }
-    let verification_log = "build-logs/source-archive-verify.log";
-    let verification_path = package_root.join(verification_log);
-    if let Some(parent) = verification_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| NativeOperatorBuilderError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+    Ok((evidence, log))
+}
+
+fn validate_archive_member_evidence(
+    operator: &str,
+    members: &[NativeOperatorArchiveMemberEvidence],
+) -> Result<()> {
+    if members.is_empty()
+        || members
+            .windows(2)
+            .any(|pair| pair[0].member >= pair[1].member)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} archive members must be sorted, unique, and non-empty"
+        )));
     }
-    fs::write(&verification_path, log).map_err(|source| NativeOperatorBuilderError::Io {
-        path: verification_path,
+    let expected_identity = &members[0].object_identity;
+    for member in members {
+        validate_relative_path(&member.member)?;
+        if Path::new(&member.member).parent() != Some(Path::new(""))
+            || !is_sha256_digest(&member.sha256)
+            || member.size_bytes == 0
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{operator} archive member evidence is incomplete: {}",
+                member.member
+            )));
+        }
+        validate_native_object_identity(&member.object_identity, &member.member)?;
+        if member.object_identity != *expected_identity {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{operator} archive mixes object targets: first={expected_identity:?} member={} actual={:?}",
+                member.member, member.object_identity
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn archive_member_evidence_file(
+    member: &str,
+    path: &Path,
+) -> Result<NativeOperatorArchiveMemberEvidence> {
+    validate_relative_path(member)?;
+    require_file(path)?;
+    let bytes = fs::read(path).map_err(|source| NativeOperatorBuilderError::Io {
+        path: path.to_path_buf(),
         source,
     })?;
-    Ok((evidence, evidence_file_at(package_root, verification_log)?))
+    let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if size_bytes == 0 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "archive member object is empty: {member}"
+        )));
+    }
+    Ok(NativeOperatorArchiveMemberEvidence {
+        member: member.to_string(),
+        sha256: sha256_bytes(&bytes),
+        size_bytes,
+        object_identity: native_object_identity_bytes(&bytes, member)?,
+    })
 }
 
 fn is_archive_metadata_member(member: &str) -> bool {
@@ -1038,6 +1228,29 @@ fn is_archive_metadata_member(member: &str) -> bool {
         member,
         "/" | "//" | "__.SYMDEF" | "__.SYMDEF SORTED" | "__.SYMDEF_64" | "__.SYMDEF_64 SORTED"
     )
+}
+
+fn validate_recorded_tool_binary(
+    operator: &str,
+    name: &str,
+    tool: &NativeOperatorToolIdentity,
+) -> Result<()> {
+    let path = Path::new(&tool.path);
+    require_file(path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let actual_path = canonical.display().to_string();
+    let actual_sha256 = sha256_file(&canonical)?;
+    if actual_path != tool.path || actual_sha256 != tool.sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} recorded {name} binary changed before artifact-set assembly"
+        )));
+    }
+    Ok(())
 }
 
 fn package_build_environment(
@@ -1151,6 +1364,21 @@ pub fn assemble_native_operator_set(
             "artifact set requires at least one package receipt".to_string(),
         ));
     }
+    if request.expected_receipt_sha256.len() != request.receipt_paths.len()
+        || request
+            .expected_receipt_sha256
+            .iter()
+            .any(|digest| !is_sha256_digest(digest))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "artifact set requires one external receipt sha256 pin per package".to_string(),
+        ));
+    }
+    if !is_sha256_digest(&request.expected_g03_catalog_sha256) {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "artifact set requires an external g03 catalog sha256 pin".to_string(),
+        ));
+    }
     if request.output_lock_path.exists() {
         return Err(NativeOperatorBuilderError::OutputExists(
             request.output_lock_path.clone(),
@@ -1176,26 +1404,37 @@ pub fn assemble_native_operator_set(
             source,
         })?;
 
-    let mut expected_catalog: Option<String> = None;
     let mut artifacts = Vec::with_capacity(request.receipt_paths.len());
-    for receipt_path in &request.receipt_paths {
+    for (receipt_path, expected_receipt_sha256) in request
+        .receipt_paths
+        .iter()
+        .zip(&request.expected_receipt_sha256)
+    {
         require_file(receipt_path)?;
+        let actual_receipt_sha256 = sha256_file(receipt_path)?;
+        if &actual_receipt_sha256 != expected_receipt_sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "package receipt differs from its external sha256 pin: path={} expected={expected_receipt_sha256} actual={actual_receipt_sha256}",
+                receipt_path.display()
+            )));
+        }
         let receipt: NativeOperatorPackageReceipt = read_json(receipt_path)?;
         validate_package_receipt(&receipt)?;
-        match expected_catalog.as_deref() {
-            Some(expected) if expected != receipt.g03_catalog_sha256 => {
-                return Err(NativeOperatorBuilderError::Invalid(format!(
-                    "package {} catalog differs from artifact set: expected={expected} actual={}",
-                    receipt.operator, receipt.g03_catalog_sha256
-                )))
-            }
-            None => expected_catalog = Some(receipt.g03_catalog_sha256.clone()),
-            _ => {}
+        if receipt.g03_catalog_sha256 != request.expected_g03_catalog_sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "package {} catalog differs from the external artifact-set pin: expected={} actual={}",
+                receipt.operator,
+                request.expected_g03_catalog_sha256,
+                receipt.g03_catalog_sha256
+            )));
         }
         let package_root = receipt_path.parent().unwrap_or_else(|| Path::new("."));
         let package_receipt = resolve_file_evidence(receipt_path, &canonical_root)?;
         let manifest_path = resolve_relative_file(package_root, &receipt.manifest_file)?;
+        let manifest_evidence = resolve_file_evidence(&manifest_path, &canonical_root)?;
         let artifact_path = resolve_relative_file(package_root, &receipt.artifact_file)?;
+        let package_spec =
+            resolve_package_evidence(package_root, &canonical_root, &receipt.package_spec)?;
         let source_build_receipt =
             resolve_package_evidence(package_root, &canonical_root, &receipt.source_build_receipt)?;
         let source_build_plan =
@@ -1210,7 +1449,26 @@ pub fn assemble_native_operator_set(
             .iter()
             .map(|evidence| resolve_package_evidence(package_root, &canonical_root, evidence))
             .collect::<Result<Vec<_>>>()?;
-        if sha256_file(&manifest_path)? != receipt.manifest_sha256 {
+        let license_files = receipt
+            .license_files
+            .iter()
+            .map(|evidence| resolve_package_evidence(package_root, &canonical_root, evidence))
+            .collect::<Result<Vec<_>>>()?;
+        let package_spec_path = resolve_relative_file(package_root, &receipt.package_spec.path)?;
+        let source_build_receipt_path =
+            resolve_relative_file(package_root, &receipt.source_build_receipt.path)?;
+        let source_build_plan_path =
+            resolve_relative_file(package_root, &receipt.source_build_plan.path)?;
+        let packaged_spec: NativeOperatorPackageSpec = read_json(&package_spec_path)?;
+        let packaged_source_build: NativeOperatorSourceBuildReceipt =
+            read_json(&source_build_receipt_path)?;
+        validate_package_spec(&packaged_spec)?;
+        validate_source_build_for_package(&packaged_source_build, &packaged_spec)?;
+        let packaged_source_plan = verify_source_build_receipt_against_plan_portable(
+            &packaged_source_build,
+            &source_build_plan_path,
+        )?;
+        if manifest_evidence.sha256 != receipt.manifest_sha256 {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "{} manifest sha256 differs from its package receipt",
                 receipt.operator
@@ -1222,21 +1480,31 @@ pub fn assemble_native_operator_set(
                 receipt.operator
             )));
         }
+        validate_recorded_tool_binary(
+            &receipt.operator,
+            "archiver",
+            &receipt.package_toolchain.archiver,
+        )?;
+        let package_environment = package_build_environment(&receipt.package_toolchain)?;
+        inspect_archive_members(
+            &artifact_path,
+            &receipt.operator,
+            &receipt.final_archive_members,
+            &receipt.package_toolchain.archiver.path,
+            package_root,
+            &package_environment,
+        )?;
         let manifest: NativeOperatorManifest = read_json(&manifest_path)?;
         manifest
             .validate()
             .map_err(NativeOperatorBuilderError::Invalid)?;
-        if manifest.operator != receipt.operator
-            || manifest.binary_sha256 != receipt.binary_sha256
-            || manifest.g03_catalog_sha256.as_deref() != Some(&receipt.g03_catalog_sha256)
-            || manifest.abi_contract_sha256.as_deref() != Some(&receipt.abi_contract_sha256)
-            || manifest.descriptor_export.as_deref() != Some(&receipt.descriptor_export)
-        {
-            return Err(NativeOperatorBuilderError::Invalid(format!(
-                "{} package receipt does not match its manifest",
-                receipt.operator
-            )));
-        }
+        validate_package_semantic_links(
+            &receipt,
+            &packaged_spec,
+            &packaged_source_build,
+            &packaged_source_plan,
+            &manifest,
+        )?;
         NativeOperatorResolver.resolve(
             &NativeOperatorResolveRequest::new(
                 manifest.operator.clone(),
@@ -1258,17 +1526,20 @@ pub fn assemble_native_operator_set(
             operator: manifest.operator,
             backend: manifest.backend,
             manifest_path: relative_path(&canonical_root, &manifest_path)?,
+            manifest: manifest_evidence,
             artifact_path: relative_path(&canonical_root, &artifact_path)?,
             operator_abi_version: manifest.operator_abi_version,
             ferrum_native_abi_version: manifest.ferrum_native_abi_version,
             source_package_sha256: manifest.source_package.sha256,
             inputs_sha256: manifest.inputs_sha256,
+            package_spec,
             source_build_receipt,
             source_build_plan,
             source_build_logs,
             source_archive_sha256: receipt.source_archive_sha256,
             package_receipt,
             package_build_logs,
+            license_files,
             binary_sha256: receipt.binary_sha256,
             abi_contract_sha256: receipt.abi_contract_sha256,
             descriptor_export: receipt.descriptor_export,
@@ -1288,7 +1559,7 @@ pub fn assemble_native_operator_set(
     }
     let lock = NativeOperatorArtifactSetLock {
         schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
-        g03_catalog_sha256: expected_catalog.expect("non-empty receipts"),
+        g03_catalog_sha256: request.expected_g03_catalog_sha256.clone(),
         artifacts,
     };
 
@@ -1412,6 +1683,7 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
     }
     validate_relative_path(&receipt.manifest_file)?;
     validate_relative_path(&receipt.artifact_file)?;
+    validate_evidence_record("package_spec", &receipt.package_spec)?;
     validate_evidence_record("source_build_receipt", &receipt.source_build_receipt)?;
     validate_evidence_record("source_build_plan", &receipt.source_build_plan)?;
     if receipt.source_build_logs.is_empty()
@@ -1432,27 +1704,44 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
         "source_archive_verification",
         &receipt.source_archive_verification,
     )?;
-    if receipt.source_archive_members.is_empty()
-        || receipt
-            .source_archive_members
-            .windows(2)
-            .any(|pair| pair[0].member >= pair[1].member)
-    {
+    validate_archive_member_evidence(&receipt.operator, &receipt.source_archive_members)?;
+    validate_archive_member_evidence(
+        &receipt.operator,
+        std::slice::from_ref(&receipt.descriptor_object),
+    )?;
+    if receipt.descriptor_object.member != "descriptor.o" {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "{} package receipt source_archive_members must be sorted, unique, and non-empty",
+            "{} package descriptor object must be descriptor.o",
             receipt.operator
         )));
     }
-    for member in &receipt.source_archive_members {
-        validate_relative_path(&member.member)?;
-        if Path::new(&member.member).parent() != Some(Path::new(""))
-            || !is_sha256_digest(&member.sha256)
-        {
-            return Err(NativeOperatorBuilderError::Invalid(format!(
-                "{} package receipt source archive member is invalid: {}",
-                receipt.operator, member.member
-            )));
-        }
+    let mut expected_final_members = receipt.source_archive_members.clone();
+    expected_final_members.push(receipt.descriptor_object.clone());
+    expected_final_members.sort_by(|left, right| left.member.cmp(&right.member));
+    if receipt.final_archive_members != expected_final_members {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} final archive members must exactly equal source members plus descriptor.o",
+            receipt.operator
+        )));
+    }
+    validate_archive_member_evidence(&receipt.operator, &receipt.final_archive_members)?;
+    validate_evidence_record(
+        "final_archive_verification",
+        &receipt.final_archive_verification,
+    )?;
+    if receipt.license_files.is_empty()
+        || receipt
+            .license_files
+            .windows(2)
+            .any(|pair| pair[0].path >= pair[1].path)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package receipt license_files must be sorted, unique, and non-empty",
+            receipt.operator
+        )));
+    }
+    for evidence in &receipt.license_files {
+        validate_evidence_record("license_file", evidence)?;
     }
     for (field, digest) in [
         ("source_archive_sha256", &receipt.source_archive_sha256),
@@ -1494,6 +1783,23 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
                 receipt.operator
             )));
         }
+    }
+    if receipt
+        .package_toolchain
+        .descriptor_target
+        .trim()
+        .is_empty()
+        || receipt.package_toolchain.descriptor_target.len() > 256
+        || receipt
+            .package_toolchain
+            .descriptor_target
+            .chars()
+            .any(char::is_whitespace)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package descriptor target identity is invalid",
+            receipt.operator
+        )));
     }
     let expected_environment = package_build_environment(&receipt.package_toolchain)?;
     if receipt.package_environment != expected_environment {
@@ -1567,7 +1873,10 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
     for evidence in &receipt.package_build_logs {
         validate_evidence_record("package_build_log", evidence)?;
     }
-    let mut expected_log_paths = vec![receipt.source_archive_verification.path.clone()];
+    let mut expected_log_paths = vec![
+        receipt.source_archive_verification.path.clone(),
+        receipt.final_archive_verification.path.clone(),
+    ];
     expected_log_paths.extend(
         receipt
             .package_commands
@@ -1584,9 +1893,134 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
         || !receipt
             .package_build_logs
             .contains(&receipt.source_archive_verification)
+        || !receipt
+            .package_build_logs
+            .contains(&receipt.final_archive_verification)
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} package build-log evidence does not match recorded commands",
+            receipt.operator
+        )));
+    }
+    Ok(())
+}
+
+fn validate_package_semantic_links(
+    receipt: &NativeOperatorPackageReceipt,
+    spec: &NativeOperatorPackageSpec,
+    source_build: &NativeOperatorSourceBuildReceipt,
+    source_plan: &NativeOperatorSourceBuildPlan,
+    manifest: &NativeOperatorManifest,
+) -> Result<()> {
+    validate_package_spec(spec)?;
+    validate_source_build_for_package(source_build, spec)?;
+
+    if receipt.operator != spec.operator
+        || source_plan.operator != spec.operator
+        || source_plan.source_package != source_build.source_package
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package spec, source receipt, and source plan identities differ",
+            receipt.operator
+        )));
+    }
+    if receipt.package_spec.path != "provenance/package.spec.json"
+        || receipt.source_build_receipt.path != "provenance/source-build.receipt.json"
+        || receipt.source_build_plan.path != "provenance/source-build.plan.json"
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package provenance paths differ from the deterministic layout",
+            receipt.operator
+        )));
+    }
+
+    let expected_source_log_paths = source_build
+        .commands
+        .iter()
+        .flat_map(|command| [&command.stdout_log, &command.stderr_log])
+        .map(|relative| format!("provenance/{relative}"))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let actual_source_log_paths = receipt
+        .source_build_logs
+        .iter()
+        .map(|evidence| evidence.path.clone())
+        .collect::<Vec<_>>();
+    if actual_source_log_paths != expected_source_log_paths {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} packaged source-build logs do not exactly match its command graph",
+            receipt.operator
+        )));
+    }
+
+    if receipt.source_archive_sha256 != source_build.archive_sha256.as_deref().unwrap_or_default() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package source archive pin differs from the source-build receipt",
+            receipt.operator
+        )));
+    }
+    let expected_source_members = source_archive_member_expectations(source_build)?;
+    if receipt.source_archive_members != expected_source_members {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package source archive members differ from source-build object evidence",
+            receipt.operator
+        )));
+    }
+
+    let identity_suffix = &sha256_bytes(spec.operator.as_bytes())[..12];
+    let symbol_slug = symbol_slug(&spec.operator)?;
+    let expected_descriptor =
+        format!("ferrum_native_{symbol_slug}_{identity_suffix}_descriptor_v2");
+    let expected_artifact = format!("libferrum_native_{symbol_slug}_{identity_suffix}.a");
+    let mut expected_exports = spec.required_exports.clone();
+    expected_exports.push(expected_descriptor.clone());
+    expected_exports.sort();
+    let expected_license_paths = spec
+        .license_files
+        .iter()
+        .map(|license| license.output_path.clone())
+        .collect::<Vec<_>>();
+    let actual_license_paths = receipt
+        .license_files
+        .iter()
+        .map(|evidence| evidence.path.clone())
+        .collect::<Vec<_>>();
+
+    if receipt.descriptor_export != expected_descriptor
+        || receipt.manifest_file != "native_operator_manifest.json"
+        || receipt.artifact_file != expected_artifact
+        || receipt.system_libraries != spec.system_libraries
+        || actual_license_paths != expected_license_paths
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package receipt differs from its deterministic spec projection",
+            receipt.operator
+        )));
+    }
+
+    let expected_build_summary = source_build_summary(source_build)?;
+    if manifest.operator != spec.operator
+        || manifest.operator_abi_version != spec.operator_abi_version
+        || manifest.ferrum_native_abi_version != FERRUM_NATIVE_OPERATOR_ABI_VERSION
+        || manifest.backend != spec.backend
+        || manifest.cuda_toolkit != spec.cuda_toolkit
+        || manifest.cuda_runtime_min != spec.cuda_runtime_min
+        || manifest.compute_capabilities != spec.compute_capabilities
+        || manifest.source_package != source_build.source_package
+        || manifest.inputs_sha256 != source_build.inputs_sha256
+        || manifest.binary_sha256 != receipt.binary_sha256
+        || manifest.linkage != NativeOperatorLinkage::Static
+        || manifest.g03_catalog_sha256.as_deref() != Some(&receipt.g03_catalog_sha256)
+        || manifest.abi_contract_sha256.as_deref() != Some(&receipt.abi_contract_sha256)
+        || manifest.descriptor_export.as_deref() != Some(expected_descriptor.as_str())
+        || manifest.operation_bindings != spec.operation_bindings
+        || manifest.exports != expected_exports
+        || manifest.license_files != expected_license_paths
+        || manifest.build_summary != expected_build_summary
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} manifest is not the exact semantic projection of its package and source evidence",
             receipt.operator
         )));
     }
@@ -1814,6 +2248,19 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
+fn read_json_with_sha256<T: DeserializeOwned>(path: &Path) -> Result<(T, String)> {
+    let bytes = fs::read(path).map_err(|source| NativeOperatorBuilderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let value =
+        serde_json::from_slice(&bytes).map_err(|source| NativeOperatorBuilderError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok((value, sha256_bytes(&bytes)))
+}
+
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut bytes =
         serde_json::to_vec_pretty(value).map_err(|source| NativeOperatorBuilderError::Json {
@@ -1870,6 +2317,13 @@ mod tests {
 
     fn digest(character: char) -> String {
         std::iter::repeat(character).take(64).collect()
+    }
+
+    fn write_executable_script(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn run_source_build_fixture(
@@ -2088,6 +2542,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_archive_members_with_mixed_object_abis() {
+        let members = vec![
+            NativeOperatorArchiveMemberEvidence {
+                member: "00000000_alpha.o".to_string(),
+                sha256: digest('a'),
+                size_bytes: 1,
+                object_identity: NativeOperatorObjectIdentity {
+                    format: NativeOperatorObjectFormat::Elf,
+                    class_bits: 64,
+                    endianness: NativeOperatorObjectEndianness::Little,
+                    machine: 62,
+                },
+            },
+            NativeOperatorArchiveMemberEvidence {
+                member: "descriptor.o".to_string(),
+                sha256: digest('b'),
+                size_bytes: 1,
+                object_identity: NativeOperatorObjectIdentity {
+                    format: NativeOperatorObjectFormat::Elf,
+                    class_bits: 64,
+                    endianness: NativeOperatorObjectEndianness::Little,
+                    machine: 183,
+                },
+            },
+        ];
+
+        let error = validate_archive_member_evidence("mixed-abi", &members).unwrap_err();
+
+        assert!(error.to_string().contains("archive mixes object targets"));
+    }
+
+    #[test]
     fn package_spec_rejects_legacy_self_reported_build_provenance() {
         let mut value = serde_json::to_value(package_spec(
             CudaNativeBuildUnit::Marlin.artifact_operator(),
@@ -2147,6 +2633,59 @@ mod tests {
 
         assert!(is_sha256_digest(&receipt.source_build_receipt.sha256));
         assert!(output_dir.join("package.receipt.json").is_file());
+    }
+
+    #[test]
+    fn accepts_descriptor_target_alias_when_object_abi_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, catalog_path, abi_path) = fixture_files(root.path());
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (source_build_receipt, source_build_plan, _) = run_source_build_fixture(
+            root.path(),
+            &source_root,
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "target-mismatch",
+            exports,
+        );
+        let spec = package_spec(
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+        );
+        let spec_path = root.path().join("target-mismatch.package.json");
+        write_json(&spec_path, &spec).unwrap();
+        let output_dir = root.path().join("packages/target-mismatch");
+        let mismatched_cc = root.path().join("mismatched-cc");
+        write_executable_script(
+            &mismatched_cc,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"-dumpmachine\" ]; then echo 'forged-unknown-target'; exit 0; fi\n\
+             exec /usr/bin/cc \"$@\"\n",
+        );
+
+        let receipt = package_native_operator(&NativeOperatorPackageRequest {
+            spec_path,
+            source_root,
+            source_build_receipt_path: source_build_receipt,
+            source_build_plan_path: source_build_plan,
+            g03_catalog_path: catalog_path,
+            abi_contract_path: abi_path,
+            output_dir: output_dir.clone(),
+            cc: mismatched_cc,
+            ar: PathBuf::from("/usr/bin/ar"),
+        })
+        .unwrap();
+
+        assert_eq!(
+            receipt.package_toolchain.descriptor_target,
+            "forged-unknown-target"
+        );
+        assert!(output_dir.exists());
+        assert!(receipt
+            .final_archive_members
+            .iter()
+            .all(|member| member.object_identity == receipt.descriptor_object.object_identity));
     }
 
     #[test]
@@ -2300,6 +2839,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_archiver_success_without_a_final_descriptor_member() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, catalog_path, abi_path) = fixture_files(root.path());
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (source_build_receipt, source_build_plan, _) = run_source_build_fixture(
+            root.path(),
+            &source_root,
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "false-archiver-success",
+            exports,
+        );
+        let spec = package_spec(
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+        );
+        let spec_path = root.path().join("false-archiver-success.package.json");
+        write_json(&spec_path, &spec).unwrap();
+        let output_dir = root.path().join("packages/false-archiver-success");
+        let false_success_ar = root.path().join("false-success-ar");
+        write_executable_script(
+            &false_success_ar,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"rcs\" ] && [ \"$3\" = \"descriptor.o\" ]; then exit 0; fi\n\
+             exec /usr/bin/ar \"$@\"\n",
+        );
+
+        let error = package_native_operator(&NativeOperatorPackageRequest {
+            spec_path,
+            source_root,
+            source_build_receipt_path: source_build_receipt,
+            source_build_plan_path: source_build_plan,
+            g03_catalog_path: catalog_path,
+            abi_contract_path: abi_path,
+            output_dir: output_dir.clone(),
+            cc: PathBuf::from("/usr/bin/cc"),
+            ar: false_success_ar,
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("native archive members differ from expected evidence"));
+        assert!(!output_dir.exists());
+    }
+
+    #[test]
     fn rejects_source_archive_member_hash_mismatch_with_updated_archive_pin() {
         let root = tempfile::tempdir().unwrap();
         let (source_root, catalog_path, abi_path) = fixture_files(root.path());
@@ -2367,7 +2954,9 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(error.to_string().contains("member hash mismatch"));
+        assert!(error
+            .to_string()
+            .contains("native archive member evidence mismatch"));
         assert!(!output_dir.exists());
     }
 
@@ -2458,10 +3047,134 @@ mod tests {
     }
 
     #[test]
+    fn artifact_set_rejects_semantically_forged_source_receipt_with_updated_file_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (package_dir, _) = package_fixture(
+            root.path(),
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+            "semantic-forgery",
+        )
+        .unwrap();
+        let package_receipt_path = package_dir.join("package.receipt.json");
+        let external_receipt_sha256 = sha256_file(&package_receipt_path).unwrap();
+        let mut package_receipt: NativeOperatorPackageReceipt =
+            read_json(&package_receipt_path).unwrap();
+        let source_receipt_path = package_dir.join(&package_receipt.source_build_receipt.path);
+        let mut source_receipt: NativeOperatorSourceBuildReceipt =
+            read_json(&source_receipt_path).unwrap();
+        source_receipt.builder_sha = "8".repeat(40);
+        write_json(&source_receipt_path, &source_receipt).unwrap();
+        package_receipt.source_build_receipt.sha256 = sha256_file(&source_receipt_path).unwrap();
+        package_receipt.source_build_receipt.size_bytes =
+            fs::metadata(&source_receipt_path).unwrap().len();
+        write_json(&package_receipt_path, &package_receipt).unwrap();
+        let forged_receipt_sha256 = sha256_file(&package_receipt_path).unwrap();
+        let anchor_lock_path = root.path().join("packages/anchor-reject.lock.json");
+        let anchor_error = assemble_native_operator_set(&NativeOperatorSetRequest {
+            receipt_paths: vec![package_receipt_path.clone()],
+            expected_receipt_sha256: vec![external_receipt_sha256],
+            expected_g03_catalog_sha256: package_receipt.g03_catalog_sha256.clone(),
+            output_lock_path: anchor_lock_path.clone(),
+            compute_capability: "sm_89".to_string(),
+        })
+        .unwrap_err();
+        assert!(anchor_error
+            .to_string()
+            .contains("differs from its external sha256 pin"));
+        assert!(!anchor_lock_path.exists());
+        let lock_path = root.path().join("packages/native-operators.lock.json");
+
+        let error = assemble_native_operator_set(&NativeOperatorSetRequest {
+            receipt_paths: vec![package_receipt_path],
+            expected_receipt_sha256: vec![forged_receipt_sha256],
+            expected_g03_catalog_sha256: package_receipt.g03_catalog_sha256.clone(),
+            output_lock_path: lock_path.clone(),
+            compute_capability: "sm_89".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("manifest is not the exact semantic projection"));
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn artifact_set_rejects_replaced_final_member_with_updated_outer_pins() {
+        let root = tempfile::tempdir().unwrap();
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (package_dir, _) = package_fixture(
+            root.path(),
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+            "final-member-forgery",
+        )
+        .unwrap();
+        let package_receipt_path = package_dir.join("package.receipt.json");
+        let mut package_receipt: NativeOperatorPackageReceipt =
+            read_json(&package_receipt_path).unwrap();
+        let member_name = package_receipt.source_archive_members[0].member.clone();
+        let replacement_source = root.path().join("replacement-final-member.c");
+        let replacement_object = root.path().join(&member_name);
+        fs::write(
+            &replacement_source,
+            "int marlin_cuda(void) { return 101; }\n\
+             int marlin_cuda_moe(void) { return 102; }\n",
+        )
+        .unwrap();
+        assert!(Command::new("/usr/bin/cc")
+            .args(["-c"])
+            .arg(&replacement_source)
+            .arg("-o")
+            .arg(&replacement_object)
+            .status()
+            .unwrap()
+            .success());
+        let artifact_path = package_dir.join(&package_receipt.artifact_file);
+        assert!(Command::new("/usr/bin/ar")
+            .arg("rcs")
+            .arg(&artifact_path)
+            .arg(&replacement_object)
+            .status()
+            .unwrap()
+            .success());
+        let forged_binary_sha256 = sha256_file(&artifact_path).unwrap();
+        let manifest_path = package_dir.join(&package_receipt.manifest_file);
+        let mut manifest: NativeOperatorManifest = read_json(&manifest_path).unwrap();
+        manifest.binary_sha256 = forged_binary_sha256.clone();
+        write_json(&manifest_path, &manifest).unwrap();
+        package_receipt.binary_sha256 = forged_binary_sha256;
+        package_receipt.manifest_sha256 = sha256_file(&manifest_path).unwrap();
+        write_json(&package_receipt_path, &package_receipt).unwrap();
+        let forged_receipt_sha256 = sha256_file(&package_receipt_path).unwrap();
+        let lock_path = root.path().join("packages/native-operators.lock.json");
+
+        let error = assemble_native_operator_set(&NativeOperatorSetRequest {
+            receipt_paths: vec![package_receipt_path],
+            expected_receipt_sha256: vec![forged_receipt_sha256],
+            expected_g03_catalog_sha256: package_receipt.g03_catalog_sha256.clone(),
+            output_lock_path: lock_path.clone(),
+            compute_capability: "sm_89".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("native archive member evidence mismatch"));
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
     fn assembles_multiple_verified_packages_into_one_resolvable_lock() {
         let root = tempfile::tempdir().unwrap();
         let marlin_exports = CudaNativeBuildUnit::Marlin.required_exports();
-        let (alpha_dir, _) = package_fixture(
+        let (alpha_dir, alpha_receipt) = package_fixture(
             root.path(),
             CudaNativeBuildUnit::Marlin.artifact_operator(),
             "operation.dense_linear",
@@ -2471,7 +3184,7 @@ mod tests {
         )
         .unwrap();
         let vllm_marlin_exports = CudaNativeBuildUnit::VllmMarlin.required_exports();
-        let (beta_dir, _) = package_fixture(
+        let (beta_dir, beta_receipt) = package_fixture(
             root.path(),
             CudaNativeBuildUnit::VllmMarlin.artifact_operator(),
             "operation.quantized_linear",
@@ -2481,17 +3194,25 @@ mod tests {
         )
         .unwrap();
         let lock_path = root.path().join("packages/native-operators.lock.json");
+        let alpha_receipt_path = alpha_dir.join("package.receipt.json");
+        let beta_receipt_path = beta_dir.join("package.receipt.json");
 
         let lock = assemble_native_operator_set(&NativeOperatorSetRequest {
-            receipt_paths: vec![
-                alpha_dir.join("package.receipt.json"),
-                beta_dir.join("package.receipt.json"),
+            receipt_paths: vec![alpha_receipt_path.clone(), beta_receipt_path.clone()],
+            expected_receipt_sha256: vec![
+                sha256_file(&alpha_receipt_path).unwrap(),
+                sha256_file(&beta_receipt_path).unwrap(),
             ],
+            expected_g03_catalog_sha256: alpha_receipt.g03_catalog_sha256.clone(),
             output_lock_path: lock_path.clone(),
             compute_capability: "sm_89".to_string(),
         })
         .unwrap();
 
+        assert_eq!(
+            alpha_receipt.g03_catalog_sha256,
+            beta_receipt.g03_catalog_sha256
+        );
         assert_eq!(lock.artifacts.len(), 2);
         let resolved =
             NativeOperatorArtifactSetLock::load_and_resolve(&lock_path, Some("sm_89")).unwrap();

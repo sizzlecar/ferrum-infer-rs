@@ -18,7 +18,7 @@ use crate::{
     ResolvedNativeOperator,
 };
 
-pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorArtifactSetLock {
@@ -32,17 +32,20 @@ pub struct NativeOperatorArtifactLock {
     pub operator: String,
     pub backend: NativeOperatorBackend,
     pub manifest_path: String,
+    pub manifest: NativeOperatorEvidenceFile,
     pub artifact_path: String,
     pub operator_abi_version: String,
     pub ferrum_native_abi_version: String,
     pub source_package_sha256: String,
     pub inputs_sha256: String,
+    pub package_spec: NativeOperatorEvidenceFile,
     pub source_build_receipt: NativeOperatorEvidenceFile,
     pub source_build_plan: NativeOperatorEvidenceFile,
     pub source_build_logs: Vec<NativeOperatorEvidenceFile>,
     pub source_archive_sha256: String,
     pub package_receipt: NativeOperatorEvidenceFile,
     pub package_build_logs: Vec<NativeOperatorEvidenceFile>,
+    pub license_files: Vec<NativeOperatorEvidenceFile>,
     pub binary_sha256: String,
     pub abi_contract_sha256: String,
     pub descriptor_export: String,
@@ -198,6 +201,18 @@ impl NativeOperatorArtifactSetLock {
             verify_evidence_file(
                 &canonical_root,
                 &artifact_lock.operator,
+                "manifest",
+                &artifact_lock.manifest,
+            )?;
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
+                "package_spec",
+                &artifact_lock.package_spec,
+            )?;
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
                 "source_build_receipt",
                 &artifact_lock.source_build_receipt,
             )?;
@@ -226,6 +241,14 @@ impl NativeOperatorArtifactSetLock {
                     &canonical_root,
                     &artifact_lock.operator,
                     "package_build_log",
+                    evidence,
+                )?;
+            }
+            for evidence in &artifact_lock.license_files {
+                verify_evidence_file(
+                    &canonical_root,
+                    &artifact_lock.operator,
+                    "license_file",
                     evidence,
                 )?;
             }
@@ -380,6 +403,14 @@ impl NativeOperatorArtifactSetLock {
                     )));
                 }
             }
+            validate_evidence_file(&artifact.operator, "manifest", &artifact.manifest)?;
+            if artifact.manifest.path != artifact.manifest_path {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.manifest evidence path must equal manifest_path",
+                    artifact.operator
+                )));
+            }
+            validate_evidence_file(&artifact.operator, "package_spec", &artifact.package_spec)?;
             validate_evidence_file(
                 &artifact.operator,
                 "source_build_receipt",
@@ -422,6 +453,20 @@ impl NativeOperatorArtifactSetLock {
             }
             for evidence in &artifact.package_build_logs {
                 validate_evidence_file(&artifact.operator, "package_build_log", evidence)?;
+            }
+            if artifact.license_files.is_empty()
+                || artifact
+                    .license_files
+                    .windows(2)
+                    .any(|pair| pair[0].path >= pair[1].path)
+            {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.license_files must be sorted, unique, and non-empty",
+                    artifact.operator
+                )));
+            }
+            for evidence in &artifact.license_files {
+                validate_evidence_file(&artifact.operator, "license_file", evidence)?;
             }
             if artifact.required_exports.is_empty() {
                 return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
@@ -743,13 +788,17 @@ mod tests {
         let receipt_path = dir.join("source-build.receipt.json");
         let plan_path = dir.join("source-build.plan.json");
         let log_path = dir.join("source-build.log");
+        let package_spec_path = dir.join("package.spec.json");
         let package_receipt_path = dir.join("package.receipt.json");
         let package_log_path = dir.join("package-build.log");
+        let license_path = dir.join("LICENSE");
         fs::write(&receipt_path, "{\"status\":\"pass\"}\n").unwrap();
         fs::write(&plan_path, "{\"schema_version\":2}\n").unwrap();
         fs::write(&log_path, "source build complete\n").unwrap();
+        fs::write(&package_spec_path, "{\"schema_version\":2}\n").unwrap();
         fs::write(&package_receipt_path, "{\"status\":\"pass\"}\n").unwrap();
         fs::write(&package_log_path, "package build complete\n").unwrap();
+        fs::write(&license_path, "fixture license\n").unwrap();
         let evidence = |path: &Path| NativeOperatorEvidenceFile {
             path: format!("{operator}/{}", path.file_name().unwrap().to_string_lossy()),
             sha256: digest_bytes(&fs::read(path).unwrap()),
@@ -759,17 +808,20 @@ mod tests {
             operator: operator.to_string(),
             backend: NativeOperatorBackend::Cuda,
             manifest_path: format!("{operator}/native_operator_manifest.json"),
+            manifest: evidence(&manifest_path),
             artifact_path: format!("{operator}/libferrum_native_{operator}.a"),
             operator_abi_version: "1".to_string(),
             ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
             source_package_sha256,
             inputs_sha256,
+            package_spec: evidence(&package_spec_path),
             source_build_receipt: evidence(&receipt_path),
             source_build_plan: evidence(&plan_path),
             source_build_logs: vec![evidence(&log_path)],
             source_archive_sha256: digest('8'),
             package_receipt: evidence(&package_receipt_path),
             package_build_logs: vec![evidence(&package_log_path)],
+            license_files: vec![evidence(&license_path)],
             binary_sha256,
             abi_contract_sha256,
             descriptor_export: descriptor,
@@ -783,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_multiple_schema_v2_artifacts_in_deterministic_order() {
+    fn resolves_multiple_schema_v3_artifacts_in_deterministic_order() {
         let dir = temp_dir("pass");
         let alpha = write_artifact(
             dir.path(),
@@ -849,7 +901,13 @@ mod tests {
 
     #[test]
     fn rejects_tampered_package_provenance_files() {
-        for field in ["package_receipt", "package_build_log"] {
+        for field in [
+            "manifest",
+            "package_spec",
+            "package_receipt",
+            "package_build_log",
+            "license_file",
+        ] {
             let dir = temp_dir(field);
             let artifact = write_artifact(
                 dir.path(),
@@ -858,10 +916,13 @@ mod tests {
                 "provider.cuda.alpha",
                 None,
             );
-            let evidence = if field == "package_receipt" {
-                &artifact.package_receipt
-            } else {
-                &artifact.package_build_logs[0]
+            let evidence = match field {
+                "manifest" => &artifact.manifest,
+                "package_spec" => &artifact.package_spec,
+                "package_receipt" => &artifact.package_receipt,
+                "package_build_log" => &artifact.package_build_logs[0],
+                "license_file" => &artifact.license_files[0],
+                _ => unreachable!(),
             };
             let evidence_path = dir.path().join(&evidence.path);
             fs::write(&evidence_path, format!("tampered {field}\n")).unwrap();
