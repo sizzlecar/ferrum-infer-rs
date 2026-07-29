@@ -72,6 +72,10 @@ enum Command {
     AssembleSet {
         #[arg(long, required = true)]
         receipt: Vec<PathBuf>,
+        #[arg(long = "receipt-sha256", required = true)]
+        receipt_sha256: Vec<String>,
+        #[arg(long)]
+        g03_catalog_sha256: String,
         #[arg(long)]
         compute_capability: String,
         #[arg(long)]
@@ -157,11 +161,15 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
         }
         Command::AssembleSet {
             receipt,
+            receipt_sha256,
+            g03_catalog_sha256,
             compute_capability,
             out,
         } => {
             assemble_native_operator_set(&NativeOperatorSetRequest {
                 receipt_paths: receipt,
+                expected_receipt_sha256: receipt_sha256,
+                expected_g03_catalog_sha256: g03_catalog_sha256,
                 output_lock_path: out.clone(),
                 compute_capability,
             })?;

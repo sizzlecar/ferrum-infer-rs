@@ -21,8 +21,8 @@ use super::{
 
 pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_OPERATOR_SOURCE_BUILD_PLAN_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 1;
+pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 2;
 pub const MAX_NVCC_THREADS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +152,7 @@ pub enum NativeOperatorSourceBuildStatus {
 pub struct NativeOperatorSourceBuildToolchain {
     pub nvcc: NativeOperatorToolIdentity,
     pub host_compiler: NativeOperatorToolIdentity,
+    pub host_target: String,
     pub archiver: NativeOperatorToolIdentity,
 }
 
@@ -160,6 +161,29 @@ pub struct NativeOperatorToolIdentity {
     pub path: String,
     pub sha256: String,
     pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorObjectIdentity {
+    pub format: NativeOperatorObjectFormat,
+    pub class_bits: u8,
+    pub endianness: NativeOperatorObjectEndianness,
+    pub machine: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorObjectFormat {
+    Elf,
+    MachO,
+    Coff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorObjectEndianness {
+    Little,
+    Big,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +198,8 @@ pub struct NativeOperatorSourceBuildCommand {
     pub object_cache_status: Option<NativeOperatorSourceObjectCacheStatus>,
     pub object_cache_entry: Option<String>,
     pub object_sha256: Option<String>,
+    pub object_size_bytes: Option<u64>,
+    pub object_identity: Option<NativeOperatorObjectIdentity>,
     pub compiler_executed: bool,
     pub elapsed_ms: Option<u64>,
     pub return_code: Option<i32>,
@@ -503,6 +529,7 @@ pub fn run_native_operator_source_build(
     receipt.failure_class = Some("build_incomplete".to_string());
     write_json(&receipt_path, &receipt)?;
 
+    let mut expected_object_identity: Option<NativeOperatorObjectIdentity> = None;
     for index in 0..plan.translation_units.len() {
         let translation_unit = &plan.translation_units[index];
         let object_path = PathBuf::from(
@@ -519,6 +546,51 @@ pub fn run_native_operator_source_build(
                 commands[index].object_cache_entry =
                     Some(cache_receipt.cache_entry.display().to_string());
                 commands[index].object_sha256 = Some(cache_receipt.artifact_sha256);
+                let object_size_bytes = match native_object_size(&object_path) {
+                    Ok(size_bytes) => size_bytes,
+                    Err(error) => {
+                        commands[index].object_cache_status =
+                            Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                        receipt.commands = commands.clone();
+                        receipt.elapsed_ms = millis(started.elapsed());
+                        return reject_source_build(
+                            &receipt_path,
+                            &mut receipt,
+                            format!("cached_object_size_failed:{index}:{error}"),
+                        );
+                    }
+                };
+                commands[index].object_size_bytes = Some(object_size_bytes);
+                let object_identity = match native_object_identity_file(&object_path) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        commands[index].object_cache_status =
+                            Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                        receipt.commands = commands.clone();
+                        receipt.elapsed_ms = millis(started.elapsed());
+                        return reject_source_build(
+                            &receipt_path,
+                            &mut receipt,
+                            format!("cached_object_identity_failed:{index}:{error}"),
+                        );
+                    }
+                };
+                if expected_object_identity
+                    .as_ref()
+                    .is_some_and(|expected| expected != &object_identity)
+                {
+                    commands[index].object_cache_status =
+                        Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                    receipt.commands = commands.clone();
+                    receipt.elapsed_ms = millis(started.elapsed());
+                    return reject_source_build(
+                        &receipt_path,
+                        &mut receipt,
+                        format!("cached_object_target_mismatch:{index}"),
+                    );
+                }
+                expected_object_identity.get_or_insert_with(|| object_identity.clone());
+                commands[index].object_identity = Some(object_identity);
                 commands[index].elapsed_ms = Some(millis(command_started.elapsed()));
                 append_command_stream(
                     &request.output_dir.join(&commands[index].stdout_log),
@@ -599,6 +671,51 @@ pub fn run_native_operator_source_build(
                 format!("compiled_object_missing:{index}:{error}"),
             );
         }
+        let object_identity = match native_object_identity_file(&object_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                return reject_source_build(
+                    &receipt_path,
+                    &mut receipt,
+                    format!("compiled_object_identity_failed:{index}:{error}"),
+                );
+            }
+        };
+        if expected_object_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &object_identity)
+        {
+            commands[index].object_cache_status =
+                Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+            receipt.commands = commands.clone();
+            receipt.elapsed_ms = millis(started.elapsed());
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("compiled_object_target_mismatch:{index}"),
+            );
+        }
+        expected_object_identity.get_or_insert_with(|| object_identity.clone());
+        commands[index].object_identity = Some(object_identity);
+        let object_size_bytes = match native_object_size(&object_path) {
+            Ok(size_bytes) => size_bytes,
+            Err(error) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                return reject_source_build(
+                    &receipt_path,
+                    &mut receipt,
+                    format!("compiled_object_size_failed:{index}:{error}"),
+                );
+            }
+        };
+        commands[index].object_size_bytes = Some(object_size_bytes);
         let cache_receipt = match object_cache.publish(&object_specs[index], &object_path) {
             Ok(cache_receipt) => cache_receipt,
             Err(error) => {
@@ -778,6 +895,22 @@ pub(crate) fn verify_source_build_receipt_against_plan(
     plan_path: &Path,
     source_root: &Path,
 ) -> Result<NativeOperatorSourceBuildPlan> {
+    let plan = verify_source_build_receipt_against_plan_portable(receipt, plan_path)?;
+    let canonical_source_root =
+        source_root
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: source_root.to_path_buf(),
+                source,
+            })?;
+    validate_locked_source_tree(&canonical_source_root, &plan)?;
+    Ok(plan)
+}
+
+pub(crate) fn verify_source_build_receipt_against_plan_portable(
+    receipt: &NativeOperatorSourceBuildReceipt,
+    plan_path: &Path,
+) -> Result<NativeOperatorSourceBuildPlan> {
     require_file(plan_path)?;
     let plan: NativeOperatorSourceBuildPlan = read_json(plan_path)?;
     validate_plan(&plan)?;
@@ -794,14 +927,6 @@ pub(crate) fn verify_source_build_receipt_against_plan(
             receipt.operator
         )));
     }
-    let canonical_source_root =
-        source_root
-            .canonicalize()
-            .map_err(|source| NativeOperatorBuilderError::Io {
-                path: source_root.to_path_buf(),
-                source,
-            })?;
-    validate_locked_source_tree(&canonical_source_root, &plan)?;
 
     let expected_architecture =
         architecture_argument(plan.architecture, &receipt.compute_capability);
@@ -1123,8 +1248,179 @@ fn resolve_toolchain(
     Ok(NativeOperatorSourceBuildToolchain {
         nvcc: tool_identity(&request.nvcc_path)?,
         host_compiler: tool_identity(&request.ccbin_path)?,
+        host_target: compiler_target(&request.ccbin_path)?,
         archiver: tool_identity(&request.ar_path)?,
     })
+}
+
+pub(crate) fn compiler_target(path: &Path) -> Result<String> {
+    require_file(path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let output = Command::new(&canonical)
+        .arg("-dumpmachine")
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: canonical.clone(),
+            source,
+        })?;
+    let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success()
+        || target.is_empty()
+        || target.len() > 256
+        || target.chars().any(char::is_whitespace)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "compiler produced no valid target identity: {}",
+            canonical.display()
+        )));
+    }
+    Ok(target)
+}
+
+pub(crate) fn native_object_identity_file(path: &Path) -> Result<NativeOperatorObjectIdentity> {
+    let bytes = fs::read(path).map_err(|source| NativeOperatorBuilderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    native_object_identity_bytes(&bytes, &path.display().to_string())
+}
+
+fn native_object_size(path: &Path) -> Result<u64> {
+    let size_bytes = fs::metadata(path)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if size_bytes == 0 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "native object is empty: {}",
+            path.display()
+        )));
+    }
+    Ok(size_bytes)
+}
+
+pub(crate) fn native_object_identity_bytes(
+    bytes: &[u8],
+    context: &str,
+) -> Result<NativeOperatorObjectIdentity> {
+    if bytes.len() >= 20 && bytes.starts_with(b"\x7fELF") {
+        let class_bits = match bytes[4] {
+            1 => 32,
+            2 => 64,
+            value => {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "unsupported ELF class in {context}: {value}"
+                )))
+            }
+        };
+        let endianness = match bytes[5] {
+            1 => NativeOperatorObjectEndianness::Little,
+            2 => NativeOperatorObjectEndianness::Big,
+            value => {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "unsupported ELF endianness in {context}: {value}"
+                )))
+            }
+        };
+        let machine = u32::from(read_u16(&bytes[18..20], endianness));
+        let identity = NativeOperatorObjectIdentity {
+            format: NativeOperatorObjectFormat::Elf,
+            class_bits,
+            endianness,
+            machine,
+        };
+        validate_native_object_identity(&identity, context)?;
+        return Ok(identity);
+    }
+
+    if bytes.len() >= 8 {
+        let (class_bits, endianness) = match &bytes[..4] {
+            [0xce, 0xfa, 0xed, 0xfe] => (32, NativeOperatorObjectEndianness::Little),
+            [0xfe, 0xed, 0xfa, 0xce] => (32, NativeOperatorObjectEndianness::Big),
+            [0xcf, 0xfa, 0xed, 0xfe] => (64, NativeOperatorObjectEndianness::Little),
+            [0xfe, 0xed, 0xfa, 0xcf] => (64, NativeOperatorObjectEndianness::Big),
+            _ => (0, NativeOperatorObjectEndianness::Little),
+        };
+        if class_bits != 0 {
+            let machine = read_u32(&bytes[4..8], endianness);
+            let identity = NativeOperatorObjectIdentity {
+                format: NativeOperatorObjectFormat::MachO,
+                class_bits,
+                endianness,
+                machine,
+            };
+            validate_native_object_identity(&identity, context)?;
+            return Ok(identity);
+        }
+    }
+
+    if bytes.len() >= 20 {
+        let machine = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if matches!(machine, 0x014c | 0x01c0 | 0x01c4 | 0x8664 | 0xaa64) {
+            let identity = NativeOperatorObjectIdentity {
+                format: NativeOperatorObjectFormat::Coff,
+                class_bits: if matches!(machine, 0x8664 | 0xaa64) {
+                    64
+                } else {
+                    32
+                },
+                endianness: NativeOperatorObjectEndianness::Little,
+                machine: u32::from(machine),
+            };
+            validate_native_object_identity(&identity, context)?;
+            return Ok(identity);
+        }
+    }
+
+    Err(NativeOperatorBuilderError::Invalid(format!(
+        "native object has no supported ELF, Mach-O, or COFF header: {context}"
+    )))
+}
+
+pub(crate) fn validate_native_object_identity(
+    identity: &NativeOperatorObjectIdentity,
+    context: &str,
+) -> Result<()> {
+    if !matches!(identity.class_bits, 32 | 64) || identity.machine == 0 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "native object identity is incomplete for {context}: {identity:?}"
+        )));
+    }
+    if identity.format == NativeOperatorObjectFormat::Coff
+        && identity.endianness != NativeOperatorObjectEndianness::Little
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "COFF object must be little-endian for {context}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_u16(bytes: &[u8], endianness: NativeOperatorObjectEndianness) -> u16 {
+    let bytes = [bytes[0], bytes[1]];
+    match endianness {
+        NativeOperatorObjectEndianness::Little => u16::from_le_bytes(bytes),
+        NativeOperatorObjectEndianness::Big => u16::from_be_bytes(bytes),
+    }
+}
+
+fn read_u32(bytes: &[u8], endianness: NativeOperatorObjectEndianness) -> u32 {
+    let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    match endianness {
+        NativeOperatorObjectEndianness::Little => u32::from_le_bytes(bytes),
+        NativeOperatorObjectEndianness::Big => u32::from_be_bytes(bytes),
+    }
 }
 
 pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
@@ -1283,7 +1579,7 @@ fn object_file_name(index: usize, translation_unit: &NativeOperatorSourceFileLoc
         .and_then(|value| value.to_str())
         .unwrap_or("translation_unit");
     format!(
-        "{index:02}_{}_{}.o",
+        "{index:08}_{}_{}.o",
         safe_component(stem),
         &translation_unit.sha256[..8]
     )
@@ -1377,6 +1673,8 @@ fn build_commands(
             }),
             object_cache_entry: None,
             object_sha256: None,
+            object_size_bytes: None,
+            object_identity: None,
             compiler_executed: false,
             elapsed_ms: None,
             return_code: None,
@@ -1400,6 +1698,8 @@ fn build_commands(
         object_cache_status: None,
         object_cache_entry: None,
         object_sha256: None,
+        object_size_bytes: None,
+        object_identity: None,
         compiler_executed: false,
         elapsed_ms: None,
         return_code: None,
@@ -1651,6 +1951,16 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         (path, counter)
+    }
+
+    #[test]
+    fn object_file_names_preserve_lexical_order_past_one_hundred_units() {
+        let translation_unit = NativeOperatorSourceFileLock {
+            path: "kernels/unit.cu".to_string(),
+            sha256: "a".repeat(64),
+        };
+
+        assert!(object_file_name(99, &translation_unit) < object_file_name(100, &translation_unit));
     }
 
     #[test]
