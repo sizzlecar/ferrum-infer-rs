@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,13 +6,13 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ferrum_native_ops::{
-    legacy_signature_matches_without_numeric_line, NativeBuildArtifactCache,
-    NativeBuildArtifactLookup, NativeBuildArtifactSpec, NativeOperatorResolveRequest,
-    NativeOperatorResolver,
+    legacy_signature_matches_without_numeric_line, load_manifest, NativeBuildArtifactCache,
+    NativeBuildArtifactLookup, NativeBuildArtifactSpec, NativeOperatorArtifactSetLock,
+    NativeOperatorResolveRequest, NativeOperatorResolver, NativeOperatorSystemLibrary,
 };
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
-    NativeOperatorRequirement,
+    NativeOperatorRequirement, LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -21,6 +22,8 @@ const FA2_NATIVE_SOURCE_SHA256_ENV: &str = "FERRUM_FA2_NATIVE_SOURCE_SHA256";
 const FA2_NATIVE_INPUTS_SHA256_ENV: &str = "FERRUM_FA2_NATIVE_INPUTS_SHA256";
 const FA2_NATIVE_ARTIFACT_COMPILE_ENV: &str = "FERRUM_FA2_NATIVE_ARTIFACT_COMPILE";
 const NATIVE_OP_ARTIFACT_FEATURE_ENV: &str = "CARGO_FEATURE_NATIVE_OP_ARTIFACT";
+const NATIVE_OPERATOR_SET_LOCK_ENV: &str = "FERRUM_NATIVE_OPERATOR_SET_LOCK";
+const COMPILED_NATIVE_OPERATOR_SET_JSON_ENV: &str = "FERRUM_COMPILED_NATIVE_OPERATOR_SET_JSON";
 const COMPILED_FA2_NATIVE_MANIFEST_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_MANIFEST";
 const COMPILED_FA2_NATIVE_ARTIFACT_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_ARTIFACT";
 const COMPILED_FA2_NATIVE_SOURCE_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_SOURCE_SHA256";
@@ -408,6 +411,135 @@ fn native_dynamic_link_name(path: &Path) -> String {
     );
 }
 
+fn link_native_operator_artifact_set() -> bool {
+    let start = Instant::now();
+    let feature_enabled = env::var_os(NATIVE_OP_ARTIFACT_FEATURE_ENV).is_some();
+    println!("cargo:rerun-if-env-changed={NATIVE_OP_ARTIFACT_FEATURE_ENV}");
+    let lock_path = optional_non_empty_env(NATIVE_OPERATOR_SET_LOCK_ENV);
+    let Some(lock_path) = lock_path else {
+        println!("cargo:rustc-env={COMPILED_NATIVE_OPERATOR_SET_JSON_ENV}=[]");
+        return false;
+    };
+    if !feature_enabled {
+        panic!("{NATIVE_OPERATOR_SET_LOCK_ENV} requires --features native-op-artifact");
+    }
+    for legacy_key in [
+        FA2_NATIVE_MANIFEST_ENV,
+        FA2_NATIVE_ARTIFACT_ENV,
+        FA2_NATIVE_SOURCE_SHA256_ENV,
+        FA2_NATIVE_INPUTS_SHA256_ENV,
+    ] {
+        if env::var_os(legacy_key).is_some() {
+            panic!("{NATIVE_OPERATOR_SET_LOCK_ENV} cannot be combined with legacy {legacy_key}");
+        }
+    }
+
+    let lock_path = PathBuf::from(lock_path);
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let compute_capability = normalize_compute_capability(
+        &env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| detect_cuda_compute_cap()),
+    );
+    let resolved_set =
+        NativeOperatorArtifactSetLock::load_and_resolve(&lock_path, Some(&compute_capability))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to resolve native operator artifact set {}: {error}",
+                    lock_path.display()
+                )
+            });
+
+    let cuda_root = cuda_root_from_env();
+    if let Some(cuda_root) = cuda_root.as_ref() {
+        let lib64 = cuda_root.join("lib64");
+        if lib64.is_dir() {
+            println!("cargo:rustc-link-search=native={}", lib64.display());
+        }
+    }
+    let mut system_libraries = BTreeSet::new();
+    let mut inventory = Vec::with_capacity(resolved_set.artifacts.len());
+    for artifact in &resolved_set.artifacts {
+        let resolved = &artifact.resolved;
+        if resolved.manifest.backend != NativeOperatorBackend::Cuda {
+            panic!(
+                "ferrum-kernels CUDA artifact set rejects non-CUDA operator {} ({:?})",
+                resolved.manifest.operator, resolved.manifest.backend
+            );
+        }
+        println!(
+            "cargo:rerun-if-changed={}",
+            resolved.manifest_path.display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            resolved.artifact_path.display()
+        );
+        let parent = resolved
+            .artifact_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        println!("cargo:rustc-link-search=native={}", parent.display());
+        match resolved.manifest.linkage {
+            NativeOperatorLinkage::Static => println!(
+                "cargo:rustc-link-lib=static={}",
+                native_static_link_name(&resolved.artifact_path)
+            ),
+            NativeOperatorLinkage::Dynamic => println!(
+                "cargo:rustc-link-lib=dylib={}",
+                native_dynamic_link_name(&resolved.artifact_path)
+            ),
+        }
+        system_libraries.extend(artifact.lock.system_libraries.iter().copied());
+        inventory.push(serde_json::json!({
+            "schema_version": resolved.manifest.schema_version,
+            "operator": resolved.manifest.operator,
+            "operator_abi_version": resolved.manifest.operator_abi_version,
+            "ferrum_native_abi_version": resolved.manifest.ferrum_native_abi_version,
+            "backend": resolved.manifest.backend,
+            "linkage": resolved.manifest.linkage,
+            "g03_catalog_sha256": resolved.manifest.g03_catalog_sha256,
+            "abi_contract_sha256": resolved.manifest.abi_contract_sha256,
+            "descriptor_export": resolved.manifest.descriptor_export,
+            "operation_bindings": resolved.manifest.operation_bindings,
+            "exports": resolved.manifest.exports,
+            "source_package_sha256": resolved.manifest.source_package.sha256,
+            "inputs_sha256": resolved.manifest.inputs_sha256,
+            "binary_sha256": resolved.artifact_sha256,
+        }));
+    }
+    for library in system_libraries {
+        let link_name = match library {
+            NativeOperatorSystemLibrary::CudaDriver => "cuda",
+            NativeOperatorSystemLibrary::CudaRuntime => "cudart",
+            NativeOperatorSystemLibrary::Cublas => "cublas",
+            NativeOperatorSystemLibrary::CublasLt => "cublasLt",
+            NativeOperatorSystemLibrary::StdCxx => {
+                if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                    "c++"
+                } else {
+                    "stdc++"
+                }
+            }
+        };
+        println!("cargo:rustc-link-lib=dylib={link_name}");
+    }
+    let inventory_json =
+        serde_json::to_string(&inventory).expect("native operator inventory must serialize");
+    println!("cargo:rustc-env={COMPILED_NATIVE_OPERATOR_SET_JSON_ENV}={inventory_json}");
+    emit_cuda_build_summary(
+        "native_operator_artifact_set",
+        "linked",
+        "manifest-v2-set-validated",
+        start.elapsed(),
+        &format!(
+            "lock={}:catalog={}:operators={}",
+            resolved_set.lock_path.display(),
+            resolved_set.g03_catalog_sha256,
+            resolved_set.artifacts.len()
+        ),
+    );
+    true
+}
+
 fn link_fa2_native_operator_artifact() {
     let start = Instant::now();
     let feature_enabled = env::var_os(NATIVE_OP_ARTIFACT_FEATURE_ENV).is_some();
@@ -451,6 +583,18 @@ fn link_fa2_native_operator_artifact() {
     let artifact = PathBuf::from(required_native_env(FA2_NATIVE_ARTIFACT_ENV, artifact));
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-changed={}", artifact.display());
+    let legacy_manifest = load_manifest(&manifest).unwrap_or_else(|error| {
+        panic!(
+            "failed to load legacy FA2 native operator manifest {}: {error}",
+            manifest.display()
+        )
+    });
+    if legacy_manifest.schema_version != LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION {
+        panic!(
+            "schema-v2 native operators must use {NATIVE_OPERATOR_SET_LOCK_ENV}; \
+             legacy {FA2_NATIVE_MANIFEST_ENV} only accepts schema v1"
+        );
+    }
 
     let compute_capability = normalize_compute_capability(
         &env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| detect_cuda_compute_cap()),
@@ -461,6 +605,8 @@ fn link_fa2_native_operator_artifact() {
         manifest.clone(),
         artifact.clone(),
     )
+    .with_operator_abi_version(legacy_manifest.operator_abi_version.clone())
+    .with_ferrum_native_abi_version(legacy_manifest.ferrum_native_abi_version.clone())
     .with_compute_capability(compute_capability.clone());
     let resolved = NativeOperatorResolver
         .resolve(&request)
@@ -472,6 +618,8 @@ fn link_fa2_native_operator_artifact() {
             )
         });
     let mut requirement = NativeOperatorRequirement::cuda("fa2", compute_capability);
+    requirement.operator_abi_version = resolved.manifest.operator_abi_version.clone();
+    requirement.ferrum_native_abi_version = resolved.manifest.ferrum_native_abi_version.clone();
     requirement.source_package_sha256 = source_sha256;
     requirement.inputs_sha256 = inputs_sha256;
     requirement.binary_sha256 = Some(resolved.artifact_sha256.clone());
@@ -923,7 +1071,9 @@ fn emit_cuda_static_link(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    link_fa2_native_operator_artifact();
+    if !link_native_operator_artifact_set() {
+        link_fa2_native_operator_artifact();
+    }
 
     // Link Accelerate framework on macOS (provides cblas_sgemm, vDSP_*)
     if env::consts::OS == "macos" {

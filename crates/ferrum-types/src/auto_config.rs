@@ -5,8 +5,9 @@
 
 use crate::{
     is_sha256_digest, parse_bool_env_value, parse_usize_env_value, AttentionExecutionPolicy,
-    ExecutionResourceAuthority, RuntimeConfigEffect, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
+    CompiledNativeOperatorIdentity, ExecutionResourceAuthority, RuntimeConfigEffect,
+    RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
+    CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -167,6 +168,8 @@ pub struct CompiledKernelFeatures {
     pub fa2_native_operator_artifact: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fa2_native_operator_artifact_metadata: Option<CompiledNativeOperatorArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_operator_artifacts: Vec<CompiledNativeOperatorIdentity>,
 }
 
 impl Default for CompiledKernelFeatures {
@@ -181,6 +184,7 @@ impl Default for CompiledKernelFeatures {
             fa2_direct_ffi: false,
             fa2_native_operator_artifact: false,
             fa2_native_operator_artifact_metadata: None,
+            native_operator_artifacts: Vec::new(),
         }
     }
 }
@@ -197,6 +201,7 @@ impl CompiledKernelFeatures {
             fa2_direct_ffi: false,
             fa2_native_operator_artifact: false,
             fa2_native_operator_artifact_metadata: None,
+            native_operator_artifacts: Vec::new(),
         }
     }
 

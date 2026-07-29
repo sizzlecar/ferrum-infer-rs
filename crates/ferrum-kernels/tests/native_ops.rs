@@ -10,8 +10,9 @@ use ferrum_kernels::native_ops::{
 };
 use ferrum_native_ops::{NativeOperatorArtifactFormat, NativeOperatorResolveError};
 use ferrum_types::{
-    NativeOperatorBackend, NativeOperatorBuildSummary, NativeOperatorLinkage,
-    NativeOperatorManifest, NativeOperatorSourcePackage, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+    NativeOperatorBackend, NativeOperatorBinding, NativeOperatorBuildSummary,
+    NativeOperatorLinkage, NativeOperatorManifest, NativeOperatorSourcePackage,
+    FERRUM_NATIVE_OPERATOR_ABI_VERSION, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -64,9 +65,10 @@ fn digest(ch: char) -> String {
 
 fn write_static_archive(root: &Path, include_descriptor: bool) -> PathBuf {
     let source = root.join("native_op.c");
-    let mut source_text = String::from("int ferrum_native_op_init(void) { return 0; }\n");
+    let mut source_text = String::from("int ferrum_native_fa2_execute_v1(void) { return 0; }\n");
     if include_descriptor {
-        source_text.push_str("const char *ferrum_native_op_descriptor(void) { return \"fa2\"; }\n");
+        source_text
+            .push_str("const char *ferrum_native_fa2_descriptor_v2(void) { return \"fa2\"; }\n");
     }
     std::fs::write(&source, source_text).unwrap();
     let object = root.join("native_op.o");
@@ -99,7 +101,7 @@ fn write_manifest(
         schema_version: NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
         operator: FA2_NATIVE_OPERATOR.to_string(),
         operator_abi_version: "1".to_string(),
-        ferrum_native_abi_version: "1".to_string(),
+        ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
         backend: NativeOperatorBackend::Cuda,
         cuda_toolkit: Some("12.4".to_string()),
         cuda_runtime_min: Some("12.4".to_string()),
@@ -112,13 +114,24 @@ fn write_manifest(
         inputs_sha256,
         binary_sha256,
         linkage: NativeOperatorLinkage::Static,
+        g03_catalog_sha256: Some(digest('c')),
+        abi_contract_sha256: Some(digest('d')),
+        descriptor_export: Some("ferrum_native_fa2_descriptor_v2".to_string()),
+        operation_bindings: vec![NativeOperatorBinding {
+            operation_id: "operation.causal_paged_attention".to_string(),
+            operation_contract_version: 1,
+            provider_id: "provider.cuda.fa2".to_string(),
+            provider_version: 1,
+            provider_implementation_fingerprint: digest('e'),
+            entrypoints: vec!["ferrum_native_fa2_execute_v1".to_string()],
+        }],
         exports: vec![
-            "ferrum_native_op_init".to_string(),
-            "ferrum_native_op_descriptor".to_string(),
+            "ferrum_native_fa2_descriptor_v2".to_string(),
+            "ferrum_native_fa2_execute_v1".to_string(),
         ],
         license_files: vec!["LICENSE".to_string()],
         build_summary: NativeOperatorBuildSummary {
-            builder_sha: "test-builder".to_string(),
+            builder_sha: digest('7'),
             elapsed_ms: 1,
             nvcc_version: Some("12.4".to_string()),
             host_compiler: "cc".to_string(),
@@ -193,8 +206,8 @@ fn resolves_cuda_fa2_native_operator_with_pinned_hashes_and_exports() {
     assert_eq!(
         selection.required_exports,
         vec![
-            "ferrum_native_op_init".to_string(),
-            "ferrum_native_op_descriptor".to_string(),
+            "ferrum_native_fa2_descriptor_v2".to_string(),
+            "ferrum_native_fa2_execute_v1".to_string(),
         ]
     );
 }

@@ -2037,6 +2037,11 @@ fn infer_sm_count_from_gpu_name(name: &str) -> Option<u32> {
 
 fn compiled_kernel_features() -> CompiledKernelFeatures {
     let fa2_native = ferrum_kernels::native_ops::compiled_fa2_native_operator_artifact();
+    let native_operator_artifacts =
+        ferrum_kernels::native_ops::compiled_native_operator_artifacts().to_vec();
+    let has_v2_fa2 = native_operator_artifacts
+        .iter()
+        .any(|artifact| artifact.operator == ferrum_kernels::native_ops::FA2_NATIVE_OPERATOR);
     CompiledKernelFeatures {
         cuda: cfg!(feature = "cuda"),
         vllm_paged_attn: cfg!(feature = "vllm-paged-attn-v2"),
@@ -2045,7 +2050,7 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
         fa2_source: false,
         fa2_direct_ffi: cfg!(feature = "cuda"),
-        fa2_native_operator_artifact: fa2_native.is_some(),
+        fa2_native_operator_artifact: fa2_native.is_some() || has_v2_fa2,
         fa2_native_operator_artifact_metadata: fa2_native.map(|artifact| {
             CompiledNativeOperatorArtifact {
                 manifest_path: artifact.manifest_path.to_string(),
@@ -2055,6 +2060,7 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
                 binary_sha256: artifact.binary_sha256.to_string(),
             }
         }),
+        native_operator_artifacts,
     }
 }
 
