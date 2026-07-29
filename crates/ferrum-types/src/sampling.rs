@@ -49,6 +49,14 @@ pub struct SamplingParams {
     /// in that case the grammar activates only after the typed delimiter.
     #[serde(default)]
     pub structured_output_start: StructuredOutputStart,
+    /// Product completion boundary that must be satisfied before model EOS
+    /// tokens may terminate generation.
+    ///
+    /// This is independent of structured-output grammar activation: ordinary
+    /// text, tool calls, and structured responses all need a complete
+    /// reasoning-to-payload transition when the rendered prompt opens one.
+    #[serde(default)]
+    pub response_completion_boundary: ResponseCompletionBoundary,
 }
 
 /// Typed activation boundary for constrained decoding.
@@ -61,6 +69,18 @@ pub enum StructuredOutputStart {
     /// Allow reasoning tokens until this exact tokenizer sequence is emitted,
     /// then constrain every subsequent token.
     AfterDelimiter(String),
+}
+
+/// Typed model-EOS boundary for product response completion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "mode", content = "delimiter", rename_all = "snake_case")]
+pub enum ResponseCompletionBoundary {
+    /// Model EOS may terminate any generated token.
+    #[default]
+    Immediate,
+    /// Model EOS remains unavailable until the exact delimiter token sequence
+    /// and at least one subsequent non-whitespace payload token are emitted.
+    AfterDelimiterAndPayload(String),
 }
 
 /// Response format for structured output. Mirrors OpenAI's
@@ -103,6 +123,7 @@ impl Default for SamplingParams {
             mirostat: None,
             response_format: ResponseFormat::default(),
             structured_output_start: StructuredOutputStart::default(),
+            response_completion_boundary: ResponseCompletionBoundary::default(),
         }
     }
 }
@@ -180,6 +201,15 @@ impl SamplingParams {
                     "typical_p must be in range (0, 1]".to_string(),
                 ));
             }
+        }
+        if matches!(
+            &self.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload(delimiter)
+                if delimiter.is_empty()
+        ) {
+            return Err(FerrumError::invalid_request(
+                "response completion delimiter must not be empty".to_string(),
+            ));
         }
         Ok(())
     }

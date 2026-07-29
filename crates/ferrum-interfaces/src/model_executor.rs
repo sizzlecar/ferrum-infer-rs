@@ -81,12 +81,39 @@ pub struct TokenSelectionMask {
 
 impl TokenSelectionMask {
     pub fn new(valid_token_mask: Vec<i8>) -> Self {
-        let mut hasher = DefaultHasher::new();
-        valid_token_mask.hash(&mut hasher);
+        let fingerprint = Self::fingerprint(&valid_token_mask);
         Self {
-            fingerprint: hasher.finish(),
+            fingerprint,
             valid_token_mask: Arc::from(valid_token_mask),
         }
+    }
+
+    fn fingerprint(valid_token_mask: &[i8]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        valid_token_mask.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Change a small set of token-validity slots and refresh the cache key
+    /// once. `Arc::make_mut` keeps the common unshared request mask in place
+    /// and preserves safety when an in-flight backend policy still owns a
+    /// clone.
+    pub fn set_tokens_validity(&mut self, token_ids: &[u32], valid: bool) -> bool {
+        let value = i8::from(valid);
+        let slots = Arc::make_mut(&mut self.valid_token_mask);
+        let mut changed = false;
+        for &token_id in token_ids {
+            if let Some(slot) = slots.get_mut(token_id as usize) {
+                if *slot != value {
+                    *slot = value;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.fingerprint = Self::fingerprint(slots);
+        }
+        changed
     }
 
     pub fn len(&self) -> usize {
@@ -106,6 +133,30 @@ impl std::fmt::Debug for TokenSelectionMask {
             .field("len", &self.valid_token_mask.len())
             .field("valid_count", &valid_count)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod token_selection_mask_tests {
+    use super::TokenSelectionMask;
+
+    #[test]
+    fn response_completion_mask_is_copy_on_write_and_restores_fingerprint() {
+        let mut mask = TokenSelectionMask::new(vec![1, 1, 1]);
+        let original = mask.clone();
+        let original_fingerprint = mask.fingerprint;
+
+        assert!(mask.set_tokens_validity(&[1], false));
+        assert_eq!(mask.valid_token_mask.as_ref(), &[1, 0, 1]);
+        assert_eq!(original.valid_token_mask.as_ref(), &[1, 1, 1]);
+        assert_ne!(mask.fingerprint, original_fingerprint);
+
+        let masked_fingerprint = mask.fingerprint;
+        assert!(!mask.set_tokens_validity(&[1], false));
+        assert_eq!(mask.fingerprint, masked_fingerprint);
+
+        assert!(mask.set_tokens_validity(&[1], true));
+        assert_eq!(mask.fingerprint, original_fingerprint);
     }
 }
 
