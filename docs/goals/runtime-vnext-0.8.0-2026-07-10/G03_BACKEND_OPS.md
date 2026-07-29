@@ -139,6 +139,30 @@ GDN 自身为 `2,250` QKVZBA 加 `2,250` output GEMV。它没有产生 `vnext-g0
 canonical PASS。完整 CUDA/Metal conformance、numerical catalog
 和 dispatch-overhead 仍未完成，G03 状态保持 Open。
 
+## 2026-07-29 Typed Attention Authority Checkpoint
+
+Clean source `fab3996956f9daefe7487904a04a0c66ecd07bb3` 将 requested、
+resolved 和 observed attention execution 分成一个 typed policy 与动态 provider variant：
+effective config 不再把启动期 V2 能力冒充实际执行的固定实现；`NativeAdaptive` 明确允许
+每 invocation 选择 addressed V1/V2、varlen 或 Ferrum builtin，实际 node event 必须携带
+provider implementation fingerprint。Portable policy 的 focused CUDA tests `2/2` 通过，
+official-feature release binary SHA256 为
+`35d6aa421cc33be164b6f6b75e3fe5e1a60197fdd7851c3b333d4155405d18cb`。
+
+真实 Qwen3.5-35B-A3B CUDA 产品 profile 观测到 `320` 个
+`vnext.causal_attention.vllm_paged_attention_v1_addressed` event，全部携带
+fingerprint
+`7fb8cf0ce185a9ac0abe61946adf9ecd7fdf163181e7a10e4d148607c913625e`，
+并满足 scalar participant `1`、compute dispatch `9`、transfer `0`。现有 validator 打印：
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-authority-fab39969-20260729/g06-provider-profile/attribution/causal-paged-attention
+```
+
+这关闭“plan/effective config 与实际 provider 无法机械归因”的当前 M2 CUDA failure class，
+不关闭 G03：完整 provider conformance、三模型 determinism coverage、Metal parity、
+numerical catalog coverage 和 dispatch-overhead 仍须由 canonical G03 gate 验收。
+
 ## 产物与 PASS
 
 ```text

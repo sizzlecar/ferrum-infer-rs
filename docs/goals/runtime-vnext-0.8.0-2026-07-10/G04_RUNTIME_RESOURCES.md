@@ -385,6 +385,31 @@ scratch 和 graph workspace 多个 lease：
   使用同一 lifecycle implementation，重复主循环数量 `0`。G08 在真实三模型迁移后重新
   执行同一 ownership analyzer；不再使用可通过改变分母操纵的“复用率”指标。
 
+## 2026-07-29 Current-HEAD CUDA Resource Wiring Checkpoint
+
+本轮没有重写已经完成本地 contract 验证的共享 Execution Runtime、Scheduler 或资源事务。
+Clean source `fab3996956f9daefe7487904a04a0c66ecd07bb3` 只收敛它们的产品 authority
+边界：executor 公开 typed admission limits，scheduler 生成同一采样代的 phase snapshot，
+PlanRuntime snapshot failure 不再静默回退 startup estimate。
+
+真实 Qwen3.5-35B-A3B CUDA `serve` c32 压力在 `105.124678s` 内完成 `32/32`：
+typed admission cap=`16`、observed max-active=`16`、active floor=`16`、
+eligible interval duty-cycle=`0.9591967864`。error、OOM、panic、crosstalk、
+server 500 均为 `0`；32 个 request lifecycle 最终 active=`0`。
+资源事务重算结果为：
+
+- `request_slot`: reserve/commit/release=`32/32/32`;
+- `model_cache_ref`: reserve/commit/release=`32/32/32`;
+- `backend_workspace`: reserve/commit/release=`1015/1015/1015`;
+- rollback、leak、underflow=`0/0/0`。
+
+bounded receipt 位于
+`/workspace/ferrum-artifacts/runtime-vnext-authority-fab39969-20260729/g08b-c18-c32/focused-c18-c32/receipt.json`，
+产品 runner 打印 `FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`。该证据确认新
+G03/G06 wiring 没有绕过共享 G04 authority；它不是 canonical G04 PASS，100,000
+状态序列、pressure/yield/release-fence、三类 synthetic program 和完整 G04 artifact
+仍保持 Open。
+
 ## 性能约束
 
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32
