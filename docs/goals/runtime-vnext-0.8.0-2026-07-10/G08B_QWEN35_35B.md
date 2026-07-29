@@ -1739,6 +1739,32 @@ one correctness-profile exact `c13-022` comparison on the retained cached 4090.
 Native compilation, deadline, reference validation failure, plan mismatch or the
 focused result is the stop condition. It must not restart the 703 sweep.
 
+## Current-HEAD Authority Wiring Sentinel - 2026-07-29
+
+The canonical `703/703` checkpoint remains bound to clean source `b0431ca5`;
+it is not relabeled as current-HEAD evidence. After the attention/admission/profile
+authority changes, clean pushed source
+`fab3996956f9daefe7487904a04a0c66ecd07bb3` completed a staged sentinel on the
+retained 1x RTX 4090:
+
+- official CUDA release-feature build PASS in `468.558363s`, binary SHA256
+  `35d6aa421cc33be164b6f6b75e3fe5e1a60197fdd7851c3b333d4155405d18cb`;
+- multi-turn `run`, non-stream `serve`, streaming usage/`[DONE]`, Chinese
+  `run`/`serve`, and c1 admission passed `6/6`;
+- c32 `serve` completed `32/32`, typed cap and observed max-active were both
+  `16`, active duty-cycle was `0.9591967864`, and error/OOM/panic/leak/
+  underflow counts were all `0`;
+- a separate public full-profile c1 case produced real native events, and the
+  causal-attention provider attribution gate accepted `320/320` addressed V1
+  events with a bound provider implementation fingerprint.
+
+The c32 and profile runners printed focused `KEEP`; the attribution validator
+printed `FERRUM NATIVE WORK ATTRIBUTION PASS`. This closes the post-canonical
+typed-authority regression class and permits a profile-off performance
+diagnostic. It does not advance the formal `1/6` correctness matrix or close
+G08B; the next broad CUDA matrix is deferred to the next source-freeze
+milestone rather than restarted after each focused change.
+
 ## Metal Matrix Workflow
 
 The Metal lane reuses the same backend-parameterized preparation and checkpoint

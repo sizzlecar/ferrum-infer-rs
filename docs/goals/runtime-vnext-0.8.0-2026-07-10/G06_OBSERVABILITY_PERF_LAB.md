@@ -458,6 +458,32 @@ GitHub artifact branch 为
 的真实 CUDA attribution 检查，但没有运行 G06 全套 replay/historical/profile-overhead 门，
 因此不关闭 G06。
 
+### Typed authority native attribution evidence（2026-07-29）
+
+Clean source `fab3996956f9daefe7487904a04a0c66ecd07bb3` 使用公开产品参数
+`--profile-detail full --profile-sample-rate 1.0 --profile-jsonl <path>` 执行一个
+Qwen3.5-35B-A3B CUDA `serve` correctness case。bounded 产品诊断耗时
+`108.816283s`、返回码 `0`、process group cleanup 成功，并打印
+`FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP`。profile 文件为 `42,779,460`
+bytes，实际 attention event 不再依赖 effective config 猜测 provider。
+
+`native_work_attribution_gate.py` 从原始 JSONL 流式重算：
+
+- addressed V1 causal-attention eligible/matching=`320/320`;
+- provider implementation fingerprint 为
+  `7fb8cf0ce185a9ac0abe61946adf9ecd7fdf163181e7a10e4d148607c913625e`;
+- batching=`scalar`、participant=`1`、compute dispatch=`9`、transfer=`0`;
+- artifact 绑定 source SHA 与 binary SHA256
+  `35d6aa421cc33be164b6f6b75e3fe5e1a60197fdd7851c3b333d4155405d18cb`。
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-authority-fab39969-20260729/g06-provider-profile/attribution/causal-paged-attention
+```
+
+这关闭当前 M2 CUDA 的 requested/resolved/observed provider identity failure class；
+它没有运行 historical replay、stage/top-kernel coverage、profile overhead 或 G09
+throughput，因此 G06 仍为 Open。
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。

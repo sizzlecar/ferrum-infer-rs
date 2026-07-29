@@ -260,6 +260,36 @@ kernel-selection policy、effective config 和 physical admission 共享同一 t
 本次 paid window 为 `54m54s`、约 `$0.3558`，未超过 `$0.58` cap；实例
 `46127509` 和 `45897840` 均为 `stopped/exited`，`potentially_billable=[]`。
 
+clean、已推送 source `fab3996956f9daefe7487904a04a0c66ecd07bb3`
+关闭了上述 typed-authority blocker。`c8bba60f` 将 attention execution policy、
+executor admission limits、scheduler phase snapshot 和 provider implementation
+fingerprint 收敛到 PlanRuntime/DeviceRuntime 的 typed authority；`ead75924` 修复
+CUDA-only error mapping，`fab39969` 把 Portable policy 的测试边界改为“禁止可选
+vLLM V1/V2 provider、允许 Ferrum builtin PTX”，没有把动态 V1/V2/varlen 选择重新写死。
+official-feature release binary 构建用时 `468.558363s`，SHA256 为
+`35d6aa421cc33be164b6f6b75e3fe5e1a60197fdd7851c3b333d4155405d18cb`；
+base CUDA policy tests `2/2` 通过。
+
+当前 HEAD 的真实 CUDA `run`/`serve` 哨兵覆盖 multi-turn、non-stream、stream usage /
+`[DONE]`、中文和 admission，共 `6/6` 通过。独立 c32 `serve` 压力完成 `32/32`，
+typed cap 与 observed max-active 均为 `16`，active duty-cycle 为 `0.9591967864`，
+error/OOM/panic/crosstalk 均为 `0`；`request_slot`、`model_cache_ref` 和
+`backend_workspace` reserve/release 全部平衡，leak/underflow 为 `0`。最小公开
+`--profile-detail full --profile-jsonl` 产品诊断随后生成真实 CUDA profile；
+`320/320` 个 addressed V1 causal-attention event 携带 64-hex provider fingerprint
+`7fb8cf0ce185a9ac0abe61946adf9ecd7fdf163181e7a10e4d148607c913625e`，
+且全部满足 compute dispatch `9`、transfer `0`。validator 打印：
+
+```text
+FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-authority-fab39969-20260729/g06-provider-profile/attribution/causal-paged-attention
+```
+
+因此 G03/G06 的“配置声称固定 V2、产品实际执行另一条不可归因路径”failure class 已关闭，
+共享 G04 runtime/scheduler/resource transaction 没有重新设计；本轮只验证新 authority wiring
+没有绕过它。以上均为 current-HEAD focused KEEP/PASS 诊断，不替代 stale 后必须重跑的
+G08B 完整 correctness、G03/G04/G06 canonical gate 或 G09 正式性能门。下一步允许执行
+profile-off CUDA 性能诊断，正式性能证据仍须先绑定当前 HEAD 的 canonical correctness。
+
 2026-07-14 起，开发顺序和阶段依赖以
 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
 为准。G00-G10 继续定义最终能力与验收维度；S0-S7 定义实际生产纵切顺序。修订不降低本文件的
