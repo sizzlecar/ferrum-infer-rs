@@ -1243,6 +1243,10 @@ impl VNextProfileExecutionEventSink {
 }
 
 impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn enablement(&self) -> ferrum_interfaces::vnext::ExecutionEventSinkEnablement {
+        ferrum_interfaces::vnext::ExecutionEventSinkEnablement::All
+    }
+
     fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
         true
     }
