@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ferrum_native_ops::{
@@ -33,10 +34,13 @@ const COMPILED_FA2_NATIVE_BINARY_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_
 const CUDA_NATIVE_BUILD_CACHE_ENV: &str = "FERRUM_CUDA_NATIVE_BUILD_CACHE";
 const CUDA_NATIVE_IMPORT_DIRS_ENV: &str = "FERRUM_CUDA_NATIVE_IMPORT_DIRS";
 const CUDA_NATIVE_SOURCE_POLICY_ENV: &str = "FERRUM_CUDA_NATIVE_SOURCE_POLICY";
+const CUDA_BUILD_SUMMARY_RECEIPT_ENV: &str = "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT";
+const CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION: u64 = 1;
 const CUDA_NATIVE_SIGNATURE_SCHEMA: &str = "ferrum-cuda-native-input-v2";
 const DEFAULT_NVCC_THREADS: u32 = 4;
 const MAX_NVCC_THREADS: u32 = 8;
 const HISTORICAL_NVCC_THREAD_VALUES: std::ops::RangeInclusive<u32> = 0..=MAX_NVCC_THREADS;
+static CUDA_BUILD_SUMMARY_ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
 
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
@@ -329,6 +333,129 @@ elapsed_ms={} inputs_hash={}",
         elapsed.as_millis(),
         signature_hash(signature)
     );
+    CUDA_BUILD_SUMMARY_ROWS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("CUDA build summary rows lock must not be poisoned")
+        .push(serde_json::json!({
+            "artifact": artifact,
+            "status": status,
+            "reason": reason,
+            "elapsed_ms": elapsed.as_millis(),
+            "inputs_hash": signature_hash(signature),
+        }));
+}
+
+fn initialize_cuda_build_summary_receipt() {
+    println!("cargo:rerun-if-env-changed={CUDA_BUILD_SUMMARY_RECEIPT_ENV}");
+    CUDA_BUILD_SUMMARY_ROWS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("CUDA build summary rows lock must not be poisoned")
+        .clear();
+    let Some(raw_path) = env::var_os(CUDA_BUILD_SUMMARY_RECEIPT_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(raw_path);
+    assert!(
+        path.is_absolute(),
+        "{CUDA_BUILD_SUMMARY_RECEIPT_ENV} must be an absolute path"
+    );
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            assert!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "{CUDA_BUILD_SUMMARY_RECEIPT_ENV} must name a regular file when it exists: {}",
+                path.display()
+            );
+            fs::remove_file(&path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to remove stale CUDA build summary receipt {}: {error}",
+                    path.display()
+                )
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "failed to inspect CUDA build summary receipt {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn finalize_cuda_build_summary_receipt() {
+    let Some(raw_path) = env::var_os(CUDA_BUILD_SUMMARY_RECEIPT_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(raw_path);
+    let parent = path.parent().unwrap_or_else(|| {
+        panic!(
+            "{CUDA_BUILD_SUMMARY_RECEIPT_ENV} has no parent: {}",
+            path.display()
+        )
+    });
+    assert!(
+        parent.is_dir(),
+        "{CUDA_BUILD_SUMMARY_RECEIPT_ENV} parent is not a directory: {}",
+        parent.display()
+    );
+    let rows = CUDA_BUILD_SUMMARY_ROWS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("CUDA build summary rows lock must not be poisoned")
+        .clone();
+    let payload = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION,
+        "artifact_type": "ferrum_cuda_build_summary_receipt",
+        "rows": rows,
+    }))
+    .expect("CUDA build summary receipt must serialize");
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "{CUDA_BUILD_SUMMARY_RECEIPT_ENV} must have a UTF-8 file name: {}",
+                path.display()
+            )
+        });
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to create CUDA build summary receipt temporary {}: {error}",
+                temporary.display()
+            )
+        });
+    file.write_all(&payload).unwrap_or_else(|error| {
+        panic!(
+            "failed to write CUDA build summary receipt temporary {}: {error}",
+            temporary.display()
+        )
+    });
+    file.write_all(b"\n").unwrap_or_else(|error| {
+        panic!(
+            "failed to terminate CUDA build summary receipt temporary {}: {error}",
+            temporary.display()
+        )
+    });
+    file.sync_all().unwrap_or_else(|error| {
+        panic!(
+            "failed to sync CUDA build summary receipt temporary {}: {error}",
+            temporary.display()
+        )
+    });
+    drop(file);
+    fs::rename(&temporary, &path).unwrap_or_else(|error| {
+        let _ = fs::remove_file(&temporary);
+        panic!(
+            "failed to publish CUDA build summary receipt {}: {error}",
+            path.display()
+        )
+    });
 }
 
 fn optional_non_empty_env(key: &str) -> Option<String> {
@@ -1107,6 +1234,7 @@ fn emit_cuda_static_link(
 }
 
 fn main() {
+    initialize_cuda_build_summary_receipt();
     println!("cargo:rerun-if-changed=build.rs");
     let native_artifact_coverage = link_native_operator_artifact_set();
     if native_artifact_coverage.is_none() {
@@ -1119,6 +1247,7 @@ fn main() {
     }
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        finalize_cuda_build_summary_receipt();
         return;
     }
 
@@ -1216,6 +1345,7 @@ fn main() {
     if env::var_os("CARGO_FEATURE_FA2_SOURCE").is_some() {
         report_fa2_source_obsolete();
     }
+    finalize_cuda_build_summary_receipt();
 }
 
 fn detect_cuda_compute_cap() -> String {

@@ -63,6 +63,7 @@ EXPECTED_BUILD_UNITS = {
     "vllm_moe_marlin",
     "vllm_paged_attn",
 }
+CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION = 1
 EXPECTED_STEPS = {
     "builder-build",
     "bootstrap-example-build",
@@ -85,9 +86,7 @@ DOES_NOT_PROVE = {
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-CUDA_SUMMARY_RE = re.compile(
-    r"\[cuda-build-summary\]\s+artifact=(\S+)\s+status=(\S+)\s+reason=(\S+)"
-)
+CUDA_INPUTS_HASH_RE = re.compile(r"^fnv1a64:[0-9a-f]{16}$")
 
 
 class VerificationError(RuntimeError):
@@ -2229,17 +2228,53 @@ def verify_catalogs_and_packages(
 
 
 def verify_build_summaries(root: Path, manifest: dict[str, Any]) -> None:
-    step_root = root / "steps/artifact-example-build"
-    text = (
-        (step_root / "stdout.log").read_text(encoding="utf-8", errors="replace")
-        + "\n"
-        + (step_root / "stderr.log").read_text(encoding="utf-8", errors="replace")
+    path = root / "artifact-build-summary.receipt.json"
+    receipt = require_dict(
+        read_json(path, "artifact build summary receipt"),
+        "artifact build summary receipt",
     )
-    summaries = [
-        {"artifact": artifact, "status": status, "reason": reason}
-        for artifact, status, reason in CUDA_SUMMARY_RE.findall(text)
-    ]
-    require(manifest.get("artifact_build_summaries") == summaries, "manifest build summaries differ from logs")
+    require(
+        receipt.get("schema_version") == CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION
+        and receipt.get("artifact_type") == "ferrum_cuda_build_summary_receipt",
+        "artifact build summary receipt identity mismatch",
+    )
+    summaries = require_list(receipt.get("rows"), "artifact build summary receipt.rows")
+    for index, raw_row in enumerate(summaries):
+        row = require_dict(raw_row, f"artifact build summary row {index}")
+        require(
+            set(row) == {"artifact", "status", "reason", "elapsed_ms", "inputs_hash"},
+            f"artifact build summary row {index} shape mismatch",
+        )
+        require(
+            all(isinstance(row.get(key), str) and row[key] for key in ("artifact", "status", "reason")),
+            f"artifact build summary row {index} text fields are invalid",
+        )
+        require(
+            isinstance(row.get("elapsed_ms"), int) and row["elapsed_ms"] >= 0,
+            f"artifact build summary row {index} elapsed_ms is invalid",
+        )
+        require(
+            isinstance(row.get("inputs_hash"), str)
+            and CUDA_INPUTS_HASH_RE.fullmatch(row["inputs_hash"]) is not None,
+            f"artifact build summary row {index} inputs_hash is invalid",
+        )
+    require(
+        manifest.get("artifact_build_summaries") == summaries,
+        "manifest build summaries differ from receipt",
+    )
+    receipt_summary = require_dict(
+        manifest.get("artifact_build_summary_receipt"),
+        "manifest.artifact_build_summary_receipt",
+    )
+    require(
+        receipt_summary
+        == {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": sha256(path),
+            "schema_version": CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION,
+        },
+        "manifest build summary receipt identity mismatch",
+    )
     for unit in EXPECTED_BUILD_UNITS:
         rows = [row for row in summaries if row["artifact"] == unit]
         require(len(rows) == 1, f"artifact build summary count mismatch for {unit}")
@@ -2248,6 +2283,10 @@ def verify_build_summaries(root: Path, manifest: dict[str, Any]) -> None:
             and rows[0]["reason"] == "native-operator-artifact-set",
             f"native artifact {unit} fell back to source",
         )
+    require(
+        not any(row["status"] == "rejected" for row in summaries),
+        "artifact build summary contains a rejected build decision",
+    )
     for step in ("bootstrap-catalog-export", "artifact-catalog-export"):
         output = (root / "steps" / step / "stdout.log").read_text(encoding="utf-8", errors="replace")
         require(
@@ -2307,19 +2346,81 @@ def expect_reject(action: Any, label: str) -> None:
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="g07b-native-chain-validator-") as temporary:
         root = Path(temporary)
-        payload = root / "payload.txt"
+        summary_root = root / "build-summary"
+        summary_path = summary_root / "artifact-build-summary.receipt.json"
+        summary_path.parent.mkdir(parents=True)
+        summary_rows = [
+            {
+                "artifact": unit,
+                "status": "artifact",
+                "reason": "native-operator-artifact-set",
+                "elapsed_ms": 0,
+                "inputs_hash": f"fnv1a64:{index:016x}",
+            }
+            for index, unit in enumerate(sorted(EXPECTED_BUILD_UNITS), start=1)
+        ]
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION,
+                    "artifact_type": "ferrum_cuda_build_summary_receipt",
+                    "rows": summary_rows,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for step in ("bootstrap-catalog-export", "artifact-catalog-export"):
+            step_root = summary_root / "steps" / step
+            step_root.mkdir(parents=True)
+            (step_root / "stdout.log").write_text(
+                "FERRUM RUNTIME VNEXT CUDA LIVE CATALOG READY: fixture\n",
+                encoding="utf-8",
+            )
+        summary_manifest = {
+            "artifact_build_summaries": summary_rows,
+            "artifact_build_summary_receipt": {
+                "path": summary_path.relative_to(summary_root).as_posix(),
+                "sha256": sha256(summary_path),
+                "schema_version": CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION,
+            },
+        }
+        verify_build_summaries(summary_root, summary_manifest)
+        tampered_summary = copy.deepcopy(
+            json.loads(summary_path.read_text(encoding="utf-8"))
+        )
+        tampered_summary["rows"][0]["status"] = "built"
+        summary_path.write_text(
+            json.dumps(tampered_summary, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_build_summaries(summary_root, summary_manifest),
+            "artifact build summary receipt tamper",
+        )
+
+        artifact_index_root = root / "artifact-index"
+        artifact_index_root.mkdir()
+        payload = artifact_index_root / "payload.txt"
         payload.write_text("original\n", encoding="utf-8")
         manifest = {
-            "artifacts": collect_artifact_index(root),
+            "artifacts": collect_artifact_index(artifact_index_root),
             "artifact_count": 1,
         }
-        verify_artifact_index(root, manifest)
+        verify_artifact_index(artifact_index_root, manifest)
         payload.write_text("tampered\n", encoding="utf-8")
-        expect_reject(lambda: verify_artifact_index(root, manifest), "artifact-index tamper")
+        expect_reject(
+            lambda: verify_artifact_index(artifact_index_root, manifest),
+            "artifact-index tamper",
+        )
         payload.write_text("original\n", encoding="utf-8")
-        link = root / "payload-link"
+        link = artifact_index_root / "payload-link"
         os.symlink(payload.name, link)
-        expect_reject(lambda: collect_artifact_index(root), "artifact symlink")
+        expect_reject(
+            lambda: collect_artifact_index(artifact_index_root),
+            "artifact symlink",
+        )
 
         def digest(value: str) -> str:
             return hashlib.sha256(value.encode("utf-8")).hexdigest()
