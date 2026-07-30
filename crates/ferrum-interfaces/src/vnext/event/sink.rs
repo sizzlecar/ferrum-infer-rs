@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::model_executor::ExecutorRequestOrigin;
+
 use super::{
     has_active, ExecutionEvent, ExecutionEventCursor, ExecutionEventKind, RequestIdentity, RunId,
     TrustedExecutionEventContext,
@@ -76,6 +78,7 @@ pub enum ExecutionEventCapturePolicy {
     #[default]
     AllFrames,
     FirstFramePerRequest,
+    LifecycleOnly,
 }
 
 impl ExecutionEventCapturePolicy {
@@ -83,6 +86,7 @@ impl ExecutionEventCapturePolicy {
         match self {
             Self::AllFrames => true,
             Self::FirstFramePerRequest => completed_frames == 0,
+            Self::LifecycleOnly => false,
         }
     }
 
@@ -90,6 +94,7 @@ impl ExecutionEventCapturePolicy {
         match self {
             Self::AllFrames => "all_frames",
             Self::FirstFramePerRequest => "first_frame_per_request",
+            Self::LifecycleOnly => "lifecycle_only",
         }
     }
 }
@@ -103,6 +108,13 @@ pub trait ExecutionEventSink: Send + Sync {
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         ExecutionEventCapturePolicy::AllFrames
+    }
+
+    fn capture_policy_for_request(
+        &self,
+        _origin: ExecutorRequestOrigin,
+    ) -> ExecutionEventCapturePolicy {
+        self.capture_policy()
     }
 
     fn record_device_submission_attribution(

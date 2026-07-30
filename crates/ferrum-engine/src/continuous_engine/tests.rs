@@ -6056,6 +6056,16 @@ fn vnext_profile_test_event() -> (
     ferrum_interfaces::vnext::RequestIdentity,
     ferrum_interfaces::vnext::ExecutionEvent,
 ) {
+    vnext_profile_test_event_for_request("request.vnext.engine-profile-test")
+}
+
+fn vnext_profile_test_event_for_request(
+    request_identity: &str,
+) -> (
+    ferrum_interfaces::vnext::RunId,
+    ferrum_interfaces::vnext::RequestIdentity,
+    ferrum_interfaces::vnext::ExecutionEvent,
+) {
     use ferrum_interfaces::vnext::{
         ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
         ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp, RequestIdentity, RunId, SpanId,
@@ -6063,7 +6073,7 @@ fn vnext_profile_test_event() -> (
     };
 
     let run_id = RunId::new("run.vnext.engine-profile-test").unwrap();
-    let request_id = RequestIdentity::new("request.vnext.engine-profile-test").unwrap();
+    let request_id = RequestIdentity::new(request_identity).unwrap();
     let event = ExecutionEvent::new(
         MonotonicTimestamp {
             nanos_since_run_start: 1,
@@ -6207,6 +6217,41 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
         Some(&serde_json::json!("first_frame_per_request"))
     );
 
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+fn basic_vnext_profile_keeps_startup_lifecycle_without_repeated_frame_detail() {
+    let trace_path = resource_trace_temp_path("vnext-startup-lifecycle-profile");
+    let _ = std::fs::remove_file(&trace_path);
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+
+    assert_eq!(
+        sink.capture_policy_for_request(ExecutorRequestOrigin::Startup),
+        ExecutionEventCapturePolicy::LifecycleOnly
+    );
+    assert_eq!(
+        sink.capture_policy_for_request(ExecutorRequestOrigin::Product),
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    );
+    let (_, _, startup) =
+        vnext_profile_test_event_for_request("request.startup.engine-profile-test");
+    let profile = sink.profile_event(&startup).unwrap();
+    assert_eq!(
+        profile.attributes.get("execution_request_origin"),
+        Some(&serde_json::json!("startup"))
+    );
+    assert_eq!(
+        profile.attributes.get("execution_capture_policy"),
+        Some(&serde_json::json!("lifecycle_only"))
+    );
+
+    drop(sink);
+    journal.close().unwrap();
     let _ = std::fs::remove_file(trace_path);
 }
 
