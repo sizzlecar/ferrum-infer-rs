@@ -1057,9 +1057,21 @@ impl ExecutionEventCursor {
         context: &TrustedExecutionEventContext<'_>,
     ) -> Result<(), VNextError> {
         let mut next = self.clone();
-        next.observe_inner(event, context)?;
+        next.observe_candidate_in_place(event, context)?;
         *self = next;
         Ok(())
+    }
+
+    /// Advances a detached transactional candidate without cloning it again.
+    ///
+    /// The event emitter creates the candidate before invoking this boundary
+    /// and publishes it only after the sink accepts the event or batch.
+    pub(super) fn observe_candidate_in_place(
+        &mut self,
+        event: &ExecutionEvent,
+        context: &TrustedExecutionEventContext<'_>,
+    ) -> Result<(), VNextError> {
+        self.observe_inner(event, context)
     }
 
     pub const fn last_sequence(&self) -> u64 {

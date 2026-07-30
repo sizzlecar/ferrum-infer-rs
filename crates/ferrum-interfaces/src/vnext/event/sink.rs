@@ -114,7 +114,24 @@ impl ExecutionEventCapturePolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionEventSinkEnablement {
+    None,
+    All,
+    #[default]
+    PerKind,
+}
+
 pub trait ExecutionEventSink: Send + Sync {
+    /// Resolves stable event enablement once when an emitter is constructed.
+    ///
+    /// Dynamically filtered sinks keep the conservative `PerKind` default.
+    /// Permanently disabled and all-event sinks select `None` or `All` so the
+    /// event hot path does not perform a virtual enablement query.
+    fn enablement(&self) -> ExecutionEventSinkEnablement {
+        ExecutionEventSinkEnablement::PerKind
+    }
+
     fn is_enabled(&self, kind: ExecutionEventKind) -> bool;
 
     fn device_timing_mode(&self) -> super::super::DeviceTimingMode {
@@ -182,6 +199,7 @@ pub struct ExecutionEventEmitter<'sink> {
     sink: ExecutionEventSinkHandle<'sink>,
     cursor: ExecutionEventCursor,
     capture_policy: ExecutionEventCapturePolicy,
+    sink_enablement: ExecutionEventSinkEnablement,
     sink_failed: bool,
 }
 
@@ -192,10 +210,12 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         request_id: RequestIdentity,
     ) -> Self {
         let capture_policy = sink.capture_policy();
+        let sink_enablement = sink.enablement();
         Self {
             sink: ExecutionEventSinkHandle::Borrowed(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
             capture_policy,
+            sink_enablement,
             sink_failed: false,
         }
     }
@@ -219,17 +239,25 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         request_id: RequestIdentity,
         capture_policy: ExecutionEventCapturePolicy,
     ) -> ExecutionEventEmitter<'static> {
+        let sink_enablement = sink.enablement();
         ExecutionEventEmitter {
             sink: ExecutionEventSinkHandle::Shared(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
             capture_policy,
+            sink_enablement,
             sink_failed: false,
         }
     }
 
     fn records_event(&self, event: &ExecutionEvent) -> bool {
         self.capture_policy.records_event(event.kind())
-            && self.sink.as_sink().is_enabled(event.kind())
+            && match self.sink_enablement {
+                ExecutionEventSinkEnablement::None => false,
+                ExecutionEventSinkEnablement::All => true,
+                ExecutionEventSinkEnablement::PerKind => {
+                    self.sink.as_sink().is_enabled(event.kind())
+                }
+            }
     }
 
     fn validate_next(
@@ -262,7 +290,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             live.map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
         }
         cursor
-            .observe_against(event, context)
+            .observe_candidate_in_place(event, context)
             .map_err(|error| ExecutionEventSinkError::new(error.to_string()))
     }
 
@@ -278,6 +306,10 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         }
         let mut next_cursor = self.cursor.clone();
         Self::validate_next(&mut next_cursor, &event, context)?;
+        if self.sink_enablement == ExecutionEventSinkEnablement::None {
+            self.cursor = next_cursor;
+            return Ok(());
+        }
         if self.records_event(&event) {
             let permit = EventEmissionPermit {
                 event,
@@ -314,6 +346,10 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         let mut next_cursor = self.cursor.clone();
         for (event, context) in events.iter().zip(contexts) {
             Self::validate_next(&mut next_cursor, event, context)?;
+        }
+        if self.sink_enablement == ExecutionEventSinkEnablement::None {
+            self.cursor = next_cursor;
+            return Ok(());
         }
 
         let all_enabled = events.iter().all(|event| self.records_event(event));
@@ -358,6 +394,10 @@ impl<'sink> ExecutionEventEmitter<'sink> {
 pub struct DisabledExecutionEventSink;
 
 impl ExecutionEventSink for DisabledExecutionEventSink {
+    fn enablement(&self) -> ExecutionEventSinkEnablement {
+        ExecutionEventSinkEnablement::None
+    }
+
     fn is_enabled(&self, _kind: ExecutionEventKind) -> bool {
         false
     }
