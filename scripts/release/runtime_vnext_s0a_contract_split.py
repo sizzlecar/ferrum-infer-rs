@@ -31,7 +31,7 @@ INVENTORY_DOCUMENT = (
 )
 ADR_DOCUMENT = GOAL_ROOT / "S0A_CONTRACT_SPLIT_MAP.md"
 PUBLIC_API_MIGRATIONS = GOAL_ROOT / "S0A_PUBLIC_API_MIGRATIONS.json"
-PUBLIC_API_ADDED_SHA256 = "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9"
+PUBLIC_API_ADDED_SHA256 = "6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41"
 
 PRODUCTION_GROUPS = {
     "resource": {
@@ -253,12 +253,12 @@ def validate_public_api_migrations() -> dict[str, Any]:
     require(
         document.get("schema_version") == 1
         and document.get("baseline_commit") == BASELINE_COMMIT
-        and document.get("expected_added_items") == 248
+        and document.get("expected_added_items") == 598
         and document.get("expected_added_items_sha256") == PUBLIC_API_ADDED_SHA256,
         "S0A public API migration manifest header drifted",
     )
     migrations = document.get("migrations")
-    require(isinstance(migrations, list) and len(migrations) == 9, "S0A migration count drifted")
+    require(isinstance(migrations, list) and len(migrations) == 10, "S0A migration count drifted")
     old_keys: set[tuple[str, str]] = set()
     for migration in migrations:
         require(
@@ -551,8 +551,8 @@ def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
                 "facade re-export preserves unchanged ferrum_interfaces::vnext::* paths; "
                 "intentional migrations are manifest-bound"
             ),
-            "semantic_change_count": 9,
-            "added_public_item_count": 248,
+            "semantic_change_count": 10,
+            "added_public_item_count": 598,
             "added_public_item_sha256": PUBLIC_API_ADDED_SHA256,
         },
     }
@@ -620,8 +620,8 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
     )
     require(result.returncode == 0, "public owner map command failed")
     expected_line = (
-        f"{OWNER_MAP_PASS_PREFIX}: mapped=1481/1490 migrated=9 lost=0 ambiguous=0 "
-        f"inaccessible=0 added=248 added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
+        f"{OWNER_MAP_PASS_PREFIX}: mapped=1480/1490 migrated=10 lost=0 ambiguous=0 "
+        f"inaccessible=0 added=598 added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
         f"output={output_path}"
     )
     require(result.stdout.splitlines().count(expected_line) == 1, "public owner map exact PASS line mismatch")
@@ -630,12 +630,12 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
         owner_map.get("summary")
         == {
             "baseline_items": 1490,
-            "mapped_items": 1481,
-            "migrated_items": 9,
+            "mapped_items": 1480,
+            "migrated_items": 10,
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 248,
+            "added_items": 598,
             "added_items_sha256": PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,

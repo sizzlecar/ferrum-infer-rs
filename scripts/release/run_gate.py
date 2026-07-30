@@ -90,7 +90,7 @@ SAFETENSORS_SHARD_RE = re.compile(
 )
 VNEXT_FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
 VNEXT_S0A_PUBLIC_API_ADDED_SHA256 = (
-    "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9"
+    "6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41"
 )
 VNEXT_G00_FULL_SELFTEST_PASS = (
     "FERRUM RUNTIME VNEXT G00 BASELINE FULL SELFTEST PASS"
@@ -2783,12 +2783,12 @@ def validate_vnext_g01a_s0a_provenance(
         owner_map.get("summary")
         == {
             "baseline_items": 1490,
-            "mapped_items": 1481,
-            "migrated_items": 9,
+            "mapped_items": 1480,
+            "migrated_items": 10,
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 248,
+            "added_items": 598,
             "added_items_sha256": VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
@@ -2812,7 +2812,7 @@ def validate_vnext_g01a_s0a_provenance(
         owner_evidence.get("summary") == owner_map.get("summary")
         and isinstance(owner_evidence.get("pass_line"), str)
         and owner_evidence["pass_line"].startswith(
-            "VNEXT PUBLIC OWNER MAP PASS: mapped=1481/1490 migrated=9"
+            "VNEXT PUBLIC OWNER MAP PASS: mapped=1480/1490 migrated=10"
         ),
         "vnext-g01a S0A public owner evidence binding mismatch",
     )
@@ -2820,8 +2820,8 @@ def validate_vnext_g01a_s0a_provenance(
         owner_migration
         == {"path": "public-api-migrations.json", "sha256": migration_digest}
         and owner_map_migration.get("sha256") == migration_digest
-        and owner_map_migration.get("migration_count") == 9
-        and owner_map_migration.get("expected_added_items") == 248
+        and owner_map_migration.get("migration_count") == 10
+        and owner_map_migration.get("expected_added_items") == 598
         and owner_map_migration.get("expected_added_items_sha256")
         == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A public owner migration evidence mismatch",
@@ -2866,8 +2866,8 @@ def validate_vnext_g01a_s0a_provenance(
         and contract_summary.get("production_group_count") == 3
         and contract_summary.get("multi_module_scc_count") == 0
         and contract_summary.get("test_target_count") == 24
-        and contract_summary.get("semantic_change_count") == 9
-        and contract_summary.get("added_public_item_count") == 248
+        and contract_summary.get("semantic_change_count") == 10
+        and contract_summary.get("added_public_item_count") == 598
         and contract_summary.get("added_public_item_sha256")
         == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A contract map acceptance mismatch",

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "baseline_commit": "b5377b12464b60203a3fe57a6de4c9952ed2474b",
-  "expected_added_items": 248,
-  "expected_added_items_sha256": "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9",
+  "expected_added_items": 598,
+  "expected_added_items_sha256": "6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41",
   "migrations": [
     {
       "old_path": "ferrum_interfaces::vnext::AdmittedSequenceResources::backing_slices",
@@ -191,6 +191,18 @@
       ],
       "introduced_by_commit": "926a3678e59c9b5dfa0d9b6201c8044021c083d1",
       "rationale": "The public path is retained but the alias was replaced by a provider-owned typed formula that excludes scheduler-specific ceilings."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::ProviderSelectionReason::DeterministicCompatible",
+      "old_kind": "enum_variant",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::ProviderSelectionReason::CanonicalCompatible",
+          "kind": "enum_variant"
+        }
+      ],
+      "introduced_by_commit": "8d9d6a9a41e7869317c1dd7234861f1cadba7065",
+      "rationale": "Provider ordering now records canonical compatibility independently from determinism. The required determinism level and provider execution semantics are validated as separate typed contracts, so the old selection reason conflated ordering with a behavioral guarantee."
     }
   ]
 }
