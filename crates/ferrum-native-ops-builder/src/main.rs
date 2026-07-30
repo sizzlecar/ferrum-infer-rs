@@ -37,6 +37,8 @@ enum Command {
         #[arg(long)]
         nvcc: PathBuf,
         #[arg(long)]
+        cuda_toolkit_root: PathBuf,
+        #[arg(long)]
         ccbin: PathBuf,
         #[arg(long)]
         ar: PathBuf,
@@ -106,6 +108,7 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
             compute_capability,
             builder_sha,
             nvcc,
+            cuda_toolkit_root,
             ccbin,
             ar,
             nvcc_threads,
@@ -120,6 +123,7 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
                 compute_capability,
                 builder_sha,
                 nvcc_path: nvcc,
+                cuda_toolkit_root,
                 ccbin_path: ccbin,
                 ar_path: ar,
                 nvcc_threads,

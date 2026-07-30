@@ -1,6 +1,6 @@
 //! Locked, independently runnable native source-build plans.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,17 +13,33 @@ use ferrum_native_ops::{
 };
 use ferrum_types::{is_sha256_digest, NativeOperatorSourcePackage};
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use super::{
     read_json, require_file, sha256_bytes, sha256_file, symbol_slug, validate_relative_path,
-    write_json, NativeOperatorBuilderError, Result,
+    write_json, NativeOperatorBuilderError, NativeOperatorEvidenceFile, Result,
 };
 
-pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_SOURCE_BUILD_PLAN_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 3;
-pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_OPERATOR_SOURCE_BUILD_PLAN_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 4;
+pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 4;
+pub const NATIVE_OPERATOR_CUDA_TOOLKIT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_OBJECT_DEPENDENCY_PROOF_SCHEMA_VERSION: u32 = 1;
 pub const MAX_NVCC_THREADS: u32 = 8;
+const REQUIRED_CUDA_TOOLKIT_FILES: [&str; 6] = [
+    "bin/bin2c",
+    "bin/cudafe++",
+    "bin/fatbinary",
+    "bin/nvcc",
+    "bin/nvlink",
+    "bin/ptxas",
+];
+const REQUIRED_CUDA_TOOLKIT_SCOPES: [&str; 4] =
+    ["bin/crt", "include", "nvvm/bin", "nvvm/libdevice"];
+const HOST_TOOLCHAIN_PROGRAMS: [&str; 5] = ["as", "cc1", "cc1plus", "collect2", "ld"];
+const MAX_HOST_TOOLCHAIN_FILES: usize = 250_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorSourceDefinition {
@@ -34,6 +50,7 @@ pub struct NativeOperatorSourceDefinition {
     pub upstream_sources: Vec<NativeOperatorUpstreamSource>,
     pub translation_units: Vec<String>,
     pub headers: Vec<String>,
+    pub dependency_closures: Vec<NativeOperatorTranslationUnitDependencies>,
     pub include_dirs: Vec<String>,
     pub defines: Vec<String>,
     pub nvcc_policy: NativeOperatorNvccPolicy,
@@ -49,6 +66,12 @@ pub struct NativeOperatorUpstreamSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorTranslationUnitDependencies {
+    pub translation_unit: String,
+    pub headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorSourceBuildPlan {
     pub schema_version: u32,
     pub operator: String,
@@ -56,6 +79,7 @@ pub struct NativeOperatorSourceBuildPlan {
     pub upstream_sources: Vec<NativeOperatorUpstreamSource>,
     pub translation_units: Vec<NativeOperatorSourceFileLock>,
     pub headers: Vec<NativeOperatorSourceFileLock>,
+    pub dependency_closures: Vec<NativeOperatorTranslationUnitDependencyLock>,
     pub include_dirs: Vec<String>,
     pub defines: Vec<String>,
     pub nvcc_policy: NativeOperatorNvccPolicy,
@@ -67,6 +91,13 @@ pub struct NativeOperatorSourceBuildPlan {
 pub struct NativeOperatorSourceFileLock {
     pub path: String,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorTranslationUnitDependencyLock {
+    pub translation_unit: String,
+    pub headers: Vec<NativeOperatorSourceFileLock>,
+    pub closure_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +140,7 @@ pub struct NativeOperatorSourceBuildRequest {
     pub nvcc_path: PathBuf,
     pub ccbin_path: PathBuf,
     pub ar_path: PathBuf,
+    pub cuda_toolkit_root: PathBuf,
     pub nvcc_threads: u32,
     pub object_cache_dir: PathBuf,
     pub plan_only: bool,
@@ -150,10 +182,84 @@ pub enum NativeOperatorSourceBuildStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorSourceBuildToolchain {
-    pub nvcc: NativeOperatorToolIdentity,
-    pub host_compiler: NativeOperatorToolIdentity,
+    pub static_identity: NativeOperatorSourceBuildStaticToolchain,
+    pub miss_probe: Option<NativeOperatorSourceBuildToolchainProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorSourceBuildStaticToolchain {
+    pub cuda_toolkit: NativeOperatorCudaToolkitIdentity,
+    pub host_toolchain: NativeOperatorHostToolchainIdentity,
+    pub archiver: NativeOperatorToolFileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorCudaToolkitIdentity {
+    pub canonical_root: String,
+    pub release_version: String,
+    pub nvcc: NativeOperatorToolFileIdentity,
+    pub manifest: NativeOperatorEvidenceFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorToolFileIdentity {
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorHostToolchainIdentity {
+    pub compiler: NativeOperatorToolFileIdentity,
+    pub compiler_version: String,
+    pub target: String,
+    pub manifest: NativeOperatorEvidenceFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorHostToolchainManifest {
+    pub schema_version: u32,
+    pub compiler: NativeOperatorToolFileIdentity,
+    pub compiler_version: String,
+    pub target: String,
+    pub executable_inputs: Vec<NativeOperatorToolFileIdentity>,
+    pub include_roots: Vec<String>,
+    pub include_probe_sha256: String,
+    pub driver_probe_sha256: String,
+    pub discovery_roots: Vec<String>,
+    pub files: Vec<NativeOperatorHostToolchainFileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorHostToolchainFileIdentity {
+    pub logical_path: String,
+    pub resolved_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorSourceBuildToolchainProbe {
+    pub nvcc_version: String,
+    pub host_compiler_version: String,
     pub host_target: String,
-    pub archiver: NativeOperatorToolIdentity,
+    pub archiver_version: String,
+    pub probed_for_misses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorCudaToolkitManifest {
+    pub schema_version: u32,
+    pub canonical_root: String,
+    pub entries: Vec<NativeOperatorCudaToolkitFileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorCudaToolkitFileIdentity {
+    pub logical_path: String,
+    pub resolved_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,9 +306,33 @@ pub struct NativeOperatorSourceBuildCommand {
     pub object_sha256: Option<String>,
     pub object_size_bytes: Option<u64>,
     pub object_identity: Option<NativeOperatorObjectIdentity>,
+    pub dependency_closure_sha256: Option<String>,
+    pub dependency_validation: Option<NativeOperatorDependencyValidation>,
+    pub depfile: Option<String>,
+    pub depfile_sha256: Option<String>,
+    pub observed_dependencies: Vec<String>,
     pub compiler_executed: bool,
     pub elapsed_ms: Option<u64>,
     pub return_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorDependencyValidation {
+    Plan,
+    Pending,
+    CacheProof,
+    Depfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorObjectDependencyProof {
+    pub schema_version: u32,
+    pub object_cache_key: String,
+    pub object_sha256: String,
+    pub dependency_closure_sha256: String,
+    pub depfile_sha256: String,
+    pub observed_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,13 +355,19 @@ struct NativeOperatorSourceInventoryIdentity<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct NativeOperatorDependencyClosureIdentity<'a> {
+    translation_unit: &'a NativeOperatorSourceFileLock,
+    headers: &'a [NativeOperatorSourceFileLock],
+}
+
+#[derive(Debug, Serialize)]
 struct NativeOperatorBuildInputIdentity<'a> {
     plan_sha256: &'a str,
     source_package_sha256: &'a str,
     builder_contract_version: u32,
     architecture_argument: &'a str,
     effective_environment: &'a BTreeMap<String, String>,
-    toolchain: Option<&'a NativeOperatorSourceBuildToolchain>,
+    toolchain: Option<&'a NativeOperatorSourceBuildStaticToolchain>,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +375,7 @@ struct NativeOperatorObjectInputIdentity<'a> {
     schema_version: u32,
     operator: &'a str,
     translation_unit: &'a NativeOperatorSourceFileLock,
+    dependency_closure_sha256: &'a str,
     headers: &'a [NativeOperatorSourceFileLock],
     include_dirs: &'a [String],
     defines: &'a [String],
@@ -246,7 +383,7 @@ struct NativeOperatorObjectInputIdentity<'a> {
     architecture_argument: &'a str,
     builder_contract_version: u32,
     effective_environment: &'a BTreeMap<String, String>,
-    toolchain: &'a NativeOperatorSourceBuildToolchain,
+    toolchain: &'a NativeOperatorSourceBuildStaticToolchain,
 }
 
 pub fn lock_native_operator_source_definition(
@@ -292,6 +429,52 @@ pub fn lock_native_operator_source_definition(
     }
     let translation_units = lock_source_files(&canonical_root, &definition.translation_units)?;
     let headers = lock_source_files(&canonical_root, &definition.headers)?;
+    let translation_unit_by_path = translation_units
+        .iter()
+        .map(|locked| (locked.path.as_str(), locked))
+        .collect::<BTreeMap<_, _>>();
+    let header_by_path = headers
+        .iter()
+        .map(|locked| (locked.path.as_str(), locked))
+        .collect::<BTreeMap<_, _>>();
+    let dependency_closures = definition
+        .dependency_closures
+        .iter()
+        .map(|closure| {
+            let translation_unit = translation_unit_by_path
+                .get(closure.translation_unit.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    NativeOperatorBuilderError::Invalid(format!(
+                        "dependency closure references unknown translation unit: {}",
+                        closure.translation_unit
+                    ))
+                })?;
+            let locked_headers = closure
+                .headers
+                .iter()
+                .map(|path| {
+                    header_by_path
+                        .get(path.as_str())
+                        .copied()
+                        .cloned()
+                        .ok_or_else(|| {
+                            NativeOperatorBuilderError::Invalid(format!(
+                                "dependency closure for {} references unknown header: {path}",
+                                closure.translation_unit
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let closure_sha256 =
+                dependency_closure_sha256(translation_unit, &locked_headers, output_plan_path)?;
+            Ok(NativeOperatorTranslationUnitDependencyLock {
+                translation_unit: closure.translation_unit.clone(),
+                headers: locked_headers,
+                closure_sha256,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let inventory_identity = NativeOperatorSourceInventoryIdentity {
         operator: &definition.operator,
         upstream_sources: &definition.upstream_sources,
@@ -316,6 +499,7 @@ pub fn lock_native_operator_source_definition(
         upstream_sources: definition.upstream_sources,
         translation_units,
         headers,
+        dependency_closures,
         include_dirs: definition.include_dirs,
         defines: definition.defines,
         nvcc_policy: definition.nvcc_policy,
@@ -352,12 +536,17 @@ pub fn run_native_operator_source_build(
             "source build object_cache_dir must be absolute".to_string(),
         ));
     }
-    if [&request.nvcc_path, &request.ccbin_path, &request.ar_path]
-        .iter()
-        .any(|path| !path.is_absolute())
+    if [
+        &request.nvcc_path,
+        &request.ccbin_path,
+        &request.ar_path,
+        &request.cuda_toolkit_root,
+    ]
+    .iter()
+    .any(|path| !path.is_absolute())
     {
         return Err(NativeOperatorBuilderError::Invalid(
-            "source build tool paths must be absolute".to_string(),
+            "source build tool paths and cuda_toolkit_root must be absolute".to_string(),
         ));
     }
     validate_compute_capability(&request.compute_capability)?;
@@ -394,6 +583,7 @@ pub fn run_native_operator_source_build(
     let receipt_path = request.output_dir.join("source-build.receipt.json");
     let logs_dir = request.output_dir.join("logs");
     let objects_dir = request.output_dir.join("objects");
+    let depfiles_dir = request.output_dir.join("depfiles");
     fs::create_dir_all(&logs_dir).map_err(|source| NativeOperatorBuilderError::Io {
         path: logs_dir.clone(),
         source,
@@ -403,12 +593,16 @@ pub fn run_native_operator_source_build(
             path: objects_dir.clone(),
             source,
         })?;
+        fs::create_dir_all(&depfiles_dir).map_err(|source| NativeOperatorBuilderError::Io {
+            path: depfiles_dir.clone(),
+            source,
+        })?;
     }
 
     let (toolchain, toolchain_failure) = if request.plan_only {
         (None, None)
     } else {
-        match resolve_toolchain(request) {
+        match resolve_static_toolchain(request) {
             Ok(toolchain) => (Some(toolchain), None),
             Err(error) => (None, Some(error.to_string())),
         }
@@ -419,7 +613,9 @@ pub fn run_native_operator_source_build(
         &plan.source_package.sha256,
         &architecture_argument,
         &effective_environment,
-        toolchain.as_ref(),
+        toolchain
+            .as_ref()
+            .map(|toolchain| &toolchain.static_identity),
         &receipt_path,
     )?;
     let mut commands = build_commands(
@@ -509,6 +705,7 @@ pub fn run_native_operator_source_build(
         receipt
             .toolchain
             .as_ref()
+            .map(|toolchain| &toolchain.static_identity)
             .expect("actual source build has a resolved toolchain"),
         &receipt.effective_environment,
     ) {
@@ -530,6 +727,7 @@ pub fn run_native_operator_source_build(
     write_json(&receipt_path, &receipt)?;
 
     let mut expected_object_identity: Option<NativeOperatorObjectIdentity> = None;
+    let mut miss_indices = Vec::new();
     for index in 0..plan.translation_units.len() {
         let translation_unit = &plan.translation_units[index];
         let object_path = PathBuf::from(
@@ -538,9 +736,54 @@ pub fn run_native_operator_source_build(
                 .as_deref()
                 .expect("translation-unit command has an object file"),
         );
-        let command_started = Instant::now();
+        let lookup_started = Instant::now();
         match object_cache.restore(&object_specs[index], &object_path) {
             Ok(NativeBuildArtifactLookup::Hit(cache_receipt)) => {
+                let depfile_relative = commands[index]
+                    .depfile
+                    .as_deref()
+                    .expect("translation-unit command has depfile output")
+                    .to_string();
+                let depfile_path = request.output_dir.join(&depfile_relative);
+                let dependency_proof = match restore_object_dependency_proof(
+                    &cache_receipt.cache_entry,
+                    object_specs[index].input_signature_sha256(),
+                    &cache_receipt.artifact_sha256,
+                    &plan.dependency_closures[index],
+                    translation_unit,
+                    &commands[index].working_directory,
+                    &object_path,
+                    &depfile_path,
+                ) {
+                    Ok(Some(proof)) => proof,
+                    Ok(None) => {
+                        fs::remove_file(&object_path).map_err(|source| {
+                            NativeOperatorBuilderError::Io {
+                                path: object_path.clone(),
+                                source,
+                            }
+                        })?;
+                        commands[index].object_cache_status =
+                            Some(NativeOperatorSourceObjectCacheStatus::Miss);
+                        append_command_stream(
+                            &request.output_dir.join(&commands[index].stdout_log),
+                            b"object-cache-miss: dependency-proof-absent\n",
+                        )?;
+                        miss_indices.push(index);
+                        continue;
+                    }
+                    Err(error) => {
+                        commands[index].object_cache_status =
+                            Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                        receipt.commands = commands.clone();
+                        receipt.elapsed_ms = millis(started.elapsed());
+                        return reject_source_build(
+                            &receipt_path,
+                            &mut receipt,
+                            format!("cached_dependency_proof_failed:{index}:{error}"),
+                        );
+                    }
+                };
                 commands[index].object_cache_status =
                     Some(NativeOperatorSourceObjectCacheStatus::Hit);
                 commands[index].object_cache_entry =
@@ -591,18 +834,18 @@ pub fn run_native_operator_source_build(
                 }
                 expected_object_identity.get_or_insert_with(|| object_identity.clone());
                 commands[index].object_identity = Some(object_identity);
-                commands[index].elapsed_ms = Some(millis(command_started.elapsed()));
+                commands[index].dependency_validation =
+                    Some(NativeOperatorDependencyValidation::CacheProof);
+                commands[index].depfile_sha256 = Some(dependency_proof.depfile_sha256);
+                commands[index].observed_dependencies = dependency_proof.observed_dependencies;
+                commands[index].elapsed_ms = Some(millis(lookup_started.elapsed()));
                 append_command_stream(
                     &request.output_dir.join(&commands[index].stdout_log),
-                    b"object-cache-hit: compiler was not executed\n",
+                    b"object-cache-hit: compiler and toolchain probes were not executed\n",
                 )?;
                 receipt
                     .cache_hit_translation_units
                     .push(translation_unit.path.clone());
-                receipt.commands = commands.clone();
-                receipt.elapsed_ms = millis(started.elapsed());
-                write_json(&receipt_path, &receipt)?;
-                continue;
             }
             Ok(NativeBuildArtifactLookup::Miss { reason }) => {
                 commands[index].object_cache_status =
@@ -611,6 +854,7 @@ pub fn run_native_operator_source_build(
                     &request.output_dir.join(&commands[index].stdout_log),
                     format!("object-cache-miss: {reason}\n").as_bytes(),
                 )?;
+                miss_indices.push(index);
             }
             Err(error) => {
                 commands[index].object_cache_status =
@@ -624,6 +868,51 @@ pub fn run_native_operator_source_build(
                 );
             }
         }
+    }
+    receipt.commands = commands.clone();
+    receipt.elapsed_ms = millis(started.elapsed());
+    write_json(&receipt_path, &receipt)?;
+
+    if !miss_indices.is_empty() {
+        let missed_translation_units = miss_indices
+            .iter()
+            .map(|index| plan.translation_units[*index].path.clone())
+            .collect::<Vec<_>>();
+        let static_identity = receipt
+            .toolchain
+            .as_ref()
+            .expect("actual source build has a resolved toolchain")
+            .static_identity
+            .clone();
+        let probe = match probe_source_toolchain(&static_identity, missed_translation_units) {
+            Ok(probe) => probe,
+            Err(error) => {
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                return reject_source_build(
+                    &receipt_path,
+                    &mut receipt,
+                    format!("toolchain_miss_probe_failed:{error}"),
+                );
+            }
+        };
+        receipt
+            .toolchain
+            .as_mut()
+            .expect("actual source build has a resolved toolchain")
+            .miss_probe = Some(probe);
+        write_json(&receipt_path, &receipt)?;
+    }
+
+    for index in miss_indices {
+        let translation_unit = &plan.translation_units[index];
+        let object_path = PathBuf::from(
+            commands[index]
+                .object_file
+                .as_deref()
+                .expect("translation-unit command has an object file"),
+        );
+        let command_started = Instant::now();
         let stdout_path = request.output_dir.join(&commands[index].stdout_log);
         let stderr_path = request.output_dir.join(&commands[index].stderr_log);
         commands[index].compiler_executed = true;
@@ -671,6 +960,35 @@ pub fn run_native_operator_source_build(
                 format!("compiled_object_missing:{index}:{error}"),
             );
         }
+        let depfile_relative = commands[index]
+            .depfile
+            .as_deref()
+            .expect("cache-miss command has a depfile")
+            .to_string();
+        let depfile_path = request.output_dir.join(&depfile_relative);
+        let validated_depfile = match validate_translation_unit_depfile(
+            &depfile_path,
+            &object_path,
+            &canonical_root,
+            translation_unit,
+            &plan.dependency_closures[index],
+        ) {
+            Ok(dependencies) => dependencies,
+            Err(error) => {
+                commands[index].object_cache_status =
+                    Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+                receipt.commands = commands.clone();
+                receipt.elapsed_ms = millis(started.elapsed());
+                return reject_source_build(
+                    &receipt_path,
+                    &mut receipt,
+                    format!("dependency_validation_failed:{index}:{error}"),
+                );
+            }
+        };
+        commands[index].depfile_sha256 = Some(validated_depfile.sha256.clone());
+        commands[index].observed_dependencies = validated_depfile.observed_dependencies.clone();
+        commands[index].dependency_validation = Some(NativeOperatorDependencyValidation::Depfile);
         let object_identity = match native_object_identity_file(&object_path) {
             Ok(identity) => identity,
             Err(error) => {
@@ -730,6 +1048,25 @@ pub fn run_native_operator_source_build(
                 );
             }
         };
+        if let Err(error) = publish_object_dependency_proof(
+            &cache_receipt.cache_entry,
+            object_specs[index].input_signature_sha256(),
+            &cache_receipt.artifact_sha256,
+            &plan.dependency_closures[index],
+            &validated_depfile.raw,
+            &validated_depfile.sha256,
+            &commands[index].observed_dependencies,
+        ) {
+            commands[index].object_cache_status =
+                Some(NativeOperatorSourceObjectCacheStatus::Rejected);
+            receipt.commands = commands.clone();
+            receipt.elapsed_ms = millis(started.elapsed());
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("object_dependency_proof_publish_failed:{index}:{error}"),
+            );
+        }
         commands[index].object_cache_status =
             Some(NativeOperatorSourceObjectCacheStatus::Published);
         commands[index].object_cache_entry = Some(cache_receipt.cache_entry.display().to_string());
@@ -793,6 +1130,39 @@ pub fn run_native_operator_source_build(
             );
         }
     };
+    let static_identity = receipt
+        .toolchain
+        .as_ref()
+        .expect("actual source build has a resolved toolchain")
+        .static_identity
+        .clone();
+    if let Err(error) = validate_tool_file_unchanged(&static_identity.archiver) {
+        return reject_source_build(
+            &receipt_path,
+            &mut receipt,
+            format!("archiver_changed_during_build:{error}"),
+        );
+    }
+    if receipt
+        .toolchain
+        .as_ref()
+        .is_some_and(|toolchain| toolchain.miss_probe.is_some())
+    {
+        if let Err(error) = validate_host_toolchain_unchanged(
+            &static_identity.host_toolchain,
+            &request.output_dir,
+            &receipt.effective_environment,
+        )
+        .and_then(|()| validate_tool_file_unchanged(&static_identity.cuda_toolkit.nvcc))
+        .and_then(|()| validate_cuda_toolkit_unchanged(&static_identity.cuda_toolkit))
+        {
+            return reject_source_build(
+                &receipt_path,
+                &mut receipt,
+                format!("compiler_toolchain_changed_during_build:{error}"),
+            );
+        }
+    }
     receipt.archive_sha256 = Some(archive_sha256);
     receipt.archive_file = Some(plan.archive_file);
     receipt.status = NativeOperatorSourceBuildStatus::Pass;
@@ -816,6 +1186,11 @@ fn validate_definition(definition: &NativeOperatorSourceDefinition) -> Result<()
         &definition.include_dirs,
         &definition.defines,
         &definition.archive_file,
+    )?;
+    validate_definition_dependency_closures(
+        &definition.translation_units,
+        &definition.headers,
+        &definition.dependency_closures,
     )?;
     if definition.source_package_kind.trim().is_empty()
         || definition.source_package_revision.trim().is_empty()
@@ -869,6 +1244,7 @@ fn validate_plan(plan: &NativeOperatorSourceBuildPlan) -> Result<()> {
             )));
         }
     }
+    validate_plan_dependency_closures(plan)?;
     let identity = NativeOperatorSourceInventoryIdentity {
         operator: &plan.operator,
         upstream_sources: &plan.upstream_sources,
@@ -890,12 +1266,153 @@ fn validate_plan(plan: &NativeOperatorSourceBuildPlan) -> Result<()> {
     Ok(())
 }
 
+fn validate_definition_dependency_closures(
+    translation_units: &[String],
+    headers: &[String],
+    closures: &[NativeOperatorTranslationUnitDependencies],
+) -> Result<()> {
+    let closure_translation_units = closures
+        .iter()
+        .map(|closure| closure.translation_unit.as_str())
+        .collect::<Vec<_>>();
+    let expected_translation_units = translation_units
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if closure_translation_units != expected_translation_units {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "dependency_closures must contain exactly one row per translation unit in translation_units order"
+                .to_string(),
+        ));
+    }
+    let declared_headers = headers.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut attached_headers = BTreeSet::new();
+    for closure in closures {
+        require_sorted_optional_paths(
+            &format!("dependency_closures[{}].headers", closure.translation_unit),
+            &closure.headers,
+        )?;
+        for header in &closure.headers {
+            if !declared_headers.contains(header.as_str()) {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "dependency closure for {} references undeclared header: {header}",
+                    closure.translation_unit
+                )));
+            }
+            attached_headers.insert(header.as_str());
+        }
+    }
+    if attached_headers != declared_headers {
+        let missing = declared_headers
+            .difference(&attached_headers)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "every declared header must belong to at least one dependency closure; unattached={missing}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_plan_dependency_closures(plan: &NativeOperatorSourceBuildPlan) -> Result<()> {
+    let translation_units = plan
+        .translation_units
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let headers = plan
+        .headers
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let closures = plan
+        .dependency_closures
+        .iter()
+        .map(|closure| NativeOperatorTranslationUnitDependencies {
+            translation_unit: closure.translation_unit.clone(),
+            headers: closure
+                .headers
+                .iter()
+                .map(|header| header.path.clone())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    validate_definition_dependency_closures(&translation_units, &headers, &closures)?;
+
+    let translation_unit_by_path = plan
+        .translation_units
+        .iter()
+        .map(|locked| (locked.path.as_str(), locked))
+        .collect::<BTreeMap<_, _>>();
+    let header_by_path = plan
+        .headers
+        .iter()
+        .map(|locked| (locked.path.as_str(), locked))
+        .collect::<BTreeMap<_, _>>();
+    for closure in &plan.dependency_closures {
+        let translation_unit = translation_unit_by_path
+            .get(closure.translation_unit.as_str())
+            .copied()
+            .expect("definition-shaped closure already validated");
+        for header in &closure.headers {
+            let global = header_by_path
+                .get(header.path.as_str())
+                .copied()
+                .expect("definition-shaped closure already validated");
+            if global != header {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "dependency closure header lock differs from the global lock: {}",
+                    header.path
+                )));
+            }
+        }
+        if !is_sha256_digest(&closure.closure_sha256) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "dependency closure for {} has an invalid sha256",
+                closure.translation_unit
+            )));
+        }
+        let actual = dependency_closure_sha256(
+            translation_unit,
+            &closure.headers,
+            Path::new("<source-build-plan>"),
+        )?;
+        if actual != closure.closure_sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "dependency closure hash mismatch for {}: expected={} actual={actual}",
+                closure.translation_unit, closure.closure_sha256
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn dependency_closure_sha256(
+    translation_unit: &NativeOperatorSourceFileLock,
+    headers: &[NativeOperatorSourceFileLock],
+    context: &Path,
+) -> Result<String> {
+    let identity = NativeOperatorDependencyClosureIdentity {
+        translation_unit,
+        headers,
+    };
+    let bytes =
+        serde_json::to_vec(&identity).map_err(|source| NativeOperatorBuilderError::Json {
+            path: context.to_path_buf(),
+            source,
+        })?;
+    Ok(sha256_bytes(&bytes))
+}
+
 pub(crate) fn verify_source_build_receipt_against_plan(
     receipt: &NativeOperatorSourceBuildReceipt,
+    receipt_root: &Path,
     plan_path: &Path,
     source_root: &Path,
 ) -> Result<NativeOperatorSourceBuildPlan> {
     let plan = verify_source_build_receipt_against_plan_portable(receipt, plan_path)?;
+    verify_source_build_evidence(receipt, receipt_root, &plan)?;
     let canonical_source_root =
         source_root
             .canonicalize()
@@ -942,10 +1459,12 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
             receipt.operator
         ))
     })?;
+    validate_static_toolchain_identity(&receipt.operator, &toolchain.static_identity)?;
+    let static_identity = &toolchain.static_identity;
     let expected_environment = effective_environment_for_tool_paths([
-        toolchain.nvcc.path.as_str(),
-        toolchain.host_compiler.path.as_str(),
-        toolchain.archiver.path.as_str(),
+        static_identity.cuda_toolkit.nvcc.path.as_str(),
+        static_identity.host_toolchain.compiler.path.as_str(),
+        static_identity.archiver.path.as_str(),
     ])?;
     if receipt.effective_environment != expected_environment {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -958,7 +1477,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         &plan.source_package.sha256,
         &expected_architecture,
         &expected_environment,
-        Some(toolchain),
+        Some(static_identity),
         plan_path,
     )?;
     if receipt.inputs_sha256 != expected_inputs_sha256 {
@@ -970,7 +1489,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
     let object_specs = build_object_cache_specs(
         &plan,
         &expected_architecture,
-        toolchain,
+        static_identity,
         &expected_environment,
     )?;
     if receipt.commands.len() != plan.translation_units.len() + 1 {
@@ -987,8 +1506,10 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         .enumerate()
     {
         let expected_object_file = object_file_name(index, translation_unit);
+        let closure = &plan.dependency_closures[index];
         if command.translation_unit.as_deref() != Some(translation_unit.path.as_str())
             || command.object_cache_key.as_deref() != Some(object_spec.input_signature_sha256())
+            || command.dependency_closure_sha256.as_deref() != Some(closure.closure_sha256.as_str())
             || command
                 .object_file
                 .as_deref()
@@ -1000,15 +1521,25 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
                 receipt.operator, translation_unit.path
             )));
         }
+        let stem = Path::new(&translation_unit.path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("translation_unit");
+        let expected_depfile = format!("{index:08}-{stem}.d");
         let mut expected_argv = vec![
-            toolchain.nvcc.path.clone(),
+            static_identity.cuda_toolkit.nvcc.path.clone(),
             "-c".to_string(),
             translation_unit.path.clone(),
             "-o".to_string(),
             expected_object_file.clone(),
             expected_architecture.clone(),
             "-ccbin".to_string(),
-            toolchain.host_compiler.path.clone(),
+            static_identity.host_toolchain.compiler.path.clone(),
+            "-MMD".to_string(),
+            "-MF".to_string(),
+            expected_depfile.clone(),
+            "-MT".to_string(),
+            expected_object_file.clone(),
         ];
         expected_argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
         expected_argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));
@@ -1023,11 +1554,86 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
                 .to_string_lossy()
                 .into_owned();
         }
+        for argument in [10_usize, 12] {
+            if let Some(path) = actual_argv.get_mut(argument) {
+                *path = Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         if actual_argv != expected_argv {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "{} source-build argv for {} differs from its locked plan",
                 receipt.operator, translation_unit.path
             )));
+        }
+        let expected_observed = std::iter::once(translation_unit.path.as_str())
+            .chain(closure.headers.iter().map(|header| header.path.as_str()))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let expected_depfile_relative = format!("depfiles/{expected_depfile}");
+        match command.object_cache_status {
+            Some(NativeOperatorSourceObjectCacheStatus::Published)
+                if command.dependency_validation
+                    == Some(NativeOperatorDependencyValidation::Depfile)
+                    && command.depfile.as_deref() == Some(expected_depfile_relative.as_str())
+                    && command
+                        .depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
+                    && command
+                        .observed_dependencies
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        == expected_observed
+                    && command
+                        .observed_dependencies
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1]) => {}
+            Some(NativeOperatorSourceObjectCacheStatus::Hit)
+                if command.dependency_validation
+                    == Some(NativeOperatorDependencyValidation::CacheProof)
+                    && command.depfile.as_deref() == Some(expected_depfile_relative.as_str())
+                    && command
+                        .depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
+                    && command
+                        .observed_dependencies
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        == expected_observed
+                    && command
+                        .observed_dependencies
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1]) => {}
+            _ => {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "{} source-build dependency evidence for {} differs from its locked plan",
+                    receipt.operator, translation_unit.path
+                )))
+            }
+        }
+    }
+    match &toolchain.miss_probe {
+        Some(probe)
+            if probe.probed_for_misses == receipt.compiled_translation_units
+                && !receipt.compiled_translation_units.is_empty()
+                && !probe.nvcc_version.trim().is_empty()
+                && probe.host_compiler_version
+                    == static_identity.host_toolchain.compiler_version
+                && !probe.archiver_version.trim().is_empty()
+                && probe.host_target == static_identity.host_toolchain.target => {}
+        None if receipt.compiled_translation_units.is_empty() => {}
+        _ => {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build miss-only toolchain probe differs from compiled translation units",
+                receipt.operator
+            )))
         }
     }
     let archive_command = receipt.commands.last().expect("command count checked");
@@ -1048,7 +1654,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         })
         .collect::<Vec<_>>();
     let mut expected_archive_argv = vec![
-        toolchain.archiver.path.clone(),
+        static_identity.archiver.path.clone(),
         "rcs".to_string(),
         plan.archive_file.clone(),
     ];
@@ -1067,6 +1673,217 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         )));
     }
     Ok(plan)
+}
+
+pub(crate) fn verify_source_build_evidence(
+    receipt: &NativeOperatorSourceBuildReceipt,
+    receipt_root: &Path,
+    plan: &NativeOperatorSourceBuildPlan,
+) -> Result<()> {
+    let toolchain = receipt.toolchain.as_ref().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt is missing toolchain provenance",
+            receipt.operator
+        ))
+    })?;
+    let manifest_evidence = &toolchain.static_identity.cuda_toolkit.manifest;
+    let manifest_path =
+        resolve_source_build_evidence_file(receipt_root, &receipt.operator, manifest_evidence)?;
+    let manifest: NativeOperatorCudaToolkitManifest = read_json(&manifest_path)?;
+    validate_cuda_toolkit_manifest(
+        &receipt.operator,
+        &toolchain.static_identity.cuda_toolkit,
+        &manifest,
+    )?;
+    let host_identity = &toolchain.static_identity.host_toolchain;
+    let host_manifest_path = resolve_source_build_evidence_file(
+        receipt_root,
+        &receipt.operator,
+        &host_identity.manifest,
+    )?;
+    let host_manifest: NativeOperatorHostToolchainManifest = read_json(&host_manifest_path)?;
+    validate_host_toolchain_manifest(&receipt.operator, &host_manifest)?;
+    if host_manifest.compiler != host_identity.compiler
+        || host_manifest.compiler_version != host_identity.compiler_version
+        || host_manifest.target != host_identity.target
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} host toolchain manifest differs from its receipt identity",
+            receipt.operator
+        )));
+    }
+    for (index, command) in receipt
+        .commands
+        .iter()
+        .take(plan.translation_units.len())
+        .enumerate()
+    {
+        if !matches!(
+            command.dependency_validation,
+            Some(
+                NativeOperatorDependencyValidation::Depfile
+                    | NativeOperatorDependencyValidation::CacheProof
+            )
+        ) {
+            continue;
+        }
+        let relative = command.depfile.as_deref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} compiled source-build command is missing depfile evidence",
+                receipt.operator
+            ))
+        })?;
+        let sha256 = command.depfile_sha256.as_deref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} compiled source-build command is missing depfile sha256",
+                receipt.operator
+            ))
+        })?;
+        let path = resolve_source_build_relative_file(receipt_root, relative)?;
+        let actual = sha256_file(&path)?;
+        if actual != sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build depfile sha256 mismatch: path={relative} expected={sha256} actual={actual}",
+                receipt.operator
+            )));
+        }
+        let raw = fs::read_to_string(&path).map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let object_path = command.object_file.as_deref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build command is missing object path for depfile validation",
+                receipt.operator
+            ))
+        })?;
+        let observed = validate_portable_depfile(
+            &raw,
+            &path,
+            Path::new(object_path),
+            &command.working_directory,
+            &plan.translation_units[index],
+            &plan.dependency_closures[index],
+        )?;
+        if observed != command.observed_dependencies {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build depfile semantics differ from receipt evidence: path={relative}",
+                receipt.operator
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_source_build_evidence_file(
+    root: &Path,
+    operator: &str,
+    evidence: &NativeOperatorEvidenceFile,
+) -> Result<PathBuf> {
+    if !is_sha256_digest(&evidence.sha256) || evidence.size_bytes == 0 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} source-build evidence identity is incomplete: {}",
+            evidence.path
+        )));
+    }
+    let path = resolve_source_build_relative_file(root, &evidence.path)?;
+    let size_bytes = fs::metadata(&path)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.clone(),
+            source,
+        })?
+        .len();
+    let sha256 = sha256_file(&path)?;
+    if size_bytes != evidence.size_bytes || sha256 != evidence.sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} source-build evidence mismatch: path={} expected_size={} actual_size={size_bytes} expected_sha256={} actual_sha256={sha256}",
+            evidence.path, evidence.size_bytes, evidence.sha256
+        )));
+    }
+    Ok(path)
+}
+
+fn resolve_source_build_relative_file(root: &Path, relative: &str) -> Result<PathBuf> {
+    validate_relative_path(relative)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    let path = canonical_root.join(relative);
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    if !canonical.starts_with(&canonical_root) || !canonical.is_file() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "source-build evidence escapes its root or is not a file: {relative}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn validate_cuda_toolkit_manifest(
+    operator: &str,
+    identity: &NativeOperatorCudaToolkitIdentity,
+    manifest: &NativeOperatorCudaToolkitManifest,
+) -> Result<()> {
+    if manifest.schema_version != NATIVE_OPERATOR_CUDA_TOOLKIT_MANIFEST_SCHEMA_VERSION
+        || manifest.canonical_root != identity.canonical_root
+        || manifest.entries.is_empty()
+        || manifest
+            .entries
+            .windows(2)
+            .any(|pair| pair[0].logical_path >= pair[1].logical_path)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} cuda toolkit manifest header/order is invalid"
+        )));
+    }
+    let mut scopes = BTreeSet::new();
+    let mut required_files = REQUIRED_CUDA_TOOLKIT_FILES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut selected_nvcc = None;
+    for entry in &manifest.entries {
+        validate_relative_path(&entry.logical_path)?;
+        validate_relative_path(&entry.resolved_path)?;
+        if !is_sha256_digest(&entry.sha256) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{operator} cuda toolkit manifest entry is incomplete: {}",
+                entry.logical_path
+            )));
+        }
+        for scope in ["bin/crt/", "include/", "nvvm/bin/", "nvvm/libdevice/"] {
+            if entry.logical_path.starts_with(scope) {
+                scopes.insert(scope);
+            }
+        }
+        required_files.remove(entry.logical_path.as_str());
+        if Path::new(&identity.canonical_root).join(&entry.resolved_path)
+            == Path::new(&identity.nvcc.path)
+        {
+            selected_nvcc = Some(entry);
+        }
+    }
+    if scopes.len() != REQUIRED_CUDA_TOOLKIT_SCOPES.len() || !required_files.is_empty() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} cuda toolkit manifest does not cover every required compiler input; missing={}",
+            required_files.into_iter().collect::<Vec<_>>().join(",")
+        )));
+    }
+    if selected_nvcc.is_none_or(|entry| {
+        entry.sha256 != identity.nvcc.sha256 || entry.size_bytes != identity.nvcc.size_bytes
+    }) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} cuda toolkit manifest does not bind the selected nvcc"
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1215,6 +2032,497 @@ fn validate_locked_source_tree(root: &Path, plan: &NativeOperatorSourceBuildPlan
     Ok(())
 }
 
+fn validate_translation_unit_depfile(
+    depfile_path: &Path,
+    object_path: &Path,
+    source_root: &Path,
+    translation_unit: &NativeOperatorSourceFileLock,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+) -> Result<ValidatedTranslationUnitDepfile> {
+    if closure.translation_unit != translation_unit.path {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "dependency closure translation unit mismatch: expected={} actual={}",
+            translation_unit.path, closure.translation_unit
+        )));
+    }
+    require_file(depfile_path)?;
+    let raw = fs::read(depfile_path).map_err(|source| NativeOperatorBuilderError::Io {
+        path: depfile_path.to_path_buf(),
+        source,
+    })?;
+    let raw_text = std::str::from_utf8(&raw).map_err(|_| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "depfile is not valid UTF-8: {}",
+            depfile_path.display()
+        ))
+    })?;
+    let (target, dependencies) = parse_make_depfile(raw_text, depfile_path)?;
+    let canonical_target =
+        Path::new(&target)
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: PathBuf::from(&target),
+                source,
+            })?;
+    let canonical_object =
+        object_path
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: object_path.to_path_buf(),
+                source,
+            })?;
+    if canonical_target != canonical_object {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile target differs from the compiled object: expected={} actual={}",
+            canonical_object.display(),
+            canonical_target.display()
+        )));
+    }
+
+    let mut observed = BTreeSet::new();
+    for dependency in dependencies {
+        let candidate = if Path::new(&dependency).is_absolute() {
+            PathBuf::from(&dependency)
+        } else {
+            source_root.join(&dependency)
+        };
+        let canonical =
+            candidate
+                .canonicalize()
+                .map_err(|source| NativeOperatorBuilderError::Io {
+                    path: candidate.clone(),
+                    source,
+                })?;
+        if !canonical.starts_with(source_root) || !canonical.is_file() {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "depfile contains a dependency outside the locked source root: {}",
+                canonical.display()
+            )));
+        }
+        let relative = canonical.strip_prefix(source_root).map_err(|_| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "depfile dependency escapes the source root: {}",
+                canonical.display()
+            ))
+        })?;
+        let relative = path_with_forward_slashes(relative)?;
+        if !observed.insert(relative.clone()) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "depfile contains a duplicate dependency: {relative}"
+            )));
+        }
+    }
+
+    let expected = std::iter::once(translation_unit.path.as_str())
+        .chain(closure.headers.iter().map(|header| header.path.as_str()))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if observed != expected {
+        let missing = expected
+            .difference(&observed)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let undeclared = observed
+            .difference(&expected)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile differs from the declared dependency closure: missing={missing} undeclared={undeclared}"
+        )));
+    }
+
+    for locked in std::iter::once(translation_unit).chain(closure.headers.iter()) {
+        let path = locked_source_file(source_root, &locked.path)?;
+        let actual = sha256_file(&path)?;
+        if actual != locked.sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "dependency changed while compiling: path={} expected={} actual={actual}",
+                locked.path, locked.sha256
+            )));
+        }
+    }
+    Ok(ValidatedTranslationUnitDepfile {
+        sha256: sha256_bytes(&raw),
+        raw,
+        observed_dependencies: observed.into_iter().collect(),
+    })
+}
+
+struct ValidatedTranslationUnitDepfile {
+    raw: Vec<u8>,
+    sha256: String,
+    observed_dependencies: Vec<String>,
+}
+
+fn publish_object_dependency_proof(
+    cache_entry: &Path,
+    object_cache_key: &str,
+    object_sha256: &str,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+    depfile_raw: &[u8],
+    expected_depfile_sha256: &str,
+    observed_dependencies: &[String],
+) -> Result<()> {
+    let depfile_sha256 = sha256_bytes(depfile_raw);
+    if depfile_sha256 != expected_depfile_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "validated depfile bytes differ from their recorded sha256: expected={expected_depfile_sha256} actual={depfile_sha256}"
+        )));
+    }
+    let proof = NativeOperatorObjectDependencyProof {
+        schema_version: NATIVE_OPERATOR_OBJECT_DEPENDENCY_PROOF_SCHEMA_VERSION,
+        object_cache_key: object_cache_key.to_string(),
+        object_sha256: object_sha256.to_string(),
+        dependency_closure_sha256: closure.closure_sha256.clone(),
+        depfile_sha256: depfile_sha256.clone(),
+        observed_dependencies: observed_dependencies.to_vec(),
+    };
+    validate_object_dependency_proof(
+        "<object-cache-publish>",
+        &proof,
+        object_cache_key,
+        object_sha256,
+        closure,
+    )?;
+    let proof_dir = cache_entry.join("dependency-proofs").join(&depfile_sha256);
+    fs::create_dir_all(&proof_dir).map_err(|source| NativeOperatorBuilderError::Io {
+        path: proof_dir.clone(),
+        source,
+    })?;
+    atomic_write_bytes(&proof_dir.join("dependency.d"), depfile_raw)?;
+    write_json(&proof_dir.join("proof.json"), &proof)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_object_dependency_proof(
+    cache_entry: &Path,
+    object_cache_key: &str,
+    object_sha256: &str,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+    translation_unit: &NativeOperatorSourceFileLock,
+    working_directory: &str,
+    object_path: &Path,
+    output_depfile: &Path,
+) -> Result<Option<NativeOperatorObjectDependencyProof>> {
+    let proofs_root = cache_entry.join("dependency-proofs");
+    if !proofs_root.is_dir() {
+        return Ok(None);
+    }
+    let mut candidates = fs::read_dir(&proofs_root)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: proofs_root.clone(),
+            source,
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: proofs_root.clone(),
+            source,
+        })?;
+    candidates.sort_by_key(|entry| entry.file_name());
+    for candidate in candidates {
+        let proof_dir = candidate.path();
+        if !proof_dir.is_dir() {
+            continue;
+        }
+        let proof_path = proof_dir.join("proof.json");
+        let depfile_path = proof_dir.join("dependency.d");
+        if !proof_path.is_file() || !depfile_path.is_file() {
+            continue;
+        }
+        let proof: NativeOperatorObjectDependencyProof = read_json(&proof_path)?;
+        validate_object_dependency_proof(
+            "<object-cache-restore>",
+            &proof,
+            object_cache_key,
+            object_sha256,
+            closure,
+        )?;
+        if proof_dir.file_name().and_then(|value| value.to_str())
+            != Some(proof.depfile_sha256.as_str())
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "object dependency proof directory differs from depfile sha256: {}",
+                proof_dir.display()
+            )));
+        }
+        let raw = fs::read(&depfile_path).map_err(|source| NativeOperatorBuilderError::Io {
+            path: depfile_path.clone(),
+            source,
+        })?;
+        if sha256_bytes(&raw) != proof.depfile_sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "cached object dependency depfile hash mismatch: {}",
+                depfile_path.display()
+            )));
+        }
+        let raw_text = std::str::from_utf8(&raw).map_err(|_| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "cached object dependency depfile is not UTF-8: {}",
+                depfile_path.display()
+            ))
+        })?;
+        let observed = validate_portable_depfile(
+            raw_text,
+            &depfile_path,
+            object_path,
+            working_directory,
+            translation_unit,
+            closure,
+        )?;
+        if observed != proof.observed_dependencies {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "cached object dependency proof observed list differs from depfile: {}",
+                proof_path.display()
+            )));
+        }
+        atomic_write_bytes(output_depfile, &raw)?;
+        return Ok(Some(proof));
+    }
+    Ok(None)
+}
+
+fn validate_object_dependency_proof(
+    context: &str,
+    proof: &NativeOperatorObjectDependencyProof,
+    object_cache_key: &str,
+    object_sha256: &str,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+) -> Result<()> {
+    if proof.schema_version != NATIVE_OPERATOR_OBJECT_DEPENDENCY_PROOF_SCHEMA_VERSION
+        || proof.object_cache_key != object_cache_key
+        || proof.object_sha256 != object_sha256
+        || proof.dependency_closure_sha256 != closure.closure_sha256
+        || !is_sha256_digest(&proof.object_cache_key)
+        || !is_sha256_digest(&proof.object_sha256)
+        || !is_sha256_digest(&proof.dependency_closure_sha256)
+        || !is_sha256_digest(&proof.depfile_sha256)
+        || proof.observed_dependencies.is_empty()
+        || proof
+            .observed_dependencies
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || proof
+            .observed_dependencies
+            .iter()
+            .any(|path| validate_relative_path(path).is_err())
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{context} object dependency proof is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_portable_depfile(
+    raw: &str,
+    depfile_path: &Path,
+    object_path: &Path,
+    working_directory: &str,
+    translation_unit: &NativeOperatorSourceFileLock,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+) -> Result<Vec<String>> {
+    let (target, dependencies) = parse_make_depfile(raw, depfile_path)?;
+    if Path::new(&target).file_name() != object_path.file_name() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "portable depfile target differs from object file: depfile={} target={target}",
+            depfile_path.display()
+        )));
+    }
+    let working_directory = Path::new(working_directory);
+    if !working_directory.is_absolute() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "source-build working directory is not absolute: {}",
+            working_directory.display()
+        )));
+    }
+    let mut observed = BTreeSet::new();
+    for dependency in dependencies {
+        let path = Path::new(&dependency);
+        let relative = if path.is_absolute() {
+            path.strip_prefix(working_directory).map_err(|_| {
+                NativeOperatorBuilderError::Invalid(format!(
+                    "portable depfile dependency is outside its recorded working directory: {dependency}"
+                ))
+            })?
+        } else {
+            path
+        };
+        let normalized = normalize_portable_relative_path(relative)?;
+        if !observed.insert(normalized.clone()) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "portable depfile contains a duplicate dependency: {normalized}"
+            )));
+        }
+    }
+    let expected = std::iter::once(translation_unit.path.as_str())
+        .chain(closure.headers.iter().map(|header| header.path.as_str()))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if observed != expected {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "portable depfile differs from locked dependency closure: expected={} observed={}",
+            expected.into_iter().collect::<Vec<_>>().join(","),
+            observed.iter().cloned().collect::<Vec<_>>().join(",")
+        )));
+    }
+    Ok(observed.into_iter().collect())
+}
+
+fn normalize_portable_relative_path(path: &Path) -> Result<String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                components.push(value.to_str().ok_or_else(|| {
+                    NativeOperatorBuilderError::Invalid(format!(
+                        "depfile path is not valid UTF-8: {}",
+                        path.display()
+                    ))
+                })?)
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "depfile path is not normalized beneath its working directory: {}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    let normalized = components.join("/");
+    validate_relative_path(&normalized)?;
+    Ok(normalized)
+}
+
+fn atomic_write_bytes(destination: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "atomic write destination has no parent: {}",
+            destination.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|source| NativeOperatorBuilderError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let mut temporary =
+        NamedTempFile::new_in(parent).map_err(|source| NativeOperatorBuilderError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .write_all(bytes)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist(destination)
+        .map_err(|error| NativeOperatorBuilderError::Io {
+            path: destination.to_path_buf(),
+            source: error.error,
+        })?;
+    Ok(())
+}
+
+fn parse_make_depfile(raw: &str, path: &Path) -> Result<(String, Vec<String>)> {
+    if raw.trim().is_empty() || raw.as_bytes().contains(&0) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile is empty or contains NUL: {}",
+            path.display()
+        )));
+    }
+    let normalized = raw.replace("\\\r\n", "").replace("\\\n", "");
+    let normalized = normalized.trim_end_matches(&['\r', '\n'][..]);
+    if normalized.contains('\n') || normalized.contains('\r') {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile contains more than one make rule: {}",
+            path.display()
+        )));
+    }
+    let mut escaped = false;
+    let mut delimiter = None;
+    for (index, character) in normalized.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            ':' => {
+                delimiter = Some(index);
+                break;
+            }
+            '\n' | '\r' => {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "depfile contains multiple or unterminated rules: {}",
+                    path.display()
+                )))
+            }
+            _ => {}
+        }
+    }
+    let delimiter = delimiter.ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "depfile has no make target delimiter: {}",
+            path.display()
+        ))
+    })?;
+    let targets = parse_make_words(&normalized[..delimiter], path)?;
+    let dependencies = parse_make_words(&normalized[delimiter + 1..], path)?;
+    if targets.len() != 1 || dependencies.is_empty() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile must contain exactly one target and at least one dependency: {}",
+            path.display()
+        )));
+    }
+    Ok((targets[0].clone(), dependencies))
+}
+
+fn parse_make_words(value: &str, path: &Path) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '\n' | '\r' => unreachable!("newlines rejected before make-word parsing"),
+            character if character.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(character),
+        }
+    }
+    if escaped {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile ends with an incomplete escape: {}",
+            path.display()
+        )));
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Ok(words)
+}
+
 fn locked_source_file(root: &Path, relative: &str) -> Result<PathBuf> {
     validate_relative_path(relative)?;
     let path = root.join(relative);
@@ -1242,15 +2550,1024 @@ fn locked_source_file(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn resolve_toolchain(
+fn resolve_static_toolchain(
     request: &NativeOperatorSourceBuildRequest,
 ) -> Result<NativeOperatorSourceBuildToolchain> {
+    let canonical_root = request.cuda_toolkit_root.canonicalize().map_err(|source| {
+        NativeOperatorBuilderError::Io {
+            path: request.cuda_toolkit_root.clone(),
+            source,
+        }
+    })?;
+    if !canonical_root.is_dir() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cuda_toolkit_root is not a directory: {}",
+            canonical_root.display()
+        )));
+    }
+    let nvcc = tool_file_identity(&request.nvcc_path)?;
+    let canonical_nvcc = Path::new(&nvcc.path);
+    if !canonical_nvcc.starts_with(&canonical_root) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "nvcc must resolve inside cuda_toolkit_root: nvcc={} root={}",
+            canonical_nvcc.display(),
+            canonical_root.display()
+        )));
+    }
+    let manifest = build_cuda_toolkit_manifest(&canonical_root)?;
+    if !manifest.entries.iter().any(|entry| {
+        canonical_root.join(&entry.resolved_path) == canonical_nvcc
+            && entry.sha256 == nvcc.sha256
+            && entry.size_bytes == nvcc.size_bytes
+    }) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit manifest does not contain the selected nvcc: {}",
+            canonical_nvcc.display()
+        )));
+    }
+    let manifest_relative = "toolchain/cuda-static-manifest.json";
+    let manifest_path = request.output_dir.join(manifest_relative);
+    let manifest_parent = manifest_path
+        .parent()
+        .expect("cuda toolkit manifest has a parent directory");
+    fs::create_dir_all(manifest_parent).map_err(|source| NativeOperatorBuilderError::Io {
+        path: manifest_parent.to_path_buf(),
+        source,
+    })?;
+    write_json(&manifest_path, &manifest)?;
+    let manifest_size = fs::metadata(&manifest_path)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: manifest_path.clone(),
+            source,
+        })?
+        .len();
+    let manifest_evidence = NativeOperatorEvidenceFile {
+        path: manifest_relative.to_string(),
+        sha256: sha256_file(&manifest_path)?,
+        size_bytes: manifest_size,
+    };
+    let host_toolchain = resolve_host_toolchain(request)?;
     Ok(NativeOperatorSourceBuildToolchain {
-        nvcc: tool_identity(&request.nvcc_path)?,
-        host_compiler: tool_identity(&request.ccbin_path)?,
-        host_target: compiler_target(&request.ccbin_path)?,
-        archiver: tool_identity(&request.ar_path)?,
+        static_identity: NativeOperatorSourceBuildStaticToolchain {
+            cuda_toolkit: NativeOperatorCudaToolkitIdentity {
+                canonical_root: canonical_root.display().to_string(),
+                release_version: cuda_toolkit_release_version(&canonical_root)?,
+                nvcc,
+                manifest: manifest_evidence,
+            },
+            host_toolchain,
+            archiver: tool_file_identity(&request.ar_path)?,
+        },
+        miss_probe: None,
     })
+}
+
+fn resolve_host_toolchain(
+    request: &NativeOperatorSourceBuildRequest,
+) -> Result<NativeOperatorHostToolchainIdentity> {
+    let compiler = tool_file_identity(&request.ccbin_path)?;
+    let cache_key = sha256_bytes(format!("{}\n{}\n", compiler.path, compiler.sha256).as_bytes());
+    let cache_dir = request
+        .object_cache_dir
+        .join(".host-toolchains")
+        .join(cache_key);
+    fs::create_dir_all(&cache_dir).map_err(|source| NativeOperatorBuilderError::Io {
+        path: cache_dir.clone(),
+        source,
+    })?;
+    let cached_path = cache_dir.join("manifest.json");
+    let environment = effective_environment_for_tool_paths([
+        request.nvcc_path.to_str().unwrap_or(""),
+        compiler.path.as_str(),
+        request.ar_path.to_str().unwrap_or(""),
+    ])?;
+    let cached = cached_path
+        .is_file()
+        .then(|| read_json::<NativeOperatorHostToolchainManifest>(&cached_path))
+        .transpose()
+        .ok()
+        .flatten()
+        .filter(|manifest| {
+            validate_host_toolchain_manifest("<host-toolchain-cache>", manifest).is_ok()
+        });
+    let manifest = match cached {
+        Some(cached)
+            if host_toolchain_manifest_matches_current(&cached, &compiler, &environment)? =>
+        {
+            cached
+        }
+        _ => {
+            let probed = probe_host_toolchain_manifest(&compiler, &environment)?;
+            write_json(&cached_path, &probed)?;
+            probed
+        }
+    };
+
+    let relative = "toolchain/host-static-manifest.json";
+    let output_path = request.output_dir.join(relative);
+    write_json(&output_path, &manifest)?;
+    let size_bytes = fs::metadata(&output_path)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: output_path.clone(),
+            source,
+        })?
+        .len();
+    Ok(NativeOperatorHostToolchainIdentity {
+        compiler: manifest.compiler.clone(),
+        compiler_version: manifest.compiler_version.clone(),
+        target: manifest.target.clone(),
+        manifest: NativeOperatorEvidenceFile {
+            path: relative.to_string(),
+            sha256: sha256_file(&output_path)?,
+            size_bytes,
+        },
+    })
+}
+
+fn probe_host_toolchain_manifest(
+    compiler: &NativeOperatorToolFileIdentity,
+    environment: &BTreeMap<String, String>,
+) -> Result<NativeOperatorHostToolchainManifest> {
+    let compiler_path = Path::new(&compiler.path);
+    let compiler_version = host_compiler_output(compiler_path, &["--version"], b"", environment)?;
+    let target = host_compiler_output(compiler_path, &["-dumpmachine"], b"", environment)?;
+    if target.is_empty() || target.len() > 256 || target.chars().any(char::is_whitespace) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host compiler produced an invalid target: {}",
+            compiler.path
+        )));
+    }
+
+    let discovery_probe = probe_host_compiler_discovery(compiler_path, environment)?;
+
+    let mut executable_inputs = BTreeMap::new();
+    executable_inputs.insert(compiler.path.clone(), compiler.clone());
+    for program in HOST_TOOLCHAIN_PROGRAMS {
+        let value = host_compiler_output(
+            compiler_path,
+            &[&format!("-print-prog-name={program}")],
+            b"",
+            environment,
+        )?;
+        if let Some(path) = resolve_host_program(&value, environment)? {
+            let identity = tool_file_identity(&path)?;
+            executable_inputs.insert(identity.path.clone(), identity);
+        }
+    }
+
+    let mut discovery_roots = executable_inputs
+        .values()
+        .filter_map(|identity| Path::new(&identity.path).parent())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    discovery_roots.sort();
+    discovery_roots.dedup();
+    let scope_roots = discovery_probe
+        .include_roots
+        .iter()
+        .chain(discovery_roots.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let files = collect_host_toolchain_scope_files(&scope_roots)?;
+    let manifest = NativeOperatorHostToolchainManifest {
+        schema_version: NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION,
+        compiler: compiler.clone(),
+        compiler_version,
+        target,
+        executable_inputs: executable_inputs.into_values().collect(),
+        include_roots: discovery_probe.include_roots,
+        include_probe_sha256: discovery_probe.include_probe_sha256,
+        driver_probe_sha256: discovery_probe.driver_probe_sha256,
+        discovery_roots,
+        files,
+    };
+    validate_host_toolchain_manifest("<host-toolchain-probe>", &manifest)?;
+    Ok(manifest)
+}
+
+fn rebuild_host_toolchain_manifest(
+    recorded: &NativeOperatorHostToolchainManifest,
+) -> Result<NativeOperatorHostToolchainManifest> {
+    validate_host_toolchain_manifest("<host-toolchain-recorded>", recorded)?;
+    let compiler = tool_file_identity(Path::new(&recorded.compiler.path))?;
+    let executable_inputs = recorded
+        .executable_inputs
+        .iter()
+        .map(|identity| tool_file_identity(Path::new(&identity.path)))
+        .collect::<Result<Vec<_>>>()?;
+    let scope_roots = recorded
+        .include_roots
+        .iter()
+        .chain(recorded.discovery_roots.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let files = collect_host_toolchain_scope_files(&scope_roots)?;
+    let current = NativeOperatorHostToolchainManifest {
+        schema_version: NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION,
+        compiler,
+        compiler_version: recorded.compiler_version.clone(),
+        target: recorded.target.clone(),
+        executable_inputs,
+        include_roots: recorded.include_roots.clone(),
+        include_probe_sha256: recorded.include_probe_sha256.clone(),
+        driver_probe_sha256: recorded.driver_probe_sha256.clone(),
+        discovery_roots: recorded.discovery_roots.clone(),
+        files,
+    };
+    validate_host_toolchain_manifest("<host-toolchain-current>", &current)?;
+    Ok(current)
+}
+
+struct HostCompilerDiscoveryProbe {
+    include_roots: Vec<String>,
+    include_probe_sha256: String,
+    driver_probe_sha256: String,
+}
+
+fn probe_host_compiler_discovery(
+    compiler: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<HostCompilerDiscoveryProbe> {
+    let include_probe = host_compiler_raw_output(
+        compiler,
+        &["-E", "-x", "c++", "-", "-v"],
+        b"\n",
+        environment,
+    )?;
+    let include_roots = parse_host_compiler_include_roots(
+        &String::from_utf8_lossy(&include_probe.stderr),
+        compiler,
+    )?;
+    let driver_probe = host_compiler_raw_output(
+        compiler,
+        &["-###", "-x", "c++", "-c", "-", "-o", "/dev/null"],
+        b"\n",
+        environment,
+    )?;
+    Ok(HostCompilerDiscoveryProbe {
+        include_roots,
+        include_probe_sha256: compiler_probe_sha256(&include_probe),
+        driver_probe_sha256: compiler_probe_sha256(&driver_probe),
+    })
+}
+
+fn compiler_probe_sha256(output: &std::process::Output) -> String {
+    let mut identity = Vec::with_capacity(output.stdout.len() + output.stderr.len() + 16);
+    identity.extend_from_slice(&(output.stdout.len() as u64).to_le_bytes());
+    identity.extend_from_slice(&output.stdout);
+    identity.extend_from_slice(&(output.stderr.len() as u64).to_le_bytes());
+    identity.extend_from_slice(&output.stderr);
+    sha256_bytes(&identity)
+}
+
+fn host_toolchain_manifest_matches_current(
+    recorded: &NativeOperatorHostToolchainManifest,
+    compiler: &NativeOperatorToolFileIdentity,
+    environment: &BTreeMap<String, String>,
+) -> Result<bool> {
+    if &recorded.compiler != compiler || rebuild_host_toolchain_manifest(recorded)? != *recorded {
+        return Ok(false);
+    }
+    let discovery = probe_host_compiler_discovery(Path::new(&compiler.path), environment)?;
+    Ok(discovery.include_roots == recorded.include_roots
+        && discovery.include_probe_sha256 == recorded.include_probe_sha256
+        && discovery.driver_probe_sha256 == recorded.driver_probe_sha256)
+}
+
+fn host_compiler_output(
+    compiler: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    environment: &BTreeMap<String, String>,
+) -> Result<String> {
+    let output = host_compiler_raw_output(compiler, args, stdin, environment)?;
+    let value = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .trim()
+    .chars()
+    .take(16_384)
+    .collect::<String>();
+    if value.is_empty() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host compiler produced no output for {:?}: {}",
+            args,
+            compiler.display()
+        )));
+    }
+    Ok(value)
+}
+
+fn host_compiler_raw_output(
+    compiler: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    environment: &BTreeMap<String, String>,
+) -> Result<std::process::Output> {
+    let mut child = Command::new(compiler)
+        .args(args)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: compiler.to_path_buf(),
+            source,
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("host compiler stdin is piped")
+        .write_all(stdin)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: compiler.to_path_buf(),
+            source,
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: compiler.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host compiler probe failed for {:?}: path={} status={}",
+            args,
+            compiler.display(),
+            output.status
+        )));
+    }
+    Ok(output)
+}
+
+fn parse_host_compiler_include_roots(stderr: &str, compiler: &Path) -> Result<Vec<String>> {
+    let mut in_search_list = false;
+    let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#include <...> search starts here:" {
+            in_search_list = true;
+            continue;
+        }
+        if in_search_list && trimmed == "End of search list." {
+            break;
+        }
+        if !in_search_list || trimmed.is_empty() {
+            continue;
+        }
+        let path = trimmed
+            .strip_suffix(" (framework directory)")
+            .unwrap_or(trimmed);
+        let canonical =
+            Path::new(path)
+                .canonicalize()
+                .map_err(|source| NativeOperatorBuilderError::Io {
+                    path: PathBuf::from(path),
+                    source,
+                })?;
+        if !canonical.is_dir() {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "host compiler include search entry is not a directory: {}",
+                canonical.display()
+            )));
+        }
+        let canonical = canonical.display().to_string();
+        if seen.insert(canonical.clone()) {
+            roots.push(canonical);
+        }
+    }
+    if roots.is_empty() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host compiler include search probe produced no roots: {}",
+            compiler.display()
+        )));
+    }
+    Ok(roots)
+}
+
+fn resolve_host_program(
+    value: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<PathBuf>> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r'))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host compiler returned an invalid program path: {value:?}"
+        )));
+    }
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        return Ok(candidate.is_file().then(|| candidate.to_path_buf()));
+    }
+    let path = environment.get("PATH").ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(
+            "host compiler probe environment has no PATH".to_string(),
+        )
+    })?;
+    Ok(std::env::split_paths(std::ffi::OsStr::new(path))
+        .map(|directory| directory.join(candidate))
+        .find(|candidate| candidate.is_file()))
+}
+
+fn collect_host_toolchain_scope_files(
+    roots: &[String],
+) -> Result<Vec<NativeOperatorHostToolchainFileIdentity>> {
+    let mut files = BTreeMap::new();
+    for root in roots {
+        collect_host_toolchain_files(Path::new(root), &mut BTreeSet::new(), &mut files)?;
+    }
+    if files.len() > MAX_HOST_TOOLCHAIN_FILES {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host toolchain manifest must contain at most {MAX_HOST_TOOLCHAIN_FILES} sorted unique files"
+        )));
+    }
+    Ok(files.into_values().collect())
+}
+
+fn collect_host_toolchain_files(
+    directory: &Path,
+    active_directories: &mut BTreeSet<PathBuf>,
+    files: &mut BTreeMap<String, NativeOperatorHostToolchainFileIdentity>,
+) -> Result<()> {
+    let resolved_directory =
+        directory
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+    if !resolved_directory.is_dir() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "host toolchain scope is not a directory: {}",
+            directory.display()
+        )));
+    }
+    if !active_directories.insert(resolved_directory.clone()) {
+        return Ok(());
+    }
+    let mut children = fs::read_dir(directory)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let logical = child.path();
+        let resolved = logical
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: logical.clone(),
+                source,
+            })?;
+        if resolved.is_dir() {
+            collect_host_toolchain_files(&logical, active_directories, files)?;
+        } else if resolved.is_file() {
+            let logical_path = logical.display().to_string();
+            if !files.contains_key(&logical_path) && files.len() >= MAX_HOST_TOOLCHAIN_FILES {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "host toolchain manifest exceeds {MAX_HOST_TOOLCHAIN_FILES} files"
+                )));
+            }
+            let size_bytes = fs::metadata(&resolved)
+                .map_err(|source| NativeOperatorBuilderError::Io {
+                    path: resolved.clone(),
+                    source,
+                })?
+                .len();
+            let identity = NativeOperatorHostToolchainFileIdentity {
+                logical_path,
+                resolved_path: resolved.display().to_string(),
+                sha256: sha256_file(&resolved)?,
+                size_bytes,
+            };
+            if let Some(existing) = files.insert(identity.logical_path.clone(), identity.clone()) {
+                if existing != identity {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "host toolchain scope resolved inconsistently: {}",
+                        identity.logical_path
+                    )));
+                }
+            }
+        } else {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "host toolchain scope contains a non-file entry: {}",
+                logical.display()
+            )));
+        }
+    }
+    active_directories.remove(&resolved_directory);
+    Ok(())
+}
+
+fn validate_host_toolchain_manifest(
+    context: &str,
+    manifest: &NativeOperatorHostToolchainManifest,
+) -> Result<()> {
+    if manifest.schema_version != NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION
+        || manifest.compiler_version.trim().is_empty()
+        || manifest.target.trim().is_empty()
+        || manifest.target.len() > 256
+        || manifest.target.chars().any(char::is_whitespace)
+        || manifest.executable_inputs.is_empty()
+        || manifest.include_roots.is_empty()
+        || !is_sha256_digest(&manifest.include_probe_sha256)
+        || !is_sha256_digest(&manifest.driver_probe_sha256)
+        || manifest.discovery_roots.is_empty()
+        || manifest.files.is_empty()
+        || manifest
+            .executable_inputs
+            .windows(2)
+            .any(|pair| pair[0].path >= pair[1].path)
+        || manifest.include_roots.iter().collect::<BTreeSet<_>>().len()
+            != manifest.include_roots.len()
+        || manifest
+            .discovery_roots
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || manifest
+            .files
+            .windows(2)
+            .any(|pair| pair[0].logical_path >= pair[1].logical_path)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{context} host toolchain manifest header/order is invalid"
+        )));
+    }
+    for tool in std::iter::once(&manifest.compiler).chain(manifest.executable_inputs.iter()) {
+        if !Path::new(&tool.path).is_absolute()
+            || !is_sha256_digest(&tool.sha256)
+            || tool.size_bytes == 0
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{context} host toolchain executable identity is invalid: {}",
+                tool.path
+            )));
+        }
+    }
+    if !manifest
+        .executable_inputs
+        .iter()
+        .any(|tool| tool == &manifest.compiler)
+        || manifest
+            .include_roots
+            .iter()
+            .chain(manifest.discovery_roots.iter())
+            .any(|root| !Path::new(root).is_absolute())
+        || manifest.executable_inputs.iter().any(|tool| {
+            Path::new(&tool.path).parent().map_or(true, |parent| {
+                !manifest
+                    .discovery_roots
+                    .iter()
+                    .any(|root| Path::new(root) == parent)
+            })
+        })
+        || manifest.discovery_roots.iter().any(|root| {
+            !manifest
+                .executable_inputs
+                .iter()
+                .any(|tool| Path::new(&tool.path).parent() == Some(Path::new(root)))
+        })
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{context} host toolchain manifest does not bind its compiler/search roots"
+        )));
+    }
+    for file in &manifest.files {
+        if !Path::new(&file.logical_path).is_absolute()
+            || !Path::new(&file.resolved_path).is_absolute()
+            || !is_sha256_digest(&file.sha256)
+            || !manifest
+                .include_roots
+                .iter()
+                .chain(manifest.discovery_roots.iter())
+                .any(|root| Path::new(&file.logical_path).starts_with(root))
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{context} host toolchain file identity is invalid: {}",
+                file.logical_path
+            )));
+        }
+    }
+    for root in manifest
+        .include_roots
+        .iter()
+        .chain(manifest.discovery_roots.iter())
+    {
+        if !manifest
+            .files
+            .iter()
+            .any(|file| Path::new(&file.logical_path).starts_with(root))
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{context} host toolchain search root has no locked files: {root}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn build_cuda_toolkit_manifest(root: &Path) -> Result<NativeOperatorCudaToolkitManifest> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    let root = canonical_root.as_path();
+    let mut entries = Vec::new();
+    for relative in REQUIRED_CUDA_TOOLKIT_FILES {
+        collect_cuda_toolkit_single_file(root, relative, &mut entries)?;
+    }
+    for optional in ["bin/cudafe", "bin/nvcc.profile"] {
+        if root.join(optional).exists() {
+            collect_cuda_toolkit_single_file(root, optional, &mut entries)?;
+        }
+    }
+    for scope in REQUIRED_CUDA_TOOLKIT_SCOPES {
+        let scope_path = root.join(scope);
+        if !scope_path.is_dir() {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "cuda toolkit compiler scope is missing: {scope}"
+            )));
+        }
+        collect_cuda_toolkit_files(root, &scope_path, &mut BTreeSet::new(), &mut entries)?;
+    }
+    entries.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    if entries.is_empty()
+        || entries
+            .windows(2)
+            .any(|pair| pair[0].logical_path >= pair[1].logical_path)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "cuda toolkit manifest entries must be non-empty, sorted, and unique".to_string(),
+        ));
+    }
+    Ok(NativeOperatorCudaToolkitManifest {
+        schema_version: NATIVE_OPERATOR_CUDA_TOOLKIT_MANIFEST_SCHEMA_VERSION,
+        canonical_root: root.display().to_string(),
+        entries,
+    })
+}
+
+fn collect_cuda_toolkit_single_file(
+    root: &Path,
+    relative: &str,
+    entries: &mut Vec<NativeOperatorCudaToolkitFileIdentity>,
+) -> Result<()> {
+    validate_relative_path(relative)?;
+    let logical = root.join(relative);
+    let resolved = logical
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: logical.clone(),
+            source,
+        })?;
+    if !resolved.starts_with(root) || !resolved.is_file() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit compiler input escapes root or is not a file: {relative}"
+        )));
+    }
+    entries.push(cuda_toolkit_file_identity(root, &logical, &resolved)?);
+    Ok(())
+}
+
+fn cuda_toolkit_release_version(root: &Path) -> Result<String> {
+    let cuda_header = root.join("include/cuda.h");
+    require_file(&cuda_header)?;
+    let contents =
+        fs::read_to_string(&cuda_header).map_err(|source| NativeOperatorBuilderError::Io {
+            path: cuda_header.clone(),
+            source,
+        })?;
+    let encoded = contents
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some("#define"), Some("CUDA_VERSION"), Some(value), None) => {
+                    value.parse::<u32>().ok()
+                }
+                _ => None,
+            }
+        })
+        .filter(|value| *value >= 1000)
+        .ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "cuda toolkit include/cuda.h has no valid CUDA_VERSION: {}",
+                cuda_header.display()
+            ))
+        })?;
+    Ok(format!(
+        "{}.{}.{}",
+        encoded / 1000,
+        (encoded % 1000) / 10,
+        encoded % 10
+    ))
+}
+
+fn collect_cuda_toolkit_files(
+    root: &Path,
+    directory: &Path,
+    active_directories: &mut BTreeSet<PathBuf>,
+    entries: &mut Vec<NativeOperatorCudaToolkitFileIdentity>,
+) -> Result<()> {
+    let resolved_directory =
+        directory
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+    if !resolved_directory.starts_with(root) || !resolved_directory.is_dir() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit compiler directory escapes its canonical root: {}",
+            directory.display()
+        )));
+    }
+    if !active_directories.insert(resolved_directory.clone()) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit compiler directory contains a symlink cycle: {}",
+            directory.display()
+        )));
+    }
+    let mut children = fs::read_dir(directory)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let logical_path = child.path();
+        let resolved =
+            logical_path
+                .canonicalize()
+                .map_err(|source| NativeOperatorBuilderError::Io {
+                    path: logical_path.clone(),
+                    source,
+                })?;
+        if !resolved.starts_with(root) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "cuda toolkit symlink escapes its canonical root: {}",
+                logical_path.display()
+            )));
+        }
+        if resolved.is_dir() {
+            collect_cuda_toolkit_files(root, &logical_path, active_directories, entries)?;
+        } else if resolved.is_file() {
+            entries.push(cuda_toolkit_file_identity(root, &logical_path, &resolved)?);
+        } else {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "cuda toolkit compiler scope contains a non-file entry: {}",
+                logical_path.display()
+            )));
+        }
+    }
+    active_directories.remove(&resolved_directory);
+    Ok(())
+}
+
+fn cuda_toolkit_file_identity(
+    root: &Path,
+    logical: &Path,
+    resolved: &Path,
+) -> Result<NativeOperatorCudaToolkitFileIdentity> {
+    let logical_path = logical.strip_prefix(root).map_err(|_| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit logical path escapes root: {}",
+            logical.display()
+        ))
+    })?;
+    let resolved_path = resolved.strip_prefix(root).map_err(|_| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit resolved path escapes root: {}",
+            resolved.display()
+        ))
+    })?;
+    let size_bytes = fs::metadata(resolved)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: resolved.to_path_buf(),
+            source,
+        })?
+        .len();
+    Ok(NativeOperatorCudaToolkitFileIdentity {
+        logical_path: path_with_forward_slashes(logical_path)?,
+        resolved_path: path_with_forward_slashes(resolved_path)?,
+        sha256: sha256_file(resolved)?,
+        size_bytes,
+    })
+}
+
+fn path_with_forward_slashes(path: &Path) -> Result<String> {
+    let components = path
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => {
+                value.to_str().map(str::to_string).ok_or_else(|| {
+                    NativeOperatorBuilderError::Invalid(format!(
+                        "native build path is not valid UTF-8: {}",
+                        path.display()
+                    ))
+                })
+            }
+            _ => Err(NativeOperatorBuilderError::Invalid(format!(
+                "native build path is not normalized and relative: {}",
+                path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(components.join("/"))
+}
+
+fn tool_file_identity(path: &Path) -> Result<NativeOperatorToolFileIdentity> {
+    require_file(path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let size_bytes = fs::metadata(&canonical)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: canonical.clone(),
+            source,
+        })?
+        .len();
+    if size_bytes == 0 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "source build tool is empty: {}",
+            canonical.display()
+        )));
+    }
+    Ok(NativeOperatorToolFileIdentity {
+        path: canonical.display().to_string(),
+        sha256: sha256_file(&canonical)?,
+        size_bytes,
+    })
+}
+
+fn probe_source_toolchain(
+    static_identity: &NativeOperatorSourceBuildStaticToolchain,
+    missed_translation_units: Vec<String>,
+) -> Result<NativeOperatorSourceBuildToolchainProbe> {
+    Ok(NativeOperatorSourceBuildToolchainProbe {
+        nvcc_version: tool_version(Path::new(&static_identity.cuda_toolkit.nvcc.path))?,
+        host_compiler_version: static_identity.host_toolchain.compiler_version.clone(),
+        host_target: static_identity.host_toolchain.target.clone(),
+        archiver_version: tool_version(Path::new(&static_identity.archiver.path))?,
+        probed_for_misses: missed_translation_units,
+    })
+}
+
+fn validate_static_toolchain_identity(
+    operator: &str,
+    toolchain: &NativeOperatorSourceBuildStaticToolchain,
+) -> Result<()> {
+    if !Path::new(&toolchain.cuda_toolkit.canonical_root).is_absolute() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} cuda toolkit canonical_root must be absolute"
+        )));
+    }
+    if toolchain.cuda_toolkit.release_version.trim().is_empty()
+        || toolchain
+            .cuda_toolkit
+            .release_version
+            .chars()
+            .any(|character| !(character.is_ascii_digit() || character == '.'))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} cuda toolkit release_version is invalid"
+        )));
+    }
+    for (name, tool) in [
+        ("nvcc", &toolchain.cuda_toolkit.nvcc),
+        ("host_compiler", &toolchain.host_toolchain.compiler),
+        ("archiver", &toolchain.archiver),
+    ] {
+        if !Path::new(&tool.path).is_absolute()
+            || !is_sha256_digest(&tool.sha256)
+            || tool.size_bytes == 0
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{operator} source-build static {name} identity is incomplete"
+            )));
+        }
+    }
+    if !Path::new(&toolchain.cuda_toolkit.nvcc.path)
+        .starts_with(&toolchain.cuda_toolkit.canonical_root)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} nvcc identity escapes cuda toolkit root"
+        )));
+    }
+    let manifest = &toolchain.cuda_toolkit.manifest;
+    if manifest.path != "toolchain/cuda-static-manifest.json"
+        || !is_sha256_digest(&manifest.sha256)
+        || manifest.size_bytes == 0
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} cuda toolkit manifest evidence is incomplete"
+        )));
+    }
+    let host = &toolchain.host_toolchain;
+    if host.compiler_version.trim().is_empty()
+        || host.target.trim().is_empty()
+        || host.target.len() > 256
+        || host.target.chars().any(char::is_whitespace)
+        || host.manifest.path != "toolchain/host-static-manifest.json"
+        || !is_sha256_digest(&host.manifest.sha256)
+        || host.manifest.size_bytes == 0
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{operator} host toolchain manifest evidence is incomplete"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tool_file_unchanged(identity: &NativeOperatorToolFileIdentity) -> Result<()> {
+    let current = tool_file_identity(Path::new(&identity.path))?;
+    if &current != identity {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "tool file changed after static identity was recorded: {}",
+            identity.path
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cuda_toolkit_unchanged(identity: &NativeOperatorCudaToolkitIdentity) -> Result<()> {
+    let manifest_path = Path::new(&identity.canonical_root);
+    let current = build_cuda_toolkit_manifest(manifest_path)?;
+    validate_cuda_toolkit_manifest("<source-build-finalize>", identity, &current)?;
+    let recorded_path = Path::new(&identity.canonical_root);
+    if current.canonical_root != recorded_path.display().to_string() {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "cuda toolkit canonical root changed during source build".to_string(),
+        ));
+    }
+    let recorded_manifest = identity.manifest.sha256.as_str();
+    let serialized_with_newline = {
+        let mut bytes = serde_json::to_vec_pretty(&current).map_err(|source| {
+            NativeOperatorBuilderError::Json {
+                path: PathBuf::from("<cuda-static-manifest>"),
+                source,
+            }
+        })?;
+        bytes.push(b'\n');
+        sha256_bytes(&bytes)
+    };
+    if serialized_with_newline != recorded_manifest {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cuda toolkit manifest changed during source build: expected={recorded_manifest} actual={serialized_with_newline}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_host_toolchain_unchanged(
+    identity: &NativeOperatorHostToolchainIdentity,
+    receipt_root: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<()> {
+    let manifest_path = resolve_source_build_evidence_file(
+        receipt_root,
+        "<source-build-finalize>",
+        &identity.manifest,
+    )?;
+    let recorded: NativeOperatorHostToolchainManifest = read_json(&manifest_path)?;
+    validate_host_toolchain_manifest("<source-build-finalize>", &recorded)?;
+    if recorded.compiler != identity.compiler
+        || recorded.compiler_version != identity.compiler_version
+        || recorded.target != identity.target
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "host toolchain identity differs from its manifest".to_string(),
+        ));
+    }
+    if !host_toolchain_manifest_matches_current(&recorded, &identity.compiler, environment)? {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "host toolchain files or driver configuration changed during source build".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn compiler_target(path: &Path) -> Result<String> {
@@ -1431,6 +3748,21 @@ pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
             path: path.to_path_buf(),
             source,
         })?;
+    Ok(NativeOperatorToolIdentity {
+        path: canonical.display().to_string(),
+        sha256: sha256_file(&canonical)?,
+        version: tool_version(&canonical)?,
+    })
+}
+
+fn tool_version(path: &Path) -> Result<String> {
+    require_file(path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let output = Command::new(&canonical)
         .arg("--version")
         .env_clear()
@@ -1457,11 +3789,7 @@ pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
             canonical.display()
         )));
     }
-    Ok(NativeOperatorToolIdentity {
-        path: canonical.display().to_string(),
-        sha256: sha256_file(&canonical)?,
-        version,
-    })
+    Ok(version)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1470,7 +3798,7 @@ fn build_inputs_sha256(
     source_package_sha256: &str,
     architecture_argument: &str,
     effective_environment: &BTreeMap<String, String>,
-    toolchain: Option<&NativeOperatorSourceBuildToolchain>,
+    toolchain: Option<&NativeOperatorSourceBuildStaticToolchain>,
     receipt_path: &Path,
 ) -> Result<String> {
     let identity = NativeOperatorBuildInputIdentity {
@@ -1495,9 +3823,14 @@ fn effective_build_environment(
 ) -> Result<BTreeMap<String, String>> {
     let tool_paths = if let Some(toolchain) = toolchain {
         [
-            toolchain.nvcc.path.as_str(),
-            toolchain.host_compiler.path.as_str(),
-            toolchain.archiver.path.as_str(),
+            toolchain.static_identity.cuda_toolkit.nvcc.path.as_str(),
+            toolchain
+                .static_identity
+                .host_toolchain
+                .compiler
+                .path
+                .as_str(),
+            toolchain.static_identity.archiver.path.as_str(),
         ]
     } else {
         [
@@ -1513,20 +3846,32 @@ fn effective_environment_for_tool_paths(tool_paths: [&str; 3]) -> Result<BTreeMa
     let mut path_entries = tool_paths
         .iter()
         .filter_map(|path| Path::new(path).parent())
-        .map(|path| path.display().to_string())
+        .map(Path::to_path_buf)
         .collect::<Vec<_>>();
-    path_entries.extend(["/bin".to_string(), "/usr/bin".to_string()]);
+    path_entries.extend([PathBuf::from("/bin"), PathBuf::from("/usr/bin")]);
     path_entries.sort();
     path_entries.dedup();
-    if path_entries.iter().any(|path| path.is_empty()) {
+    if path_entries.iter().any(|path| path.as_os_str().is_empty()) {
         return Err(NativeOperatorBuilderError::Invalid(
             "source build tool paths must have parent directories".to_string(),
         ));
     }
+    let path = std::env::join_paths(&path_entries)
+        .map_err(|error| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "source build tool PATH cannot be represented: {error}"
+            ))
+        })?
+        .into_string()
+        .map_err(|_| {
+            NativeOperatorBuilderError::Invalid(
+                "source build tool PATH is not valid UTF-8".to_string(),
+            )
+        })?;
     let mut environment = BTreeMap::new();
     environment.insert("LANG".to_string(), "C".to_string());
     environment.insert("LC_ALL".to_string(), "C".to_string());
-    environment.insert("PATH".to_string(), path_entries.join(":"));
+    environment.insert("PATH".to_string(), path);
     environment.insert("SOURCE_DATE_EPOCH".to_string(), "0".to_string());
     environment.insert("TMPDIR".to_string(), "/tmp".to_string());
     environment.insert("TZ".to_string(), "UTC".to_string());
@@ -1537,18 +3882,31 @@ fn effective_environment_for_tool_paths(tool_paths: [&str; 3]) -> Result<BTreeMa
 fn build_object_cache_specs(
     plan: &NativeOperatorSourceBuildPlan,
     architecture_argument: &str,
-    toolchain: &NativeOperatorSourceBuildToolchain,
+    toolchain: &NativeOperatorSourceBuildStaticToolchain,
     effective_environment: &BTreeMap<String, String>,
 ) -> Result<Vec<NativeBuildArtifactSpec>> {
     plan.translation_units
         .iter()
         .enumerate()
         .map(|(index, translation_unit)| {
+            let closure = plan.dependency_closures.get(index).ok_or_else(|| {
+                NativeOperatorBuilderError::Invalid(format!(
+                    "missing dependency closure for {}",
+                    translation_unit.path
+                ))
+            })?;
+            if closure.translation_unit != translation_unit.path {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "dependency closure order differs from translation units: expected={} actual={}",
+                    translation_unit.path, closure.translation_unit
+                )));
+            }
             let identity = NativeOperatorObjectInputIdentity {
-                schema_version: 1,
+                schema_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
                 operator: &plan.operator,
                 translation_unit,
-                headers: &plan.headers,
+                dependency_closure_sha256: &closure.closure_sha256,
+                headers: &closure.headers,
                 include_dirs: &plan.include_dirs,
                 defines: &plan.defines,
                 nvcc_policy: &plan.nvcc_policy,
@@ -1625,13 +3983,20 @@ fn build_commands(
     _effective_environment: &BTreeMap<String, String>,
 ) -> Vec<NativeOperatorSourceBuildCommand> {
     let nvcc_path = toolchain
-        .map(|toolchain| toolchain.nvcc.path.as_str())
+        .map(|toolchain| toolchain.static_identity.cuda_toolkit.nvcc.path.as_str())
         .unwrap_or_else(|| request.nvcc_path.to_str().unwrap_or("<non-utf8-nvcc>"));
     let ccbin_path = toolchain
-        .map(|toolchain| toolchain.host_compiler.path.as_str())
+        .map(|toolchain| {
+            toolchain
+                .static_identity
+                .host_toolchain
+                .compiler
+                .path
+                .as_str()
+        })
         .unwrap_or_else(|| request.ccbin_path.to_str().unwrap_or("<non-utf8-ccbin>"));
     let ar_path = toolchain
-        .map(|toolchain| toolchain.archiver.path.as_str())
+        .map(|toolchain| toolchain.static_identity.archiver.path.as_str())
         .unwrap_or_else(|| request.ar_path.to_str().unwrap_or("<non-utf8-ar>"));
     let mut commands = Vec::with_capacity(plan.translation_units.len() + 1);
     let mut object_paths = Vec::with_capacity(plan.translation_units.len());
@@ -1642,6 +4007,9 @@ fn build_commands(
             .unwrap_or("translation_unit");
         let object_name = object_file_name(index, translation_unit);
         let object_path = objects_dir.join(object_name);
+        let depfile_name = format!("{index:08}-{stem}.d");
+        let depfile_relative = format!("depfiles/{depfile_name}");
+        let depfile_path = request.output_dir.join(&depfile_relative);
         object_paths.push(object_path.clone());
         let mut argv = vec![
             nvcc_path.to_string(),
@@ -1652,6 +4020,11 @@ fn build_commands(
             architecture_argument.to_string(),
             "-ccbin".to_string(),
             ccbin_path.to_string(),
+            "-MMD".to_string(),
+            "-MF".to_string(),
+            depfile_path.display().to_string(),
+            "-MT".to_string(),
+            object_path.display().to_string(),
         ];
         argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
         argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));
@@ -1675,6 +4048,18 @@ fn build_commands(
             object_sha256: None,
             object_size_bytes: None,
             object_identity: None,
+            dependency_closure_sha256: plan
+                .dependency_closures
+                .get(index)
+                .map(|closure| closure.closure_sha256.clone()),
+            dependency_validation: Some(if request.plan_only {
+                NativeOperatorDependencyValidation::Plan
+            } else {
+                NativeOperatorDependencyValidation::Pending
+            }),
+            depfile: Some(depfile_relative),
+            depfile_sha256: None,
+            observed_dependencies: Vec::new(),
             compiler_executed: false,
             elapsed_ms: None,
             return_code: None,
@@ -1700,6 +4085,11 @@ fn build_commands(
         object_sha256: None,
         object_size_bytes: None,
         object_identity: None,
+        dependency_closure_sha256: None,
+        dependency_validation: None,
+        depfile: None,
+        depfile_sha256: None,
+        observed_dependencies: Vec::new(),
         compiler_executed: false,
         elapsed_ms: None,
         return_code: None,
@@ -1871,7 +4261,7 @@ fn millis(duration: std::time::Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     use super::*;
 
@@ -1888,6 +4278,10 @@ mod tests {
             }],
             translation_units: vec!["kernels/marlin.cu".to_string()],
             headers: vec!["kernels/marlin.h".to_string()],
+            dependency_closures: vec![NativeOperatorTranslationUnitDependencies {
+                translation_unit: "kernels/marlin.cu".to_string(),
+                headers: vec!["kernels/marlin.h".to_string()],
+            }],
             include_dirs: vec!["kernels".to_string()],
             defines: vec!["FERRUM_FIXTURE=1".to_string()],
             nvcc_policy: NativeOperatorNvccPolicy {
@@ -1909,7 +4303,8 @@ mod tests {
         fs::create_dir_all(source_root.join("kernels")).unwrap();
         fs::write(
             source_root.join("kernels/marlin.cu"),
-            "int marlin_cuda(void) { return 0; }\n\
+            "#include \"marlin.h\"\n\
+             int marlin_cuda(void) { return MARLIN - 1; }\n\
              int marlin_cuda_moe(void) { return 0; }\n",
         )
         .unwrap();
@@ -1919,20 +4314,80 @@ mod tests {
         (source_root, definition_path)
     }
 
-    fn write_fake_nvcc(root: &Path) -> (PathBuf, PathBuf) {
-        let path = root.join("fake-nvcc");
+    struct FakeCudaToolkit {
+        root: PathBuf,
+        nvcc: PathBuf,
+        ccbin: PathBuf,
+        compile_counter: PathBuf,
+        invocation_counter: PathBuf,
+        host_compiler_invocation_counter: PathBuf,
+        host_driver_config: PathBuf,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeDepfileMode {
+        Valid,
+        MissingDeclaredHeader,
+        UndeclaredExternal,
+    }
+
+    fn write_fake_nvcc(root: &Path) -> FakeCudaToolkit {
+        write_fake_nvcc_with_mode(root, FakeDepfileMode::Valid)
+    }
+
+    fn write_fake_nvcc_with_mode(root: &Path, mode: FakeDepfileMode) -> FakeCudaToolkit {
+        let toolkit_root = root.join("fake-cuda");
+        for directory in ["bin/crt", "include", "nvvm/bin", "nvvm/libdevice"] {
+            fs::create_dir_all(toolkit_root.join(directory)).unwrap();
+        }
+        for (relative, contents) in [
+            ("bin/bin2c", "fake bin2c\n"),
+            ("bin/crt/link.stub", "fake link stub\n"),
+            ("bin/cudafe++", "fake cudafe\n"),
+            ("bin/ptxas", "fake ptxas\n"),
+            ("bin/fatbinary", "fake fatbinary\n"),
+            ("bin/nvlink", "fake nvlink\n"),
+            ("include/cuda.h", "#define CUDA_VERSION 12040\n"),
+            ("nvvm/bin/cicc", "fake cicc\n"),
+            ("nvvm/libdevice/libdevice.10.bc", "fake libdevice\n"),
+        ] {
+            fs::write(toolkit_root.join(relative), contents).unwrap();
+        }
+        let path = toolkit_root.join("bin/nvcc");
         let counter = root.join("fake-nvcc-compile-count");
+        let invocation_counter = root.join("fake-nvcc-invocation-count");
+        let compile_tail = match mode {
+            FakeDepfileMode::Valid => {
+                "exec /usr/bin/cc -x c -MMD -MF \"$depfile\" -MT \"$dep_target\" -c \"$src\" -o \"$out\"\n"
+                    .to_string()
+            }
+            FakeDepfileMode::MissingDeclaredHeader => {
+                "/usr/bin/cc -x c -MMD -MF \"$depfile\" -MT \"$dep_target\" -c \"$src\" -o \"$out\" || exit $?\n\
+                 printf '%s: %s\\n' \"$dep_target\" \"$src\" > \"$depfile\"\n"
+                    .to_string()
+            }
+            FakeDepfileMode::UndeclaredExternal => {
+                "/usr/bin/cc -x c -MMD -MF \"$depfile\" -MT \"$dep_target\" -c \"$src\" -o \"$out\" || exit $?\n\
+                 printf '%s: %s kernels/marlin.h /etc/hosts\\n' \"$dep_target\" \"$src\" > \"$depfile\"\n"
+                    .to_string()
+            }
+        };
         fs::write(
             &path,
             format!(
                 "#!/bin/sh\n\
+             printf 'invoke:%s\\n' \"$*\" >> '{}'\n\
              if [ \"$1\" = \"--version\" ]; then echo 'fake nvcc 12.4'; exit 0; fi\n\
              src=''\n\
              out=''\n\
+             depfile=''\n\
+             dep_target=''\n\
              while [ \"$#\" -gt 0 ]; do\n\
                case \"$1\" in\n\
                  -c) src=\"$2\"; shift 2 ;;\n\
                  -o) out=\"$2\"; shift 2 ;;\n\
+                 -MF) depfile=\"$2\"; shift 2 ;;\n\
+                 -MT) dep_target=\"$2\"; shift 2 ;;\n\
                  *) shift ;;\n\
                esac\n\
              done\n\
@@ -1942,15 +4397,73 @@ mod tests {
              grep -q '\"status\": \"reject\"' \"$receipt\"\n\
              grep -q '\"failure_class\": \"build_incomplete\"' \"$receipt\"\n\
              printf 'compile\\n' >> '{}'\n\
-             exec /usr/bin/cc -x c -c \"$src\" -o \"$out\"\n",
-                counter.display()
+             {}",
+                invocation_counter.display(),
+                counter.display(),
+                compile_tail
             ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
-        (path, counter)
+
+        let host_root = root.join("fake-host-toolchain");
+        fs::create_dir_all(host_root.join("bin")).unwrap();
+        fs::create_dir_all(host_root.join("include")).unwrap();
+        fs::write(
+            host_root.join("include/stddef.h"),
+            "#define FAKE_SIZE_T 1\n",
+        )
+        .unwrap();
+        for program in HOST_TOOLCHAIN_PROGRAMS {
+            fs::write(
+                host_root.join("bin").join(program),
+                format!("fake host tool {program}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            host_root.join("bin/driver.specs"),
+            "fake host driver configuration\n",
+        )
+        .unwrap();
+        let ccbin = host_root.join("bin/c++");
+        let host_compiler_invocation_counter = root.join("fake-host-compiler-invocation-count");
+        let host_driver_config = root.join("fake-host-driver.conf");
+        fs::write(&host_driver_config, "external driver option v1\n").unwrap();
+        fs::write(
+            &ccbin,
+            format!(
+                "#!/bin/sh\n\
+                 printf 'invoke:%s\\n' \"$*\" >> '{}'\n\
+                 case \"$1\" in\n\
+                   --version) echo 'fake host compiler 1.0'; exit 0 ;;\n\
+                   -dumpmachine) echo 'x86_64-ferrum-linux-gnu'; exit 0 ;;\n\
+                   -E) echo '#include <...> search starts here:' >&2; echo ' {}' >&2; echo 'End of search list.' >&2; exit 0 ;;\n\
+                   -###) echo 'fake cc1plus -O2 -x c++' >&2; cat '{}' >&2; exit 0 ;;\n\
+                   -print-prog-name=*) name=${{1#*=}}; echo '{}/bin/'\"$name\"; exit 0 ;;\n\
+                 esac\n\
+                 exit 2\n",
+                host_compiler_invocation_counter.display(),
+                host_root.join("include").display(),
+                host_driver_config.display(),
+                host_root.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&ccbin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&ccbin, permissions).unwrap();
+        FakeCudaToolkit {
+            root: toolkit_root,
+            nvcc: path,
+            ccbin,
+            compile_counter: counter,
+            invocation_counter,
+            host_compiler_invocation_counter,
+            host_driver_config,
+        }
     }
 
     #[test]
@@ -1964,11 +4477,70 @@ mod tests {
     }
 
     #[test]
+    fn host_include_probe_preserves_search_order_and_deduplicates_first_occurrence() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first include");
+        let second = root.path().join("second include");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let raw = format!(
+            "#include <...> search starts here:\n {}\n {}\n {}\nEnd of search list.\n",
+            second.display(),
+            first.display(),
+            second.display()
+        );
+
+        let roots = parse_host_compiler_include_roots(&raw, Path::new("/fake/compiler")).unwrap();
+
+        assert_eq!(
+            roots,
+            [
+                second.canonicalize().unwrap().display().to_string(),
+                first.canonicalize().unwrap().display().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_program_resolution_and_effective_path_support_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        let tool_dir = root.path().join("tool chain");
+        fs::create_dir_all(&tool_dir).unwrap();
+        let helper = tool_dir.join("cc helper");
+        fs::write(&helper, "fixture\n").unwrap();
+        let path = std::env::join_paths([tool_dir.clone()])
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let environment = BTreeMap::from([("PATH".to_string(), path)]);
+
+        assert_eq!(
+            resolve_host_program("cc helper", &environment).unwrap(),
+            Some(helper)
+        );
+
+        let nvcc = tool_dir.join("nvcc");
+        let ccbin = tool_dir.join("c++");
+        let ar = tool_dir.join("ar");
+        let effective = effective_environment_for_tool_paths([
+            nvcc.to_str().unwrap(),
+            ccbin.to_str().unwrap(),
+            ar.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(
+            std::env::split_paths(std::ffi::OsStr::new(&effective["PATH"]))
+                .any(|entry| entry == tool_dir)
+        );
+    }
+
+    #[test]
     fn locks_self_contained_translation_unit_without_auxiliary_inputs() {
         let root = tempfile::tempdir().unwrap();
         let (source_root, _) = write_fixture(root.path());
         let mut definition = definition();
         definition.headers.clear();
+        definition.dependency_closures[0].headers.clear();
         definition.include_dirs.clear();
         let definition_path = root.path().join("self-contained-definition.json");
         write_json(&definition_path, &definition).unwrap();
@@ -1998,6 +4570,7 @@ mod tests {
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
             nvcc_path: PathBuf::from("/missing/nvcc"),
+            cuda_toolkit_root: PathBuf::from("/missing/cuda"),
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
             nvcc_threads: 4,
@@ -2024,6 +4597,7 @@ mod tests {
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
             nvcc_path: PathBuf::from("/missing/nvcc"),
+            cuda_toolkit_root: PathBuf::from("/missing/cuda"),
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
             nvcc_threads: 4,
@@ -2065,6 +4639,7 @@ mod tests {
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
             nvcc_path: PathBuf::from("/missing/nvcc"),
+            cuda_toolkit_root: PathBuf::from("/missing/cuda"),
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
             nvcc_threads: 4,
@@ -2095,13 +4670,242 @@ mod tests {
     }
 
     #[test]
+    fn rejects_incomplete_or_undeclared_depfiles_before_cache_publish() {
+        for (name, mode) in [
+            ("missing-header", FakeDepfileMode::MissingDeclaredHeader),
+            ("undeclared-external", FakeDepfileMode::UndeclaredExternal),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (source_root, definition_path) = write_fixture(root.path());
+            let plan_path = root.path().join("source-build.plan.json");
+            lock_native_operator_source_definition(&definition_path, &source_root, &plan_path)
+                .unwrap();
+            let fake_cuda = write_fake_nvcc_with_mode(root.path(), mode);
+            let output_dir = root.path().join(name);
+            let object_cache_dir = root.path().join("object-cache");
+
+            let error = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+                plan_path,
+                source_root,
+                output_dir: output_dir.clone(),
+                compute_capability: "sm_89".to_string(),
+                builder_sha: "7".repeat(40),
+                nvcc_path: fake_cuda.nvcc,
+                cuda_toolkit_root: fake_cuda.root,
+                ccbin_path: fake_cuda.ccbin.clone(),
+                ar_path: PathBuf::from("/usr/bin/ar"),
+                nvcc_threads: 2,
+                object_cache_dir: object_cache_dir.clone(),
+                plan_only: false,
+            })
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                NativeOperatorBuilderError::SourceBuildRejected { .. }
+            ));
+            let receipt: NativeOperatorSourceBuildReceipt =
+                read_json(&output_dir.join("source-build.receipt.json")).unwrap();
+            assert!(receipt
+                .failure_class
+                .as_deref()
+                .is_some_and(|failure| failure.starts_with("dependency_validation_failed:")));
+            assert_eq!(
+                receipt.commands[0].object_cache_status,
+                Some(NativeOperatorSourceObjectCacheStatus::Rejected)
+            );
+            assert!(receipt.commands[0].object_cache_entry.is_none());
+            assert!(
+                fs::read_dir(object_cache_dir).unwrap().all(|entry| {
+                    entry
+                        .is_ok_and(|entry| entry.file_name() == ".host-toolchains")
+                }),
+                "invalid dependency evidence may cache toolchain inventory but must not publish an object"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tampered_cached_depfile_proof_before_compiler_start() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, definition_path) = write_fixture(root.path());
+        let plan_path = root.path().join("source-build.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &plan_path).unwrap();
+        let fake_cuda = write_fake_nvcc(root.path());
+        let object_cache_dir = root.path().join("object-cache");
+        let request = |name: &str| NativeOperatorSourceBuildRequest {
+            plan_path: plan_path.clone(),
+            source_root: source_root.clone(),
+            output_dir: root.path().join(name),
+            compute_capability: "sm_89".to_string(),
+            builder_sha: "7".repeat(40),
+            nvcc_path: fake_cuda.nvcc.clone(),
+            cuda_toolkit_root: fake_cuda.root.clone(),
+            ccbin_path: fake_cuda.ccbin.clone(),
+            ar_path: PathBuf::from("/usr/bin/ar"),
+            nvcc_threads: 2,
+            object_cache_dir: object_cache_dir.clone(),
+            plan_only: false,
+        };
+
+        let cold = run_native_operator_source_build(&request("cold")).unwrap();
+        let cache_entry = PathBuf::from(
+            cold.commands[0]
+                .object_cache_entry
+                .as_deref()
+                .expect("published object records its cache entry"),
+        );
+        let proof_dir = fs::read_dir(cache_entry.join("dependency-proofs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(
+            proof_dir.join("dependency.d"),
+            "forged.o: kernels/marlin.cu\n",
+        )
+        .unwrap();
+
+        let error = run_native_operator_source_build(&request("tampered")).unwrap_err();
+        assert!(matches!(
+            error,
+            NativeOperatorBuilderError::SourceBuildRejected { .. }
+        ));
+        let receipt: NativeOperatorSourceBuildReceipt =
+            read_json(&root.path().join("tampered/source-build.receipt.json")).unwrap();
+        assert!(receipt
+            .failure_class
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("cached_dependency_proof_failed:")));
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "tampered cache proof must reject before another compiler starts"
+        );
+    }
+
+    #[test]
+    fn compiler_inputs_invalidate_object_cache_without_hidden_probe_hits() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, definition_path) = write_fixture(root.path());
+        let plan_path = root.path().join("source-build.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &plan_path).unwrap();
+        let fake_cuda = write_fake_nvcc(root.path());
+        let object_cache_dir = root.path().join("object-cache");
+        let run_build = |name: &str| {
+            run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+                plan_path: plan_path.clone(),
+                source_root: source_root.clone(),
+                output_dir: root.path().join(name),
+                compute_capability: "sm_89".to_string(),
+                builder_sha: "7".repeat(40),
+                nvcc_path: fake_cuda.nvcc.clone(),
+                cuda_toolkit_root: fake_cuda.root.clone(),
+                ccbin_path: fake_cuda.ccbin.clone(),
+                ar_path: PathBuf::from("/usr/bin/ar"),
+                nvcc_threads: 2,
+                object_cache_dir: object_cache_dir.clone(),
+                plan_only: false,
+            })
+            .unwrap()
+        };
+
+        assert_eq!(run_build("cold").compiled_translation_units.len(), 1);
+        assert_eq!(run_build("hit").cache_hit_translation_units.len(), 1);
+        for (index, relative) in [
+            "bin/ptxas",
+            "include/cuda.h",
+            "nvvm/libdevice/libdevice.10.bc",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = fake_cuda.root.join(relative);
+            let mut contents = fs::read_to_string(&path).unwrap();
+            contents.push_str(&format!("mutation-{index}\n"));
+            fs::write(path, contents).unwrap();
+            let receipt = run_build(&format!("mutation-{index}"));
+            assert_eq!(receipt.compiled_translation_units, ["kernels/marlin.cu"]);
+            assert!(receipt.cache_hit_translation_units.is_empty());
+        }
+        let host_root = fake_cuda
+            .ccbin
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf();
+        for (index, relative) in ["include/stddef.h", "bin/cc1plus", "bin/driver.specs"]
+            .iter()
+            .enumerate()
+        {
+            let path = host_root.join(relative);
+            let mut contents = fs::read_to_string(&path).unwrap();
+            contents.push_str(&format!("host-mutation-{index}\n"));
+            fs::write(path, contents).unwrap();
+            let receipt = run_build(&format!("host-mutation-{index}"));
+            assert_eq!(receipt.compiled_translation_units, ["kernels/marlin.cu"]);
+            assert!(receipt.cache_hit_translation_units.is_empty());
+        }
+        fs::write(&fake_cuda.host_driver_config, "external driver option v2\n").unwrap();
+        let external_config_receipt = run_build("external-driver-config-mutation");
+        assert_eq!(
+            external_config_receipt.compiled_translation_units,
+            ["kernels/marlin.cu"]
+        );
+        assert!(external_config_receipt
+            .cache_hit_translation_units
+            .is_empty());
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            8
+        );
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.invocation_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            16,
+            "each cache miss invokes one nvcc version probe and one compile; the full hit invokes zero"
+        );
+    }
+
+    #[test]
+    fn cuda_toolkit_manifest_accepts_internal_symlink_directories_and_rejects_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        let fake_cuda = write_fake_nvcc(root.path());
+        let internal_target = fake_cuda.root.join("targets/headers");
+        fs::create_dir_all(&internal_target).unwrap();
+        fs::write(internal_target.join("linked.h"), "#define LINKED 1\n").unwrap();
+        let internal_link = fake_cuda.root.join("include/linked");
+        symlink(&internal_target, &internal_link).unwrap();
+
+        let manifest = build_cuda_toolkit_manifest(&fake_cuda.root).unwrap();
+        assert!(manifest.entries.iter().any(|entry| {
+            entry.logical_path == "include/linked/linked.h"
+                && entry.resolved_path == "targets/headers/linked.h"
+        }));
+
+        fs::remove_file(&internal_link).unwrap();
+        symlink("/etc", &internal_link).unwrap();
+        let error = build_cuda_toolkit_manifest(&fake_cuda.root).unwrap_err();
+        assert!(error.to_string().contains("escapes its canonical root"));
+    }
+
+    #[test]
     fn bounded_fixture_build_writes_pass_receipt_and_archive_hash() {
         let root = tempfile::tempdir().unwrap();
         let (source_root, definition_path) = write_fixture(root.path());
         let plan_path = root.path().join("source-build.plan.json");
         lock_native_operator_source_definition(&definition_path, &source_root, &plan_path).unwrap();
         let output_dir = root.path().join("build");
-        let (fake_nvcc, compile_counter) = write_fake_nvcc(root.path());
+        let fake_cuda = write_fake_nvcc(root.path());
         let object_cache_dir = root.path().join("object-cache");
 
         let receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
@@ -2110,8 +4914,9 @@ mod tests {
             output_dir: output_dir.clone(),
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
-            nvcc_path: fake_nvcc.clone(),
-            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            nvcc_path: fake_cuda.nvcc.clone(),
+            cuda_toolkit_root: fake_cuda.root.clone(),
+            ccbin_path: fake_cuda.ccbin.clone(),
             ar_path: PathBuf::from("/usr/bin/ar"),
             nvcc_threads: 2,
             object_cache_dir: object_cache_dir.clone(),
@@ -2136,6 +4941,10 @@ mod tests {
                 fs::read_to_string(path).is_ok_and(|content| content.contains("execution-start"))
             })
         }));
+        let host_probe_count = fs::read_to_string(&fake_cuda.host_compiler_invocation_counter)
+            .unwrap()
+            .lines()
+            .count();
 
         let cached_output_dir = root.path().join("cached-build");
         let cached_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
@@ -2144,8 +4953,9 @@ mod tests {
             output_dir: cached_output_dir.clone(),
             compute_capability: "sm_89".to_string(),
             builder_sha: "8".repeat(40),
-            nvcc_path: fake_nvcc,
-            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            nvcc_path: fake_cuda.nvcc.clone(),
+            cuda_toolkit_root: fake_cuda.root.clone(),
+            ccbin_path: fake_cuda.ccbin.clone(),
             ar_path: PathBuf::from("/usr/bin/ar"),
             nvcc_threads: 8,
             object_cache_dir,
@@ -2164,8 +4974,35 @@ mod tests {
             Some(NativeOperatorSourceObjectCacheStatus::Hit)
         );
         assert_eq!(
-            fs::read_to_string(compile_counter).unwrap().lines().count(),
+            cached_receipt.commands[0].dependency_validation,
+            Some(NativeOperatorDependencyValidation::CacheProof)
+        );
+        assert!(cached_receipt.commands[0]
+            .depfile
+            .as_deref()
+            .is_some_and(|relative| cached_output_dir.join(relative).is_file()));
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
             1
+        );
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.invocation_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "cold build invokes one miss-only version probe plus one compile; full cache hit invokes neither"
+        );
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.host_compiler_invocation_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            host_probe_count + 2,
+            "full cache hit runs only the bounded include/driver configuration probes"
         );
         assert_eq!(
             receipt.archive_sha256, cached_receipt.archive_sha256,
@@ -2222,9 +5059,9 @@ mod tests {
         let package_receipt =
             crate::package_native_operator(&crate::NativeOperatorPackageRequest {
                 spec_path: package_spec_path,
-                source_root,
+                source_root: source_root.clone(),
                 source_build_receipt_path: output_dir.join("source-build.receipt.json"),
-                source_build_plan_path: plan_path,
+                source_build_plan_path: plan_path.clone(),
                 g03_catalog_path: catalog_path,
                 abi_contract_path: abi_path,
                 output_dir: package_output.clone(),
@@ -2242,6 +5079,28 @@ mod tests {
             receipt.archive_sha256.unwrap()
         );
         assert!(package_output.join("package.receipt.json").is_file());
+
+        let cached_package_spec_path = root.path().join("cached-package-spec.json");
+        write_json(&cached_package_spec_path, &package_spec).unwrap();
+        let cached_package_output = root.path().join("cached-package");
+        crate::package_native_operator(&crate::NativeOperatorPackageRequest {
+            spec_path: cached_package_spec_path,
+            source_root,
+            source_build_receipt_path: cached_output_dir.join("source-build.receipt.json"),
+            source_build_plan_path: plan_path,
+            g03_catalog_path: root.path().join("operation-catalog.json"),
+            abi_contract_path: root.path().join("native-abi.json"),
+            output_dir: cached_package_output.clone(),
+            cc: PathBuf::from("/usr/bin/cc"),
+            ar: PathBuf::from("/usr/bin/ar"),
+        })
+        .unwrap();
+        let cached_manifest: ferrum_types::NativeOperatorManifest =
+            read_json(&cached_package_output.join("native_operator_manifest.json")).unwrap();
+        assert_eq!(
+            cached_manifest.build_summary.nvcc_version.as_deref(),
+            Some("cuda-toolkit-static 12.4.0")
+        );
     }
 
     #[test]
@@ -2258,12 +5117,22 @@ mod tests {
             "kernels/marlin.cu".to_string(),
             "kernels/other.cu".to_string(),
         ];
+        source_definition.dependency_closures = vec![
+            NativeOperatorTranslationUnitDependencies {
+                translation_unit: "kernels/marlin.cu".to_string(),
+                headers: vec!["kernels/marlin.h".to_string()],
+            },
+            NativeOperatorTranslationUnitDependencies {
+                translation_unit: "kernels/other.cu".to_string(),
+                headers: Vec::new(),
+            },
+        ];
         let definition_path = root.path().join("two-tu-definition.json");
         write_json(&definition_path, &source_definition).unwrap();
         let first_plan_path = root.path().join("first.plan.json");
         lock_native_operator_source_definition(&definition_path, &source_root, &first_plan_path)
             .unwrap();
-        let (fake_nvcc, compile_counter) = write_fake_nvcc(root.path());
+        let fake_cuda = write_fake_nvcc(root.path());
         let object_cache_dir = root.path().join("object-cache");
 
         let first_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
@@ -2272,8 +5141,9 @@ mod tests {
             output_dir: root.path().join("first-build"),
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
-            nvcc_path: fake_nvcc.clone(),
-            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            nvcc_path: fake_cuda.nvcc.clone(),
+            cuda_toolkit_root: fake_cuda.root.clone(),
+            ccbin_path: fake_cuda.ccbin.clone(),
             ar_path: PathBuf::from("/usr/bin/ar"),
             nvcc_threads: 2,
             object_cache_dir: object_cache_dir.clone(),
@@ -2293,15 +5163,16 @@ mod tests {
             .unwrap();
         let second_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
             plan_path: second_plan_path,
-            source_root,
+            source_root: source_root.clone(),
             output_dir: root.path().join("second-build"),
             compute_capability: "sm_89".to_string(),
             builder_sha: "8".repeat(40),
-            nvcc_path: fake_nvcc,
-            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            nvcc_path: fake_cuda.nvcc.clone(),
+            cuda_toolkit_root: fake_cuda.root.clone(),
+            ccbin_path: fake_cuda.ccbin.clone(),
             ar_path: PathBuf::from("/usr/bin/ar"),
             nvcc_threads: 4,
-            object_cache_dir,
+            object_cache_dir: object_cache_dir.clone(),
             plan_only: false,
         })
         .unwrap();
@@ -2315,8 +5186,47 @@ mod tests {
             ["kernels/marlin.cu"]
         );
         assert_eq!(
-            fs::read_to_string(compile_counter).unwrap().lines().count(),
+            fs::read_to_string(&fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
             3
+        );
+
+        fs::write(source_root.join("kernels/marlin.h"), "#define MARLIN 2\n").unwrap();
+        let third_plan_path = root.path().join("third.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &third_plan_path)
+            .unwrap();
+        let third_receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+            plan_path: third_plan_path,
+            source_root,
+            output_dir: root.path().join("third-build"),
+            compute_capability: "sm_89".to_string(),
+            builder_sha: "9".repeat(40),
+            nvcc_path: fake_cuda.nvcc,
+            cuda_toolkit_root: fake_cuda.root,
+            ccbin_path: fake_cuda.ccbin.clone(),
+            ar_path: PathBuf::from("/usr/bin/ar"),
+            nvcc_threads: 4,
+            object_cache_dir,
+            plan_only: false,
+        })
+        .unwrap();
+        assert_eq!(
+            third_receipt.compiled_translation_units,
+            ["kernels/marlin.cu"]
+        );
+        assert_eq!(
+            third_receipt.cache_hit_translation_units,
+            ["kernels/other.cu"]
+        );
+        assert_eq!(
+            fs::read_to_string(fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            4,
+            "private header drift must recompile only its owning translation unit"
         );
     }
 }
