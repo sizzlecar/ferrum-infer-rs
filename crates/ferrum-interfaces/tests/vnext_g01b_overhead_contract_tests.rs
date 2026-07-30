@@ -225,6 +225,10 @@ fn overhead_ratio(measured: &[f64], baseline: &[f64]) -> Vec<f64> {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only performance contract enforced by the G01B gate"
+)]
 fn g01b_preselected_provider_and_event_sink_overhead_are_bounded() {
     let fixture = journal_fixture();
     assert!(fixture.journal.len() > 32);
