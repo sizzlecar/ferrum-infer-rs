@@ -240,6 +240,17 @@ workspace source gate 和 canonical validator，CUDA 主模型工作继续剩余
 historical `7*3 -> 21` 文件只保留作 raw-logits attribution，不再冒充当前 C13 replay；
 禁止输出过滤、模型名特判、降低 C13 oracle 或因单个失败重跑全量。
 
+2026-07-30 的后续 G07A fixed-host diagnostic 已在 clean pushed source
+`9e68055481b8ade0f3e9600e202e814414a48fbc` 上证明 profile 分层修复：
+no-op 为 `0.819575s`，Rust model leaf 为 `7.079652s`，两者均使用
+`cuda-correctness`，native TU 重编数均为 `0`；正式 clean release 仍绑定
+`--release`。完整 GitHub asset `495338367` 的 SHA256
+`eb2fe227492ca146cd322d88d1ffff00bd1d2e5bf9fc40a0b76abea31a34e722`
+已在本机复验。该结果是 focused `KEEP`，不是五样本 p95 或 G07A PASS。
+bootstrap 与首次 prewarm 重复使用两个冷 target 的问题也已收敛为共享声明式
+correctness target，待下一轮 diagnostic 验证后再进入 canonical matrix。实例
+`46247151` 已停止到 `actual_status=exited`，当前 potentially billable 实例数为 `0`。
+
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是
 `G03 weight ABI/fidelity contract -> G08B M2 CUDA current-HEAD correctness -> G09
