@@ -43,6 +43,9 @@ COLLECTOR_RELATIVE_PATH = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
 SCHEMA_VERSION = 4
 TELEMETRY_SCHEMA_VERSION = 2
 GPU_TELEMETRY_POLICY = "single_persistent_process"
+CORRECTNESS_RUN_THINKING_ARGS = ("--disable-thinking",)
+CORRECTNESS_BENCH_THINKING_ARGS = ("--enable-thinking", "false")
+CORRECTNESS_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTOR SELFTEST PASS"
 COLLECTED_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTED"
 NATIVE_OPERATOR_SET_SNAPSHOT_DIR = "native-operator-set"
@@ -596,8 +599,8 @@ def served_model_id(models: dict[str, Any]) -> str:
     return model_id
 
 
-def collect_stream(port: int, model_id: str, directory: Path) -> None:
-    request = {
+def correctness_stream_request(model_id: str) -> dict[str, Any]:
+    return {
         "model": model_id,
         "messages": [
             {
@@ -609,7 +612,12 @@ def collect_stream(port: int, model_id: str, directory: Path) -> None:
         "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
+        "chat_template_kwargs": dict(CORRECTNESS_CHAT_TEMPLATE_KWARGS),
     }
+
+
+def collect_stream(port: int, model_id: str, directory: Path) -> None:
+    request = correctness_stream_request(model_id)
     write_json(directory / "request.json", request)
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=300.0)
     body = json.dumps(request, separators=(",", ":"))
@@ -699,6 +707,7 @@ def collect_correctness(
         "Respond with only the city name: What is the capital of France?",
         "--max-tokens",
         "16",
+        *CORRECTNESS_RUN_THINKING_ARGS,
         "--output-format",
         "jsonl",
         "--profile-jsonl",
@@ -786,6 +795,7 @@ def collect_correctness(
             "1",
             "--n-repeats",
             "1",
+            *CORRECTNESS_BENCH_THINKING_ARGS,
             "--fail-on-error",
             "--seed",
             "9271",
@@ -1007,6 +1017,12 @@ def collect(args: argparse.Namespace) -> int:
             "telemetry_interval_ms": args.telemetry_interval_ms,
             "gpu_telemetry_policy": GPU_TELEMETRY_POLICY,
             "profile_health_after_bench": True,
+            "correctness_thinking_control": {
+                "run_args": list(CORRECTNESS_RUN_THINKING_ARGS),
+                "serve_chat_template_kwargs": CORRECTNESS_CHAT_TEMPLATE_KWARGS,
+                "bench_args": list(CORRECTNESS_BENCH_THINKING_ARGS),
+                "production_default_changed": False,
+            },
         },
     }
     write_json(out / "collection.json", collection)
@@ -1156,6 +1172,14 @@ def self_test() -> int:
             pass
         else:
             raise CollectionError(f"invalid served model catalog unexpectedly passed: {invalid_models}")
+    correctness_request = correctness_stream_request(advertised_model_id)
+    require(
+        CORRECTNESS_RUN_THINKING_ARGS == ("--disable-thinking",)
+        and CORRECTNESS_BENCH_THINKING_ARGS == ("--enable-thinking", "false")
+        and correctness_request.get("chat_template_kwargs")
+        == {"enable_thinking": False},
+        "deterministic correctness paths lost their typed thinking control",
+    )
 
     sample = (
         "0, GPU-1234, P2, 2520, 2520, 10501, 241.50, 450.00, 61, 97, 42, 8123, 24564\n"

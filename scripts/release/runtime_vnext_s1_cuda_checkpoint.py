@@ -1347,6 +1347,10 @@ def validate_product_commands(root: Path) -> dict[str, Any]:
     require_option(run_tokens, "--profile-sample-rate", "1.0", "run")
     require("--profile-jsonl" in run_tokens, "run command lacks profile JSONL")
     require("--scheduler-trace-jsonl" in run_tokens, "run command lacks scheduler trace")
+    require(
+        "--disable-thinking" in run_tokens,
+        "run correctness command does not explicitly disable thinking",
+    )
 
     serve_tokens = command_tokens(root / "serve" / "command")
     require("serve" in serve_tokens, "serve command is not ferrum serve")
@@ -1359,12 +1363,18 @@ def validate_product_commands(root: Path) -> dict[str, Any]:
     require_option(serve_tokens, "--profile-sample-rate", "1.0", "serve")
     require("--profile-jsonl" in serve_tokens, "serve command lacks profile JSONL")
     require("--scheduler-trace-jsonl" in serve_tokens, "serve command lacks scheduler trace")
+    serve_request = read_json(root / "serve" / "request.json")
+    require(
+        serve_request.get("chat_template_kwargs") == {"enable_thinking": False},
+        "serve correctness request does not explicitly disable thinking",
+    )
 
     bench_tokens = command_tokens(root / "serve" / "bench.command")
     require("bench-serve" in bench_tokens, "serve smoke is not ferrum bench-serve")
     require("--fail-on-error" in bench_tokens, "serve smoke lacks --fail-on-error")
     require_option(bench_tokens, "--target-backend", "cuda", "serve smoke")
     require_option(bench_tokens, "--seed", "9271", "serve smoke")
+    require_option(bench_tokens, "--enable-thinking", "false", "serve smoke")
     return {
         "model_id": "Qwen/Qwen3.5-4B",
         "model_snapshot_path": run_model,
@@ -1945,6 +1955,67 @@ def create_selftest_fixture(root: Path) -> None:
     (root / "build.log").write_text("Finished release build\n")
     (root / "binary.sha256").write_text("b" * 64 + "  target/release/ferrum\n")
     (root / "hardware.csv").write_text("NVIDIA GeForce RTX 4090, 24564 MiB\n")
+    model = (
+        "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/"
+        f"snapshots/{'c' * 40}"
+    )
+    (root / "run" / "command").write_text(
+        shlex.join(
+            [
+                "target/release/ferrum",
+                "run",
+                model,
+                "--backend",
+                "cuda",
+                "--disable-thinking",
+                "--profile-detail",
+                "basic",
+                "--profile-sample-rate",
+                "1.0",
+                "--profile-jsonl",
+                "run/profile.jsonl",
+                "--scheduler-trace-jsonl",
+                "run/scheduler-trace.jsonl",
+            ]
+        )
+        + "\n"
+    )
+    (root / "serve" / "command").write_text(
+        shlex.join(
+            [
+                "target/release/ferrum",
+                "serve",
+                model,
+                "--backend",
+                "cuda",
+                "--profile-detail",
+                "basic",
+                "--profile-sample-rate",
+                "1.0",
+                "--profile-jsonl",
+                "serve/profile.jsonl",
+                "--scheduler-trace-jsonl",
+                "serve/scheduler-trace.jsonl",
+            ]
+        )
+        + "\n"
+    )
+    (root / "serve" / "bench.command").write_text(
+        shlex.join(
+            [
+                "target/release/ferrum",
+                "bench-serve",
+                "--target-backend",
+                "cuda",
+                "--seed",
+                "9271",
+                "--enable-thinking",
+                "false",
+                "--fail-on-error",
+            ]
+        )
+        + "\n"
+    )
     event_names = [
         "request_accepted",
         "plan_built",
@@ -1979,6 +2050,13 @@ def create_selftest_fixture(root: Path) -> None:
     (root / "serve" / "http.status").write_text("200")
     (root / "serve" / "health.json").write_text('{"status":"healthy"}\n')
     (root / "serve" / "models.json").write_text('{"data":[{"id":"model"}]}\n')
+    write_json(
+        root / "serve" / "request.json",
+        {
+            "model": "model",
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
     (root / "serve" / "stream.sse").write_text("data: chunk\n\ndata: [DONE]\n\n")
     write_jsonl(
         root / "serve" / "stream.data.jsonl",
@@ -2318,6 +2396,19 @@ def self_test() -> int:
         root = Path(temp)
         create_selftest_fixture(root)
         validate(root, "a" * 40)
+        validate_product_commands(root)
+        run_command = command_tokens(root / "run" / "command")
+        run_command.remove("--disable-thinking")
+        (root / "run" / "command").write_text(shlex.join(run_command) + "\n")
+        try:
+            validate_product_commands(root)
+        except ValidationError as error:
+            require(
+                "does not explicitly disable thinking" in str(error),
+                "thinking-control mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("missing run thinking control unexpectedly passed")
         rows = read_jsonl(root / "run" / "scheduler-trace.jsonl")
         operation = next(row for row in rows if row.get("phase") == "vnext.operation_submitted")
         del operation["attributes"]["provider_id"]
