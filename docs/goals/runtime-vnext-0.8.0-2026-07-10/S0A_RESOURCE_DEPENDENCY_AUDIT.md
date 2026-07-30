@@ -47,12 +47,16 @@ This cycle was not visible in a pairwise-only audit.
 | Backing chunk identity, segment projection, and free-extent index | `backing_extent` | This is the leaf owner for physical range translation and allocation journal rollback |
 | Logical backing evidence, authority, and views | `dynamic_pool` | These contracts bind allocated extents to request and invocation lifetimes |
 | Dynamic pool domain specification | `dynamic_pool` | Pool identity and membership are pool-owned facts |
+| Cross-pool growth, claim, reclaim and lane-stable arena orchestration | `dynamic_pool_set` | Depends on backing/pool contracts without making the lower-level pool owner depend on orchestration |
+| Program binding layout | `program_binding` | Immutable reusable-execution binding layout is compiled separately from pool lifecycle |
+| Dynamic pool maintenance API | `dynamic_pool_maintenance` | Pressure handling and retry policy consume the pool-set boundary without owning allocation state |
 | Core resource failure constructor and dispatch poison bit | `contracts` | Shared wire/state encoding with no higher-level owner dependency |
 | Step lease storage | `batch` | A step owns one exact continuous-batch frame and its participants |
 | Sequence slot/dispatch state machine | `sequence` | Sequence lifecycle owns the encoded slot and dispatch gate |
 | Sequence abort evidence and recovery registry | `recovery` | Recovery owns terminal abort evidence and abandoned stream state |
 | Request admission implementation | `sequence` | It creates the request root and is a consumer of the plan runtime binding |
 | Bound execution stream | `invocation` | Invocation dispatch owns stream activation and transfer to recovery |
+| Step admission and bound stream activation/synchronization | `execution_session` | Execution-session typestate consumes batch/invocation owners and remains the terminal dependency |
 | Static owned slots and borrowed buffer views | `static_lease` | These types are used exclusively by the static provisioning lease |
 
 No public resource path changed: the parent facade continues to re-export the public contracts.
@@ -60,7 +64,7 @@ Sibling-only implementation access uses `pub(super)` and does not widen the crat
 
 ## Final Result
 
-The final production graph contains seventeen modules and zero strongly connected components with
+The final production graph contains twenty-one modules and zero strongly connected components with
 more than one member:
 
 ```text
@@ -71,12 +75,19 @@ One valid dependencies-first topological order is:
 
 ```text
 contracts -> backing_extent -> capacity -> ledger -> work -> allocation -> dynamic_pool
--> runtime_driver -> static_lease -> provisioning -> plan_runtime -> recovery -> transaction
--> sequence -> static_initialization -> batch -> invocation
+-> program_binding -> dynamic_pool_set -> dynamic_pool_maintenance -> runtime_driver
+-> static_lease -> provisioning -> plan_runtime -> recovery -> transaction -> sequence
+-> static_initialization -> batch -> invocation -> execution_session
 ```
 
 This order is evidence that the graph is acyclic, not a requirement that unrelated modules share
 one linear architectural layer.
+
+The 2026-07-31 split deliberately uses peer `mod` owners rather than nested files. Logical backing
+evidence remains in `dynamic_pool`; `dynamic_pool_set` imports it and never exports a dependency
+back into the lower-level owner. Likewise, `execution_session` consumes `invocation`; invocation
+does not consume session typestate. This keeps both new edges one-way and makes every source owner
+visible to the canonical inventory.
 
 ## Bounded Validation
 
@@ -84,8 +95,9 @@ The following validations passed after the ownership corrections:
 
 ```text
 CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
-RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2
-  66 passed; 0 failed
+RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --lib \
+  vnext::resource:: -- --test-threads=1
+  92 passed; 0 failed
 RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --test vnext_resource_capacity_contract_tests \
   --test vnext_resource_transaction_lifecycle_tests \

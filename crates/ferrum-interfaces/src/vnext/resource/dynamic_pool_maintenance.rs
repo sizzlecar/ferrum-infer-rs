@@ -1,9 +1,9 @@
-use super::dynamic_pool::{DynamicDeviceCapacityBlocked, DynamicPoolGrowthIntent, DynamicPoolSet};
+use super::dynamic_pool::{DynamicDeviceCapacityBlocked, DynamicPoolGrowthIntent};
 use super::{
     invalid_resource, AdmissionDeferred, CapacityEpochs, CapacityVector, CapacityWaitCondition,
     DeviceRuntime, DynamicBackingBlocker, DynamicBackingDeferred, DynamicBackingPoolId,
     DynamicChunkQuarantineReason, DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthReceipt,
-    DynamicPoolGrowthRequest, DynamicPoolStatus, VNextError,
+    DynamicPoolGrowthRequest, DynamicPoolSet, DynamicPoolStatus, VNextError,
 };
 use crate::vnext::{
     CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DynamicBackingPressure,

@@ -29,21 +29,22 @@
 - Pre-split event logical lines: `4,893`
 - Pre-split event SHA256:
   `aac28b3bdadf16f15ebcab71ec72d3bab62c3cc28f9b18893c8b8b053c50edcb`
-- Repository inventory: `docs/release/cleanup/20260714-inventory.md`
+- Repository inventory:
+  `docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md`
 - Inventory SHA256:
-  `6cce246fc3f62ec058498bdb0a825613d47abaf327fcf8a698c59ece41c79190`
+  `74877fe125242d7044c7381d9c52725683a81ed0a7eccb30b66dfd9078c92f50`
 - Inventory validator result:
-  `INVENTORY PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/cleanup/20260714-inventory.md`
+  `INVENTORY PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md`
 
 Before module visibility changed, the 13 initial physical fragments concatenated byte-for-byte with the
 original seven-line test-module tail to the pre-split SHA256. The validated implementation now
-uses real child `mod` declarations and facade `pub use` exports; it does not use `include!`.
+uses real `mod` declarations and facade `pub use` exports; it does not use `include!`.
 Unchanged public paths remain available through the facades. Nine deliberate post-split semantic
 changes are recorded in `S0A_PUBLIC_API_MIGRATIONS.json`; the owner audit rejects an absent target,
 an unexplained removal, a redundant migration, or any added-item digest drift. Cross-owner
 implementation details that were implicitly shared by the giant module are explicitly limited to
 the `vnext::resource` parent with `pub(super)`, so they do not become crate-public API. All current
-production owners use explicit symbol imports. Resource normalization now has 17 production owners
+production owners use explicit symbol imports. Resource normalization now has 21 production owners
 and the complete symbol graph has zero multi-module strongly connected components. The transition
 is recorded in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.
 
@@ -67,28 +68,32 @@ recorded in `S0A_EXECUTION_DEPENDENCY_AUDIT.md`.
 
 | Current owner | Lines | Primary responsibility |
 |---|---:|---|
-| `resource/contracts.rs` | 564 | Base identifiers, descriptors, shared error/state encodings and reservation contracts |
+| `resource/contracts.rs` | 565 | Base identifiers, descriptors, shared error/state encodings and reservation contracts |
 | `resource/backing_extent.rs` | 434 | Backing chunk/segment identity, range projection, free-extent indexes, allocation and rollback |
 | `resource/capacity.rs` | 634 | Device capacity authority, accounting, epochs and process-wide claims |
-| `resource/provisioning.rs` | 355 | Static/elastic plan provisioning and admission construction |
+| `resource/provisioning.rs` | 356 | Static/elastic plan provisioning and admission construction |
 | `resource/allocation.rs` | 555 | Allocation ownership and resource driver contracts |
 | `resource/ledger.rs` | 1,668 | Lease state, transition receipts, allocation ledger and receipt validation |
 | `resource/recovery.rs` | 348 | Abandoned-sequence recovery registry and terminal abort evidence |
-| `resource/dynamic_pool.rs` | 2,454 | Dynamic pool state, backing authority, growth/claim transactions, maintenance and quarantine |
+| `resource/dynamic_pool.rs` | 2,373 | Dynamic pool state, physical backing authority, extent claims and lane-stable primitives |
+| `resource/program_binding.rs` | 635 | Immutable reusable-execution binding layouts and projection checks |
+| `resource/dynamic_pool_set.rs` | 1,999 | Cross-pool growth, claim, reclaim, rebalance and backing-view orchestration |
+| `resource/dynamic_pool_maintenance.rs` | 621 | Pressure maintenance, wait/retry decisions and quarantine release |
 | `resource/runtime_driver.rs` | 185 | Dynamic runtime-driver binding and allocation bridge |
-| `resource/static_lease.rs` | 375 | Plan-static lease, owned slots, borrowed buffer views and typed admission requests |
-| `resource/work.rs` | 453 | Step/invocation work-shape admission requests and checked demand derivation |
-| `resource/plan_runtime.rs` | 1,418 | Plan runtime root, close state, capacity waits and pool coordination |
-| `resource/sequence.rs` | 1,750 | Request, sequence and session resource lifetime authorities |
-| `resource/static_initialization.rs` | 944 | Static resource initialization transaction and installation evidence |
-| `resource/batch.rs` | 1,531 | Batch participants, step ownership, physical invocation ledger and retirement |
-| `resource/invocation.rs` | 2,451 | Invocation leases, bound streams, retry authority and active-sequence permits |
+| `resource/static_lease.rs` | 424 | Plan-static lease, owned slots, borrowed buffer views and typed admission requests |
+| `resource/work.rs` | 465 | Step/invocation work-shape admission requests and checked demand derivation |
+| `resource/plan_runtime.rs` | 1,632 | Plan runtime root, close state, capacity waits and pool coordination |
+| `resource/sequence.rs` | 2,101 | Request, sequence and session resource lifetime authorities |
+| `resource/static_initialization.rs` | 1,141 | Static resource initialization transaction and installation evidence |
+| `resource/batch.rs` | 2,010 | Batch participants, step ownership, physical invocation ledger and retirement |
+| `resource/invocation.rs` | 2,455 | Invocation backing, submission-wave leases and definitely-not-submitted retry authority |
+| `resource/execution_session.rs` | 820 | Step admission plus bound stream activation, synchronization and terminal typestate |
 | `resource/transaction.rs` | 1,920 | Sealed transaction typestate, commit/rollback/release and compensation |
 
-`resource.rs` is now a 77-line facade. Every production owner is below the S0A `2,500`
-physical-line limit and the facade is below `500` physical lines. The largest owners are
-`dynamic_pool.rs` at 2,454 lines and `invocation.rs` at 2,451 lines; the gate records the exact
-offending path and line count if either bound regresses.
+`resource.rs` is now an 87-line facade. Every production owner is below the S0A `2,500`
+physical-line limit and the facade is below `500` physical lines. The largest owner is
+`invocation.rs` at 2,455 lines; the gate records the exact offending path and line count if the
+bound regresses.
 
 ## Execution Ownership Checkpoint
 
@@ -225,13 +230,13 @@ hidden nor multiplied by its consumer count.
 This split is not permission to simplify the resource model. The following owners and behavior
 must remain represented after S0B:
 
-- `capacity.rs`, `backing_extent.rs`, and `dynamic_pool.rs`: effective capacity is published only
+- `capacity.rs`, `backing_extent.rs`, `dynamic_pool.rs`, and `dynamic_pool_set.rs`: effective capacity is published only
   from installed, committed backing; extent rollback is journaled and growth/release advance
   monotonic epochs.
 - `work.rs`, `plan_runtime.rs`, and `transaction.rs`: no provider encode, prefill, or device submit
   is reachable before a committed lease; temporary pressure remains typed defer and permanent
   over-capacity remains typed impossible/reject.
-- `sequence.rs`, `batch.rs`, and `invocation.rs`: request/sequence/session/step/invocation
+- `sequence.rs`, `batch.rs`, `invocation.rs`, and `execution_session.rs`: request/sequence/session/step/invocation
   authorities retain exact lifetimes and non-empty participant identity.
 - `ledger.rs`, `recovery.rs`, and `invocation.rs`: possibly-submitted work retains ownership until
   a typed fence terminal; retry, compensation, release, recovery, and quarantine remain explicit.
@@ -244,8 +249,9 @@ The final resource graph is acyclic. One valid dependencies-first topological or
 
 ```text
 contracts -> backing_extent -> capacity -> ledger -> work -> allocation -> dynamic_pool
--> runtime_driver -> static_lease -> provisioning -> plan_runtime -> recovery -> transaction
--> sequence -> static_initialization -> batch -> invocation
+-> program_binding -> dynamic_pool_set -> dynamic_pool_maintenance -> runtime_driver
+-> static_lease -> provisioning -> plan_runtime -> recovery -> transaction -> sequence
+-> static_initialization -> batch -> invocation -> execution_session
 ```
 
 Rust module privacy now separates the owners, all newly shared internals are restricted to the
@@ -277,8 +283,8 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
    the module visibility/prelude additions and applying the same formatter.
 3. `cargo fmt --all -- --check` accepts the fragments and facade.
 4. `CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets` passes.
-5. `RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2`
-   passes `66/66` tests.
+5. `RUST_TEST_THREADS=1 cargo test -p ferrum-interfaces --lib vnext::resource:: -- --test-threads=1`
+   passes `92/92` tests.
 6. One bounded cargo invocation with the seven `vnext_resource_*` owner targets and
    `-- --test-threads=2` passes `12/12` parent tests, including the expected isolated panic-child
    fault case and all `311` frozen proof cases.
