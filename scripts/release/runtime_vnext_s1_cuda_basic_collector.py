@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import signal
+import shutil
 import statistics
 import subprocess
 import sys
@@ -28,8 +29,10 @@ from runtime_vnext_native_operator_set import (
     LOCK_FILE_NAME,
     NativeOperatorSetEvidenceError,
     create_selftest_native_operator_set,
+    cuda_native_build_cache_contract,
     cuda_build_inputs_hash,
     cuda_native_set_signature,
+    ensure_content_addressed_native_operator_set,
     public_identity as native_operator_set_public_identity,
     stage_native_operator_set,
     validate_cuda_build_summary,
@@ -52,6 +55,7 @@ NATIVE_OPERATOR_SET_SNAPSHOT_DIR = "native-operator-set"
 NATIVE_OPERATOR_SET_LOCK_SNAPSHOT = (
     f"{NATIVE_OPERATOR_SET_SNAPSHOT_DIR}/{LOCK_FILE_NAME}"
 )
+NATIVE_OPERATOR_BUILD_CACHE_DIR = "ferrum-native-operator-set-cache"
 CUDA_BUILD_SUMMARY_RECEIPT = "cuda-build-summary.receipt.json"
 REQUIRED_CUDA_NATIVE_OPERATORS = (
     "ferrum.cuda.marlin",
@@ -72,6 +76,9 @@ REQUIRED_CUDA_NATIVE_BUILD_UNITS = (
         "vllm_paged_attention_v2",
         "ferrum.cuda.vllm_paged_attention_v2",
     ),
+)
+CUDA_NATIVE_BUILD_CACHE_CONTRACT = cuda_native_build_cache_contract(
+    REQUIRED_CUDA_NATIVE_BUILD_UNITS
 )
 SLOT_ORDER = (
     "off1",
@@ -969,15 +976,30 @@ def collect(args: argparse.Namespace) -> int:
     require(not dirty, "collector requires a clean source worktree")
     out.mkdir(parents=True)
     source_native_lock = args.native_operator_set_lock.expanduser().absolute()
+    build_native_lock, build_native_set, build_cache_key, build_cache_reused = (
+        ensure_content_addressed_native_operator_set(
+            source_native_lock,
+            repo / "target" / NATIVE_OPERATOR_BUILD_CACHE_DIR,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+            CUDA_NATIVE_BUILD_CACHE_CONTRACT,
+        )
+    )
     staged_native_lock, staged_native_set = stage_native_operator_set(
-        source_native_lock,
+        build_native_lock,
         out / NATIVE_OPERATOR_SET_SNAPSHOT_DIR,
         REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    require(
+        native_operator_set_public_identity(staged_native_set)
+        == native_operator_set_public_identity(build_native_set),
+        "portable native operator snapshot differs from the build cache entry",
     )
     native_lock_identity = {
         "source_input_path": str(source_native_lock),
         "staged_lock_path": NATIVE_OPERATOR_SET_LOCK_SNAPSHOT,
-        "build_lock_path": str(staged_native_lock),
+        "build_lock_path": str(build_native_lock),
+        "build_cache_key": build_cache_key,
+        "build_cache_reused": build_cache_reused,
         **native_operator_set_public_identity(staged_native_set),
     }
     environment = product_environment()
@@ -1030,16 +1052,30 @@ def collect(args: argparse.Namespace) -> int:
 
     build_environment = dict(environment)
     build_environment["CARGO_BUILD_JOBS"] = "8"
-    build_environment["FERRUM_NATIVE_OPERATOR_SET_LOCK"] = str(staged_native_lock)
-    cuda_build_summary = out / CUDA_BUILD_SUMMARY_RECEIPT
-    build_environment["FERRUM_CUDA_BUILD_SUMMARY_RECEIPT"] = str(cuda_build_summary)
+    build_environment["FERRUM_NATIVE_OPERATOR_SET_LOCK"] = str(build_native_lock)
+    cuda_build_summary = build_native_lock.parent / CUDA_BUILD_SUMMARY_RECEIPT
+    summary_before_build: tuple[str, int] | None = None
+    if cuda_build_summary.exists() or cuda_build_summary.is_symlink():
+        validated_before = validate_cuda_build_summary(
+            cuda_build_summary,
+            str(build_native_lock),
+            build_native_set,
+            REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+        )
+        summary_before_build = (
+            validated_before["sha256"],
+            cuda_build_summary.stat().st_mtime_ns,
+        )
+    build_environment["FERRUM_CUDA_BUILD_SUMMARY_RECEIPT"] = str(
+        cuda_build_summary
+    )
     write_command(
         out / "build.command",
         list(BUILD_ARGV),
         {
             "CARGO_BUILD_JOBS": "8",
             "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT": str(cuda_build_summary),
-            "FERRUM_NATIVE_OPERATOR_SET_LOCK": str(staged_native_lock),
+            "FERRUM_NATIVE_OPERATOR_SET_LOCK": str(build_native_lock),
         },
     )
     write_text(out / "build.started", now_iso() + "\n")
@@ -1057,24 +1093,45 @@ def collect(args: argparse.Namespace) -> int:
     write_text(out / "build.finished", now_iso() + "\n")
     require(build.returncode == 0, f"CUDA release build failed: {out / 'build.log'}")
     lock_identity_after_build = validate_native_operator_set(
-        staged_native_lock,
+        build_native_lock,
         REQUIRED_CUDA_NATIVE_OPERATORS,
     )
     require(
         native_operator_set_public_identity(lock_identity_after_build)
-        == native_operator_set_public_identity(staged_native_set),
-        "staged native operator set closure changed during the CUDA build",
+        == native_operator_set_public_identity(build_native_set),
+        "cached native operator set closure changed during the CUDA build",
     )
     validated_build_summary = validate_cuda_build_summary(
         cuda_build_summary,
-        str(staged_native_lock),
+        str(build_native_lock),
+        build_native_set,
+        REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+    )
+    receipt_reused = (
+        summary_before_build is not None
+        and summary_before_build
+        == (
+            validated_build_summary["sha256"],
+            cuda_build_summary.stat().st_mtime_ns,
+        )
+    )
+    summary_snapshot = out / CUDA_BUILD_SUMMARY_RECEIPT
+    shutil.copy2(cuda_build_summary, summary_snapshot)
+    validated_snapshot = validate_cuda_build_summary(
+        summary_snapshot,
+        str(build_native_lock),
         staged_native_set,
         REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+    )
+    require(
+        validated_snapshot == validated_build_summary,
+        "portable CUDA build summary differs from the build-cache receipt",
     )
     collection["cuda_build_summary_receipt"] = {
         "build_path": str(cuda_build_summary),
         "snapshot_path": CUDA_BUILD_SUMMARY_RECEIPT,
-        **validated_build_summary,
+        "receipt_reused": receipt_reused,
+        **validated_snapshot,
         "native_operator_set_lock_sha256": staged_native_set["lock_sha256"],
         "native_operator_set_closure_sha256": staged_native_set["closure"][
             "index_sha256"
@@ -1256,8 +1313,37 @@ def self_test() -> int:
             source_root,
             REQUIRED_CUDA_NATIVE_OPERATORS,
         )
+        cached_lock, cached, cache_key, cache_reused = (
+            ensure_content_addressed_native_operator_set(
+                lock,
+                root / NATIVE_OPERATOR_BUILD_CACHE_DIR,
+                REQUIRED_CUDA_NATIVE_OPERATORS,
+                CUDA_NATIVE_BUILD_CACHE_CONTRACT,
+            )
+        )
+        require(
+            not cache_reused
+            and cached_lock.parent.name == cache_key,
+            "first native operator build-cache publication was not content addressed",
+        )
+        cached_lock_again, cached_again, cache_key_again, cache_reused_again = (
+            ensure_content_addressed_native_operator_set(
+                lock,
+                root / NATIVE_OPERATOR_BUILD_CACHE_DIR,
+                REQUIRED_CUDA_NATIVE_OPERATORS,
+                CUDA_NATIVE_BUILD_CACHE_CONTRACT,
+            )
+        )
+        require(
+            cache_reused_again
+            and cached_lock_again == cached_lock
+            and cache_key_again == cache_key
+            and native_operator_set_public_identity(cached_again)
+            == native_operator_set_public_identity(cached),
+            "native operator build cache did not reuse an identical closure",
+        )
         staged_lock, staged = stage_native_operator_set(
-            lock,
+            cached_lock,
             root / "staged",
             REQUIRED_CUDA_NATIVE_OPERATORS,
         )
@@ -1267,10 +1353,10 @@ def self_test() -> int:
             >= len(REQUIRED_CUDA_NATIVE_OPERATORS) * 9,
             "native operator set staging self-test lost its closure",
         )
-        summary = root / CUDA_BUILD_SUMMARY_RECEIPT
+        summary = cached_lock.parent / CUDA_BUILD_SUMMARY_RECEIPT
         set_signature = cuda_native_set_signature(
-            str(staged_lock),
-            staged,
+            str(cached_lock),
+            cached,
             REQUIRED_CUDA_NATIVE_BUILD_UNITS,
         )
         native_units = {
@@ -1307,8 +1393,8 @@ def self_test() -> int:
         )
         validate_cuda_build_summary(
             summary,
-            str(staged_lock),
-            staged,
+            str(cached_lock),
+            cached,
             REQUIRED_CUDA_NATIVE_BUILD_UNITS,
         )
 
@@ -1352,8 +1438,8 @@ def self_test() -> int:
         try:
             validate_cuda_build_summary(
                 summary,
-                str(staged_lock),
-                staged,
+                str(cached_lock),
+                cached,
                 REQUIRED_CUDA_NATIVE_BUILD_UNITS,
             )
         except NativeOperatorSetEvidenceError as error:
@@ -1377,6 +1463,22 @@ def self_test() -> int:
             )
         else:
             raise CollectionError("mutated staged native closure unexpectedly passed")
+        cached_member = cached_lock.parent / cached["_members"][0]["path"]
+        cached_member.write_bytes(b"mutated cached closure\n")
+        try:
+            ensure_content_addressed_native_operator_set(
+                lock,
+                root / NATIVE_OPERATOR_BUILD_CACHE_DIR,
+                REQUIRED_CUDA_NATIVE_OPERATORS,
+                CUDA_NATIVE_BUILD_CACHE_CONTRACT,
+            )
+        except NativeOperatorSetEvidenceError as error:
+            require(
+                "mismatch" in str(error),
+                "mutated native build cache failed for the wrong reason",
+            )
+        else:
+            raise CollectionError("mutated native build cache unexpectedly passed")
     require(SHA256_RE.fullmatch(file_sha256(COLLECTOR_PATH)) is not None, "collector SHA is malformed")
     print(SELFTEST_PASS_LINE)
     return 0

@@ -9,6 +9,7 @@ import json
 import math
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -22,8 +23,11 @@ from runtime_vnext_native_operator_set import (
     LOCK_FILE_NAME,
     NativeOperatorSetEvidenceError,
     create_selftest_native_operator_set,
+    cuda_native_build_cache_contract,
     cuda_build_inputs_hash,
     cuda_native_set_signature,
+    ensure_content_addressed_native_operator_set,
+    native_operator_set_cache_key,
     public_identity as native_operator_set_public_identity,
     stage_native_operator_set,
     validate_cuda_build_summary,
@@ -99,6 +103,7 @@ NATIVE_OPERATOR_SET_SNAPSHOT_DIR = "native-operator-set"
 NATIVE_OPERATOR_SET_LOCK_SNAPSHOT = (
     f"{NATIVE_OPERATOR_SET_SNAPSHOT_DIR}/{LOCK_FILE_NAME}"
 )
+NATIVE_OPERATOR_BUILD_CACHE_DIR = "ferrum-native-operator-set-cache"
 CUDA_BUILD_SUMMARY_RECEIPT = "cuda-build-summary.receipt.json"
 REQUIRED_CUDA_NATIVE_OPERATORS = (
     "ferrum.cuda.marlin",
@@ -119,6 +124,9 @@ REQUIRED_CUDA_NATIVE_BUILD_UNITS = (
         "vllm_paged_attention_v2",
         "ferrum.cuda.vllm_paged_attention_v2",
     ),
+)
+CUDA_NATIVE_BUILD_CACHE_CONTRACT = cuda_native_build_cache_contract(
+    REQUIRED_CUDA_NATIVE_BUILD_UNITS
 )
 EXPECTED_CUDA_BUILD_ARGV = (
     "cargo",
@@ -564,6 +572,8 @@ def validate_native_operator_build_contract(
             "source_input_path",
             "staged_lock_path",
             "build_lock_path",
+            "build_cache_key",
+            "build_cache_reused",
             "lock_sha256",
             "lock_size_bytes",
             "schema_version",
@@ -580,7 +590,8 @@ def validate_native_operator_build_contract(
         isinstance(source_input_path, str)
         and Path(source_input_path).is_absolute()
         and isinstance(build_lock_path, str)
-        and Path(build_lock_path).is_absolute(),
+        and Path(build_lock_path).is_absolute()
+        and isinstance(lock_ref.get("build_cache_reused"), bool),
         "collection native operator set source/build paths are not absolute",
     )
     require(
@@ -591,11 +602,6 @@ def validate_native_operator_build_contract(
     )
     staged_relative = Path(NATIVE_OPERATOR_SET_LOCK_SNAPSHOT)
     build_path = Path(build_lock_path)
-    require(
-        tuple(build_path.parts[-len(staged_relative.parts) :])
-        == staged_relative.parts,
-        "collection build lock path does not point at the staged closure",
-    )
     lock_path = root / staged_relative
     try:
         validated_native_set = validate_native_operator_set(
@@ -621,6 +627,17 @@ def validate_native_operator_build_contract(
         == expected_native_identity,
         "collection staged native operator set closure identity mismatch",
     )
+    expected_cache_key = native_operator_set_cache_key(
+        validated_native_set,
+        CUDA_NATIVE_BUILD_CACHE_CONTRACT,
+    )
+    require(
+        lock_ref.get("build_cache_key") == expected_cache_key
+        and build_path.name == LOCK_FILE_NAME
+        and build_path.parent.name == expected_cache_key
+        and build_path.parent.parent.name == NATIVE_OPERATOR_BUILD_CACHE_DIR,
+        "collection build lock path is not bound to the content-addressed native cache",
+    )
 
     summary_ref = collection.get("cuda_build_summary_receipt")
     require(isinstance(summary_ref, dict), "collection CUDA build summary receipt is missing")
@@ -629,6 +646,7 @@ def validate_native_operator_build_contract(
         == {
             "build_path",
             "snapshot_path",
+            "receipt_reused",
             "sha256",
             "size_bytes",
             "row_count",
@@ -643,13 +661,14 @@ def validate_native_operator_build_contract(
     require(
         isinstance(build_summary_path, str)
         and Path(build_summary_path).is_absolute()
+        and isinstance(summary_ref.get("receipt_reused"), bool)
         and summary_ref.get("snapshot_path") == CUDA_BUILD_SUMMARY_RECEIPT
         and summary_ref.get("native_operator_artifact_set_status") == "linked",
         "collection CUDA build summary receipt identity drifted",
     )
     require(
-        Path(build_summary_path).parent / staged_relative == build_path,
-        "collection build summary and staged native lock do not share the raw artifact root",
+        Path(build_summary_path) == build_path.parent / CUDA_BUILD_SUMMARY_RECEIPT,
+        "collection build summary is not colocated with its content-addressed native lock",
     )
     summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
     require(
@@ -2313,19 +2332,27 @@ def create_native_build_contract_selftest_fixture(root: Path) -> dict[str, Any]:
         root / "external-source",
         REQUIRED_CUDA_NATIVE_OPERATORS,
     )
+    build_lock, build_native_set, build_cache_key, build_cache_reused = (
+        ensure_content_addressed_native_operator_set(
+            source_lock,
+            root / "target" / NATIVE_OPERATOR_BUILD_CACHE_DIR,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+            CUDA_NATIVE_BUILD_CACHE_CONTRACT,
+        )
+    )
     staged_lock, staged = stage_native_operator_set(
-        source_lock,
+        build_lock,
         root / NATIVE_OPERATOR_SET_SNAPSHOT_DIR,
         REQUIRED_CUDA_NATIVE_OPERATORS,
     )
-    summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
+    build_summary_path = build_lock.parent / CUDA_BUILD_SUMMARY_RECEIPT
     set_signature = cuda_native_set_signature(
-        str(staged_lock),
-        staged,
+        str(build_lock),
+        build_native_set,
         REQUIRED_CUDA_NATIVE_BUILD_UNITS,
     )
     write_json(
-        summary_path,
+        build_summary_path,
         {
             "schema_version": 1,
             "artifact_type": "ferrum_cuda_build_summary_receipt",
@@ -2353,18 +2380,30 @@ def create_native_build_contract_selftest_fixture(root: Path) -> dict[str, Any]:
         },
     )
     validated_summary = validate_cuda_build_summary(
+        build_summary_path,
+        str(build_lock),
+        build_native_set,
+        REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+    )
+    summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
+    shutil.copy2(build_summary_path, summary_path)
+    validated_snapshot = validate_cuda_build_summary(
         summary_path,
-        str(staged_lock),
+        str(build_lock),
         staged,
         REQUIRED_CUDA_NATIVE_BUILD_UNITS,
     )
-    build_path = str(summary_path.resolve())
+    require(
+        validated_snapshot == validated_summary,
+        "native build contract fixture snapshot differs from its cached receipt",
+    )
+    build_path = str(build_summary_path.resolve())
     (root / "build.command").write_text(
         shlex.join(
             [
                 "CARGO_BUILD_JOBS=8",
                 f"FERRUM_CUDA_BUILD_SUMMARY_RECEIPT={build_path}",
-                f"FERRUM_NATIVE_OPERATOR_SET_LOCK={staged_lock}",
+                f"FERRUM_NATIVE_OPERATOR_SET_LOCK={build_lock}",
                 *EXPECTED_CUDA_BUILD_ARGV,
             ]
         )
@@ -2376,13 +2415,16 @@ def create_native_build_contract_selftest_fixture(root: Path) -> dict[str, Any]:
         "native_operator_set_lock": {
             "source_input_path": str(source_lock),
             "staged_lock_path": NATIVE_OPERATOR_SET_LOCK_SNAPSHOT,
-            "build_lock_path": str(staged_lock),
+            "build_lock_path": str(build_lock),
+            "build_cache_key": build_cache_key,
+            "build_cache_reused": build_cache_reused,
             **native_operator_set_public_identity(staged),
         },
         "cuda_build_summary_receipt": {
             "build_path": build_path,
             "snapshot_path": CUDA_BUILD_SUMMARY_RECEIPT,
-            **validated_summary,
+            "receipt_reused": False,
+            **validated_snapshot,
             "native_operator_set_lock_sha256": staged["lock_sha256"],
             "native_operator_set_closure_sha256": staged["closure"][
                 "index_sha256"
@@ -2502,6 +2544,25 @@ def self_test() -> int:
             native["operators"] == sorted(REQUIRED_CUDA_NATIVE_OPERATORS),
             "native build contract self-test lost operators",
         )
+        expected_cache_key = collection["native_operator_set_lock"][
+            "build_cache_key"
+        ]
+        collection["native_operator_set_lock"]["build_cache_key"] = "0" * 64
+        try:
+            validate_native_operator_build_contract(
+                root,
+                collection,
+            )
+        except ValidationError as error:
+            require(
+                "content-addressed native cache" in str(error),
+                "native cache-key mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("forged native build cache key unexpectedly passed")
+        collection["native_operator_set_lock"][
+            "build_cache_key"
+        ] = expected_cache_key
         summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
         summary = read_json(summary_path)
         summary["rows"][0]["status"] = "skipped"

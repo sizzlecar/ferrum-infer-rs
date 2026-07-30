@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -429,6 +431,31 @@ def public_identity(validated: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def cuda_native_build_cache_contract(
+    build_units: Iterable[tuple[str, str, str]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "artifact_type": "ferrum_cuda_native_build_cache_contract",
+        "build_summary_schema_version": 1,
+        "build_units": [list(unit) for unit in build_units],
+    }
+
+
+def native_operator_set_cache_key(
+    validated: dict[str, Any],
+    cache_contract: dict[str, Any],
+) -> str:
+    return canonical_json_sha256(
+        {
+            "schema_version": 1,
+            "artifact_type": "ferrum_native_operator_set_build_cache_key",
+            "native_operator_set": public_identity(validated),
+            "cache_contract": cache_contract,
+        }
+    )
+
+
 def stage_native_operator_set(
     source_lock: Path,
     destination_root: Path,
@@ -472,6 +499,68 @@ def stage_native_operator_set(
         "staged native operator set closure differs from its source",
     )
     return staged_lock.resolve(), staged
+
+
+def ensure_content_addressed_native_operator_set(
+    source_lock: Path,
+    cache_root: Path,
+    required_operators: Iterable[str],
+    cache_contract: dict[str, Any],
+) -> tuple[Path, dict[str, Any], str, bool]:
+    operators = tuple(required_operators)
+    source = validate_native_operator_set(source_lock, operators)
+    cache_key = native_operator_set_cache_key(source, cache_contract)
+    root = _absolute_without_resolution(cache_root.expanduser())
+    require(
+        not root.is_symlink(),
+        f"native operator build cache root must not be a symlink: {root}",
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    require(
+        root.is_dir() and not root.is_symlink(),
+        f"native operator build cache root is not a directory: {root}",
+    )
+    destination = root / cache_key
+    cached_lock = destination / LOCK_FILE_NAME
+
+    if destination.exists() or destination.is_symlink():
+        require(
+            destination.is_dir() and not destination.is_symlink(),
+            f"native operator build cache entry is not a directory: {destination}",
+        )
+        cached = validate_native_operator_set(cached_lock, operators)
+        require(
+            public_identity(cached) == public_identity(source)
+            and cached["_members"] == source["_members"],
+            f"native operator build cache identity mismatch: {destination}",
+        )
+        return cached_lock.resolve(), cached, cache_key, True
+
+    temporary = root / f".{cache_key}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        staged_lock, staged = stage_native_operator_set(
+            source_lock,
+            temporary,
+            operators,
+        )
+        try:
+            temporary.rename(destination)
+        except OSError:
+            if not destination.is_dir() or destination.is_symlink():
+                raise
+            shutil.rmtree(temporary)
+        cached = validate_native_operator_set(cached_lock, operators)
+        require(
+            public_identity(cached) == public_identity(source)
+            and cached["_members"] == source["_members"]
+            and public_identity(cached) == public_identity(staged),
+            f"native operator build cache changed while it was published: {destination}",
+        )
+    except BaseException:
+        if temporary.exists() and not temporary.is_symlink():
+            shutil.rmtree(temporary)
+        raise
+    return cached_lock.resolve(), cached, cache_key, False
 
 
 def create_selftest_native_operator_set(
