@@ -7823,6 +7823,37 @@ def self_test() -> int:
             g07a_missing_semantic.stderr or g07a_missing_semantic.stdout,
         )
 
+        s1_out = (root / "vnext-s1-cuda-dry-run").resolve()
+        s1_raw = (root / "s1-raw").resolve()
+        s1 = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s1-cuda",
+                "--s1-artifact",
+                str(s1_raw),
+                "--out",
+                str(s1_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(s1.returncode == 0, s1.stderr or s1.stdout)
+        s1_manifest = json.loads((s1_out / "gate.manifest.json").read_text())
+        require_selftest(
+            s1_manifest["status"] == "dry-run"
+            and s1_manifest["lane"] == "vnext-s1-cuda"
+            and s1_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_s1_cuda_checkpoint.py",
+                str(s1_raw),
+                "--require-bounded-overhead",
+                "--out",
+                str(s1_out),
+            ],
+            s1_manifest,
+        )
+
         g00a_provenance_root = root / "vnext-g00a-provenance"
         g00a_lane = make_selftest_vnext_g00a_artifact(g00a_provenance_root)
         g00a_child_manifest = read_json_object(

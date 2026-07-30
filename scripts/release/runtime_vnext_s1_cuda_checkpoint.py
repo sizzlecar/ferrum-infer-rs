@@ -18,6 +18,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from runtime_vnext_native_operator_set import (
+    LOCK_FILE_NAME,
+    NativeOperatorSetEvidenceError,
+    create_selftest_native_operator_set,
+    cuda_build_inputs_hash,
+    cuda_native_set_signature,
+    public_identity as native_operator_set_public_identity,
+    stage_native_operator_set,
+    validate_cuda_build_summary,
+    validate_native_operator_set,
+)
+
 
 PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT PASS"
 BASIC_SLICE_PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS"
@@ -76,12 +88,49 @@ PROFILE_EXPECTED_EVENTS_PER_REQUEST = 399
 PROFILE_MAX_BYTES_PER_REQUEST = 1024 * 1024
 PROFILE_MAX_OVERHEAD = 0.02
 PROFILE_MAX_CV = 0.05
-COLLECTION_SCHEMA_VERSION = 3
-LEGACY_COLLECTION_SCHEMA_VERSION = 2
+COLLECTION_SCHEMA_VERSION = 4
+LEGACY_COLLECTION_SCHEMA_VERSIONS = (2, 3)
 TELEMETRY_SCHEMA_VERSION = 2
 LEGACY_TELEMETRY_SCHEMA_VERSION = 1
 GPU_TELEMETRY_POLICY = "single_persistent_process"
 COLLECTOR_RELATIVE_PATH = "scripts/release/runtime_vnext_s1_cuda_basic_collector.py"
+NATIVE_OPERATOR_SET_LOCK_SCHEMA_VERSION = 5
+NATIVE_OPERATOR_SET_SNAPSHOT_DIR = "native-operator-set"
+NATIVE_OPERATOR_SET_LOCK_SNAPSHOT = (
+    f"{NATIVE_OPERATOR_SET_SNAPSHOT_DIR}/{LOCK_FILE_NAME}"
+)
+CUDA_BUILD_SUMMARY_RECEIPT = "cuda-build-summary.receipt.json"
+REQUIRED_CUDA_NATIVE_OPERATORS = (
+    "ferrum.cuda.marlin",
+    "ferrum.cuda.vllm_marlin",
+    "ferrum.cuda.vllm_moe_marlin",
+    "ferrum.cuda.vllm_paged_attention_v2",
+)
+REQUIRED_CUDA_NATIVE_BUILD_UNITS = (
+    ("marlin", "marlin", "ferrum.cuda.marlin"),
+    ("vllm_marlin", "vllm_marlin", "ferrum.cuda.vllm_marlin"),
+    (
+        "vllm_moe_marlin",
+        "vllm_moe_marlin",
+        "ferrum.cuda.vllm_moe_marlin",
+    ),
+    (
+        "vllm_paged_attn",
+        "vllm_paged_attention_v2",
+        "ferrum.cuda.vllm_paged_attention_v2",
+    ),
+)
+EXPECTED_CUDA_BUILD_ARGV = (
+    "cargo",
+    "build",
+    "--release",
+    "-p",
+    "ferrum-cli",
+    "--bin",
+    "ferrum",
+    "--features",
+    "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
+)
 FIRST_HALF_PROFILE_SLOTS = PROFILE_SLOT_ORDER[:4]
 GPU_QUERY_FIELDS = (
     "index",
@@ -419,14 +468,18 @@ def validate_serve(root: Path) -> dict[str, Any]:
     return summary
 
 
-def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] | None:
+def validate_collection_manifest(
+    root: Path,
+    source_sha: str,
+) -> dict[str, Any] | None:
     path = root / "collection.json"
     if not path.exists():
         return None
     collection = read_json(path)
     collection_schema = collection.get("schema_version")
     require(
-        collection_schema in (LEGACY_COLLECTION_SCHEMA_VERSION, COLLECTION_SCHEMA_VERSION),
+        collection_schema
+        in (*LEGACY_COLLECTION_SCHEMA_VERSIONS, COLLECTION_SCHEMA_VERSION),
         "S1 collection schema version mismatch",
     )
     require(
@@ -479,7 +532,7 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
         isinstance(interval, int) and not isinstance(interval, bool) and 250 <= interval <= 1000,
         "collection telemetry interval is outside 250..1000 ms",
     )
-    if collection_schema == COLLECTION_SCHEMA_VERSION:
+    if collection_schema >= 3:
         require(
             protocol.get("gpu_telemetry_policy") == GPU_TELEMETRY_POLICY,
             "collection GPU telemetry process policy drifted",
@@ -489,7 +542,181 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
         runtime_env.get("hidden_ferrum_environment_overrides") == [],
         "collection used hidden Ferrum environment overrides",
     )
+    if collection_schema == COLLECTION_SCHEMA_VERSION:
+        collection["_validated_native_operator_build"] = (
+            validate_native_operator_build_contract(
+                root,
+                collection,
+            )
+        )
     return collection
+
+
+def validate_native_operator_build_contract(
+    root: Path,
+    collection: dict[str, Any],
+) -> dict[str, Any]:
+    lock_ref = collection.get("native_operator_set_lock")
+    require(isinstance(lock_ref, dict), "collection native operator set lock is missing")
+    require(
+        set(lock_ref)
+        == {
+            "source_input_path",
+            "staged_lock_path",
+            "build_lock_path",
+            "lock_sha256",
+            "lock_size_bytes",
+            "schema_version",
+            "g03_catalog_sha256",
+            "operators",
+            "binary_sha256_by_operator",
+            "closure",
+        },
+        "collection native operator set lock field set mismatch",
+    )
+    source_input_path = lock_ref.get("source_input_path")
+    build_lock_path = lock_ref.get("build_lock_path")
+    require(
+        isinstance(source_input_path, str)
+        and Path(source_input_path).is_absolute()
+        and isinstance(build_lock_path, str)
+        and Path(build_lock_path).is_absolute(),
+        "collection native operator set source/build paths are not absolute",
+    )
+    require(
+        lock_ref.get("staged_lock_path") == NATIVE_OPERATOR_SET_LOCK_SNAPSHOT
+        and lock_ref.get("schema_version") == NATIVE_OPERATOR_SET_LOCK_SCHEMA_VERSION
+        and lock_ref.get("operators") == sorted(REQUIRED_CUDA_NATIVE_OPERATORS),
+        "collection native operator set lock identity drifted",
+    )
+    staged_relative = Path(NATIVE_OPERATOR_SET_LOCK_SNAPSHOT)
+    build_path = Path(build_lock_path)
+    require(
+        tuple(build_path.parts[-len(staged_relative.parts) :])
+        == staged_relative.parts,
+        "collection build lock path does not point at the staged closure",
+    )
+    lock_path = root / staged_relative
+    try:
+        validated_native_set = validate_native_operator_set(
+            lock_path,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+    except NativeOperatorSetEvidenceError as error:
+        raise ValidationError(str(error)) from error
+    expected_native_identity = {
+        key: lock_ref[key]
+        for key in (
+            "lock_sha256",
+            "lock_size_bytes",
+            "schema_version",
+            "g03_catalog_sha256",
+            "operators",
+            "binary_sha256_by_operator",
+            "closure",
+        )
+    }
+    require(
+        native_operator_set_public_identity(validated_native_set)
+        == expected_native_identity,
+        "collection staged native operator set closure identity mismatch",
+    )
+
+    summary_ref = collection.get("cuda_build_summary_receipt")
+    require(isinstance(summary_ref, dict), "collection CUDA build summary receipt is missing")
+    require(
+        set(summary_ref)
+        == {
+            "build_path",
+            "snapshot_path",
+            "sha256",
+            "size_bytes",
+            "row_count",
+            "native_operator_artifact_set_status",
+            "native_operator_artifact_set_inputs_hash",
+            "native_operator_set_lock_sha256",
+            "native_operator_set_closure_sha256",
+        },
+        "collection CUDA build summary receipt field set mismatch",
+    )
+    build_summary_path = summary_ref.get("build_path")
+    require(
+        isinstance(build_summary_path, str)
+        and Path(build_summary_path).is_absolute()
+        and summary_ref.get("snapshot_path") == CUDA_BUILD_SUMMARY_RECEIPT
+        and summary_ref.get("native_operator_artifact_set_status") == "linked",
+        "collection CUDA build summary receipt identity drifted",
+    )
+    require(
+        Path(build_summary_path).parent / staged_relative == build_path,
+        "collection build summary and staged native lock do not share the raw artifact root",
+    )
+    summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
+    require(
+        summary_path.is_file()
+        and not summary_path.is_symlink()
+        and summary_ref.get("native_operator_set_lock_sha256")
+        == lock_ref["lock_sha256"]
+        and summary_ref.get("native_operator_set_closure_sha256")
+        == lock_ref["closure"]["index_sha256"],
+        "collection CUDA build summary receipt snapshot identity mismatch",
+    )
+    try:
+        validated_summary = validate_cuda_build_summary(
+            summary_path,
+            build_lock_path,
+            validated_native_set,
+            REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+        )
+    except NativeOperatorSetEvidenceError as error:
+        raise ValidationError(str(error)) from error
+    require(
+        {
+            key: summary_ref[key]
+            for key in (
+                "sha256",
+                "size_bytes",
+                "row_count",
+                "native_operator_artifact_set_status",
+                "native_operator_artifact_set_inputs_hash",
+            )
+        }
+        == validated_summary,
+        "collection CUDA build summary content identity mismatch",
+    )
+
+    try:
+        build_tokens = shlex.split(read_text(root / "build.command"))
+    except ValueError as error:
+        raise ValidationError(f"malformed build command receipt: {error}") from error
+    require("cargo" in build_tokens, "build command receipt has no cargo command")
+    cargo_index = build_tokens.index("cargo")
+    assignments: dict[str, str] = {}
+    for token in build_tokens[:cargo_index]:
+        require("=" in token, "build command receipt has a non-assignment prefix")
+        key, value = token.split("=", 1)
+        require(key and key not in assignments, "build command receipt has duplicate assignments")
+        assignments[key] = value
+    require(
+        assignments
+        == {
+            "CARGO_BUILD_JOBS": "8",
+            "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT": build_summary_path,
+            "FERRUM_NATIVE_OPERATOR_SET_LOCK": build_lock_path,
+        }
+        and tuple(build_tokens[cargo_index:]) == EXPECTED_CUDA_BUILD_ARGV,
+        "CUDA build command is not bound to the typed native operator inputs",
+    )
+    return {
+        "lock_sha256": lock_ref["lock_sha256"],
+        "lock_size_bytes": lock_ref["lock_size_bytes"],
+        "closure": lock_ref["closure"],
+        "operators": lock_ref["operators"],
+        "binary_sha256_by_operator": lock_ref["binary_sha256_by_operator"],
+        "build_summary_sha256": summary_ref["sha256"],
+        "build_summary_row_count": summary_ref["row_count"],
+        "native_operator_artifact_set_status": "linked",
+    }
 
 
 def phase_reusable_execution(metrics: dict[str, Any], phase: str) -> dict[str, Any]:
@@ -602,7 +829,10 @@ def validate_prefill_replay(root: Path) -> dict[str, Any]:
     }
 
 
-def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
+def validate(
+    root: Path,
+    expected_git_sha: str | None,
+) -> dict[str, Any]:
     root = root.resolve()
     require(root.is_dir(), f"artifact directory does not exist: {root}")
     source_sha = read_text(root / "git.sha").strip()
@@ -614,7 +844,10 @@ def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
     binary_line = read_text(root / "binary.sha256").strip().split()
     require(binary_line and SHA256_RE.fullmatch(binary_line[0]) is not None, "invalid binary SHA256")
     require("RTX 4090" in read_text(root / "hardware.csv"), "artifact is not from RTX 4090")
-    collection = validate_collection_manifest(root, source_sha)
+    collection = validate_collection_manifest(
+        root,
+        source_sha,
+    )
     validate_forbidden_logs(root)
     summary = {
         "schema_version": 1,
@@ -625,6 +858,11 @@ def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
         "hardware": read_text(root / "hardware.csv").strip(),
         "collection_schema_version": (
             collection["schema_version"] if collection is not None else 1
+        ),
+        "native_operator_build": (
+            collection.get("_validated_native_operator_build")
+            if collection is not None
+            else None
         ),
         "run": validate_run(root),
         "serve": validate_serve(root),
@@ -1418,7 +1656,7 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
             == {expected_collector_sha},
             "slot telemetry collector SHA differs from collection provenance",
         )
-        if collection.get("schema_version") == COLLECTION_SCHEMA_VERSION:
+        if collection.get("schema_version", 0) >= 3:
             require(
                 {row["gpu_query_policy"] for row in telemetry.values()}
                 == {GPU_TELEMETRY_POLICY},
@@ -1545,6 +1783,7 @@ def write_basic_slice_evidence(
         "binary_sha256": correctness["binary_sha256"],
         "hardware": correctness["hardware"],
         "product": product,
+        "native_operator_build": correctness["native_operator_build"],
         "correctness": {
             "run": correctness["run"],
             "serve": correctness["serve"],
@@ -1587,7 +1826,11 @@ def write_basic_slice_evidence(
             "profile_off_device_timing_samples_zero": True,
             "profile_measurement_reported_non_blocking": True,
             "slot_gpu_host_telemetry_complete": True,
+            "native_operator_artifact_set_bound": (
+                correctness["native_operator_build"] is not None
+            ),
         },
+        "native_operator_build": correctness["native_operator_build"],
         "metrics": {
             "mean_overhead_fraction": performance["mean_overhead"],
             "median_overhead_fraction": performance["median_overhead"],
@@ -1637,6 +1880,14 @@ def write_basic_slice_evidence(
     }
     write_json(out / "manifest.json", manifest)
     print(pass_line)
+
+
+def require_bounded_overhead_native_evidence(summary: dict[str, Any]) -> None:
+    require(
+        summary.get("collection_schema_version") == COLLECTION_SCHEMA_VERSION
+        and summary.get("native_operator_build") is not None,
+        "bounded-overhead lane requires schema-4 portable native build evidence",
+    )
 
 
 def profile_event(sequence: int, kind: str, entrypoint: str) -> dict[str, Any]:
@@ -1979,6 +2230,89 @@ def create_profile_runtime_selftest_fixture(directory: Path, mode: str) -> None:
     )
 
 
+def create_native_build_contract_selftest_fixture(root: Path) -> dict[str, Any]:
+    source_lock = create_selftest_native_operator_set(
+        root / "external-source",
+        REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    staged_lock, staged = stage_native_operator_set(
+        source_lock,
+        root / NATIVE_OPERATOR_SET_SNAPSHOT_DIR,
+        REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
+    set_signature = cuda_native_set_signature(
+        str(staged_lock),
+        staged,
+        REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+    )
+    write_json(
+        summary_path,
+        {
+            "schema_version": 1,
+            "artifact_type": "ferrum_cuda_build_summary_receipt",
+            "rows": [
+                {
+                    "artifact": "native_operator_artifact_set",
+                    "status": "linked",
+                    "reason": "manifest-v3-artifact-set-v5-validated",
+                    "elapsed_ms": 1,
+                    "inputs_hash": cuda_build_inputs_hash(set_signature),
+                },
+                *[
+                    {
+                        "artifact": summary_artifact,
+                        "status": "artifact",
+                        "reason": "native-operator-artifact-set",
+                        "elapsed_ms": 0,
+                        "inputs_hash": cuda_build_inputs_hash(operator),
+                    }
+                    for summary_artifact, _unit_name, operator in (
+                        REQUIRED_CUDA_NATIVE_BUILD_UNITS
+                    )
+                ],
+            ],
+        },
+    )
+    validated_summary = validate_cuda_build_summary(
+        summary_path,
+        str(staged_lock),
+        staged,
+        REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+    )
+    build_path = str(summary_path.resolve())
+    (root / "build.command").write_text(
+        shlex.join(
+            [
+                "CARGO_BUILD_JOBS=8",
+                f"FERRUM_CUDA_BUILD_SUMMARY_RECEIPT={build_path}",
+                f"FERRUM_NATIVE_OPERATOR_SET_LOCK={staged_lock}",
+                *EXPECTED_CUDA_BUILD_ARGV,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "schema_version": COLLECTION_SCHEMA_VERSION,
+        "native_operator_set_lock": {
+            "source_input_path": str(source_lock),
+            "staged_lock_path": NATIVE_OPERATOR_SET_LOCK_SNAPSHOT,
+            "build_lock_path": str(staged_lock),
+            **native_operator_set_public_identity(staged),
+        },
+        "cuda_build_summary_receipt": {
+            "build_path": build_path,
+            "snapshot_path": CUDA_BUILD_SUMMARY_RECEIPT,
+            **validated_summary,
+            "native_operator_set_lock_sha256": staged["lock_sha256"],
+            "native_operator_set_closure_sha256": staged["closure"][
+                "index_sha256"
+            ],
+        },
+    }
+
+
 def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-") as temp:
         root = Path(temp)
@@ -2066,6 +2400,70 @@ def self_test() -> int:
             )
         else:
             raise ValidationError("empty basic device timing unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-native-build-") as temp:
+        root = Path(temp)
+        collection = create_native_build_contract_selftest_fixture(root)
+        native = validate_native_operator_build_contract(
+            root,
+            collection,
+        )
+        require(
+            native["operators"] == sorted(REQUIRED_CUDA_NATIVE_OPERATORS),
+            "native build contract self-test lost operators",
+        )
+        summary_path = root / CUDA_BUILD_SUMMARY_RECEIPT
+        summary = read_json(summary_path)
+        summary["rows"][0]["status"] = "skipped"
+        write_json(summary_path, summary)
+        collection["cuda_build_summary_receipt"]["sha256"] = sha256(summary_path)
+        collection["cuda_build_summary_receipt"]["size_bytes"] = (
+            summary_path.stat().st_size
+        )
+        try:
+            validate_native_operator_build_contract(
+                root,
+                collection,
+            )
+        except ValidationError as error:
+            require(
+                "did not validate and link" in str(error),
+                "native build summary mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("unlinked native operator artifact set unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-native-closure-") as temp:
+        root = Path(temp)
+        collection = create_native_build_contract_selftest_fixture(root)
+        lock_path = root / NATIVE_OPERATOR_SET_LOCK_SNAPSHOT
+        validated = validate_native_operator_set(
+            lock_path,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+        member = lock_path.parent / validated["_members"][0]["path"]
+        member.write_bytes(b"tampered staged evidence\n")
+        try:
+            validate_native_operator_build_contract(root, collection)
+        except ValidationError as error:
+            require(
+                "mismatch" in str(error),
+                "native closure mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("mutated staged native closure unexpectedly passed")
+    try:
+        require_bounded_overhead_native_evidence(
+            {
+                "collection_schema_version": 3,
+                "native_operator_build": None,
+            }
+        )
+    except ValidationError as error:
+        require(
+            "schema-4 portable native build evidence" in str(error),
+            "schema downgrade failed for the wrong reason",
+        )
+    else:
+        raise ValidationError("schema-3 bounded-overhead evidence unexpectedly passed")
     synthetic_reports = {
         "off1": {"throughput": [100.0, 100.5, 99.5]},
         "basic1": {"throughput": [99.0, 99.5, 98.5]},
@@ -2123,6 +2521,7 @@ def main() -> int:
         )
         if args.require_bounded_overhead:
             require(args.out is not None, "--out is required with --require-bounded-overhead")
+            require_bounded_overhead_native_evidence(summary)
             performance = validate_profile_overhead(args.artifact_dir.resolve())
             write_basic_slice_evidence(
                 args.artifact_dir,
@@ -2145,7 +2544,7 @@ def main() -> int:
         write_json(output, summary)
         print(f"{PASS_PREFIX}: {args.artifact_dir.resolve()}")
         return 0
-    except (OSError, ValidationError) as error:
+    except (NativeOperatorSetEvidenceError, OSError, ValidationError) as error:
         if args.require_bounded_overhead:
             fail_prefix = "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE FAIL"
         elif args.require_prefill_replay:

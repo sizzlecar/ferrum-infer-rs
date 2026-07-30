@@ -123,6 +123,11 @@ fn sha256_file_fingerprint(path: &Path) -> String {
     )
 }
 
+fn sha256_file_digest(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    format!("{:x}", Sha256::digest(&bytes))
+}
+
 fn resolve_program(program: &Path) -> PathBuf {
     if program.components().count() > 1 {
         return program
@@ -674,16 +679,29 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
     let inventory_json =
         serde_json::to_string(&inventory).expect("native operator inventory must serialize");
     println!("cargo:rustc-env={COMPILED_NATIVE_OPERATOR_SET_JSON_ENV}={inventory_json}");
+    let operator_binaries = resolved_set
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "{}={}",
+                artifact.lock.operator, artifact.resolved.artifact_sha256
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     emit_cuda_build_summary(
         "native_operator_artifact_set",
         "linked",
         "manifest-v3-artifact-set-v5-validated",
         start.elapsed(),
         &format!(
-            "lock={}:catalog={}:operators={}:build_units={}",
+            "lock={}:lock_sha256={}:catalog={}:operators={}:operator_binaries={}:build_units={}",
             resolved_set.lock_path.display(),
+            sha256_file_digest(&resolved_set.lock_path),
             resolved_set.g03_catalog_sha256,
             resolved_set.artifacts.len(),
+            operator_binaries,
             build_coverage
                 .iter()
                 .map(CudaNativeBuildUnit::as_str)
