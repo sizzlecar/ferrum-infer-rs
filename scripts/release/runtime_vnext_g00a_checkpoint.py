@@ -79,6 +79,7 @@ PRESET_FIELDS = {
     "repetition_penalty",
     "seed",
     "max_tokens",
+    "output_budget_mode",
     "stop",
     "eos_token_ids",
     "enable_thinking",
@@ -1499,6 +1500,8 @@ def validate_presets_catalog(
             require(eos_ids and all(isinstance(item, int) and item >= 0 for item in eos_ids), f"generation presets {model_key}.{preset_name}.eos_token_ids invalid")
             require(isinstance(preset.get("template_kwargs"), dict), f"generation presets {model_key}.{preset_name}.template_kwargs must be an object")
             require_string(preset.get("source"), f"generation presets {model_key}.{preset_name}.source")
+            expected_budget_mode = "explicit" if preset_name in {"P_DETERMINISTIC", "P_NO_THINKING"} else "auto-ceiling"
+            require(preset.get("output_budget_mode") == expected_budget_mode, f"generation presets {model_key}.{preset_name}.output_budget_mode must be {expected_budget_mode}")
             if preset_name == "P_DETERMINISTIC":
                 require(preset.get("temperature") == 0.0 and preset.get("enable_thinking") is False, f"generation presets {model_key}.P_DETERMINISTIC contract mismatch")
                 require(preset.get("template_kwargs") == {"enable_thinking": False}, f"generation presets {model_key}.P_DETERMINISTIC template kwargs mismatch")
@@ -2340,6 +2343,16 @@ def run_self_test() -> None:
     )
 
     validate_models_catalog()
+    checked_in_presets = read_json(PRESETS_CATALOG_PATH)
+    checked_in_models = require_object(checked_in_presets.get("models"), "checked-in generation presets models")
+    require(set(checked_in_models) == set(PRIMARY_MODEL_KEYS.values()), "checked-in generation presets model matrix mismatch")
+    for model_key, raw_model in checked_in_models.items():
+        raw_presets = require_object(require_object(raw_model, model_key).get("presets"), f"{model_key}.presets")
+        require(set(raw_presets) == REQUIRED_PRESETS, f"checked-in generation presets {model_key} preset matrix mismatch")
+        for preset_name, raw_preset in raw_presets.items():
+            preset = require_object(raw_preset, f"{model_key}.{preset_name}")
+            expected_budget_mode = "explicit" if preset_name in {"P_DETERMINISTIC", "P_NO_THINKING"} else "auto-ceiling"
+            require(set(preset) == PRESET_FIELDS and preset.get("output_budget_mode") == expected_budget_mode, f"checked-in generation preset contract drift: {model_key}.{preset_name}")
     validate_historical_catalog()
     with tempfile.TemporaryDirectory(prefix="ferrum-g00a-history-selftest-") as raw_tmp:
         downgraded_catalog_path = Path(raw_tmp) / "historical-bugs.json"
