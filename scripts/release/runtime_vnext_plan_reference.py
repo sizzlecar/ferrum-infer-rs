@@ -44,7 +44,7 @@ RELEASE_BUILD_COMMAND = [
 ]
 GIT_SHA_LENGTH = 40
 SHA256_LENGTH = 64
-MAX_PORTABLE_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_PORTABLE_ARTIFACT_BYTES = 512 * 1024 * 1024
 SELFTEST_PASS_LINE = "FERRUM CUDA RELEASE PLAN REFERENCE SELFTEST PASS"
 
 
@@ -324,7 +324,7 @@ def validate_focused_report(
 def validate_release_build_receipt(
     execution_root: Path,
     execution: dict[str, Any],
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], Path]:
     receipt_path = resolve_execution_artifact_ref(
         execution_root,
         execution.get("binary_build_receipt"),
@@ -376,7 +376,7 @@ def validate_release_build_receipt(
         == receipt.get("binary_sha256"),
         "release build and execution binary identities differ",
     )
-    return receipt_path, receipt
+    return receipt_path, receipt, binary_path
 
 
 def capture(
@@ -444,7 +444,11 @@ def capture(
         "reference execution hardware differs from the requested hardware",
     )
     validate_focused_report(focused, expected=execution)
-    build_receipt_path, _ = validate_release_build_receipt(execution_root, execution)
+    (
+        build_receipt_path,
+        _,
+        release_binary_path,
+    ) = validate_release_build_receipt(execution_root, execution)
     effective_config_path = resolve_execution_artifact_ref(
         execution_root,
         execution.get("effective_config"),
@@ -495,6 +499,7 @@ def capture(
         ("scheduler-trace.jsonl", trace_path),
         ("typed-effective-config.json", effective_config_path),
         ("actual-effective-config.json", actual_effective_config_path),
+        ("release-binary", release_binary_path),
     ):
         destination = input_dir / label
         shutil.copy2(source, destination)
@@ -627,6 +632,7 @@ def validate(
         "scheduler-trace.jsonl",
         "typed-effective-config.json",
         "actual-effective-config.json",
+        "release-binary",
     }
     require(set(inputs) == expected_inputs, "release plan reference input set is invalid")
     resolved = {
@@ -682,6 +688,10 @@ def validate(
         and sha256(resolved["actual-effective-config.json"])
         == manifest["actual_effective_config_sha256"],
         "release reference effective config identity differs from manifest",
+    )
+    require(
+        sha256(resolved["release-binary"]) == manifest["binary_sha256"],
+        "release reference binary content differs from its recorded SHA256",
     )
     trace_events = plan_events_from_trace(resolved["scheduler-trace.jsonl"])
     require(
@@ -768,7 +778,7 @@ def copy_validated(
             total_bytes += path.stat().st_size
     require(
         total_bytes <= MAX_PORTABLE_ARTIFACT_BYTES,
-        "release plan reference exceeds the 64 MiB portable artifact limit",
+        "release plan reference exceeds the 512 MiB portable artifact limit",
     )
     shutil.copytree(source_root, destination_root, symlinks=False)
     imported_manifest = destination_root / source_manifest.relative_to(source_root)
@@ -1017,6 +1027,27 @@ def self_test() -> None:
             and validated["plan_identity"]["plan_hash"] == fixture["plan_hash"],
             "matching release plan reference did not round-trip",
         )
+        release_binary = artifact / "inputs/release-binary"
+        release_binary_bytes = release_binary.read_bytes()
+        release_binary.write_bytes(release_binary_bytes + b"-tampered")
+        try:
+            validate(
+                artifact / "manifest.json",
+                expected_hardware_id=fixture["hardware_id"],
+                candidate_source_git_sha=fixture["source_git_sha"],
+                candidate_source_tree_sha=fixture["source_tree_sha"],
+                allow_internal_fixture=True,
+            )
+        except PlanReferenceError as error:
+            require(
+                "release-binary" in str(error)
+                and "identity mismatch" in str(error),
+                f"tampered release binary used an unexpected rejection: {error}",
+            )
+        else:
+            raise PlanReferenceError("tampered release binary was accepted")
+        release_binary.write_bytes(release_binary_bytes)
+
         hostile = read_object(artifact / "manifest.json", "hostile manifest")
         hostile["plan_identity"]["plan_hash"] = "b" * 64
         hostile["plan_identity"]["plan_id"] = f"plan/sha256/{'b' * 64}"

@@ -231,7 +231,7 @@ current `cuda-correctness` cache-only build 用时 `24.897233s`，44 个 native 
 `b9d739bc80d05fcaf1ad679f2a9a1deaa78880035377f46eabe3822d3101b06a`），并已通过
 GitHub 下载到本机完成 SHA256/zstd 复验。这关闭 G07A 的真实 release/correctness
 semantic-plan 对照和一个 Rust-only cache-hit 样本；五样本 p95、workspace source gate、
-canonical G07A/G07B/G07 validator 仍未完成，因此 G07 仍为 Open。
+canonical G07A/G07B/G07 PASS 仍未完成，因此 G07 仍为 Open。
 
 paid inventory 已核对：RTX 4090 实例 `46127509` 与 `45897840` 均为
 `cur_state=stopped`、`actual_status=exited`，`potentially_billable=[]`。在 runtime-affecting
@@ -250,6 +250,17 @@ no-op 为 `0.819575s`，Rust model leaf 为 `7.079652s`，两者均使用
 bootstrap 与首次 prewarm 重复使用两个冷 target 的问题也已收敛为共享声明式
 correctness target，待下一轮 diagnostic 验证后再进入 canonical matrix。实例
 `46247151` 已停止到 `actual_status=exited`，当前 potentially billable 实例数为 `0`。
+
+当前 source checkpoint 已注册正式 `run_gate.py vnext-g07a` lane。其 child
+checkpoint 会重算 canonical 五样本 raw timing，并显式绑定 current-clean-source 的
+G00F、S1 `run`/`serve` CUDA slice、bounded workspace unit source gate 和
+release/correctness semantic-plan trace；unit child receipt 绑定测试前后完全相同的
+`HEAD/tree/status`，semantic artifact 自带 release/correctness 两个真实二进制、
+typed config、模型锁和 trace，并独立重算全部 SHA256 与 plan hash。外层 gate 再次
+验证全部引用和当前 checkout。
+`FERRUM RUNTIME VNEXT G07A CHECKPOINT SELFTEST PASS` 与
+`FERRUM RUN GATE SELFTEST PASS` 已通过。这只关闭 validator 接线缺口，不是 G07A
+完成证据；仍需在同一 clean SHA 上取得五样本 raw evidence 以及精确 child/outer PASS。
 
 截至 2026-07-25，正式 G00-G10 PASS 仍为 `0/11`，三主模型 x 双后端 fresh
 correctness matrix 仍为 `0/6`。当前生产纵切是

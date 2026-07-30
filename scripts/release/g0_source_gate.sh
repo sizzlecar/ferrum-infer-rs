@@ -18,7 +18,68 @@ run_unit() {
   local unit_receipt="$unit_bounded_root/receipt.json"
   local unit_stdout="$unit_bounded_root/stdout.log"
   local unit_stderr="$unit_bounded_root/stderr.log"
+  local unit_source="$unit_bounded_root/source.before.json"
   mkdir -p "$unit_bounded_root"
+  python3 - "$unit_source" <<'PY'
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+destination = pathlib.Path(sys.argv[1]).resolve()
+
+
+def git_output(*args):
+    proc = subprocess.run(
+        ["git", *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"G0 source unit checkout receipt ERROR: git {' '.join(args)} "
+            f"failed rc={proc.returncode}: {proc.stderr.strip()}"
+        )
+    return proc.stdout.strip()
+
+
+git_sha = git_output("rev-parse", "HEAD")
+git_tree_sha = git_output("rev-parse", "HEAD^{tree}")
+status_short = [
+    line
+    for line in git_output(
+        "status",
+        "--short",
+        "--untracked-files=all",
+    ).splitlines()
+    if line.strip()
+]
+if re.fullmatch(r"[0-9a-f]{40}", git_sha) is None:
+    raise SystemExit("G0 source unit checkout receipt ERROR: invalid HEAD SHA")
+if re.fullmatch(r"[0-9a-f]{40}", git_tree_sha) is None:
+    raise SystemExit("G0 source unit checkout receipt ERROR: invalid tree SHA")
+receipt = {
+    "schema_version": 1,
+    "artifact_type": "g0_source_checkout_receipt",
+    "git_sha": git_sha,
+    "git_tree_sha": git_tree_sha,
+    "dirty_status": {
+        "is_dirty": bool(status_short),
+        "status_short": status_short,
+    },
+}
+temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+temporary.write_text(
+    json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+os.replace(temporary, destination)
+PY
   python3 scripts/release/bounded_command.py \
     --receipt "$unit_receipt" \
     --stdout-log "$unit_stdout" \
@@ -66,6 +127,9 @@ run_unit() {
     scripts/release/runtime_vnext_historical_replay.py \
     scripts/release/runtime_vnext_historical_capture.py \
     scripts/release/runtime_vnext_g01a_checkpoint.py \
+    scripts/release/runtime_vnext_plan_reference.py \
+    scripts/release/runtime_vnext_cuda_correctness_build.py \
+    scripts/release/runtime_vnext_g07a_checkpoint.py \
     scripts/release/runtime_vnext_numerical_tolerances.py \
     scripts/release/runtime_vnext_checkpoint_artifact.py \
     scripts/release/qwen35_gguf_linear_attention_reference.py \
@@ -94,11 +158,13 @@ PY
   bash -n scripts/release/g0_source_gate.sh | tee "$OUT_ROOT/g0-source-bashn.log"
   python3 scripts/release/selftest_g0_validators.py | tee "$OUT_ROOT/g0-validator-selftest.log"
   python3 scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/g1-g3-g4-validator-selftest.log"
-  python3 - "$OUT_ROOT" "$unit_receipt" "$unit_stdout" "$unit_stderr" <<'PY'
+  python3 - "$OUT_ROOT" "$unit_receipt" "$unit_stdout" "$unit_stderr" "$unit_source" <<'PY'
 import hashlib
 import json
 import os
 import pathlib
+import re
+import subprocess
 import sys
 
 out_raw = sys.argv[1]
@@ -106,6 +172,7 @@ out_root = pathlib.Path(out_raw).resolve()
 receipt_path = pathlib.Path(sys.argv[2]).resolve()
 stdout_path = pathlib.Path(sys.argv[3]).resolve()
 stderr_path = pathlib.Path(sys.argv[4]).resolve()
+source_path = pathlib.Path(sys.argv[5]).resolve()
 expected_command = [
     "env",
     "PYTHONDONTWRITEBYTECODE=1",
@@ -162,6 +229,76 @@ def identity(path):
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size_bytes": len(payload),
     }
+
+
+def git_output(*args):
+    proc = subprocess.run(
+        ["git", *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    require(
+        proc.returncode == 0,
+        f"git {' '.join(args)} failed rc={proc.returncode}: {proc.stderr.strip()}",
+    )
+    return proc.stdout.strip()
+
+
+source_receipt = json.loads(source_path.read_text(encoding="utf-8"))
+require(
+    isinstance(source_receipt, dict)
+    and set(source_receipt)
+    == {
+        "schema_version",
+        "artifact_type",
+        "git_sha",
+        "git_tree_sha",
+        "dirty_status",
+    }
+    and source_receipt.get("schema_version") == 1
+    and source_receipt.get("artifact_type") == "g0_source_checkout_receipt",
+    "source checkout receipt schema mismatch",
+)
+source_git_sha = source_receipt.get("git_sha")
+source_tree_sha = source_receipt.get("git_tree_sha")
+source_dirty = source_receipt.get("dirty_status")
+require(
+    isinstance(source_git_sha, str)
+    and re.fullmatch(r"[0-9a-f]{40}", source_git_sha) is not None
+    and isinstance(source_tree_sha, str)
+    and re.fullmatch(r"[0-9a-f]{40}", source_tree_sha) is not None,
+    "source checkout receipt SHA mismatch",
+)
+require(
+    isinstance(source_dirty, dict)
+    and set(source_dirty) == {"is_dirty", "status_short"}
+    and isinstance(source_dirty.get("is_dirty"), bool)
+    and isinstance(source_dirty.get("status_short"), list)
+    and all(
+        isinstance(line, str) and line
+        for line in source_dirty["status_short"]
+    )
+    and source_dirty["is_dirty"] == bool(source_dirty["status_short"]),
+    "source checkout dirty status mismatch",
+)
+current_status = [
+    line
+    for line in git_output(
+        "status",
+        "--short",
+        "--untracked-files=all",
+    ).splitlines()
+    if line.strip()
+]
+require(
+    git_output("rev-parse", "HEAD") == source_git_sha
+    and git_output("rev-parse", "HEAD^{tree}") == source_tree_sha
+    and current_status == source_dirty["status_short"],
+    "source checkout changed while the unit gate was running",
+)
 
 
 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -237,6 +374,12 @@ manifest = {
     "limits": expected_limits,
     "peaks": peaks,
     "cleanup": {"process_group_gone": True},
+    "source": {
+        "git_sha": source_git_sha,
+        "git_tree_sha": source_tree_sha,
+        "dirty_status": source_dirty,
+    },
+    "source_receipt": identity(source_path),
     "bounded_receipt": identity(receipt_path),
     "stdout_log": identity(stdout_path),
     "stderr_log": identity(stderr_path),

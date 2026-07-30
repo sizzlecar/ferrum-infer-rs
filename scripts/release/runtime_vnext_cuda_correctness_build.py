@@ -40,6 +40,7 @@ PLAN_READY_PREFIX = "FERRUM CUDA CORRECTNESS IMPORT INVENTORY READY"
 SEMANTIC_PASS_PREFIX = "FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS"
 SELFTEST_PASS_LINE = "FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS"
 SCHEMA_VERSION = 5
+SEMANTIC_SCHEMA_VERSION = 6
 REFERENCE_ARTIFACT_TYPE = plan_reference.ARTIFACT_TYPE
 CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
 REFERENCE_MODEL_KEY = plan_reference.MODEL_KEY
@@ -897,6 +898,283 @@ def read_typed_effective_config(path: Path, label: str) -> dict[str, Any]:
     return typed
 
 
+def verify_semantic_trace_artifact(
+    artifact_root: Path,
+    *,
+    source_root: Path | None = None,
+    verify_checkout: bool = False,
+    allow_internal_fixture: bool = False,
+) -> dict[str, Any]:
+    validation_path = artifact_root.expanduser().resolve()
+    if validation_path.name != "validation.json":
+        validation_path = validation_path / "validation.json"
+    root = validation_path.parent
+    validation = read_json_object(validation_path, "semantic validation")
+    require(
+        validation.get("schema_version") == SEMANTIC_SCHEMA_VERSION
+        and validation.get("artifact_type")
+        == "runtime-vnext-cuda-correctness-semantic-trace"
+        and validation.get("status") == "pass",
+        "semantic validation schema, type, or status is invalid",
+    )
+    source_git_sha = validation.get("source_git_sha")
+    source_tree_sha = validation.get("source_tree_sha")
+    require(
+        isinstance(source_git_sha, str)
+        and GIT_SHA_RE.fullmatch(source_git_sha) is not None
+        and isinstance(source_tree_sha, str)
+        and GIT_SHA_RE.fullmatch(source_tree_sha) is not None,
+        "semantic validation source identity is invalid",
+    )
+    require(
+        validation.get("dirty_status")
+        == {"is_dirty": False, "status_short": []},
+        "semantic validation does not prove a clean source",
+    )
+    require(
+        isinstance(validation.get("pass_line"), str)
+        and validation["pass_line"].startswith(
+            f"{SEMANTIC_PASS_PREFIX}: "
+        ),
+        "semantic validation PASS line is invalid",
+    )
+    inputs = validation.get("inputs")
+    expected_inputs = {
+        "build-manifest.json",
+        "execution-manifest.json",
+        "focused-report.json",
+        "scheduler-trace.jsonl",
+        "correctness-binary",
+        "correctness-typed-effective-config.json",
+        "release-plan-reference.json",
+    }
+    require(
+        isinstance(inputs, dict) and set(inputs) == expected_inputs,
+        "semantic validation input set is invalid",
+    )
+    resolved = {
+        label: resolve_file_ref(
+            root,
+            inputs[label],
+            f"semantic validation {label}",
+        )
+        for label in sorted(expected_inputs)
+    }
+
+    build = read_json_object(
+        resolved["build-manifest.json"],
+        "semantic correctness build manifest",
+    )
+    execution = read_json_object(
+        resolved["execution-manifest.json"],
+        "semantic correctness execution manifest",
+    )
+    focused = read_json_object(
+        resolved["focused-report.json"],
+        "semantic correctness focused report",
+    )
+    hardware_id = build.get("hardware_id")
+    require(
+        build.get("artifact_type") == CORRECTNESS_ARTIFACT_TYPE
+        and build.get("status") == "binary-ready"
+        and build.get("source_git_sha") == source_git_sha
+        and build.get("source_tree_sha") == source_tree_sha
+        and build.get("dirty_status")
+        == {"is_dirty": False, "status_short": []}
+        and build.get("profile", {}).get("name") == PROFILE
+        and build.get("profile", {}).get("settings")
+        == {
+            "inherits": "release",
+            "lto": False,
+            "codegen-units": 16,
+            "incremental": True,
+            "strip": False,
+        }
+        and build.get("profile", {}).get("inherited_opt_level") == 3
+        and build.get("features") == plan_reference.FEATURES
+        and build.get("native_build_signal", {}).get(
+            "native_recompile_count"
+        )
+        == 0
+        and isinstance(hardware_id, str)
+        and hardware_id,
+        "semantic correctness build boundary is invalid",
+    )
+    binary_path = resolved["correctness-binary"]
+    binary_sha256 = sha256(binary_path)
+    build_binary_ref = build.get("binary")
+    execution_binary_ref = execution.get("binary_artifact")
+    require(
+        isinstance(build_binary_ref, dict)
+        and isinstance(execution_binary_ref, dict)
+        and build_binary_ref.get("sha256") == binary_sha256
+        and build_binary_ref.get("size_bytes") == binary_path.stat().st_size
+        and execution_binary_ref.get("kind") == "binary"
+        and execution_binary_ref.get("sha256") == binary_sha256
+        and execution.get("binary_sha256") == binary_sha256
+        and focused.get("binary_sha256") == binary_sha256
+        and validation.get("binary_sha256") == binary_sha256,
+        "semantic correctness binary identities differ",
+    )
+    require(
+        execution.get("source_git_sha")
+        == focused.get("source_git_sha")
+        == source_git_sha
+        and execution.get("source_tree_sha")
+        == focused.get("source_tree_sha")
+        == source_tree_sha
+        and execution.get("dirty_status")
+        == focused.get("dirty_status")
+        == {"is_dirty": False, "status_short": []}
+        and execution.get("backend") == focused.get("backend") == "cuda"
+        and execution.get("hardware_id")
+        == focused.get("hardware_id")
+        == hardware_id,
+        "semantic execution/focused source or hardware boundary differs",
+    )
+    try:
+        reference = plan_reference.validate(
+            resolved["release-plan-reference.json"],
+            expected_hardware_id=hardware_id,
+            candidate_source_git_sha=source_git_sha,
+            candidate_source_tree_sha=source_tree_sha,
+            repository_root=source_root,
+            allow_internal_fixture=allow_internal_fixture,
+        )
+        plan_reference.validate_focused_report(
+            focused,
+            expected=execution,
+        )
+    except plan_reference.PlanReferenceError as error:
+        raise CorrectnessBuildError(
+            f"semantic release reference failed: {error}"
+        ) from error
+    reference_plan_hash = reference["plan_identity"]["plan_hash"]
+    contract = build.get("semantic_plan_contract")
+    require(
+        isinstance(contract, dict)
+        and contract.get("reference_kind") == REFERENCE_ARTIFACT_TYPE
+        and contract.get("reference_plan_hash") == reference_plan_hash
+        and contract.get("reference_source_git_sha")
+        == reference["source_git_sha"]
+        and contract.get("reference_source_tree_sha")
+        == reference["source_tree_sha"]
+        and contract.get("reference_binary_sha256")
+        == reference["binary_sha256"]
+        and contract.get("reference_profile") == "release"
+        and contract.get("hardware_id") == hardware_id
+        and contract.get("model_key") == REFERENCE_MODEL_KEY
+        and contract.get("case_id") == REFERENCE_CASE_ID
+        and contract.get("require_exact_match_before_focused_result")
+        is True,
+        "semantic correctness build is not bound to the copied release reference",
+    )
+    require(
+        execution.get("models_lock_sha256")
+        == reference.get("models_lock_sha256")
+        and execution.get("model_revision")
+        == reference.get("model_revision")
+        and plan_reference.canonical_json_sha256(
+            execution.get("model_files")
+        )
+        == reference.get("model_files_sha256"),
+        "semantic release/correctness model locks differ",
+    )
+    correctness_config_path = resolved[
+        "correctness-typed-effective-config.json"
+    ]
+    correctness_config_ref = execution.get("effective_config")
+    require(
+        isinstance(correctness_config_ref, dict)
+        and correctness_config_ref.get("kind") == "raw-json"
+        and correctness_config_ref.get("sha256")
+        == sha256(correctness_config_path),
+        "semantic correctness typed config identity differs from execution",
+    )
+    reference_config_path = plan_reference.resolve_file_ref(
+        resolved["release-plan-reference.json"].parent,
+        reference["inputs"]["typed-effective-config.json"],
+        "semantic release typed effective config",
+    )
+    require(
+        read_typed_effective_config(
+            correctness_config_path,
+            "semantic correctness typed effective config",
+        )
+        == read_typed_effective_config(
+            reference_config_path,
+            "semantic release typed effective config",
+        ),
+        "semantic release/correctness typed effective configs differ",
+    )
+    try:
+        events = plan_reference.plan_events_from_trace(
+            resolved["scheduler-trace.jsonl"]
+        )
+    except plan_reference.PlanReferenceError as error:
+        raise CorrectnessBuildError(
+            f"semantic scheduler trace failed: {error}"
+        ) from error
+    observed_hashes = sorted({event["plan_hash"] for event in events})
+    request_ids = sorted(
+        {
+            event["request_id"]
+            for event in events
+            if isinstance(event["request_id"], str)
+        }
+    )
+    model_values = sorted(
+        {
+            event["model"]
+            for event in events
+            if isinstance(event["model"], str)
+        }
+    )
+    require(
+        observed_hashes == [reference_plan_hash]
+        and validation.get("reference_plan_hash")
+        == reference_plan_hash
+        and validation.get("reference_source_git_sha")
+        == reference["source_git_sha"]
+        and validation.get("reference_source_tree_sha")
+        == reference["source_tree_sha"]
+        and validation.get("reference_binary_sha256")
+        == reference["binary_sha256"]
+        and validation.get("observed_plan_hashes") == observed_hashes
+        and validation.get("plan_built_event_count") == len(events)
+        and validation.get("request_ids") == request_ids
+        and validation.get("model_values") == model_values
+        and validation.get("focused_decision") == focused.get("decision")
+        and focused.get("decision") in {"KEEP", "PASS"},
+        "semantic validation summary is not reproducible from copied inputs",
+    )
+    if verify_checkout:
+        require(
+            source_root is not None,
+            "semantic checkout verification requires a source root",
+        )
+        current = source_identity(
+            source_root.expanduser().resolve(),
+            require_clean=True,
+        )
+        require(
+            current["source_git_sha"] == source_git_sha
+            and current["source_tree_sha"] == source_tree_sha,
+            "semantic artifact differs from the current source checkout",
+        )
+    return {
+        "validation_path": str(validation_path),
+        "source_git_sha": source_git_sha,
+        "source_tree_sha": source_tree_sha,
+        "hardware_id": hardware_id,
+        "binary_sha256": binary_sha256,
+        "reference_plan_hash": reference_plan_hash,
+        "reference_binary_sha256": reference["binary_sha256"],
+        "plan_built_event_count": len(events),
+        "focused_decision": focused["decision"],
+    }
+
+
 def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     build_manifest_path = args.build_manifest.expanduser().resolve()
     execution_manifest_path = args.execution_manifest.expanduser().resolve()
@@ -1046,25 +1324,45 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
     )
 
     input_dir = root / "inputs"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    copied = {}
+    require(
+        not input_dir.exists(),
+        f"semantic validation input directory already exists: {input_dir}",
+    )
+    input_dir.mkdir(parents=True)
+    copied: dict[str, Any] = {}
     for label, source in (
         ("build-manifest.json", build_manifest_path),
         ("execution-manifest.json", execution_manifest_path),
         ("focused-report.json", focused_report_path),
         ("scheduler-trace.jsonl", trace_path),
-        ("release-plan-reference.json", reference_path),
+        ("correctness-binary", build_binary),
+        (
+            "correctness-typed-effective-config.json",
+            execution_effective,
+        ),
     ):
         destination = input_dir / label
         shutil.copy2(source, destination)
         copied[label] = file_ref(destination, root)
+    reference_copy_root = input_dir / "release-plan-reference"
+    shutil.copytree(
+        reference_path.parent,
+        reference_copy_root,
+        symlinks=False,
+    )
+    copied_reference_path = reference_copy_root / reference_path.name
+    copied["release-plan-reference.json"] = file_ref(
+        copied_reference_path,
+        root,
+    )
     result = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SEMANTIC_SCHEMA_VERSION,
         "artifact_type": "runtime-vnext-cuda-correctness-semantic-trace",
         "status": "pass",
         "created_at": now_iso(),
         "source_git_sha": build["source_git_sha"],
         "source_tree_sha": build["source_tree_sha"],
+        "dirty_status": {"is_dirty": False, "status_short": []},
         "binary_sha256": build_binary_sha256,
         "reference_plan_hash": reference_plan_hash,
         "reference_source_git_sha": reference["source_git_sha"],
@@ -1091,6 +1389,11 @@ def validate_semantic_trace(args: argparse.Namespace, root: Path) -> dict[str, A
         "pass_line": f"{SEMANTIC_PASS_PREFIX}: {root}",
     }
     write_json(root / "validation.json", result)
+    verify_semantic_trace_artifact(
+        root,
+        source_root=ROOT,
+        verify_checkout=False,
+    )
     return result
 
 
@@ -1365,6 +1668,27 @@ strip = false
                 "source_tree_sha": source_tree_sha,
                 "dirty_status": {"is_dirty": False, "status_short": []},
                 "hardware_id": hardware_id,
+                "profile": {
+                    "name": PROFILE,
+                    "settings": {
+                        "inherits": "release",
+                        "lto": False,
+                        "codegen-units": 16,
+                        "incremental": True,
+                        "strip": False,
+                    },
+                    "inherited_opt_level": 3,
+                    "semantic_delta_from_release": [
+                        "lto",
+                        "codegen-units",
+                        "incremental",
+                        "strip",
+                    ],
+                },
+                "features": copy.deepcopy(plan_reference.FEATURES),
+                "native_build_signal": {
+                    "native_recompile_count": 0,
+                },
                 "binary": file_ref(build_binary, build_artifact),
                 "semantic_plan_contract": {
                     "status": "pending-product-trace-validation",
@@ -1396,6 +1720,115 @@ strip = false
             and semantic["observed_plan_hashes"] == [plan_hash],
             "matching semantic trace was not accepted",
         )
+        verified_semantic = verify_semantic_trace_artifact(
+            root / "semantic-validation",
+            allow_internal_fixture=True,
+        )
+        require(
+            verified_semantic["binary_sha256"] == sha256(build_binary)
+            and verified_semantic["reference_plan_hash"] == plan_hash,
+            "self-contained semantic artifact did not round-trip",
+        )
+
+        def expect_semantic_artifact_reject(
+            name: str,
+            mutate: Any,
+            expected_error: str,
+        ) -> None:
+            hostile_root = root / f"semantic-hostile-{name}"
+            shutil.copytree(root / "semantic-validation", hostile_root)
+            mutate(hostile_root)
+            try:
+                verify_semantic_trace_artifact(
+                    hostile_root,
+                    allow_internal_fixture=True,
+                )
+            except CorrectnessBuildError as error:
+                require(
+                    expected_error in str(error),
+                    f"{name} used an unexpected rejection: {error}",
+                )
+                return
+            raise CorrectnessBuildError(
+                f"hostile semantic artifact was accepted: {name}"
+            )
+
+        expect_semantic_artifact_reject(
+            "correctness-binary",
+            lambda hostile: (
+                hostile / "inputs/correctness-binary"
+            ).write_bytes(b"tampered-correctness-binary"),
+            "reference identity mismatch",
+        )
+
+        def mutate_typed_config(hostile: Path) -> None:
+            config_path = (
+                hostile
+                / "inputs/correctness-typed-effective-config.json"
+            )
+            config = read_json_object(config_path, "hostile typed config")
+            config["typed_effective_config"]["serve"]["gpu_devices"] = [1]
+            write_json(config_path, config)
+            execution_path = hostile / "inputs/execution-manifest.json"
+            execution_doc = read_json_object(
+                execution_path,
+                "hostile execution",
+            )
+            execution_doc["effective_config"]["sha256"] = sha256(config_path)
+            write_json(execution_path, execution_doc)
+            validation_path = hostile / "validation.json"
+            validation_doc = read_json_object(
+                validation_path,
+                "hostile semantic validation",
+            )
+            validation_doc["inputs"][
+                "correctness-typed-effective-config.json"
+            ] = file_ref(config_path, hostile)
+            validation_doc["inputs"]["execution-manifest.json"] = file_ref(
+                execution_path,
+                hostile,
+            )
+            write_json(validation_path, validation_doc)
+
+        expect_semantic_artifact_reject(
+            "typed-config",
+            mutate_typed_config,
+            "typed effective configs differ",
+        )
+
+        def mutate_model_lock(hostile: Path) -> None:
+            execution_path = hostile / "inputs/execution-manifest.json"
+            execution_doc = read_json_object(
+                execution_path,
+                "hostile model-lock execution",
+            )
+            execution_doc["model_revision"] = "9" * 40
+            write_json(execution_path, execution_doc)
+            validation_path = hostile / "validation.json"
+            validation_doc = read_json_object(
+                validation_path,
+                "hostile semantic validation",
+            )
+            validation_doc["inputs"]["execution-manifest.json"] = file_ref(
+                execution_path,
+                hostile,
+            )
+            write_json(validation_path, validation_doc)
+
+        expect_semantic_artifact_reject(
+            "model-lock",
+            mutate_model_lock,
+            "model_revision differs",
+        )
+        expect_semantic_artifact_reject(
+            "release-binary",
+            lambda hostile: (
+                hostile
+                / "inputs/release-plan-reference/inputs/release-binary"
+            ).write_bytes(b"tampered-release-binary"),
+            "release-binary reference identity mismatch",
+        )
+
         trace.write_text(
             trace.read_text(encoding="utf-8").replace(plan_hash, "b" * 64),
             encoding="utf-8",

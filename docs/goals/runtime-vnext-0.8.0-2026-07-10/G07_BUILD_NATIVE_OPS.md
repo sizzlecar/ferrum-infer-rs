@@ -31,7 +31,13 @@ graph，就开始测量并拆分 invalidation domain；否则到 S4 大模型迁
 G07A/G07B 是 canonical DAG checkpoint：
 
 ```text
-python3 scripts/release/run_gate.py vnext-g07a --g00f <g00f-manifest> --s1-artifact <s1-manifest> --g07a-evidence-root <raw-evidence> --out <external-out>
+python3 scripts/release/run_gate.py vnext-g07a \
+  --g00f <g00f-manifest> \
+  --s1-artifact <s1-manifest> \
+  --g07a-evidence-root <raw-evidence> \
+  --source-gate <unit-gate-manifest> \
+  --semantic-plan-equivalence <semantic-trace-root> \
+  --out <external-out>
 python3 scripts/release/run_gate.py vnext-g07b --g03 <g03-manifest> --g07a <g07a-manifest> --out <external-out>
 python3 scripts/release/run_gate.py vnext-g07 --g07a <g07a-manifest> --g07b <g07b-manifest> --out <external-out>
 ```
@@ -568,6 +574,44 @@ and incremental samples to the same declared correctness-profile target. This
 removes a redundant dependency build without changing any timed boundary,
 profile, feature set or acceptance threshold. It must be verified by the next
 diagnostic before the canonical five-sample matrix. G07A remains Open.
+
+### 2026-07-30 canonical G07A checkpoint wiring
+
+Clean source implementation adds
+`scripts/release/runtime_vnext_g07a_checkpoint.py` and the unified
+`run_gate.py vnext-g07a` lane. The checkpoint does not reinterpret raw
+`EVIDENCE READY` as PASS. It independently revalidates the canonical
+five-sample timing root and binds the following current-clean-source
+dependencies:
+
+- G00F manifest and its G00A provenance;
+- S1 `run`/`serve` CUDA slice plus its complete raw artifact index;
+- bounded `cargo test --workspace --all-targets` unit source gate whose child
+  receipt binds the exact `HEAD`, tree and dirty status before and after the
+  test command;
+- a self-contained release/correctness semantic-plan artifact containing both
+  actual binaries, both typed configs, model locks, focused report and trace.
+  Its verifier recomputes every binary/config/input SHA and the plan hash
+  without trusting the original remote paths.
+
+The child checkpoint writes only the compact crate graph, invalidation report
+and timing summary; the large raw evidence remains external and is bound by
+manifest SHA256 plus its independently verified artifact-index digest. The
+outer `run_gate` validates the whole dependency chain again and excludes only
+its own three execution receipts from the child artifact index.
+
+Focused self-tests currently print:
+
+```text
+FERRUM RUNTIME VNEXT G07A CHECKPOINT SELFTEST PASS
+FERRUM RUN GATE SELFTEST PASS
+```
+
+The release-reference and semantic-build self-tests also reject tampered
+release binaries, correctness binaries, typed config and model locks. This is
+validator/source progress only. No bounded workspace source artifact on the
+eventual clean checkpoint SHA, canonical five-sample CUDA timing root, or the
+two required real PASS lines exists yet, so G07A and G07 remain Open.
 
 ## 验收
 
