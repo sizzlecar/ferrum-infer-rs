@@ -1068,6 +1068,14 @@ fn validate_source_build_for_package(
                     && command.dependency_validation
                         == Some(NativeOperatorDependencyValidation::CacheProof)
                     && command
+                        .compiler_depfile
+                        .as_deref()
+                        .is_some_and(|path| validate_relative_path(path).is_ok())
+                    && command
+                        .compiler_depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
+                    && command
                         .depfile
                         .as_deref()
                         .is_some_and(|path| validate_relative_path(path).is_ok())
@@ -1083,6 +1091,7 @@ fn validate_source_build_for_package(
                         .depfile_producer_object_file
                         .as_deref()
                         .is_some_and(|path| Path::new(path).is_absolute())
+                    && !command.depfile_bindings.is_empty()
                     && !command.observed_dependencies.is_empty() =>
             {
                 observed_cache_hits.push(translation_unit.to_string());
@@ -1093,6 +1102,14 @@ fn validate_source_build_for_package(
                     && command.dependency_validation
                         == Some(NativeOperatorDependencyValidation::Depfile)
                     && command
+                        .compiler_depfile
+                        .as_deref()
+                        .is_some_and(|path| validate_relative_path(path).is_ok())
+                    && command
+                        .compiler_depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
+                    && command
                         .depfile
                         .as_deref()
                         .is_some_and(|path| validate_relative_path(path).is_ok())
@@ -1108,6 +1125,7 @@ fn validate_source_build_for_package(
                         .depfile_producer_object_file
                         .as_deref()
                         .is_some_and(|path| Path::new(path).is_absolute())
+                    && !command.depfile_bindings.is_empty()
                     && !command.observed_dependencies.is_empty() =>
             {
                 observed_compiled.push(translation_unit.to_string());
@@ -1130,10 +1148,13 @@ fn validate_source_build_for_package(
         || archive_command.object_identity.is_some()
         || archive_command.dependency_closure_sha256.is_some()
         || archive_command.dependency_validation.is_some()
+        || archive_command.compiler_depfile.is_some()
+        || archive_command.compiler_depfile_sha256.is_some()
         || archive_command.depfile.is_some()
         || archive_command.depfile_sha256.is_some()
         || archive_command.depfile_producer_working_directory.is_some()
         || archive_command.depfile_producer_object_file.is_some()
+        || !archive_command.depfile_bindings.is_empty()
         || !archive_command.observed_dependencies.is_empty()
         || archive_command.return_code != Some(0)
         || archive_command.elapsed_ms.is_none()
@@ -1251,7 +1272,11 @@ fn copy_source_build_inputs(
                     )
                 )
             })
-            .filter_map(|command| command.depfile.clone()),
+            .flat_map(|command| {
+                [command.compiler_depfile.clone(), command.depfile.clone()]
+                    .into_iter()
+                    .flatten()
+            }),
     );
     inputs.sort();
     inputs.dedup();
@@ -2606,7 +2631,11 @@ fn validate_package_semantic_links(
                     )
                 )
             })
-            .filter_map(|command| command.depfile.as_ref())
+            .flat_map(|command| {
+                [command.compiler_depfile.as_ref(), command.depfile.as_ref()]
+                    .into_iter()
+                    .flatten()
+            })
             .map(|relative| format!("provenance/{relative}")),
     );
     expected_source_input_paths.sort();
@@ -3460,7 +3489,7 @@ mod tests {
         );
         assert!(is_sha256_digest(&receipt.source_build_receipt.sha256));
         assert!(is_sha256_digest(&receipt.source_build_plan.sha256));
-        assert_eq!(receipt.source_build_inputs.len(), 3);
+        assert_eq!(receipt.source_build_inputs.len(), 4);
         assert!(receipt
             .source_build_inputs
             .iter()
@@ -3472,7 +3501,10 @@ mod tests {
         assert!(receipt
             .source_build_inputs
             .iter()
-            .any(|evidence| evidence.path.ends_with(".d")));
+            .any(|evidence| evidence.path.ends_with(".compiler.raw.d")));
+        assert!(receipt.source_build_inputs.iter().any(|evidence| {
+            evidence.path.ends_with(".d") && !evidence.path.ends_with(".compiler.raw.d")
+        }));
         assert!(!receipt.source_build_logs.is_empty());
         assert!(is_sha256_digest(&receipt.source_archive_sha256));
         assert_eq!(receipt.source_archive_members.len(), 1);
@@ -4163,7 +4195,7 @@ mod tests {
             .source_build_inputs
             .iter_mut()
             .find(|evidence| evidence.path == packaged_depfile)
-            .expect("package carries the compiler depfile");
+            .expect("package carries the portable depfile");
         depfile_evidence.sha256 = sha256_file(&depfile_path).unwrap();
         depfile_evidence.size_bytes = fs::metadata(&depfile_path).unwrap().len();
 
@@ -4181,7 +4213,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("portable depfile contains an undeclared source dependency: forged.h"));
+            .contains("portable depfile bytes differ from their canonical typed bindings"));
         assert!(!lock_path.exists());
     }
 

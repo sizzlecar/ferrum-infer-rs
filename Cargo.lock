@@ -1593,6 +1593,7 @@ dependencies = [
  "clap",
  "ferrum-native-ops",
  "ferrum-types",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
