@@ -60,6 +60,12 @@ OPTIONAL_TOKENIZER_FILES = [
     "added_tokens.json",
     "chat_template.jinja",
 ]
+GIT_BOUNDED_CONFIG = [
+    "-c",
+    "core.preloadindex=false",
+    "-c",
+    "index.threads=1",
+]
 
 
 class ResolutionError(Exception):
@@ -1106,7 +1112,7 @@ class Resolver:
 def git_identity() -> dict[str, Any]:
     def run(args: list[str]) -> str:
         proc = subprocess.run(
-            args,
+            ["git", *GIT_BOUNDED_CONFIG, *args],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -1115,9 +1121,9 @@ def git_identity() -> dict[str, Any]:
         )
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
-    status = run(["git", "status", "--short"])
+    status = run(["status", "--short"])
     return {
-        "git_sha": run(["git", "rev-parse", "HEAD"]),
+        "git_sha": run(["rev-parse", "HEAD"]),
         "dirty": bool(status),
         "status_short": status.splitlines() if status else [],
     }
@@ -1479,6 +1485,11 @@ def expect_failure(catalog: dict[str, Any], fixture: dict[str, Any], needle: str
 
 
 def run_selftest() -> None:
+    require(
+        GIT_BOUNDED_CONFIG
+        == ["-c", "core.preloadindex=false", "-c", "index.threads=1"],
+        "selftest Git worker bound mismatch",
+    )
     for payload in ('{"fact":1,"fact":2}', '{"fact":NaN}'):
         try:
             strict_json_loads(payload)
