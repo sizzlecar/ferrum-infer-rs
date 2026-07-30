@@ -98,14 +98,14 @@ CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
 RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --lib \
   vnext::resource:: -- --test-threads=1
   92 passed; 0 failed
-RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
+RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --test vnext_resource_capacity_contract_tests \
   --test vnext_resource_transaction_lifecycle_tests \
   --test vnext_resource_transaction_evidence_tests \
   --test vnext_resource_sequence_activation_tests \
   --test vnext_resource_sequence_recovery_tests \
   --test vnext_resource_recovery_authority_tests \
-  --test vnext_resource_runtime_close_tests -- --test-threads=2
+  --test vnext_resource_runtime_close_tests -- --test-threads=1
   12 parent tests passed; 0 failed; 311 frozen proof cases preserved
 ```
 
