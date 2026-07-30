@@ -297,8 +297,11 @@ def normalize_depfile_relative_path(value: str, label: str) -> str:
     for part in value.split("/"):
         if part in {"", "."}:
             continue
-        require(part != "..", f"{label} escapes its working directory: {value!r}")
-        parts.append(part)
+        if part == "..":
+            require(bool(parts), f"{label} escapes its working directory: {value!r}")
+            parts.pop()
+        else:
+            parts.append(part)
     require(bool(parts), f"{label} is empty after normalization")
     return require_relative_posix_path("/".join(parts), label)
 
@@ -2321,6 +2324,22 @@ def self_test() -> None:
         def digest(value: str) -> str:
             return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+        require(
+            normalize_depfile_relative_path(
+                "kernels/vllm_marlin_moe/core/../vllm_torch_shim.h",
+                "selftest.source_parent_segment",
+            )
+            == "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+            "source depfile parent segment was not normalized",
+        )
+        for escaped in ("../outside.h", "kernels/../../outside.h"):
+            expect_reject(
+                lambda escaped=escaped: normalize_depfile_relative_path(
+                    escaped, "selftest.escaped_source"
+                ),
+                f"source depfile escape {escaped}",
+            )
+
         cuda_root = "/cuda"
         cuda_paths = sorted(
             {
@@ -2628,7 +2647,7 @@ def self_test() -> None:
                 }
                 for producer_path, portable_path, identity in (
                     ("/src/kernels/a.cu", "kernels/a.cu", source_unit),
-                    ("/src/kernels/a.h", "kernels/a.h", source_header),
+                    ("/src/kernels/core/../a.h", "kernels/a.h", source_header),
                     (
                         "/cuda/bin/../include/cuda.h",
                         "/cuda/include/cuda.h",
@@ -2649,7 +2668,7 @@ def self_test() -> None:
         compiler_depfile = root / "compiler-dependency.raw.d"
         depfile = root / "dependency.d"
         compiler_depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/core/../a.h "
             "/cuda/bin/../include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
@@ -2671,7 +2690,7 @@ def self_test() -> None:
         forged_producer = copy.deepcopy(command)
         forged_producer["depfile_bindings"][2]["producer_path"] = "/forged/include/cuda.h"
         compiler_depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/core/../a.h "
             "/forged/include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
@@ -2688,7 +2707,7 @@ def self_test() -> None:
             "unmanifested raw producer path",
         )
         compiler_depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/core/../a.h "
             "/cuda/bin/../include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
@@ -2722,7 +2741,7 @@ def self_test() -> None:
             "/cuda-alias/include/cuda.h"
         )
         compiler_depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/core/../a.h "
             "/cuda-alias/bin/../include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
@@ -2741,7 +2760,7 @@ def self_test() -> None:
             "selftest.invocation_alias",
         )
         compiler_depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/core/../a.h "
             "/cuda/bin/../include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
