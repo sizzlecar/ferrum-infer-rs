@@ -60,13 +60,17 @@ operation providers，并同时进入 `ferrum run` 和 `ferrum serve`。单向 a
 ```text
 python3 scripts/release/run_gate.py vnext-g01a --g00f <g00f-manifest> --out <external-out>
 python3 scripts/release/run_gate.py vnext-g01b --g00f <g00f-manifest> --g01a <g01a-manifest> \
-  --s1 <qwen35-4b-cuda-production-manifest> --out <external-out>
+  --s1 <qwen35-4b-cuda-production-manifest> \
+  --s1-capacity <qwen35-4b-cuda-capacity-manifest> \
+  --s1-decode-capacity <qwen35-4b-cuda-decode-capacity-manifest> \
+  --out <external-out>
 python3 scripts/release/run_gate.py vnext-g01 --g01a <g01a-manifest> --g01b <g01b-manifest> --out <external-out>
 ```
 
 G01A manifest 必须引用 G00F、inventory、public owner map、拆分前后 API/behavior evidence 和 bounded
 tests。其 `unlocks` 只能是 `G01B`/`S1`，不得声称 runtime、模型或性能已迁移。G01B 必须引用 G00F、
-G01A、actual S1 `run`/`serve` artifact 和相同 contract source。aggregate G01 必须逐字节消费两个 child
+G01A、actual S1 `run`/`serve`、capacity-pressure、decode-capacity artifact 和相同 contract source；
+三类 S1 artifact 必须显式传入并逐字节绑定，禁止按目录或“最新文件”隐式发现。aggregate G01 必须逐字节消费两个 child
 manifest并验证 source/contract/model-input freshness；任一 child stale、contract 不同或 facts 不一致时
 拒绝，不能复制 child summary 重新签发 PASS。
 
