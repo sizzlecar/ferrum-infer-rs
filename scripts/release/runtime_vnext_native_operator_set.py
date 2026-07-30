@@ -274,6 +274,7 @@ def validate_native_operator_set(
     entries: dict[str, dict[str, Any]] = {}
     operators: list[str] = []
     operator_binaries: list[dict[str, str]] = []
+    operation_binding_count = 0
 
     def add_entry(
         raw_path: Any,
@@ -357,7 +358,7 @@ def validate_native_operator_set(
         for field in ("required_exports", "operation_bindings", "system_libraries"):
             require(isinstance(raw_artifact.get(field), list), f"{label}.{field} is not a list")
         require(raw_artifact["required_exports"], f"{label}.required_exports is empty")
-        require(raw_artifact["operation_bindings"], f"{label}.operation_bindings is empty")
+        operation_binding_count += len(raw_artifact["operation_bindings"])
 
         for field in SINGLE_EVIDENCE_FIELDS:
             add_evidence(raw_artifact.get(field), f"{label}.{field}")
@@ -393,6 +394,10 @@ def validate_native_operator_set(
     require(
         operators == required,
         "native operator set lock does not cover the required operator set",
+    )
+    require(
+        operation_binding_count > 0,
+        "native operator set must bind at least one live operation/provider",
     )
     members = [entries[path] for path in sorted(entries)]
     require(
@@ -527,7 +532,9 @@ def create_selftest_native_operator_set(
                 "abi_contract_sha256": "4" * 64,
                 "descriptor_export": f"ferrum_fixture_descriptor_{index}",
                 "required_exports": [f"ferrum_fixture_{index}"],
-                "operation_bindings": [
+                "operation_bindings": []
+                if index == 0
+                else [
                     {
                         "operation_id": f"fixture.operation.{index}",
                         "provider_id": f"fixture.provider.{index}",
