@@ -33,7 +33,9 @@ use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
 };
-use ferrum_types::{AttentionExecutionPolicy, NativeOperatorBackend};
+use ferrum_types::{
+    AttentionExecutionPolicy, NativeOperatorBackend, NativeOperatorProviderCatalog,
+};
 use sha2::{Digest, Sha256};
 
 use super::vnext_replay::CudaCommandReplayKeyBuilder;
@@ -257,7 +259,7 @@ pub struct CudaVNextComposition {
 }
 
 impl CudaVNextComposition {
-    pub fn create(
+    fn prepare(
         ordinal: usize,
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
@@ -295,14 +297,6 @@ impl CudaVNextComposition {
         let catalog = weight_materializers
             .augment_catalog(catalog)
             .map_err(contract_error)?;
-        let native_provider_catalog = catalog
-            .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
-            .map_err(contract_error)?;
-        crate::native_ops::validate_compiled_native_operator_provider_catalog(
-            &native_provider_catalog,
-            crate::native_ops::compiled_native_operator_artifacts(),
-        )
-        .map_err(CudaDeviceRuntimeError::contract)?;
         Ok(Self {
             runtime,
             registry,
@@ -310,6 +304,28 @@ impl CudaVNextComposition {
             weight_materializer_id,
             catalog,
         })
+    }
+
+    pub fn create(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let composition = Self::prepare(ordinal, device_id, requested_attention_policy)?;
+        composition.validate_compiled_native_operators()?;
+        Ok(composition)
+    }
+
+    fn validate_compiled_native_operators(&self) -> Result<(), CudaDeviceRuntimeError> {
+        let catalog = &self.catalog;
+        let native_provider_catalog = catalog
+            .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
+            .map_err(contract_error)?;
+        crate::native_ops::validate_compiled_native_operator_provider_catalog(
+            &native_provider_catalog,
+            crate::native_ops::compiled_native_operator_artifacts(),
+        )
+        .map_err(CudaDeviceRuntimeError::contract)
     }
 
     pub fn runtime(&self) -> &Arc<CudaDeviceRuntime> {
@@ -341,6 +357,47 @@ impl CudaVNextComposition {
             self.catalog,
         )
     }
+}
+
+/// Immutable catalog input used to rebuild native artifacts after provider
+/// identity changes. It deliberately exposes no executable runtime.
+pub struct CudaNativeOperatorCatalogInput {
+    provider_catalog: NativeOperatorProviderCatalog,
+    capability_catalog: CapabilityCatalog,
+}
+
+impl CudaNativeOperatorCatalogInput {
+    pub fn provider_catalog(&self) -> &NativeOperatorProviderCatalog {
+        &self.provider_catalog
+    }
+
+    pub fn capability_catalog(&self) -> &CapabilityCatalog {
+        &self.capability_catalog
+    }
+
+    pub fn into_parts(self) -> (NativeOperatorProviderCatalog, CapabilityCatalog) {
+        (self.provider_catalog, self.capability_catalog)
+    }
+}
+
+/// Capture the exact provider identities needed to package a new native
+/// artifact set. Product composition still uses [`CudaVNextComposition::create`]
+/// and cannot bypass compiled-artifact validation.
+pub fn cuda_native_operator_catalog_input(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    let composition =
+        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy)?;
+    let provider_catalog = composition
+        .catalog
+        .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
+        .map_err(contract_error)?;
+    Ok(CudaNativeOperatorCatalogInput {
+        provider_catalog,
+        capability_catalog: composition.catalog,
+    })
 }
 
 pub struct CudaTokenEmbeddingProvider {
