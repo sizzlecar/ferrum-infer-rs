@@ -10,9 +10,9 @@ use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.len() != 5 {
+    if arguments.len() != 6 {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out>",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out>",
             arguments.first().map(String::as_str).unwrap_or("runtime_vnext_cuda_catalog")
         )
         .into());
@@ -21,18 +21,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let policy = AttentionExecutionPolicy::parse_runtime_value(&arguments[2])?;
     let provider_catalog_path = Path::new(&arguments[3]);
     let capability_catalog_path = Path::new(&arguments[4]);
+    let compiled_native_operators_path = Path::new(&arguments[5]);
     let composition =
         CudaVNextComposition::create(ordinal, DeviceId::new(format!("cuda:{ordinal}"))?, policy)?;
     let capability_catalog = composition.catalog();
     let provider_catalog =
         capability_catalog.native_operator_provider_catalog(NativeOperatorBackend::Cuda)?;
+    let compiled_native_operators =
+        ferrum_kernels::native_ops::compiled_native_operator_artifacts();
 
     write_json_create_new(provider_catalog_path, &provider_catalog)?;
     write_json_create_new(capability_catalog_path, capability_catalog)?;
+    write_json_create_new(compiled_native_operators_path, &compiled_native_operators)?;
     println!(
-        "FERRUM RUNTIME VNEXT CUDA LIVE CATALOG READY: provider={} capability={} capability_fingerprint={}",
+        "FERRUM RUNTIME VNEXT CUDA LIVE CATALOG READY: provider={} capability={} compiled_native_operators={} compiled_native_operator_count={} capability_fingerprint={}",
         provider_catalog_path.display(),
         capability_catalog_path.display(),
+        compiled_native_operators_path.display(),
+        compiled_native_operators.len(),
         capability_catalog.fingerprint()?
     );
     Ok(())
