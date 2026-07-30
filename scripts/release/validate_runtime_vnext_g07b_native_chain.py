@@ -2083,6 +2083,9 @@ def verify_lock_and_inventory(
     require(set(lock_by_operator) == set(PACKAGES.values()), "artifact-set operator coverage mismatch")
     require([row["operator"] for row in artifacts] == sorted(PACKAGES.values()), "artifact-set is not sorted")
 
+    manifest_by_operator = {
+        manifest["operator"]: manifest for _, _, manifest in packages.values()
+    }
     inventory_by_operator: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(artifact_inventory):
         row = require_dict(raw, f"artifact inventory[{index}]")
@@ -2094,27 +2097,31 @@ def verify_lock_and_inventory(
         ):
             raise VerificationError(f"invalid compiled operator: {operator}")
         inventory_by_operator[operator] = row
-        lock_row = lock_by_operator[operator]
-        for field in (
-            "operator_abi_version",
-            "ferrum_native_abi_version",
-            "backend",
-            "linkage",
-            "g03_catalog_sha256",
-            "abi_contract_sha256",
-            "descriptor_export",
-            "operation_bindings",
-            "required_exports",
-            "source_package_sha256",
-            "inputs_sha256",
-            "binary_sha256",
-        ):
-            inventory_field = "exports" if field == "required_exports" else field
-            require(
-                row.get(inventory_field) == lock_row.get(field),
-                f"compiled inventory {operator}.{inventory_field} differs from the lock",
-            )
-        require(row.get("schema_version") == 3, f"compiled inventory {operator} schema mismatch")
+        package_manifest = manifest_by_operator[operator]
+        source_package = require_dict(
+            package_manifest.get("source_package"),
+            f"package manifest {operator}.source_package",
+        )
+        expected_inventory = {
+            "schema_version": package_manifest.get("schema_version"),
+            "operator": package_manifest.get("operator"),
+            "operator_abi_version": package_manifest.get("operator_abi_version"),
+            "ferrum_native_abi_version": package_manifest.get("ferrum_native_abi_version"),
+            "backend": package_manifest.get("backend"),
+            "linkage": package_manifest.get("linkage"),
+            "g03_catalog_sha256": package_manifest.get("g03_catalog_sha256"),
+            "abi_contract_sha256": package_manifest.get("abi_contract_sha256"),
+            "descriptor_export": package_manifest.get("descriptor_export"),
+            "operation_bindings": package_manifest.get("operation_bindings"),
+            "exports": package_manifest.get("exports"),
+            "source_package_sha256": source_package.get("sha256"),
+            "inputs_sha256": package_manifest.get("inputs_sha256"),
+            "binary_sha256": package_manifest.get("binary_sha256"),
+        }
+        require(
+            row == expected_inventory,
+            f"compiled inventory {operator} differs from the package manifest bound by the lock",
+        )
     require(set(inventory_by_operator) == set(PACKAGES.values()), "compiled inventory coverage mismatch")
 
 
