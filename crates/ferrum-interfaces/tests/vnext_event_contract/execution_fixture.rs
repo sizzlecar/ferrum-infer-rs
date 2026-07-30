@@ -456,9 +456,14 @@ pub(crate) fn live_witness_emitter_contract(
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
     let lane = ExecutionLane::create(Arc::clone(runtime)).unwrap();
     let step = begin_single_participant_step_on_lane(&batch, &lane);
-    let sink = RecordingSink::default();
-    let mut emitter =
-        ExecutionEventEmitter::new(&sink, active.run_id().clone(), active.request_id().clone());
+    let sink = Arc::new(RecordingSink::default());
+    let durable_sink: Arc<dyn ExecutionEventSink> = sink.clone();
+    let mut emitter = ExecutionEventEmitter::from_shared_with_capture_policy(
+        durable_sink,
+        active.run_id().clone(),
+        active.request_id().clone(),
+        ExecutionEventCapturePolicy::LifecycleOnly,
+    );
     emit_pre_active_prefix(&mut emitter, plan, &active);
     let frame = frame_event(
         plan,
@@ -483,7 +488,11 @@ pub(crate) fn live_witness_emitter_contract(
             )
             .is_ok()
             && emitter.cursor().last_sequence() == 3
-            && sink.kinds.lock().unwrap().last() == Some(&ExecutionEventKind::FrameStarted),
+            && sink.kinds.lock().unwrap().as_slice()
+                == [
+                    ExecutionEventKind::RequestAccepted,
+                    ExecutionEventKind::PlanBuilt,
+                ],
     );
     step.try_retire_normal().unwrap();
     session.try_complete().unwrap();
