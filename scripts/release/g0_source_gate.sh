@@ -4,10 +4,11 @@ export PYTHONDONTWRITEBYTECODE=1
 
 LANE="${1:-}"
 if [[ -z "$LANE" ]]; then
-  echo "usage: scripts/release/g0_source_gate.sh {unit|metal|cuda-smoke|cuda-full|cuda-llama-dense|cuda-llama33-70b-4bit-2x4090-smoke|cuda-llama33-70b-4bit-2x4090|all-source} [OUT_ROOT]" >&2
+  echo "usage: scripts/release/g0_source_gate.sh {unit|metal|cuda-smoke|cuda-full|cuda-llama-dense|cuda-llama33-70b-4bit-2x4090-smoke|cuda-llama33-70b-4bit-2x4090|all-source} [OUT_ROOT] [NATIVE_OPERATOR_SET_LOCK]" >&2
   exit 2
 fi
 OUT_ROOT="${2:-docs/release/g0/source-$(date +%Y%m%d-%H%M%S)}"
+NATIVE_OPERATOR_SET_LOCK="${3:-}"
 mkdir -p "$OUT_ROOT"
 
 pass() { echo "G0 SOURCE ${1} PASS: $OUT_ROOT"; }
@@ -50,6 +51,7 @@ run_unit() {
     scripts/release/openai_tool_call_regression.py \
     scripts/release/runtime_vnext_baseline_gate.py \
     scripts/release/runtime_vnext_inventory.py \
+    scripts/release/native_operator_source_bundle.py \
     scripts/release/runtime_vnext_model_resolver.py \
     scripts/release/runtime_vnext_hardware_probe.py \
     scripts/release/runtime_vnext_build_timing.py \
@@ -258,7 +260,15 @@ run_metal() {
 }
 
 cuda_build() {
-  cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 | tee "$OUT_ROOT/cuda-build.log"
+  if [[ -z "$NATIVE_OPERATOR_SET_LOCK" || ! -f "$NATIVE_OPERATOR_SET_LOCK" || -L "$NATIVE_OPERATOR_SET_LOCK" ]]; then
+    echo "CUDA source lanes require a regular native operator set lock as argument 3" >&2
+    exit 2
+  fi
+  local lock_dir
+  lock_dir="$(cd "$(dirname "$NATIVE_OPERATOR_SET_LOCK")" && pwd -P)"
+  NATIVE_OPERATOR_SET_LOCK="$lock_dir/$(basename "$NATIVE_OPERATOR_SET_LOCK")"
+  FERRUM_NATIVE_OPERATOR_SET_LOCK="$NATIVE_OPERATOR_SET_LOCK" \
+    cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 | tee "$OUT_ROOT/cuda-build.log"
 }
 
 run_cuda_template() {

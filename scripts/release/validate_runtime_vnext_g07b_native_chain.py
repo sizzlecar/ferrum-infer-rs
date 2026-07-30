@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 SOURCE_OBJECT_BUILD_CONTRACT_VERSION = 7
@@ -50,13 +50,13 @@ PACKAGES = {
     "vllm-moe-marlin": "ferrum.cuda.vllm_moe_marlin",
     "vllm-paged-attention-v2": "ferrum.cuda.vllm_paged_attention_v2",
 }
-SOURCE_FEATURES = [
+ARTIFACT_FEATURES = [
     "cuda",
     "vllm-marlin",
     "vllm-moe-marlin",
     "vllm-paged-attn-v2",
+    "native-op-artifact",
 ]
-ARTIFACT_FEATURES = [*SOURCE_FEATURES, "native-op-artifact"]
 EXPECTED_BUILD_UNITS = {
     "marlin",
     "vllm_marlin",
@@ -66,8 +66,6 @@ EXPECTED_BUILD_UNITS = {
 CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION = 1
 EXPECTED_STEPS = {
     "builder-build",
-    "bootstrap-example-build",
-    "bootstrap-catalog-export",
     "assemble-artifact-set",
     "artifact-example-build",
     "artifact-catalog-export",
@@ -1565,6 +1563,7 @@ def verify_binding(binding: Any, providers: dict[tuple[str, str], dict[str, Any]
 def verify_source_build(
     root: Path,
     source_root: Path,
+    native_source_root: Path,
     name: str,
     operator: str,
     source: dict[str, Any],
@@ -1646,11 +1645,10 @@ def verify_source_build(
         and defines == sorted(set(defines)),
         f"{name}.plan.defines must be sorted, unique single arguments",
     )
-    locked_source_root = source_root / "crates/ferrum-kernels"
     for collection in (translation_units, require_list(plan.get("headers"), f"{name}.plan.headers")):
         for row in collection:
             path = resolve_relative_file(
-                locked_source_root,
+                native_source_root,
                 row.get("path"),
                 f"{name}.locked_source.{row.get('path')}",
             )
@@ -2128,38 +2126,29 @@ def verify_lock_and_inventory(
 def verify_catalogs_and_packages(
     root: Path,
     source_root: Path,
+    native_source_root: Path,
     manifest: dict[str, Any],
     source: dict[str, Any],
 ) -> None:
-    bootstrap_provider = root / "bootstrap/provider-catalog.json"
+    catalog_input = root / "catalog-input/provider-catalog.json"
     artifact_provider = root / "artifact/provider-catalog.json"
-    bootstrap_capability = root / "bootstrap/capability-catalog.json"
     artifact_capability = root / "artifact/capability-catalog.json"
-    bootstrap_inventory_path = root / "bootstrap/compiled-native-operators.json"
     artifact_inventory_path = root / "artifact/compiled-native-operators.json"
     for path in (
-        bootstrap_provider,
+        catalog_input,
         artifact_provider,
-        bootstrap_capability,
         artifact_capability,
-        bootstrap_inventory_path,
         artifact_inventory_path,
     ):
         require(path.is_file() and not path.is_symlink(), f"runtime export is missing: {path}")
-    require(bootstrap_provider.read_bytes() == artifact_provider.read_bytes(), "provider catalogs differ")
-    require(bootstrap_capability.read_bytes() == artifact_capability.read_bytes(), "capability catalogs differ")
-    provider_bytes = bootstrap_provider.read_bytes()
-    provider_sha = sha256(bootstrap_provider)
-    providers = verify_provider_catalog(read_json(bootstrap_provider, "bootstrap provider catalog"))
-    bootstrap_inventory = require_list(
-        read_json(bootstrap_inventory_path, "bootstrap compiled inventory"),
-        "bootstrap compiled inventory",
-    )
+    require(catalog_input.read_bytes() == artifact_provider.read_bytes(), "provider catalogs differ")
+    provider_bytes = catalog_input.read_bytes()
+    provider_sha = sha256(catalog_input)
+    providers = verify_provider_catalog(read_json(catalog_input, "G03 provider catalog input"))
     artifact_inventory = require_list(
         read_json(artifact_inventory_path, "artifact compiled inventory"),
         "artifact compiled inventory",
     )
-    require(bootstrap_inventory == [], "bootstrap binary unexpectedly contains native artifacts")
     require(len(artifact_inventory) == 4, "artifact binary must contain exactly four native artifacts")
 
     abi_path = root / "contracts/ferrum-native-abi-v2.json"
@@ -2189,7 +2178,14 @@ def verify_catalogs_and_packages(
 
     package_results: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
     for name, operator in PACKAGES.items():
-        source_receipt, source_plan = verify_source_build(root, source_root, name, operator, source)
+        source_receipt, source_plan = verify_source_build(
+            root,
+            source_root,
+            native_source_root,
+            name,
+            operator,
+            source,
+        )
         package_results[name] = verify_package(
             root,
             source_root,
@@ -2217,8 +2213,7 @@ def verify_catalogs_and_packages(
         == {
             "provider_sha256": provider_sha,
             "provider_identity_unchanged": True,
-            "capability_identity_unchanged": True,
-            "bootstrap_native_operator_count": 0,
+            "input_kind": "explicit-g03-provider-catalog",
             "artifact_native_operator_count": 4,
         },
         "manifest catalog summary mismatch",
@@ -2290,11 +2285,19 @@ def verify_build_summaries(root: Path, manifest: dict[str, Any]) -> None:
             and rows[0]["reason"] == "native-operator-artifact-set",
             f"native artifact {unit} fell back to source",
         )
+    artifact_set_rows = [
+        row for row in summaries if row["artifact"] == "native_operator_artifact_set"
+    ]
+    require(
+        len(artifact_set_rows) == 1
+        and artifact_set_rows[0]["status"] == "linked",
+        "artifact build did not link exactly one native operator artifact set",
+    )
     require(
         not any(row["status"] == "rejected" for row in summaries),
         "artifact build summary contains a rejected build decision",
     )
-    for step in ("bootstrap-catalog-export", "artifact-catalog-export"):
+    for step in ("artifact-catalog-export",):
         output = (root / "steps" / step / "stdout.log").read_text(encoding="utf-8", errors="replace")
         require(
             output.count("FERRUM RUNTIME VNEXT CUDA LIVE CATALOG READY:") == 1,
@@ -2302,9 +2305,15 @@ def verify_build_summaries(root: Path, manifest: dict[str, Any]) -> None:
         )
 
 
-def verify_manifest(root: Path, source_root: Path) -> None:
+def verify_manifest(root: Path, source_root: Path, native_source_root: Path) -> None:
     root = root.resolve()
     source_root = source_root.resolve()
+    native_source_root = native_source_root.resolve()
+    require(
+        native_source_root.is_dir()
+        and not native_source_root.is_relative_to(source_root),
+        "native source root must be an external directory",
+    )
     require(not (root / "failure.json").exists(), "KEEP artifact also contains failure.json")
     manifest = require_dict(read_json(root / "chain.manifest.json", "chain manifest"), "chain manifest")
     require(
@@ -2322,24 +2331,38 @@ def verify_manifest(root: Path, source_root: Path) -> None:
             "gpu_count": 1,
             "gpu_model": "RTX 4090",
             "compute_capability": "sm_89",
-            "source_features": SOURCE_FEATURES,
+            "source_build_units": list(PACKAGES),
             "artifact_features": ARTIFACT_FEATURES,
             "operators": sorted(PACKAGES.values()),
         },
         "chain scope mismatch",
     )
+    require(
+        manifest.get("native_source")
+        == {
+            "root": str(native_source_root),
+            "external_to_repository": True,
+        },
+        "chain native source root binding mismatch",
+    )
     verify_artifact_index(root, manifest)
     source = verify_source(root, source_root, manifest)
     verify_hardware(root, manifest)
     verify_steps(root)
-    verify_catalogs_and_packages(root, source_root, manifest, source)
+    verify_catalogs_and_packages(
+        root,
+        source_root,
+        native_source_root,
+        manifest,
+        source,
+    )
     verify_build_summaries(root, manifest)
     binaries = require_dict(manifest.get("binaries"), "manifest.binaries")
-    for kind in ("bootstrap", "artifact"):
-        path = root / f"binaries/{kind}/runtime_vnext_cuda_catalog"
-        identity = require_dict(binaries.get(kind), f"manifest.binaries.{kind}")
-        require(path.is_file() and not path.is_symlink(), f"{kind} binary is missing")
-        require(sha256(path) == identity.get("sha256"), f"{kind} binary SHA mismatch")
+    require(set(binaries) == {"artifact"}, "manifest binary set mismatch")
+    path = root / "binaries/artifact/runtime_vnext_cuda_catalog"
+    identity = require_dict(binaries.get("artifact"), "manifest.binaries.artifact")
+    require(path.is_file() and not path.is_symlink(), "artifact binary is missing")
+    require(sha256(path) == identity.get("sha256"), "artifact binary SHA mismatch")
 
 
 def expect_reject(action: Any, label: str) -> None:
@@ -2366,6 +2389,15 @@ def self_test() -> None:
             }
             for index, unit in enumerate(sorted(EXPECTED_BUILD_UNITS), start=1)
         ]
+        summary_rows.append(
+            {
+                "artifact": "native_operator_artifact_set",
+                "status": "linked",
+                "reason": "manifest-v3-artifact-set-v5-validated",
+                "elapsed_ms": 1,
+                "inputs_hash": f"sha256:{9:064x}",
+            }
+        )
         summary_path.write_text(
             json.dumps(
                 {
@@ -2378,7 +2410,7 @@ def self_test() -> None:
             + "\n",
             encoding="utf-8",
         )
-        for step in ("bootstrap-catalog-export", "artifact-catalog-export"):
+        for step in ("artifact-catalog-export",):
             step_root = summary_root / "steps" / step
             step_root.mkdir(parents=True)
             (step_root / "stdout.log").write_text(
@@ -3039,6 +3071,7 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(__file__).resolve().parents[2],
     )
+    result.add_argument("--native-source-root", type=Path)
     result.add_argument("--self-test", action="store_true")
     return result
 
@@ -3058,9 +3091,16 @@ def main() -> int:
     if args.artifact_root is None:
         print("--artifact-root is required unless --self-test is used", file=sys.stderr)
         return 2
+    if args.native_source_root is None:
+        print("--native-source-root is required unless --self-test is used", file=sys.stderr)
+        return 2
     root = args.artifact_root.expanduser().resolve()
     try:
-        verify_manifest(root, args.source_root.expanduser().resolve())
+        verify_manifest(
+            root,
+            args.source_root.expanduser().resolve(),
+            args.native_source_root.expanduser().resolve(),
+        )
     except (OSError, subprocess.SubprocessError, VerificationError, ValueError) as error:
         print(
             f"FERRUM RUNTIME VNEXT G07B NATIVE CHAIN KEEP REJECTED: {root}: {error}",

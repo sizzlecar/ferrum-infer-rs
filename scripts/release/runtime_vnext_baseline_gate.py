@@ -5043,11 +5043,34 @@ def validate_inventory(root: Path) -> None:
     require(duplicate_decisions, "coupling-inventory must capture run/serve duplicate decision candidates")
     native = require_list(data.get("large_native_source_trees"), "coupling-inventory.large_native_source_trees")
     require(summary.get("native_source_tree_count") == len(native), "coupling-inventory native tree count mismatch")
-    require(
-        summary.get("large_third_party_native_source_count")
-        == sum(1 for row in native if isinstance(row, dict) and row.get("is_large") is True),
-        "coupling-inventory large native count mismatch",
+    large_native = [
+        row for row in native if isinstance(row, dict) and row.get("is_large") is True
+    ]
+    ownership_aware = all(
+        isinstance(row.get("is_third_party"), bool)
+        and row.get("origin_classification")
+        in {"project-owned", "upstream-vendored"}
+        for row in native
+        if isinstance(row, dict)
     )
+    if ownership_aware:
+        require(
+            summary.get("large_native_source_count") == len(large_native),
+            "coupling-inventory large native count mismatch",
+        )
+        require(
+            summary.get("large_third_party_native_source_count")
+            == sum(row["is_third_party"] for row in large_native),
+            "coupling-inventory large third-party native count mismatch",
+        )
+    else:
+        # Frozen schema-v1 inventories used the third-party field for every
+        # large native root. Preserve validation of those historical artifacts.
+        require(
+            summary.get("large_third_party_native_source_count")
+            == len(large_native),
+            "legacy coupling-inventory large native count mismatch",
+        )
     review = read_json(INVENTORY_REVIEW_PATH)
     require_schema(review, "runtime_vnext_inventory_review")
     require(review.get("reviewed_at_git_sha") == FROZEN_LEGACY_SHA, "inventory review SHA mismatch")
@@ -5089,10 +5112,13 @@ def validate_inventory(root: Path) -> None:
     require(review.get("reviewed_count") == len(reviewed), "inventory review reviewed_count mismatch")
     require(review.get("classification_counts") == classification_counts, "inventory review classification_counts mismatch")
     reviewed_native = require_list(review.get("large_native_content_roots"), "inventory review large native roots")
-    native_keys = {
-        (row.get("tree_key"), row.get("content_root_sha256"))
+    native_by_key = {
+        (row.get("tree_key"), row.get("content_root_sha256")): row
         for row in native
         if isinstance(row, dict) and row.get("is_large") is True
+    }
+    native_keys = {
+        key for key in native_by_key
     }
     review_native_keys: set[tuple[Any, Any]] = set()
     for index, raw in enumerate(reviewed_native):
@@ -5105,6 +5131,12 @@ def validate_inventory(root: Path) -> None:
         require_string(row.get("reason"), f"inventory native review {key}.reason")
         require_string(row.get("owner"), f"inventory native review {key}.owner")
         require(row.get("reviewed_at_git_sha") == FROZEN_LEGACY_SHA, f"inventory native review {key} SHA mismatch")
+        if ownership_aware:
+            require(
+                native_by_key[key].get("origin_classification")
+                == row.get("origin_classification"),
+                f"inventory native review {key} ownership mismatch",
+            )
     require(review_native_keys == native_keys, "inventory native content-root review is stale")
     require(review.get("large_native_content_root_count") == len(native_keys), "inventory review native count mismatch")
     require(review.get("large_native_content_root_reviewed_count") == len(review_native_keys), "inventory review native reviewed count mismatch")

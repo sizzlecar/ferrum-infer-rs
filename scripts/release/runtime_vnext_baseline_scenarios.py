@@ -117,7 +117,7 @@ EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
 CUDA_CORRECTNESS_BUILD_MODE = "cuda-correctness-cache-only"
 CUDA_CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
-CUDA_CORRECTNESS_SCHEMA_VERSION = 4
+CUDA_CORRECTNESS_SCHEMA_VERSION = 5
 CUDA_RELEASE_PLAN_REFERENCE_TYPE = plan_reference.ARTIFACT_TYPE
 CUDA_RELEASE_PLAN_REFERENCE_CASE = plan_reference.CASE_ID
 CUDA_RELEASE_PLAN_REFERENCE_MODEL = plan_reference.MODEL_KEY
@@ -366,6 +366,44 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def native_operator_set_lock_identity(path: Path) -> dict[str, Any]:
+    require(path.is_absolute(), "native operator set lock path must be absolute")
+    require(not path.is_symlink(), "native operator set lock must not be a symlink")
+    require(path.is_file(), f"native operator set lock is missing: {path}")
+    stat = path.stat()
+    require(stat.st_size > 0, "native operator set lock must not be empty")
+    return {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def candidate_build_command(
+    backend: str,
+    native_operator_set_lock: Path | None = None,
+) -> list[str]:
+    require(backend in CANDIDATE_BUILD_COMMANDS, "candidate build backend is unsupported")
+    command = list(CANDIDATE_BUILD_COMMANDS[backend])
+    if backend == "cuda":
+        require(
+            native_operator_set_lock is not None,
+            "CUDA candidate build requires a native operator set lock",
+        )
+        identity = native_operator_set_lock_identity(native_operator_set_lock)
+        return [
+            "env",
+            f"FERRUM_NATIVE_OPERATOR_SET_LOCK={identity['path']}",
+            *command,
+        ]
+    require(
+        native_operator_set_lock is None,
+        "native operator set lock is CUDA-only",
+    )
+    return command
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -911,6 +949,7 @@ def validate_cuda_correctness_build_command(
         "FERRUM_CUDA_NATIVE_BUILD_CACHE",
         "FERRUM_CUDA_NATIVE_IMPORT_DIRS",
         "FERRUM_CUDA_NATIVE_SOURCE_POLICY",
+        "FERRUM_NATIVE_OPERATOR_SET_LOCK",
     }
     require(
         set(environment) == required_keys,
@@ -923,6 +962,44 @@ def validate_cuda_correctness_build_command(
     require(
         environment["FERRUM_CUDA_NATIVE_SOURCE_POLICY"] == "cache-only",
         "CUDA correctness build command is not cache-only",
+    )
+    native_operator_set_lock = require_object(
+        manifest.get("native_operator_set_lock"),
+        "CUDA correctness native operator set lock",
+    )
+    require(
+        set(native_operator_set_lock) == {
+            "path",
+            "sha256",
+            "size_bytes",
+            "mtime_ns",
+        }
+        and Path(
+            require_string(
+                native_operator_set_lock.get("path"),
+                "CUDA correctness native operator set lock path",
+            )
+        ).is_absolute()
+        and require_sha256(
+            native_operator_set_lock.get("sha256"),
+            "CUDA correctness native operator set lock sha256",
+        )
+        and require_count(
+            native_operator_set_lock.get("size_bytes"),
+            "CUDA correctness native operator set lock size_bytes",
+            minimum=1,
+        )
+        and require_count(
+            native_operator_set_lock.get("mtime_ns"),
+            "CUDA correctness native operator set lock mtime_ns",
+            minimum=1,
+        ),
+        "CUDA correctness native operator set lock identity is invalid",
+    )
+    require(
+        environment["FERRUM_NATIVE_OPERATOR_SET_LOCK"]
+        == native_operator_set_lock["path"],
+        "CUDA correctness native operator set lock command binding mismatch",
     )
     require(
         Path(environment["CARGO_TARGET_DIR"]).is_absolute()
@@ -1146,6 +1223,7 @@ def validate_cuda_correctness_build_artifact(
         "target_dir",
         "native_build_cache",
         "native_import_dirs",
+        "native_operator_set_lock",
         "semantic_plan_contract",
     ):
         expected_value = (
@@ -1189,6 +1267,20 @@ def validate_cuda_correctness_build_artifact(
         "direct_nvcc_invocations",
     ):
         require(native_signal.get(key) == [], f"CUDA correctness {key} must be empty")
+    artifact_set_summaries = [
+        require_object(row, "CUDA correctness native build summary")
+        for row in require_list(
+            native_signal.get("build_summaries"),
+            "CUDA correctness native build summaries",
+        )
+        if isinstance(row, dict)
+        and row.get("artifact") == "native_operator_artifact_set"
+    ]
+    require(
+        len(artifact_set_summaries) == 1
+        and artifact_set_summaries[0].get("status") == "linked",
+        "CUDA correctness build did not link exactly one native operator artifact set",
+    )
     inventory = require_list(
         plan.get("native_import_inventory"),
         "CUDA correctness native import inventory",
@@ -1430,7 +1522,50 @@ def validate_candidate_build_receipt(
             )
         return receipt, receipt_path, file_sha256(receipt_path), binary_path
     require(build_mode == "release", "candidate build mode is unsupported")
-    build_command = CANDIDATE_BUILD_COMMANDS[backend]
+    if backend == "cuda":
+        native_operator_set_lock = require_object(
+            receipt.get("native_operator_set_lock"),
+            "candidate CUDA native operator set lock",
+        )
+        require(
+            set(native_operator_set_lock)
+            == {"path", "sha256", "size_bytes", "mtime_ns"}
+            and Path(
+                require_string(
+                    native_operator_set_lock.get("path"),
+                    "candidate CUDA native operator set lock path",
+                )
+            ).is_absolute()
+            and require_sha256(
+                native_operator_set_lock.get("sha256"),
+                "candidate CUDA native operator set lock sha256",
+            )
+            and require_count(
+                native_operator_set_lock.get("size_bytes"),
+                "candidate CUDA native operator set lock size_bytes",
+                minimum=1,
+            )
+            and require_count(
+                native_operator_set_lock.get("mtime_ns"),
+                "candidate CUDA native operator set lock mtime_ns",
+                minimum=1,
+            ),
+            "candidate CUDA native operator set lock identity is invalid",
+        )
+        build_command = [
+            "env",
+            (
+                "FERRUM_NATIVE_OPERATOR_SET_LOCK="
+                f"{native_operator_set_lock['path']}"
+            ),
+            *CANDIDATE_BUILD_COMMANDS[backend],
+        ]
+    else:
+        require(
+            "native_operator_set_lock" not in receipt,
+            "Metal candidate build unexpectedly carries a native operator set lock",
+        )
+        build_command = CANDIDATE_BUILD_COMMANDS[backend]
     require(receipt.get("command") == build_command, "candidate build command is not canonical")
     require(receipt.get("returncode") == 0, "candidate build returncode must be 0")
     recorded_artifact_root = Path(
@@ -10934,6 +11069,24 @@ def make_candidate_build_receipt_fixture(
 ) -> dict[str, str]:
     backend = require_string(manifest.get("backend"), "candidate build fixture backend")
     build_root = root / "build/candidate"
+    native_operator_set_lock: dict[str, Any] | None = None
+    native_operator_set_lock_path: Path | None = None
+    if backend == "cuda":
+        native_operator_set_lock_path = (
+            build_root / "fixture-native-operator-set.lock.json"
+        ).resolve()
+        native_operator_set_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        native_operator_set_lock_path.write_text(
+            '{"schema_version":1,"fixture":true}\n',
+            encoding="utf-8",
+        )
+        native_operator_set_lock = native_operator_set_lock_identity(
+            native_operator_set_lock_path
+        )
+    build_command = candidate_build_command(
+        backend,
+        native_operator_set_lock_path,
+    )
     stdout_path = build_root / "stdout.log"
     stderr_path = build_root / "stderr.log"
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -10973,7 +11126,7 @@ def make_candidate_build_receipt_fixture(
         bounded_path,
         {
             "schema": "ferrum.bounded-command-receipt.v1",
-            "command": CANDIDATE_BUILD_COMMANDS[backend],
+            "command": build_command,
             "cwd": str(REPO_ROOT),
             "pid": 4242,
             "pgid": 4242,
@@ -11017,41 +11170,41 @@ def make_candidate_build_receipt_fixture(
         },
     )
     receipt_path = build_root / "candidate-build-receipt.json"
-    write_json(
-        receipt_path,
-        {
-            "schema_version": SCHEMA_VERSION,
-            "artifact_type": CANDIDATE_BUILD_RECEIPT_TYPE,
-            "status": "pass",
-            "execution_contract": G08_EXECUTION_CONTRACT,
-            "source_git_sha": manifest["source_git_sha"],
-            "source_tree_sha": manifest["source_tree_sha"],
-            "dirty_status": {"is_dirty": False, "status_short": []},
-            "hardware_id": manifest["hardware_id"],
-            "backend": backend,
-            "artifact_root": str(root.resolve()),
-            "repository_root": str(REPO_ROOT),
-            "source_observations": {
-                phase: {
-                    "source_git_sha": manifest["source_git_sha"],
-                    "source_tree_sha": manifest["source_tree_sha"],
-                    "dirty_status": {"is_dirty": False, "status_short": []},
-                }
-                for phase in ("before", "after")
-            },
-            "command": CANDIDATE_BUILD_COMMANDS[backend],
-            "returncode": 0,
-            "started_at": started_at,
-            "finished_at": ended_at,
-            "duration_sec": 5.0,
-            "binary_artifact": manifest["binary_artifact"],
-            "binary_sha256": manifest["binary_sha256"],
-            "bounded_receipt": existing_artifact_ref(root, bounded_path, "raw-json"),
-            "stdout": stdout_ref,
-            "stderr": stderr_ref,
-            "probe_artifacts": probes,
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": CANDIDATE_BUILD_RECEIPT_TYPE,
+        "status": "pass",
+        "execution_contract": G08_EXECUTION_CONTRACT,
+        "source_git_sha": manifest["source_git_sha"],
+        "source_tree_sha": manifest["source_tree_sha"],
+        "dirty_status": {"is_dirty": False, "status_short": []},
+        "hardware_id": manifest["hardware_id"],
+        "backend": backend,
+        "artifact_root": str(root.resolve()),
+        "repository_root": str(REPO_ROOT),
+        "source_observations": {
+            phase: {
+                "source_git_sha": manifest["source_git_sha"],
+                "source_tree_sha": manifest["source_tree_sha"],
+                "dirty_status": {"is_dirty": False, "status_short": []},
+            }
+            for phase in ("before", "after")
         },
-    )
+        "command": build_command,
+        "returncode": 0,
+        "started_at": started_at,
+        "finished_at": ended_at,
+        "duration_sec": 5.0,
+        "binary_artifact": manifest["binary_artifact"],
+        "binary_sha256": manifest["binary_sha256"],
+        "bounded_receipt": existing_artifact_ref(root, bounded_path, "raw-json"),
+        "stdout": stdout_ref,
+        "stderr": stderr_ref,
+        "probe_artifacts": probes,
+    }
+    if native_operator_set_lock is not None:
+        receipt["native_operator_set_lock"] = native_operator_set_lock
+    write_json(receipt_path, receipt)
     return existing_artifact_ref(root, receipt_path, "raw-json")
 
 

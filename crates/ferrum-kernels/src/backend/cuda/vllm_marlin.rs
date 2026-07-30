@@ -1,4 +1,4 @@
-//! Rust FFI binding for the vendored vLLM Marlin port.
+//! Rust FFI binding for the versioned vLLM Marlin native operator artifact.
 //!
 //! Marlin compiles one CUDA specialization per supported scalar combination,
 //! but all Rust callers share one versioned C launch ABI. Rust exposes a typed

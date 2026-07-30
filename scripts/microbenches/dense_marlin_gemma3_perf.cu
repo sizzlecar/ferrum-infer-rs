@@ -3,12 +3,12 @@
 //
 // Goal: validate dense Marlin kernel/tile hypotheses without loading a model
 // or rebuilding the Rust workspace. This directly calls `marlin_cuda` from
-// crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu with synthetic buffers.
+// the locked native-source bundle's marlin_cuda_kernel.cu with synthetic buffers.
 //
 // Build:
 //   nvcc -O3 -arch=sm_89 -std=c++17 \
 //     scripts/microbenches/dense_marlin_gemma3_perf.cu \
-//     crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu \
+//     $FERRUM_NATIVE_SOURCE_ROOT/kernels/marlin_cuda_kernel.cu \
 //     -lcuda -lcudart -o /tmp/dense_marlin_gemma3_perf
 
 #include <cuda_runtime.h>

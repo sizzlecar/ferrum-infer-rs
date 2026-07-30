@@ -14,11 +14,12 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/workspace/ferrum-infer-rs}"
 cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/microbenches/resolve_native_source_root.sh"
 
 NVCC="${NVCC:-nvcc}"
 ARCH="${ARCH:-sm_89}"
 SRC="scripts/microbenches/dense_triton_w4a16_gemma3_perf.cu"
-KERNEL_SRC="crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu"
+KERNEL_SRC="$FERRUM_NATIVE_SOURCE_ROOT/kernels/marlin_cuda_kernel.cu"
 PTX="${PTX:-crates/ferrum-kernels/triton_ptx/w4a16_gptq_f16.ptx}"
 OUT_BIN="${OUT_BIN:-/tmp/dense_triton_w4a16_gemma3_perf}"
 

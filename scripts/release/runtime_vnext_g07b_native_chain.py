@@ -25,14 +25,14 @@ import bounded_command
 import validate_runtime_vnext_g07b_native_chain as independent_validator
 
 
-SCHEMA_VERSION = 1
-SOURCE_FEATURES = (
+SCHEMA_VERSION = 2
+ARTIFACT_FEATURES = (
     "cuda",
     "vllm-marlin",
     "vllm-moe-marlin",
     "vllm-paged-attn-v2",
+    "native-op-artifact",
 )
-ARTIFACT_FEATURES = (*SOURCE_FEATURES, "native-op-artifact")
 PACKAGES = (
     "marlin",
     "vllm-marlin",
@@ -242,7 +242,7 @@ def cargo_build_command(
     target_dir: Path,
     cargo_jobs: int,
     features: Sequence[str],
-    artifact_lock: Path | None,
+    artifact_lock: Path,
     native_cache: Path,
     compute_capability: str,
     nvcc_threads: int,
@@ -256,15 +256,12 @@ def cargo_build_command(
         f"FERRUM_NVCC_THREADS={nvcc_threads}",
         f"FERRUM_CUDA_NATIVE_BUILD_CACHE={native_cache}",
     ]
-    if artifact_lock is not None:
-        environment.extend(
-            [
-                f"FERRUM_NATIVE_OPERATOR_SET_LOCK={artifact_lock}",
-                "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only",
-            ]
-        )
-    else:
-        environment.append("FERRUM_CUDA_NATIVE_SOURCE_POLICY=allow")
+    environment.extend(
+        [
+            f"FERRUM_NATIVE_OPERATOR_SET_LOCK={artifact_lock}",
+            "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only",
+        ]
+    )
     if build_summary_receipt is not None:
         environment.append(f"FERRUM_CUDA_BUILD_SUMMARY_RECEIPT={build_summary_receipt}")
     return [
@@ -345,16 +342,14 @@ def validate_chain(
     root: Path,
     source: dict[str, Any],
     hardware: dict[str, Any],
-    bootstrap_paths: dict[str, Path],
+    native_source_root: Path,
+    catalog_input_path: Path,
     artifact_paths: dict[str, Path],
     lock_path: Path,
     abi_contract_path: Path,
-    bootstrap_binary: Path,
     artifact_binary: Path,
 ) -> dict[str, Any]:
-    bootstrap_inventory = read_json(bootstrap_paths["inventory"], "bootstrap native inventory")
     artifact_inventory = read_json(artifact_paths["inventory"], "artifact native inventory")
-    require(bootstrap_inventory == [], "source bootstrap unexpectedly linked native artifacts")
     require(isinstance(artifact_inventory, list), "artifact native inventory must be an array")
     operators = {
         row.get("operator")
@@ -363,14 +358,10 @@ def validate_chain(
     }
     require(operators == EXPECTED_OPERATORS, f"artifact operator set mismatch: {operators}")
 
-    provider_sha = sha256(bootstrap_paths["provider"])
+    provider_sha = sha256(catalog_input_path)
     require(
-        bootstrap_paths["provider"].read_bytes() == artifact_paths["provider"].read_bytes(),
-        "provider catalog changed after linking native artifacts",
-    )
-    require(
-        bootstrap_paths["capability"].read_bytes() == artifact_paths["capability"].read_bytes(),
-        "capability catalog changed after linking native artifacts",
+        catalog_input_path.read_bytes() == artifact_paths["provider"].read_bytes(),
+        "artifact runtime provider catalog differs from the explicit G03 catalog input",
     )
     for row in artifact_inventory:
         require(isinstance(row, dict), "artifact inventory row must be an object")
@@ -459,6 +450,13 @@ def validate_chain(
         ),
         f"artifact build unexpectedly used native source: {artifact_rows}",
     )
+    artifact_set_rows = [
+        row for row in summaries if row["artifact"] == "native_operator_artifact_set"
+    ]
+    require(
+        len(artifact_set_rows) == 1 and artifact_set_rows[0]["status"] == "linked",
+        "artifact build did not resolve and link exactly one native operator artifact set",
+    )
     require(
         not any(row["status"] == "rejected" for row in summaries),
         "artifact build summary contains a rejected build decision",
@@ -471,20 +469,23 @@ def validate_chain(
         "created_at": now_iso(),
         "source": source,
         "hardware": hardware,
+        "native_source": {
+            "root": str(native_source_root),
+            "external_to_repository": True,
+        },
         "scope": {
             "backend": "cuda",
             "gpu_count": 1,
             "gpu_model": "RTX 4090",
             "compute_capability": "sm_89",
-            "source_features": list(SOURCE_FEATURES),
+            "source_build_units": list(PACKAGES),
             "artifact_features": list(ARTIFACT_FEATURES),
             "operators": sorted(EXPECTED_OPERATORS),
         },
         "catalog": {
             "provider_sha256": provider_sha,
             "provider_identity_unchanged": True,
-            "capability_identity_unchanged": True,
-            "bootstrap_native_operator_count": 0,
+            "input_kind": "explicit-g03-provider-catalog",
             "artifact_native_operator_count": len(artifact_inventory),
         },
         "abi_contract": {
@@ -498,10 +499,6 @@ def validate_chain(
             "operator_count": len(lock_artifacts),
         },
         "binaries": {
-            "bootstrap": {
-                "path": str(bootstrap_binary),
-                "sha256": sha256(bootstrap_binary),
-            },
             "artifact": {
                 "path": str(artifact_binary),
                 "sha256": sha256(artifact_binary),
@@ -527,11 +524,22 @@ def validate_chain(
 
 def execute(args: argparse.Namespace) -> Path:
     source_root = args.source_root.expanduser().resolve()
+    native_source_root = args.native_source_root.expanduser().resolve()
+    g03_provider_catalog = args.g03_provider_catalog.expanduser().resolve()
     out = args.out.expanduser().resolve()
     target_dir = args.target_dir.expanduser().resolve()
     object_cache = args.object_cache.expanduser().resolve()
     native_cache = args.native_cache.expanduser().resolve()
     require(source_root.is_dir(), f"source root is missing: {source_root}")
+    require(
+        native_source_root.is_dir()
+        and not native_source_root.is_relative_to(source_root),
+        "--native-source-root must be an existing directory outside the Git source tree",
+    )
+    require(
+        g03_provider_catalog.is_file() and not g03_provider_catalog.is_symlink(),
+        f"G03 provider catalog is missing: {g03_provider_catalog}",
+    )
     require(not out.exists(), f"output already exists: {out}")
     require(not out.is_relative_to(source_root), "--out must be outside the Git source tree")
     require(args.compute_capability == "sm_89", "G07B fixed lane requires --compute-capability sm_89")
@@ -565,6 +573,9 @@ def execute(args: argparse.Namespace) -> Path:
         source_root / "native-operators/abi/ferrum-native-abi-v2.json",
         abi_contract,
     )
+    catalog_input = out / "catalog-input/provider-catalog.json"
+    catalog_input.parent.mkdir(parents=True)
+    shutil.copy2(g03_provider_catalog, catalog_input)
     write_json(
         out / "lane-plan.json",
         {
@@ -574,7 +585,7 @@ def execute(args: argparse.Namespace) -> Path:
             "expected_runtime_seconds": args.expected_runtime_seconds,
             "hard_deadline_seconds": args.hard_timeout_seconds,
             "hard_stop": "first failed bounded step, catalog drift, source fallback, or runtime binding rejection",
-            "correctness_gate": "source and artifact catalog exports must be byte-identical; runtime inventory must be 0 then exactly 4",
+            "correctness_gate": "artifact catalog must equal the explicit G03 input; runtime inventory must contain exactly four verified operators",
             "performance_command": "not applicable; G07B validates build/runtime selection, not model throughput",
             "progress_signal": "per-step bounded receipts, log byte growth, and newly materialized package/artifact files",
         },
@@ -604,45 +615,6 @@ def execute(args: argparse.Namespace) -> Path:
     builder = target_dir / "release/ferrum-native-ops-builder"
     require(builder.is_file() and os.access(builder, os.X_OK), f"builder binary is missing: {builder}")
 
-    run_step(
-        root=out,
-        step_id="bootstrap-example-build",
-        cwd=source_root,
-        command=cargo_build_command(
-            target_dir=target_dir,
-            cargo_jobs=args.cargo_jobs,
-            features=SOURCE_FEATURES,
-            artifact_lock=None,
-            native_cache=native_cache,
-            compute_capability=args.compute_capability,
-            nvcc_threads=args.nvcc_threads,
-            build_summary_receipt=None,
-        ),
-        expected_duration_seconds=args.bootstrap_expected_seconds,
-        deadline_seconds=args.bootstrap_timeout_seconds,
-        progress_signal="Cargo log growth, CPU activity, or native-cache file growth",
-        lane_deadline_monotonic=lane_deadline_monotonic,
-    )
-    built_example = target_dir / "cuda-correctness/examples/runtime_vnext_cuda_catalog"
-    require(built_example.is_file(), f"bootstrap catalog example is missing: {built_example}")
-    bootstrap_binary = out / "binaries/bootstrap/runtime_vnext_cuda_catalog"
-    bootstrap_binary.parent.mkdir(parents=True)
-    shutil.copy2(built_example, bootstrap_binary)
-    bootstrap_paths = run_catalog_export(
-        root=out,
-        step_id="bootstrap-catalog-export",
-        source_root=source_root,
-        binary=bootstrap_binary,
-        output_root=out / "bootstrap",
-        cuda_ordinal=args.cuda_ordinal,
-        attention_policy=args.attention_policy,
-        lane_deadline_monotonic=lane_deadline_monotonic,
-    )
-    require(
-        read_json(bootstrap_paths["inventory"], "bootstrap native inventory") == [],
-        "bootstrap binary unexpectedly contains native artifacts",
-    )
-
     specs_root = out / "package-specs"
     specs_root.mkdir()
     for name in PACKAGES:
@@ -656,7 +628,7 @@ def execute(args: argparse.Namespace) -> Path:
                 "--definition",
                 str(source_root / f"native-operators/cuda/package-definitions/{name}.json"),
                 "--g03-catalog",
-                str(bootstrap_paths["provider"]),
+                str(catalog_input),
                 "--out",
                 str(specs_root / f"{name}.json"),
             ],
@@ -682,7 +654,7 @@ def execute(args: argparse.Namespace) -> Path:
                 "--plan",
                 str(source_root / f"native-operators/cuda/source-locks/{name}.plan.json"),
                 "--source-root",
-                str(source_root / "crates/ferrum-kernels"),
+                str(native_source_root),
                 "--compute-capability",
                 args.compute_capability,
                 "--builder-sha",
@@ -718,7 +690,7 @@ def execute(args: argparse.Namespace) -> Path:
                 "--spec",
                 str(specs_root / f"{name}.json"),
                 "--source-root",
-                str(source_root / "crates/ferrum-kernels"),
+                str(native_source_root),
                 "--license-root",
                 str(source_root),
                 "--source-build-receipt",
@@ -726,7 +698,7 @@ def execute(args: argparse.Namespace) -> Path:
                 "--source-build-plan",
                 str(source_root / f"native-operators/cuda/source-locks/{name}.plan.json"),
                 "--g03-catalog",
-                str(bootstrap_paths["provider"]),
+                str(catalog_input),
                 "--abi-contract",
                 str(source_root / "native-operators/abi/ferrum-native-abi-v2.json"),
                 "--out",
@@ -744,7 +716,7 @@ def execute(args: argparse.Namespace) -> Path:
 
     receipt_paths = [packages_root / name / "package.receipt.json" for name in PACKAGES]
     receipt_hashes = [sha256(path) for path in receipt_paths]
-    provider_sha = sha256(bootstrap_paths["provider"])
+    provider_sha = sha256(catalog_input)
     lock_path = out / "native-operators.lock.json"
     assemble_command = [str(builder), "assemble-set"]
     for receipt in receipt_paths:
@@ -792,6 +764,7 @@ def execute(args: argparse.Namespace) -> Path:
         progress_signal="Cargo log growth and linker activity; native source compilation is a stop condition",
         lane_deadline_monotonic=lane_deadline_monotonic,
     )
+    built_example = target_dir / "cuda-correctness/examples/runtime_vnext_cuda_catalog"
     require(built_example.is_file(), f"artifact catalog example is missing: {built_example}")
     artifact_binary = out / "binaries/artifact/runtime_vnext_cuda_catalog"
     artifact_binary.parent.mkdir(parents=True)
@@ -813,23 +786,25 @@ def execute(args: argparse.Namespace) -> Path:
         root=out,
         source=source,
         hardware=hardware,
-        bootstrap_paths=bootstrap_paths,
+        native_source_root=native_source_root,
+        catalog_input_path=catalog_input,
         artifact_paths=artifact_paths,
         lock_path=lock_path,
         abi_contract_path=abi_contract,
-        bootstrap_binary=bootstrap_binary,
         artifact_binary=artifact_binary,
     )
     manifest["artifacts"] = artifact_index(out)
     manifest["artifact_count"] = len(manifest["artifacts"])
     write_json(out / "chain.manifest.json", manifest)
-    independent_validator.verify_manifest(out, source_root)
+    independent_validator.verify_manifest(out, source_root, native_source_root)
     return out
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     result.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2])
+    result.add_argument("--native-source-root", type=Path, required=True)
+    result.add_argument("--g03-provider-catalog", type=Path, required=True)
     result.add_argument("--out", type=Path, required=True)
     result.add_argument("--target-dir", type=Path, required=True)
     result.add_argument("--object-cache", type=Path, required=True)
@@ -846,8 +821,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--nvcc-threads", type=int, choices=(4,), default=4)
     result.add_argument("--expected-runtime-seconds", type=int, default=3600)
     result.add_argument("--hard-timeout-seconds", type=int, default=5400)
-    result.add_argument("--bootstrap-expected-seconds", type=int, default=600)
-    result.add_argument("--bootstrap-timeout-seconds", type=int, default=1800)
     result.add_argument("--source-build-expected-seconds", type=int, default=300)
     result.add_argument("--source-build-timeout-seconds", type=int, default=1200)
     result.add_argument("--artifact-build-expected-seconds", type=int, default=120)

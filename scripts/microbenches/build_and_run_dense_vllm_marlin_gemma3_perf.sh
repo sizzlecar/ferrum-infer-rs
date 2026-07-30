@@ -3,7 +3,7 @@
 # Build + run the standalone dense vLLM Marlin Gemma3 native-CUDA probe.
 #
 # This intentionally bypasses Cargo and product model loading. It builds a
-# temporary, selector-enabled copy of the vendored vLLM dense Marlin source
+# temporary, selector-enabled copy of the verified vLLM dense Marlin bundle
 # with only the FP16/U4B8 selector branches needed by Gemma3 m=16/23/32 shapes.
 #
 # Usage:
@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPO_ROOT="${REPO_ROOT:-$DEFAULT_REPO_ROOT}"
 cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/microbenches/resolve_native_source_root.sh"
 
 NVCC="${NVCC:-nvcc}"
 ARCH="${ARCH:-sm_89}"
@@ -24,7 +25,7 @@ SRC="scripts/microbenches/dense_vllm_marlin_gemma3_perf.cu"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
-cp -R crates/ferrum-kernels/vllm_marlin "$BUILD_DIR/vllm_marlin"
+cp -R "$FERRUM_NATIVE_SOURCE_ROOT/vllm_marlin" "$BUILD_DIR/vllm_marlin"
 
 cat > "$BUILD_DIR/vllm_marlin/kernel_selector.h" <<'EOF'
 // Minimal selector for dense_vllm_marlin_gemma3_perf.cu.

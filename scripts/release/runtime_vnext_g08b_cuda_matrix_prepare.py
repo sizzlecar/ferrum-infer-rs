@@ -318,8 +318,37 @@ def validate_checked_in_lock(spec: BackendSpec) -> dict[str, Any]:
     return {"document": document, "sources": sources}
 
 
-def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
+def build_candidate(
+    root: Path,
+    hardware_id: str,
+    spec: BackendSpec,
+    native_operator_set_lock: Path | None,
+) -> Path:
     require(hardware_id.strip() == hardware_id and hardware_id, "hardware id must be non-empty and trimmed")
+    if spec.backend == "cuda":
+        require(
+            native_operator_set_lock is not None,
+            "CUDA candidate build requires --native-operator-set-lock",
+        )
+        require(
+            not native_operator_set_lock.is_symlink()
+            and native_operator_set_lock.is_file(),
+            "CUDA native operator set lock must be a regular non-symlink file",
+        )
+        native_operator_set_lock = native_operator_set_lock.resolve()
+        native_operator_set_lock_identity = (
+            matrix.native_operator_set_lock_identity(native_operator_set_lock)
+        )
+    else:
+        require(
+            native_operator_set_lock is None,
+            "--native-operator-set-lock is CUDA-only",
+        )
+        native_operator_set_lock_identity = None
+    build_command = matrix.candidate_build_command(
+        spec.backend,
+        native_operator_set_lock,
+    )
     receipt_path = root / BUILD_RECEIPT_REL
     binary_path = root / BUILD_BINARY_REL
     require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
@@ -333,7 +362,7 @@ def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
     stdout_path = root / BUILD_DIR / "stdout.log"
     stderr_path = root / BUILD_DIR / "stderr.log"
     wrapper_rc, bounded_receipt = bounded_command.run_bounded_command(
-        command=matrix.CANDIDATE_BUILD_COMMANDS[spec.backend],
+        command=build_command,
         cwd=REPO_ROOT,
         receipt_path=bounded_path,
         stdout_path=stdout_path,
@@ -399,7 +428,7 @@ def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
         "artifact_root": str(root),
         "repository_root": str(REPO_ROOT),
         "source_observations": {"before": before, "after": after},
-        "command": matrix.CANDIDATE_BUILD_COMMANDS[spec.backend],
+        "command": build_command,
         "build_environment": {
             key: os.environ[key]
             for key in BUILD_ENV_KEYS
@@ -417,6 +446,8 @@ def build_candidate(root: Path, hardware_id: str, spec: BackendSpec) -> Path:
         "stderr": stderr_ref,
         "probe_artifacts": probes,
     }
+    if native_operator_set_lock_identity is not None:
+        receipt["native_operator_set_lock"] = native_operator_set_lock_identity
     write_json(receipt_path, receipt)
     matrix.validate_candidate_build_receipt(
         root,
@@ -681,6 +712,34 @@ def self_test(spec: BackendSpec) -> None:
         prefix=spec.selftest_temp_prefix
     ) as tmp:
         root = Path(tmp)
+        if spec.backend == "cuda":
+            try:
+                matrix.candidate_build_command("cuda")
+            except matrix.ScenarioError as error:
+                require(
+                    "requires a native operator set lock" in str(error),
+                    f"missing CUDA lock failed for an unexpected reason: {error}",
+                )
+            else:
+                raise AssertionError("CUDA candidate build accepted a missing native lock")
+            native_lock = (root / "native-operator-set.lock.json").resolve()
+            native_lock.write_text('{"schema_version":1}\n', encoding="utf-8")
+            candidate_command = matrix.candidate_build_command("cuda", native_lock)
+            require(
+                candidate_command[:2]
+                == [
+                    "env",
+                    f"FERRUM_NATIVE_OPERATOR_SET_LOCK={native_lock}",
+                ]
+                and candidate_command[2:] == matrix.CANDIDATE_BUILD_COMMANDS["cuda"],
+                "CUDA candidate build command did not bind its explicit native lock",
+            )
+        else:
+            require(
+                matrix.candidate_build_command("metal")
+                == matrix.CANDIDATE_BUILD_COMMANDS["metal"],
+                "Metal candidate build command drifted",
+            )
         blob = root / "blobs" / ("a" * 64)
         blob.parent.mkdir(parents=True)
         blob.write_bytes(b"locked GGUF bytes\n")
@@ -778,6 +837,7 @@ def parse_args(
     )
     build_parser.add_argument("--artifact-root", required=True)
     build_parser.add_argument("--hardware-id", required=True)
+    build_parser.add_argument("--native-operator-set-lock", type=Path)
     bind_parser = subparsers.add_parser(
         "bind-correctness",
         help="import and bind a cache-only CUDA correctness binary",
@@ -820,6 +880,7 @@ def main(
                 artifact_root(args.artifact_root),
                 args.hardware_id,
                 spec,
+                args.native_operator_set_lock,
             )
         elif args.command == "bind-correctness":
             bind_cuda_correctness_artifact(

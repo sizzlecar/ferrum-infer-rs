@@ -18,6 +18,9 @@ RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
 RUN_GATE = REPO_ROOT / "scripts/release/run_gate.py"
 RUNTIME_VNEXT_BASELINE_GATE = REPO_ROOT / "scripts/release/runtime_vnext_baseline_gate.py"
 RUNTIME_VNEXT_INVENTORY = REPO_ROOT / "scripts/release/runtime_vnext_inventory.py"
+NATIVE_OPERATOR_SOURCE_BUNDLE = (
+    REPO_ROOT / "scripts/release/native_operator_source_bundle.py"
+)
 RUNTIME_VNEXT_MODEL_RESOLVER = REPO_ROOT / "scripts/release/runtime_vnext_model_resolver.py"
 RUNTIME_VNEXT_HARDWARE_PROBE = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
 RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
@@ -421,6 +424,12 @@ def test_runtime_vnext_inventory_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_INVENTORY), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("RUNTIME VNEXT INVENTORY SELF-TEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_native_operator_source_bundle_selftest() -> None:
+    ok = run([sys.executable, str(NATIVE_OPERATOR_SOURCE_BUNDLE), "self-test"])
+    require(ok.returncode == 0, ok.stderr)
+    require("FERRUM NATIVE SOURCE BUNDLE SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
 def test_runtime_vnext_model_resolver_selftest() -> None:
@@ -1153,6 +1162,7 @@ def main() -> int:
     test_release_binary_gate_staged_asset_path()
     test_runtime_vnext_baseline_gate_selftest()
     test_runtime_vnext_inventory_selftest()
+    test_native_operator_source_bundle_selftest()
     test_runtime_vnext_model_resolver_selftest()
     test_runtime_vnext_hardware_probe_selftest()
     test_runtime_vnext_build_timing_selftest()

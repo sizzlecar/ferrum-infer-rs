@@ -34,35 +34,24 @@ sha2 = "0.10"
 
 [features]
 default = []
-cuda = ["dep:cudarc", "marlin", "cudarc?/nccl"]
+cuda = ["dep:cudarc", "marlin", "native-op-artifact", "cudarc?/nccl"]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
 metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
-marlin = []  # Marlin INT4xFP16 kernel (auto-enabled by cuda)
-vllm-marlin = ["cuda"]  # vLLM gptq_marlin port (Phase 12). NOT enabled by default
-                        # — opt-in until correctness + perf validated. Adds
-                        # ~30 min to first build (compiles 19 .cu instantiations).
-vllm-moe-marlin = ["cuda", "vllm-marlin"]  # vLLM marlin_moe_wna16 port (Stage
-                        # 14). NOT enabled by default — opt-in. Adds ~15 min to
-                        # first build (single .cu with many template
-                        # instantiations). Pulls in vllm-marlin because the
-                        # MoE path needs the gptq_marlin_repack helper to
-                        # convert GPTQ-on-disk → vLLM-Marlin tile layout.
-vllm-paged-attn-v2 = ["cuda"]  # vLLM paged_attention_v2 port (2026-05-12).
-                        # Vendored from vllm v0.20.2 csrc/attention/. Single
-                        # template instantiation (HEAD=128, BLOCK=16, FP16) —
-                        # ~1-2 min compile. Bench expected to switch c=32 attn
-                        # from `paged_batched_flash_decode_attn_f16` to vLLM's
-                        # v2 multi-partition kernel. Pairs with the
-                        # `split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16`
-                        # PTX kernel which writes the vLLM K/V layout vLLM v2
-                        # expects (`[blocks, heads, head/x, block, x]` K).
-                        # Runtime selection via `FERRUM_USE_VLLM_PAGED_ATTN=1`.
+marlin = []  # Marlin INT4xFP16 native artifact (auto-enabled by cuda).
+vllm-marlin = ["cuda"]  # vLLM GPTQ-Marlin native artifact (Phase 12).
+vllm-moe-marlin = ["cuda", "vllm-marlin"]  # vLLM Marlin MoE artifact (Stage
+                        # 14). It also requires the dense Marlin repack export.
+vllm-paged-attn-v2 = ["cuda"]  # vLLM paged-attention-v2 native artifact.
+                        # Pairs with the core PTX kernel that writes its K/V
+                        # layout. Runtime selection remains a typed product
+                        # policy; source compilation is external to Cargo.
 fa2-source = ["cuda"]  # Backward-compatible obsolete alias. It no longer
                         # compiles vendored FlashAttention/CUTLASS source;
                         # FA2 must come from a Ferrum native operator artifact.
-native-op-artifact = ["cuda"]  # Enables build.rs consumption of explicit
-                        # Ferrum native operator manifests/artifacts. With no
-                        # manifest configured this does not link anything.
+native-op-artifact = []  # Internal build-graph marker, enabled by `cuda`.
+                        # CUDA native units fail closed when the explicit
+                        # artifact-set lock is absent or partial; product builds
+                        # never compile third-party CUDA/C++.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

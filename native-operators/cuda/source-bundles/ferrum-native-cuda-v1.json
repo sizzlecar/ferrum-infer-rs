@@ -1,0 +1,285 @@
+{
+  "archive": {
+    "file_name": "ferrum-native-cuda-sources-v1.tar.gz",
+    "format": "tar.gz",
+    "sha256": "7ea3cc2c0260bb1e7dfb471efd52d6b85aeee4072a491b7a57605534d554ef2c",
+    "size_bytes": 117591
+  },
+  "bundle_id": "ferrum-native-cuda-v1+sha256.7f6f35f91a85df6ea5374d5597f7f8ca4c159b5e567c1c1ef122a0ab88657613",
+  "distribution": {
+    "asset_name": "ferrum-native-cuda-sources-v1.tar.gz",
+    "kind": "github-release-asset",
+    "repository": "sizzlecar/ferrum-infer-rs",
+    "tag": "runtime-vnext-native-sources-v1"
+  },
+  "member_set_sha256": "7f6f35f91a85df6ea5374d5597f7f8ca4c159b5e567c1c1ef122a0ab88657613",
+  "members": [
+    {
+      "path": "kernels/marlin_cuda_kernel.cu",
+      "sha256": "6aa1c7acf987bed6ed2659cda0d079392a2b0adf631779f26c0d99dfe0cd07b7",
+      "size_bytes": 46096
+    },
+    {
+      "path": "kernels/vllm_attn/attention_dtypes.h",
+      "sha256": "adbf81937188baa7a4215e51dd4f3ae7ce74f92a90b54f7cdf783d96ea483d53",
+      "size_bytes": 160
+    },
+    {
+      "path": "kernels/vllm_attn/attention_generic.cuh",
+      "sha256": "a9eed8b72c93948c71c90784eaacddf6dafd229cdf12f5df0ce1f05cd21aa41e",
+      "size_bytes": 1732
+    },
+    {
+      "path": "kernels/vllm_attn/attention_kernels.cuh",
+      "sha256": "2981b1b970e94e7f617d11df20f6b484a54f6774bd8a31e63556f68c2c8a509a",
+      "size_bytes": 29949
+    },
+    {
+      "path": "kernels/vllm_attn/attention_utils.cuh",
+      "sha256": "20403e8453b68be65a7855d0516efc3310c46cff8dc46b5514c856492adf0c78",
+      "size_bytes": 1885
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_bfloat16.cuh",
+      "sha256": "eb5118767d89e5f9de1bf6953ab5cd0e80cdb3040c2bb9001130d1b2ccb92e43",
+      "size_bytes": 12263
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_float16.cuh",
+      "sha256": "fb6eb4daeb98fc1c4eeb6ea55ebb7f76d2fb725e17c1cab63e5f4b1c4298dbe2",
+      "size_bytes": 12125
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_float32.cuh",
+      "sha256": "5d9b84448e6886650f7456606cddc812f0d9a014ef17ed98a92e24b5d4464e00",
+      "size_bytes": 5640
+    },
+    {
+      "path": "kernels/vllm_attn/dtype_fp8.cuh",
+      "sha256": "01861d5426d41213a1b8c5c9f8ea0cb7a02e5bc93f48a52c25adc7515b265255",
+      "size_bytes": 1313
+    },
+    {
+      "path": "kernels/vllm_attn/ferrum_shim.h",
+      "sha256": "2136d3f4473ff16195d199e69b9e91136ac7ba37c8ba35233bbcf9655ee9db9e",
+      "size_bytes": 984
+    },
+    {
+      "path": "kernels/vllm_attn/include/cuda_compat.h",
+      "sha256": "959bc9e0e73e020d777530b18bf12160d35cc4eb976335955395729700b2f975",
+      "size_bytes": 1896
+    },
+    {
+      "path": "kernels/vllm_attn/launcher.cu",
+      "sha256": "19cdd5472b11b7a950a38f71ec00191acfdff93bc8dc967ca863288870911ca6",
+      "size_bytes": 21430
+    },
+    {
+      "path": "kernels/vllm_attn/quant_utils_stub.cuh",
+      "sha256": "cb3bb3d40f972dd2649d42536c26c767f68dfb5c09ba9d4856299a888af12f17",
+      "size_bytes": 1238
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+      "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f",
+      "size_bytes": 14162
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/kernel.h",
+      "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67",
+      "size_bytes": 2561
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+      "sha256": "e8e61d18a34ec211f865003180837cb638a901d0f378d85ab1fabbc2c73eb2a6",
+      "size_bytes": 6965
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/marlin_template.h",
+      "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19",
+      "size_bytes": 78563
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/ops.cu",
+      "sha256": "e028776eff53fa88d748b8f8fefbb5a14a12f6c47a62276a032be8920629e79a",
+      "size_bytes": 56031
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+      "sha256": "8d8de7ec568d47928ff2f4fc833e8365d6afe46ab16b07fdf524a6dc5a1ddf95",
+      "size_bytes": 19163
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+      "sha256": "02c99b24fde6c1ab0179dfa27034c7ef6ae7b1bd5654b767e4c196dc8ee12a86",
+      "size_bytes": 2545
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+      "sha256": "bd0e545afa3ecc23fbf919f50826219832258ce81d31d118a30b350e5cb9699a",
+      "size_bytes": 2098
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+      "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50",
+      "size_bytes": 2651
+    },
+    {
+      "path": "vllm_marlin/dequant.h",
+      "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728",
+      "size_bytes": 22312
+    },
+    {
+      "path": "vllm_marlin/ferrum_marlin_ffi.h",
+      "sha256": "56d69698efb288c9d4b30bbe5627baa96fbf76c069a2578b71689e7696a29606",
+      "size_bytes": 2068
+    },
+    {
+      "path": "vllm_marlin/gptq_marlin_repack.cu",
+      "sha256": "fc675bbe27ebea4634eddc490ceed35855c63b7191b5cb081c6c592de477f91e",
+      "size_bytes": 14489
+    },
+    {
+      "path": "vllm_marlin/kernel.h",
+      "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c",
+      "size_bytes": 2389
+    },
+    {
+      "path": "vllm_marlin/kernel_selector.h",
+      "sha256": "e6519b39ab932372629296e5e13efa5a79d5735bc8a4dc23b7ca97619d3df425",
+      "size_bytes": 400964
+    },
+    {
+      "path": "vllm_marlin/marlin.cu",
+      "sha256": "7ea8ceaede5e4126e34b62ae2ac8fe6c42364be804a5327d4d66618fcbda4721",
+      "size_bytes": 37893
+    },
+    {
+      "path": "vllm_marlin/marlin.cuh",
+      "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b",
+      "size_bytes": 5339
+    },
+    {
+      "path": "vllm_marlin/marlin_dtypes.cuh",
+      "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415",
+      "size_bytes": 3977
+    },
+    {
+      "path": "vllm_marlin/marlin_mma.h",
+      "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b",
+      "size_bytes": 12756
+    },
+    {
+      "path": "vllm_marlin/marlin_template.h",
+      "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17",
+      "size_bytes": 81758
+    },
+    {
+      "path": "vllm_marlin/scalar_type.hpp",
+      "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b",
+      "size_bytes": 13172
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu",
+      "sha256": "cdfdd5de248c4f6c200942c157f3c51790e9277198b1411ccbbf3c5949ef18ec",
+      "size_bytes": 5475
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu",
+      "sha256": "8174c138706abad2104648c5d031681c9a743b28781f2c1504ed6cfaddf9abb7",
+      "size_bytes": 8220
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
+      "sha256": "5ecc2ae9f2e9d6555f75782111196eaec639fd3b364b2c57de814f0ecd986868",
+      "size_bytes": 10605
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+      "sha256": "236e0552f2dd3b2c92256a5a52b9067830cda6ac1f222c775faa4348eb7f6276",
+      "size_bytes": 13365
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu",
+      "sha256": "1c5c5b34eff5d56756b3b4ba17751fc47da985d71397a3785e8787e010cf1c5a",
+      "size_bytes": 13515
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_fe2m1f_float16.cu",
+      "sha256": "1fb62a3780709d94d1c0aae4666b26e3c71470caec0d4e2b2b07b5b0fb355619",
+      "size_bytes": 2775
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_fe4m3fn_float16.cu",
+      "sha256": "47c62a8c5f7efde2f9b52db9b30a9256d396195dcbc466c4b927c3bbc2f627b9",
+      "size_bytes": 5445
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_u4_float16.cu",
+      "sha256": "9d872b27c8e6f005c4849f1f8bc1099b4b28d3f50e106cfdb8f088d7f52d5484",
+      "size_bytes": 10425
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_u4b8_float16.cu",
+      "sha256": "03c1f1bdf29125281102b5640d480aba85697ffa162ecc250bddf00cfd9c60d7",
+      "size_bytes": 13140
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_float16_u8b128_float16.cu",
+      "sha256": "6d977da332cccf1eec0641e8bd5d4f6915f84a52012c07e88e5c3d3087073e05",
+      "size_bytes": 13290
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu",
+      "sha256": "dabc4919f1a0857816b20a8201610b6e55c3aee3b658c241a4755e44ff59994f",
+      "size_bytes": 8238
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4_float16.cu",
+      "sha256": "afc118fd11c77d085338d76057d1833dac47b614234fd4971b5b5b7eca8b6221",
+      "size_bytes": 8142
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4b8_bfloat16.cu",
+      "sha256": "756a4787c09460ea8538009ae5e6be720dabf41698075c1642b4c19955b235ce",
+      "size_bytes": 8334
+    },
+    {
+      "path": "vllm_marlin/sm80_kernel_s8_u4b8_float16.cu",
+      "sha256": "d635d4de863a75d1a9d267cd7bf36136411970fac715be912e20183d5ac1fd08",
+      "size_bytes": 8238
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu",
+      "sha256": "3709fe7e297dfd0862506ce2cc6e2972c5b1ee96353820a49979cb63511885f8",
+      "size_bytes": 2277
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4_bfloat16.cu",
+      "sha256": "a23794a65d079e1a2528ffaa4ebc6bf26f5e13d0eb4312a68c5f71a26569ba9c",
+      "size_bytes": 8478
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4_float16.cu",
+      "sha256": "3877851ad4f179e22ffd86b5c44ec8afe971450781d866738a22b5047f094e4b",
+      "size_bytes": 8382
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
+      "sha256": "17208293e1a5e6c509dcd3b73884ed7afae40ee4da8cf418e87f48ad50194427",
+      "size_bytes": 8574
+    },
+    {
+      "path": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu",
+      "sha256": "2344f66ca73ed4003347fce695bc236c8fa236a04d9acf82b475eab27a9f8beb",
+      "size_bytes": 8478
+    },
+    {
+      "path": "vllm_marlin/torch_stubs.h",
+      "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30",
+      "size_bytes": 2215
+    }
+  ],
+  "schema_version": 1,
+  "source_layout": "ferrum-kernels-relative-v1"
+}

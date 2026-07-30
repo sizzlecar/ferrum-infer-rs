@@ -1,6 +1,7 @@
 //! vLLM paged-attention wrappers.
 //!
-//! Calls the extern "C" launcher in `kernels/vllm_attn/launcher.cu` which
+//! Calls the extern "C" launcher exported by the paged-attention native artifact,
+//! whose source bundle contains `kernels/vllm_attn/launcher.cu` and
 //! invokes vLLM's `paged_attention_v1_kernel` for short single-partition
 //! decode, or `paged_attention_v2_kernel` + reduce kernel for longer
 //! multi-partition decode. Only the HEAD_SIZE=128, BLOCK_SIZE=16, FP16

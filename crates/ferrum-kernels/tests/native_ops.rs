@@ -7,7 +7,7 @@ use ferrum_kernels::native_ops::{
     compiled_fa2_native_operator_artifact, compiled_fa2_native_operator_artifact_linked,
     compiled_fa2_native_operator_artifact_state, resolve_cuda_fa2_native_operator,
     validate_compiled_native_operator_provider_catalog, NativeOperatorArtifactSpec,
-    FA2_NATIVE_OPERATOR,
+    CUDA_NATIVE_SOURCE_BUNDLE_ID, FA2_NATIVE_OPERATOR,
 };
 use ferrum_native_ops::{NativeOperatorArtifactFormat, NativeOperatorResolveError};
 use ferrum_types::{
@@ -19,7 +19,50 @@ use ferrum_types::{
 };
 use sha2::{Digest, Sha256};
 
+const CUDA_SOURCE_BUNDLE_MANIFEST: &str =
+    include_str!("../../../native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json");
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn compiled_cuda_source_bundle_identity_matches_the_distribution_manifest() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(CUDA_SOURCE_BUNDLE_MANIFEST).expect("valid source bundle manifest");
+
+    assert_eq!(
+        manifest["bundle_id"].as_str(),
+        Some(CUDA_NATIVE_SOURCE_BUNDLE_ID)
+    );
+}
+
+#[test]
+fn product_workspace_does_not_vendor_native_source_bundle_members() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(CUDA_SOURCE_BUNDLE_MANIFEST).expect("valid source bundle manifest");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let members = manifest["members"]
+        .as_array()
+        .expect("source bundle members");
+
+    assert_eq!(members.len(), 53);
+    for member in members {
+        let relative = member["path"].as_str().expect("source bundle member path");
+        assert!(
+            !manifest_dir.join(relative).exists(),
+            "product workspace retained bundled native source {relative}"
+        );
+    }
+    for removed_tree in [
+        "vllm_marlin",
+        "kernels/vllm_marlin_moe",
+        "kernels/vllm_attn",
+    ] {
+        assert!(
+            !manifest_dir.join(removed_tree).exists(),
+            "product workspace retained native source tree {removed_tree}"
+        );
+    }
+}
 
 struct TestDir(PathBuf);
 

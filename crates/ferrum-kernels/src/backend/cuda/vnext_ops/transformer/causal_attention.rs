@@ -137,17 +137,7 @@ impl CudaCausalPagedAttentionProvider {
         #[cfg(feature = "vllm-paged-attn-v2")]
         provider_sources.extend([
             include_str!("../../vllm_paged_attn.rs").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/launcher.cu").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/attention_kernels.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/attention_dtypes.h").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/attention_utils.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/attention_generic.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/dtype_float16.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/dtype_float32.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/dtype_bfloat16.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/dtype_fp8.cuh").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/ferrum_shim.h").as_bytes(),
-            include_str!("../../../../../kernels/vllm_attn/include/cuda_compat.h").as_bytes(),
+            crate::native_ops::CUDA_NATIVE_SOURCE_BUNDLE_ID.as_bytes(),
         ]);
         provider_sources.push(attention_policy.as_runtime_value().as_bytes());
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
