@@ -1255,6 +1255,28 @@ def self_test() -> int:
             REQUIRED_CUDA_NATIVE_BUILD_UNITS,
         )
 
+        all_unbound_root = root / "all-unbound"
+        all_unbound_lock = create_selftest_native_operator_set(
+            all_unbound_root,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+        all_unbound = json.loads(all_unbound_lock.read_text(encoding="utf-8"))
+        for artifact in all_unbound["artifacts"]:
+            artifact["operation_bindings"] = []
+        write_json(all_unbound_lock, all_unbound)
+        try:
+            validate_native_operator_set(
+                all_unbound_lock,
+                REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+        except NativeOperatorSetEvidenceError as error:
+            require(
+                "at least one live operation/provider" in str(error),
+                "all-unbound native set failed for the wrong reason",
+            )
+        else:
+            raise CollectionError("all-unbound native operator set unexpectedly passed")
+
         source_member = source_root / staged["_members"][0]["path"]
         source_member.write_bytes(b"mutated source after staging\n")
         require(
