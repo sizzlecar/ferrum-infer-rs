@@ -313,8 +313,9 @@ def load_policy(path: Path) -> dict[str, Any]:
             "core_ptx_source_policy",
             "default_source_policy",
             "features",
+            "incremental_profile",
             "nvcc_threads",
-            "profile",
+            "official_release_profile",
         }
         and product.get("bootstrap_source_policy") == "allow"
         and product.get("cargo_jobs") == 4
@@ -323,8 +324,9 @@ def load_policy(path: Path) -> dict[str, Any]:
         and product.get("default_source_policy") == "cache-only"
         and product.get("features")
         == "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+        and product.get("incremental_profile") == "cuda-correctness"
         and product.get("nvcc_threads") == 4
-        and product.get("profile") == "release"
+        and product.get("official_release_profile") == "release"
         and len(core_ptx_inputs) == 40
         and len(set(core_ptx_inputs)) == len(core_ptx_inputs)
         and all(
@@ -492,6 +494,7 @@ def verify_product_command(
     command: list[str],
     policy: dict[str, Any],
     *,
+    profile: str,
     target_dir: str,
     native_operator_set_lock: str,
     build_summary_receipt: str,
@@ -515,6 +518,14 @@ def verify_product_command(
         )
         assignments[key] = value
     product = policy["product_build"]
+    require(
+        profile
+        in {
+            product["incremental_profile"],
+            product["official_release_profile"],
+        },
+        "product command profile is invalid",
+    )
     expected_values = {
         "NO_COLOR": "1",
         "CARGO_TARGET_DIR": target_dir,
@@ -533,12 +544,17 @@ def verify_product_command(
         and Path(build_summary_receipt).is_absolute(),
         "product command environment drift",
     )
+    profile_args = (
+        ["--release"]
+        if profile == product["official_release_profile"]
+        else ["--profile", profile]
+    )
     require(
         command[cargo_index:]
         == [
             "cargo",
             "build",
-            "--release",
+            *profile_args,
             "--locked",
             "--jobs",
             str(product["cargo_jobs"]),
@@ -856,6 +872,8 @@ def verify_product_cache_bootstrap(
         and bootstrap.get("source_tree_sha") == source["git_tree_sha"]
         and bootstrap.get("source_policy")
         == policy["product_build"]["bootstrap_source_policy"]
+        and bootstrap.get("profile")
+        == policy["product_build"]["incremental_profile"]
         and bootstrap.get("cargo_target") == expected_target
         and bootstrap.get("native_build_cache")
         == expected_native_build_cache,
@@ -871,6 +889,7 @@ def verify_product_cache_bootstrap(
     verify_product_command(
         build_receipt["command"],
         policy,
+        profile=policy["product_build"]["incremental_profile"],
         target_dir=expected_target,
         native_operator_set_lock=lane_paths["native_operator_set_lock"],
         build_summary_receipt=expected_summary,
@@ -886,6 +905,12 @@ def verify_product_cache_bootstrap(
     )
     require(
         len(smoke_receipt["command"]) == 2
+        and smoke_receipt["command"][0]
+        == str(
+            Path(expected_target)
+            / policy["product_build"]["incremental_profile"]
+            / "ferrum"
+        )
         and smoke_receipt["command"][1] == "--version"
         and smoke_stdout.stat().st_size > 0,
         "product core PTX cache bootstrap binary smoke mismatch",
@@ -999,6 +1024,11 @@ def verify_product_sample(
     expected_worktree = str(
         Path(lane_paths["worktree_root"]) / "product-timing-worktree"
     )
+    expected_profile = (
+        policy["product_build"]["official_release_profile"]
+        if name == "clean-release"
+        else policy["product_build"]["incremental_profile"]
+    )
     require(
         sample.get("schema_version") == SCHEMA_VERSION
         and sample.get("sample_id") == f"{name}-{index}"
@@ -1021,6 +1051,7 @@ def verify_product_sample(
     )
     require(
         cargo_target == expected_target
+        and cache.get("profile") == expected_profile
         and cache.get("baseline_native_build_cache")
         == baseline_native_build_cache
         and cache.get("native_build_cache") == expected_native_build_cache
@@ -1053,6 +1084,7 @@ def verify_product_sample(
         verify_product_command(
             prewarm_command,
             policy,
+            profile=expected_profile,
             target_dir=expected_target,
             native_operator_set_lock=lane_paths["native_operator_set_lock"],
             build_summary_receipt=expected_summary,
@@ -1109,6 +1141,7 @@ def verify_product_sample(
     verify_product_command(
         build_receipt["command"],
         policy,
+        profile=expected_profile,
         target_dir=expected_target,
         native_operator_set_lock=lane_paths["native_operator_set_lock"],
         build_summary_receipt=expected_summary,
@@ -1129,6 +1162,8 @@ def verify_product_sample(
     )
     require(
         len(smoke_receipt["command"]) == 2
+        and smoke_receipt["command"][0]
+        == str(Path(expected_target) / expected_profile / "ferrum")
         and smoke_receipt["command"][1] == "--version"
         and smoke_stdout.stat().st_size > 0,
         f"{label} binary smoke command/output mismatch",
@@ -1958,7 +1993,8 @@ def self_test() -> None:
         "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT=/tmp/g07a-summary.json",
         "cargo",
         "build",
-        "--release",
+        "--profile",
+        product["incremental_profile"],
         "--locked",
         "--jobs",
         str(product["cargo_jobs"]),
@@ -1975,6 +2011,7 @@ def self_test() -> None:
     verify_product_command(
         command,
         policy,
+        profile=product["incremental_profile"],
         target_dir="/tmp/g07a-target",
         native_operator_set_lock="/tmp/native.lock.json",
         build_summary_receipt="/tmp/g07a-summary.json",
@@ -1987,6 +2024,7 @@ def self_test() -> None:
         lambda: verify_product_command(
             duplicate_env,
             policy,
+            profile=product["incremental_profile"],
             target_dir="/tmp/g07a-target",
             native_operator_set_lock="/tmp/native.lock.json",
             build_summary_receipt="/tmp/g07a-summary.json",
@@ -1994,6 +2032,32 @@ def self_test() -> None:
             native_build_cache="/tmp/g07a-cache",
         ),
         "duplicate product environment",
+    )
+    cargo_index = command.index("cargo")
+    release_command = command.copy()
+    release_command[cargo_index + 2 : cargo_index + 4] = ["--release"]
+    verify_product_command(
+        release_command,
+        policy,
+        profile=product["official_release_profile"],
+        target_dir="/tmp/g07a-target",
+        native_operator_set_lock="/tmp/native.lock.json",
+        build_summary_receipt="/tmp/g07a-summary.json",
+        source_policy="cache-only",
+        native_build_cache="/tmp/g07a-cache",
+    )
+    expect_reject(
+        lambda: verify_product_command(
+            release_command,
+            policy,
+            profile=product["incremental_profile"],
+            target_dir="/tmp/g07a-target",
+            native_operator_set_lock="/tmp/native.lock.json",
+            build_summary_receipt="/tmp/g07a-summary.json",
+            source_policy="cache-only",
+            native_build_cache="/tmp/g07a-cache",
+        ),
+        "release command accepted as incremental profile",
     )
     with tempfile.TemporaryDirectory(prefix="g07a-validator-selftest-") as raw:
         root = Path(raw)

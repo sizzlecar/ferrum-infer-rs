@@ -337,8 +337,9 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             "core_ptx_source_policy",
             "default_source_policy",
             "features",
+            "incremental_profile",
             "nvcc_threads",
-            "profile",
+            "official_release_profile",
         },
         "G07A product build policy shape drift",
     )
@@ -351,8 +352,9 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         and product["default_source_policy"] == "cache-only"
         and product["features"]
         == "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+        and product["incremental_profile"] == "cuda-correctness"
         and product["nvcc_threads"] == 4
-        and product["profile"] == "release"
+        and product["official_release_profile"] == "release"
         and isinstance(core_ptx_inputs, list)
         and len(core_ptx_inputs) == 40
         and len(set(core_ptx_inputs)) == len(core_ptx_inputs)
@@ -555,6 +557,7 @@ def run_bounded_step(
 def cargo_build_command(
     *,
     policy: dict[str, Any],
+    profile: str,
     target_dir: Path,
     native_operator_set_lock: Path,
     native_build_cache: Path,
@@ -565,6 +568,19 @@ def cargo_build_command(
     require(
         source_policy in {"allow", "cache-only"},
         f"invalid CUDA source policy: {source_policy}",
+    )
+    require(
+        profile
+        in {
+            product["incremental_profile"],
+            product["official_release_profile"],
+        },
+        f"invalid G07A Cargo profile: {profile}",
+    )
+    profile_args = (
+        ["--release"]
+        if profile == product["official_release_profile"]
+        else ["--profile", profile]
     )
     return [
         "env",
@@ -585,7 +601,7 @@ def cargo_build_command(
         f"FERRUM_CUDA_BUILD_SUMMARY_RECEIPT={build_summary_receipt}",
         "cargo",
         "build",
-        "--release",
+        *profile_args,
         "--locked",
         "--jobs",
         str(product["cargo_jobs"]),
@@ -599,6 +615,14 @@ def cargo_build_command(
         "--timings",
         "-vv",
     ]
+
+
+def product_binary_path(target_dir: Path, profile: str) -> Path:
+    require(
+        profile in {"cuda-correctness", "release"},
+        f"invalid G07A binary profile: {profile}",
+    )
+    return target_dir / profile / "ferrum"
 
 
 def parse_cargo_messages(path: Path) -> dict[str, Any]:
@@ -1091,6 +1115,7 @@ def build_product_core_ptx_cache(
     summary_path = setup_root / "cuda-build-summary.receipt.json"
     command = cargo_build_command(
         policy=policy,
+        profile=policy["product_build"]["incremental_profile"],
         target_dir=target_dir,
         native_operator_set_lock=native_operator_set_lock,
         native_build_cache=native_build_cache,
@@ -1110,7 +1135,8 @@ def build_product_core_ptx_cache(
         ),
         lane_deadline=lane_deadline,
     )
-    binary = target_dir / "release/ferrum"
+    profile = policy["product_build"]["incremental_profile"]
+    binary = product_binary_path(target_dir, profile)
     require(
         binary.is_file() and os.access(binary, os.X_OK),
         "core PTX cache bootstrap binary is missing",
@@ -1159,6 +1185,7 @@ def build_product_core_ptx_cache(
         "source_git_sha": source["git_sha"],
         "source_tree_sha": source["git_tree_sha"],
         "source_policy": policy["product_build"]["bootstrap_source_policy"],
+        "profile": profile,
         "cargo_target": str(target_dir),
         "native_build_cache": str(native_build_cache),
         "cache_inventory": cache_inventory,
@@ -1194,6 +1221,11 @@ def product_sample(
     lane_deadline: float,
 ) -> dict[str, Any]:
     name = scenario["name"]
+    profile = (
+        policy["product_build"]["official_release_profile"]
+        if scenario["kind"] == "cargo_clean_release"
+        else policy["product_build"]["incremental_profile"]
+    )
     source_policy = (
         policy["product_build"]["core_ptx_source_policy"]
         if name == "core-ptx"
@@ -1251,6 +1283,7 @@ def product_sample(
             cwd=worktree,
             command=cargo_build_command(
                 policy=policy,
+                profile=profile,
                 target_dir=target_dir,
                 native_operator_set_lock=native_operator_set_lock,
                 native_build_cache=sample_native_build_cache,
@@ -1315,6 +1348,7 @@ def product_sample(
             cwd=worktree,
             command=cargo_build_command(
                 policy=policy,
+                profile=profile,
                 target_dir=target_dir,
                 native_operator_set_lock=native_operator_set_lock,
                 native_build_cache=sample_native_build_cache,
@@ -1326,7 +1360,7 @@ def product_sample(
             progress_signal="Cargo log growth and rustc/PTX/linker activity",
             lane_deadline=lane_deadline,
         )
-        binary = target_dir / "release/ferrum"
+        binary = product_binary_path(target_dir, profile)
         require(binary.is_file() and os.access(binary, os.X_OK), "ferrum binary is missing")
         smoke = run_bounded_step(
             evidence_root=evidence_root,
@@ -1413,6 +1447,7 @@ def product_sample(
         },
         "cache": {
             "cargo_target": str(target_dir),
+            "profile": profile,
             "scope": (
                 "fresh-per-sample"
                 if scenario["kind"] == "cargo_clean_release"
@@ -2531,6 +2566,7 @@ def self_test() -> None:
         lock.write_text("{}\n", encoding="utf-8")
         command = cargo_build_command(
             policy=policy,
+            profile=policy["product_build"]["incremental_profile"],
             target_dir=root / "target",
             native_operator_set_lock=lock,
             native_build_cache=root / "native-cache",
@@ -2539,6 +2575,8 @@ def self_test() -> None:
         )
         require(
             command[0] == "env"
+            and command[command.index("cargo") + 2 : command.index("cargo") + 4]
+            == ["--profile", "cuda-correctness"]
             and f"FERRUM_NATIVE_OPERATOR_SET_LOCK={lock}" in command
             and "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only" in command
             and f"FERRUM_CUDA_NATIVE_BUILD_CACHE={root / 'native-cache'}"
