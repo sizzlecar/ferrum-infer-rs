@@ -178,12 +178,12 @@ normal Rust fixture modules. No `include!` source assembly is used.
 | Target | Owner responsibility | Frozen proof cases |
 |---|---|---:|
 | `vnext_event_execution_contract_tests` | execution identity, wire validation and cursor state | 54 |
-| `vnext_event_sink_contract_tests` | transactional emission, live witness and sink failure | 16 |
+| `vnext_event_sink_contract_tests` | transactional emission, live witness and sink failure | 28 |
 | `vnext_event_resource_pool_contract_tests` | pool event identity, transition and lease cursors | 27 |
 | `vnext_event_recovery_contract_tests` | failure/recovery continuation and root close evidence | 20 |
 | `vnext_event_replay_contract_tests` | replay closure, terminal evidence and no-static cleanup | 47 |
 
-The frozen counted total remains `54 + 16 + 27 + 20 + 47 = 164`. The no-static replay helper also
+The frozen counted total remains `54 + 28 + 27 + 20 + 47 = 176`. The no-static replay helper also
 retains its direct assertions. Every target root and every reusable fixture owner is below 2,000
 lines. S0A LOC accounting counts each source owner once: a target and each reusable fixture module
 are independently bounded, while a shared fixture is not duplicated into every consumer's LOC.
@@ -305,9 +305,9 @@ inventory to the same clean Git SHA.
 
 For the normalized event graph, `cargo check -p ferrum-interfaces --all-targets` passes and all `80`
 vNext compile-time UI fixtures pass without snapshot changes. The former aggregate is now five
-owner targets whose exact proof lines pass `54/54`, `16/16`, `27/27`, `20/20`, and `47/47`.
+owner targets whose exact proof lines pass `54/54`, `28/28`, `27/27`, `20/20`, and `47/47`.
 `runtime_vnext_g01a_checkpoint.py` preserves the historical exact five-target matrix and sums it
-back to `164`; the current S0A gate consumes the same proof lines from the bounded aggregate.
+back to `176`; the current S0A gate consumes the same proof lines from the bounded aggregate.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
 library tests, and all seven external resource owner targets pass. The transaction-evidence
