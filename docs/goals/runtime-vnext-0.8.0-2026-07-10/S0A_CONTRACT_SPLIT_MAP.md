@@ -7,10 +7,10 @@
   owner modules with explicit imports and zero multi-module dependency SCCs. The four oversized
   resource/event/core/device contract targets are replaced by 24 invariant-owner targets and 11
   explicit reusable support owners. The structured public owner audit accounts for all `1,490`
-  baseline API units: `1,481` preserve the original path/kind and `9` are explicit migrations with
+  baseline API units: `1,480` preserve the original path/kind and `10` are explicit migrations with
   verified public replacement targets. Unexplained loss, ambiguity, and inaccessible count are `0`.
-  All `248` added public units are retained in the artifact and frozen by SHA256
-  `3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9`.
+  All `598` added public units are retained in the artifact and frozen by SHA256
+  `6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41`.
 - This map records the implemented ownership structure. Canonical G01A/S0A completion still
   requires a clean-source `vnext-g00f` binding and bounded aggregate `vnext-g01a` artifact; neither
   this document nor historical focused test output substitutes for those PASS lines.
@@ -39,7 +39,7 @@
 Before module visibility changed, the 13 initial physical fragments concatenated byte-for-byte with the
 original seven-line test-module tail to the pre-split SHA256. The validated implementation now
 uses real `mod` declarations and facade `pub use` exports; it does not use `include!`.
-Unchanged public paths remain available through the facades. Nine deliberate post-split semantic
+Unchanged public paths remain available through the facades. Ten deliberate post-split semantic
 changes are recorded in `S0A_PUBLIC_API_MIGRATIONS.json`; the owner audit rejects an absent target,
 an unexplained removal, a redundant migration, or any added-item digest drift. Cross-owner
 implementation details that were implicitly shared by the giant module are explicitly limited to
