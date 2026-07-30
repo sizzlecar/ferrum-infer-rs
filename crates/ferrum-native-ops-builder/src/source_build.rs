@@ -3270,7 +3270,7 @@ fn probe_host_compiler_discovery(
     )?;
     let driver_probe = host_compiler_raw_output(
         compiler,
-        &["-###", "-x", "c++", "-c", "-", "-o", "/dev/null"],
+        &["-###", "-pipe", "-x", "c++", "-c", "-", "-o", "/dev/null"],
         b"\n",
         environment,
     )?;
@@ -4930,7 +4930,7 @@ mod tests {
                    --version) echo 'fake host compiler 1.0'; exit 0 ;;\n\
                    -dumpmachine) echo 'x86_64-ferrum-linux-gnu'; exit 0 ;;\n\
                    -E) echo '#include <...> search starts here:' >&2; echo ' {}' >&2; echo ' {}' >&2; echo 'End of search list.' >&2; exit 0 ;;\n\
-                   -###) echo 'fake cc1plus -O2 -x c++' >&2; cat '{}' >&2; exit 0 ;;\n\
+                   -###) test \"$2\" = '-pipe' || exit 3; echo 'fake cc1plus -O2 -x c++' >&2; cat '{}' >&2; exit 0 ;;\n\
                    -print-prog-name=*) name=${{1#*=}}; echo '{}/bin/'\"$name\"; exit 0 ;;\n\
                  esac\n\
                  exit 2\n",
