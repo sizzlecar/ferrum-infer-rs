@@ -133,14 +133,18 @@ impl DeviceRuntime for Runtime {
     }
 
     fn query_fence(&self, _fence: &Fence) -> FenceQuery<io::Error> {
-        FenceQuery::Terminal(DeviceTerminal::Succeeded)
+        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(
+            DeviceTerminal::Succeeded,
+        ))
     }
 
     fn wait_fence(
         &self,
         _fence: &Fence,
-    ) -> Result<DeviceTerminal<io::Error>, FenceIndeterminate<io::Error>> {
-        Ok(DeviceTerminal::Succeeded)
+    ) -> Result<DeviceTerminalReceipt<io::Error>, FenceIndeterminate<io::Error>> {
+        Ok(DeviceTerminalReceipt::unprofiled(
+            DeviceTerminal::Succeeded,
+        ))
     }
 
     fn synchronize(&self, _stream: &mut Stream) -> Result<(), io::Error> {

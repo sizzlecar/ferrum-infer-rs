@@ -1,13 +1,24 @@
-error[E0451]: fields `provider`, `plan_id`, `plan_hash` and `node_id` of struct `ferrum_interfaces::vnext::BoundOperationProvider` are private
+error[E0308]: mismatched types
   --> tests/ui/vnext/fail/bound_operation_provider_cannot_be_constructed.rs:10:9
    |
- 9 |     let _ = BoundOperationProvider {
-   |             ---------------------- in this type
 10 |         provider,
-   |         ^^^^^^^^ private field
+   |         ^^^^^^^^ expected `BoundOperationProviderSource<'_, _>`, found `&dyn OperationProvider<R>`
+   |
+   = note:   expected enum `vnext::operation::BoundOperationProviderSource<'_, _>`
+           found reference `&'static (dyn ferrum_interfaces::vnext::OperationProvider<R> + 'static)`
+
+error: cannot construct `ferrum_interfaces::vnext::BoundOperationProvider<'_, _>` with struct literal syntax due to private fields
+  --> tests/ui/vnext/fail/bound_operation_provider_cannot_be_constructed.rs:9:13
+   |
+ 9 |     let _ = BoundOperationProvider {
+   |             ^^^^^^^^^^^^^^^^^^^^^^
+10 |         provider,
+   |         -------- private field
 11 |         plan_id,
-   |         ^^^^^^^ private field
+   |         ------- private field
 12 |         plan_hash,
-   |         ^^^^^^^^^ private field
+   |         --------- private field
 13 |         node_id,
-   |         ^^^^^^^ private field
+   |         ------- private field
+   |
+   = note: ...and other private field `dispatch` that was not provided

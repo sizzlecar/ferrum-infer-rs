@@ -183,8 +183,8 @@ fn parse_sse(body: &str) -> (Vec<Value>, usize) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn structured_output_rejects_unsupported_strict_schema_subset() {
-    let fx = ServerFixture::spawn("unused").await;
+async fn structured_output_supports_strict_one_of_schema() {
+    let fx = ServerFixture::spawn(r#"{"answer":"ok"}"#).await;
     let response = Client::new()
         .post(fx.chat_url())
         .json(&json!({
@@ -202,10 +202,15 @@ async fn structured_output_rejects_unsupported_strict_schema_subset() {
         .send()
         .await
         .expect("post");
-    assert_eq!(response.status(), 400);
-    let body: Value = response.json().await.expect("error json");
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert_eq!(body["error"]["param"], "response_format.json_schema");
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("completion json");
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content");
+    assert_eq!(
+        serde_json::from_str::<Value>(content).expect("valid JSON"),
+        json!({"answer": "ok"})
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
