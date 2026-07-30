@@ -30,6 +30,12 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GIT_BOUNDED_CONFIG = [
+    "-c",
+    "core.preloadindex=false",
+    "-c",
+    "index.threads=1",
+]
 SOURCE_LANES = {
     "unit": "unit",
     "metal": "metal",
@@ -442,7 +448,7 @@ VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET = {
 }
 VNEXT_G01A_EVENT_PROOF_LINES = {
     "vnext_event_execution_contract_tests": ("VNEXT EVENT EXECUTION PASS", 54),
-    "vnext_event_sink_contract_tests": ("VNEXT EVENT SINK PASS", 16),
+    "vnext_event_sink_contract_tests": ("VNEXT EVENT SINK PASS", 28),
     "vnext_event_resource_pool_contract_tests": (
         "VNEXT EVENT RESOURCE POOL PASS",
         27,
@@ -591,7 +597,7 @@ VNEXT_G01A_QUALITY_COMMANDS = (
 )
 VNEXT_G01A_EXPECTED_RESOURCE_CASES = 311
 VNEXT_G01A_EXPECTED_FAIL_CLOSED_CASES = 63
-VNEXT_G01A_EXPECTED_EVENT_REPLAY_V5_CASES = 164
+VNEXT_G01A_EXPECTED_EVENT_REPLAY_V5_CASES = 176
 VNEXT_G01A_EXPECTED_DEVICE_OPERATION_CASES = 299
 VNEXT_G01A_EXPECTED_ORACLE_CASES = 26
 VNEXT_G01A_EXPECTED_MODEL_WIRE_CASES = 24
@@ -754,7 +760,7 @@ def command_line() -> list[str]:
 def git_output(args: list[str], *, default: str = "unknown") -> str:
     try:
         proc = subprocess.run(
-            ["git", *args],
+            ["git", *GIT_BOUNDED_CONFIG, *args],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -6675,6 +6681,11 @@ def make_selftest_completion_manifest(path: Path) -> None:
 def self_test() -> int:
     import runpy
 
+    require_selftest(
+        GIT_BOUNDED_CONFIG
+        == ["-c", "core.preloadindex=false", "-c", "index.threads=1"],
+        "run gate Git worker bound mismatch",
+    )
     this_script = Path(__file__).resolve()
     source_gate_text = (REPO_ROOT / "scripts/release/g0_source_gate.sh").read_text(
         encoding="utf-8"
