@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -2739,12 +2740,26 @@ def validate_vnext_g01a_s0a_provenance(
     inventory_ref = require_object(
         child_manifest.get("inventory_document"), "vnext-g01a S0A inventory document"
     )
+    s0a_contract = runpy.run_path(
+        str(REPO_ROOT / "scripts/release/runtime_vnext_s0a_contract_split.py")
+    )
+    expected_inventory = s0a_contract.get("INVENTORY_DOCUMENT")
+    require_gate(
+        isinstance(expected_inventory, Path),
+        "vnext-g01a S0A producer inventory contract is invalid",
+    )
+    expected_inventory = expected_inventory.resolve()
+    require_gate(
+        expected_inventory.parent
+        == (REPO_ROOT / "docs/release/cleanup").resolve()
+        and expected_inventory.name.endswith("-inventory.md"),
+        "vnext-g01a S0A producer inventory path is outside the cleanup inventory root",
+    )
     inventory_source_path = REPO_ROOT / require_string(
         inventory_ref.get("path"), "vnext-g01a S0A inventory source path"
     )
     require_gate(
-        inventory_source_path
-        == REPO_ROOT / "docs/release/cleanup/20260714-inventory.md"
+        inventory_source_path.resolve() == expected_inventory
         and sha256(inventory_source_path)
         == require_sha256(inventory_ref.get("sha256"), "vnext-g01a S0A inventory SHA256"),
         "vnext-g01a S0A inventory source mismatch",
@@ -6679,8 +6694,6 @@ def make_selftest_completion_manifest(path: Path) -> None:
 
 
 def self_test() -> int:
-    import runpy
-
     require_selftest(
         GIT_BOUNDED_CONFIG
         == ["-c", "core.preloadindex=false", "-c", "index.threads=1"],
