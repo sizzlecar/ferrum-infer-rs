@@ -9207,9 +9207,17 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
         Some(plain.prefill_context_len() as u64)
     );
 
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        4,
+        &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+    ));
     let mut request = policy_request();
     request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
-    let structured = SequenceState::new(request, vec![TokenId::new(0)]);
+    let structured = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
     assert_eq!(
         structured
             .model_decode_metadata()
@@ -9223,13 +9231,35 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
         r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
             .to_string(),
     );
-    let json_schema_without_tokenizer = SequenceState::new(request, vec![TokenId::new(0)]);
+    let json_schema =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
     assert_eq!(
-        json_schema_without_tokenizer
+        json_schema
             .model_decode_metadata()
             .get("ferrum_require_full_logits")
             .and_then(|value| value.as_bool()),
         Some(true)
+    );
+}
+
+#[test]
+fn structured_sequence_requires_a_tokenizer_aware_grammar_factory() {
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+
+    let error = SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+        request,
+        vec![TokenId::new(0)],
+        None,
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("structured output requires a tokenizer-aware grammar factory"),
+        "{error}"
     );
 }
 
