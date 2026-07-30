@@ -63,3 +63,8 @@ triton-kernels = ["cuda", "candle-cuda-compat"]
 name = "runtime_vnext_cuda_catalog"
 path = "examples/runtime_vnext_cuda_catalog.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "runtime_vnext_cuda_catalog_input"
+path = "examples/runtime_vnext_cuda_catalog_input.rs"
+required-features = ["cuda"]

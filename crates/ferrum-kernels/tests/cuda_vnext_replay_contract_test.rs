@@ -3,6 +3,7 @@ const CAUSAL_ATTENTION_SOURCE: &str =
 const RECURRENT_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/attention.rs");
 const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
+const VNEXT_OPS_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops.rs");
 const RUNTIME_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime.rs");
 const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
@@ -64,6 +65,50 @@ fn product_cuda_build_is_artifact_only_and_fails_closed_without_a_lock() {
         assert!(
             !main.contains(forbidden_source_build),
             "product build main must not call {forbidden_source_build}"
+        );
+    }
+}
+
+#[test]
+fn native_catalog_packaging_input_cannot_bypass_product_validation() {
+    let composition = VNEXT_OPS_SOURCE
+        .split("impl CudaVNextComposition {")
+        .nth(1)
+        .expect("CUDA composition impl must exist");
+    let create = composition
+        .split("pub fn create(")
+        .nth(1)
+        .expect("CUDA composition must expose product create")
+        .split("\n    fn ")
+        .next()
+        .expect("product create must have a bounded body");
+    assert!(create.contains("composition.validate_compiled_native_operators()?"));
+
+    let packaging_input = VNEXT_OPS_SOURCE
+        .split("pub fn cuda_native_operator_catalog_input(")
+        .nth(1)
+        .expect("CUDA packaging catalog input must exist")
+        .split("\npub struct CudaTokenEmbeddingProvider")
+        .next()
+        .expect("CUDA packaging catalog input must have a bounded body");
+    assert!(packaging_input.contains("CudaVNextComposition::prepare("));
+    assert!(!packaging_input.contains("validate_compiled_native_operators"));
+
+    let packaging_value = VNEXT_OPS_SOURCE
+        .split("pub struct CudaNativeOperatorCatalogInput {")
+        .nth(1)
+        .expect("CUDA packaging catalog input value must exist")
+        .split("\n}")
+        .next()
+        .expect("CUDA packaging catalog input value must have a bounded body");
+    for executable_owner in [
+        "CudaDeviceRuntime",
+        "OperationRuntimeRegistry",
+        "WeightMaterializerRegistry",
+    ] {
+        assert!(
+            !packaging_value.contains(executable_owner),
+            "packaging catalog input retained executable owner {executable_owner}"
         );
     }
 }
