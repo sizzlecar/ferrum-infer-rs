@@ -27,7 +27,7 @@ POLICY_PATH = (
     REPO_ROOT
     / "scripts/release/configs/runtime_vnext_g07a_build_iteration.json"
 )
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 ARTIFACT_TYPE = "runtime_vnext_g07a_build_iteration_evidence"
 PASS_LINE = "FERRUM RUNTIME VNEXT G07A BUILD ITERATION EVIDENCE READY"
@@ -154,10 +154,7 @@ def claim_managed_root(
                 and observed.get("artifact_type")
                 == "runtime_vnext_g07a_managed_root"
                 and observed.get("role") == role
-                and GIT_SHA_RE.fullmatch(
-                    str(observed.get("created_source_git_sha"))
-                )
-                is not None,
+                and observed.get("created_source_git_sha") == source_git_sha,
                 f"{role} ownership marker mismatch",
             )
             return
@@ -329,15 +326,42 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         )
     product = policy.get("product_build")
     require(
-        product
+        isinstance(product, dict)
+        and set(product)
         == {
-            "cargo_jobs": 4,
-            "compute_capability": "89",
-            "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
-            "native_source_policy": "cache-only",
-            "nvcc_threads": 4,
-            "profile": "release",
+            "bootstrap_source_policy",
+            "cargo_jobs",
+            "compute_capability",
+            "core_ptx_inputs",
+            "core_ptx_source_policy",
+            "default_source_policy",
+            "features",
+            "nvcc_threads",
+            "profile",
         },
+        "G07A product build policy shape drift",
+    )
+    core_ptx_inputs = product["core_ptx_inputs"]
+    require(
+        product["bootstrap_source_policy"] == "allow"
+        and product["cargo_jobs"] == 4
+        and product["compute_capability"] == "89"
+        and product["core_ptx_source_policy"] == "allow"
+        and product["default_source_policy"] == "cache-only"
+        and product["features"]
+        == "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+        and product["nvcc_threads"] == 4
+        and product["profile"] == "release"
+        and isinstance(core_ptx_inputs, list)
+        and len(core_ptx_inputs) == 40
+        and len(set(core_ptx_inputs)) == len(core_ptx_inputs)
+        and all(
+            isinstance(path, str)
+            and path.startswith("kernels/")
+            and path.endswith(".cu")
+            for path in core_ptx_inputs
+        )
+        and "kernels/add_bias.cu" in core_ptx_inputs,
         "G07A product build policy drift",
     )
     native = policy.get("native_build")
@@ -532,9 +556,15 @@ def cargo_build_command(
     policy: dict[str, Any],
     target_dir: Path,
     native_operator_set_lock: Path,
+    native_build_cache: Path,
     build_summary_receipt: Path,
+    source_policy: str,
 ) -> list[str]:
     product = policy["product_build"]
+    require(
+        source_policy in {"allow", "cache-only"},
+        f"invalid CUDA source policy: {source_policy}",
+    )
     return [
         "env",
         "NO_COLOR=1",
@@ -548,8 +578,9 @@ def cargo_build_command(
         ),
         (
             "FERRUM_CUDA_NATIVE_SOURCE_POLICY="
-            f"{product['native_source_policy']}"
+            f"{source_policy}"
         ),
+        f"FERRUM_CUDA_NATIVE_BUILD_CACHE={native_build_cache}",
         f"FERRUM_CUDA_BUILD_SUMMARY_RECEIPT={build_summary_receipt}",
         "cargo",
         "build",
@@ -672,14 +703,44 @@ def parse_product_native_signal(
         and str(row.get("artifact", "")).startswith("core-ptx:")
         and row.get("status") == "built"
     )
+    core_ptx_rows = {
+        str(row.get("artifact")).removeprefix("core-ptx:"): row
+        for row in summaries
+        if isinstance(row, dict)
+        and str(row.get("artifact", "")).startswith("core-ptx:")
+    }
     return {
         "compiled_native_tu_paths": compiled_paths,
         "compiled_native_tu_count": len(compiled_paths),
         "core_ptx_built_paths": core_ptx_built,
+        "core_ptx_rows": core_ptx_rows,
         "artifact_build_units": sorted(artifact_rows),
         "build_summary_present": build_summary_receipt.is_file(),
         "build_summaries": summaries,
     }
+
+
+def validate_product_cache_bootstrap_signal(
+    policy: dict[str, Any],
+    native: dict[str, Any],
+) -> None:
+    expected_core = set(policy["product_build"]["core_ptx_inputs"])
+    require(
+        native["compiled_native_tu_count"] == 0,
+        "core PTX cache bootstrap compiled external native operator source",
+    )
+    require(
+        set(native["artifact_build_units"]) == PRODUCT_NATIVE_ARTIFACTS,
+        "core PTX cache bootstrap did not resolve the complete native artifact set",
+    )
+    require(
+        set(native["core_ptx_rows"]) == expected_core
+        and all(
+            row.get("status") in {"built", "cache_hit"}
+            for row in native["core_ptx_rows"].values()
+        ),
+        "core PTX cache bootstrap did not materialize every configured PTX",
+    )
 
 
 def fsync_replace(path: Path, payload: bytes) -> tuple[int, int]:
@@ -854,6 +915,130 @@ def validate_product_sample_signal(
         )
 
 
+def build_product_core_ptx_cache(
+    *,
+    source_root: Path,
+    evidence_root: Path,
+    source: dict[str, Any],
+    policy: dict[str, Any],
+    target_root: Path,
+    native_operator_set_lock: Path,
+    native_build_cache: Path,
+    lane_deadline: float,
+    resume: bool,
+) -> dict[str, Any]:
+    setup_root = evidence_root / "setup/product-core-ptx-cache-bootstrap"
+    record_path = setup_root / "bootstrap.json"
+    if resume and record_path.is_file():
+        record = read_json(record_path, "product core PTX cache bootstrap")
+        require(
+            record.get("schema_version") == SCHEMA_VERSION
+            and record.get("status") == "pass"
+            and record.get("source_git_sha") == source["git_sha"]
+            and record.get("native_build_cache") == str(native_build_cache)
+            and native_build_cache.is_dir()
+            and any(native_build_cache.iterdir()),
+            "resumed product core PTX cache bootstrap is stale",
+        )
+        for label, raw in (
+            ("bootstrap bounded receipt", record["build"]["bounded_receipt"]),
+            ("bootstrap stdout", record["build"]["stdout"]),
+            ("bootstrap stderr", record["build"]["stderr"]),
+            ("bootstrap CUDA summary", record["build"]["cuda_build_summary"]),
+            ("bootstrap smoke receipt", record["smoke"]["bounded_receipt"]),
+            ("bootstrap binary", record["output"]["artifact"]),
+        ):
+            verify_ref(evidence_root, raw, label)
+        return record
+    if setup_root.exists():
+        require(resume, f"bootstrap output already exists: {setup_root}")
+        shutil.rmtree(setup_root)
+
+    target_dir = target_root / "product-cache-bootstrap"
+    summary_path = setup_root / "cuda-build-summary.receipt.json"
+    command = cargo_build_command(
+        policy=policy,
+        target_dir=target_dir,
+        native_operator_set_lock=native_operator_set_lock,
+        native_build_cache=native_build_cache,
+        build_summary_receipt=summary_path,
+        source_policy=policy["product_build"]["bootstrap_source_policy"],
+    )
+    build = run_bounded_step(
+        evidence_root=evidence_root,
+        step_root=setup_root / "build",
+        cwd=source_root,
+        command=command,
+        expected_seconds=300,
+        deadline_seconds=1200,
+        progress_signal=(
+            "Cargo log growth, explicit core PTX cache publish/hit rows, "
+            "and product binary creation"
+        ),
+        lane_deadline=lane_deadline,
+    )
+    binary = target_dir / "release/ferrum"
+    require(
+        binary.is_file() and os.access(binary, os.X_OK),
+        "core PTX cache bootstrap binary is missing",
+    )
+    smoke = run_bounded_step(
+        evidence_root=evidence_root,
+        step_root=setup_root / "smoke",
+        cwd=source_root,
+        command=[str(binary), "--version"],
+        expected_seconds=1,
+        deadline_seconds=30,
+        progress_signal="bootstrap ferrum version output",
+        lane_deadline=lane_deadline,
+        max_processes=8,
+        max_group_threads=32,
+        max_per_process_threads=16,
+    )
+    cargo_stdout = verify_ref(
+        evidence_root,
+        build["stdout"],
+        "core PTX cache bootstrap Cargo stdout",
+    )
+    cargo_stderr = verify_ref(
+        evidence_root,
+        build["stderr"],
+        "core PTX cache bootstrap Cargo stderr",
+    )
+    cargo_summary = parse_cargo_messages(cargo_stdout)
+    native_signal = parse_product_native_signal(cargo_stderr, summary_path)
+    validate_product_cache_bootstrap_signal(policy, native_signal)
+    summary_ref = artifact_ref(
+        evidence_root,
+        summary_path,
+        "cuda-build-summary",
+    )
+    binary_ref = store_blob(evidence_root, binary, "binary")
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "runtime_vnext_g07a_product_core_ptx_cache_bootstrap",
+        "status": "pass",
+        "source_git_sha": source["git_sha"],
+        "source_tree_sha": source["git_tree_sha"],
+        "source_policy": policy["product_build"]["bootstrap_source_policy"],
+        "native_build_cache": str(native_build_cache),
+        "build": {
+            **build,
+            "cargo_summary": cargo_summary,
+            "native_signal": native_signal,
+            "cuda_build_summary": summary_ref,
+        },
+        "smoke": smoke,
+        "output": {
+            "kind": "binary",
+            "artifact": binary_ref,
+            "sha256": binary_ref["sha256"],
+        },
+    }
+    write_json(record_path, record)
+    return record
+
+
 def product_sample(
     *,
     source_root: Path,
@@ -865,9 +1050,15 @@ def product_sample(
     worktree: Path,
     target_dir: Path,
     native_operator_set_lock: Path,
+    native_build_cache: Path,
     lane_deadline: float,
 ) -> dict[str, Any]:
     name = scenario["name"]
+    source_policy = (
+        policy["product_build"]["core_ptx_source_policy"]
+        if name == "core-ptx"
+        else policy["product_build"]["default_source_policy"]
+    )
     sample_id = f"{name}-{sample_index}"
     sample_root = evidence_root / "build-timings" / name / f"sample-{sample_index}"
     require(not sample_root.exists(), f"sample output already exists: {sample_root}")
@@ -894,7 +1085,9 @@ def product_sample(
                 policy=policy,
                 target_dir=target_dir,
                 native_operator_set_lock=native_operator_set_lock,
+                native_build_cache=native_build_cache,
                 build_summary_receipt=summary_path,
+                source_policy=source_policy,
             ),
             expected_seconds=60,
             deadline_seconds=1200,
@@ -923,7 +1116,9 @@ def product_sample(
                 policy=policy,
                 target_dir=target_dir,
                 native_operator_set_lock=native_operator_set_lock,
+                native_build_cache=native_build_cache,
                 build_summary_receipt=summary_path,
+                source_policy=source_policy,
             ),
             expected_seconds=min(60, scenario["p95_target_seconds"]),
             deadline_seconds=scenario["deadline_seconds"],
@@ -1021,6 +1216,8 @@ def product_sample(
             "native_operator_set_lock_sha256": sha256(
                 native_operator_set_lock
             ),
+            "native_build_cache": str(native_build_cache),
+            "source_policy": source_policy,
         },
         "setup": setup,
         "prewarm": prewarm,
@@ -1523,6 +1720,7 @@ def collect(args: argparse.Namespace) -> Path:
     worktree_root = args.worktree_root.expanduser().resolve()
     target_root = args.target_root.expanduser().resolve()
     object_cache = args.object_cache.expanduser().resolve()
+    product_native_build_cache = object_cache / "product-core-ptx"
     cuda_toolkit_root = args.cuda_toolkit_root.expanduser().resolve()
     policy = load_policy()
     canonical = args.mode == "canonical"
@@ -1671,6 +1869,7 @@ def collect(args: argparse.Namespace) -> Path:
             "worktree_root": str(worktree_root),
             "target_root": str(target_root),
             "object_cache": str(object_cache),
+            "product_native_build_cache": str(product_native_build_cache),
         },
         "inputs": input_refs,
     }
@@ -1687,6 +1886,17 @@ def collect(args: argparse.Namespace) -> Path:
         source_root=source_root,
         evidence_root=evidence_root,
         target_root=target_root,
+        lane_deadline=lane_deadline,
+        resume=args.resume,
+    )
+    product_cache_bootstrap = build_product_core_ptx_cache(
+        source_root=source_root,
+        evidence_root=evidence_root,
+        source=source,
+        policy=policy,
+        target_root=target_root,
+        native_operator_set_lock=native_operator_set_lock,
+        native_build_cache=product_native_build_cache,
         lane_deadline=lane_deadline,
         resume=args.resume,
     )
@@ -1747,6 +1957,7 @@ def collect(args: argparse.Namespace) -> Path:
                     worktree=worktree,
                     target_dir=target,
                     native_operator_set_lock=native_operator_set_lock,
+                    native_build_cache=product_native_build_cache,
                     lane_deadline=lane_deadline,
                 )
             samples.append(sample)
@@ -1810,6 +2021,7 @@ def collect(args: argparse.Namespace) -> Path:
             "cargo-metadata",
         ),
         "builder_setup": builder_setup,
+        "product_cache_bootstrap": product_cache_bootstrap,
         "repeats": repeats,
         "scenarios": scenario_rows,
         "invalidation_report": artifact_ref(
@@ -1956,12 +2168,16 @@ def self_test() -> None:
             policy=policy,
             target_dir=root / "target",
             native_operator_set_lock=lock,
+            native_build_cache=root / "native-cache",
             build_summary_receipt=root / "summary.json",
+            source_policy=policy["product_build"]["default_source_policy"],
         )
         require(
             command[0] == "env"
             and f"FERRUM_NATIVE_OPERATOR_SET_LOCK={lock}" in command
             and "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only" in command
+            and f"FERRUM_CUDA_NATIVE_BUILD_CACHE={root / 'native-cache'}"
+            in command
             and command[-1] == "-vv",
             "canonical Cargo command self-test failed",
         )
