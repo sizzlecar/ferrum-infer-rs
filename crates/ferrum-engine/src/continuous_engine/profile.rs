@@ -289,12 +289,33 @@ impl VNextProfileExecutionEventSink {
 }
 
 impl VNextProfileEventContext {
+    fn capture_policy_for_request(
+        &self,
+        origin: ExecutorRequestOrigin,
+    ) -> ExecutionEventCapturePolicy {
+        if origin == ExecutorRequestOrigin::Startup
+            && matches!(
+                self.profile_detail,
+                ObservabilityProfileDetail::Off | ObservabilityProfileDetail::Basic
+            )
+        {
+            ExecutionEventCapturePolicy::LifecycleOnly
+        } else {
+            self.capture_policy
+        }
+    }
+
     fn profile_event(
         &self,
         event: &ExecutionEvent,
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
         let identity = event.identity().parts();
+        let request_origin =
+            ExecutorRequestOrigin::from_namespaced_request_identity(identity.request_id.as_str());
+        let capture_policy = request_origin
+            .map(|origin| self.capture_policy_for_request(origin))
+            .unwrap_or(self.capture_policy);
         let event_name = vnext_execution_event_name(event.kind());
         let failure = match event.detail() {
             ExecutionEventDetail::Failure(failure) => Some(ProfileError {
@@ -360,7 +381,7 @@ impl VNextProfileEventContext {
             ),
             (
                 "execution_capture_policy".to_string(),
-                serde_json::json!(self.capture_policy.as_str()),
+                serde_json::json!(capture_policy.as_str()),
             ),
             (
                 "execution_event_kind".to_string(),
@@ -387,6 +408,12 @@ impl VNextProfileEventContext {
                 serde_json::json!(identity.span_id.to_string()),
             ),
         ]);
+        if let Some(origin) = request_origin {
+            attributes.insert(
+                "execution_request_origin".to_string(),
+                serde_json::json!(origin.namespace()),
+            );
+        }
         for (key, value) in [
             (
                 "plan_id",
@@ -1238,6 +1265,13 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         self.context.capture_policy
+    }
+
+    fn capture_policy_for_request(
+        &self,
+        origin: ExecutorRequestOrigin,
+    ) -> ExecutionEventCapturePolicy {
+        self.context.capture_policy_for_request(origin)
     }
 
     fn record_device_submission_attribution(

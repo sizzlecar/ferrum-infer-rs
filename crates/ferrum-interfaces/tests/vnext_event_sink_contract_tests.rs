@@ -1,10 +1,11 @@
 mod vnext_event_contract;
 
+use ferrum_interfaces::model_executor::ExecutorRequestOrigin;
 use vnext_event_contract::*;
 
 #[test]
 fn vnext_event_sink_contract() {
-    const EXPECTED_CASES: usize = 27;
+    const EXPECTED_CASES: usize = 28;
     let mut passed = 0_usize;
     let runtime_catalog = catalog();
     let operation_registry = make_operation_registry(&runtime_catalog);
@@ -52,6 +53,13 @@ fn vnext_event_sink_contract() {
         &mut passed,
         ExecutionEventCapturePolicy::FirstFramePerRequest.captures_frame(0)
             && !ExecutionEventCapturePolicy::FirstFramePerRequest.captures_frame(1),
+    );
+    check(
+        &mut passed,
+        !ExecutionEventCapturePolicy::LifecycleOnly.captures_frame(0)
+            && ExecutionEventCapturePolicy::LifecycleOnly.as_str() == "lifecycle_only"
+            && sink.capture_policy_for_request(ExecutorRequestOrigin::Startup)
+                == ExecutionEventCapturePolicy::AllFrames,
     );
     let mut emitter =
         ExecutionEventEmitter::new(&sink, active.run_id().clone(), active.request_id().clone());

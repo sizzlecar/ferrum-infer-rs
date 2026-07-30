@@ -1690,11 +1690,12 @@ impl VNextExecutionJournal {
         sink: Arc<dyn ExecutionEventSink>,
         plan: &ExecutionPlan,
         active: Arc<TrustedActiveSequenceBinding>,
+        request_origin: ExecutorRequestOrigin,
     ) -> std::result::Result<Self, ExecutionEventSinkError> {
         let topology = TrustedExecutionTopology::from_plan(plan).map_err(Self::error)?;
         let root_span =
             SpanId::new(format!("vnext/request/{}", active.fingerprint())).map_err(Self::error)?;
-        let capture_policy = sink.capture_policy();
+        let capture_policy = sink.capture_policy_for_request(request_origin);
         let mut journal = Self {
             emitter: ExecutionEventEmitter::from_shared(
                 sink,
@@ -4549,7 +4550,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(FerrumError::backend(error.to_string()));
             }
         };
-        let events = match self.execution_journal(&active_binding) {
+        let events = match self.execution_journal(&active_binding, request_origin) {
             Ok(events) => events,
             Err(error) => {
                 let _ = session.request_cancel();
@@ -4667,6 +4668,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn execution_journal(
         &self,
         active: &Arc<TrustedActiveSequenceBinding>,
+        request_origin: ExecutorRequestOrigin,
     ) -> Result<Option<VNextExecutionJournal>> {
         let Some(sink) = self.event_sink.read().clone() else {
             return Ok(None);
@@ -4675,6 +4677,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             sink,
             self.resolved_plan.execution_plan(),
             Arc::clone(active),
+            request_origin,
         )
         .map(Some)
         .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
