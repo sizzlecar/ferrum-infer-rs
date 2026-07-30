@@ -1065,10 +1065,12 @@ impl ExecutionPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::vnext::{
-        AliasPolicy, BufferUsage, NodeTokenBindingProjection, NodeWorkContract, PlanNode,
-        ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueRole, ResolvedValueStorage,
+        AliasPolicy, BufferUsage, ElementType, ExecutionDeterminismValueExtent,
+        ExecutionDeterminismWitnessKind, ExecutionDeterminismWitnessSpec, NodeId,
+        NodeTokenBindingProjection, NodeWorkContract, PlanNode, ProgramValueId,
+        ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
+        ResolvedValueStorage, ResourceId, TensorAccess, TokenSpanWork,
     };
 
     #[test]

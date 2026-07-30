@@ -491,13 +491,18 @@ pub(super) fn lane_stable_layout_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        compile_program_binding_layouts, DynamicPoolDomainSpec, SubmissionWaveDomainCapacityLayout,
+        SubmissionWaveDomainLayout,
+    };
     use crate::vnext::{
         DynamicResourceDemand, DynamicResourceDescriptor, DynamicStorageAllocator,
-        DynamicStorageContract, DynamicStorageProfile, MemoryPlan, ResolvedReusableExecutionBucket,
+        DynamicStorageContract, DynamicStorageProfile, DynamicStorageView, MemoryPlan, NodeId,
+        PlanNode, ResolvedReusableExecutionBucket, ResourceId, ReusableExecutionBucketId,
         ReusableExecutionBucketSpec, ReusableExecutionCapacity, ReusableExecutionClassId,
         ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget,
     };
+    use std::collections::BTreeMap;
 
     fn binding_descriptor(
         resource_id: &str,
