@@ -1320,6 +1320,24 @@ mod plan_runtime_resource_snapshot_tests {
     }
 }
 
+/// Typed origin for an executor-owned request lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorRequestOrigin {
+    Product,
+    Startup,
+    Diagnostic,
+}
+
+impl ExecutorRequestOrigin {
+    pub const fn namespace(self) -> &'static str {
+        match self {
+            Self::Product => "product",
+            Self::Startup => "startup",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
+}
+
 /// Borrowed, already-tokenized input used to probe plan-runtime prefill
 /// admission before the request can enter a device submission batch.
 ///
@@ -1337,10 +1355,11 @@ pub struct ExecutorPrefillAdmission<'a> {
     pub product_prompt_tokens: usize,
     /// Already-committed output tokens replayed as part of a recompute input.
     pub replayed_output_tokens: usize,
+    pub request_origin: ExecutorRequestOrigin,
 }
 
 impl<'a> ExecutorPrefillAdmission<'a> {
-    pub const fn new(
+    pub const fn for_startup(
         request_id: &'a RequestId,
         input_tokens: &'a [TokenId],
         maximum_sequence_tokens: usize,
@@ -1351,6 +1370,22 @@ impl<'a> ExecutorPrefillAdmission<'a> {
             maximum_sequence_tokens,
             product_prompt_tokens: input_tokens.len(),
             replayed_output_tokens: 0,
+            request_origin: ExecutorRequestOrigin::Startup,
+        }
+    }
+
+    pub const fn for_diagnostic(
+        request_id: &'a RequestId,
+        input_tokens: &'a [TokenId],
+        maximum_sequence_tokens: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            input_tokens,
+            maximum_sequence_tokens,
+            product_prompt_tokens: input_tokens.len(),
+            replayed_output_tokens: 0,
+            request_origin: ExecutorRequestOrigin::Diagnostic,
         }
     }
 
@@ -1369,6 +1404,7 @@ impl<'a> ExecutorPrefillAdmission<'a> {
             maximum_sequence_tokens,
             product_prompt_tokens,
             replayed_output_tokens,
+            request_origin: ExecutorRequestOrigin::Product,
         };
         admission.validate()?;
         Ok(admission)
@@ -1413,7 +1449,7 @@ impl<'a> ExecutorPrefillAdmission<'a> {
 
 #[cfg(test)]
 mod executor_prefill_admission_tests {
-    use super::ExecutorPrefillAdmission;
+    use super::{ExecutorPrefillAdmission, ExecutorRequestOrigin};
     use ferrum_types::{RequestId, TokenId};
 
     #[test]
@@ -1430,6 +1466,18 @@ mod executor_prefill_admission_tests {
 
         assert_eq!(admission.product_prompt_tokens, 3);
         assert_eq!(admission.replayed_output_tokens, 2);
+        assert_eq!(admission.request_origin, ExecutorRequestOrigin::Product);
+        assert_eq!(
+            ExecutorPrefillAdmission::for_startup(&request_id, &tokens, 8).request_origin,
+            ExecutorRequestOrigin::Startup
+        );
+        assert_eq!(
+            ExecutorPrefillAdmission::for_diagnostic(&request_id, &tokens, 8).request_origin,
+            ExecutorRequestOrigin::Diagnostic
+        );
+        assert_eq!(ExecutorRequestOrigin::Product.namespace(), "product");
+        assert_eq!(ExecutorRequestOrigin::Startup.namespace(), "startup");
+        assert_eq!(ExecutorRequestOrigin::Diagnostic.namespace(), "diagnostic");
     }
 
     #[test]

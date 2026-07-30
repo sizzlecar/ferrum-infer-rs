@@ -231,7 +231,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .collect::<Vec<_>>();
             let mut maintenance_attempts = 0_u32;
             loop {
-                match self.try_admit_prefill(ExecutorPrefillAdmission::new(
+                match self.try_admit_prefill(ExecutorPrefillAdmission::for_diagnostic(
                     &request_id,
                     &input_tokens,
                     participant.maximum_sequence_tokens,
