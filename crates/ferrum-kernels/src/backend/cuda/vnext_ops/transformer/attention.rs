@@ -1888,7 +1888,8 @@ fn launch_prepare(request: AttentionPrepareRequest<'_>) -> Result<(), CudaDevice
         .ok_or_else(|| CudaDeviceRuntimeError::contract("attention prepare work overflows"))?;
     let grid = checked_grid(total, THREADS_PER_BLOCK, "attention prepare")?;
     let mut builder = stream.launch_builder(function);
-    for pointer in &buffers.kernel_arguments() {
+    let kernel_arguments = buffers.kernel_arguments();
+    for pointer in &kernel_arguments {
         builder.arg(pointer);
     }
     let dimensions = [
