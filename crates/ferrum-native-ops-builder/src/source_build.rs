@@ -3161,21 +3161,6 @@ fn validate_host_toolchain_manifest(
             )));
         }
     }
-    for root in manifest
-        .include_roots
-        .iter()
-        .chain(manifest.discovery_roots.iter())
-    {
-        if !manifest
-            .files
-            .iter()
-            .any(|file| Path::new(&file.logical_path).starts_with(root))
-        {
-            return Err(NativeOperatorBuilderError::Invalid(format!(
-                "{context} host toolchain search root has no locked files: {root}"
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -4318,6 +4303,7 @@ mod tests {
         root: PathBuf,
         nvcc: PathBuf,
         ccbin: PathBuf,
+        empty_host_include_root: PathBuf,
         compile_counter: PathBuf,
         invocation_counter: PathBuf,
         host_compiler_invocation_counter: PathBuf,
@@ -4411,6 +4397,8 @@ mod tests {
         let host_root = root.join("fake-host-toolchain");
         fs::create_dir_all(host_root.join("bin")).unwrap();
         fs::create_dir_all(host_root.join("include")).unwrap();
+        let empty_host_include_root = host_root.join("empty-include");
+        fs::create_dir_all(&empty_host_include_root).unwrap();
         fs::write(
             host_root.join("include/stddef.h"),
             "#define FAKE_SIZE_T 1\n",
@@ -4440,13 +4428,14 @@ mod tests {
                  case \"$1\" in\n\
                    --version) echo 'fake host compiler 1.0'; exit 0 ;;\n\
                    -dumpmachine) echo 'x86_64-ferrum-linux-gnu'; exit 0 ;;\n\
-                   -E) echo '#include <...> search starts here:' >&2; echo ' {}' >&2; echo 'End of search list.' >&2; exit 0 ;;\n\
+                   -E) echo '#include <...> search starts here:' >&2; echo ' {}' >&2; echo ' {}' >&2; echo 'End of search list.' >&2; exit 0 ;;\n\
                    -###) echo 'fake cc1plus -O2 -x c++' >&2; cat '{}' >&2; exit 0 ;;\n\
                    -print-prog-name=*) name=${{1#*=}}; echo '{}/bin/'\"$name\"; exit 0 ;;\n\
                  esac\n\
                  exit 2\n",
                 host_compiler_invocation_counter.display(),
                 host_root.join("include").display(),
+                empty_host_include_root.display(),
                 host_driver_config.display(),
                 host_root.display(),
             ),
@@ -4459,6 +4448,7 @@ mod tests {
             root: toolkit_root,
             nvcc: path,
             ccbin,
+            empty_host_include_root,
             compile_counter: counter,
             invocation_counter,
             host_compiler_invocation_counter,
@@ -4873,6 +4863,96 @@ mod tests {
                 .count(),
             16,
             "each cache miss invokes one nvcc version probe and one compile; the full hit invokes zero"
+        );
+    }
+
+    #[test]
+    fn empty_host_include_root_is_locked_and_new_header_invalidates_object_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, definition_path) = write_fixture(root.path());
+        let plan_path = root.path().join("source-build.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &plan_path).unwrap();
+        let fake_cuda = write_fake_nvcc(root.path());
+        let object_cache_dir = root.path().join("object-cache");
+        let run_build = |name: &str| {
+            run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+                plan_path: plan_path.clone(),
+                source_root: source_root.clone(),
+                output_dir: root.path().join(name),
+                compute_capability: "sm_89".to_string(),
+                builder_sha: "7".repeat(40),
+                nvcc_path: fake_cuda.nvcc.clone(),
+                cuda_toolkit_root: fake_cuda.root.clone(),
+                ccbin_path: fake_cuda.ccbin.clone(),
+                ar_path: PathBuf::from("/usr/bin/ar"),
+                nvcc_threads: 2,
+                object_cache_dir: object_cache_dir.clone(),
+                plan_only: false,
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            fs::read_dir(&fake_cuda.empty_host_include_root)
+                .unwrap()
+                .count(),
+            0
+        );
+        let cold = run_build("cold-empty-root");
+        assert_eq!(cold.compiled_translation_units, ["kernels/marlin.cu"]);
+        let cold_manifest: NativeOperatorHostToolchainManifest = read_json(
+            &root
+                .path()
+                .join("cold-empty-root/toolchain/host-static-manifest.json"),
+        )
+        .unwrap();
+        let empty_root = fake_cuda
+            .empty_host_include_root
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(cold_manifest.include_roots.contains(&empty_root));
+        assert!(!cold_manifest
+            .files
+            .iter()
+            .any(|file| Path::new(&file.logical_path).starts_with(&empty_root)));
+
+        let hit = run_build("unchanged-empty-root");
+        assert!(hit.compiled_translation_units.is_empty());
+        assert_eq!(hit.cache_hit_translation_units, ["kernels/marlin.cu"]);
+        assert!(!hit.commands[0].compiler_executed);
+
+        let late_header = fake_cuda.empty_host_include_root.join("late-header.h");
+        fs::write(&late_header, "#define LATE_HEADER 1\n").unwrap();
+        let changed = run_build("populated-root");
+        assert_eq!(changed.compiled_translation_units, ["kernels/marlin.cu"]);
+        assert!(changed.cache_hit_translation_units.is_empty());
+        let changed_manifest: NativeOperatorHostToolchainManifest = read_json(
+            &root
+                .path()
+                .join("populated-root/toolchain/host-static-manifest.json"),
+        )
+        .unwrap();
+        assert!(changed_manifest
+            .files
+            .iter()
+            .any(|file| file.logical_path
+                == late_header.canonicalize().unwrap().display().to_string()));
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.invocation_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            4,
+            "the unchanged empty root is an nvcc-free hit; adding a header forces one probe and compile"
         );
     }
 
