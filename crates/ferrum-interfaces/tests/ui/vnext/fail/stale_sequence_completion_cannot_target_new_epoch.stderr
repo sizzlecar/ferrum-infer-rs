@@ -5,7 +5,7 @@ error[E0061]: this method takes 0 arguments but 1 argument was supplied
   |                    ^^^^^^^^ ----- unexpected argument of type `ActiveSequenceCompletionReceipt`
   |
 note: method defined here
- --> src/vnext/resource/invocation.rs
+ --> src/vnext/resource/execution_session.rs
   |
   |     pub fn complete(mut self) -> Result<ActiveSequenceCompletionReceipt, VNextError> {
   |            ^^^^^^^^
