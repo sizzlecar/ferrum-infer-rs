@@ -387,30 +387,30 @@ async fn tiny_stack_capability_fallback_law_cpu() {
 
 /// Guided / tool constraints. Two checks:
 ///
-/// 1. A `JsonSchema`-constrained request must force full logits even when the
-///    schema fails to compile to a guided processor — otherwise the greedy
-///    argmax fast path silently bypasses the constraint. Kills hb-04 (removal
-///    of the `JsonSchema` clause in `requires_full_logits_for_sampling`).
-/// 2. End-to-end: a valid guided request runs through the real engine without
-///    panicking even when the tiny vocab cannot satisfy the pattern (the
-///    no-extension fallback path).
+/// 1. A `JsonSchema`-constrained request must compile a tokenizer-aware
+///    processor and force full logits; otherwise the greedy argmax fast path
+///    could silently bypass the constraint.
+/// 2. End-to-end: a valid guided request runs through the real engine and
+///    returns text accepted by the requested JSON schema.
 #[tokio::test]
 async fn tiny_stack_guided_tool_constraint() {
     let cfg = TinyLlamaConfig::default();
-    let tokenizer = tiny_tokenizer(&cfg);
+    let tokenizer = Arc::new(TinyTokenizer::new(cfg.vocab_size).with_composite_token(1, "0"));
 
-    // (1) A JsonSchema request whose only full-logits trigger is the schema
-    // itself must still force full logits. Built with no tokenizer so no
-    // guided processor and no forbidden-token masks are wired — the JsonSchema
-    // clause is then the sole reason the predicate can be true, isolating the
-    // exact decision hb-04 removes.
+    // (1) A JsonSchema request must own a compiled grammar processor and force
+    // full logits. Missing tokenizer state is rejected by construction.
     let mut req = greedy_request("constrain me", 4);
     req.sampling_params.response_format =
         ResponseFormat::JsonSchema("{\"type\":\"object\"}".into());
-    let seq = SequenceState::new(req, vec![TokenId::new(1)]);
+    let seq =
+        SequenceState::new_with_tokenizer(req, vec![TokenId::new(1)], Some(tokenizer.clone()));
+    assert!(
+        seq.has_structured_output_constraint(),
+        "a JsonSchema request must compile a tokenizer-aware grammar processor"
+    );
     assert!(
         seq.requires_full_logits_for_sampling(),
-        "a JsonSchema-constrained request must force full logits via the schema clause alone"
+        "a JsonSchema-constrained request must force full logits"
     );
 
     // (2) Valid guided request runs end-to-end without panic.
@@ -429,5 +429,10 @@ async fn tiny_stack_guided_tool_constraint() {
         ),
         "guided run terminates cleanly: {:?}",
         resp.finish_reason
+    );
+    assert!(
+        serde_json::from_str::<i64>(&resp.text).is_ok(),
+        "guided output must be a JSON integer: {:?}",
+        resp.text
     );
 }
