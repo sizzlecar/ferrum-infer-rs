@@ -9914,6 +9914,73 @@ fn model_decode_logits_policy_requires_full_for_structured_output() {
 }
 
 #[test]
+fn token_policy_cache_keeps_request_control_allowances_isolated() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        8,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("<pad>", 4),
+        ],
+    ));
+    let no_allowances = HashSet::new();
+    let forbidden = cached_forbidden_generation_tokens(&tokenizer, &no_allowances);
+    assert!(forbidden.contains(&2));
+
+    let allowed = HashSet::from([2]);
+    let request_forbidden = cached_forbidden_generation_tokens(&tokenizer, &allowed);
+    assert!(!request_forbidden.contains(&2));
+
+    let next_request_forbidden = cached_forbidden_generation_tokens(&tokenizer, &no_allowances);
+    assert!(
+        next_request_forbidden.contains(&2),
+        "one request's allowed controls must not mutate the shared base policy"
+    );
+}
+
+#[test]
+fn token_policy_cache_rejects_an_expired_tokenizer_identity() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        9,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("<pad>", 4),
+        ],
+    ));
+    let expired_tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(9, &[("stale", 0)]));
+    let expired_identity = Arc::downgrade(&expired_tokenizer);
+    drop(expired_tokenizer);
+
+    let key = (tokenizer_cache_key(&tokenizer), tokenizer.vocab_size());
+    let cache = TOKEN_POLICY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    cache.lock().expect("token policy cache poisoned").insert(
+        key,
+        TokenPolicyCacheEntry {
+            tokenizer: expired_identity,
+            forbidden: HashSet::from([u32::MAX]),
+        },
+    );
+
+    let forbidden = cached_forbidden_generation_tokens(&tokenizer, &HashSet::new());
+    assert!(
+        !forbidden.contains(&u32::MAX),
+        "an expired tokenizer identity must not return stale policy data"
+    );
+    assert!(forbidden.contains(&2));
+
+    cache
+        .lock()
+        .expect("token policy cache poisoned")
+        .remove(&key);
+}
+
+#[test]
 fn model_greedy_argmax_output_accepts_masked_policy_token_and_tracks_frequency() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,
@@ -10410,7 +10477,7 @@ fn structured_sampling_preserves_split_utf8_fragments_and_masks_model_vocab_hole
         "🔥"
     );
 
-    let forbidden = cached_forbidden_generation_tokens(tokenizer.as_ref(), &HashSet::new());
+    let forbidden = cached_forbidden_generation_tokens(&tokenizer, &HashSet::new());
     assert!(!forbidden.contains(&fire_head.get()));
     assert!(!forbidden.contains(&fire_tail.get()));
     assert!(forbidden.contains(&FragmentedUtf8PolicyTokenizer::REPLACEMENT));

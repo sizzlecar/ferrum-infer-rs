@@ -70,8 +70,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -114,8 +114,14 @@ const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
     "</s>",
 ];
 
-static TOKEN_POLICY_CACHE: OnceLock<std::sync::Mutex<HashMap<(usize, usize), HashSet<u32>>>> =
-    OnceLock::new();
+struct TokenPolicyCacheEntry {
+    tokenizer: Weak<dyn Tokenizer + Send + Sync>,
+    forbidden: HashSet<u32>,
+}
+
+static TOKEN_POLICY_CACHE: OnceLock<
+    std::sync::Mutex<HashMap<(usize, usize), TokenPolicyCacheEntry>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ContinuousEngineRuntimeConfig {
@@ -705,7 +711,7 @@ fn delimiter_failure_table(tokens: &[u32]) -> Vec<usize> {
 }
 
 fn resolve_sampling_token_constraints(
-    tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    tokenizer: Option<&Arc<dyn Tokenizer + Send + Sync>>,
     stop_token_ids: &HashSet<u32>,
     request_generated_control_token_texts: &[&str],
 ) -> (HashSet<u32>, Option<usize>, HashSet<u32>) {
@@ -789,13 +795,22 @@ fn build_argmax_token_mask(
 }
 
 fn cached_forbidden_generation_tokens(
-    tok: &(dyn Tokenizer + Send + Sync),
+    tok: &Arc<dyn Tokenizer + Send + Sync>,
     allowed_generated_controls: &HashSet<u32>,
 ) -> HashSet<u32> {
     let key = (tokenizer_cache_key(tok), tok.vocab_size());
     let cache = TOKEN_POLICY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Some(cached) = cache.lock().expect("token policy cache poisoned").get(&key) {
-        return cached.clone();
+    let tokenizer_identity = Arc::downgrade(tok);
+    {
+        let mut cache = cache.lock().expect("token policy cache poisoned");
+        if let Some(cached) = cache.get(&key) {
+            if cached.tokenizer.ptr_eq(&tokenizer_identity) && cached.tokenizer.strong_count() > 0 {
+                let mut forbidden = cached.forbidden.clone();
+                forbidden.retain(|token_id| !allowed_generated_controls.contains(token_id));
+                return forbidden;
+            }
+        }
+        cache.remove(&key);
     }
 
     let mut forbidden = HashSet::new();
@@ -814,9 +829,7 @@ fn cached_forbidden_generation_tokens(
     .into_iter()
     .flatten()
     {
-        if !allowed_generated_controls.contains(&token.get()) {
-            forbidden.insert(token.get());
-        }
+        forbidden.insert(token.get());
     }
 
     for text in [
@@ -831,39 +844,40 @@ fn cached_forbidden_generation_tokens(
         "\u{00ef}\u{00bf}\u{00bd}",
     ] {
         if let Some(token) = tok.token_id(text) {
-            if !allowed_generated_controls.contains(&token.get()) {
-                forbidden.insert(token.get());
-            }
+            forbidden.insert(token.get());
         }
     }
     for token_id in 0..scan_limit {
         let id = token_id as u32;
-        if allowed_generated_controls.contains(&id) {
-            continue;
-        }
         let token = TokenId::new(id);
         let raw_text = tok.token_text(token);
         let missing_token_text = has_reverse_vocab && raw_text.is_none();
         let raw_text_forbidden = raw_text.is_some_and(is_forbidden_generation_token_text);
         let decoded_text_forbidden = tok
             .decode(&[token], true)
-            .map(|text| decoded_token_is_statically_forbidden(tok, token, &text))
+            .map(|text| decoded_token_is_statically_forbidden(tok.as_ref(), token, &text))
             .unwrap_or(true);
         if missing_token_text || raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
         }
     }
 
-    cache
-        .lock()
-        .expect("token policy cache poisoned")
-        .insert(key, forbidden.clone());
+    let mut cache = cache.lock().expect("token policy cache poisoned");
+    cache.retain(|_, entry| entry.tokenizer.strong_count() > 0);
+    cache.insert(
+        key,
+        TokenPolicyCacheEntry {
+            tokenizer: tokenizer_identity,
+            forbidden: forbidden.clone(),
+        },
+    );
+    drop(cache);
+    forbidden.retain(|token_id| !allowed_generated_controls.contains(token_id));
     forbidden
 }
 
-fn tokenizer_cache_key(tok: &(dyn Tokenizer + Send + Sync)) -> usize {
-    let ptr = tok as *const (dyn Tokenizer + Send + Sync);
-    ptr.cast::<()>() as usize
+fn tokenizer_cache_key(tok: &Arc<dyn Tokenizer + Send + Sync>) -> usize {
+    Arc::as_ptr(tok).cast::<()>() as usize
 }
 
 fn maybe_trace_prompt_tokens(
@@ -1641,7 +1655,7 @@ impl SequenceState {
             .unwrap_or_default();
         let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
             resolve_sampling_token_constraints(
-                tokenizer.as_deref(),
+                tokenizer.as_ref(),
                 &stop_token_ids,
                 request_generated_control_token_texts,
             );
