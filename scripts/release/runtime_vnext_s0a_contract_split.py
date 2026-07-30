@@ -24,7 +24,9 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS"
 OWNER_MAP_PASS_PREFIX = "VNEXT PUBLIC OWNER MAP PASS"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 OWNER_MAP_EXAMPLE = "vnext_public_owner_map"
-INVENTORY_DOCUMENT = REPO_ROOT / "docs/release/cleanup/20260714-inventory.md"
+INVENTORY_DOCUMENT = (
+    REPO_ROOT / "docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md"
+)
 ADR_DOCUMENT = GOAL_ROOT / "S0A_CONTRACT_SPLIT_MAP.md"
 PUBLIC_API_MIGRATIONS = GOAL_ROOT / "S0A_PUBLIC_API_MIGRATIONS.json"
 PUBLIC_API_ADDED_SHA256 = "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9"
@@ -39,6 +41,9 @@ PRODUCTION_GROUPS = {
             "work",
             "allocation",
             "dynamic_pool",
+            "program_binding",
+            "dynamic_pool_set",
+            "dynamic_pool_maintenance",
             "runtime_driver",
             "static_lease",
             "provisioning",
@@ -49,6 +54,7 @@ PRODUCTION_GROUPS = {
             "static_initialization",
             "batch",
             "invocation",
+            "execution_session",
         ],
         "audit": "S0A_RESOURCE_DEPENDENCY_AUDIT.md",
     },
