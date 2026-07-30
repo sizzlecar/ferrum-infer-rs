@@ -21,8 +21,8 @@
 // Build:
 //   nvcc -O3 -arch=sm_89 -std=c++17 -I<ferrum-root>/crates/ferrum-kernels \
 //        scripts/microbenches/moe_marlin_perf.cu \
-//        crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu \
-//        crates/ferrum-kernels/kernels/vllm_marlin/gptq_marlin_repack.cu \
+//        $FERRUM_NATIVE_SOURCE_ROOT/kernels/vllm_marlin_moe/ops.cu \
+//        $FERRUM_NATIVE_SOURCE_ROOT/vllm_marlin/gptq_marlin_repack.cu \
 //        -lcuda -o moe_marlin_perf
 //
 // (The exact compile command lives in scripts/microbenches/README.md plus

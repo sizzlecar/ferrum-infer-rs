@@ -1814,7 +1814,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //
     // Marlin-MoE kernel template is instantiated for thread_m_blocks ∈
     // {1, 2, 3, 4} via COMMON_GET_IF_M1 / COMMON_GET_IF_M234 in
-    // vllm_marlin_moe/ops.cu. Each maps to block_size = thread_m_blocks
+    // the native vLLM Marlin MoE artifact. Each maps to block_size = thread_m_blocks
     // × 16 ∈ {16, 32, 48, 64}. Picking the right one is a classic
     // throughput-vs-padding-waste tradeoff:
     //

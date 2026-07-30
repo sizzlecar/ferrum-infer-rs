@@ -2,8 +2,8 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package": {
-    "kind": "ferrum-git-tree",
-    "revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
+    "kind": "ferrum-native-source-bundle",
+    "revision": "ferrum-native-cuda-v1+sha256.7f6f35f91a85df6ea5374d5597f7f8ca4c159b5e567c1c1ef122a0ab88657613",
     "sha256": "5b6c74405d61f6744889e2d2594d905bf797aced96e4f315c31fc82b81d34132"
   },
   "upstream_sources": [

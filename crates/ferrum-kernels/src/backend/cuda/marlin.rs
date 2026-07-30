@@ -343,8 +343,8 @@ extern "C" {
     ) -> i32;
 }
 
-// vLLM marlin_moe_wna16 port (Stage 14). Vendored kernel under
-// `crates/ferrum-kernels/kernels/vllm_marlin_moe/`. Single fused
+// vLLM marlin_moe_wna16 port (Stage 14). Supplied by the versioned native
+// operator artifact set. Single fused
 // (sorted_token_ids, expert_ids) launch — eliminates the m=16 padding
 // waste of our Stage 12.1 path. Linked statically only when the
 // `vllm-moe-marlin` feature is built in.
@@ -1058,7 +1058,7 @@ fn marlin_moe_ffi_status(ret: i32) -> (&'static str, u32) {
 /// The owning caller must retain every allocation until work enqueued on
 /// `stream` has completed. Optional pointers deliberately retain their
 /// corresponding mode flags so this boundary can reject inconsistent FFI
-/// states before the vendored C++ implementation reaches `TORCH_CHECK`.
+/// states before the native C++ implementation reaches `TORCH_CHECK`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MarlinMoeRawLaunchArgs {
     pub(crate) a: cudarc::driver::sys::CUdeviceptr,
@@ -1262,7 +1262,7 @@ pub(crate) fn launch_marlin_moe_vllm_raw(
     ))
 }
 
-/// Stage 14 — fused MoE Marlin via the vendored vLLM marlin_moe_wna16
+/// Stage 14 - fused MoE Marlin via the vLLM marlin_moe_wna16 native artifact
 /// kernel. Replaces our Stage 12.1 bucketed `marlin_gemm_moe` with a
 /// single launch that processes ALL `(token, expert)` pairs of a layer
 /// in one go using vLLM's `(sorted_token_ids, expert_ids)` indirection.

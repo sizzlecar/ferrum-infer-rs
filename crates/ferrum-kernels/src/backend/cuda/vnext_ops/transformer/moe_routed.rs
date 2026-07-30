@@ -133,7 +133,7 @@ impl CudaRoutedSwiGluMoeProvider {
             include_str!("moe_workspace.rs").as_bytes(),
             include_str!("../../marlin.rs").as_bytes(),
             include_str!("../../../../../kernels/moe_combine.cu").as_bytes(),
-            include_str!("../../../../../kernels/vllm_marlin_moe/ops.cu").as_bytes(),
+            crate::native_ops::CUDA_NATIVE_SOURCE_BUNDLE_ID.as_bytes(),
             crate::ptx::MOE_ROUTER.as_bytes(),
             crate::ptx::MOE_ALIGN_BLOCK_SIZE_PAIR_IDS.as_bytes(),
             crate::ptx::MOE_COMBINE.as_bytes(),

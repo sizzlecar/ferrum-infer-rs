@@ -761,10 +761,17 @@ def aggregate_native_trees(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             reasons.append("translation_units")
         content_hashes = sorted(entry["sha256"] for entry in entries)
         content_root_sha256 = sha256_bytes(("\n".join(content_hashes) + "\n").encode())
+        third_party = tree_key.startswith("upstream:") or any(
+            entry["classification"] == "vendor" for entry in entries
+        )
         results.append(
             {
                 "tree_key": tree_key,
                 "content_root_sha256": content_root_sha256,
+                "origin_classification": (
+                    "upstream-vendored" if third_party else "project-owned"
+                ),
+                "is_third_party": third_party,
                 "paths": sorted(entry["path"] for entry in entries),
                 "source_file_count": len(entries),
                 "production_loc": production_loc,
@@ -936,8 +943,9 @@ def build_inventory(
             "coupling_finding_count": len(all_findings),
             "coupling_count_by_category": dict(sorted(category_counts.items())),
             "native_source_tree_count": len(native_trees),
+            "large_native_source_count": sum(tree["is_large"] for tree in native_trees),
             "large_third_party_native_source_count": sum(
-                tree["is_large"] for tree in native_trees
+                tree["is_large"] and tree["is_third_party"] for tree in native_trees
             ),
         },
         "files": entries,
@@ -1083,7 +1091,21 @@ pub fn after_tests_is_production() {}
             "model_runner_candidate",
         ):
             require(counts.get(category, 0) > 0, f"missing {category}")
-        require(reparsed["summary"]["large_third_party_native_source_count"] == 1, "large native threshold")
+        require(reparsed["summary"]["large_native_source_count"] == 1, "large native threshold")
+        require(
+            reparsed["summary"]["large_third_party_native_source_count"] == 1,
+            "large third-party native threshold",
+        )
+        large_tree = next(
+            tree
+            for tree in reparsed["large_native_source_trees"]
+            if tree["is_large"]
+        )
+        require(
+            large_tree["is_third_party"]
+            and large_tree["origin_classification"] == "upstream-vendored",
+            "large native ownership classification",
+        )
         require(reparsed["move_tracking"]["movement_count"] == 1, "SHA move tracking")
         require(
             by_path["crates/demo/src/moved.rs"]["path_status"] == "moved_or_copied_identity",

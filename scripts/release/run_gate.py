@@ -1081,12 +1081,24 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
+        command = [
+            "scripts/release/g0_source_gate.sh",
+            source_lane,
+            str(out_dir),
+        ]
+        if lane.startswith("cuda"):
+            if args.native_operator_set_lock is None:
+                raise GateError(
+                    f"{lane} requires --native-operator-set-lock"
+                )
+            lock = args.native_operator_set_lock.expanduser().resolve()
+            if not lock.is_file() or lock.is_symlink():
+                raise GateError(
+                    f"native operator set lock is not a regular file: {lock}"
+                )
+            command.append(str(lock))
         return LaneCommand(
-            cmd=[
-                "scripts/release/g0_source_gate.sh",
-                source_lane,
-                str(out_dir),
-            ],
+            cmd=command,
             binary_path=Path("target/release/ferrum")
             if lane.startswith("cuda") or lane == "metal"
             else None,
@@ -6860,6 +6872,52 @@ def self_test() -> int:
             dry_manifest["child_pass_line"] == source_pass_line("unit", dry_out),
             dry_manifest,
         )
+        cuda_without_lock = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "cuda-smoke",
+                "--out",
+                str(root / "cuda-without-lock"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            cuda_without_lock.returncode != 0
+            and "requires --native-operator-set-lock"
+            in (cuda_without_lock.stderr + cuda_without_lock.stdout),
+            cuda_without_lock.stderr or cuda_without_lock.stdout,
+        )
+        native_lock = root / "native-operator-set.lock.json"
+        native_lock.write_text("{}\n", encoding="ascii")
+        cuda_out = root / "cuda-dry-run"
+        cuda_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "cuda-smoke",
+                "--native-operator-set-lock",
+                str(native_lock),
+                "--out",
+                str(cuda_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            cuda_dry.returncode == 0,
+            cuda_dry.stderr or cuda_dry.stdout,
+        )
+        cuda_manifest = json.loads((cuda_out / "gate.manifest.json").read_text())
+        require_selftest(
+            cuda_manifest["delegated_command_line"]
+            == [
+                "scripts/release/g0_source_gate.sh",
+                "cuda-smoke",
+                str(cuda_out),
+                str(native_lock.resolve()),
+            ],
+            cuda_manifest,
+        )
         g08b_root = root / "g08b-artifact-root"
         determinism_root = root / "cuda-determinism-artifact-root"
         determinism_out = root / "cuda-determinism-dry-run"
@@ -8032,6 +8090,7 @@ def main() -> int:
     parser.add_argument("--g08c-artifact-root", type=Path)
     parser.add_argument("--g08c-scenario-report", type=Path)
     parser.add_argument("--g08-performance-artifact-root", type=Path)
+    parser.add_argument("--native-operator-set-lock", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

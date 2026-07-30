@@ -14,7 +14,7 @@
 //! - `moe_gemm_phase_fused_impl` (Stage 12 fused MoE Marlin one-launch-per-bucket).
 //! - `marlin_gemm_with_perm` — perm-aware dispatcher used by both
 //!   `BackendQuantMarlin` and `quant_linear::cuda_marlin::CudaMarlinLinear`.
-//! - `launch_vllm_marlin` (vendored vLLM marlin path) + cfg(not) shim.
+//! - `launch_vllm_marlin` (vLLM Marlin native artifact path) + cfg(not) shim.
 //! - `impl BackendQuantMarlin for CudaBackend` — the trait body itself.
 //! - `impl BackendQuantGguf for CudaBackend {}` — empty (CUDA has no
 //!   k-quant kernels yet, inherits trait defaults).
@@ -75,7 +75,7 @@ fn use_triton_int4() -> bool {
 }
 
 /// Read `FERRUM_VLLM_MOE` once. Returns true iff `=1`. Selects the
-/// vendored vLLM marlin_moe_wna16 path for stacked-MoE GPTQ INT4
+/// vLLM marlin_moe_wna16 native artifact path for stacked-MoE GPTQ INT4
 /// weights (load + dispatch pair must be enabled together).
 #[cfg(feature = "vllm-moe-marlin")]
 pub(crate) fn use_vllm_moe() -> bool {

@@ -12,27 +12,54 @@ const MOE_ROUTER_KERNEL_SOURCE: &str = include_str!("../kernels/moe_router.cu");
 const BUILD_SCRIPT_SOURCE: &str = include_str!("../build.rs");
 
 #[test]
-fn native_artifact_identity_excludes_nvcc_worker_parallelism() {
-    assert!(BUILD_SCRIPT_SOURCE.contains("historical_nvcc_scheduler_signatures"));
-    assert!(BUILD_SCRIPT_SOURCE.contains("status=promoted"));
-    assert!(!BUILD_SCRIPT_SOURCE.contains("format!(\"threads={nvcc_threads}\")"));
-    assert!(BUILD_SCRIPT_SOURCE.contains("\"--threads\","));
-    assert!(BUILD_SCRIPT_SOURCE.contains("nvcc_threads.as_str()"));
+fn product_build_script_has_no_native_source_compiler_surface() {
+    for forbidden_source_surface in [
+        "fn compile_marlin(",
+        "fn compile_vllm_marlin(",
+        "fn compile_vllm_moe_marlin(",
+        "fn compile_vllm_paged_attn(",
+        "historical_nvcc_scheduler_signatures",
+        "static_lib_cache_state",
+    ] {
+        assert!(
+            !BUILD_SCRIPT_SOURCE.contains(forbidden_source_surface),
+            "product build script retained native source surface {forbidden_source_surface}"
+        );
+    }
 }
 
 #[test]
-fn fixed_arch_marlin_identity_excludes_reported_device_capability() {
-    let compile_marlin = BUILD_SCRIPT_SOURCE
-        .split("fn compile_marlin(")
+fn product_cuda_build_is_artifact_only_and_fails_closed_without_a_lock() {
+    let resolver = BUILD_SCRIPT_SOURCE
+        .split("fn link_native_operator_artifact_set()")
         .nth(1)
-        .expect("build script must define compile_marlin")
+        .expect("build script must define the native artifact resolver")
         .split("\nfn ")
         .next()
-        .expect("compile_marlin must have a bounded body");
-    assert!(compile_marlin.contains("\"arch=compute_80\""));
-    assert!(!compile_marlin.contains("format!(\"reported_compute_cap="));
-    assert!(compile_marlin.contains("Some(\"flag=reported_compute_cap=\")"));
-    assert!(BUILD_SCRIPT_SOURCE.contains("legacy_signature_matches_without_numeric_line"));
+        .expect("native artifact resolver must have a bounded body");
+    assert!(resolver.contains("if !required_build_units.is_empty()"));
+    assert!(resolver.contains("are artifact-only"));
+    assert!(resolver.contains("ferrum-native-ops-builder"));
+
+    let main = BUILD_SCRIPT_SOURCE
+        .split("fn main()")
+        .nth(1)
+        .expect("build script must define main")
+        .split("\nfn detect_cuda_compute_cap(")
+        .next()
+        .expect("build script main must have a bounded body");
+    assert!(main.contains("emit_native_artifact_build_unit(unit)"));
+    for forbidden_source_build in [
+        "compile_marlin(&",
+        "compile_vllm_marlin(&",
+        "compile_vllm_moe_marlin(&",
+        "compile_vllm_paged_attn(&",
+    ] {
+        assert!(
+            !main.contains(forbidden_source_build),
+            "product build main must not call {forbidden_source_build}"
+        );
+    }
 }
 
 #[test]

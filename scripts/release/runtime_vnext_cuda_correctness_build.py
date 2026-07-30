@@ -39,7 +39,7 @@ READY_PREFIX = "FERRUM CUDA CORRECTNESS BINARY READY"
 PLAN_READY_PREFIX = "FERRUM CUDA CORRECTNESS IMPORT INVENTORY READY"
 SEMANTIC_PASS_PREFIX = "FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS"
 SELFTEST_PASS_LINE = "FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REFERENCE_ARTIFACT_TYPE = plan_reference.ARTIFACT_TYPE
 CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
 REFERENCE_MODEL_KEY = plan_reference.MODEL_KEY
@@ -59,24 +59,6 @@ CACHE_EVENT_RE = re.compile(
 BUILD_SUMMARY_RE = re.compile(
     r"\[cuda-build-summary\]\s+artifact=(?P<artifact>\S+)\s+"
     r"status=(?P<status>\S+)\s+reason=(?P<reason>\S+)"
-)
-STATIC_OUTPUTS = (
-    ("static.marlin", "libmarlin.a", "libmarlin.stamp"),
-    (
-        "static.vllm_marlin",
-        "libvllm_marlin.a",
-        "libvllm_marlin.stamp",
-    ),
-    (
-        "static.vllm_moe_marlin",
-        "libvllm_moe_marlin.a",
-        "libvllm_moe_marlin.stamp",
-    ),
-    (
-        "static.vllm_paged_attn",
-        "libvllm_paged_attn.a",
-        "libvllm_paged_attn.stamp",
-    ),
 )
 FORBIDDEN_OVERRIDE_PREFIXES = (
     "CARGO_PROFILE_CUDA_CORRECTNESS_",
@@ -401,7 +383,7 @@ def inventory_imports(
     source_root: Path,
     import_dirs: Sequence[Path],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    requirements = [*core_ptx_outputs(source_root), *STATIC_OUTPUTS]
+    requirements = core_ptx_outputs(source_root)
     inventory = []
     missing = []
     for artifact_id, file_name, stamp_name in requirements:
@@ -450,6 +432,7 @@ def make_build_command(
     target_dir: Path,
     native_cache: Path,
     import_dirs: Sequence[Path],
+    native_operator_set_lock: Path,
     compute_capability: str,
     cargo_jobs: int,
     nvcc_threads: int,
@@ -463,6 +446,7 @@ def make_build_command(
         f"FERRUM_CUDA_NATIVE_BUILD_CACHE={native_cache}",
         f"FERRUM_CUDA_NATIVE_IMPORT_DIRS={os.pathsep.join(map(str, import_dirs))}",
         "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only",
+        f"FERRUM_NATIVE_OPERATOR_SET_LOCK={native_operator_set_lock}",
         "cargo",
         "build",
         "--profile",
@@ -582,7 +566,7 @@ def parse_ferrum_compiler_artifacts(log: str) -> list[dict[str, Any]]:
 def required_native_artifact_ids(source_root: Path) -> set[str]:
     return {
         artifact_id
-        for artifact_id, _, _ in [*core_ptx_outputs(source_root), *STATIC_OUTPUTS]
+        for artifact_id, _, _ in core_ptx_outputs(source_root)
     }
 
 
@@ -660,8 +644,15 @@ def create_plan(
     inventory, missing = inventory_imports(source_root, import_dirs)
     native_cache = args.native_cache.expanduser().resolve()
     target_dir = args.target_dir.expanduser().resolve()
+    native_operator_set_lock = args.native_operator_set_lock.expanduser().resolve()
     require(native_cache.is_absolute(), "native cache must be absolute")
     require(target_dir.is_absolute(), "Cargo target directory must be absolute")
+    require(
+        native_operator_set_lock.is_file()
+        and not native_operator_set_lock.is_symlink(),
+        f"native operator set lock must be a regular file: {native_operator_set_lock}",
+    )
+    native_operator_set_identity = stable_file_identity(native_operator_set_lock)
     require(
         re.fullmatch(r"[0-9]{2,3}", args.compute_capability) is not None,
         "compute capability must be numeric, for example 89",
@@ -671,6 +662,7 @@ def create_plan(
         target_dir=target_dir,
         native_cache=native_cache,
         import_dirs=import_dirs,
+        native_operator_set_lock=native_operator_set_lock,
         compute_capability=args.compute_capability,
         cargo_jobs=args.cargo_jobs,
         nvcc_threads=args.nvcc_threads,
@@ -704,6 +696,7 @@ def create_plan(
         "target_dir": str(target_dir),
         "native_build_cache": str(native_cache),
         "native_import_dirs": [str(path) for path in import_dirs],
+        "native_operator_set_lock": native_operator_set_identity,
         "native_import_inventory": inventory,
         "missing_native_imports": missing,
         "ready": not missing,
@@ -779,6 +772,16 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
         native_signal["native_recompile_count"] == 0,
         "CUDA correctness build compiled native PTX/TU instead of reusing signed outputs",
     )
+    artifact_set_summaries = [
+        row
+        for row in native_signal["build_summaries"]
+        if row["artifact"] == "native_operator_artifact_set"
+    ]
+    require(
+        len(artifact_set_summaries) == 1
+        and artifact_set_summaries[0]["status"] == "linked",
+        "CUDA correctness build did not resolve and link exactly one native operator artifact set",
+    )
     binary = target_dir / PROFILE / "ferrum"
     require(binary.is_file() and os.access(binary, os.X_OK), f"build output is missing: {binary}")
     compiler_artifacts = parse_ferrum_compiler_artifacts(stdout_text)
@@ -850,6 +853,7 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
         "target_dir": plan["target_dir"],
         "native_build_cache": plan["native_build_cache"],
         "native_import_dirs": plan["native_import_dirs"],
+        "native_operator_set_lock": plan["native_operator_set_lock"],
         "source_inputs": plan["source_inputs"],
         "toolchain": plan["toolchain"],
         "target_preparation": target_preparation,
@@ -1095,6 +1099,7 @@ def self_test() -> None:
         target_dir=Path("/tmp/target"),
         native_cache=Path("/tmp/native-cache"),
         import_dirs=[Path("/tmp/release/out")],
+        native_operator_set_lock=Path("/tmp/native-operators.lock.json"),
         compute_capability="89",
         cargo_jobs=4,
         nvcc_threads=4,
@@ -1106,6 +1111,10 @@ def self_test() -> None:
     require(
         "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only" in command,
         "cache-only native source policy was not written into the build command",
+    )
+    require(
+        "FERRUM_NATIVE_OPERATOR_SET_LOCK=/tmp/native-operators.lock.json" in command,
+        "typed native operator set lock was not written into the build command",
     )
     clean_log = "\n".join(
         [
@@ -1258,20 +1267,20 @@ strip = false
         )
         import_out = root / "target/release/build/ferrum-kernels-fixture/out"
         import_out.mkdir(parents=True)
-        for _, file_name, stamp_name in [*outputs, *STATIC_OUTPUTS]:
+        for _, file_name, stamp_name in outputs:
             (import_out / file_name).write_bytes(b"artifact")
             (import_out / stamp_name).write_text("signature", encoding="utf-8")
         discovered = discover_import_dirs([root / "target"])
         inventory, missing = inventory_imports(source, discovered)
         require(not missing, f"complete import fixture was rejected: {missing}")
         require(
-            len(inventory) == len(outputs) + len(STATIC_OUTPUTS),
+            len(inventory) == len(outputs),
             "native import inventory cardinality drift",
         )
-        (import_out / "libvllm_marlin.stamp").unlink()
+        (import_out / "b.ptx.stamp").unlink()
         _, missing = inventory_imports(source, discovered)
         require(
-            missing == ["static.vllm_marlin"],
+            missing == ["core_ptx.b"],
             f"missing native import was not classified: {missing}",
         )
 
@@ -1405,6 +1414,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-root", type=Path, default=ROOT)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--native-cache", type=Path)
+    parser.add_argument("--native-operator-set-lock", type=Path)
     parser.add_argument("--target-dir", type=Path)
     parser.add_argument("--import-target-root", type=Path, action="append", default=[])
     parser.add_argument("--compute-capability", default="89")
@@ -1443,6 +1453,10 @@ def parse_args() -> argparse.Namespace:
         "--reference-plan-manifest is required",
     )
     require(args.native_cache is not None, "--native-cache is required")
+    require(
+        args.native_operator_set_lock is not None,
+        "--native-operator-set-lock is required",
+    )
     require(args.target_dir is not None, "--target-dir is required")
     require(args.import_target_root, "--import-target-root is required")
     require(

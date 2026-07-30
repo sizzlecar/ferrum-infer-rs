@@ -5,6 +5,11 @@ These are standalone .cu programs compiled with `nvcc` directly — they
 these to verify CUDA-level hypotheses in 5-10 minutes instead of
 rebuilding the entire project.
 
+Build helpers that need Marlin or vLLM sources verify and materialize the
+versioned source bundle under the external Ferrum cache. Set
+`FERRUM_NATIVE_SOURCE_ROOT` only to use an already materialized tree with the
+same manifest identity; mismatched or extra files are rejected.
+
 ## Building
 
 On any host with `nvcc` + CUDA 12+/13 toolchain:
@@ -30,7 +35,7 @@ nvcc -O3 -arch=sm_89 -std=c++17 -I<include-path> \
 | `paged_varlen_window_correctness.cu` | Direct C-ABI correctness probe for Ferrum's paged varlen attention one-pass and split-K kernels. Compares `sliding_window=0` and a local-window case against CPU reference before enabling Gemma3 unified prefill semantics. |
 | `gemma3_shadow_graph_bench.cu` | Standalone CUDA graph probe for a Gemma3-style 62-layer device F32 residual shadow decode step. Use it to validate graph replay stability and launch-overhead headroom before enabling graph capture on the product Gemma3 shadow path. |
 | `dense_marlin_gemma3_perf.cu` | Direct C-ABI benchmark for Ferrum's default dense Marlin GEMM on Gemma3-27B GPTQ qkv/o/gate_up/down shapes. Reports hot event timing, product-profile-style host-sync timing, limited cold-cache timing, multi-weight-cycle timing, and block-policy probes for key auto-tile shapes. Use before changing dense Marlin tile selection or grid policy. |
-| `dense_vllm_marlin_gemma3_perf.cu` | Direct C-ABI benchmark for the vendored vLLM dense GPTQ-Marlin kernel on Gemma3-27B GPTQ qkv/gate_up/down shapes. The build script uses a temporary minimal selector, so this stays a native diagnostic and does not alter product dense GPTQ routing. |
+| `dense_vllm_marlin_gemma3_perf.cu` | Direct C-ABI benchmark for the source-bundled vLLM dense GPTQ-Marlin kernel on Gemma3-27B GPTQ qkv/gate_up/down shapes. The build script uses a temporary minimal selector, so this stays a native diagnostic and does not alter product dense GPTQ routing. |
 | `gemma3_gate_up_split_perf.cu` | Direct C-ABI benchmark for the Gemma3 GPTQ tail-MLP `gate_up` hotspot. Compares the product fused `n=43008` Marlin projection plus GeGLU against serial and two-stream split `gate`/`up` projections under an 8-layer weight cycle. Use before productizing any split gate/up loader or multi-stream projection path. |
 | `build_and_run_gemma3_marlin_cache_policy_perf.sh` | Native A/B for the Gemma3 tail-MLP chain with legacy plain Marlin B-weight `cp.async.cg` (`FERRUM_MARLIN_CP_ASYNC_PLAIN=1`) versus the product-default `L2::evict_first` cache-policy path. Use after Marlin cache-policy changes to confirm the default remains the measured fast path. |
 | `moe_marlin_active65_perf.cu` | Direct C-ABI benchmark for Ferrum's vLLM-Marlin MoE gate/up and down kernels on the real c32 active65 route. Links against existing `ferrum-kernels` build objects, avoiding a full Cargo rebuild. |

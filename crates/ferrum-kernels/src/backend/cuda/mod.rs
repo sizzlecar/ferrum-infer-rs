@@ -122,7 +122,7 @@ pub mod triton_w4a16;
 #[cfg(feature = "vllm-marlin")]
 pub mod vllm_marlin;
 // vLLM paged_attention_v2 port (opt-in, depends on `cuda`). Wraps the
-// extern "C" launcher in `kernels/vllm_attn/launcher.cu`.
+// extern "C" launcher supplied by the paged-attention native artifact.
 #[cfg(feature = "vllm-paged-attn-v2")]
 pub mod vllm_paged_attn;
 // Re-export so submodules (paged, etc.) can reach the constant via

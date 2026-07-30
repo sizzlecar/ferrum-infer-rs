@@ -14,11 +14,12 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/workspace/ferrum-infer-rs}"
 cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/microbenches/resolve_native_source_root.sh"
 
 NVCC="${NVCC:-nvcc}"
 ARCH="${ARCH:-sm_89}"
 SRC="scripts/microbenches/dense_marlin_gemma3_perf.cu"
-KERNEL_SRC="crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu"
+KERNEL_SRC="$FERRUM_NATIVE_SOURCE_ROOT/kernels/marlin_cuda_kernel.cu"
 OUT_BIN="${OUT_BIN:-/tmp/dense_marlin_gemma3_perf}"
 
 echo "[microbench] compiling $SRC + $KERNEL_SRC"

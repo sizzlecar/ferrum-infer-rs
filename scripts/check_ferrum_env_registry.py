@@ -71,30 +71,6 @@ PROCESS_ENV_WRITE_RE = re.compile(
 
 HOT_DIRECT_ENV_READ_CLASSIFICATIONS = (
     {
-        "path": "crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu",
-        "call": "std::getenv",
-        "env_name": "FERRUM_MARLIN_TILE",
-        "expected_count": 2,
-        "classification": "diagnostic_tile_override",
-        "read_phase": "request",
-        "reason": (
-            "legacy Marlin tile-tuning override; the CUDA vLLM-MoE hot path "
-            "uses typed runtime config instead"
-        ),
-    },
-    {
-        "path": "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
-        "call": "std::getenv",
-        "line_contains": "return std::getenv(name);",
-        "expected_count": 1,
-        "classification": "process_static_native_config_helper",
-        "read_phase": "startup",
-        "reason": (
-            "single helper backing process-static vLLM-MoE native diagnostic "
-            "config and the backwards-compatible profile metadata fallback"
-        ),
-    },
-    {
         "path": "crates/ferrum-kernels/src/backend/metal/q4_k_moe_id_gemv_batched.rs",
         "call": "std::env::var",
         "env_name": "MTL_CAPTURE_ENABLED",
