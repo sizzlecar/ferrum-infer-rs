@@ -1,3 +1,7 @@
+use ferrum_types::{
+    NativeOperatorBackend, NativeOperatorContractVersion, NativeOperatorProviderCatalog,
+    NativeOperatorProviderCatalogRow, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+};
 use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -6665,6 +6669,50 @@ impl CapabilityCatalog {
             )));
         }
         Ok(provider)
+    }
+
+    /// Projects the exact live registry into the device-independent identity
+    /// catalog consumed by native artifact packaging. Physical entrypoint
+    /// ownership remains in the native package definition.
+    pub fn native_operator_provider_catalog(
+        &self,
+        backend: NativeOperatorBackend,
+    ) -> Result<NativeOperatorProviderCatalog, VNextError> {
+        let mut providers = Vec::new();
+        for (operation_id, descriptors) in &self.providers {
+            let operation = self.operations.get(operation_id).ok_or_else(|| {
+                invalid_operation(
+                    "capability catalog provider row lacks its operation while exporting native identities",
+                )
+            })?;
+            let operation_fingerprint = operation.fingerprint()?;
+            for provider in descriptors {
+                providers.push(NativeOperatorProviderCatalogRow {
+                    operation_id: operation_id.to_string(),
+                    operation_contract_version: NativeOperatorContractVersion::new(
+                        operation.version.major,
+                        operation.version.minor,
+                    ),
+                    operation_fingerprint: operation_fingerprint.clone(),
+                    provider_id: provider.provider_id().to_string(),
+                    provider_version: NativeOperatorContractVersion::new(
+                        provider.version().major,
+                        provider.version().minor,
+                    ),
+                    provider_implementation_fingerprint: provider
+                        .provider_implementation_fingerprint()
+                        .to_owned(),
+                });
+            }
+        }
+        providers.sort();
+        let catalog = NativeOperatorProviderCatalog {
+            schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+            backend,
+            providers,
+        };
+        catalog.validate().map_err(invalid_operation)?;
+        Ok(catalog)
     }
 
     pub fn fingerprint(&self) -> Result<String, VNextError> {

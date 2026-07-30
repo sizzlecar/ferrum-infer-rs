@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ferrum_native_ops_builder::{
-    assemble_native_operator_set, lock_native_operator_source_definition, package_native_operator,
-    run_native_operator_source_build, NativeOperatorPackageRequest, NativeOperatorSetRequest,
-    NativeOperatorSourceBuildRequest,
+    assemble_native_operator_set, lock_native_operator_source_definition,
+    materialize_native_operator_package_spec, package_native_operator,
+    run_native_operator_source_build, NativeOperatorPackageRequest,
+    NativeOperatorPackageSpecRequest, NativeOperatorSetRequest, NativeOperatorSourceBuildRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -51,11 +52,21 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    MaterializePackageSpec {
+        #[arg(long)]
+        definition: PathBuf,
+        #[arg(long)]
+        g03_catalog: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Package {
         #[arg(long)]
         spec: PathBuf,
         #[arg(long)]
         source_root: PathBuf,
+        #[arg(long)]
+        license_root: PathBuf,
         #[arg(long)]
         source_build_receipt: PathBuf,
         #[arg(long)]
@@ -136,9 +147,22 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
                 out.join("source-build.receipt.json").display()
             );
         }
+        Command::MaterializePackageSpec {
+            definition,
+            g03_catalog,
+            out,
+        } => {
+            materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+                definition_path: definition,
+                g03_catalog_path: g03_catalog,
+                output_path: out.clone(),
+            })?;
+            println!("FERRUM NATIVE PACKAGE SPEC READY: {}", out.display());
+        }
         Command::Package {
             spec,
             source_root,
+            license_root,
             source_build_receipt,
             source_build_plan,
             g03_catalog,
@@ -150,6 +174,7 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
             package_native_operator(&NativeOperatorPackageRequest {
                 spec_path: spec,
                 source_root,
+                license_root,
                 source_build_receipt_path: source_build_receipt,
                 source_build_plan_path: source_build_plan,
                 g03_catalog_path: g03_catalog,

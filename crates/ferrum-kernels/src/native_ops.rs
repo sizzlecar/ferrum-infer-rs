@@ -13,7 +13,8 @@ use ferrum_native_ops::{
 };
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorBinding,
-    NativeOperatorLinkage, NativeOperatorRequirement,
+    NativeOperatorLinkage, NativeOperatorProviderCatalog, NativeOperatorRequirement,
+    NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 
 pub use ferrum_types::CompiledNativeOperatorIdentity as CompiledNativeOperatorArtifact;
@@ -30,6 +31,73 @@ pub fn compiled_native_operator_artifacts() -> &'static [CompiledNativeOperatorA
             .expect("build.rs emitted invalid native operator inventory JSON")
         })
         .as_slice()
+}
+
+pub fn validate_compiled_native_operator_provider_catalog(
+    catalog: &NativeOperatorProviderCatalog,
+    artifacts: &[CompiledNativeOperatorArtifact],
+) -> Result<(), String> {
+    catalog.validate()?;
+    if artifacts.is_empty() {
+        return Ok(());
+    }
+    let catalog_sha256 = catalog.canonical_sha256()?;
+    let mut binding_count = 0_usize;
+    for artifact in artifacts {
+        if artifact.schema_version != NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION {
+            return Err(format!(
+                "compiled native operator {} uses schema {}, expected {}",
+                artifact.operator, artifact.schema_version, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION
+            ));
+        }
+        if artifact.backend != catalog.backend {
+            return Err(format!(
+                "compiled native operator {} backend {:?} differs from live catalog {:?}",
+                artifact.operator, artifact.backend, catalog.backend
+            ));
+        }
+        if artifact.g03_catalog_sha256.as_deref() != Some(catalog_sha256.as_str()) {
+            return Err(format!(
+                "compiled native operator {} is stale for the live provider catalog",
+                artifact.operator
+            ));
+        }
+        for binding in &artifact.operation_bindings {
+            binding_count = binding_count.checked_add(1).ok_or_else(|| {
+                "compiled native operator binding count overflows usize".to_string()
+            })?;
+            let live = catalog
+                .providers
+                .iter()
+                .find(|provider| {
+                    provider.operation_id == binding.operation_id
+                        && provider.provider_id == binding.provider_id
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "compiled native operator {} binds missing live provider {}/{}",
+                        artifact.operator, binding.operation_id, binding.provider_id
+                    )
+                })?;
+            if live.operation_contract_version != binding.operation_contract_version
+                || live.provider_version != binding.provider_version
+                || live.provider_implementation_fingerprint
+                    != binding.provider_implementation_fingerprint
+            {
+                return Err(format!(
+                    "compiled native operator {} binding {}/{} differs from the live provider identity",
+                    artifact.operator, binding.operation_id, binding.provider_id
+                ));
+            }
+        }
+    }
+    if binding_count == 0 {
+        return Err(
+            "compiled native operator set does not bind any live G03 operation/provider"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -69,3 +69,8 @@ tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already in
 # under `triton_ptx/`. Regenerate with `tools/regen-triton-ptx.sh` on a
 # Linux+CUDA box that has triton-rs checked out as a sibling repo.
 triton-kernels = ["cuda", "candle-cuda-compat"]
+
+[[example]]
+name = "runtime_vnext_cuda_catalog"
+path = "examples/runtime_vnext_cuda_catalog.rs"
+required-features = ["cuda"]

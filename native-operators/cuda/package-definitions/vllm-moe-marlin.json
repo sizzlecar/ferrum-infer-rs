@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_moe_marlin",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_89"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.routed_shared_swiglu_moe",
+      "provider_id": "provider.cuda.routed_shared_swiglu_moe.f16.gptq_marlin",
+      "entrypoints": [
+        "ferrum_vllm_marlin_moe_f16"
+      ]
+    },
+    {
+      "operation_id": "operation.routed_swiglu_moe",
+      "provider_id": "provider.cuda.routed_swiglu_moe.f16.gptq_marlin",
+      "entrypoints": [
+        "ferrum_vllm_marlin_moe_f16"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_vllm_marlin_moe_clear_profile_config",
+    "ferrum_vllm_marlin_moe_f16",
+    "ferrum_vllm_marlin_moe_set_profile_config"
+  ],
+  "license_files": [
+    {
+      "source_path": "native-operators/licenses/Apache-2.0.txt",
+      "output_path": "licenses/Apache-2.0.txt"
+    },
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.4",
+  "cuda_runtime_min": "12.4",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

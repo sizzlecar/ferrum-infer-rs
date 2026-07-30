@@ -7,7 +7,7 @@ pub const LEGACY_FERRUM_NATIVE_OP_INIT_SYMBOL: &str = "ferrum_native_op_init";
 pub const LEGACY_FERRUM_NATIVE_OP_DESCRIPTOR_SYMBOL: &str = "ferrum_native_op_descriptor";
 
 // Compatibility aliases for schema-v1 consumers. New artifacts must declare a
-// unique descriptor symbol in their schema-v2 manifest.
+// unique descriptor symbol in their provider-bound manifest.
 pub const FERRUM_NATIVE_OP_INIT_SYMBOL: &str = "ferrum_native_op_init";
 pub const FERRUM_NATIVE_OP_DESCRIPTOR_SYMBOL: &str = "ferrum_native_op_descriptor";
 

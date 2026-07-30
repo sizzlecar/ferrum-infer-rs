@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_paged_attention_v2",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_89"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.causal_paged_attention",
+      "provider_id": "provider.cuda.causal_paged_attention.f16",
+      "entrypoints": [
+        "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed",
+        "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed",
+        "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed",
+        "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_vllm_paged_attention_v1_f16_h128_b16",
+    "ferrum_vllm_paged_attention_v1_f16_h256_b16",
+    "ferrum_vllm_paged_attention_v2_f16_h128_b16",
+    "ferrum_vllm_paged_attention_v2_f16_h256_b16",
+    "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed",
+    "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed",
+    "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed",
+    "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed"
+  ],
+  "license_files": [
+    {
+      "source_path": "native-operators/licenses/Apache-2.0.txt",
+      "output_path": "licenses/Apache-2.0.txt"
+    },
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.4",
+  "cuda_runtime_min": "12.4",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

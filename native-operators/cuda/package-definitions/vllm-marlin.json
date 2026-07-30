@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.vllm_marlin",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_89"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.dense_linear",
+      "provider_id": "provider.cuda.dense_linear.f16.marlin-fp8-w8a16",
+      "entrypoints": [
+        "ferrum_marlin_mm"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_marlin_mm",
+    "ferrum_marlin_mm_f16_u4b8",
+    "ferrum_vllm_gptq_marlin_repack"
+  ],
+  "license_files": [
+    {
+      "source_path": "native-operators/licenses/Apache-2.0.txt",
+      "output_path": "licenses/Apache-2.0.txt"
+    },
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.4",
+  "cuda_runtime_min": "12.4",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}
