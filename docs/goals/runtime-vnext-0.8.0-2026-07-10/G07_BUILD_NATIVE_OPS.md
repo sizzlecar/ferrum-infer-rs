@@ -491,6 +491,41 @@ p50/p95. Both harness self-tests currently pass. No real six-scenario
 diagnostic or five-sample RTX 4090 matrix has run at this checkpoint, so this is
 not G07A, G07B or aggregate G07 PASS.
 
+### 2026-07-30 first fixed-host G07A diagnostic REJECT
+
+Clean source `8e25b3eb9d62870268c42dd147fb693cf2e66b4b` ran the first
+bounded G07A diagnostic on retained instance `46247151`, one RTX 4090. The
+copied native operator closure contained 180 members and 140,318,025 bytes;
+the bootstrap then completed without native-source fallback. The no-op timed
+sample passed in `0.827647s` against the `<=30s` target.
+
+The Rust model leaf scenario correctly stopped the lane instead of consuming
+the remaining matrix. Its prewarm took `368.915875s`; the timed build reached
+the `300s` hard deadline and was terminated in `300.303127s`, versus the
+`<=90s` target. The receipt reports `wall_timeout_exceeded` and complete
+process-group cleanup. Actual rustc commands contained
+`-C linker-plugin-lto`, `-C codegen-units=1` and final binary LTO. The harness
+had applied the official release profile to incremental scenarios, contradicting
+this goal's required dev/release split.
+
+The policy and collector now bind bootstrap, no-op, Rust leaf and core-PTX
+scenarios to the existing `cuda-correctness` profile while retaining
+`--release` only for clean official release. Evidence records the selected
+profile, and the independent validator rejects command or binary-path profile
+substitution. Collector, validator and unified gate self-tests pass. The
+immutable REJECT record is
+`/workspace/ferrum-artifacts/runtime-vnext-g07a-diagnostic-8e25b3eb-20260730/diagnostic.reject.json`.
+The complete 295 MB evidence directory was packed and uploaded to the GitHub
+draft-release asset
+`runtime-vnext-g07a-diagnostic-8e25b3eb-20260730.tar.zst` (asset
+`495318223`, 119,436,402 bytes), SHA256
+`ccbb146acff71bd2e95785c0cb6beb5e9ffb4882b5d08195aff2525f74c36395`.
+It was downloaded through GitHub and passed SHA256 and zstd verification under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07a-diagnostic-8e25b3eb-20260730-github`.
+This remains diagnostic evidence, not canonical G07A PASS; the next paid run
+must prove the predicted `rust-model-leaf <=90s` result before running the
+five-sample matrix.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。

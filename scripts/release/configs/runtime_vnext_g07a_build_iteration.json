@@ -53,8 +53,9 @@
     "core_ptx_source_policy": "allow",
     "default_source_policy": "cache-only",
     "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
+    "incremental_profile": "cuda-correctness",
     "nvcc_threads": 4,
-    "profile": "release"
+    "official_release_profile": "release"
   },
   "native_build": {
     "compute_capability": "sm_89",
