@@ -6,16 +6,22 @@ use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
 };
-use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig};
+use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig, SpecialTokens, TokenId};
 use std::sync::Arc;
 use std::time::Duration;
 
 const VOCAB_SIZE: usize = 1000;
+const JSON_OBJECT_TOKEN_ID: u32 = 123;
 
 fn make_engine() -> ContinuousBatchEngine {
+    make_engine_with_tokenizer(Arc::new(MockTokenizer::new(VOCAB_SIZE)))
+}
+
+fn make_engine_with_tokenizer(
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+) -> ContinuousBatchEngine {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
-    let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(1024));
     let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
@@ -31,6 +37,81 @@ fn make_engine() -> ContinuousBatchEngine {
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
+}
+
+struct JsonObjectTokenizer {
+    inner: MockTokenizer,
+}
+
+impl JsonObjectTokenizer {
+    fn new() -> Self {
+        Self {
+            inner: MockTokenizer::new(VOCAB_SIZE),
+        }
+    }
+}
+
+impl Tokenizer for JsonObjectTokenizer {
+    fn encode(&self, text: &str, add_special: bool) -> ferrum_types::Result<Vec<TokenId>> {
+        self.inner.encode(text, add_special)
+    }
+
+    fn decode(&self, tokens: &[TokenId], skip_special: bool) -> ferrum_types::Result<String> {
+        let mut output = String::new();
+        for token in tokens {
+            if token.get() == JSON_OBJECT_TOKEN_ID {
+                output.push_str("{}");
+            } else {
+                if !output.is_empty() {
+                    output.push(' ');
+                }
+                output.push_str(&self.inner.decode(&[*token], skip_special)?);
+            }
+        }
+        Ok(output)
+    }
+
+    fn decode_incremental(
+        &self,
+        previous: &[TokenId],
+        next: TokenId,
+    ) -> ferrum_types::Result<String> {
+        if next.get() == JSON_OBJECT_TOKEN_ID {
+            Ok("{}".to_string())
+        } else {
+            self.inner.decode_incremental(previous, next)
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn special_tokens(&self) -> &SpecialTokens {
+        self.inner.special_tokens()
+    }
+
+    fn token_id(&self, text: &str) -> Option<TokenId> {
+        (text == "{}")
+            .then_some(TokenId::new(JSON_OBJECT_TOKEN_ID))
+            .or_else(|| self.inner.token_id(text))
+    }
+
+    fn token_text(&self, token_id: TokenId) -> Option<&str> {
+        self.inner.token_text(token_id)
+    }
+
+    fn token_bytes(&self, token_id: TokenId) -> Option<Vec<u8>> {
+        if token_id.get() == JSON_OBJECT_TOKEN_ID {
+            Some(b"{}".to_vec())
+        } else {
+            self.inner.token_bytes(token_id)
+        }
+    }
+
+    fn info(&self) -> ferrum_interfaces::tokenizer::TokenizerInfo {
+        self.inner.info()
+    }
 }
 
 fn make_request(prompt: &str) -> InferenceRequest {
@@ -418,7 +499,7 @@ async fn prefix_cache_avoids_second_prefill() {
 async fn json_mode_biases_first_token() {
     use ferrum_types::ResponseFormat;
 
-    let engine = make_engine();
+    let engine = make_engine_with_tokenizer(Arc::new(JsonObjectTokenizer::new()));
 
     // Without JSON mode: MockExecutor biases token 42, so greedy picks 42.
     let mut plain_req = make_request("Hello");
@@ -430,14 +511,15 @@ async fn json_mode_biases_first_token() {
         "Without JSON mode, greedy should pick token 42"
     );
 
-    // With JSON mode: structural_bias (5.0) on token 123 (`{`) beats 1.0 on token 42.
+    // With JSON mode, grammar masking removes token 42 and leaves token 123 (`{}`).
     let mut json_req = make_request("Hello");
     json_req.sampling_params.max_tokens = 1;
     json_req.sampling_params.response_format = ResponseFormat::JsonObject;
     let json_resp = engine.infer(json_req).await.unwrap();
     assert_eq!(
         json_resp.tokens[0].get(),
-        123,
-        "JSON mode should bias first token to `{{` (token 123)"
+        JSON_OBJECT_TOKEN_ID,
+        "JSON mode should select the complete JSON object token"
     );
+    assert_eq!(json_resp.text, "{}");
 }
