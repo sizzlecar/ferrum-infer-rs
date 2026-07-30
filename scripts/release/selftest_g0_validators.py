@@ -121,6 +121,13 @@ RUNTIME_VNEXT_CUDA_REPLAY_KERNEL_ATTRIBUTION = (
 RUNTIME_VNEXT_G07B_NATIVE_CHAIN_VALIDATOR = (
     REPO_ROOT / "scripts/release/validate_runtime_vnext_g07b_native_chain.py"
 )
+RUNTIME_VNEXT_G07A_BUILD_ITERATION = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g07a_build_iteration.py"
+)
+RUNTIME_VNEXT_G07A_BUILD_ITERATION_VALIDATOR = (
+    REPO_ROOT
+    / "scripts/release/validate_runtime_vnext_g07a_build_iteration.py"
+)
 NATIVE_WORK_ATTRIBUTION_GATE = REPO_ROOT / "scripts/release/native_work_attribution_gate.py"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
@@ -891,6 +898,35 @@ def test_runtime_vnext_g07b_native_chain_validator_selftest() -> None:
     )
 
 
+def test_runtime_vnext_g07a_build_iteration_selftests() -> None:
+    collector = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G07A_BUILD_ITERATION),
+            "--self-test",
+        ]
+    )
+    require(collector.returncode == 0, collector.stderr or collector.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G07A BUILD ITERATION SELFTEST PASS"
+        in collector.stdout,
+        collector.stdout,
+    )
+    validator = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G07A_BUILD_ITERATION_VALIDATOR),
+            "--self-test",
+        ]
+    )
+    require(validator.returncode == 0, validator.stderr or validator.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G07A BUILD ITERATION VALIDATOR SELFTEST PASS"
+        in validator.stdout,
+        validator.stdout,
+    )
+
+
 def test_native_work_attribution_gate_selftest() -> None:
     ok = run([sys.executable, str(NATIVE_WORK_ATTRIBUTION_GATE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -1205,6 +1241,7 @@ def main() -> int:
     test_runtime_vnext_g08c_metal_matrix_prepare_selftest()
     test_runtime_vnext_g08_performance_smoke_selftest()
     test_runtime_vnext_cuda_replay_kernel_attribution_selftest()
+    test_runtime_vnext_g07a_build_iteration_selftests()
     test_runtime_vnext_g07b_native_chain_validator_selftest()
     test_native_work_attribution_gate_selftest()
     test_bounded_command_selftest()

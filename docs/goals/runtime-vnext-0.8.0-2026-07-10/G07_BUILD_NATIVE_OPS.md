@@ -3,7 +3,10 @@
 ## 状态与依赖
 
 - 状态：Open
-- 总 PASS 依赖：G00P、live G03 catalog 和 S1 production build graph
+- G07A 依赖：fresh G00F build-input inventory、S1 production build graph、
+  workspace source gate 和 release/correctness semantic-plan equivalence；不等待 G00P
+- G07B 依赖：live G03 catalog 和 G07A manifest
+- G07 aggregate/发布前依赖：G00P、G07A 和 G07B
 - G07A 在 S1 后立即与 S2/S3 并行，S4 前达到开发反馈目标；G07B 随 live operation catalog/version
 - 下游：S2-S7、G08-G10
 
@@ -28,7 +31,7 @@ graph，就开始测量并拆分 invalidation domain；否则到 S4 大模型迁
 G07A/G07B 是 canonical DAG checkpoint：
 
 ```text
-python3 scripts/release/run_gate.py vnext-g07a --g00 <g00-manifest> --g01 <g01-manifest> --out <external-out>
+python3 scripts/release/run_gate.py vnext-g07a --g00f <g00f-manifest> --s1-artifact <s1-manifest> --g07a-evidence-root <raw-evidence> --out <external-out>
 python3 scripts/release/run_gate.py vnext-g07b --g03 <g03-manifest> --g07a <g07a-manifest> --out <external-out>
 python3 scripts/release/run_gate.py vnext-g07 --g07a <g07a-manifest> --g07b <g07b-manifest> --out <external-out>
 ```
@@ -446,6 +449,47 @@ This is a source/test checkpoint, not G07A, G07B or aggregate G07 PASS.
 Dependency depfiles, CUDA toolkit/subtool provenance, one fixed-RTX-4090
 source-build-to-link/load chain, the five-sample timing matrix, workspace
 source gate and canonical validators remain Open.
+
+### 2026-07-30 artifact-only boundary and G07A harness checkpoint
+
+Clean pushed source `fa463480802dc44f5c65694aa8cb176b72ae1045`
+removed 53 vendored third-party CUDA/C++ files (about 19.4K lines) from the
+product repository. `ferrum-kernels/build.rs` now requires a complete
+`FERRUM_NATIVE_OPERATOR_SET_LOCK` for CUDA native units and fails closed;
+it no longer compiles Marlin, vLLM Marlin/MoE Marlin or paged-attention
+sources and has no hidden source fallback. The deterministic external source
+bundle contains 53 members and is pinned by:
+
+```text
+bundle id: ferrum-native-cuda-v1+sha256.7f6f35f91a85df6ea5374d5597f7f8ca4c159b5e567c1c1ef122a0ab88657613
+archive sha256: 7ea3cc2c0260bb1e7dfb471efd52d6b85aeee4072a491b7a57605534d554ef2c
+```
+
+The build-input asset was published at GitHub tag
+`runtime-vnext-native-sources-v1`, downloaded again and SHA256/zstd verified
+under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-artifact-only-fa463480-20260730/source-bundle-published`.
+Focused native-op tests passed `9/9`, CUDA replay boundary tests passed
+`13/13`, and the milestone source gate printed:
+
+```text
+FERRUM GATE unit PASS: /Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07-artifact-only-e018a5d1-20260730/checkpoint/unit-gate
+```
+
+G07A now has a separate six-scenario policy, bounded collector and independent
+raw-evidence validator. The collector uses one fixed RTX 4090, stable recreated
+worktrees, declared target/object caches, fixed fsynced content sentinels,
+content-addressed binary/archive blobs and source-build receipt schema v7.
+Each native-TU timing sample clones a canonical-only cache seed so the changed
+object cannot leak from sample 1 into samples 2-5. Resume verifies completed
+sample artifacts and discards only an incomplete sample directory.
+
+The independent validator recomputes Cargo fresh/non-fresh packages, bounded
+command/limit/resource receipts, mutation restoration, source-build
+compiled/cache-hit partitions, binary/archive identities and nearest-rank
+p50/p95. Both harness self-tests currently pass. No real six-scenario
+diagnostic or five-sample RTX 4090 matrix has run at this checkpoint, so this is
+not G07A, G07B or aggregate G07 PASS.
 
 ## 验收
 
