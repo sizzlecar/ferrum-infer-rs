@@ -401,10 +401,19 @@ def validate_vnext_trace(rows: list[dict[str, Any]], entrypoint: str) -> dict[st
         origin = request_origin(request_id, entrypoint)
         origins[origin] += 1
         sequences = [row["shape"]["execution_sequence"] for row in request_rows]
-        require(
-            sequences == list(range(1, len(sequences) + 1)),
-            f"{entrypoint}: non-contiguous execution sequence for {request_id}",
-        )
+        if origin == "startup":
+            require(
+                len(sequences) == 4
+                and sequences[:2] == [1, 2]
+                and sequences[2] > 2
+                and sequences[3] == sequences[2] + 1,
+                f"{entrypoint}: startup lifecycle summary sequence is invalid for {request_id}",
+            )
+        else:
+            require(
+                sequences == list(range(1, len(sequences) + 1)),
+                f"{entrypoint}: non-contiguous product execution sequence for {request_id}",
+            )
         request_kinds = [(row.get("attributes") or {}).get("execution_event_kind") for row in request_rows]
         require(request_kinds[0] == "request_accepted", f"{entrypoint}: request does not start accepted")
         require(request_kinds[-1] == "request_completed", f"{entrypoint}: request does not complete")
@@ -1558,10 +1567,19 @@ def validate_bounded_profile_trace(
     for request_id, request_events in by_request.items():
         origin = request_origin(request_id, label)
         sequences = [event["shape"].get("execution_sequence") for event in request_events]
-        require(
-            sequences == list(range(1, len(request_events) + 1)),
-            f"{label}: non-contiguous execution sequence for {request_id}",
-        )
+        if origin == "startup":
+            require(
+                len(sequences) == 4
+                and sequences[:2] == [1, 2]
+                and sequences[2] > 2
+                and sequences[3] == sequences[2] + 1,
+                f"{label}: startup lifecycle summary sequence is invalid for {request_id}",
+            )
+        else:
+            require(
+                sequences == list(range(1, len(request_events) + 1)),
+                f"{label}: non-contiguous product execution sequence for {request_id}",
+            )
         request_counts = Counter(
             str(event["attributes"].get("execution_event_kind")) for event in request_events
         )
@@ -2103,6 +2121,7 @@ def bounded_profile_events(
             "sequence_completed",
             "request_completed",
         ]
+        sequences = [1, 2, 5 + 3 * node_count, 6 + 3 * node_count]
     else:
         kinds = [
             "request_accepted",
@@ -2117,8 +2136,9 @@ def bounded_profile_events(
             "sequence_completed",
             "request_completed",
         ]
+        sequences = list(range(1, len(kinds) + 1))
     rows = []
-    for sequence, kind in enumerate(kinds, 1):
+    for sequence, kind in zip(sequences, kinds):
         attributes: dict[str, Any] = {
             "execution_trace_source": "vnext",
             "execution_capture_policy": (
@@ -2276,12 +2296,12 @@ def create_selftest_fixture(root: Path) -> None:
         ]
         startup_events = [
             profile_event(
-                index,
+                sequence,
                 kind,
                 entrypoint,
                 request_id="request.startup.selftest",
             )
-            for index, kind in enumerate(startup_event_names, 1)
+            for sequence, kind in zip([1, 2, 8, 9], startup_event_names)
         ]
         write_jsonl(
             directory / "scheduler-trace.jsonl",

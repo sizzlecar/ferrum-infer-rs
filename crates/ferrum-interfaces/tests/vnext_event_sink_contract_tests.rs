@@ -56,7 +56,12 @@ fn vnext_event_sink_contract() {
     );
     check(
         &mut passed,
-        !ExecutionEventCapturePolicy::LifecycleOnly.captures_frame(0)
+        ExecutionEventCapturePolicy::LifecycleOnly.captures_frame(0)
+            && !ExecutionEventCapturePolicy::LifecycleOnly.captures_frame(1)
+            && ExecutionEventCapturePolicy::LifecycleOnly
+                .records_event(ExecutionEventKind::RequestAccepted)
+            && !ExecutionEventCapturePolicy::LifecycleOnly
+                .records_event(ExecutionEventKind::OperationSubmitted)
             && ExecutionEventCapturePolicy::LifecycleOnly.as_str() == "lifecycle_only"
             && sink.capture_policy_for_request(ExecutorRequestOrigin::Startup)
                 == ExecutionEventCapturePolicy::AllFrames,

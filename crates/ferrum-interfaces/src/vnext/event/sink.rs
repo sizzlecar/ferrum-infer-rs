@@ -85,8 +85,23 @@ impl ExecutionEventCapturePolicy {
     pub const fn captures_frame(self, completed_frames: u64) -> bool {
         match self {
             Self::AllFrames => true,
-            Self::FirstFramePerRequest => completed_frames == 0,
-            Self::LifecycleOnly => false,
+            Self::FirstFramePerRequest | Self::LifecycleOnly => completed_frames == 0,
+        }
+    }
+
+    pub const fn records_event(self, kind: ExecutionEventKind) -> bool {
+        match self {
+            Self::AllFrames | Self::FirstFramePerRequest => true,
+            Self::LifecycleOnly => matches!(
+                kind,
+                ExecutionEventKind::RequestAccepted
+                    | ExecutionEventKind::PlanBuilt
+                    | ExecutionEventKind::FailureObserved
+                    | ExecutionEventKind::SequenceCompleted
+                    | ExecutionEventKind::SequenceAborted
+                    | ExecutionEventKind::RequestCompleted
+                    | ExecutionEventKind::RequestFailed
+            ),
         }
     }
 
@@ -166,6 +181,7 @@ impl ExecutionEventSinkHandle<'_> {
 pub struct ExecutionEventEmitter<'sink> {
     sink: ExecutionEventSinkHandle<'sink>,
     cursor: ExecutionEventCursor,
+    capture_policy: ExecutionEventCapturePolicy,
     sink_failed: bool,
 }
 
@@ -175,9 +191,11 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         run_id: RunId,
         request_id: RequestIdentity,
     ) -> Self {
+        let capture_policy = sink.capture_policy();
         Self {
             sink: ExecutionEventSinkHandle::Borrowed(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
+            capture_policy,
             sink_failed: false,
         }
     }
@@ -191,11 +209,27 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         run_id: RunId,
         request_id: RequestIdentity,
     ) -> ExecutionEventEmitter<'static> {
+        let capture_policy = sink.capture_policy();
+        Self::from_shared_with_capture_policy(sink, run_id, request_id, capture_policy)
+    }
+
+    pub fn from_shared_with_capture_policy(
+        sink: Arc<dyn ExecutionEventSink>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        capture_policy: ExecutionEventCapturePolicy,
+    ) -> ExecutionEventEmitter<'static> {
         ExecutionEventEmitter {
             sink: ExecutionEventSinkHandle::Shared(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
+            capture_policy,
             sink_failed: false,
         }
+    }
+
+    fn records_event(&self, event: &ExecutionEvent) -> bool {
+        self.capture_policy.records_event(event.kind())
+            && self.sink.as_sink().is_enabled(event.kind())
     }
 
     fn validate_next(
@@ -244,7 +278,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         }
         let mut next_cursor = self.cursor.clone();
         Self::validate_next(&mut next_cursor, &event, context)?;
-        if self.sink.as_sink().is_enabled(event.kind()) {
+        if self.records_event(&event) {
             let permit = EventEmissionPermit {
                 event,
                 _seal: event_sink_seal::Seal,
@@ -282,9 +316,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             Self::validate_next(&mut next_cursor, event, context)?;
         }
 
-        let all_enabled = events
-            .iter()
-            .all(|event| self.sink.as_sink().is_enabled(event.kind()));
+        let all_enabled = events.iter().all(|event| self.records_event(event));
         if all_enabled {
             let permit = EventBatchEmissionPermit {
                 events,
@@ -296,7 +328,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             }
         } else {
             for event in events {
-                if !self.sink.as_sink().is_enabled(event.kind()) {
+                if !self.records_event(&event) {
                     continue;
                 }
                 let permit = EventEmissionPermit {

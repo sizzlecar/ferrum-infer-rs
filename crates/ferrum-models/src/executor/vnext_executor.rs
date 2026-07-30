@@ -1697,10 +1697,11 @@ impl VNextExecutionJournal {
             SpanId::new(format!("vnext/request/{}", active.fingerprint())).map_err(Self::error)?;
         let capture_policy = sink.capture_policy_for_request(request_origin);
         let mut journal = Self {
-            emitter: ExecutionEventEmitter::from_shared(
+            emitter: ExecutionEventEmitter::from_shared_with_capture_policy(
                 sink,
                 active.run_id().clone(),
                 active.request_id().clone(),
+                capture_policy,
             ),
             topology,
             active,
