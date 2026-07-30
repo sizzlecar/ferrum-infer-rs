@@ -23,11 +23,12 @@ import native_operator_source_bundle as source_bundle
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+COLLECTOR_PATH = Path(__file__).resolve()
 POLICY_PATH = (
     REPO_ROOT
     / "scripts/release/configs/runtime_vnext_g07a_build_iteration.json"
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 ARTIFACT_TYPE = "runtime_vnext_g07a_build_iteration_evidence"
 PASS_LINE = "FERRUM RUNTIME VNEXT G07A BUILD ITERATION EVIDENCE READY"
@@ -675,11 +676,24 @@ def parse_product_native_signal(
             "CUDA build summary receipt identity mismatch",
         )
         summaries = receipt["rows"]
+    indexed_rows: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(summaries):
+        require(
+            isinstance(row, dict)
+            and isinstance(row.get("artifact"), str)
+            and bool(row["artifact"]),
+            f"CUDA build summary row {index} is invalid",
+        )
+        artifact = row["artifact"]
+        require(
+            artifact not in indexed_rows,
+            f"CUDA build summary contains duplicate artifact row: {artifact}",
+        )
+        indexed_rows[artifact] = row
     artifact_rows = {
-        row.get("artifact"): row
-        for row in summaries
-        if isinstance(row, dict)
-        and row.get("artifact") in PRODUCT_NATIVE_ARTIFACTS
+        artifact: row
+        for artifact, row in indexed_rows.items()
+        if artifact in PRODUCT_NATIVE_ARTIFACTS
     }
     require(
         all(
@@ -691,23 +705,21 @@ def parse_product_native_signal(
     )
     require(
         not any(
-            isinstance(row, dict) and row.get("status") == "rejected"
-            for row in summaries
+            row.get("status") == "rejected"
+            for row in indexed_rows.values()
         ),
         "product CUDA build summary contains a rejection",
     )
     core_ptx_built = sorted(
-        str(row.get("artifact")).removeprefix("core-ptx:")
-        for row in summaries
-        if isinstance(row, dict)
-        and str(row.get("artifact", "")).startswith("core-ptx:")
+        artifact.removeprefix("core-ptx:")
+        for artifact, row in indexed_rows.items()
+        if artifact.startswith("core-ptx:")
         and row.get("status") == "built"
     )
     core_ptx_rows = {
-        str(row.get("artifact")).removeprefix("core-ptx:"): row
-        for row in summaries
-        if isinstance(row, dict)
-        and str(row.get("artifact", "")).startswith("core-ptx:")
+        artifact.removeprefix("core-ptx:"): row
+        for artifact, row in indexed_rows.items()
+        if artifact.startswith("core-ptx:")
     }
     return {
         "compiled_native_tu_paths": compiled_paths,
@@ -741,6 +753,75 @@ def validate_product_cache_bootstrap_signal(
         ),
         "core PTX cache bootstrap did not materialize every configured PTX",
     )
+
+
+def core_ptx_cache_inventory(
+    evidence_root: Path,
+    native_build_cache: Path,
+    core_ptx_rows: dict[str, Any],
+) -> dict[str, Any]:
+    require(
+        native_build_cache.is_dir() and not native_build_cache.is_symlink(),
+        "core PTX cache root is missing or unsafe",
+    )
+    resolved_cache_root = native_build_cache.resolve()
+    entries: list[dict[str, Any]] = []
+    stems: set[str] = set()
+    for source_path, raw_row in sorted(core_ptx_rows.items()):
+        require(isinstance(raw_row, dict), f"invalid core PTX row: {source_path}")
+        raw_inputs_hash = raw_row.get("inputs_hash")
+        require(
+            isinstance(raw_inputs_hash, str)
+            and raw_inputs_hash.startswith("sha256:")
+            and re.fullmatch(r"[0-9a-f]{64}", raw_inputs_hash[7:]) is not None,
+            f"invalid core PTX inputs hash: {source_path}",
+        )
+        inputs_hash = raw_inputs_hash[7:]
+        stem = Path(source_path).stem
+        require(stem not in stems, f"duplicate core PTX cache stem: {stem}")
+        stems.add(stem)
+        artifact_id = f"core_ptx.{stem}"
+        entry_root = native_build_cache / artifact_id / inputs_hash
+        resolved_entry_root = entry_root.resolve()
+        manifest_path = entry_root / "manifest.json"
+        payload_path = entry_root / f"{stem}.ptx"
+        require(
+            resolved_entry_root.is_relative_to(resolved_cache_root)
+            and entry_root.is_dir()
+            and not entry_root.is_symlink()
+            and manifest_path.is_file()
+            and not manifest_path.is_symlink()
+            and payload_path.is_file()
+            and not payload_path.is_symlink(),
+            f"core PTX cache entry is incomplete: {entry_root}",
+        )
+        manifest = read_json(manifest_path, f"core PTX cache manifest {source_path}")
+        payload_sha256 = sha256(payload_path)
+        require(
+            manifest.get("schema_version") == 1
+            and manifest.get("artifact_id") == artifact_id
+            and manifest.get("file_name") == payload_path.name
+            and manifest.get("input_signature_sha256") == inputs_hash
+            and manifest.get("artifact_sha256") == payload_sha256
+            and manifest.get("artifact_size_bytes") == payload_path.stat().st_size,
+            f"core PTX cache manifest does not bind its payload: {source_path}",
+        )
+        entries.append(
+            {
+                "source_path": source_path,
+                "artifact_id": artifact_id,
+                "inputs_sha256": inputs_hash,
+                "cache_entry": entry_root.relative_to(native_build_cache).as_posix(),
+                "manifest": store_blob(evidence_root, manifest_path, "core-ptx-cache-manifest"),
+                "payload": store_blob(evidence_root, payload_path, "core-ptx-cache-payload"),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "entry_count": len(entries),
+        "entries": entries,
+        "entries_sha256": canonical_json_sha256(entries),
+    }
 
 
 def fsync_replace(path: Path, payload: bytes) -> tuple[int, int]:
@@ -873,6 +954,7 @@ def copy_cargo_timing(
 
 
 def validate_product_sample_signal(
+    policy: dict[str, Any],
     scenario: dict[str, Any],
     cargo: dict[str, Any],
     native: dict[str, Any],
@@ -909,10 +991,39 @@ def validate_product_sample_signal(
             f"{name} did not invalidate {expected_package}",
         )
     if name == "core-ptx":
+        expected_core = set(policy["product_build"]["core_ptx_inputs"])
         require(
-            native["core_ptx_built_paths"] == ["kernels/add_bias.cu"],
-            "core-ptx sample did not rebuild exactly add_bias.cu",
+            set(native["core_ptx_rows"]) == expected_core
+            and native["core_ptx_built_paths"] == ["kernels/add_bias.cu"]
+            and all(
+                row.get("status")
+                == (
+                    "built"
+                    if path == "kernels/add_bias.cu"
+                    else "cache_hit"
+                )
+                for path, row in native["core_ptx_rows"].items()
+            ),
+            "core-ptx sample did not rebuild only add_bias.cu with 39 cache hits",
         )
+
+
+def validate_product_core_ptx_prewarm_signal(
+    policy: dict[str, Any],
+    native: dict[str, Any],
+) -> None:
+    expected_core = set(policy["product_build"]["core_ptx_inputs"])
+    require(
+        native["compiled_native_tu_count"] == 0
+        and set(native["artifact_build_units"]) == PRODUCT_NATIVE_ARTIFACTS
+        and set(native["core_ptx_rows"]) == expected_core
+        and native["core_ptx_built_paths"] == []
+        and all(
+            row.get("status") == "cache_hit"
+            for row in native["core_ptx_rows"].values()
+        ),
+        "core-ptx prewarm did not prove 40 cache hits and zero native compilation",
+    )
 
 
 def build_product_core_ptx_cache(
@@ -929,32 +1040,54 @@ def build_product_core_ptx_cache(
 ) -> dict[str, Any]:
     setup_root = evidence_root / "setup/product-core-ptx-cache-bootstrap"
     record_path = setup_root / "bootstrap.json"
+    target_dir = target_root / "product-cache-bootstrap"
     if resume and record_path.is_file():
-        record = read_json(record_path, "product core PTX cache bootstrap")
-        require(
-            record.get("schema_version") == SCHEMA_VERSION
-            and record.get("status") == "pass"
-            and record.get("source_git_sha") == source["git_sha"]
-            and record.get("native_build_cache") == str(native_build_cache)
-            and native_build_cache.is_dir()
-            and any(native_build_cache.iterdir()),
-            "resumed product core PTX cache bootstrap is stale",
-        )
-        for label, raw in (
-            ("bootstrap bounded receipt", record["build"]["bounded_receipt"]),
-            ("bootstrap stdout", record["build"]["stdout"]),
-            ("bootstrap stderr", record["build"]["stderr"]),
-            ("bootstrap CUDA summary", record["build"]["cuda_build_summary"]),
-            ("bootstrap smoke receipt", record["smoke"]["bounded_receipt"]),
-            ("bootstrap binary", record["output"]["artifact"]),
-        ):
-            verify_ref(evidence_root, raw, label)
-        return record
+        try:
+            record = read_json(record_path, "product core PTX cache bootstrap")
+            require(
+                record.get("schema_version") == SCHEMA_VERSION
+                and record.get("status") == "pass"
+                and record.get("source_git_sha") == source["git_sha"]
+                and record.get("native_build_cache") == str(native_build_cache)
+                and native_build_cache.is_dir()
+                and not native_build_cache.is_symlink()
+                and any(native_build_cache.iterdir()),
+                "resumed product core PTX cache bootstrap is stale",
+            )
+            for label, raw in (
+                ("bootstrap bounded receipt", record["build"]["bounded_receipt"]),
+                ("bootstrap stdout", record["build"]["stdout"]),
+                ("bootstrap stderr", record["build"]["stderr"]),
+                ("bootstrap CUDA summary", record["build"]["cuda_build_summary"]),
+                ("bootstrap smoke receipt", record["smoke"]["bounded_receipt"]),
+                ("bootstrap binary", record["output"]["artifact"]),
+            ):
+                verify_ref(evidence_root, raw, label)
+            native_signal = record["build"]["native_signal"]
+            require(
+                isinstance(native_signal, dict),
+                "resumed product core PTX cache bootstrap native signal is invalid",
+            )
+            validate_product_cache_bootstrap_signal(policy, native_signal)
+            require(
+                record.get("cache_inventory")
+                == core_ptx_cache_inventory(
+                    evidence_root,
+                    native_build_cache,
+                    native_signal["core_ptx_rows"],
+                ),
+                "resumed product core PTX cache inventory is stale",
+            )
+        except (BuildIterationError, KeyError, TypeError):
+            pass
+        else:
+            return record
     if setup_root.exists():
         require(resume, f"bootstrap output already exists: {setup_root}")
         shutil.rmtree(setup_root)
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
 
-    target_dir = target_root / "product-cache-bootstrap"
     summary_path = setup_root / "cuda-build-summary.receipt.json"
     command = cargo_build_command(
         policy=policy,
@@ -1008,6 +1141,11 @@ def build_product_core_ptx_cache(
     cargo_summary = parse_cargo_messages(cargo_stdout)
     native_signal = parse_product_native_signal(cargo_stderr, summary_path)
     validate_product_cache_bootstrap_signal(policy, native_signal)
+    cache_inventory = core_ptx_cache_inventory(
+        evidence_root,
+        native_build_cache,
+        native_signal["core_ptx_rows"],
+    )
     summary_ref = artifact_ref(
         evidence_root,
         summary_path,
@@ -1021,7 +1159,9 @@ def build_product_core_ptx_cache(
         "source_git_sha": source["git_sha"],
         "source_tree_sha": source["git_tree_sha"],
         "source_policy": policy["product_build"]["bootstrap_source_policy"],
+        "cargo_target": str(target_dir),
         "native_build_cache": str(native_build_cache),
+        "cache_inventory": cache_inventory,
         "build": {
             **build,
             "cargo_summary": cargo_summary,
@@ -1063,6 +1203,34 @@ def product_sample(
     sample_root = evidence_root / "build-timings" / name / f"sample-{sample_index}"
     require(not sample_root.exists(), f"sample output already exists: {sample_root}")
     sample_root.mkdir(parents=True)
+    sample_native_build_cache = native_build_cache
+    cache_seed: dict[str, Any] | None = None
+    if name == "core-ptx":
+        require(
+            native_build_cache.is_dir()
+            and not native_build_cache.is_symlink(),
+            "core-ptx baseline cache is missing or unsafe",
+        )
+        sample_native_build_cache = (
+            native_build_cache.parent
+            / "product-core-ptx-samples"
+            / sample_id
+        )
+        require(
+            sample_native_build_cache.resolve().is_relative_to(
+                native_build_cache.parent.resolve()
+            ),
+            "core-ptx sample cache escapes the managed object cache",
+        )
+        if sample_native_build_cache.exists():
+            shutil.rmtree(sample_native_build_cache)
+        sample_native_build_cache.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(native_build_cache, sample_native_build_cache)
+        cache_seed = {
+            "kind": "baseline-cache-clone",
+            "source": str(native_build_cache),
+            "destination": str(sample_native_build_cache),
+        }
     reset_worktree(source_root, worktree, source["git_sha"])
     clean_before = run_text(worktree, ["git", "status", "--short"]) == ""
     summary_path = target_dir / "g07a-build-summary.receipt.json"
@@ -1085,7 +1253,7 @@ def product_sample(
                 policy=policy,
                 target_dir=target_dir,
                 native_operator_set_lock=native_operator_set_lock,
-                native_build_cache=native_build_cache,
+                native_build_cache=sample_native_build_cache,
                 build_summary_receipt=summary_path,
                 source_policy=source_policy,
             ),
@@ -1094,6 +1262,39 @@ def product_sample(
             progress_signal="Cargo log growth, rustc/linker activity, and binary creation",
             lane_deadline=lane_deadline,
         )
+        prewarm_cargo_stdout = verify_ref(
+            evidence_root,
+            prewarm["stdout"],
+            f"{sample_id} prewarm Cargo stdout",
+        )
+        prewarm_cargo_stderr = verify_ref(
+            evidence_root,
+            prewarm["stderr"],
+            f"{sample_id} prewarm Cargo stderr",
+        )
+        prewarm_native_signal = parse_product_native_signal(
+            prewarm_cargo_stderr,
+            summary_path,
+        )
+        if name == "core-ptx":
+            validate_product_core_ptx_prewarm_signal(
+                policy,
+                prewarm_native_signal,
+            )
+        prewarm = {
+            **prewarm,
+            "cargo_summary": parse_cargo_messages(prewarm_cargo_stdout),
+            "native_signal": prewarm_native_signal,
+            "cuda_build_summary": (
+                store_blob(
+                    evidence_root,
+                    summary_path,
+                    "cuda-build-summary",
+                )
+                if summary_path.is_file()
+                else None
+            ),
+        }
         if scenario["input"] is None:
             setup = {"kind": "none"}
         else:
@@ -1116,7 +1317,7 @@ def product_sample(
                 policy=policy,
                 target_dir=target_dir,
                 native_operator_set_lock=native_operator_set_lock,
-                native_build_cache=native_build_cache,
+                native_build_cache=sample_native_build_cache,
                 build_summary_receipt=summary_path,
                 source_policy=source_policy,
             ),
@@ -1158,6 +1359,7 @@ def product_sample(
             summary_path,
         )
         validate_product_sample_signal(
+            policy,
             scenario,
             cargo_summary,
             native_signal,
@@ -1169,7 +1371,7 @@ def product_sample(
             sample_root,
         )
         build_summary_ref = (
-            artifact_ref(
+            store_blob(
                 evidence_root,
                 summary_path,
                 "cuda-build-summary",
@@ -1195,6 +1397,9 @@ def product_sample(
         "status": "pass",
         "source_git_sha": source["git_sha"],
         "source_tree_sha": source["git_tree_sha"],
+        "collector_sha256": sha256(COLLECTOR_PATH),
+        "policy_sha256": sha256(POLICY_PATH),
+        "scenario": scenario,
         "timed_started_at": timed_started_at,
         "timed_finished_at": timed_finished_at,
         "timed_monotonic_started_seconds": timed_started,
@@ -1216,7 +1421,9 @@ def product_sample(
             "native_operator_set_lock_sha256": sha256(
                 native_operator_set_lock
             ),
-            "native_build_cache": str(native_build_cache),
+            "baseline_native_build_cache": str(native_build_cache),
+            "native_build_cache": str(sample_native_build_cache),
+            "seed": cache_seed,
             "source_policy": source_policy,
         },
         "setup": setup,
@@ -1485,6 +1692,9 @@ def native_sample(
         "status": "pass",
         "source_git_sha": source["git_sha"],
         "source_tree_sha": source["git_tree_sha"],
+        "collector_sha256": sha256(COLLECTOR_PATH),
+        "policy_sha256": sha256(POLICY_PATH),
+        "scenario": scenario,
         "timed_started_at": timed_started_at,
         "timed_finished_at": timed_finished_at,
         "timed_monotonic_started_seconds": timed_started,
@@ -1542,16 +1752,21 @@ def resumed_sample(
     path: Path,
     source: dict[str, Any],
     expected_id: str,
+    scenario: dict[str, Any],
 ) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
         record = read_json(path, "resumed sample")
         require(
-            record.get("status") == "pass"
+            record.get("schema_version") == SCHEMA_VERSION
+            and record.get("status") == "pass"
             and record.get("sample_id") == expected_id
             and record.get("source_git_sha") == source["git_sha"]
-            and record.get("source_tree_sha") == source["git_tree_sha"],
+            and record.get("source_tree_sha") == source["git_tree_sha"]
+            and record.get("collector_sha256") == sha256(COLLECTOR_PATH)
+            and record.get("policy_sha256") == sha256(POLICY_PATH)
+            and record.get("scenario") == scenario,
             "resumed sample identity mismatch",
         )
         sample_refs_valid(evidence_root, record)
@@ -1830,6 +2045,15 @@ def collect(args: argparse.Namespace) -> Path:
             resume=args.resume,
         ),
     }
+    command_native_operator_set_lock = (
+        evidence_root / input_refs["native_operator_set_lock"]["path"]
+    ).resolve()
+    require(
+        command_native_operator_set_lock.is_file()
+        and sha256(command_native_operator_set_lock)
+        == input_refs["native_operator_set_lock"]["sha256"],
+        "copied native operator set lock identity mismatch",
+    )
     crate_graph_path = evidence_root / "crate-graph.json"
     metadata = subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
@@ -1866,10 +2090,14 @@ def collect(args: argparse.Namespace) -> Path:
         "repeats": repeats,
         "compiler_cache": compiler_cache,
         "paths": {
+            "source_root": str(source_root),
+            "native_source_root": str(native_source_root),
+            "evidence_root": str(evidence_root),
             "worktree_root": str(worktree_root),
             "target_root": str(target_root),
             "object_cache": str(object_cache),
             "product_native_build_cache": str(product_native_build_cache),
+            "native_operator_set_lock": str(command_native_operator_set_lock),
         },
         "inputs": input_refs,
     }
@@ -1895,7 +2123,7 @@ def collect(args: argparse.Namespace) -> Path:
         source=source,
         policy=policy,
         target_root=target_root,
-        native_operator_set_lock=native_operator_set_lock,
+        native_operator_set_lock=command_native_operator_set_lock,
         native_build_cache=product_native_build_cache,
         lane_deadline=lane_deadline,
         resume=args.resume,
@@ -1920,6 +2148,7 @@ def collect(args: argparse.Namespace) -> Path:
                 sample_json,
                 source,
                 f"{scenario['name']}-{index}",
+                scenario,
             )
             if resumed is not None:
                 samples.append(resumed)
@@ -1956,7 +2185,7 @@ def collect(args: argparse.Namespace) -> Path:
                     sample_index=index,
                     worktree=worktree,
                     target_dir=target,
-                    native_operator_set_lock=native_operator_set_lock,
+                    native_operator_set_lock=command_native_operator_set_lock,
                     native_build_cache=product_native_build_cache,
                     lane_deadline=lane_deadline,
                 )
@@ -2180,6 +2409,41 @@ def self_test() -> None:
             in command
             and command[-1] == "-vv",
             "canonical Cargo command self-test failed",
+        )
+        evidence = root / "evidence"
+        evidence.mkdir()
+        cache = root / "cache"
+        inputs_sha256 = "a" * 64
+        entry = cache / "core_ptx.add_bias" / inputs_sha256
+        entry.mkdir(parents=True)
+        payload = entry / "add_bias.ptx"
+        payload.write_bytes(b"fixture-ptx\n")
+        write_json(
+            entry / "manifest.json",
+            {
+                "schema_version": 1,
+                "artifact_id": "core_ptx.add_bias",
+                "file_name": "add_bias.ptx",
+                "input_signature": "fixture",
+                "input_signature_sha256": inputs_sha256,
+                "artifact_sha256": sha256(payload),
+                "artifact_size_bytes": payload.stat().st_size,
+            },
+        )
+        inventory = core_ptx_cache_inventory(
+            evidence,
+            cache,
+            {
+                "kernels/add_bias.cu": {
+                    "inputs_hash": f"sha256:{inputs_sha256}",
+                }
+            },
+        )
+        require(
+            inventory["entry_count"] == 1
+            and inventory["entries"][0]["artifact_id"]
+            == "core_ptx.add_bias",
+            "core PTX cache inventory self-test failed",
         )
     print(SELFTEST_PASS_LINE)
 

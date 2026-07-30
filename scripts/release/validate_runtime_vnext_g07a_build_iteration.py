@@ -24,7 +24,7 @@ POLICY_PATH = (
     REPO_ROOT
     / "scripts/release/configs/runtime_vnext_g07a_build_iteration.json"
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 MAX_JSON_BYTES = 64 * 1024 * 1024
@@ -399,6 +399,7 @@ def verify_bounded_step(
     label: str,
     *,
     require_nonempty_logs: bool,
+    expected_cwd: str | None = None,
 ) -> tuple[dict[str, Any], Path, Path]:
     step = require_dict(raw, label)
     command = require_list(step.get("command"), f"{label}.command")
@@ -445,7 +446,11 @@ def verify_bounded_step(
     )
     require(
         receipt.get("command") == command == plan.get("command")
-        and receipt.get("cwd") == plan.get("cwd"),
+        and receipt.get("cwd") == plan.get("cwd")
+        and (
+            expected_cwd is None
+            or receipt.get("cwd") == expected_cwd
+        ),
         f"{label} command/cwd binding mismatch",
     )
     require(
@@ -487,6 +492,9 @@ def verify_product_command(
     command: list[str],
     policy: dict[str, Any],
     *,
+    target_dir: str,
+    native_operator_set_lock: str,
+    build_summary_receipt: str,
     source_policy: str,
     native_build_cache: str,
 ) -> None:
@@ -497,35 +505,33 @@ def verify_product_command(
         "product source policy/cache path is invalid",
     )
     cargo_index = command.index("cargo")
-    env = set(command[1:cargo_index])
+    assignments: dict[str, str] = {}
+    for raw in command[1:cargo_index]:
+        require("=" in raw, "product command contains a non-assignment env argument")
+        key, value = raw.split("=", 1)
+        require(
+            bool(key) and key not in assignments,
+            f"product command contains duplicate/invalid env assignment: {key}",
+        )
+        assignments[key] = value
     product = policy["product_build"]
-    required_env = {
-        "NO_COLOR=1",
-        f"CARGO_BUILD_JOBS={product['cargo_jobs']}",
-        f"CUDA_COMPUTE_CAP={product['compute_capability']}",
-        f"FERRUM_NVCC_THREADS={product['nvcc_threads']}",
-        f"FERRUM_CUDA_NATIVE_SOURCE_POLICY={source_policy}",
-        f"FERRUM_CUDA_NATIVE_BUILD_CACHE={native_build_cache}",
+    expected_values = {
+        "NO_COLOR": "1",
+        "CARGO_TARGET_DIR": target_dir,
+        "CARGO_BUILD_JOBS": str(product["cargo_jobs"]),
+        "CUDA_COMPUTE_CAP": str(product["compute_capability"]),
+        "FERRUM_NVCC_THREADS": str(product["nvcc_threads"]),
+        "FERRUM_NATIVE_OPERATOR_SET_LOCK": native_operator_set_lock,
+        "FERRUM_CUDA_NATIVE_SOURCE_POLICY": source_policy,
+        "FERRUM_CUDA_NATIVE_BUILD_CACHE": native_build_cache,
+        "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT": build_summary_receipt,
     }
-    require(required_env.issubset(env), "product command environment drift")
     require(
-        sum(value.startswith("FERRUM_NATIVE_OPERATOR_SET_LOCK=") for value in env)
-        == 1
-        and sum(
-            value.startswith("FERRUM_CUDA_BUILD_SUMMARY_RECEIPT=")
-            for value in env
-        )
-        == 1
-        and sum(
-            value.startswith("FERRUM_CUDA_NATIVE_BUILD_CACHE=")
-            for value in env
-        )
-        == 1
-        and not any(
-            value.startswith(("RUSTC_WRAPPER=", "SCCACHE_", "CCACHE_"))
-            for value in env
-        ),
-        "product command lock/summary/cache environment is invalid",
+        set(assignments) == set(expected_values)
+        and all(assignments.get(key) == value for key, value in expected_values.items())
+        and Path(native_operator_set_lock).is_absolute()
+        and Path(build_summary_receipt).is_absolute(),
+        "product command environment drift",
     )
     require(
         command[cargo_index:]
@@ -663,11 +669,24 @@ def verify_cuda_build_summary(path: Path, label: str) -> dict[str, Any]:
         == "ferrum_cuda_build_summary_receipt",
         f"{label} identity mismatch",
     )
+    indexed_rows: dict[str, dict[str, Any]] = {}
+    for index, raw_row in enumerate(rows):
+        require(
+            isinstance(raw_row, dict)
+            and isinstance(raw_row.get("artifact"), str)
+            and bool(raw_row["artifact"]),
+            f"{label} row {index} is invalid",
+        )
+        artifact = raw_row["artifact"]
+        require(
+            artifact not in indexed_rows,
+            f"{label} contains duplicate artifact row: {artifact}",
+        )
+        indexed_rows[artifact] = raw_row
     native_rows = {
-        row.get("artifact"): row
-        for row in rows
-        if isinstance(row, dict)
-        and row.get("artifact") in PRODUCT_NATIVE_UNITS
+        artifact: row
+        for artifact, row in indexed_rows.items()
+        if artifact in PRODUCT_NATIVE_UNITS
     }
     require(
         set(native_rows) == PRODUCT_NATIVE_UNITS
@@ -677,23 +696,21 @@ def verify_cuda_build_summary(path: Path, label: str) -> dict[str, Any]:
             for row in native_rows.values()
         )
         and not any(
-            isinstance(row, dict) and row.get("status") == "rejected"
-            for row in rows
+            row.get("status") == "rejected"
+            for row in indexed_rows.values()
         ),
         f"{label} does not prove a complete cache-only native artifact set",
     )
     core = sorted(
-        str(row.get("artifact")).removeprefix("core-ptx:")
-        for row in rows
-        if isinstance(row, dict)
-        and str(row.get("artifact", "")).startswith("core-ptx:")
+        artifact.removeprefix("core-ptx:")
+        for artifact, row in indexed_rows.items()
+        if artifact.startswith("core-ptx:")
         and row.get("status") == "built"
     )
     core_rows = {
-        str(row.get("artifact")).removeprefix("core-ptx:"): row
-        for row in rows
-        if isinstance(row, dict)
-        and str(row.get("artifact", "")).startswith("core-ptx:")
+        artifact.removeprefix("core-ptx:"): row
+        for artifact, row in indexed_rows.items()
+        if artifact.startswith("core-ptx:")
     }
     return {
         "rows": rows,
@@ -703,14 +720,132 @@ def verify_cuda_build_summary(path: Path, label: str) -> dict[str, Any]:
     }
 
 
+def verify_product_native_signal(
+    raw: Any,
+    stderr_path: Path,
+    summary: dict[str, Any] | None,
+    label: str,
+) -> dict[str, Any]:
+    signal = require_dict(raw, f"{label} native signal")
+    stderr = stderr_path.read_text(encoding="utf-8", errors="strict")
+    compiled_paths = [
+        match.group(1)
+        for match in re.finditer(
+            r"\[[^]]+\]\s+compiling\s+(\S+)\s+->\s+(\S+)",
+            stderr,
+        )
+    ]
+    rows = [] if summary is None else summary["rows"]
+    core_rows = {} if summary is None else summary["core_ptx_rows"]
+    native_units = [] if summary is None else summary["native_units"]
+    core_built = [] if summary is None else summary["core_ptx"]
+    require(
+        signal.get("compiled_native_tu_paths") == compiled_paths
+        and signal.get("compiled_native_tu_count") == len(compiled_paths)
+        and signal.get("build_summary_present") == (summary is not None)
+        and signal.get("build_summaries") == rows
+        and signal.get("core_ptx_rows") == core_rows
+        and signal.get("core_ptx_built_paths") == core_built
+        and signal.get("artifact_build_units") == native_units,
+        f"{label} native signal is not independently reproducible",
+    )
+    return signal
+
+
+def verify_core_ptx_cache_inventory(
+    root: Path,
+    policy: dict[str, Any],
+    summary: dict[str, Any],
+    raw: Any,
+) -> None:
+    inventory = require_dict(raw, "core PTX cache inventory")
+    entries = require_list(inventory.get("entries"), "core PTX cache inventory entries")
+    expected_core = set(policy["product_build"]["core_ptx_inputs"])
+    require(
+        inventory.get("schema_version") == 1
+        and inventory.get("entry_count") == len(expected_core)
+        and len(entries) == len(expected_core)
+        and inventory.get("entries_sha256")
+        == hashlib.sha256(
+            json.dumps(
+                entries,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "core PTX cache inventory identity/digest mismatch",
+    )
+    indexed: dict[str, dict[str, Any]] = {}
+    for raw_entry in entries:
+        entry = require_dict(raw_entry, "core PTX cache inventory entry")
+        source_path = entry.get("source_path")
+        require(
+            isinstance(source_path, str)
+            and source_path not in indexed,
+            "core PTX cache inventory contains an invalid/duplicate source",
+        )
+        indexed[source_path] = entry
+    require(set(indexed) == expected_core, "core PTX cache inventory coverage drift")
+    for source_path, entry in indexed.items():
+        row = require_dict(
+            summary["core_ptx_rows"].get(source_path),
+            f"core PTX summary row {source_path}",
+        )
+        inputs_hash = row.get("inputs_hash")
+        stem = Path(source_path).stem
+        require(
+            isinstance(inputs_hash, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", inputs_hash) is not None
+            and entry.get("artifact_id") == f"core_ptx.{stem}"
+            and entry.get("inputs_sha256") == inputs_hash[7:]
+            and entry.get("cache_entry")
+            == f"core_ptx.{stem}/{inputs_hash[7:]}",
+            f"core PTX cache inventory identity drift: {source_path}",
+        )
+        manifest_path = resolve_ref(
+            root,
+            entry.get("manifest"),
+            f"core PTX cache manifest {source_path}",
+            expected_kind="core-ptx-cache-manifest",
+        )
+        payload_path = resolve_ref(
+            root,
+            entry.get("payload"),
+            f"core PTX cache payload {source_path}",
+            expected_kind="core-ptx-cache-payload",
+        )
+        manifest = require_dict(
+            read_json(manifest_path, f"core PTX cache manifest {source_path}"),
+            f"core PTX cache manifest {source_path}",
+        )
+        require(
+            manifest.get("schema_version") == 1
+            and manifest.get("artifact_id") == entry["artifact_id"]
+            and manifest.get("file_name") == f"{stem}.ptx"
+            and manifest.get("input_signature_sha256") == entry["inputs_sha256"]
+            and manifest.get("artifact_sha256") == sha256(payload_path)
+            and manifest.get("artifact_size_bytes") == payload_path.stat().st_size,
+            f"core PTX cache manifest/payload mismatch: {source_path}",
+        )
+
+
 def verify_product_cache_bootstrap(
     root: Path,
     policy: dict[str, Any],
     source: dict[str, Any],
     source_bundle_members: list[str],
     raw: Any,
-    expected_native_build_cache: str,
+    lane_paths: dict[str, str],
 ) -> None:
+    expected_native_build_cache = lane_paths["product_native_build_cache"]
+    expected_target = str(
+        Path(lane_paths["target_root"]) / "product-cache-bootstrap"
+    )
+    expected_summary = str(
+        Path(lane_paths["evidence_root"])
+        / "setup/product-core-ptx-cache-bootstrap/cuda-build-summary.receipt.json"
+    )
     bootstrap = require_dict(raw, "product core PTX cache bootstrap")
     require(
         bootstrap.get("schema_version") == SCHEMA_VERSION
@@ -721,6 +856,7 @@ def verify_product_cache_bootstrap(
         and bootstrap.get("source_tree_sha") == source["git_tree_sha"]
         and bootstrap.get("source_policy")
         == policy["product_build"]["bootstrap_source_policy"]
+        and bootstrap.get("cargo_target") == expected_target
         and bootstrap.get("native_build_cache")
         == expected_native_build_cache,
         "product core PTX cache bootstrap identity mismatch",
@@ -730,10 +866,14 @@ def verify_product_cache_bootstrap(
         bootstrap.get("build"),
         "product core PTX cache bootstrap build",
         require_nonempty_logs=True,
+        expected_cwd=lane_paths["source_root"],
     )
     verify_product_command(
         build_receipt["command"],
         policy,
+        target_dir=expected_target,
+        native_operator_set_lock=lane_paths["native_operator_set_lock"],
+        build_summary_receipt=expected_summary,
         source_policy=policy["product_build"]["bootstrap_source_policy"],
         native_build_cache=expected_native_build_cache,
     )
@@ -742,6 +882,7 @@ def verify_product_cache_bootstrap(
         bootstrap.get("smoke"),
         "product core PTX cache bootstrap smoke",
         require_nonempty_logs=False,
+        expected_cwd=lane_paths["source_root"],
     )
     require(
         len(smoke_receipt["command"]) == 2
@@ -779,9 +920,11 @@ def verify_product_cache_bootstrap(
         not any(member in stderr for member in source_bundle_members),
         "bootstrap product build referenced external native operator source",
     )
-    native_signal = require_dict(
+    native_signal = verify_product_native_signal(
         build.get("native_signal"),
-        "bootstrap native signal",
+        cargo_stderr,
+        summary,
+        "bootstrap",
     )
     require(
         native_signal.get("compiled_native_tu_count") == 0
@@ -792,6 +935,12 @@ def verify_product_cache_bootstrap(
         ))
         == expected_core,
         "bootstrap native signal does not match the artifact/core-PTX boundary",
+    )
+    verify_core_ptx_cache_inventory(
+        root,
+        policy,
+        summary,
+        bootstrap.get("cache_inventory"),
     )
     output = require_dict(bootstrap.get("output"), "bootstrap output")
     binary = resolve_ref(
@@ -815,60 +964,168 @@ def verify_product_sample(
     scenario: tuple[Any, ...],
     sample: dict[str, Any],
     index: int,
-    expected_native_build_cache: str,
+    lane_paths: dict[str, str],
 ) -> float:
     name, _, _, expected_package, _ = scenario
     label = f"{name} sample {index}"
+    policy_scenario = next(
+        row for row in policy["scenarios"] if row["name"] == name
+    )
+    collector_path = (
+        source_root
+        / "scripts/release/runtime_vnext_g07a_build_iteration.py"
+    )
+    baseline_native_build_cache = lane_paths["product_native_build_cache"]
+    expected_native_build_cache = (
+        str(
+            Path(lane_paths["object_cache"])
+            / "product-core-ptx-samples"
+            / f"core-ptx-{index}"
+        )
+        if name == "core-ptx"
+        else baseline_native_build_cache
+    )
+    expected_target = str(
+        Path(lane_paths["target_root"])
+        / (
+            "clean-release"
+            if name == "clean-release"
+            else "product-incremental"
+        )
+    )
+    expected_summary = str(
+        Path(expected_target) / "g07a-build-summary.receipt.json"
+    )
+    expected_worktree = str(
+        Path(lane_paths["worktree_root"]) / "product-timing-worktree"
+    )
     require(
         sample.get("schema_version") == SCHEMA_VERSION
         and sample.get("sample_id") == f"{name}-{index}"
         and sample.get("status") == "pass",
         f"{label} identity/status mismatch",
     )
+    require(
+        sample.get("scenario") == policy_scenario
+        and sample.get("policy_sha256") == sha256(POLICY_PATH)
+        and collector_path.is_file()
+        and sample.get("collector_sha256") == sha256(collector_path),
+        f"{label} collector/policy/scenario binding mismatch",
+    )
     cache = require_dict(sample.get("cache"), f"{label} cache")
+    cargo_target = cache.get("cargo_target")
     expected_source_policy = (
         policy["product_build"]["core_ptx_source_policy"]
         if name == "core-ptx"
         else policy["product_build"]["default_source_policy"]
     )
     require(
-        cache.get("native_build_cache") == expected_native_build_cache
+        cargo_target == expected_target
+        and cache.get("baseline_native_build_cache")
+        == baseline_native_build_cache
+        and cache.get("native_build_cache") == expected_native_build_cache
         and cache.get("source_policy") == expected_source_policy,
         f"{label} native cache/source policy mismatch",
     )
+    expected_seed = (
+        {
+            "kind": "baseline-cache-clone",
+            "source": baseline_native_build_cache,
+            "destination": expected_native_build_cache,
+        }
+        if name == "core-ptx"
+        else None
+    )
+    require(cache.get("seed") == expected_seed, f"{label} cache seed drift")
     prewarm = sample.get("prewarm")
+    prewarm_command: list[str] | None = None
     if name == "clean-release":
         require(prewarm is None, "clean-release must not prewarm Cargo target")
     else:
-        prewarm_receipt, _, _ = verify_bounded_step(
+        prewarm_receipt, prewarm_stdout, prewarm_stderr = verify_bounded_step(
             root,
             prewarm,
             f"{label} prewarm",
             require_nonempty_logs=True,
+            expected_cwd=expected_worktree,
         )
+        prewarm_command = prewarm_receipt["command"]
         verify_product_command(
-            prewarm_receipt["command"],
+            prewarm_command,
             policy,
+            target_dir=expected_target,
+            native_operator_set_lock=lane_paths["native_operator_set_lock"],
+            build_summary_receipt=expected_summary,
             source_policy=expected_source_policy,
             native_build_cache=expected_native_build_cache,
         )
+        prewarm_record = require_dict(prewarm, f"{label} prewarm record")
+        prewarm_cargo_summary = parse_cargo_messages(prewarm_stdout)
+        require(
+            prewarm_record.get("cargo_summary") == prewarm_cargo_summary,
+            f"{label} prewarm Cargo summary is not independently reproducible",
+        )
+        prewarm_summary_raw = prewarm_record.get("cuda_build_summary")
+        prewarm_summary = None
+        if prewarm_summary_raw is not None:
+            prewarm_summary_path = resolve_ref(
+                root,
+                prewarm_summary_raw,
+                f"{label} prewarm CUDA summary",
+                expected_kind="cuda-build-summary",
+            )
+            prewarm_summary = verify_cuda_build_summary(
+                prewarm_summary_path,
+                f"{label} prewarm CUDA summary",
+            )
+        prewarm_native_signal = verify_product_native_signal(
+            prewarm_record.get("native_signal"),
+            prewarm_stderr,
+            prewarm_summary,
+            f"{label} prewarm",
+        )
+        require(
+            prewarm_native_signal.get("compiled_native_tu_count") == 0,
+            f"{label} prewarm compiled external native source",
+        )
+        if name == "core-ptx":
+            expected_core = set(policy["product_build"]["core_ptx_inputs"])
+            require(
+                prewarm_summary is not None
+                and set(prewarm_summary["core_ptx_rows"]) == expected_core
+                and all(
+                    row.get("status") == "cache_hit"
+                    for row in prewarm_summary["core_ptx_rows"].values()
+                ),
+                "core-ptx prewarm did not restore all 40 PTX entries from the shared cache",
+            )
     build_receipt, cargo_stdout, cargo_stderr = verify_bounded_step(
         root,
         sample.get("build"),
         f"{label} build",
         require_nonempty_logs=True,
+        expected_cwd=expected_worktree,
     )
     verify_product_command(
         build_receipt["command"],
         policy,
+        target_dir=expected_target,
+        native_operator_set_lock=lane_paths["native_operator_set_lock"],
+        build_summary_receipt=expected_summary,
         source_policy=expected_source_policy,
         native_build_cache=expected_native_build_cache,
     )
+    if prewarm_command is not None:
+        require(
+            prewarm_command == build_receipt["command"],
+            f"{label} prewarm/timed Cargo argv drift",
+        )
     smoke_receipt, smoke_stdout, _ = verify_bounded_step(
         root,
         sample.get("smoke"),
         f"{label} smoke",
         require_nonempty_logs=False,
+        expected_cwd=expected_worktree,
     )
     require(
         len(smoke_receipt["command"]) == 2
@@ -912,9 +1169,20 @@ def verify_product_sample(
         )
         summary = verify_cuda_build_summary(summary_path, f"{label} CUDA summary")
         if name == "core-ptx":
+            expected_core = set(policy["product_build"]["core_ptx_inputs"])
             require(
-                summary["core_ptx"] == ["kernels/add_bias.cu"],
-                "core-ptx did not build exactly add_bias.cu",
+                set(summary["core_ptx_rows"]) == expected_core
+                and summary["core_ptx"] == ["kernels/add_bias.cu"]
+                and all(
+                    row.get("status")
+                    == (
+                        "built"
+                        if path == "kernels/add_bias.cu"
+                        else "cache_hit"
+                    )
+                    for path, row in summary["core_ptx_rows"].items()
+                ),
+                "core-ptx did not build only add_bias.cu with 39 cache hits",
             )
         else:
             require(
@@ -927,11 +1195,17 @@ def verify_product_sample(
                 set(summary["core_ptx_rows"]) == expected_core
                 and all(
                     row.get("status") == "cache_hit"
+                    and row.get("reason") == "shared-native-build-cache"
                     for row in summary["core_ptx_rows"].values()
                 ),
                 "clean release did not restore every core PTX from the declared cache",
             )
-    native_signal = require_dict(build.get("native_signal"), f"{label} native signal")
+    native_signal = verify_product_native_signal(
+        build.get("native_signal"),
+        cargo_stderr,
+        summary if summary_raw is not None else None,
+        label,
+    )
     require(
         native_signal.get("compiled_native_tu_count") == 0
         and native_signal.get("compiled_native_tu_paths") == [],
@@ -955,6 +1229,11 @@ def verify_product_sample(
         and output.get("sha256") == sha256(binary),
         f"{label} binary identity mismatch",
     )
+    worktree = require_dict(sample.get("worktree"), f"{label} worktree")
+    require(
+        worktree.get("path") == expected_worktree,
+        f"{label} worktree path drift",
+    )
     receipt_path = resolve_ref(
         root,
         build["bounded_receipt"],
@@ -976,12 +1255,36 @@ def verify_native_sample(
     scenario: tuple[Any, ...],
     sample: dict[str, Any],
     index: int,
+    lane_paths: dict[str, str],
 ) -> float:
     name, _, expected_input, _, _ = scenario
     label = f"{name} sample {index}"
+    policy_scenario = next(
+        row for row in policy["scenarios"] if row["name"] == name
+    )
+    expected_worktree = str(
+        Path(lane_paths["worktree_root"]) / "native-source-timing"
+    )
+    expected_base_cache = str(
+        Path(lane_paths["object_cache"]) / "native-base"
+    )
+    expected_sample_cache = str(
+        Path(lane_paths["object_cache"])
+        / "native-samples"
+        / f"native-tu-{index}"
+    )
+    collector_path = (
+        source_root
+        / "scripts/release/runtime_vnext_g07a_build_iteration.py"
+    )
     require(
-        sample.get("sample_id") == f"{name}-{index}"
-        and sample.get("status") == "pass",
+        sample.get("schema_version") == SCHEMA_VERSION
+        and sample.get("sample_id") == f"{name}-{index}"
+        and sample.get("status") == "pass"
+        and sample.get("scenario") == policy_scenario
+        and sample.get("policy_sha256") == sha256(POLICY_PATH)
+        and collector_path.is_file()
+        and sample.get("collector_sha256") == sha256(collector_path),
         f"{label} identity/status mismatch",
     )
     prewarm_receipt, _, _ = verify_bounded_step(
@@ -989,6 +1292,7 @@ def verify_native_sample(
         sample.get("prewarm"),
         f"{label} prewarm",
         require_nonempty_logs=False,
+        expected_cwd=lane_paths["source_root"],
     )
     require(
         "source-build" in prewarm_receipt["command"],
@@ -999,6 +1303,7 @@ def verify_native_sample(
         sample.get("plan"),
         f"{label} mutated lock",
         require_nonempty_logs=False,
+        expected_cwd=lane_paths["source_root"],
     )
     require(
         "lock-source" in plan_receipt["command"],
@@ -1009,12 +1314,14 @@ def verify_native_sample(
         sample.get("build"),
         f"{label} build",
         require_nonempty_logs=False,
+        expected_cwd=lane_paths["source_root"],
     )
     smoke_receipt, smoke_stdout, _ = verify_bounded_step(
         root,
         sample.get("smoke"),
         f"{label} smoke",
         require_nonempty_logs=False,
+        expected_cwd=lane_paths["source_root"],
     )
     require(
         len(smoke_receipt["command"]) == 3
@@ -1066,8 +1373,19 @@ def verify_native_sample(
         f"{label} source receipt projection mismatch",
     )
     require(
-        sample.get("cache", {}).get("scope")
-        == "verified-base-cloned-per-sample",
+        sample.get("cache")
+        == {
+            "base_object_cache": expected_base_cache,
+            "sample_object_cache": expected_sample_cache,
+            "scope": "verified-base-cloned-per-sample",
+        }
+        and sample.get("worktree")
+        == {
+            "path": expected_worktree,
+            "clean_before": True,
+            "clean_after": True,
+            "stable_recreated_path": True,
+        },
         f"{label} object cache isolation policy mismatch",
     )
     output = require_dict(sample.get("output"), f"{label} output")
@@ -1315,12 +1633,6 @@ def verify_manifest(
         require_fresh_inputs=require_canonical,
     )
     verify_crate_graph(root, manifest)
-    verify_bounded_step(
-        root,
-        manifest.get("builder_setup"),
-        "builder setup",
-        require_nonempty_logs=True,
-    )
     plan = require_dict(read_json(root / "lane-plan.json", "lane plan"), "lane plan")
     require(
         plan.get("lane") == "runtime-vnext-g07a-build-iteration"
@@ -1330,12 +1642,69 @@ def verify_manifest(
         and plan.get("compiler_cache") == manifest["compiler_cache"],
         "lane plan binding mismatch",
     )
-    plan_paths = require_dict(plan.get("paths"), "lane plan paths")
-    native_build_cache = plan_paths.get("product_native_build_cache")
+    raw_plan_paths = require_dict(plan.get("paths"), "lane plan paths")
     require(
-        isinstance(native_build_cache, str)
-        and Path(native_build_cache).is_absolute(),
-        "lane plan product native build cache is invalid",
+        set(raw_plan_paths)
+        == {
+            "source_root",
+            "native_source_root",
+            "evidence_root",
+            "worktree_root",
+            "target_root",
+            "object_cache",
+            "product_native_build_cache",
+            "native_operator_set_lock",
+        }
+        and all(
+            isinstance(value, str) and Path(value).is_absolute()
+            for value in raw_plan_paths.values()
+        ),
+        "lane plan path set is invalid",
+    )
+    plan_paths = {
+        key: str(value)
+        for key, value in raw_plan_paths.items()
+    }
+    native_build_cache = plan_paths["product_native_build_cache"]
+    input_refs = require_dict(manifest.get("inputs"), "manifest inputs")
+    lock_ref = require_dict(
+        input_refs.get("native_operator_set_lock"),
+        "native operator set lock input",
+    )
+    require(
+        native_build_cache
+        == str(Path(plan_paths["object_cache"]) / "product-core-ptx")
+        and plan_paths["native_operator_set_lock"]
+        == str(Path(plan_paths["evidence_root"]) / str(lock_ref["path"])),
+        "lane plan derived path binding mismatch",
+    )
+    builder_receipt, _, _ = verify_bounded_step(
+        root,
+        manifest.get("builder_setup"),
+        "builder setup",
+        require_nonempty_logs=True,
+        expected_cwd=plan_paths["source_root"],
+    )
+    builder_target = str(Path(plan_paths["target_root"]) / "builder")
+    require(
+        builder_receipt["command"]
+        == [
+            "env",
+            f"CARGO_TARGET_DIR={builder_target}",
+            "CARGO_BUILD_JOBS=4",
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--jobs",
+            "4",
+            "-p",
+            "ferrum-native-ops-builder",
+            "--bin",
+            "ferrum-native-ops-builder",
+            "--message-format=json-render-diagnostics",
+        ],
+        "builder setup command/path drift",
     )
     verify_product_cache_bootstrap(
         root,
@@ -1343,7 +1712,7 @@ def verify_manifest(
         source,
         source_members,
         manifest.get("product_cache_bootstrap"),
-        native_build_cache,
+        plan_paths,
     )
     repeats = 5 if manifest["mode"] == "canonical" else 1
     require(
@@ -1386,6 +1755,7 @@ def verify_manifest(
                     scenario,
                     sample,
                     index,
+                    plan_paths,
                 )
                 native_counts.append(
                     len(sample["build"]["compiled_translation_units"])
@@ -1399,7 +1769,7 @@ def verify_manifest(
                     scenario,
                     sample,
                     index,
-                    native_build_cache,
+                    plan_paths,
                 )
                 product_native_count += sample["build"]["native_signal"][
                     "compiled_native_tu_count"
@@ -1472,8 +1842,99 @@ def self_test() -> None:
         nearest_rank([1.0, 2.0, 3.0, 4.0, 5.0], 0.95) == 5.0,
         "nearest-rank p95 self-test failed",
     )
+    product = policy["product_build"]
+    command = [
+        "env",
+        "NO_COLOR=1",
+        "CARGO_TARGET_DIR=/tmp/g07a-target",
+        f"CARGO_BUILD_JOBS={product['cargo_jobs']}",
+        f"CUDA_COMPUTE_CAP={product['compute_capability']}",
+        f"FERRUM_NVCC_THREADS={product['nvcc_threads']}",
+        "FERRUM_NATIVE_OPERATOR_SET_LOCK=/tmp/native.lock.json",
+        "FERRUM_CUDA_NATIVE_SOURCE_POLICY=cache-only",
+        "FERRUM_CUDA_NATIVE_BUILD_CACHE=/tmp/g07a-cache",
+        "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT=/tmp/g07a-summary.json",
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--jobs",
+        str(product["cargo_jobs"]),
+        "-p",
+        "ferrum-cli",
+        "--bin",
+        "ferrum",
+        "--features",
+        product["features"],
+        "--message-format=json-render-diagnostics",
+        "--timings",
+        "-vv",
+    ]
+    verify_product_command(
+        command,
+        policy,
+        target_dir="/tmp/g07a-target",
+        native_operator_set_lock="/tmp/native.lock.json",
+        build_summary_receipt="/tmp/g07a-summary.json",
+        source_policy="cache-only",
+        native_build_cache="/tmp/g07a-cache",
+    )
+    duplicate_env = command.copy()
+    duplicate_env.insert(2, "NO_COLOR=0")
+    expect_reject(
+        lambda: verify_product_command(
+            duplicate_env,
+            policy,
+            target_dir="/tmp/g07a-target",
+            native_operator_set_lock="/tmp/native.lock.json",
+            build_summary_receipt="/tmp/g07a-summary.json",
+            source_policy="cache-only",
+            native_build_cache="/tmp/g07a-cache",
+        ),
+        "duplicate product environment",
+    )
     with tempfile.TemporaryDirectory(prefix="g07a-validator-selftest-") as raw:
         root = Path(raw)
+        cuda_summary = root / "cuda-summary.json"
+        native_rows = [
+            {
+                "artifact": unit,
+                "status": "artifact",
+                "reason": "native-operator-artifact-set",
+            }
+            for unit in sorted(PRODUCT_NATIVE_UNITS)
+        ]
+        cuda_summary.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "artifact_type": "ferrum_cuda_build_summary_receipt",
+                    "rows": native_rows,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        verify_cuda_build_summary(cuda_summary, "selftest CUDA summary")
+        duplicate_rows = native_rows + [copy.deepcopy(native_rows[0])]
+        cuda_summary.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "artifact_type": "ferrum_cuda_build_summary_receipt",
+                    "rows": duplicate_rows,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_cuda_build_summary(
+                cuda_summary,
+                "duplicate selftest CUDA summary",
+            ),
+            "duplicate CUDA summary row",
+        )
         cargo = root / "cargo.jsonl"
         cargo.write_text(
             "\n".join(
