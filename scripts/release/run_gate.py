@@ -50,6 +50,7 @@ LANES = (
     "vnext-g00f",
     "vnext-g00",
     "vnext-g01a",
+    "vnext-g07a",
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
     "vnext-s1-cuda-decode-capacity",
@@ -895,6 +896,43 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
                 out_dir / "g01a-contract-split" / "manifest.json"
             ),
             provenance_kind="vnext-g01a-s0a",
+        )
+    if lane == "vnext-g07a":
+        required = {
+            "--g00f": args.g00f,
+            "--s1-artifact": args.s1_artifact,
+            "--g07a-evidence-root": args.g07a_evidence_root,
+            "--source-gate": args.source_gate,
+            "--semantic-plan-equivalence": args.semantic_plan_equivalence,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise GateError(
+                "vnext-g07a requires " + ", ".join(missing)
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g07a_checkpoint.py",
+                "--g00f",
+                str(args.g00f.resolve()),
+                "--s1-artifact",
+                str(args.s1_artifact.resolve()),
+                "--g07a-evidence-root",
+                str(args.g07a_evidence_root.resolve()),
+                "--source-gate",
+                str(args.source_gate.resolve()),
+                "--semantic-plan-equivalence",
+                str(args.semantic_plan_equivalence.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                "FERRUM RUNTIME VNEXT G07A BUILD ITERATION PASS: "
+                f"{out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g07a",
         )
     if lane == "vnext-s1-cuda":
         if args.s1_artifact is None:
@@ -3282,6 +3320,8 @@ def validate_g0_source_unit_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
     child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
 ) -> dict[str, Any]:
     manifest_path = lane_command.child_manifest_path
     require_gate(manifest_path is not None, "g0 source unit manifest path is missing")
@@ -3300,6 +3340,8 @@ def validate_g0_source_unit_provenance(
             "limits",
             "peaks",
             "cleanup",
+            "source",
+            "source_receipt",
             "bounded_receipt",
             "stdout_log",
             "stderr_log",
@@ -3346,9 +3388,81 @@ def validate_g0_source_unit_provenance(
         )
         return path, ref
 
+    source_path, source_ref = artifact_ref("source_receipt")
     receipt_path, receipt_ref = artifact_ref("bounded_receipt")
     stdout_path, stdout_ref = artifact_ref("stdout_log")
     stderr_path, stderr_ref = artifact_ref("stderr_log")
+    source_receipt = read_json_object(
+        source_path,
+        "g0 source unit checkout receipt",
+    )
+    require_gate(
+        set(source_receipt)
+        == {
+            "schema_version",
+            "artifact_type",
+            "git_sha",
+            "git_tree_sha",
+            "dirty_status",
+        }
+        and source_receipt.get("schema_version") == 1
+        and source_receipt.get("artifact_type")
+        == "g0_source_checkout_receipt",
+        "g0 source unit checkout receipt schema mismatch",
+    )
+    source_git_sha = require_git_sha(
+        source_receipt.get("git_sha"),
+        "g0 source unit checkout receipt git_sha",
+    )
+    source_tree_sha = require_git_sha(
+        source_receipt.get("git_tree_sha"),
+        "g0 source unit checkout receipt git_tree_sha",
+    )
+    source_dirty = require_object(
+        source_receipt.get("dirty_status"),
+        "g0 source unit checkout receipt dirty_status",
+    )
+    require_gate(
+        set(source_dirty) == {"is_dirty", "status_short"}
+        and isinstance(source_dirty.get("is_dirty"), bool)
+        and isinstance(source_dirty.get("status_short"), list)
+        and all(
+            isinstance(line, str) and line
+            for line in source_dirty["status_short"]
+        )
+        and source_dirty["is_dirty"] == bool(source_dirty["status_short"]),
+        "g0 source unit checkout receipt dirty status mismatch",
+    )
+    source_summary = require_object(
+        child_manifest.get("source"),
+        "g0 source unit source",
+    )
+    require_gate(
+        set(source_summary) == {"git_sha", "git_tree_sha", "dirty_status"}
+        and source_summary
+        == {
+            "git_sha": source_git_sha,
+            "git_tree_sha": source_tree_sha,
+            "dirty_status": source_dirty,
+        },
+        "g0 source unit manifest/source receipt mismatch",
+    )
+    if verify_checkout:
+        current_status = [
+            line
+            for line in git_output(
+                ["status", "--short", "--untracked-files=all"],
+                default="",
+            ).splitlines()
+            if line.strip()
+        ]
+        require_gate(
+            git_sha() == source_git_sha
+            and git_output(["rev-parse", "HEAD^{tree}"])
+            == source_tree_sha
+            and current_status == source_dirty["status_short"],
+            "g0 source unit checkout differs from the tested source",
+        )
     receipt = read_json_object(receipt_path, "g0 source unit bounded receipt")
     stdout_bytes = stdout_path.read_bytes()
     stderr_bytes = stderr_path.read_bytes()
@@ -3394,6 +3508,8 @@ def validate_g0_source_unit_provenance(
         "child_manifest": {"path": str(manifest_path), "sha256": child_manifest_sha256},
         "command": copy.deepcopy(G0_UNIT_BOUNDED_COMMAND),
         "env_overrides": copy.deepcopy(G0_UNIT_BOUNDED_ENV_OVERRIDES),
+        "source": copy.deepcopy(source_summary),
+        "source_receipt": copy.deepcopy(source_ref),
         **bench_summary,
         "receipt": copy.deepcopy(receipt_ref),
         "stdout": copy.deepcopy(stdout_ref),
@@ -4845,6 +4961,51 @@ def validate_vnext_g00_provenance(
     }
 
 
+def validate_vnext_g07a_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-g07a delegated manifest path is missing",
+    )
+    require_gate(
+        manifest_path.resolve() == Path(
+            require_string(
+                child_manifest.get("artifact_dir"),
+                "vnext-g07a artifact_dir",
+            )
+        ).resolve()
+        / "manifest.json",
+        "vnext-g07a child manifest path mismatch",
+    )
+    try:
+        import runtime_vnext_g07a_checkpoint as checkpoint
+
+        summary = checkpoint.verify_checkpoint_manifest(
+            manifest_path,
+            verify_checkout=verify_checkout,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise GateError(
+            f"vnext-g07a checkpoint provenance failed: {error}"
+        ) from error
+    require_gate(
+        summary.get("kind") == "vnext-g07a"
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            "vnext-g07a child manifest SHA256",
+        ),
+        "vnext-g07a checkpoint summary binding mismatch",
+    )
+    return summary
+
+
 def verify_child_pass_line(
     lane_command: LaneCommand,
     stdout: str,
@@ -4916,11 +5077,19 @@ def verify_child_pass_line(
             child_manifest_digest,
             verify_checkout=verify_checkout,
         )
+    if lane_command.provenance_kind == "vnext-g07a":
+        return validate_vnext_g07a_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
     if lane_command.provenance_kind == "g0-source-unit":
         return validate_g0_source_unit_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
+            verify_checkout=verify_checkout,
         )
     return {
         "kind": "delegated-manifest",
@@ -7245,6 +7414,20 @@ def self_test() -> int:
                 "size_bytes": path.stat().st_size,
             }
 
+        unit_source = {
+            "git_sha": "4" * 40,
+            "git_tree_sha": "5" * 40,
+            "dirty_status": {"is_dirty": False, "status_short": []},
+        }
+        unit_source_path = unit_root / "unit-bounded/source.before.json"
+        write_selftest_json(
+            unit_source_path,
+            {
+                "schema_version": 1,
+                "artifact_type": "g0_source_checkout_receipt",
+                **unit_source,
+            },
+        )
         unit_pass_line = f"G0 SOURCE unit PASS: {unit_root}"
         unit_manifest_path = unit_root / "unit.gate.json"
         unit_manifest = {
@@ -7259,6 +7442,8 @@ def self_test() -> int:
             "limits": copy.deepcopy(G0_UNIT_BOUNDED_LIMITS),
             "peaks": copy.deepcopy(unit_receipt["peaks"]),
             "cleanup": {"process_group_gone": True},
+            "source": copy.deepcopy(unit_source),
+            "source_receipt": unit_ref(unit_source_path),
             "bounded_receipt": unit_ref(unit_receipt_path),
             "stdout_log": unit_ref(unit_stdout),
             "stderr_log": unit_ref(unit_stderr),
@@ -7281,6 +7466,7 @@ def self_test() -> int:
             and unit_provenance.get("cleanup") == {"process_group_gone": True}
             and unit_provenance.get("env_overrides")
             == G0_UNIT_BOUNDED_ENV_OVERRIDES
+            and unit_provenance.get("source") == unit_source
             and unit_provenance.get("executed_bench_targets") == ["engine_bench"]
             and unit_provenance.get("executed_bench_case_count")
             == len(G0_UNIT_BENCH_CASES),
@@ -7292,7 +7478,10 @@ def self_test() -> int:
         ) -> None:
             try:
                 validate_g0_source_unit_provenance(
-                    unit_lane, manifest, hashlib.sha256(name.encode()).hexdigest()
+                    unit_lane,
+                    manifest,
+                    hashlib.sha256(name.encode()).hexdigest(),
+                    verify_checkout=False,
                 )
             except GateError as exc:
                 require_selftest(
@@ -7329,6 +7518,30 @@ def self_test() -> int:
             "legacy trailing libtest argument",
             legacy_trailing_command,
             "bounded command metadata mismatch",
+        )
+        stale_source_sha = copy.deepcopy(unit_manifest)
+        stale_source_sha["source"]["git_sha"] = "6" * 40
+        expect_unit_manifest_reject(
+            "stale source SHA",
+            stale_source_sha,
+            "manifest/source receipt mismatch",
+        )
+        forged_clean_source = copy.deepcopy(unit_manifest)
+        forged_clean_source["source"]["dirty_status"] = {
+            "is_dirty": True,
+            "status_short": [" M forged.rs"],
+        }
+        expect_unit_manifest_reject(
+            "forged dirty source",
+            forged_clean_source,
+            "manifest/source receipt mismatch",
+        )
+        stale_source_receipt = copy.deepcopy(unit_manifest)
+        stale_source_receipt["source_receipt"]["sha256"] = "7" * 64
+        expect_unit_manifest_reject(
+            "stale source receipt",
+            stale_source_receipt,
+            "identity mismatch",
         )
 
         missing_receipt_env = copy.deepcopy(unit_receipt)
@@ -7528,6 +7741,86 @@ def self_test() -> int:
             "must resolve outside the Git source tree" in in_tree_g01a.stderr
             and not in_tree_g01a_out.exists(),
             in_tree_g01a.stderr or in_tree_g01a.stdout,
+        )
+
+        g07a_out = (root / "vnext-g07a-dry-run").resolve()
+        g07a_timing_root = (root / "g07a-raw-evidence").resolve()
+        g07a_source_gate = (root / "unit-gate/gate.manifest.json").resolve()
+        g07a_semantic = (root / "semantic-plan").resolve()
+        g07a = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g07a",
+                "--g00f",
+                str(g00f_out / "manifest.json"),
+                "--s1-artifact",
+                str(root / "s1/manifest.json"),
+                "--g07a-evidence-root",
+                str(g07a_timing_root),
+                "--source-gate",
+                str(g07a_source_gate),
+                "--semantic-plan-equivalence",
+                str(g07a_semantic),
+                "--out",
+                str(g07a_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(g07a.returncode == 0, g07a.stderr or g07a.stdout)
+        g07a_manifest = json.loads(
+            (g07a_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g07a_manifest["status"] == "dry-run"
+            and g07a_manifest["lane"] == "vnext-g07a"
+            and g07a_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g07a_checkpoint.py",
+                "--g00f",
+                str((g00f_out / "manifest.json").resolve()),
+                "--s1-artifact",
+                str((root / "s1/manifest.json").resolve()),
+                "--g07a-evidence-root",
+                str(g07a_timing_root),
+                "--source-gate",
+                str(g07a_source_gate),
+                "--semantic-plan-equivalence",
+                str(g07a_semantic),
+                "--out",
+                str(g07a_out),
+            ]
+            and g07a_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT G07A BUILD ITERATION PASS: "
+                f"{g07a_out}"
+            ),
+            g07a_manifest,
+        )
+        g07a_missing_semantic = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g07a",
+                "--g00f",
+                str(g00f_out / "manifest.json"),
+                "--s1-artifact",
+                str(root / "s1/manifest.json"),
+                "--g07a-evidence-root",
+                str(g07a_timing_root),
+                "--source-gate",
+                str(g07a_source_gate),
+                "--out",
+                str(root / "vnext-g07a-missing-semantic"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g07a_missing_semantic.returncode != 0
+            and "--semantic-plan-equivalence"
+            in (g07a_missing_semantic.stderr + g07a_missing_semantic.stdout),
+            g07a_missing_semantic.stderr or g07a_missing_semantic.stdout,
         )
 
         g00a_provenance_root = root / "vnext-g00a-provenance"
@@ -8084,6 +8377,9 @@ def main() -> int:
     parser.add_argument("--g00a", type=Path)
     parser.add_argument("--g00f", type=Path)
     parser.add_argument("--s1-artifact", type=Path)
+    parser.add_argument("--g07a-evidence-root", type=Path)
+    parser.add_argument("--source-gate", type=Path)
+    parser.add_argument("--semantic-plan-equivalence", type=Path)
     parser.add_argument("--cuda-determinism-artifact-root", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
@@ -8105,7 +8401,12 @@ def main() -> int:
         parser.error("--out is required")
 
     out_dir = args.out.resolve() if args.lane.startswith("vnext-") else args.out
-    if args.lane in {"vnext-g00", "vnext-g00f", "vnext-g01a"}:
+    if args.lane in {
+        "vnext-g00",
+        "vnext-g00f",
+        "vnext-g01a",
+        "vnext-g07a",
+    }:
         try:
             require_external_vnext_g00_output(out_dir)
         except GateError as exc:

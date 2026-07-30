@@ -128,6 +128,9 @@ RUNTIME_VNEXT_G07A_BUILD_ITERATION_VALIDATOR = (
     REPO_ROOT
     / "scripts/release/validate_runtime_vnext_g07a_build_iteration.py"
 )
+RUNTIME_VNEXT_G07A_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g07a_checkpoint.py"
+)
 NATIVE_WORK_ATTRIBUTION_GATE = REPO_ROOT / "scripts/release/native_work_attribution_gate.py"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
@@ -924,6 +927,22 @@ def test_runtime_vnext_g07a_build_iteration_selftests() -> None:
         "FERRUM RUNTIME VNEXT G07A BUILD ITERATION VALIDATOR SELFTEST PASS"
         in validator.stdout,
         validator.stdout,
+    )
+    checkpoint = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G07A_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(
+        checkpoint.returncode == 0,
+        checkpoint.stderr or checkpoint.stdout,
+    )
+    require(
+        "FERRUM RUNTIME VNEXT G07A CHECKPOINT SELFTEST PASS"
+        in checkpoint.stdout,
+        checkpoint.stdout,
     )
 
 
