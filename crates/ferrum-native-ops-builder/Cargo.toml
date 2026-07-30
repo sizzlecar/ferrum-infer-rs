@@ -11,6 +11,7 @@ description = "Isolated source-build and packaging tools for Ferrum native opera
 clap = { workspace = true, features = ["derive"] }
 ferrum-native-ops = { workspace = true }
 ferrum-types = { workspace = true }
+libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"

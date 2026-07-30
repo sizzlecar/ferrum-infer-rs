@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -22,11 +24,11 @@ use super::{
 
 pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 3;
 pub const NATIVE_OPERATOR_SOURCE_BUILD_PLAN_SCHEMA_VERSION: u32 = 3;
-pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 6;
-pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 6;
+pub const NATIVE_OPERATOR_SOURCE_BUILD_RECEIPT_SCHEMA_VERSION: u32 = 7;
+pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 7;
 pub const NATIVE_OPERATOR_CUDA_TOOLKIT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_OBJECT_DEPENDENCY_PROOF_SCHEMA_VERSION: u32 = 2;
+pub const NATIVE_OPERATOR_OBJECT_DEPENDENCY_PROOF_SCHEMA_VERSION: u32 = 3;
 pub const MAX_NVCC_THREADS: u32 = 8;
 const REQUIRED_CUDA_TOOLKIT_FILES: [&str; 6] = [
     "bin/bin2c",
@@ -40,6 +42,10 @@ const REQUIRED_CUDA_TOOLKIT_SCOPES: [&str; 4] =
     ["bin/crt", "include", "nvvm/bin", "nvvm/libdevice"];
 const HOST_TOOLCHAIN_PROGRAMS: [&str; 5] = ["as", "cc1", "cc1plus", "collect2", "ld"];
 const MAX_HOST_TOOLCHAIN_FILES: usize = 250_000;
+const MAX_DEPFILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DEPFILE_DEPENDENCIES: usize = 250_000;
+const MAX_DEPFILE_WORD_BYTES: usize = 16 * 1024;
+const MAX_DEPENDENCY_PROOF_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorSourceDefinition {
@@ -317,10 +323,13 @@ pub struct NativeOperatorSourceBuildCommand {
     pub object_identity: Option<NativeOperatorObjectIdentity>,
     pub dependency_closure_sha256: Option<String>,
     pub dependency_validation: Option<NativeOperatorDependencyValidation>,
+    pub compiler_depfile: Option<String>,
+    pub compiler_depfile_sha256: Option<String>,
     pub depfile: Option<String>,
     pub depfile_sha256: Option<String>,
     pub depfile_producer_working_directory: Option<String>,
     pub depfile_producer_object_file: Option<String>,
+    pub depfile_bindings: Vec<NativeOperatorDepfileDependencyBinding>,
     pub observed_dependencies: Vec<NativeOperatorObservedDependency>,
     pub compiler_executed: bool,
     pub elapsed_ms: Option<u64>,
@@ -352,15 +361,24 @@ pub struct NativeOperatorObservedDependency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorDepfileDependencyBinding {
+    pub producer_path: String,
+    pub portable_path: String,
+    pub dependency: NativeOperatorObservedDependency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorObjectDependencyProof {
     pub schema_version: u32,
     pub object_cache_key: String,
     pub object_sha256: String,
     pub dependency_closure_sha256: String,
     pub dependency_set_sha256: String,
+    pub compiler_depfile_sha256: String,
     pub depfile_sha256: String,
     pub producer_working_directory: String,
     pub producer_object_file: String,
+    pub depfile_bindings: Vec<NativeOperatorDepfileDependencyBinding>,
     pub observed_dependencies: Vec<NativeOperatorObservedDependency>,
 }
 
@@ -786,6 +804,12 @@ pub fn run_native_operator_source_build(
         let lookup_started = Instant::now();
         match object_cache.restore(&object_specs[index], &object_path) {
             Ok(NativeBuildArtifactLookup::Hit(cache_receipt)) => {
+                let compiler_depfile_relative = commands[index]
+                    .compiler_depfile
+                    .as_deref()
+                    .expect("translation-unit command has compiler depfile output")
+                    .to_string();
+                let compiler_depfile_path = request.output_dir.join(&compiler_depfile_relative);
                 let depfile_relative = commands[index]
                     .depfile
                     .as_deref()
@@ -799,6 +823,7 @@ pub fn run_native_operator_source_build(
                     &plan.dependency_closures[index],
                     translation_unit,
                     &object_path,
+                    &compiler_depfile_path,
                     &depfile_path,
                     &toolchain_dependency_scope,
                 ) {
@@ -883,11 +908,14 @@ pub fn run_native_operator_source_build(
                 commands[index].object_identity = Some(object_identity);
                 commands[index].dependency_validation =
                     Some(NativeOperatorDependencyValidation::CacheProof);
+                commands[index].compiler_depfile_sha256 =
+                    Some(dependency_proof.compiler_depfile_sha256);
                 commands[index].depfile_sha256 = Some(dependency_proof.depfile_sha256);
                 commands[index].depfile_producer_working_directory =
                     Some(dependency_proof.producer_working_directory);
                 commands[index].depfile_producer_object_file =
                     Some(dependency_proof.producer_object_file);
+                commands[index].depfile_bindings = dependency_proof.depfile_bindings;
                 commands[index].observed_dependencies = dependency_proof.observed_dependencies;
                 commands[index].elapsed_ms = Some(millis(lookup_started.elapsed()));
                 append_command_stream(
@@ -1011,13 +1039,20 @@ pub fn run_native_operator_source_build(
                 format!("compiled_object_missing:{index}:{error}"),
             );
         }
+        let compiler_depfile_relative = commands[index]
+            .compiler_depfile
+            .as_deref()
+            .expect("cache-miss command has a compiler depfile")
+            .to_string();
+        let compiler_depfile_path = request.output_dir.join(&compiler_depfile_relative);
         let depfile_relative = commands[index]
             .depfile
             .as_deref()
-            .expect("cache-miss command has a depfile")
+            .expect("cache-miss command has a portable depfile")
             .to_string();
         let depfile_path = request.output_dir.join(&depfile_relative);
         let validated_depfile = match validate_translation_unit_depfile(
+            &compiler_depfile_path,
             &depfile_path,
             &object_path,
             &canonical_root,
@@ -1038,10 +1073,12 @@ pub fn run_native_operator_source_build(
                 );
             }
         };
-        commands[index].depfile_sha256 = Some(validated_depfile.sha256.clone());
+        commands[index].compiler_depfile_sha256 = Some(validated_depfile.compiler_sha256.clone());
+        commands[index].depfile_sha256 = Some(validated_depfile.portable_sha256.clone());
         commands[index].depfile_producer_working_directory =
             Some(commands[index].working_directory.clone());
         commands[index].depfile_producer_object_file = commands[index].object_file.clone();
+        commands[index].depfile_bindings = validated_depfile.bindings.clone();
         commands[index].observed_dependencies = validated_depfile.observed_dependencies.clone();
         commands[index].dependency_validation = Some(NativeOperatorDependencyValidation::Depfile);
         let object_identity = match native_object_identity_file(&object_path) {
@@ -1109,8 +1146,10 @@ pub fn run_native_operator_source_build(
             &cache_receipt.artifact_sha256,
             translation_unit,
             &plan.dependency_closures[index],
-            &validated_depfile.raw,
-            &validated_depfile.sha256,
+            &validated_depfile.compiler_raw,
+            &validated_depfile.compiler_sha256,
+            &validated_depfile.portable_raw,
+            &validated_depfile.portable_sha256,
             commands[index]
                 .depfile_producer_working_directory
                 .as_deref()
@@ -1119,7 +1158,9 @@ pub fn run_native_operator_source_build(
                 .depfile_producer_object_file
                 .as_deref()
                 .expect("compiled depfile records its producer object"),
+            &commands[index].depfile_bindings,
             &commands[index].observed_dependencies,
+            &toolchain_dependency_scope,
         ) {
             commands[index].object_cache_status =
                 Some(NativeOperatorSourceObjectCacheStatus::Rejected);
@@ -1590,6 +1631,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
             .and_then(|value| value.to_str())
             .unwrap_or("translation_unit");
         let expected_depfile = format!("{index:08}-{stem}.d");
+        let expected_compiler_depfile = format!("{index:08}-{stem}.compiler.raw.d");
         let mut expected_argv = vec![
             static_identity.cuda_toolkit.nvcc.path.clone(),
             "-c".to_string(),
@@ -1601,7 +1643,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
             static_identity.host_toolchain.compiler.path.clone(),
             "-MMD".to_string(),
             "-MF".to_string(),
-            expected_depfile.clone(),
+            expected_compiler_depfile.clone(),
             "-MT".to_string(),
             expected_object_file.clone(),
         ];
@@ -1651,10 +1693,21 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
             )));
         }
         let expected_depfile_relative = format!("depfiles/{expected_depfile}");
+        let expected_compiler_depfile_relative = format!("depfiles/{expected_compiler_depfile}");
+        let binding_dependencies = validate_depfile_bindings_basic(
+            &format!("{}:{}", receipt.operator, translation_unit.path),
+            &command.depfile_bindings,
+        )?;
         match command.object_cache_status {
             Some(NativeOperatorSourceObjectCacheStatus::Published)
                 if command.dependency_validation
                     == Some(NativeOperatorDependencyValidation::Depfile)
+                    && command.compiler_depfile.as_deref()
+                        == Some(expected_compiler_depfile_relative.as_str())
+                    && command
+                        .compiler_depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
                     && command.depfile.as_deref() == Some(expected_depfile_relative.as_str())
                     && command
                         .depfile_sha256
@@ -1663,10 +1716,17 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
                     && command.depfile_producer_working_directory.as_deref()
                         == Some(command.working_directory.as_str())
                     && command.depfile_producer_object_file.as_deref()
-                        == command.object_file.as_deref() => {}
+                        == command.object_file.as_deref()
+                    && binding_dependencies == command.observed_dependencies => {}
             Some(NativeOperatorSourceObjectCacheStatus::Hit)
                 if command.dependency_validation
                     == Some(NativeOperatorDependencyValidation::CacheProof)
+                    && command.compiler_depfile.as_deref()
+                        == Some(expected_compiler_depfile_relative.as_str())
+                    && command
+                        .compiler_depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
                     && command.depfile.as_deref() == Some(expected_depfile_relative.as_str())
                     && command
                         .depfile_sha256
@@ -1683,7 +1743,8 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
                             Path::new(path).is_absolute()
                                 && Path::new(path).file_name()
                                     == Some(std::ffi::OsStr::new(&expected_object_file))
-                        }) => {}
+                        })
+                    && binding_dependencies == command.observed_dependencies => {}
             _ => {
                 return Err(NativeOperatorBuilderError::Invalid(format!(
                     "{} source-build dependency evidence for {} differs from its locked plan",
@@ -1802,9 +1863,40 @@ pub(crate) fn verify_source_build_evidence(
         ) {
             continue;
         }
+        let compiler_relative = command.compiler_depfile.as_deref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} compiled source-build command is missing compiler depfile evidence",
+                receipt.operator
+            ))
+        })?;
+        let compiler_sha256 = command.compiler_depfile_sha256.as_deref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} compiled source-build command is missing compiler depfile sha256",
+                receipt.operator
+            ))
+        })?;
+        let compiler_path = resolve_source_build_relative_file(receipt_root, compiler_relative)?;
+        let compiler_bytes = read_bounded_regular_file(
+            &compiler_path,
+            MAX_DEPFILE_BYTES,
+            "source-build compiler depfile",
+        )?;
+        let compiler_actual = sha256_bytes(&compiler_bytes);
+        if compiler_actual != compiler_sha256 {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build compiler depfile sha256 mismatch: path={compiler_relative} expected={compiler_sha256} actual={compiler_actual}",
+                receipt.operator
+            )));
+        }
+        let compiler_raw = std::str::from_utf8(&compiler_bytes).map_err(|_| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build compiler depfile is not UTF-8: {compiler_relative}",
+                receipt.operator
+            ))
+        })?;
         let relative = command.depfile.as_deref().ok_or_else(|| {
             NativeOperatorBuilderError::Invalid(format!(
-                "{} compiled source-build command is missing depfile evidence",
+                "{} compiled source-build command is missing portable depfile evidence",
                 receipt.operator
             ))
         })?;
@@ -1815,16 +1907,20 @@ pub(crate) fn verify_source_build_evidence(
             ))
         })?;
         let path = resolve_source_build_relative_file(receipt_root, relative)?;
-        let actual = sha256_file(&path)?;
+        let bytes =
+            read_bounded_regular_file(&path, MAX_DEPFILE_BYTES, "source-build portable depfile")?;
+        let actual = sha256_bytes(&bytes);
         if actual != sha256 {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "{} source-build depfile sha256 mismatch: path={relative} expected={sha256} actual={actual}",
                 receipt.operator
             )));
         }
-        let raw = fs::read_to_string(&path).map_err(|source| NativeOperatorBuilderError::Io {
-            path: path.clone(),
-            source,
+        let raw = std::str::from_utf8(&bytes).map_err(|_| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "{} source-build portable depfile is not UTF-8: {relative}",
+                receipt.operator
+            ))
         })?;
         let producer_object_file =
             command
@@ -1851,13 +1947,16 @@ pub(crate) fn verify_source_build_evidence(
                 receipt.operator
             ))
         })?;
-        let observed = validate_portable_depfile(
-            &raw,
+        let observed = validate_portable_depfile_pair(
+            compiler_raw,
+            &compiler_path,
+            raw,
             &path,
             producer_object_file,
             producer_working_directory,
             &plan.translation_units[index],
             &plan.dependency_closures[index],
+            &command.depfile_bindings,
             &toolchain_dependency_scope,
         )?;
         if observed != command.observed_dependencies {
@@ -2281,7 +2380,8 @@ fn observed_dependency_set_sha256(
 }
 
 fn validate_translation_unit_depfile(
-    depfile_path: &Path,
+    compiler_depfile_path: &Path,
+    portable_depfile_path: &Path,
     object_path: &Path,
     source_root: &Path,
     translation_unit: &NativeOperatorSourceFileLock,
@@ -2294,41 +2394,27 @@ fn validate_translation_unit_depfile(
             translation_unit.path, closure.translation_unit
         )));
     }
-    require_file(depfile_path)?;
-    let raw = fs::read(depfile_path).map_err(|source| NativeOperatorBuilderError::Io {
-        path: depfile_path.to_path_buf(),
-        source,
-    })?;
+    require_file(compiler_depfile_path)?;
+    let raw =
+        read_bounded_regular_file(compiler_depfile_path, MAX_DEPFILE_BYTES, "compiler depfile")?;
     let raw_text = std::str::from_utf8(&raw).map_err(|_| {
         NativeOperatorBuilderError::Invalid(format!(
-            "depfile is not valid UTF-8: {}",
-            depfile_path.display()
+            "compiler depfile is not valid UTF-8: {}",
+            compiler_depfile_path.display()
         ))
     })?;
-    let (target, dependencies) = parse_make_depfile(raw_text, depfile_path)?;
-    let canonical_target =
-        Path::new(&target)
-            .canonicalize()
-            .map_err(|source| NativeOperatorBuilderError::Io {
-                path: PathBuf::from(&target),
-                source,
-            })?;
-    let canonical_object =
-        object_path
-            .canonicalize()
-            .map_err(|source| NativeOperatorBuilderError::Io {
-                path: object_path.to_path_buf(),
-                source,
-            })?;
-    if canonical_target != canonical_object {
+    let (target, dependencies) = parse_make_depfile(raw_text, compiler_depfile_path)?;
+    let expected_target = object_path.display().to_string();
+    validate_normalized_absolute_path(&expected_target, "compiler depfile object target")?;
+    if target != expected_target {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "depfile target differs from the compiled object: expected={} actual={}",
-            canonical_object.display(),
-            canonical_target.display()
+            "compiler depfile target differs from its exact -MT object: expected={expected_target} actual={target}"
         )));
     }
 
     let mut observed = BTreeSet::new();
+    let mut portable_paths = BTreeMap::new();
+    let mut bindings = Vec::with_capacity(dependencies.len());
     for dependency in dependencies {
         let candidate = if Path::new(&dependency).is_absolute() {
             PathBuf::from(&dependency)
@@ -2344,22 +2430,24 @@ fn validate_translation_unit_depfile(
                 })?;
         if !canonical.is_file() {
             return Err(NativeOperatorBuilderError::Invalid(format!(
-                "depfile dependency is not a file: {}",
+                "compiler depfile dependency is not a file: {}",
                 canonical.display()
             )));
         }
-        let identity = if canonical.starts_with(source_root) {
+        let (identity, portable_path) = if canonical.starts_with(source_root) {
             let relative = canonical.strip_prefix(source_root).map_err(|_| {
                 NativeOperatorBuilderError::Invalid(format!(
-                    "depfile dependency escapes the source root: {}",
+                    "compiler depfile dependency escapes the source root: {}",
                     canonical.display()
                 ))
             })?;
-            NativeOperatorObservedDependency {
+            let identity = NativeOperatorObservedDependency {
                 domain: NativeOperatorDependencyDomain::Source,
                 path: path_with_forward_slashes(relative)?,
                 sha256: sha256_file(&canonical)?,
-            }
+            };
+            let portable_path = identity.path.clone();
+            (identity, portable_path)
         } else {
             let candidate_path = candidate.display().to_string();
             let canonical_path = canonical.display().to_string();
@@ -2369,7 +2457,7 @@ fn validate_translation_unit_depfile(
                 .or_else(|| toolchain_scope.by_absolute_path.get(&canonical_path))
                 .ok_or_else(|| {
                     NativeOperatorBuilderError::Invalid(format!(
-                        "depfile dependency is outside the locked source and toolchain manifests: {}",
+                        "compiler depfile dependency is outside the locked source and toolchain manifests: {}",
                         canonical.display()
                     ))
                 })?
@@ -2382,15 +2470,25 @@ fn validate_translation_unit_depfile(
                     identity.sha256
                 )));
             }
-            identity
+            validate_normalized_absolute_path(
+                &canonical_path,
+                "compiled depfile canonical toolchain dependency",
+            )?;
+            (identity, canonical_path)
         };
         validate_observed_dependency("<compiled-depfile>", &identity)?;
         if !observed.insert(identity.clone()) {
             return Err(NativeOperatorBuilderError::Invalid(format!(
-                "depfile contains a duplicate dependency identity: {:?}:{}",
+                "compiler depfile contains a duplicate dependency identity: {:?}:{}",
                 identity.domain, identity.path
             )));
         }
+        portable_paths.insert(identity.clone(), portable_path.clone());
+        bindings.push(NativeOperatorDepfileDependencyBinding {
+            producer_path: dependency,
+            portable_path,
+            dependency: identity,
+        });
     }
 
     let expected = expected_source_dependencies(translation_unit, closure);
@@ -2423,17 +2521,111 @@ fn validate_translation_unit_depfile(
             )));
         }
     }
+    let observed_dependencies = observed.into_iter().collect::<Vec<_>>();
+    let portable_dependencies = observed_dependencies
+        .iter()
+        .map(|identity| {
+            portable_paths.get(identity).cloned().ok_or_else(|| {
+                NativeOperatorBuilderError::Invalid(format!(
+                    "validated dependency has no portable depfile path: {:?}:{}",
+                    identity.domain, identity.path
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let portable_raw =
+        serialize_portable_depfile(&object_path.display().to_string(), &portable_dependencies)?;
+    let portable_text = std::str::from_utf8(&portable_raw).expect("portable depfile is UTF-8");
+    let verified_dependencies = validate_portable_depfile_pair(
+        raw_text,
+        compiler_depfile_path,
+        portable_text,
+        portable_depfile_path,
+        &object_path.display().to_string(),
+        &source_root.display().to_string(),
+        translation_unit,
+        closure,
+        &bindings,
+        toolchain_scope,
+    )?;
+    if verified_dependencies != observed_dependencies {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "producer depfile verification changed the typed dependency set".to_string(),
+        ));
+    }
+    atomic_write_bytes(portable_depfile_path, &portable_raw)?;
     Ok(ValidatedTranslationUnitDepfile {
-        sha256: sha256_bytes(&raw),
-        raw,
-        observed_dependencies: observed.into_iter().collect(),
+        compiler_sha256: sha256_bytes(&raw),
+        compiler_raw: raw,
+        portable_sha256: sha256_bytes(&portable_raw),
+        portable_raw,
+        bindings,
+        observed_dependencies,
     })
 }
 
 struct ValidatedTranslationUnitDepfile {
-    raw: Vec<u8>,
-    sha256: String,
+    compiler_raw: Vec<u8>,
+    compiler_sha256: String,
+    portable_raw: Vec<u8>,
+    portable_sha256: String,
+    bindings: Vec<NativeOperatorDepfileDependencyBinding>,
     observed_dependencies: Vec<NativeOperatorObservedDependency>,
+}
+
+fn serialize_portable_depfile(target: &str, dependencies: &[String]) -> Result<Vec<u8>> {
+    validate_normalized_absolute_path(target, "portable depfile target")?;
+    if dependencies.is_empty() || dependencies.len() > MAX_DEPFILE_DEPENDENCIES {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "portable depfile dependency count is invalid".to_string(),
+        ));
+    }
+    let mut result = escape_make_word(target)?;
+    result.push(':');
+    for dependency in dependencies {
+        if Path::new(dependency).is_absolute() {
+            validate_normalized_absolute_path(dependency, "portable depfile dependency")?;
+        } else {
+            validate_relative_path(dependency)?;
+        }
+        result.push(' ');
+        result.push_str(&escape_make_word(dependency)?);
+    }
+    result.push('\n');
+    if result.len() > MAX_DEPFILE_BYTES {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "portable depfile exceeds {MAX_DEPFILE_BYTES} bytes"
+        )));
+    }
+    let (parsed_target, parsed_dependencies) =
+        parse_make_depfile(&result, Path::new("<portable-depfile>"))?;
+    if parsed_target != target || parsed_dependencies != dependencies {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "portable depfile serialization did not round-trip".to_string(),
+        ));
+    }
+    Ok(result.into_bytes())
+}
+
+fn escape_make_word(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > MAX_DEPFILE_WORD_BYTES
+        || value
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "make depfile word must be non-empty and single-line".to_string(),
+        ));
+    }
+    let mut result = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | ' ' | '\t' | ':' | '#' | '$') {
+            result.push('\\');
+        }
+        result.push(character);
+    }
+    Ok(result)
 }
 
 fn publish_object_dependency_proof(
@@ -2442,12 +2634,22 @@ fn publish_object_dependency_proof(
     object_sha256: &str,
     translation_unit: &NativeOperatorSourceFileLock,
     closure: &NativeOperatorTranslationUnitDependencyLock,
+    compiler_depfile_raw: &[u8],
+    expected_compiler_depfile_sha256: &str,
     depfile_raw: &[u8],
     expected_depfile_sha256: &str,
     producer_working_directory: &str,
     producer_object_file: &str,
+    depfile_bindings: &[NativeOperatorDepfileDependencyBinding],
     observed_dependencies: &[NativeOperatorObservedDependency],
+    toolchain_scope: &NativeOperatorToolchainDependencyScope,
 ) -> Result<()> {
+    let compiler_depfile_sha256 = sha256_bytes(compiler_depfile_raw);
+    if compiler_depfile_sha256 != expected_compiler_depfile_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "compiler depfile bytes differ from their recorded sha256: expected={expected_compiler_depfile_sha256} actual={compiler_depfile_sha256}"
+        )));
+    }
     let depfile_sha256 = sha256_bytes(depfile_raw);
     if depfile_sha256 != expected_depfile_sha256 {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -2460,9 +2662,11 @@ fn publish_object_dependency_proof(
         object_sha256: object_sha256.to_string(),
         dependency_closure_sha256: closure.closure_sha256.clone(),
         dependency_set_sha256: observed_dependency_set_sha256(observed_dependencies)?,
+        compiler_depfile_sha256,
         depfile_sha256: depfile_sha256.clone(),
         producer_working_directory: producer_working_directory.to_string(),
         producer_object_file: producer_object_file.to_string(),
+        depfile_bindings: depfile_bindings.to_vec(),
         observed_dependencies: observed_dependencies.to_vec(),
     };
     validate_object_dependency_proof(
@@ -2475,7 +2679,15 @@ fn publish_object_dependency_proof(
     )?;
     let proof_dir = cache_entry.join("dependency-proof");
     if proof_dir.exists() {
-        return verify_published_dependency_proof(&proof_dir, &proof, depfile_raw);
+        return validate_existing_dependency_proof(
+            &proof_dir,
+            object_cache_key,
+            object_sha256,
+            translation_unit,
+            closure,
+            producer_object_file,
+            toolchain_scope,
+        );
     }
 
     let staging = tempfile::Builder::new()
@@ -2486,6 +2698,10 @@ fn publish_object_dependency_proof(
             source,
         })?;
     let staging_path = staging.path().to_path_buf();
+    atomic_write_bytes(
+        &staging_path.join("compiler-dependency.raw.d"),
+        compiler_depfile_raw,
+    )?;
     atomic_write_bytes(&staging_path.join("dependency.d"), depfile_raw)?;
     write_json(&staging_path.join("proof.json"), &proof)?;
     sync_directory(&staging_path)?;
@@ -2493,7 +2709,15 @@ fn publish_object_dependency_proof(
     match fs::rename(&staging_path, &proof_dir) {
         Ok(()) => {
             sync_directory(cache_entry)?;
-            Ok(())
+            validate_existing_dependency_proof(
+                &proof_dir,
+                object_cache_key,
+                object_sha256,
+                translation_unit,
+                closure,
+                producer_object_file,
+                toolchain_scope,
+            )
         }
         Err(_source) if proof_dir.exists() => {
             fs::remove_dir_all(&staging_path).map_err(|cleanup_source| {
@@ -2502,7 +2726,15 @@ fn publish_object_dependency_proof(
                     source: cleanup_source,
                 }
             })?;
-            verify_published_dependency_proof(&proof_dir, &proof, depfile_raw)
+            validate_existing_dependency_proof(
+                &proof_dir,
+                object_cache_key,
+                object_sha256,
+                translation_unit,
+                closure,
+                producer_object_file,
+                toolchain_scope,
+            )
         }
         Err(source) => {
             let _ = fs::remove_dir_all(&staging_path);
@@ -2512,29 +2744,6 @@ fn publish_object_dependency_proof(
             })
         }
     }
-}
-
-fn verify_published_dependency_proof(
-    proof_dir: &Path,
-    expected_proof: &NativeOperatorObjectDependencyProof,
-    expected_depfile: &[u8],
-) -> Result<()> {
-    validate_dependency_proof_directory(proof_dir)?;
-    let proof_path = proof_dir.join("proof.json");
-    let dependency_path = proof_dir.join("dependency.d");
-    let existing_proof: NativeOperatorObjectDependencyProof = read_json(&proof_path)?;
-    let existing_dependency =
-        fs::read(&dependency_path).map_err(|source| NativeOperatorBuilderError::Io {
-            path: dependency_path,
-            source,
-        })?;
-    if &existing_proof != expected_proof || existing_dependency != expected_depfile {
-        return Err(NativeOperatorBuilderError::Invalid(format!(
-            "object cache already contains a different dependency proof: {}",
-            proof_dir.display()
-        )));
-    }
-    Ok(())
 }
 
 fn validate_dependency_proof_directory(proof_dir: &Path) -> Result<()> {
@@ -2565,6 +2774,7 @@ fn validate_dependency_proof_directory(proof_dir: &Path) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     entries.sort();
     let expected = [
+        std::ffi::OsString::from("compiler-dependency.raw.d"),
         std::ffi::OsString::from("dependency.d"),
         std::ffi::OsString::from("proof.json"),
     ];
@@ -2604,62 +2814,87 @@ fn sync_directory(path: &Path) -> Result<()> {
         })
 }
 
+struct ValidatedCachedDependencyProof {
+    proof: NativeOperatorObjectDependencyProof,
+    compiler_raw: Vec<u8>,
+    portable_raw: Vec<u8>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn restore_object_dependency_proof(
-    cache_entry: &Path,
+fn load_validated_dependency_proof(
+    proof_dir: &Path,
     object_cache_key: &str,
     object_sha256: &str,
-    closure: &NativeOperatorTranslationUnitDependencyLock,
     translation_unit: &NativeOperatorSourceFileLock,
-    object_path: &Path,
-    output_depfile: &Path,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
     toolchain_scope: &NativeOperatorToolchainDependencyScope,
-) -> Result<Option<NativeOperatorObjectDependencyProof>> {
-    let proof_dir = cache_entry.join("dependency-proof");
-    if !proof_dir.exists() {
-        return Ok(None);
-    }
-    validate_dependency_proof_directory(&proof_dir)?;
+) -> Result<ValidatedCachedDependencyProof> {
+    validate_dependency_proof_directory(proof_dir)?;
     let proof_path = proof_dir.join("proof.json");
-    let depfile_path = proof_dir.join("dependency.d");
-    let proof: NativeOperatorObjectDependencyProof = read_json(&proof_path)?;
+    let proof_bytes = read_bounded_regular_file(
+        &proof_path,
+        MAX_DEPENDENCY_PROOF_BYTES,
+        "object dependency proof",
+    )?;
+    let proof: NativeOperatorObjectDependencyProof =
+        serde_json::from_slice(&proof_bytes).map_err(|source| {
+            NativeOperatorBuilderError::Json {
+                path: proof_path.clone(),
+                source,
+            }
+        })?;
     validate_object_dependency_proof(
-        "<object-cache-restore>",
+        "<object-cache-proof>",
         &proof,
         object_cache_key,
         object_sha256,
         translation_unit,
         closure,
     )?;
-    if Path::new(&proof.producer_object_file).file_name() != object_path.file_name() {
+
+    let compiler_depfile_path = proof_dir.join("compiler-dependency.raw.d");
+    let compiler_raw = read_bounded_regular_file(
+        &compiler_depfile_path,
+        MAX_DEPFILE_BYTES,
+        "cached compiler depfile",
+    )?;
+    if sha256_bytes(&compiler_raw) != proof.compiler_depfile_sha256 {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "cached dependency proof object name differs from restored object: {}",
-            proof_path.display()
+            "cached object compiler depfile hash mismatch: {}",
+            compiler_depfile_path.display()
         )));
     }
-    let raw = fs::read(&depfile_path).map_err(|source| NativeOperatorBuilderError::Io {
-        path: depfile_path.clone(),
-        source,
-    })?;
-    if sha256_bytes(&raw) != proof.depfile_sha256 {
+    let depfile_path = proof_dir.join("dependency.d");
+    let portable_raw =
+        read_bounded_regular_file(&depfile_path, MAX_DEPFILE_BYTES, "cached portable depfile")?;
+    if sha256_bytes(&portable_raw) != proof.depfile_sha256 {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "cached object dependency depfile hash mismatch: {}",
             depfile_path.display()
         )));
     }
-    let raw_text = std::str::from_utf8(&raw).map_err(|_| {
+    let compiler_text = std::str::from_utf8(&compiler_raw).map_err(|_| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "cached object compiler depfile is not UTF-8: {}",
+            compiler_depfile_path.display()
+        ))
+    })?;
+    let portable_text = std::str::from_utf8(&portable_raw).map_err(|_| {
         NativeOperatorBuilderError::Invalid(format!(
             "cached object dependency depfile is not UTF-8: {}",
             depfile_path.display()
         ))
     })?;
-    let observed = validate_portable_depfile(
-        raw_text,
+    let observed = validate_portable_depfile_pair(
+        compiler_text,
+        &compiler_depfile_path,
+        portable_text,
         &depfile_path,
         &proof.producer_object_file,
         &proof.producer_working_directory,
         translation_unit,
         closure,
+        &proof.depfile_bindings,
         toolchain_scope,
     )?;
     if observed != proof.observed_dependencies {
@@ -2668,8 +2903,75 @@ fn restore_object_dependency_proof(
             proof_path.display()
         )));
     }
-    atomic_write_bytes(output_depfile, &raw)?;
-    Ok(Some(proof))
+    Ok(ValidatedCachedDependencyProof {
+        proof,
+        compiler_raw,
+        portable_raw,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_existing_dependency_proof(
+    proof_dir: &Path,
+    object_cache_key: &str,
+    object_sha256: &str,
+    translation_unit: &NativeOperatorSourceFileLock,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+    producer_object_file: &str,
+    toolchain_scope: &NativeOperatorToolchainDependencyScope,
+) -> Result<()> {
+    let validated = load_validated_dependency_proof(
+        proof_dir,
+        object_cache_key,
+        object_sha256,
+        translation_unit,
+        closure,
+        toolchain_scope,
+    )?;
+    if Path::new(&validated.proof.producer_object_file).file_name()
+        != Path::new(producer_object_file).file_name()
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "published dependency proof object name differs from the current object: {}",
+            proof_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_object_dependency_proof(
+    cache_entry: &Path,
+    object_cache_key: &str,
+    object_sha256: &str,
+    closure: &NativeOperatorTranslationUnitDependencyLock,
+    translation_unit: &NativeOperatorSourceFileLock,
+    object_path: &Path,
+    output_compiler_depfile: &Path,
+    output_depfile: &Path,
+    toolchain_scope: &NativeOperatorToolchainDependencyScope,
+) -> Result<Option<NativeOperatorObjectDependencyProof>> {
+    let proof_dir = cache_entry.join("dependency-proof");
+    if !proof_dir.exists() {
+        return Ok(None);
+    }
+    let validated = load_validated_dependency_proof(
+        &proof_dir,
+        object_cache_key,
+        object_sha256,
+        translation_unit,
+        closure,
+        toolchain_scope,
+    )?;
+    if Path::new(&validated.proof.producer_object_file).file_name() != object_path.file_name() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "cached dependency proof object name differs from restored object: {}",
+            proof_dir.display()
+        )));
+    }
+    atomic_write_bytes(output_compiler_depfile, &validated.compiler_raw)?;
+    atomic_write_bytes(output_depfile, &validated.portable_raw)?;
+    Ok(Some(validated.proof))
 }
 
 fn validate_object_dependency_proof(
@@ -2681,6 +2983,7 @@ fn validate_object_dependency_proof(
     closure: &NativeOperatorTranslationUnitDependencyLock,
 ) -> Result<()> {
     let dependency_set_sha256 = observed_dependency_set_sha256(&proof.observed_dependencies)?;
+    let binding_dependencies = validate_depfile_bindings_basic(context, &proof.depfile_bindings)?;
     let expected_source = expected_source_dependencies(translation_unit, closure);
     let observed_source = proof
         .observed_dependencies
@@ -2705,7 +3008,9 @@ fn validate_object_dependency_proof(
         || !is_sha256_digest(&proof.object_sha256)
         || !is_sha256_digest(&proof.dependency_closure_sha256)
         || !is_sha256_digest(&proof.dependency_set_sha256)
+        || !is_sha256_digest(&proof.compiler_depfile_sha256)
         || !is_sha256_digest(&proof.depfile_sha256)
+        || binding_dependencies != proof.observed_dependencies
         || observed_source != expected_source
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -2715,70 +3020,158 @@ fn validate_object_dependency_proof(
     Ok(())
 }
 
-fn validate_portable_depfile(
-    raw: &str,
+fn validate_depfile_bindings_basic(
+    context: &str,
+    bindings: &[NativeOperatorDepfileDependencyBinding],
+) -> Result<Vec<NativeOperatorObservedDependency>> {
+    if bindings.is_empty() || bindings.len() > MAX_DEPFILE_DEPENDENCIES {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{context} depfile bindings are empty or exceed {MAX_DEPFILE_DEPENDENCIES}"
+        )));
+    }
+    let mut dependencies = BTreeSet::new();
+    for binding in bindings {
+        if binding.producer_path.is_empty()
+            || binding.producer_path.len() > MAX_DEPFILE_WORD_BYTES
+            || binding
+                .producer_path
+                .chars()
+                .any(|character| matches!(character, '\0' | '\n' | '\r'))
+            || binding.portable_path.is_empty()
+            || binding.portable_path.len() > MAX_DEPFILE_WORD_BYTES
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{context} depfile binding path is invalid"
+            )));
+        }
+        validate_observed_dependency(context, &binding.dependency)?;
+        match binding.dependency.domain {
+            NativeOperatorDependencyDomain::Source => {
+                validate_relative_path(&binding.portable_path)?;
+                if binding.portable_path != binding.dependency.path {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "{context} source depfile binding does not use its locked path"
+                    )));
+                }
+            }
+            NativeOperatorDependencyDomain::BackendToolchain
+            | NativeOperatorDependencyDomain::HostToolchain => {
+                validate_normalized_absolute_path(
+                    &binding.portable_path,
+                    &format!("{context} toolchain depfile binding"),
+                )?;
+            }
+        }
+        if !dependencies.insert(binding.dependency.clone()) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{context} depfile bindings duplicate a typed dependency"
+            )));
+        }
+    }
+    Ok(dependencies.into_iter().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_portable_depfile_pair(
+    compiler_raw: &str,
+    compiler_depfile_path: &Path,
+    portable_raw: &str,
     depfile_path: &Path,
     object_path: &str,
     working_directory: &str,
     translation_unit: &NativeOperatorSourceFileLock,
     closure: &NativeOperatorTranslationUnitDependencyLock,
+    bindings: &[NativeOperatorDepfileDependencyBinding],
     toolchain_scope: &NativeOperatorToolchainDependencyScope,
 ) -> Result<Vec<NativeOperatorObservedDependency>> {
-    let (target, dependencies) = parse_make_depfile(raw, depfile_path)?;
+    let (compiler_target, compiler_dependencies) =
+        parse_make_depfile(compiler_raw, compiler_depfile_path)?;
+    let (target, dependencies) = parse_make_depfile(portable_raw, depfile_path)?;
     validate_normalized_absolute_path(object_path, "portable depfile producer object")?;
-    if target != object_path {
+    if compiler_target != object_path || target != object_path {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "portable depfile target differs from object file: depfile={} target={target}",
+            "compiler or portable depfile target differs from object file: depfile={} compiler_target={compiler_target} portable_target={target}",
             depfile_path.display()
         )));
     }
     validate_normalized_absolute_path(working_directory, "portable depfile working directory")?;
     let working_directory = Path::new(working_directory);
     let expected = expected_source_dependencies(translation_unit, closure);
-    let expected_by_path = expected
+    let observed = validate_depfile_bindings_basic("<portable-depfile>", bindings)?;
+    let expected_compiler_dependencies = bindings
         .iter()
-        .map(|dependency| (dependency.path.as_str(), dependency))
+        .map(|binding| binding.producer_path.as_str())
+        .collect::<Vec<_>>();
+    if compiler_dependencies
+        != expected_compiler_dependencies
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>()
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "compiler depfile bytes differ from their ordered typed bindings".to_string(),
+        ));
+    }
+    let portable_by_dependency = bindings
+        .iter()
+        .map(|binding| (binding.dependency.clone(), binding.portable_path.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut observed = BTreeSet::new();
-    for dependency in dependencies {
-        let path = Path::new(&dependency);
-        let identity = if path.is_absolute() && !path.starts_with(working_directory) {
-            toolchain_scope
-                .by_absolute_path
-                .get(&dependency)
-                .ok_or_else(|| {
-                    NativeOperatorBuilderError::Invalid(format!(
-                        "portable depfile dependency is outside its source and toolchain manifests: {dependency}"
-                    ))
-                })?
-                .clone()
-        } else {
-            let relative = if path.is_absolute() {
-                path.strip_prefix(working_directory).map_err(|_| {
-                    NativeOperatorBuilderError::Invalid(format!(
-                        "portable depfile dependency escapes its recorded working directory: {dependency}"
-                    ))
-                })?
-            } else {
-                path
-            };
-            let normalized = normalize_portable_relative_path(relative)?;
-            expected_by_path
-                .get(normalized.as_str())
-                .ok_or_else(|| {
-                    NativeOperatorBuilderError::Invalid(format!(
-                        "portable depfile contains an undeclared source dependency: {normalized}"
-                    ))
-                })?
-                .to_owned()
-                .clone()
-        };
-        validate_observed_dependency("<portable-depfile>", &identity)?;
-        if !observed.insert(identity.clone()) {
-            return Err(NativeOperatorBuilderError::Invalid(format!(
-                "portable depfile contains a duplicate dependency identity: {:?}:{}",
-                identity.domain, identity.path
-            )));
+    let expected_portable_dependencies = observed
+        .iter()
+        .map(|dependency| {
+            portable_by_dependency
+                .get(dependency)
+                .cloned()
+                .expect("binding dependencies were collected from the same rows")
+        })
+        .collect::<Vec<_>>();
+    let canonical_portable =
+        serialize_portable_depfile(object_path, &expected_portable_dependencies)?;
+    if dependencies != expected_portable_dependencies
+        || portable_raw.as_bytes() != canonical_portable.as_slice()
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "portable depfile bytes differ from their canonical typed bindings".to_string(),
+        ));
+    }
+    for binding in bindings {
+        match binding.dependency.domain {
+            NativeOperatorDependencyDomain::Source => {
+                let producer = Path::new(&binding.producer_path);
+                let relative = if producer.is_absolute() {
+                    producer.strip_prefix(working_directory).map_err(|_| {
+                        NativeOperatorBuilderError::Invalid(format!(
+                            "source compiler depfile path escapes its recorded working directory: {}",
+                            binding.producer_path
+                        ))
+                    })?
+                } else {
+                    producer
+                };
+                if normalize_portable_relative_path(relative)? != binding.dependency.path {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "source compiler depfile path differs from its locked identity: {}",
+                        binding.producer_path
+                    )));
+                }
+            }
+            NativeOperatorDependencyDomain::BackendToolchain
+            | NativeOperatorDependencyDomain::HostToolchain => {
+                let normalized_producer = normalize_absolute_posix_path_lexically(
+                    &binding.producer_path,
+                    "toolchain compiler depfile binding",
+                )?;
+                if toolchain_scope.by_absolute_path.get(&normalized_producer)
+                    != Some(&binding.dependency)
+                    || toolchain_scope.by_absolute_path.get(&binding.portable_path)
+                        != Some(&binding.dependency)
+                {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "toolchain depfile binding is outside its typed manifest: producer={} portable={}",
+                        binding.producer_path, binding.portable_path
+                    )));
+                }
+            }
         }
     }
     let observed_source = observed
@@ -2791,9 +3184,51 @@ fn validate_portable_depfile(
             "portable depfile differs from locked source dependency closure: expected={expected:?} observed={observed_source:?}"
         )));
     }
-    let observed = observed.into_iter().collect::<Vec<_>>();
     validate_observed_dependencies("<portable-depfile>", &observed)?;
+    for dependency in &observed {
+        if !bindings
+            .iter()
+            .any(|binding| &binding.dependency == dependency)
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "portable depfile is missing a binding for {:?}:{}",
+                dependency.domain, dependency.path
+            )));
+        }
+    }
     Ok(observed)
+}
+
+fn normalize_absolute_posix_path_lexically(value: &str, label: &str) -> Result<String> {
+    if !value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{label} must be an absolute POSIX path: {value}"
+        )));
+    }
+    let mut components = Vec::new();
+    for component in value.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "{label} escapes the filesystem root: {value}"
+                    )));
+                }
+            }
+            _ => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", components.join("/")))
+    }
 }
 
 fn validate_normalized_absolute_path(value: &str, label: &str) -> Result<()> {
@@ -2840,6 +3275,45 @@ fn normalize_portable_relative_path(path: &Path) -> Result<String> {
     Ok(normalized)
 }
 
+fn read_bounded_regular_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{label} is not a regular file or exceeds {max_bytes} bytes: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{label} grew beyond {max_bytes} bytes while reading: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 fn atomic_write_bytes(destination: &Path, bytes: &[u8]) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         NativeOperatorBuilderError::Invalid(format!(
@@ -2880,9 +3354,9 @@ fn atomic_write_bytes(destination: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn parse_make_depfile(raw: &str, path: &Path) -> Result<(String, Vec<String>)> {
-    if raw.trim().is_empty() || raw.as_bytes().contains(&0) {
+    if raw.len() > MAX_DEPFILE_BYTES || raw.trim().is_empty() || raw.as_bytes().contains(&0) {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "depfile is empty or contains NUL: {}",
+            "depfile is too large, empty, or contains NUL: {}",
             path.display()
         )));
     }
@@ -2922,24 +3396,31 @@ fn parse_make_depfile(raw: &str, path: &Path) -> Result<(String, Vec<String>)> {
             path.display()
         ))
     })?;
-    let targets = parse_make_words(&normalized[..delimiter], path)?;
-    let dependencies = parse_make_words(&normalized[delimiter + 1..], path)?;
+    let targets = parse_make_words(&normalized[..delimiter], path, 1)?;
+    let dependencies =
+        parse_make_words(&normalized[delimiter + 1..], path, MAX_DEPFILE_DEPENDENCIES)?;
     if targets.len() != 1 || dependencies.is_empty() {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "depfile must contain exactly one target and at least one dependency: {}",
+            "depfile target/dependency count or word size is invalid: {}",
             path.display()
         )));
     }
     Ok((targets[0].clone(), dependencies))
 }
 
-fn parse_make_words(value: &str, path: &Path) -> Result<Vec<String>> {
+fn parse_make_words(value: &str, path: &Path, max_words: usize) -> Result<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut escaped = false;
     for character in value.chars() {
         if escaped {
             word.push(character);
+            if word.len() > MAX_DEPFILE_WORD_BYTES {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "depfile word exceeds {MAX_DEPFILE_WORD_BYTES} bytes: {}",
+                    path.display()
+                )));
+            }
             escaped = false;
             continue;
         }
@@ -2948,10 +3429,24 @@ fn parse_make_words(value: &str, path: &Path) -> Result<Vec<String>> {
             '\n' | '\r' => unreachable!("newlines rejected before make-word parsing"),
             character if character.is_whitespace() => {
                 if !word.is_empty() {
+                    if words.len() >= max_words {
+                        return Err(NativeOperatorBuilderError::Invalid(format!(
+                            "depfile exceeds its word-count limit: {}",
+                            path.display()
+                        )));
+                    }
                     words.push(std::mem::take(&mut word));
                 }
             }
-            _ => word.push(character),
+            _ => {
+                word.push(character);
+                if word.len() > MAX_DEPFILE_WORD_BYTES {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "depfile word exceeds {MAX_DEPFILE_WORD_BYTES} bytes: {}",
+                        path.display()
+                    )));
+                }
+            }
         }
     }
     if escaped {
@@ -2961,6 +3456,12 @@ fn parse_make_words(value: &str, path: &Path) -> Result<Vec<String>> {
         )));
     }
     if !word.is_empty() {
+        if words.len() >= max_words {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "depfile exceeds its word-count limit: {}",
+                path.display()
+            )));
+        }
         words.push(word);
     }
     Ok(words)
@@ -4487,7 +4988,8 @@ fn build_commands(
         let object_path = objects_dir.join(object_name);
         let depfile_name = format!("{index:08}-{stem}.d");
         let depfile_relative = format!("depfiles/{depfile_name}");
-        let depfile_path = request.output_dir.join(&depfile_relative);
+        let compiler_depfile_relative = format!("depfiles/{index:08}-{stem}.compiler.raw.d");
+        let compiler_depfile_path = request.output_dir.join(&compiler_depfile_relative);
         object_paths.push(object_path.clone());
         let mut argv = vec![
             nvcc_path.to_string(),
@@ -4500,7 +5002,7 @@ fn build_commands(
             ccbin_path.to_string(),
             "-MMD".to_string(),
             "-MF".to_string(),
-            depfile_path.display().to_string(),
+            compiler_depfile_path.display().to_string(),
             "-MT".to_string(),
             object_path.display().to_string(),
         ];
@@ -4535,10 +5037,13 @@ fn build_commands(
             } else {
                 NativeOperatorDependencyValidation::Pending
             }),
+            compiler_depfile: Some(compiler_depfile_relative),
+            compiler_depfile_sha256: None,
             depfile: Some(depfile_relative),
             depfile_sha256: None,
             depfile_producer_working_directory: None,
             depfile_producer_object_file: None,
+            depfile_bindings: Vec::new(),
             observed_dependencies: Vec::new(),
             compiler_executed: false,
             elapsed_ms: None,
@@ -4567,10 +5072,13 @@ fn build_commands(
         object_identity: None,
         dependency_closure_sha256: None,
         dependency_validation: None,
+        compiler_depfile: None,
+        compiler_depfile_sha256: None,
         depfile: None,
         depfile_sha256: None,
         depfile_producer_working_directory: None,
         depfile_producer_object_file: None,
+        depfile_bindings: Vec::new(),
         observed_dependencies: Vec::new(),
         compiler_executed: false,
         elapsed_ms: None,
@@ -4846,7 +5354,7 @@ mod tests {
                  declared_header=''\n\
                  case \"$src\" in */marlin.cu) declared_header=' kernels/marlin.h' ;; esac\n\
                  printf '%s: %s%s %s %s\\n' \"$dep_target\" \"$src\" \"$declared_header\" '{}' '{}' > \"$depfile\"\n",
-                toolkit_root.join("include/cuda.h").display(),
+                toolkit_root.join("bin/../include/cuda.h").display(),
                 host_root.join("include/stddef.h").display(),
             ),
             FakeDepfileMode::MissingDeclaredHeader => {
@@ -4965,6 +5473,27 @@ mod tests {
         };
 
         assert!(object_file_name(99, &translation_unit) < object_file_name(100, &translation_unit));
+    }
+
+    #[test]
+    fn portable_depfile_serialization_round_trips_restricted_make_words() {
+        let target = "/tmp/build path/object:name#$value.o";
+        let dependencies = vec![
+            "kernels/header name.h".to_string(),
+            "/tmp/tool chain/header:name#$value.h".to_string(),
+        ];
+
+        let raw = serialize_portable_depfile(target, &dependencies).unwrap();
+        let text = std::str::from_utf8(&raw).unwrap();
+        let (parsed_target, parsed_dependencies) =
+            parse_make_depfile(text, Path::new("<round-trip>")).unwrap();
+
+        assert_eq!(parsed_target, target);
+        assert_eq!(parsed_dependencies, dependencies);
+        assert!(text.contains("\\ "));
+        assert!(text.contains("\\:"));
+        assert!(text.contains("\\#"));
+        assert!(text.contains("\\$"));
     }
 
     #[test]
@@ -5299,6 +5828,79 @@ mod tests {
                 .count(),
             1,
             "tampered cache proof must reject before another compiler starts"
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_cached_compiler_depfile_before_compiler_start() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, definition_path) = write_fixture(root.path());
+        let plan_path = root.path().join("source-build.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &plan_path).unwrap();
+        let fake_cuda = write_fake_nvcc(root.path());
+        let object_cache_dir = root.path().join("object-cache");
+        let request = |name: &str| NativeOperatorSourceBuildRequest {
+            plan_path: plan_path.clone(),
+            source_root: source_root.clone(),
+            output_dir: root.path().join(name),
+            compute_capability: "sm_89".to_string(),
+            builder_sha: "7".repeat(40),
+            nvcc_path: fake_cuda.nvcc.clone(),
+            cuda_toolkit_root: fake_cuda.root.clone(),
+            ccbin_path: fake_cuda.ccbin.clone(),
+            ar_path: PathBuf::from("/usr/bin/ar"),
+            nvcc_threads: 2,
+            object_cache_dir: object_cache_dir.clone(),
+            plan_only: false,
+        };
+
+        let cold = run_native_operator_source_build(&request("cold")).unwrap();
+        let cache_entry = PathBuf::from(
+            cold.commands[0]
+                .object_cache_entry
+                .as_deref()
+                .expect("published object records its cache entry"),
+        );
+        let proof_path = cache_entry.join("dependency-proof/proof.json");
+        let compiler_depfile_path = cache_entry.join("dependency-proof/compiler-dependency.raw.d");
+        let mut proof: NativeOperatorObjectDependencyProof = read_json(&proof_path).unwrap();
+        let backend_binding = proof
+            .depfile_bindings
+            .iter_mut()
+            .find(|binding| {
+                binding.dependency.domain == NativeOperatorDependencyDomain::BackendToolchain
+            })
+            .expect("fixture depfile contains a backend toolchain dependency");
+        let original_producer = backend_binding.producer_path.clone();
+        let forged_producer =
+            original_producer.replace("/bin/../include/cuda.h", "/forged/include/cuda.h");
+        assert_ne!(forged_producer, original_producer);
+        backend_binding.producer_path = forged_producer.clone();
+        let compiler_raw = fs::read_to_string(&compiler_depfile_path)
+            .unwrap()
+            .replace(&original_producer, &forged_producer);
+        proof.compiler_depfile_sha256 = sha256_bytes(compiler_raw.as_bytes());
+        fs::write(&compiler_depfile_path, compiler_raw).unwrap();
+        write_json(&proof_path, &proof).unwrap();
+
+        let error = run_native_operator_source_build(&request("tampered")).unwrap_err();
+        assert!(matches!(
+            error,
+            NativeOperatorBuilderError::SourceBuildRejected { .. }
+        ));
+        let receipt: NativeOperatorSourceBuildReceipt =
+            read_json(&root.path().join("tampered/source-build.receipt.json")).unwrap();
+        assert!(receipt
+            .failure_class
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("cached_dependency_proof_failed:")));
+        assert_eq!(
+            fs::read_to_string(&fake_cuda.compile_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "tampered compiler depfile must reject before another compiler starts"
         );
     }
 
@@ -5673,6 +6275,55 @@ mod tests {
             .observed_dependencies
             .iter()
             .all(|dependency| is_sha256_digest(&dependency.sha256)));
+        let compiler_depfile = fs::read_to_string(
+            output_dir.join(
+                receipt.commands[0]
+                    .compiler_depfile
+                    .as_deref()
+                    .expect("cold build records its compiler depfile"),
+            ),
+        )
+        .unwrap();
+        let portable_depfile = fs::read_to_string(
+            output_dir.join(
+                receipt.commands[0]
+                    .depfile
+                    .as_deref()
+                    .expect("cold build records its portable depfile"),
+            ),
+        )
+        .unwrap();
+        assert!(compiler_depfile.contains("/bin/../include/cuda.h"));
+        assert!(!portable_depfile.contains("/../"));
+        let plan: NativeOperatorSourceBuildPlan = read_json(&plan_path).unwrap();
+        let toolchain_scope =
+            load_toolchain_dependency_scope(&output_dir, static_toolchain).unwrap();
+        let cache_entry = PathBuf::from(
+            receipt.commands[0]
+                .object_cache_entry
+                .as_deref()
+                .expect("cold build records its cache entry"),
+        );
+        let object_name = Path::new(
+            receipt.commands[0]
+                .object_file
+                .as_deref()
+                .expect("cold build records its object"),
+        )
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+        validate_existing_dependency_proof(
+            &cache_entry.join("dependency-proof"),
+            receipt.commands[0].object_cache_key.as_deref().unwrap(),
+            receipt.commands[0].object_sha256.as_deref().unwrap(),
+            &plan.translation_units[0],
+            &plan.dependency_closures[0],
+            &format!("/another-worktree/objects/{object_name}"),
+            &toolchain_scope,
+        )
+        .expect("a concurrent cache winner from another worktree remains valid");
         assert!(receipt.commands.iter().all(|command| {
             [
                 output_dir.join(&command.stdout_log),

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,8 +19,12 @@ from typing import Any, Sequence
 
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 6
-SOURCE_OBJECT_BUILD_CONTRACT_VERSION = 6
+SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
+SOURCE_OBJECT_BUILD_CONTRACT_VERSION = 7
+MAX_DEPFILE_BYTES = 16 * 1024 * 1024
+MAX_DEPFILE_DEPENDENCIES = 250_000
+MAX_DEPFILE_WORD_BYTES = 16 * 1024
+MAX_JSON_BYTES = 64 * 1024 * 1024
 DEPENDENCY_DOMAIN_ORDER = {
     "source": 0,
     "backend_toolchain": 1,
@@ -112,11 +117,40 @@ def require_sha(value: Any, label: str) -> str:
     return value
 
 
+def read_bounded_regular_file(path: Path, max_bytes: int, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise VerificationError(f"cannot open {label} {path}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(metadata.st_mode) and metadata.st_size <= max_bytes,
+            f"{label} is not a regular file or exceeds {max_bytes} bytes: {path}",
+        )
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        require(total <= max_bytes, f"{label} grew beyond {max_bytes} bytes: {path}")
+        return b"".join(chunks)
+    except OSError as error:
+        raise VerificationError(f"cannot read {label} {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+
+
 def read_json(path: Path, label: str) -> Any:
     require(path.is_file() and not path.is_symlink(), f"{label} is missing: {path}")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raw = read_bounded_regular_file(path, MAX_JSON_BYTES, label)
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise VerificationError(f"cannot read {label} {path}: {error}") from error
 
 
@@ -222,6 +256,26 @@ def require_absolute_posix_path(value: Any, label: str) -> str:
         f"{label} must be a normalized absolute path: {value!r}",
     )
     return value
+
+
+def normalize_absolute_depfile_path(value: str, label: str) -> str:
+    require(
+        bool(value)
+        and value.startswith("/")
+        and "\\" not in value
+        and not any(character in value for character in ("\0", "\n", "\r")),
+        f"{label} must be an absolute POSIX path",
+    )
+    components: list[str] = []
+    for component in value.split("/"):
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            require(bool(components), f"{label} escapes the filesystem root")
+            components.pop()
+        else:
+            components.append(component)
+    return "/" + "/".join(components)
 
 
 def require_relative_posix_path(value: Any, label: str) -> str:
@@ -837,7 +891,7 @@ def expected_source_command_argv(
     translation_unit: dict[str, str],
     object_file: str,
     architecture_argument: str,
-    depfile_output: str,
+    compiler_depfile_output: str,
     include_dirs: list[Any],
     defines: list[Any],
     nvcc_policy: dict[str, Any],
@@ -854,7 +908,7 @@ def expected_source_command_argv(
         static_identity["host_toolchain"]["compiler"]["path"],
         "-MMD",
         "-MF",
-        depfile_output,
+        compiler_depfile_output,
         "-MT",
         object_file,
         *(f"-I{value}" for value in include_dirs),
@@ -986,30 +1040,49 @@ def verify_source_object_cache_key(
     return expected
 
 
-def parse_make_words(value: str, label: str) -> list[str]:
+def parse_make_words(value: str, label: str, max_words: int) -> list[str]:
     words: list[str] = []
     word: list[str] = []
+    word_bytes = 0
     escaped = False
     for character in value:
         if escaped:
             word.append(character)
+            word_bytes += len(character.encode("utf-8"))
+            require(
+                word_bytes <= MAX_DEPFILE_WORD_BYTES,
+                f"{label} word exceeds {MAX_DEPFILE_WORD_BYTES} bytes",
+            )
             escaped = False
         elif character == "\\":
             escaped = True
         elif character.isspace():
             if word:
+                require(len(words) < max_words, f"{label} exceeds its word-count limit")
                 words.append("".join(word))
                 word = []
+                word_bytes = 0
         else:
             word.append(character)
+            word_bytes += len(character.encode("utf-8"))
+            require(
+                word_bytes <= MAX_DEPFILE_WORD_BYTES,
+                f"{label} word exceeds {MAX_DEPFILE_WORD_BYTES} bytes",
+            )
     require(not escaped, f"{label} ends with an incomplete escape")
     if word:
+        require(len(words) < max_words, f"{label} exceeds its word-count limit")
         words.append("".join(word))
     return words
 
 
 def parse_make_depfile(raw: str, label: str) -> tuple[str, list[str]]:
-    require(bool(raw.strip()) and "\0" not in raw, f"{label} is empty or contains NUL")
+    require(
+        len(raw.encode("utf-8")) <= MAX_DEPFILE_BYTES
+        and bool(raw.strip())
+        and "\0" not in raw,
+        f"{label} is too large, empty, or contains NUL",
+    )
     normalized = raw.replace("\\\r\n", "").replace("\\\n", "").rstrip("\r\n")
     require("\n" not in normalized and "\r" not in normalized, f"{label} has multiple rules")
     escaped = False
@@ -1023,22 +1096,67 @@ def parse_make_depfile(raw: str, label: str) -> tuple[str, list[str]]:
             delimiter = index
             break
     require(delimiter is not None, f"{label} has no target delimiter")
-    targets = parse_make_words(normalized[:delimiter], label)
-    dependencies = parse_make_words(normalized[delimiter + 1 :], label)
+    targets = parse_make_words(normalized[:delimiter], label, 1)
+    dependencies = parse_make_words(
+        normalized[delimiter + 1 :], label, MAX_DEPFILE_DEPENDENCIES
+    )
     require(
         len(targets) == 1 and bool(dependencies),
-        f"{label} must contain exactly one target and at least one dependency",
+        f"{label} target/dependency count or word size is invalid",
     )
     return targets[0], dependencies
 
 
+def escape_make_word(value: str, label: str) -> str:
+    require(
+        bool(value)
+        and len(value.encode("utf-8")) <= MAX_DEPFILE_WORD_BYTES
+        and not any(character in value for character in ("\0", "\n", "\r")),
+        f"{label} must be a bounded non-empty single-line make word",
+    )
+    return "".join(
+        f"\\{character}" if character in {"\\", " ", "\t", ":", "#", "$"} else character
+        for character in value
+    )
+
+
+def serialize_portable_depfile(target: str, dependencies: list[str], label: str) -> str:
+    require_absolute_posix_path(target, f"{label}.target")
+    require(
+        0 < len(dependencies) <= MAX_DEPFILE_DEPENDENCIES,
+        f"{label} dependency count is invalid",
+    )
+    words = [escape_make_word(target, f"{label}.target")]
+    for index, dependency in enumerate(dependencies):
+        if dependency.startswith("/"):
+            require_absolute_posix_path(dependency, f"{label}.dependencies[{index}]")
+        else:
+            require_relative_posix_path(dependency, f"{label}.dependencies[{index}]")
+        words.append(escape_make_word(dependency, f"{label}.dependencies[{index}]"))
+    raw = f"{words[0]}: {' '.join(words[1:])}\n"
+    require(
+        len(raw.encode("utf-8")) <= MAX_DEPFILE_BYTES,
+        f"{label} exceeds {MAX_DEPFILE_BYTES} bytes",
+    )
+    parsed_target, parsed_dependencies = parse_make_depfile(raw, label)
+    require(
+        parsed_target == target and parsed_dependencies == dependencies,
+        f"{label} serialization did not round-trip",
+    )
+    return raw
+
+
 def verify_translation_unit_dependency_evidence(
     command: dict[str, Any],
+    compiler_depfile_path: Path,
     depfile_path: Path,
     expected_source: set[DependencyIdentity],
     toolchain_owners: dict[str, DependencyIdentity],
     allowed_toolchain: set[DependencyIdentity],
     label: str,
+    *,
+    expected_compiler_sha256: str | None = None,
+    expected_portable_sha256: str | None = None,
 ) -> list[DependencyIdentity]:
     working_directory = require_absolute_posix_path(
         command.get("depfile_producer_working_directory"),
@@ -1064,47 +1182,150 @@ def verify_translation_unit_dependency_evidence(
         f"{label} contains a dependency absent from the toolchain manifests",
     )
 
+    compiler_bytes = read_bounded_regular_file(
+        compiler_depfile_path, MAX_DEPFILE_BYTES, f"{label}.compiler_depfile"
+    )
+    portable_bytes = read_bounded_regular_file(
+        depfile_path, MAX_DEPFILE_BYTES, f"{label}.depfile"
+    )
+    if expected_compiler_sha256 is not None:
+        require_sha(expected_compiler_sha256, f"{label}.compiler_depfile_sha256")
+        require(
+            hashlib.sha256(compiler_bytes).hexdigest() == expected_compiler_sha256,
+            f"{label} compiler depfile SHA mismatch",
+        )
+    if expected_portable_sha256 is not None:
+        require_sha(expected_portable_sha256, f"{label}.depfile_sha256")
+        require(
+            hashlib.sha256(portable_bytes).hexdigest() == expected_portable_sha256,
+            f"{label} portable depfile SHA mismatch",
+        )
     try:
-        raw = depfile_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise VerificationError(f"cannot read {label} depfile: {error}") from error
-    target, dependencies = parse_make_depfile(raw, f"{label}.depfile")
-    require(target == producer_object, f"{label} depfile target differs from its producer object")
+        compiler_raw = compiler_bytes.decode("utf-8")
+        portable_raw = portable_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerificationError(f"cannot read {label} depfile evidence: {error}") from error
+    compiler_target, compiler_dependencies = parse_make_depfile(
+        compiler_raw, f"{label}.compiler_depfile"
+    )
+    portable_target, portable_dependencies = parse_make_depfile(
+        portable_raw, f"{label}.depfile"
+    )
+    require(
+        compiler_target == producer_object and portable_target == producer_object,
+        f"{label} compiler/portable depfile target differs from its producer object",
+    )
 
-    expected_by_path = {row[1]: row for row in expected_source}
+    raw_bindings = require_list(command.get("depfile_bindings"), f"{label}.depfile_bindings")
+    require(
+        0 < len(raw_bindings) <= MAX_DEPFILE_DEPENDENCIES,
+        f"{label}.depfile_bindings count is invalid",
+    )
     working = PurePosixPath(working_directory)
-    parsed: set[DependencyIdentity] = set()
-    for raw_dependency in dependencies:
-        path = PurePosixPath(raw_dependency)
-        if path.is_absolute() and not path.is_relative_to(working):
-            identity = toolchain_owners.get(path.as_posix())
+    bindings: list[tuple[str, str, DependencyIdentity]] = []
+    bound_dependencies: set[DependencyIdentity] = set()
+    for index, raw_binding in enumerate(raw_bindings):
+        binding = require_dict(raw_binding, f"{label}.depfile_bindings[{index}]")
+        require(
+            set(binding) == {"producer_path", "portable_path", "dependency"},
+            f"{label}.depfile_bindings[{index}] shape mismatch",
+        )
+        producer_path = binding.get("producer_path")
+        portable_path = binding.get("portable_path")
+        require(
+            isinstance(producer_path, str)
+            and bool(producer_path)
+            and len(producer_path.encode("utf-8")) <= MAX_DEPFILE_WORD_BYTES
+            and not any(character in producer_path for character in ("\0", "\n", "\r")),
+            f"{label}.depfile_bindings[{index}].producer_path is invalid",
+        )
+        require(
+            isinstance(portable_path, str)
+            and bool(portable_path)
+            and len(portable_path.encode("utf-8")) <= MAX_DEPFILE_WORD_BYTES,
+            f"{label}.depfile_bindings[{index}].portable_path is invalid",
+        )
+        dependency = verify_dependency_rows(
+            [binding.get("dependency")],
+            f"{label}.depfile_bindings[{index}].dependency",
+        )[0]
+        require(
+            dependency not in bound_dependencies,
+            f"{label}.depfile_bindings duplicate a typed dependency",
+        )
+        bound_dependencies.add(dependency)
+        producer = PurePosixPath(producer_path)
+        if dependency[0] == "source":
             require(
-                identity is not None,
-                f"{label} depfile contains an unmanifested external dependency: {raw_dependency}",
+                portable_path == dependency[1],
+                f"{label}.depfile_bindings[{index}] source portable path mismatch",
+            )
+            if producer.is_absolute():
+                try:
+                    producer_relative = producer.relative_to(working).as_posix()
+                except ValueError as error:
+                    raise VerificationError(
+                        f"{label}.depfile_bindings[{index}] source producer path escapes its working directory"
+                    ) from error
+            else:
+                producer_relative = producer_path
+            require(
+                normalize_depfile_relative_path(
+                    producer_relative,
+                    f"{label}.depfile_bindings[{index}].producer_path",
+                )
+                == dependency[1],
+                f"{label}.depfile_bindings[{index}] source producer path mismatch",
             )
         else:
-            if path.is_absolute():
-                relative_raw = path.relative_to(working).as_posix()
-            else:
-                relative_raw = raw_dependency
-            relative = normalize_depfile_relative_path(
-                relative_raw, f"{label}.depfile dependency"
+            normalized_producer = normalize_absolute_depfile_path(
+                producer_path,
+                f"{label}.depfile_bindings[{index}].producer_path",
             )
-            identity = expected_by_path.get(relative)
             require(
-                identity is not None,
-                f"{label} depfile contains an undeclared source dependency: {relative}",
+                producer.is_absolute()
+                and require_absolute_posix_path(
+                    portable_path,
+                    f"{label}.depfile_bindings[{index}].portable_path",
+                )
+                and toolchain_owners.get(normalized_producer) == dependency
+                and toolchain_owners.get(portable_path) == dependency,
+                f"{label}.depfile_bindings[{index}] toolchain identity is unmanifested",
             )
-        require(identity not in parsed, f"{label} depfile contains a duplicate dependency")
-        parsed.add(identity)
+        bindings.append((producer_path, portable_path, dependency))
+
     require(
-        {row for row in parsed if row[0] == "source"} == expected_source,
-        f"{label} depfile differs from the exact translation-unit closure",
+        compiler_dependencies == [binding[0] for binding in bindings],
+        f"{label} compiler depfile differs from its ordered typed bindings",
     )
-    parsed_rows = sorted(parsed, key=dependency_sort_key)
+    expected_portable_dependencies = [
+        portable_path
+        for _, portable_path, _ in sorted(
+            bindings, key=lambda binding: dependency_sort_key(binding[2])
+        )
+    ]
     require(
-        parsed_rows == observed,
-        f"{label} raw depfile semantics differ from typed receipt evidence",
+        portable_dependencies == expected_portable_dependencies
+        and portable_raw
+        == serialize_portable_depfile(
+            producer_object, expected_portable_dependencies, f"{label}.canonical_depfile"
+        ),
+        f"{label} portable depfile differs from its canonical typed bindings",
+    )
+    require(
+        sorted(bound_dependencies, key=dependency_sort_key) == observed,
+        f"{label} depfile bindings differ from typed receipt evidence",
+    )
+    for _, portable_path, dependency in bindings:
+        if dependency[0] != "source":
+            identity = toolchain_owners.get(portable_path)
+            require(
+                identity == dependency,
+                f"{label} portable depfile contains an unmanifested external dependency: {portable_path}",
+            )
+    require(
+        {row for row in bound_dependencies if row[0] == "source"} == expected_source,
+        f"{label} depfile differs from the exact translation-unit closure",
     )
     return observed
 
@@ -1358,7 +1579,7 @@ def verify_source_build(
         and receipt.get("status") == "pass"
         and receipt.get("plan_only") is False
         and receipt.get("failure_class") is None,
-        f"{name} source build is not a terminal schema-v6 PASS",
+        f"{name} source build is not a terminal schema-v7 PASS",
     )
     require(plan.get("schema_version") == 3, f"{name} source plan schema mismatch")
     require(receipt.get("operator") == operator == plan.get("operator"), f"{name} source operator mismatch")
@@ -1505,8 +1726,12 @@ def verify_source_build(
         )
         stem = PurePosixPath(translation_unit["path"]).stem or "translation_unit"
         expected_depfile = f"depfiles/{index:08}-{stem}.d"
+        expected_compiler_depfile = (
+            f"depfiles/{index:08}-{stem}.compiler.raw.d"
+        )
         require(
-            command.get("depfile") == expected_depfile
+            command.get("compiler_depfile") == expected_compiler_depfile
+            and command.get("depfile") == expected_depfile
             and command.get("stdout_log") == f"logs/{index:02}-{stem}.stdout.log"
             and command.get("stderr_log") == f"logs/{index:02}-{stem}.stderr.log",
             f"{name}.commands[{index}] output paths differ from the source-build contract",
@@ -1516,7 +1741,9 @@ def verify_source_build(
             translation_unit=translation_unit,
             object_file=object_file,
             architecture_argument=architecture_argument,
-            depfile_output=(output_root / expected_depfile).as_posix(),
+            compiler_depfile_output=(
+                output_root / expected_compiler_depfile
+            ).as_posix(),
             include_dirs=include_dirs,
             defines=defines,
             nvcc_policy=nvcc_policy,
@@ -1556,22 +1783,31 @@ def verify_source_build(
         for stream in ("stdout_log", "stderr_log"):
             path = resolve_relative_file(build_root, command.get(stream), f"{name}.commands[{index}].{stream}")
             require(path.stat().st_size > 0, f"{name}.commands[{index}].{stream} is empty")
+        compiler_depfile = command.get("compiler_depfile")
+        compiler_depfile_path = resolve_relative_file(
+            build_root,
+            compiler_depfile,
+            f"{name}.commands[{index}].compiler_depfile",
+        )
+        require_sha(
+            command.get("compiler_depfile_sha256"),
+            f"{name}.commands[{index}].compiler_depfile_sha256",
+        )
         depfile = command.get("depfile")
         depfile_path = resolve_relative_file(
             build_root, depfile, f"{name}.commands[{index}].depfile"
         )
         require_sha(command.get("depfile_sha256"), f"{name}.commands[{index}].depfile_sha256")
-        require(
-            sha256(depfile_path) == command["depfile_sha256"],
-            f"{name}.commands[{index}] depfile SHA mismatch",
-        )
         verify_translation_unit_dependency_evidence(
             command,
+            compiler_depfile_path,
             depfile_path,
             expected_source,
             toolchain_owners,
             allowed_toolchain,
             f"{name}.commands[{index}]",
+            expected_compiler_sha256=command["compiler_depfile_sha256"],
+            expected_portable_sha256=command["depfile_sha256"],
         )
         if command.get("object_cache_status") == "published":
             require(
@@ -1605,10 +1841,13 @@ def verify_source_build(
         and archive_command.get("object_identity") is None
         and archive_command.get("dependency_closure_sha256") is None
         and archive_command.get("dependency_validation") is None
+        and archive_command.get("compiler_depfile") is None
+        and archive_command.get("compiler_depfile_sha256") is None
         and archive_command.get("depfile") is None
         and archive_command.get("depfile_sha256") is None
         and archive_command.get("depfile_producer_working_directory") is None
         and archive_command.get("depfile_producer_object_file") is None
+        and archive_command.get("depfile_bindings") == []
         and archive_command.get("observed_dependencies") == []
         and archive_command.get("compiler_executed") is False
         and archive_command.get("return_code") == 0
@@ -2300,7 +2539,7 @@ def self_test() -> None:
             translation_unit=fixture_translation_unit,
             object_file=fixture_object,
             architecture_argument=fixture_architecture,
-            depfile_output="/out/depfiles/00000000-a.d",
+            compiler_depfile_output="/out/depfiles/00000000-a.compiler.raw.d",
             include_dirs=fixture_plan["include_dirs"],
             defines=fixture_plan["defines"],
             nvcc_policy=fixture_policy,
@@ -2377,41 +2616,137 @@ def self_test() -> None:
             "object_file": "/new/objects/00000000-a.o",
             "depfile_producer_working_directory": "/src",
             "depfile_producer_object_file": "/old/objects/00000000-a.o",
+            "depfile_bindings": [
+                {
+                    "producer_path": producer_path,
+                    "portable_path": portable_path,
+                    "dependency": {
+                        "domain": identity[0],
+                        "path": identity[1],
+                        "sha256": identity[2],
+                    },
+                }
+                for producer_path, portable_path, identity in (
+                    ("/src/kernels/a.cu", "kernels/a.cu", source_unit),
+                    ("/src/kernels/a.h", "kernels/a.h", source_header),
+                    (
+                        "/cuda/bin/../include/cuda.h",
+                        "/cuda/include/cuda.h",
+                        backend_header,
+                    ),
+                    (
+                        "/host/include/stddef.h",
+                        "/host/include/stddef.h",
+                        host_header,
+                    ),
+                )
+            ],
             "observed_dependencies": [
                 {"domain": domain, "path": path, "sha256": dependency_sha}
                 for domain, path, dependency_sha in identities
             ],
         }
+        compiler_depfile = root / "compiler-dependency.raw.d"
         depfile = root / "dependency.d"
-        depfile.write_text(
+        compiler_depfile.write_text(
             "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/bin/../include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o: kernels/a.cu kernels/a.h "
             "/cuda/include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
         expected_source = {source_unit, source_header}
         verify_translation_unit_dependency_evidence(
             command,
+            compiler_depfile,
             depfile,
             expected_source,
             owners,
             allowed,
             "selftest.command",
         )
-        depfile.write_text(
+        forged_producer = copy.deepcopy(command)
+        forged_producer["depfile_bindings"][2]["producer_path"] = "/forged/include/cuda.h"
+        compiler_depfile.write_text(
             "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/forged/include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                forged_producer,
+                compiler_depfile,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.forged_producer",
+            ),
+            "unmanifested raw producer path",
+        )
+        compiler_depfile.write_text(
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/bin/../include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o:  kernels/a.cu kernels/a.h "
+            "/cuda/include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                command,
+                compiler_depfile,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.noncanonical_portable",
+            ),
+            "noncanonical portable depfile bytes",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o: kernels/a.cu kernels/a.h "
+            "/cuda/include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        invocation_alias = copy.deepcopy(command)
+        invocation_alias["depfile_bindings"][2]["producer_path"] = (
+            "/cuda-alias/bin/../include/cuda.h"
+        )
+        invocation_alias["depfile_bindings"][2]["portable_path"] = (
+            "/cuda-alias/include/cuda.h"
+        )
+        compiler_depfile.write_text(
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda-alias/bin/../include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o: kernels/a.cu kernels/a.h "
             "/cuda-alias/include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
         verify_translation_unit_dependency_evidence(
-            command,
+            invocation_alias,
+            compiler_depfile,
             depfile,
             expected_source,
             owners,
             allowed,
             "selftest.invocation_alias",
         )
-        depfile.write_text(
+        compiler_depfile.write_text(
             "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/bin/../include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o: kernels/a.cu kernels/a.h "
             "/cuda/include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
@@ -2421,6 +2756,7 @@ def self_test() -> None:
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 tampered_identity,
+                compiler_depfile,
                 depfile,
                 expected_source,
                 owners,
@@ -2434,6 +2770,7 @@ def self_test() -> None:
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 unsorted,
+                compiler_depfile,
                 depfile,
                 expected_source,
                 owners,
@@ -2447,6 +2784,7 @@ def self_test() -> None:
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 unknown_domain,
+                compiler_depfile,
                 depfile,
                 expected_source,
                 owners,
@@ -2460,6 +2798,7 @@ def self_test() -> None:
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 relative_producer,
+                compiler_depfile,
                 depfile,
                 expected_source,
                 owners,
@@ -2469,13 +2808,14 @@ def self_test() -> None:
             "relative producer root",
         )
         depfile.write_text(
-            "/wrong/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/wrong/objects/00000000-a.o: kernels/a.cu kernels/a.h "
             "/cuda/include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 command,
+                compiler_depfile,
                 depfile,
                 expected_source,
                 owners,
@@ -2485,13 +2825,14 @@ def self_test() -> None:
             "same-basename wrong-directory target",
         )
         depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: kernels/a.cu kernels/a.h "
             "/cuda/include/cuda.h /host/include/stddef.h /tmp/generated.h\n",
             encoding="utf-8",
         )
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 command,
+                compiler_depfile,
                 depfile,
                 expected_source,
                 owners,
@@ -2501,13 +2842,14 @@ def self_test() -> None:
             "unmanifested external dependency",
         )
         depfile.write_text(
-            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/old/objects/00000000-a.o: kernels/a.cu kernels/a.h "
             "/cuda/include/cuda.h /host/include/stddef.h\n",
             encoding="utf-8",
         )
         expect_reject(
             lambda: verify_translation_unit_dependency_evidence(
                 command,
+                compiler_depfile,
                 depfile,
                 {source_unit},
                 owners,
