@@ -3250,6 +3250,22 @@ fn validate_normalized_absolute_path(value: &str, label: &str) -> Result<()> {
 }
 
 fn normalize_portable_relative_path(path: &Path) -> Result<String> {
+    let raw = path.to_str().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "depfile path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    if raw.contains('\\')
+        || raw
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "depfile path is not a relative POSIX path: {}",
+            path.display()
+        )));
+    }
     let mut components = Vec::new();
     for component in path.components() {
         match component {
@@ -3262,6 +3278,14 @@ fn normalize_portable_relative_path(path: &Path) -> Result<String> {
                 })?)
             }
             std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if components.pop().is_none() {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "depfile path escapes its working directory: {}",
+                        path.display()
+                    )));
+                }
+            }
             _ => {
                 return Err(NativeOperatorBuilderError::Invalid(format!(
                     "depfile path is not normalized beneath its working directory: {}",
@@ -5291,6 +5315,7 @@ mod tests {
     fn write_fixture(root: &Path) -> (PathBuf, PathBuf) {
         let source_root = root.join("source");
         fs::create_dir_all(source_root.join("kernels")).unwrap();
+        fs::create_dir_all(source_root.join("kernels/core")).unwrap();
         fs::write(
             source_root.join("kernels/marlin.cu"),
             "#include \"marlin.h\"\n\
@@ -5352,7 +5377,7 @@ mod tests {
             FakeDepfileMode::Valid => format!(
                 "/usr/bin/cc -x c -c \"$src\" -o \"$out\" || exit $?\n\
                  declared_header=''\n\
-                 case \"$src\" in */marlin.cu) declared_header=' kernels/marlin.h' ;; esac\n\
+                 case \"$src\" in */marlin.cu) declared_header=' kernels/core/../marlin.h' ;; esac\n\
                  printf '%s: %s%s %s %s\\n' \"$dep_target\" \"$src\" \"$declared_header\" '{}' '{}' > \"$depfile\"\n",
                 toolkit_root.join("bin/../include/cuda.h").display(),
                 host_root.join("include/stddef.h").display(),
@@ -5494,6 +5519,23 @@ mod tests {
         assert!(text.contains("\\:"));
         assert!(text.contains("\\#"));
         assert!(text.contains("\\$"));
+    }
+
+    #[test]
+    fn source_depfile_paths_lexically_normalize_without_escaping_working_directory() {
+        assert_eq!(
+            normalize_portable_relative_path(Path::new(
+                "kernels/vllm_marlin_moe/core/../vllm_torch_shim.h"
+            ))
+            .unwrap(),
+            "kernels/vllm_marlin_moe/vllm_torch_shim.h"
+        );
+        for path in ["../outside.h", "kernels/../../outside.h"] {
+            let error = normalize_portable_relative_path(Path::new(path)).unwrap_err();
+            assert!(error.to_string().contains("escapes its working directory"));
+        }
+        let error = normalize_portable_relative_path(Path::new("kernels\\outside.h")).unwrap_err();
+        assert!(error.to_string().contains("relative POSIX path"));
     }
 
     #[test]
