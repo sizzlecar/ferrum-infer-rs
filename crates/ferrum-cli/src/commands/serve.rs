@@ -360,6 +360,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         lora_model_id_template,
     } = cmd;
 
+    // Reject malformed adapter specs before selecting a device or resolving,
+    // downloading, and preparing the base model.
+    let lora_specs = parse_lora_specs(&lora)?;
+
     if let Some(out_dir) = observability_vertical_slice_out.as_ref() {
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Serve,
@@ -520,7 +524,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let mut materialized_runtime_keys =
         crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
 
-    let lora_specs = parse_lora_specs(&lora)?;
     let startup_lora_adapters = if lora_specs.is_empty() {
         Vec::new()
     } else {
