@@ -526,6 +526,49 @@ This remains diagnostic evidence, not canonical G07A PASS; the next paid run
 must prove the predicted `rust-model-leaf <=90s` result before running the
 five-sample matrix.
 
+### 2026-07-30 correctness-profile leaf diagnostic KEEP
+
+Clean pushed source `9e68055481b8ade0f3e9600e202e814414a48fbc` ran the
+bounded follow-up on the same RTX 4090 host. The exact timed command used
+`cargo build --profile cuda-correctness` with the official CUDA feature set.
+The independent focused checks verified content mutation/fsync/restoration,
+clean worktree boundaries, bounded receipt cleanup, runnable binary SHA256,
+the selected profile and absence of `--release`.
+
+- no-op completed in `0.819575s` against `<=30s`, with zero non-fresh Cargo
+  artifacts and zero native TU compilation;
+- Rust model leaf completed in `7.079652s` against `<=90s`, including
+  `6.842112s` build and `0.204601s` binary smoke;
+- the invalidation set contained `ferrum-models`, `ferrum-engine`,
+  `ferrum-server` and `ferrum-cli`, while native TU compilation remained `0`;
+- the runnable binary SHA256 was
+  `f1ee64e74bba10f9c93cf1cc62203f6d984d3565d12f3c46968d5447e1b8057b`.
+
+The focused validator printed:
+
+```text
+FERRUM RUNTIME VNEXT G07A RUST MODEL LEAF FOCUSED KEEP: /workspace/ferrum-artifacts/runtime-vnext-g07a-focused-9e680554-r2-20260730
+```
+
+The complete evidence and the preceding fail-fast launch-environment REJECT
+were uploaded to GitHub draft-release asset
+`runtime-vnext-g07a-focused-9e680554-r2-20260730.tar.zst` (asset
+`495338367`, 124,946,615 bytes), SHA256
+`eb2fe227492ca146cd322d88d1ffff00bd1d2e5bf9fc40a0b76abea31a34e722`.
+The asset was downloaded through GitHub and passed SHA256/zstd verification
+under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g07a-focused-9e680554-r2-20260730-github`.
+Instance `46247151` then reached `cur_state=stopped`,
+`actual_status=exited`; inventory reported `potentially_billable=[]`.
+
+This diagnostic also exposed setup-only duplication: core-PTX bootstrap used
+`324.367076s`, then a separate Cargo target repeated a `321.068441s` cold
+prewarm before the timed no-op. The collector and validator now bind bootstrap
+and incremental samples to the same declared correctness-profile target. This
+removes a redundant dependency build without changing any timed boundary,
+profile, feature set or acceptance threshold. It must be verified by the next
+diagnostic before the canonical five-sample matrix. G07A remains Open.
+
 ## 验收
 
 - 普通仓库中继续 vendored 的大体量第三方 CUDA/C++ template build input 数量 `0`。

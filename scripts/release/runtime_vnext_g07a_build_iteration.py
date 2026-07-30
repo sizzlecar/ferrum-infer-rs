@@ -1064,7 +1064,7 @@ def build_product_core_ptx_cache(
 ) -> dict[str, Any]:
     setup_root = evidence_root / "setup/product-core-ptx-cache-bootstrap"
     record_path = setup_root / "bootstrap.json"
-    target_dir = target_root / "product-cache-bootstrap"
+    target_dir = target_root / "product-incremental"
     if resume and record_path.is_file():
         try:
             record = read_json(record_path, "product core PTX cache bootstrap")

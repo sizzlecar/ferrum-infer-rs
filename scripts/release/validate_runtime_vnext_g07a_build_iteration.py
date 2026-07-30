@@ -856,7 +856,7 @@ def verify_product_cache_bootstrap(
 ) -> None:
     expected_native_build_cache = lane_paths["product_native_build_cache"]
     expected_target = str(
-        Path(lane_paths["target_root"]) / "product-cache-bootstrap"
+        Path(lane_paths["target_root"]) / "product-incremental"
     )
     expected_summary = str(
         Path(lane_paths["evidence_root"])
