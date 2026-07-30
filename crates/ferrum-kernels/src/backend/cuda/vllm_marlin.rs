@@ -73,6 +73,102 @@ impl MarlinF16WeightType {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct MarlinMmBuffers {
+    pub a: *const c_void,
+    pub b: *const c_void,
+    pub c: *mut c_void,
+    pub c_tmp: *mut c_void,
+    pub a_scales: *mut c_void,
+    pub b_scales: *mut c_void,
+    pub group_index: *mut c_void,
+    pub permutation: *mut c_void,
+    pub a_tmp: *mut c_void,
+    pub workspace: *mut c_void,
+}
+
+#[derive(Clone, Copy)]
+pub struct MarlinMmProblem {
+    pub m: i32,
+    pub n: i32,
+    pub k: i32,
+    pub lda: i32,
+    pub num_groups: i32,
+    pub group_size: i32,
+}
+
+#[derive(Clone, Copy)]
+pub struct MarlinMmExecution {
+    pub device: i32,
+    pub stream: CUstream,
+    pub sms: i32,
+    pub has_act_order: bool,
+    pub is_k_full: bool,
+    pub use_atomic_add: bool,
+    pub use_fp32_reduce: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct MarlinMmF16WeightRequest {
+    pub weight_type: MarlinF16WeightType,
+    pub buffers: MarlinMmBuffers,
+    pub problem: MarlinMmProblem,
+    pub execution: MarlinMmExecution,
+}
+
+impl MarlinMmF16WeightRequest {
+    fn into_ffi(self) -> FerrumMarlinLaunch {
+        let mut flags = 0;
+        if self.execution.has_act_order {
+            flags |= FERRUM_MARLIN_HAS_ACT_ORDER;
+        }
+        if self.execution.is_k_full {
+            flags |= FERRUM_MARLIN_IS_K_FULL;
+        }
+        if self.execution.use_atomic_add {
+            flags |= FERRUM_MARLIN_USE_ATOMIC_ADD;
+        }
+        if self.execution.use_fp32_reduce {
+            flags |= FERRUM_MARLIN_USE_FP32_REDUCE;
+        }
+
+        FerrumMarlinLaunch {
+            abi_version: FERRUM_MARLIN_ABI_VERSION,
+            struct_size: std::mem::size_of::<FerrumMarlinLaunch>() as u32,
+            a: self.buffers.a,
+            b: self.buffers.b,
+            c: self.buffers.c,
+            c_tmp: self.buffers.c_tmp,
+            b_bias: std::ptr::null_mut(),
+            a_scales: self.buffers.a_scales,
+            b_scales: self.buffers.b_scales,
+            global_scale: std::ptr::null_mut(),
+            zero_points: std::ptr::null_mut(),
+            group_index: self.buffers.group_index,
+            permutation: self.buffers.permutation,
+            a_tmp: self.buffers.a_tmp,
+            workspace: self.buffers.workspace,
+            stream: self.execution.stream.cast(),
+            prob_m: self.problem.m,
+            prob_n: self.problem.n,
+            prob_k: self.problem.k,
+            lda: self.problem.lda,
+            a_type: FERRUM_MARLIN_SCALAR_F16,
+            b_type: self.weight_type.ffi_scalar_type(),
+            c_type: FERRUM_MARLIN_SCALAR_F16,
+            scale_type: FERRUM_MARLIN_SCALAR_F16,
+            num_groups: self.problem.num_groups,
+            group_size: self.problem.group_size,
+            device: self.execution.device,
+            thread_k_init: -1,
+            thread_n_init: -1,
+            sms: self.execution.sms,
+            flags,
+            reserved: 0,
+        }
+    }
+}
+
 extern "C" {
     /// GPTQ → vLLM-Marlin tile-format repack. Same total bytes as input
     /// (size_k × size_n / pack_factor uint32), just a permutation. Single
@@ -105,87 +201,13 @@ extern "C" {
 /// Launch an FP16-activation Marlin GEMM through the shared versioned FFI.
 ///
 /// # Safety
-/// - `a`, `b`, `c`, `c_tmp`, `a_s`, `b_s`, `g_idx`, `perm`, `a_tmp`,
-///   `workspace` must be valid device pointers on device `dev`.
-/// - `stream` must be a valid CUstream associated with device `dev`.
+/// - The request buffers must be valid device pointers on the requested device.
+/// - The stream must be a valid CUstream associated with that device.
 /// - Caller must respect Marlin shape constraints (size_n divisible by
 ///   min_thread_n, size_k divisible by tile_k_size, etc.). The kernel
 ///   abort()s otherwise.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_marlin_mm_f16_weight(
-    weight_type: MarlinF16WeightType,
-    a: *const c_void,
-    b: *const c_void,
-    c: *mut c_void,
-    c_tmp: *mut c_void,
-    a_s: *mut c_void,
-    b_s: *mut c_void,
-    g_idx: *mut c_void,
-    perm: *mut c_void,
-    a_tmp: *mut c_void,
-    prob_m: i32,
-    prob_n: i32,
-    prob_k: i32,
-    lda: i32,
-    workspace: *mut c_void,
-    has_act_order: bool,
-    is_k_full: bool,
-    num_groups: i32,
-    group_size: i32,
-    dev: i32,
-    stream: CUstream,
-    sms: i32,
-    use_atomic_add: bool,
-    use_fp32_reduce: bool,
-) {
-    let mut flags = 0;
-    if has_act_order {
-        flags |= FERRUM_MARLIN_HAS_ACT_ORDER;
-    }
-    if is_k_full {
-        flags |= FERRUM_MARLIN_IS_K_FULL;
-    }
-    if use_atomic_add {
-        flags |= FERRUM_MARLIN_USE_ATOMIC_ADD;
-    }
-    if use_fp32_reduce {
-        flags |= FERRUM_MARLIN_USE_FP32_REDUCE;
-    }
-
-    let launch = FerrumMarlinLaunch {
-        abi_version: FERRUM_MARLIN_ABI_VERSION,
-        struct_size: std::mem::size_of::<FerrumMarlinLaunch>() as u32,
-        a,
-        b,
-        c,
-        c_tmp,
-        b_bias: std::ptr::null_mut(),
-        a_scales: a_s,
-        b_scales: b_s,
-        global_scale: std::ptr::null_mut(),
-        zero_points: std::ptr::null_mut(),
-        group_index: g_idx,
-        permutation: perm,
-        a_tmp,
-        workspace,
-        stream: stream.cast(),
-        prob_m,
-        prob_n,
-        prob_k,
-        lda,
-        a_type: FERRUM_MARLIN_SCALAR_F16,
-        b_type: weight_type.ffi_scalar_type(),
-        c_type: FERRUM_MARLIN_SCALAR_F16,
-        scale_type: FERRUM_MARLIN_SCALAR_F16,
-        num_groups,
-        group_size,
-        device: dev,
-        thread_k_init: -1,
-        thread_n_init: -1,
-        sms,
-        flags,
-        reserved: 0,
-    };
+pub unsafe fn launch_marlin_mm_f16_weight(request: MarlinMmF16WeightRequest) {
+    let launch = request.into_ffi();
     ferrum_marlin_mm(&launch);
 }
 
@@ -220,32 +242,38 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
     use_atomic_add: bool,
     use_fp32_reduce: bool,
 ) {
-    launch_marlin_mm_f16_weight(
-        MarlinF16WeightType::U4B8,
-        a,
-        b,
-        c,
-        c_tmp,
-        a_s,
-        b_s,
-        g_idx,
-        perm,
-        a_tmp,
-        prob_m,
-        prob_n,
-        prob_k,
-        lda,
-        workspace,
-        has_act_order,
-        is_k_full,
-        num_groups,
-        group_size,
-        dev,
-        stream,
-        sms,
-        use_atomic_add,
-        use_fp32_reduce,
-    );
+    launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
+        weight_type: MarlinF16WeightType::U4B8,
+        buffers: MarlinMmBuffers {
+            a,
+            b,
+            c,
+            c_tmp,
+            a_scales: a_s,
+            b_scales: b_s,
+            group_index: g_idx,
+            permutation: perm,
+            a_tmp,
+            workspace,
+        },
+        problem: MarlinMmProblem {
+            m: prob_m,
+            n: prob_n,
+            k: prob_k,
+            lda,
+            num_groups,
+            group_size,
+        },
+        execution: MarlinMmExecution {
+            device: dev,
+            stream,
+            sms,
+            has_act_order,
+            is_k_full,
+            use_atomic_add,
+            use_fp32_reduce,
+        },
+    });
 }
 
 /// Build a stacked `MarlinWeight` whose `qweight` is in the shared
@@ -516,7 +544,10 @@ pub fn vllm_gptq_marlin_repack(
 mod tests {
     use super::{
         gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin, FerrumMarlinLaunch,
-        MarlinF16WeightType, FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4B8,
+        MarlinF16WeightType, MarlinMmBuffers, MarlinMmExecution, MarlinMmF16WeightRequest,
+        MarlinMmProblem, FERRUM_MARLIN_HAS_ACT_ORDER, FERRUM_MARLIN_IS_K_FULL,
+        FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4B8, FERRUM_MARLIN_USE_ATOMIC_ADD,
+        FERRUM_MARLIN_USE_FP32_REDUCE,
     };
 
     #[test]
@@ -530,6 +561,69 @@ mod tests {
         assert_eq!(
             MarlinF16WeightType::E4M3Fn.ffi_scalar_type(),
             FERRUM_MARLIN_SCALAR_FE4M3FN
+        );
+    }
+
+    #[test]
+    fn typed_marlin_request_maps_to_versioned_ffi() {
+        let request = MarlinMmF16WeightRequest {
+            weight_type: MarlinF16WeightType::E4M3Fn,
+            buffers: MarlinMmBuffers {
+                a: 1_usize as *const _,
+                b: 2_usize as *const _,
+                c: 3_usize as *mut _,
+                c_tmp: 4_usize as *mut _,
+                a_scales: 5_usize as *mut _,
+                b_scales: 6_usize as *mut _,
+                group_index: 7_usize as *mut _,
+                permutation: 8_usize as *mut _,
+                a_tmp: 9_usize as *mut _,
+                workspace: 10_usize as *mut _,
+            },
+            problem: MarlinMmProblem {
+                m: 11,
+                n: 12,
+                k: 13,
+                lda: 14,
+                num_groups: 15,
+                group_size: 16,
+            },
+            execution: MarlinMmExecution {
+                device: 17,
+                stream: 18_usize as _,
+                sms: 19,
+                has_act_order: true,
+                is_k_full: true,
+                use_atomic_add: true,
+                use_fp32_reduce: true,
+            },
+        };
+
+        let launch = request.into_ffi();
+        assert_eq!(launch.a, request.buffers.a);
+        assert_eq!(launch.b, request.buffers.b);
+        assert_eq!(launch.c, request.buffers.c);
+        assert_eq!(launch.c_tmp, request.buffers.c_tmp);
+        assert_eq!(launch.a_scales, request.buffers.a_scales);
+        assert_eq!(launch.b_scales, request.buffers.b_scales);
+        assert_eq!(launch.group_index, request.buffers.group_index);
+        assert_eq!(launch.permutation, request.buffers.permutation);
+        assert_eq!(launch.a_tmp, request.buffers.a_tmp);
+        assert_eq!(launch.workspace, request.buffers.workspace);
+        assert_eq!(launch.prob_m, request.problem.m);
+        assert_eq!(launch.prob_n, request.problem.n);
+        assert_eq!(launch.prob_k, request.problem.k);
+        assert_eq!(launch.lda, request.problem.lda);
+        assert_eq!(launch.num_groups, request.problem.num_groups);
+        assert_eq!(launch.group_size, request.problem.group_size);
+        assert_eq!(launch.device, request.execution.device);
+        assert_eq!(launch.sms, request.execution.sms);
+        assert_eq!(
+            launch.flags,
+            FERRUM_MARLIN_HAS_ACT_ORDER
+                | FERRUM_MARLIN_IS_K_FULL
+                | FERRUM_MARLIN_USE_ATOMIC_ADD
+                | FERRUM_MARLIN_USE_FP32_REDUCE
         );
     }
 

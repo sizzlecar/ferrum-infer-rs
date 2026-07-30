@@ -1603,29 +1603,33 @@ fn enqueue_attention(
         "attention QKVZBA GEMM",
     )?;
 
-    launch_prepare(
+    launch_prepare(AttentionPrepareRequest {
         stream,
-        &functions.prepare,
-        qkvzba,
-        regions[shared.conv].device_ptr(),
-        state_binding,
-        regions[shared.a_log].device_ptr(),
-        regions[shared.dt_bias].device_ptr(),
-        cu_seqlens,
-        token_seq_indices,
-        query,
-        key,
-        value,
-        z,
-        g,
-        beta,
-        final_conv_state,
-        launch.tokens,
-        launch.tokens_i32,
-        launch.batch_i32,
-        cuda,
-        shape,
-    )?;
+        function: &functions.prepare,
+        buffers: AttentionPrepareBuffers {
+            qkvzba,
+            conv_weight: regions[shared.conv].device_ptr(),
+            state_binding,
+            a_log: regions[shared.a_log].device_ptr(),
+            dt_bias: regions[shared.dt_bias].device_ptr(),
+            cu_seqlens,
+            token_seq_indices,
+            query,
+            key,
+            value,
+            z,
+            g,
+            beta,
+            final_conv_state,
+        },
+        context: AttentionPrepareContext {
+            tokens: launch.tokens,
+            tokens_i32: launch.tokens_i32,
+            batch: launch.batch_i32,
+            physical: cuda,
+            logical: shape,
+        },
+    })?;
     let conv_state_elements = i32::try_from(
         shape
             .conv_state_elements()
@@ -1791,10 +1795,8 @@ fn launch_attention_projection(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn launch_prepare(
-    stream: &CudaStream,
-    function: &CudaFunction,
+#[derive(Clone, Copy)]
+struct AttentionPrepareBuffers {
     qkvzba: u64,
     conv_weight: u64,
     state_binding: u64,
@@ -1809,12 +1811,59 @@ fn launch_prepare(
     g: u64,
     beta: u64,
     final_conv_state: u64,
+}
+
+impl AttentionPrepareBuffers {
+    fn kernel_arguments(self) -> [u64; 14] {
+        [
+            self.qkvzba,
+            self.conv_weight,
+            self.state_binding,
+            self.a_log,
+            self.dt_bias,
+            self.cu_seqlens,
+            self.token_seq_indices,
+            self.query,
+            self.key,
+            self.value,
+            self.z,
+            self.g,
+            self.beta,
+            self.final_conv_state,
+        ]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AttentionPrepareContext {
     tokens: u64,
     tokens_i32: i32,
     batch: i32,
-    shape: CudaAttentionShape,
+    physical: CudaAttentionShape,
     logical: AttentionShape,
-) -> Result<(), CudaDeviceRuntimeError> {
+}
+
+struct AttentionPrepareRequest<'a> {
+    stream: &'a CudaStream,
+    function: &'a CudaFunction,
+    buffers: AttentionPrepareBuffers,
+    context: AttentionPrepareContext,
+}
+
+fn launch_prepare(request: AttentionPrepareRequest<'_>) -> Result<(), CudaDeviceRuntimeError> {
+    let AttentionPrepareRequest {
+        stream,
+        function,
+        buffers,
+        context,
+    } = request;
+    let AttentionPrepareContext {
+        tokens,
+        tokens_i32,
+        batch,
+        physical,
+        logical,
+    } = context;
     if batch <= 0 {
         return Err(CudaDeviceRuntimeError::contract(
             "attention prepare batch is not positive",
@@ -1839,33 +1888,17 @@ fn launch_prepare(
         .ok_or_else(|| CudaDeviceRuntimeError::contract("attention prepare work overflows"))?;
     let grid = checked_grid(total, THREADS_PER_BLOCK, "attention prepare")?;
     let mut builder = stream.launch_builder(function);
-    let pointers = [
-        qkvzba,
-        conv_weight,
-        state_binding,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        token_seq_indices,
-        query,
-        key,
-        value,
-        z,
-        g,
-        beta,
-        final_conv_state,
-    ];
-    for pointer in &pointers {
+    for pointer in &buffers.kernel_arguments() {
         builder.arg(pointer);
     }
     let dimensions = [
         batch,
         tokens_i32,
-        shape.key_heads,
-        shape.value_heads,
-        shape.key_head_dim,
-        shape.value_head_dim,
-        shape.conv_kernel,
+        physical.key_heads,
+        physical.value_heads,
+        physical.key_head_dim,
+        physical.value_head_dim,
+        physical.conv_kernel,
     ];
     for dimension in &dimensions {
         builder.arg(dimension);
@@ -2606,5 +2639,30 @@ mod tests {
 
         assert_ne!(one_three, two_two);
         assert_eq!(one_three, same_one_three);
+    }
+
+    #[test]
+    fn prepare_buffers_preserve_kernel_argument_order() {
+        let buffers = AttentionPrepareBuffers {
+            qkvzba: 1,
+            conv_weight: 2,
+            state_binding: 3,
+            a_log: 4,
+            dt_bias: 5,
+            cu_seqlens: 6,
+            token_seq_indices: 7,
+            query: 8,
+            key: 9,
+            value: 10,
+            z: 11,
+            g: 12,
+            beta: 13,
+            final_conv_state: 14,
+        };
+
+        assert_eq!(
+            buffers.kernel_arguments(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
     }
 }
