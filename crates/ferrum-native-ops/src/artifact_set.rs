@@ -6,8 +6,9 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use ferrum_types::{
-    is_sha256_digest, NativeOperatorBackend, NativeOperatorBinding, NativeOperatorLinkage,
-    FERRUM_NATIVE_OPERATOR_ABI_VERSION, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+    is_sha256_digest, NativeOperatorBackend, NativeOperatorBinding, NativeOperatorContractVersion,
+    NativeOperatorLinkage, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
+    NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +19,7 @@ use crate::{
     ResolvedNativeOperator,
 };
 
-pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 4;
+pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorArtifactSetLock {
@@ -39,6 +40,8 @@ pub struct NativeOperatorArtifactLock {
     pub source_package_sha256: String,
     pub inputs_sha256: String,
     pub package_spec: NativeOperatorEvidenceFile,
+    pub g03_catalog: NativeOperatorEvidenceFile,
+    pub abi_contract: NativeOperatorEvidenceFile,
     pub source_build_receipt: NativeOperatorEvidenceFile,
     pub source_build_plan: NativeOperatorEvidenceFile,
     pub source_build_inputs: Vec<NativeOperatorEvidenceFile>,
@@ -133,14 +136,33 @@ pub enum NativeOperatorArtifactSetError {
         second: String,
     },
     #[error(
-        "native operator artifact-set operation/provider collision: operation={operation_id} provider={provider_id} first={first} second={second}"
+        "native operator artifact-set operation/provider identity conflict: operation={operation_id} provider={provider_id} first={first} second={second}"
     )]
-    OperationProviderCollision {
+    OperationProviderIdentityConflict {
         operation_id: String,
         provider_id: String,
         first: String,
         second: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperationProviderIdentity {
+    operation_contract_version: NativeOperatorContractVersion,
+    provider_version: NativeOperatorContractVersion,
+    provider_implementation_fingerprint: String,
+}
+
+impl From<&NativeOperatorBinding> for OperationProviderIdentity {
+    fn from(binding: &NativeOperatorBinding) -> Self {
+        Self {
+            operation_contract_version: binding.operation_contract_version,
+            provider_version: binding.provider_version,
+            provider_implementation_fingerprint: binding
+                .provider_implementation_fingerprint
+                .clone(),
+        }
+    }
 }
 
 impl NativeOperatorArtifactSetLock {
@@ -186,7 +208,8 @@ impl NativeOperatorArtifactSetLock {
         let mut resolved_artifacts = Vec::with_capacity(self.artifacts.len());
         let mut link_names = BTreeMap::<String, String>::new();
         let mut strong_symbols = BTreeMap::<String, String>::new();
-        let mut operation_providers = BTreeMap::<(String, String), String>::new();
+        let mut operation_providers =
+            BTreeMap::<(String, String), (OperationProviderIdentity, String)>::new();
 
         for artifact_lock in &self.artifacts {
             let manifest_path = resolve_locked_path(
@@ -210,6 +233,18 @@ impl NativeOperatorArtifactSetLock {
                 &artifact_lock.operator,
                 "package_spec",
                 &artifact_lock.package_spec,
+            )?;
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
+                "g03_catalog",
+                &artifact_lock.g03_catalog,
+            )?;
+            verify_evidence_file(
+                &canonical_root,
+                &artifact_lock.operator,
+                "abi_contract",
+                &artifact_lock.abi_contract,
             )?;
             verify_evidence_file(
                 &canonical_root,
@@ -339,21 +374,31 @@ impl NativeOperatorArtifactSetLock {
             }
             for binding in &resolved.manifest.operation_bindings {
                 let key = (binding.operation_id.clone(), binding.provider_id.clone());
-                if let Some(first) =
-                    operation_providers.insert(key.clone(), artifact_lock.operator.clone())
-                {
-                    return Err(NativeOperatorArtifactSetError::OperationProviderCollision {
-                        operation_id: key.0,
-                        provider_id: key.1,
-                        first,
-                        second: artifact_lock.operator.clone(),
-                    });
+                let identity = OperationProviderIdentity::from(binding);
+                if let Some((first_identity, first_operator)) = operation_providers.get(&key) {
+                    if first_identity != &identity {
+                        return Err(
+                            NativeOperatorArtifactSetError::OperationProviderIdentityConflict {
+                                operation_id: key.0,
+                                provider_id: key.1,
+                                first: first_operator.clone(),
+                                second: artifact_lock.operator.clone(),
+                            },
+                        );
+                    }
+                } else {
+                    operation_providers.insert(key, (identity, artifact_lock.operator.clone()));
                 }
             }
             resolved_artifacts.push(ResolvedNativeOperatorArtifact {
                 lock: artifact_lock.clone(),
                 resolved,
             });
+        }
+        if operation_providers.is_empty() {
+            return Err(NativeOperatorArtifactSetError::LockInvalid(
+                "artifact set must bind at least one live G03 operation/provider".to_string(),
+            ));
         }
 
         Ok(ResolvedNativeOperatorArtifactSet {
@@ -380,6 +425,7 @@ impl NativeOperatorArtifactSetLock {
             ));
         }
         let mut previous: Option<&str> = None;
+        let mut operation_binding_count = 0_usize;
         for artifact in &self.artifacts {
             if artifact.operator.trim().is_empty() {
                 return Err(NativeOperatorArtifactSetError::LockInvalid(
@@ -420,6 +466,20 @@ impl NativeOperatorArtifactSetLock {
                 )));
             }
             validate_evidence_file(&artifact.operator, "package_spec", &artifact.package_spec)?;
+            validate_evidence_file(&artifact.operator, "g03_catalog", &artifact.g03_catalog)?;
+            validate_evidence_file(&artifact.operator, "abi_contract", &artifact.abi_contract)?;
+            if artifact.g03_catalog.sha256 != self.g03_catalog_sha256 {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.g03_catalog sha256 must equal the artifact-set catalog pin",
+                    artifact.operator
+                )));
+            }
+            if artifact.abi_contract.sha256 != artifact.abi_contract_sha256 {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.abi_contract sha256 must equal abi_contract_sha256",
+                    artifact.operator
+                )));
+            }
             validate_evidence_file(
                 &artifact.operator,
                 "source_build_receipt",
@@ -507,12 +567,13 @@ impl NativeOperatorArtifactSetLock {
                     artifact.operator
                 )));
             }
-            if artifact.operation_bindings.is_empty() {
-                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
-                    "{}.operation_bindings must be non-empty",
-                    artifact.operator
-                )));
-            }
+            operation_binding_count = operation_binding_count
+                .checked_add(artifact.operation_bindings.len())
+                .ok_or_else(|| {
+                    NativeOperatorArtifactSetError::LockInvalid(
+                        "artifact-set operation binding count overflows usize".to_string(),
+                    )
+                })?;
             if artifact
                 .system_libraries
                 .windows(2)
@@ -525,6 +586,11 @@ impl NativeOperatorArtifactSetLock {
             }
             validate_relative_path(&artifact.manifest_path)?;
             validate_relative_path(&artifact.artifact_path)?;
+        }
+        if operation_binding_count == 0 {
+            return Err(NativeOperatorArtifactSetError::LockInvalid(
+                "artifact set must bind at least one live G03 operation/provider".to_string(),
+            ));
         }
         Ok(())
     }
@@ -757,7 +823,10 @@ mod tests {
         let binary_sha256 = digest_bytes(&fs::read(&artifact_path).unwrap());
         let source_package_sha256 = digest(if operator == "alpha" { 'a' } else { 'b' });
         let inputs_sha256 = digest(if operator == "alpha" { 'c' } else { 'd' });
-        let abi_contract_sha256 = digest(if operator == "alpha" { 'e' } else { 'f' });
+        let g03_catalog_bytes = b"{\"schema_version\":1}\n";
+        let abi_contract_bytes = b"{\"schema_version\":1}\n";
+        let g03_catalog_sha256 = digest_bytes(g03_catalog_bytes);
+        let abi_contract_sha256 = digest_bytes(abi_contract_bytes);
         let provider_fingerprint = digest(if operator == "alpha" { '1' } else { '2' });
         let mut exports = vec![descriptor.clone(), execute.clone()];
         if let Some(symbol) = extra_strong_symbol {
@@ -766,9 +835,9 @@ mod tests {
         }
         let operation_bindings = vec![NativeOperatorBinding {
             operation_id: operation_id.to_string(),
-            operation_contract_version: 1,
+            operation_contract_version: NativeOperatorContractVersion::new(1, 0),
             provider_id: provider_id.to_string(),
-            provider_version: 1,
+            provider_version: NativeOperatorContractVersion::new(1, 0),
             provider_implementation_fingerprint: provider_fingerprint,
             entrypoints: vec![execute],
         }];
@@ -789,7 +858,7 @@ mod tests {
             inputs_sha256: inputs_sha256.clone(),
             binary_sha256: binary_sha256.clone(),
             linkage: NativeOperatorLinkage::Static,
-            g03_catalog_sha256: Some(digest('9')),
+            g03_catalog_sha256: Some(g03_catalog_sha256.clone()),
             abi_contract_sha256: Some(abi_contract_sha256.clone()),
             descriptor_export: Some(descriptor.clone()),
             operation_bindings: operation_bindings.clone(),
@@ -812,6 +881,8 @@ mod tests {
         let plan_path = dir.join("source-build.plan.json");
         let log_path = dir.join("source-build.log");
         let package_spec_path = dir.join("package.spec.json");
+        let g03_catalog_path = dir.join("g03-provider-catalog.json");
+        let abi_contract_path = dir.join("native-abi-contract.json");
         let source_input_path = dir.join("cuda-static-manifest.json");
         let package_receipt_path = dir.join("package.receipt.json");
         let package_log_path = dir.join("package-build.log");
@@ -820,6 +891,8 @@ mod tests {
         fs::write(&plan_path, "{\"schema_version\":2}\n").unwrap();
         fs::write(&log_path, "source build complete\n").unwrap();
         fs::write(&package_spec_path, "{\"schema_version\":2}\n").unwrap();
+        fs::write(&g03_catalog_path, g03_catalog_bytes).unwrap();
+        fs::write(&abi_contract_path, abi_contract_bytes).unwrap();
         fs::write(&source_input_path, "{\"schema_version\":1}\n").unwrap();
         fs::write(&package_receipt_path, "{\"status\":\"pass\"}\n").unwrap();
         fs::write(&package_log_path, "package build complete\n").unwrap();
@@ -840,6 +913,8 @@ mod tests {
             source_package_sha256,
             inputs_sha256,
             package_spec: evidence(&package_spec_path),
+            g03_catalog: evidence(&g03_catalog_path),
+            abi_contract: evidence(&abi_contract_path),
             source_build_receipt: evidence(&receipt_path),
             source_build_plan: evidence(&plan_path),
             source_build_inputs: vec![evidence(&source_input_path)],
@@ -860,8 +935,24 @@ mod tests {
         }
     }
 
+    fn rewrite_bindings(
+        root: &Path,
+        artifact: &mut NativeOperatorArtifactLock,
+        bindings: Vec<NativeOperatorBinding>,
+    ) {
+        let manifest_path = root.join(&artifact.manifest_path);
+        let mut manifest: NativeOperatorManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.operation_bindings = bindings.clone();
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&manifest_path, &bytes).unwrap();
+        artifact.manifest.sha256 = digest_bytes(&bytes);
+        artifact.manifest.size_bytes = bytes.len().try_into().unwrap();
+        artifact.operation_bindings = bindings;
+    }
+
     #[test]
-    fn resolves_multiple_schema_v4_artifacts_in_deterministic_order() {
+    fn resolves_multiple_schema_v5_artifacts_in_deterministic_order() {
         let dir = temp_dir("pass");
         let alpha = write_artifact(
             dir.path(),
@@ -877,9 +968,10 @@ mod tests {
             "provider.cuda.beta",
             None,
         );
+        let g03_catalog_sha256 = alpha.g03_catalog.sha256.clone();
         let lock = NativeOperatorArtifactSetLock {
             schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
-            g03_catalog_sha256: digest('9'),
+            g03_catalog_sha256,
             artifacts: vec![alpha, beta],
         };
         let lock_path = dir.path().join("native-operators.lock.json");
@@ -890,6 +982,92 @@ mod tests {
         assert_eq!(resolved.artifacts.len(), 2);
         assert_eq!(resolved.artifacts[0].resolved.manifest.operator, "alpha");
         assert_eq!(resolved.artifacts[1].resolved.manifest.operator, "beta");
+    }
+
+    #[test]
+    fn resolves_unbound_leaf_and_shared_provider_across_multiple_archives() {
+        let dir = temp_dir("many-to-many");
+        let mut unbound = write_artifact(
+            dir.path(),
+            "alpha",
+            "operation.alpha",
+            "provider.cuda.alpha",
+            None,
+        );
+        rewrite_bindings(dir.path(), &mut unbound, Vec::new());
+        let mut first = write_artifact(
+            dir.path(),
+            "beta",
+            "operation.shared",
+            "provider.cuda.shared",
+            None,
+        );
+        let mut second = write_artifact(
+            dir.path(),
+            "gamma",
+            "operation.shared",
+            "provider.cuda.shared",
+            None,
+        );
+        let first_identity = first.operation_bindings[0].clone();
+        let mut second_binding = second.operation_bindings[0].clone();
+        second_binding.operation_contract_version = first_identity.operation_contract_version;
+        second_binding.provider_version = first_identity.provider_version;
+        second_binding.provider_implementation_fingerprint =
+            first_identity.provider_implementation_fingerprint.clone();
+        rewrite_bindings(dir.path(), &mut first, vec![first_identity]);
+        rewrite_bindings(dir.path(), &mut second, vec![second_binding]);
+        let g03_catalog_sha256 = unbound.g03_catalog.sha256.clone();
+        let lock = NativeOperatorArtifactSetLock {
+            schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
+            g03_catalog_sha256,
+            artifacts: vec![unbound, first, second],
+        };
+        let lock_path = dir.path().join("native-operators.lock.json");
+        fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+        let resolved =
+            NativeOperatorArtifactSetLock::load_and_resolve(&lock_path, Some("sm_89")).unwrap();
+        assert_eq!(resolved.artifacts.len(), 3);
+        assert!(resolved.artifacts[0]
+            .resolved
+            .manifest
+            .operation_bindings
+            .is_empty());
+    }
+
+    #[test]
+    fn rejects_conflicting_provider_identity_across_archives() {
+        let dir = temp_dir("provider-conflict");
+        let alpha = write_artifact(
+            dir.path(),
+            "alpha",
+            "operation.shared",
+            "provider.cuda.shared",
+            None,
+        );
+        let beta = write_artifact(
+            dir.path(),
+            "beta",
+            "operation.shared",
+            "provider.cuda.shared",
+            None,
+        );
+        let g03_catalog_sha256 = alpha.g03_catalog.sha256.clone();
+        let lock = NativeOperatorArtifactSetLock {
+            schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
+            g03_catalog_sha256,
+            artifacts: vec![alpha, beta],
+        };
+        let lock_path = dir.path().join("native-operators.lock.json");
+        fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+        let error =
+            NativeOperatorArtifactSetLock::load_and_resolve(&lock_path, Some("sm_89")).unwrap_err();
+        assert!(matches!(
+            error,
+            NativeOperatorArtifactSetError::OperationProviderIdentityConflict { .. }
+        ));
     }
 
     #[test]
@@ -909,9 +1087,10 @@ mod tests {
             "provider.cuda.beta",
             Some("ferrum_native_shared_collision"),
         );
+        let g03_catalog_sha256 = alpha.g03_catalog.sha256.clone();
         let lock = NativeOperatorArtifactSetLock {
             schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
-            g03_catalog_sha256: digest('9'),
+            g03_catalog_sha256,
             artifacts: vec![alpha, beta],
         };
         let lock_path = dir.path().join("native-operators.lock.json");
@@ -930,6 +1109,8 @@ mod tests {
         for field in [
             "manifest",
             "package_spec",
+            "g03_catalog",
+            "abi_contract",
             "package_receipt",
             "package_build_log",
             "license_file",
@@ -945,6 +1126,8 @@ mod tests {
             let evidence = match field {
                 "manifest" => &artifact.manifest,
                 "package_spec" => &artifact.package_spec,
+                "g03_catalog" => &artifact.g03_catalog,
+                "abi_contract" => &artifact.abi_contract,
                 "package_receipt" => &artifact.package_receipt,
                 "package_build_log" => &artifact.package_build_logs[0],
                 "license_file" => &artifact.license_files[0],
@@ -952,9 +1135,10 @@ mod tests {
             };
             let evidence_path = dir.path().join(&evidence.path);
             fs::write(&evidence_path, format!("tampered {field}\n")).unwrap();
+            let g03_catalog_sha256 = artifact.g03_catalog.sha256.clone();
             let lock = NativeOperatorArtifactSetLock {
                 schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
-                g03_catalog_sha256: digest('9'),
+                g03_catalog_sha256,
                 artifacts: vec![artifact],
             };
             let lock_path = dir.path().join("native-operators.lock.json");

@@ -560,7 +560,7 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
     emit_cuda_build_summary(
         "native_operator_artifact_set",
         "linked",
-        "manifest-v2-set-validated",
+        "manifest-v3-artifact-set-v5-validated",
         start.elapsed(),
         &format!(
             "lock={}:catalog={}:operators={}:build_units={}",
@@ -628,7 +628,7 @@ fn link_fa2_native_operator_artifact() {
     });
     if legacy_manifest.schema_version != LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION {
         panic!(
-            "schema-v2 native operators must use {NATIVE_OPERATOR_SET_LOCK_ENV}; \
+            "provider-bound native operators must use {NATIVE_OPERATOR_SET_LOCK_ENV}; \
              legacy {FA2_NATIVE_MANIFEST_ENV} only accepts schema v1"
         );
     }

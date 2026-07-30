@@ -521,9 +521,9 @@ mod tests {
             descriptor_export: Some("ferrum_native_dummy_descriptor_v2".to_string()),
             operation_bindings: vec![NativeOperatorBinding {
                 operation_id: "operation.dummy".to_string(),
-                operation_contract_version: 1,
+                operation_contract_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
                 provider_id: "provider.cuda.dummy".to_string(),
-                provider_version: 1,
+                provider_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
                 provider_implementation_fingerprint: digest('e'),
                 entrypoints: vec!["ferrum_native_dummy_execute_v1".to_string()],
             }],

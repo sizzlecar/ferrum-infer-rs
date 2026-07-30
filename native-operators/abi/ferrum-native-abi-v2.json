@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "ferrum_native_abi_version": "2",
+  "descriptor_struct": "FerrumNativeOperatorDescriptorV2",
+  "descriptor_symbol_policy": "operator_namespaced",
+  "descriptor_fields": [
+    {
+      "name": "struct_size",
+      "c_type": "uint32_t"
+    },
+    {
+      "name": "ferrum_native_abi_version",
+      "c_type": "uint32_t"
+    },
+    {
+      "name": "operator_name",
+      "c_type": "const char *"
+    },
+    {
+      "name": "operator_abi_version",
+      "c_type": "const char *"
+    },
+    {
+      "name": "g03_catalog_sha256",
+      "c_type": "const char *"
+    },
+    {
+      "name": "abi_contract_sha256",
+      "c_type": "const char *"
+    }
+  ]
+}

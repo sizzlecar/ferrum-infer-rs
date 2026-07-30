@@ -5022,9 +5022,9 @@ mod tests {
             compute_capabilities: vec!["sm_89".to_string()],
             operation_bindings: vec![ferrum_types::NativeOperatorBinding {
                 operation_id: "operation.dense_linear".to_string(),
-                operation_contract_version: 1,
+                operation_contract_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
                 provider_id: "provider.cuda.dense_linear.f16.marlin".to_string(),
-                provider_version: 1,
+                provider_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
                 provider_implementation_fingerprint: "a".repeat(64),
                 entrypoints: CudaNativeBuildUnit::Marlin
                     .required_exports()
@@ -5052,14 +5052,56 @@ mod tests {
         write_json(&package_spec_path, &package_spec).unwrap();
         let catalog_path = root.path().join("operation-catalog.json");
         let abi_path = root.path().join("native-abi.json");
-        fs::write(&catalog_path, "{\"schema\":1}\n").unwrap();
-        fs::write(&abi_path, "{\"ferrum_native_abi\":2}\n").unwrap();
+        write_json(
+            &catalog_path,
+            &ferrum_types::NativeOperatorProviderCatalog {
+                schema_version: ferrum_types::NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+                backend: ferrum_types::NativeOperatorBackend::Cuda,
+                providers: vec![ferrum_types::NativeOperatorProviderCatalogRow {
+                    operation_id: "operation.dense_linear".to_string(),
+                    operation_contract_version: ferrum_types::NativeOperatorContractVersion::new(
+                        1, 0,
+                    ),
+                    operation_fingerprint: "b".repeat(64),
+                    provider_id: "provider.cuda.dense_linear.f16.marlin".to_string(),
+                    provider_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
+                    provider_implementation_fingerprint: "a".repeat(64),
+                }],
+            },
+        )
+        .unwrap();
+        write_json(
+            &abi_path,
+            &ferrum_types::NativeOperatorAbiContract {
+                schema_version: ferrum_types::NATIVE_OPERATOR_ABI_CONTRACT_SCHEMA_VERSION,
+                ferrum_native_abi_version: ferrum_types::FERRUM_NATIVE_OPERATOR_ABI_VERSION
+                    .to_string(),
+                descriptor_struct: "FerrumNativeOperatorDescriptorV2".to_string(),
+                descriptor_symbol_policy: "operator_namespaced".to_string(),
+                descriptor_fields: [
+                    ("struct_size", "uint32_t"),
+                    ("ferrum_native_abi_version", "uint32_t"),
+                    ("operator_name", "const char *"),
+                    ("operator_abi_version", "const char *"),
+                    ("g03_catalog_sha256", "const char *"),
+                    ("abi_contract_sha256", "const char *"),
+                ]
+                .into_iter()
+                .map(|(name, c_type)| ferrum_types::NativeOperatorAbiField {
+                    name: name.to_string(),
+                    c_type: c_type.to_string(),
+                })
+                .collect(),
+            },
+        )
+        .unwrap();
         let package_output = root.path().join("package");
 
         let package_receipt =
             crate::package_native_operator(&crate::NativeOperatorPackageRequest {
                 spec_path: package_spec_path,
                 source_root: source_root.clone(),
+                license_root: source_root.clone(),
                 source_build_receipt_path: output_dir.join("source-build.receipt.json"),
                 source_build_plan_path: plan_path.clone(),
                 g03_catalog_path: catalog_path,
@@ -5085,7 +5127,8 @@ mod tests {
         let cached_package_output = root.path().join("cached-package");
         crate::package_native_operator(&crate::NativeOperatorPackageRequest {
             spec_path: cached_package_spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: cached_output_dir.join("source-build.receipt.json"),
             source_build_plan_path: plan_path,
             g03_catalog_path: root.path().join("operation-catalog.json"),

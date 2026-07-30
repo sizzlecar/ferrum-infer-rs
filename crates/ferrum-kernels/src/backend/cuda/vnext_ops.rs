@@ -33,7 +33,7 @@ use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
 };
-use ferrum_types::AttentionExecutionPolicy;
+use ferrum_types::{AttentionExecutionPolicy, NativeOperatorBackend};
 use sha2::{Digest, Sha256};
 
 use super::vnext_replay::CudaCommandReplayKeyBuilder;
@@ -295,6 +295,14 @@ impl CudaVNextComposition {
         let catalog = weight_materializers
             .augment_catalog(catalog)
             .map_err(contract_error)?;
+        let native_provider_catalog = catalog
+            .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
+            .map_err(contract_error)?;
+        crate::native_ops::validate_compiled_native_operator_provider_catalog(
+            &native_provider_catalog,
+            crate::native_ops::compiled_native_operator_artifacts(),
+        )
+        .map_err(contract_error)?;
         Ok(Self {
             runtime,
             registry,

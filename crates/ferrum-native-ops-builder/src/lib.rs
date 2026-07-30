@@ -16,8 +16,9 @@ use ferrum_native_ops::{
     NativeOperatorSystemLibrary, NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
 };
 use ferrum_types::{
-    is_sha256_digest, NativeOperatorBackend, NativeOperatorBinding, NativeOperatorBuildSummary,
-    NativeOperatorLinkage, NativeOperatorManifest, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
+    is_sha256_digest, NativeOperatorAbiContract, NativeOperatorBackend, NativeOperatorBinding,
+    NativeOperatorBuildSummary, NativeOperatorLinkage, NativeOperatorManifest,
+    NativeOperatorProviderCatalog, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
     NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -25,8 +26,9 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use thiserror::Error;
 
-pub const NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 4;
+pub const NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION: u32 = 1;
+pub const NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 5;
 
 pub use source_build::*;
 
@@ -47,6 +49,30 @@ pub struct NativeOperatorPackageSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOperatorPackageDefinition {
+    pub schema_version: u32,
+    pub operator: String,
+    pub operator_abi_version: String,
+    pub backend: NativeOperatorBackend,
+    pub compute_capabilities: Vec<String>,
+    pub provider_bindings: Vec<NativeOperatorProviderBindingDefinition>,
+    pub required_exports: Vec<String>,
+    pub license_files: Vec<NativeOperatorLicenseInput>,
+    pub cuda_toolkit: Option<String>,
+    pub cuda_runtime_min: Option<String>,
+    pub system_libraries: Vec<NativeOperatorSystemLibrary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOperatorProviderBindingDefinition {
+    pub operation_id: String,
+    pub provider_id: String,
+    pub entrypoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorLicenseInput {
     pub source_path: String,
     pub output_path: String,
@@ -58,6 +84,8 @@ pub struct NativeOperatorPackageReceipt {
     pub schema_version: u32,
     pub operator: String,
     pub package_spec: NativeOperatorEvidenceFile,
+    pub g03_catalog: NativeOperatorEvidenceFile,
+    pub abi_contract: NativeOperatorEvidenceFile,
     pub source_build_receipt: NativeOperatorEvidenceFile,
     pub source_build_plan: NativeOperatorEvidenceFile,
     pub source_build_inputs: Vec<NativeOperatorEvidenceFile>,
@@ -112,6 +140,7 @@ pub struct NativeOperatorArchiveMemberEvidence {
 pub struct NativeOperatorPackageRequest {
     pub spec_path: PathBuf,
     pub source_root: PathBuf,
+    pub license_root: PathBuf,
     pub source_build_receipt_path: PathBuf,
     pub source_build_plan_path: PathBuf,
     pub g03_catalog_path: PathBuf,
@@ -119,6 +148,13 @@ pub struct NativeOperatorPackageRequest {
     pub output_dir: PathBuf,
     pub cc: PathBuf,
     pub ar: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeOperatorPackageSpecRequest {
+    pub definition_path: PathBuf,
+    pub g03_catalog_path: PathBuf,
+    pub output_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +202,100 @@ pub enum NativeOperatorBuilderError {
 
 pub type Result<T> = std::result::Result<T, NativeOperatorBuilderError>;
 
+pub fn materialize_native_operator_package_spec(
+    request: &NativeOperatorPackageSpecRequest,
+) -> Result<NativeOperatorPackageSpec> {
+    require_file(&request.definition_path)?;
+    require_file(&request.g03_catalog_path)?;
+    if request.output_path.exists() {
+        return Err(NativeOperatorBuilderError::OutputExists(
+            request.output_path.clone(),
+        ));
+    }
+    let definition: NativeOperatorPackageDefinition = read_json(&request.definition_path)?;
+    validate_package_definition(&definition)?;
+    let (catalog, catalog_sha256): (NativeOperatorProviderCatalog, String) =
+        read_json_with_sha256(&request.g03_catalog_path)?;
+    catalog
+        .validate()
+        .map_err(NativeOperatorBuilderError::Invalid)?;
+    if catalog_sha256
+        != catalog
+            .canonical_sha256()
+            .map_err(NativeOperatorBuilderError::Invalid)?
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "live G03 catalog is not in canonical JSON form: {}",
+            request.g03_catalog_path.display()
+        )));
+    }
+    if catalog.backend != definition.backend {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "package definition backend {:?} differs from live G03 catalog backend {:?}",
+            definition.backend, catalog.backend
+        )));
+    }
+
+    let mut operation_bindings = Vec::with_capacity(definition.provider_bindings.len());
+    for requested in &definition.provider_bindings {
+        let provider = catalog
+            .providers
+            .iter()
+            .find(|provider| {
+                provider.operation_id == requested.operation_id
+                    && provider.provider_id == requested.provider_id
+            })
+            .ok_or_else(|| {
+                NativeOperatorBuilderError::Invalid(format!(
+                    "live G03 catalog does not contain operation/provider {}/{}",
+                    requested.operation_id, requested.provider_id
+                ))
+            })?;
+        operation_bindings.push(NativeOperatorBinding {
+            operation_id: provider.operation_id.clone(),
+            operation_contract_version: provider.operation_contract_version,
+            provider_id: provider.provider_id.clone(),
+            provider_version: provider.provider_version,
+            provider_implementation_fingerprint: provider
+                .provider_implementation_fingerprint
+                .clone(),
+            entrypoints: requested.entrypoints.clone(),
+        });
+    }
+    operation_bindings.sort_by(|left, right| {
+        left.operation_id
+            .cmp(&right.operation_id)
+            .then(left.provider_id.cmp(&right.provider_id))
+    });
+
+    let spec = NativeOperatorPackageSpec {
+        schema_version: NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
+        operator: definition.operator,
+        operator_abi_version: definition.operator_abi_version,
+        backend: definition.backend,
+        compute_capabilities: definition.compute_capabilities,
+        operation_bindings,
+        required_exports: definition.required_exports,
+        license_files: definition.license_files,
+        cuda_toolkit: definition.cuda_toolkit,
+        cuda_runtime_min: definition.cuda_runtime_min,
+        system_libraries: definition.system_libraries,
+    };
+    validate_package_spec(&spec)?;
+    let parent = request.output_path.parent().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "package spec output has no parent: {}",
+            request.output_path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|source| NativeOperatorBuilderError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    write_json(&request.output_path, &spec)?;
+    Ok(spec)
+}
+
 pub fn package_native_operator(
     request: &NativeOperatorPackageRequest,
 ) -> Result<NativeOperatorPackageReceipt> {
@@ -201,6 +331,20 @@ pub fn package_native_operator(
             source_root.display()
         )));
     }
+    let license_root =
+        request
+            .license_root
+            .canonicalize()
+            .map_err(|source| NativeOperatorBuilderError::Io {
+                path: request.license_root.clone(),
+                source,
+            })?;
+    if !license_root.is_dir() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "license_root is not a directory: {}",
+            license_root.display()
+        )));
+    }
     let source_build = load_source_build_for_package(
         &request.source_build_receipt_path,
         &request.source_build_plan_path,
@@ -214,8 +358,37 @@ pub fn package_native_operator(
     };
     let package_environment = package_build_environment(&package_toolchain)?;
 
-    let g03_catalog_sha256 = sha256_file(&request.g03_catalog_path)?;
-    let abi_contract_sha256 = sha256_file(&request.abi_contract_path)?;
+    let (g03_catalog, g03_catalog_sha256): (NativeOperatorProviderCatalog, String) =
+        read_json_with_sha256(&request.g03_catalog_path)?;
+    g03_catalog
+        .validate()
+        .map_err(NativeOperatorBuilderError::Invalid)?;
+    if g03_catalog_sha256
+        != g03_catalog
+            .canonical_sha256()
+            .map_err(NativeOperatorBuilderError::Invalid)?
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "live G03 catalog is not in canonical JSON form: {}",
+            request.g03_catalog_path.display()
+        )));
+    }
+    validate_spec_against_catalog(&spec, &g03_catalog)?;
+    let (abi_contract, abi_contract_sha256): (NativeOperatorAbiContract, String) =
+        read_json_with_sha256(&request.abi_contract_path)?;
+    abi_contract
+        .validate()
+        .map_err(NativeOperatorBuilderError::Invalid)?;
+    if abi_contract_sha256
+        != abi_contract
+            .canonical_sha256()
+            .map_err(NativeOperatorBuilderError::Invalid)?
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "native ABI contract is not in canonical JSON form: {}",
+            request.abi_contract_path.display()
+        )));
+    }
     let identity_suffix = &sha256_bytes(spec.operator.as_bytes())[..12];
     let symbol_slug = symbol_slug(&spec.operator)?;
     let descriptor_export = format!("ferrum_native_{symbol_slug}_{identity_suffix}_descriptor_v2");
@@ -246,6 +419,28 @@ pub fn package_native_operator(
     if package_spec.sha256 != spec_sha256 {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} package spec changed while packaging",
+            spec.operator
+        )));
+    }
+    let g03_catalog = copy_evidence_file(
+        &request.g03_catalog_path,
+        staging.path(),
+        "provenance/g03-provider-catalog.json",
+    )?;
+    if g03_catalog.sha256 != g03_catalog_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} live G03 catalog changed while packaging",
+            spec.operator
+        )));
+    }
+    let abi_contract = copy_evidence_file(
+        &request.abi_contract_path,
+        staging.path(),
+        "provenance/native-abi-contract.json",
+    )?;
+    if abi_contract.sha256 != abi_contract_sha256 {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} native ABI contract changed while packaging",
             spec.operator
         )));
     }
@@ -392,7 +587,7 @@ pub fn package_native_operator(
     let mut license_files = Vec::with_capacity(spec.license_files.len());
     let mut license_evidence = Vec::with_capacity(spec.license_files.len());
     for license in &spec.license_files {
-        let source = resolve_relative_file(&source_root, &license.source_path)?;
+        let source = resolve_relative_file(&license_root, &license.source_path)?;
         license_evidence.push(copy_evidence_file(
             &source,
             staging.path(),
@@ -453,6 +648,8 @@ pub fn package_native_operator(
         schema_version: NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION,
         operator: spec.operator.clone(),
         package_spec,
+        g03_catalog,
+        abi_contract,
         source_build_receipt,
         source_build_plan,
         source_build_inputs,
@@ -1619,6 +1816,10 @@ pub fn assemble_native_operator_set(
         let artifact_path = resolve_relative_file(package_root, &receipt.artifact_file)?;
         let package_spec =
             resolve_package_evidence(package_root, &canonical_root, &receipt.package_spec)?;
+        let g03_catalog =
+            resolve_package_evidence(package_root, &canonical_root, &receipt.g03_catalog)?;
+        let abi_contract =
+            resolve_package_evidence(package_root, &canonical_root, &receipt.abi_contract)?;
         let source_build_receipt =
             resolve_package_evidence(package_root, &canonical_root, &receipt.source_build_receipt)?;
         let source_build_plan =
@@ -1644,14 +1845,39 @@ pub fn assemble_native_operator_set(
             .map(|evidence| resolve_package_evidence(package_root, &canonical_root, evidence))
             .collect::<Result<Vec<_>>>()?;
         let package_spec_path = resolve_relative_file(package_root, &receipt.package_spec.path)?;
+        let g03_catalog_path = resolve_relative_file(package_root, &receipt.g03_catalog.path)?;
+        let abi_contract_path = resolve_relative_file(package_root, &receipt.abi_contract.path)?;
         let source_build_receipt_path =
             resolve_relative_file(package_root, &receipt.source_build_receipt.path)?;
         let source_build_plan_path =
             resolve_relative_file(package_root, &receipt.source_build_plan.path)?;
         let packaged_spec: NativeOperatorPackageSpec = read_json(&package_spec_path)?;
+        let packaged_g03_catalog: NativeOperatorProviderCatalog = read_json(&g03_catalog_path)?;
+        let packaged_abi_contract: NativeOperatorAbiContract = read_json(&abi_contract_path)?;
         let packaged_source_build: NativeOperatorSourceBuildReceipt =
             read_json(&source_build_receipt_path)?;
         validate_package_spec(&packaged_spec)?;
+        packaged_g03_catalog
+            .validate()
+            .map_err(NativeOperatorBuilderError::Invalid)?;
+        packaged_abi_contract
+            .validate()
+            .map_err(NativeOperatorBuilderError::Invalid)?;
+        validate_spec_against_catalog(&packaged_spec, &packaged_g03_catalog)?;
+        if packaged_g03_catalog
+            .canonical_sha256()
+            .map_err(NativeOperatorBuilderError::Invalid)?
+            != receipt.g03_catalog_sha256
+            || packaged_abi_contract
+                .canonical_sha256()
+                .map_err(NativeOperatorBuilderError::Invalid)?
+                != receipt.abi_contract_sha256
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{} packaged catalog/ABI semantic hashes differ from their receipt pins",
+                receipt.operator
+            )));
+        }
         validate_source_build_for_package(&packaged_source_build, &packaged_spec)?;
         let packaged_source_plan = verify_source_build_receipt_against_plan_portable(
             &packaged_source_build,
@@ -1729,6 +1955,8 @@ pub fn assemble_native_operator_set(
             source_package_sha256: manifest.source_package.sha256,
             inputs_sha256: manifest.inputs_sha256,
             package_spec,
+            g03_catalog,
+            abi_contract,
             source_build_receipt,
             source_build_plan,
             source_build_inputs,
@@ -1796,6 +2024,91 @@ pub fn assemble_native_operator_set(
     Ok(lock)
 }
 
+fn validate_package_definition(definition: &NativeOperatorPackageDefinition) -> Result<()> {
+    if definition.schema_version != NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "package definition schema_version must be {NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION}"
+        )));
+    }
+    let common = NativeOperatorPackageSpec {
+        schema_version: NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
+        operator: definition.operator.clone(),
+        operator_abi_version: definition.operator_abi_version.clone(),
+        backend: definition.backend,
+        compute_capabilities: definition.compute_capabilities.clone(),
+        operation_bindings: Vec::new(),
+        required_exports: definition.required_exports.clone(),
+        license_files: definition.license_files.clone(),
+        cuda_toolkit: definition.cuda_toolkit.clone(),
+        cuda_runtime_min: definition.cuda_runtime_min.clone(),
+        system_libraries: definition.system_libraries.clone(),
+    };
+    validate_package_spec(&common)?;
+    let mut previous: Option<(&str, &str)> = None;
+    for binding in &definition.provider_bindings {
+        if !valid_contract_identifier(&binding.operation_id, "operation.")
+            || !valid_contract_identifier(&binding.provider_id, "provider.")
+        {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "package definition operation/provider identities are invalid".to_string(),
+            ));
+        }
+        let key = (binding.operation_id.as_str(), binding.provider_id.as_str());
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "package definition provider_bindings must be sorted and unique".to_string(),
+            ));
+        }
+        previous = Some(key);
+        require_sorted_unique_non_empty("provider binding entrypoints", &binding.entrypoints)?;
+        if binding
+            .entrypoints
+            .iter()
+            .any(|entrypoint| !definition.required_exports.contains(entrypoint))
+        {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "package definition provider entrypoint is absent from required_exports"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_spec_against_catalog(
+    spec: &NativeOperatorPackageSpec,
+    catalog: &NativeOperatorProviderCatalog,
+) -> Result<()> {
+    if spec.backend != catalog.backend {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "package spec backend {:?} differs from live G03 catalog backend {:?}",
+            spec.backend, catalog.backend
+        )));
+    }
+    for binding in &spec.operation_bindings {
+        let Some(provider) = catalog.providers.iter().find(|provider| {
+            provider.operation_id == binding.operation_id
+                && provider.provider_id == binding.provider_id
+        }) else {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "package spec binding {}/{} is absent from the live G03 catalog",
+                binding.operation_id, binding.provider_id
+            )));
+        };
+        if provider.operation_contract_version != binding.operation_contract_version
+            || provider.provider_version != binding.provider_version
+            || provider.provider_implementation_fingerprint
+                != binding.provider_implementation_fingerprint
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "package spec binding {}/{} differs from the live G03 catalog identity",
+                binding.operation_id, binding.provider_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_package_spec(spec: &NativeOperatorPackageSpec) -> Result<()> {
     if spec.schema_version != NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -1833,6 +2146,37 @@ fn validate_package_spec(spec: &NativeOperatorPackageSpec) -> Result<()> {
         ));
     }
     require_sorted_unique_non_empty("required_exports", &spec.required_exports)?;
+    let mut previous_binding: Option<(&str, &str)> = None;
+    for binding in &spec.operation_bindings {
+        if !valid_contract_identifier(&binding.operation_id, "operation.")
+            || !valid_contract_identifier(&binding.provider_id, "provider.")
+            || binding.operation_contract_version.major == 0
+            || binding.provider_version.major == 0
+            || !is_sha256_digest(&binding.provider_implementation_fingerprint)
+        {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "package spec operation binding identity or version is invalid".to_string(),
+            ));
+        }
+        let key = (binding.operation_id.as_str(), binding.provider_id.as_str());
+        if previous_binding.is_some_and(|previous| previous >= key) {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "package spec operation_bindings must be sorted and unique".to_string(),
+            ));
+        }
+        previous_binding = Some(key);
+        require_sorted_unique_non_empty("operation binding entrypoints", &binding.entrypoints)?;
+        if binding
+            .entrypoints
+            .iter()
+            .any(|entrypoint| !spec.required_exports.contains(entrypoint))
+        {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "package spec operation binding entrypoint is absent from required_exports"
+                    .to_string(),
+            ));
+        }
+    }
     if let Some(unit) = CudaNativeBuildUnit::from_artifact_operator(&spec.operator) {
         for required in unit.required_exports() {
             if !spec
@@ -1875,6 +2219,15 @@ fn validate_package_spec(spec: &NativeOperatorPackageSpec) -> Result<()> {
     Ok(())
 }
 
+fn valid_contract_identifier(value: &str, prefix: &str) -> bool {
+    value.starts_with(prefix)
+        && value.len() > prefix.len()
+        && value.len() <= 160
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+}
+
 fn cuda_toolkit_version_matches(declared: &str, actual: &str) -> bool {
     let Some(declared) = parse_cuda_version(declared) else {
         return false;
@@ -1911,6 +2264,8 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
     validate_relative_path(&receipt.manifest_file)?;
     validate_relative_path(&receipt.artifact_file)?;
     validate_evidence_record("package_spec", &receipt.package_spec)?;
+    validate_evidence_record("g03_catalog", &receipt.g03_catalog)?;
+    validate_evidence_record("abi_contract", &receipt.abi_contract)?;
     validate_evidence_record("source_build_receipt", &receipt.source_build_receipt)?;
     validate_evidence_record("source_build_plan", &receipt.source_build_plan)?;
     if receipt.source_build_inputs.is_empty()
@@ -1997,6 +2352,14 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
                 receipt.operator
             )));
         }
+    }
+    if receipt.g03_catalog.sha256 != receipt.g03_catalog_sha256
+        || receipt.abi_contract.sha256 != receipt.abi_contract_sha256
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package receipt catalog/ABI evidence differs from its semantic hash pins",
+            receipt.operator
+        )));
     }
     if receipt
         .system_libraries
@@ -2166,6 +2529,8 @@ fn validate_package_semantic_links(
         )));
     }
     if receipt.package_spec.path != "provenance/package.spec.json"
+        || receipt.g03_catalog.path != "provenance/g03-provider-catalog.json"
+        || receipt.abi_contract.path != "provenance/native-abi-contract.json"
         || receipt.source_build_receipt.path != "provenance/source-build.receipt.json"
         || receipt.source_build_plan.path != "provenance/source-build.plan.json"
     {
@@ -2612,6 +2977,45 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[test]
+    fn checked_in_native_package_definitions_and_abi_are_canonical() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let abi_path = repository_root.join("native-operators/abi/ferrum-native-abi-v2.json");
+        let abi: NativeOperatorAbiContract = read_json(&abi_path).unwrap();
+        assert_eq!(
+            fs::read(&abi_path).unwrap(),
+            abi.canonical_json_bytes().unwrap()
+        );
+
+        for name in [
+            "marlin",
+            "vllm-marlin",
+            "vllm-moe-marlin",
+            "vllm-paged-attention-v2",
+        ] {
+            let definition_path = repository_root.join(format!(
+                "native-operators/cuda/package-definitions/{name}.json"
+            ));
+            let definition: NativeOperatorPackageDefinition = read_json(&definition_path).unwrap();
+            validate_package_definition(&definition).unwrap();
+            let mut canonical = serde_json::to_vec_pretty(&definition).unwrap();
+            canonical.push(b'\n');
+            assert_eq!(fs::read(&definition_path).unwrap(), canonical);
+
+            let source_definition: NativeOperatorSourceDefinition =
+                read_json(&repository_root.join(format!(
+                    "native-operators/cuda/source-definitions/{name}.json"
+                )))
+                .unwrap();
+            let source_plan: NativeOperatorSourceBuildPlan = read_json(&repository_root.join(
+                format!("native-operators/cuda/source-locks/{name}.plan.json"),
+            ))
+            .unwrap();
+            assert_eq!(definition.operator, source_definition.operator);
+            assert_eq!(definition.operator, source_plan.operator);
+        }
+    }
+
     fn run_source_build_fixture(
         root: &Path,
         source_root: &Path,
@@ -2772,9 +3176,9 @@ mod tests {
             compute_capabilities: vec!["sm_89".to_string()],
             operation_bindings: vec![NativeOperatorBinding {
                 operation_id: operation_id.to_string(),
-                operation_contract_version: 1,
+                operation_contract_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
                 provider_id: provider_id.to_string(),
-                provider_version: 1,
+                provider_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
                 provider_implementation_fingerprint: digest('c'),
                 entrypoints: exports.iter().map(|value| (*value).to_string()).collect(),
             }],
@@ -2798,9 +3202,169 @@ mod tests {
         fs::write(source_root.join("LICENSE"), "fixture license\n").unwrap();
         let catalog_path = root.join("operation-catalog.json");
         let abi_path = root.join("native-abi.json");
-        fs::write(&catalog_path, "{\"schema\":1}\n").unwrap();
-        fs::write(&abi_path, "{\"ferrum_native_abi\":2}\n").unwrap();
+        let version = ferrum_types::NativeOperatorContractVersion::new(1, 0);
+        write_json(
+            &catalog_path,
+            &NativeOperatorProviderCatalog {
+                schema_version: ferrum_types::NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+                backend: NativeOperatorBackend::Cuda,
+                providers: vec![
+                    ferrum_types::NativeOperatorProviderCatalogRow {
+                        operation_id: "operation.dense_linear".to_string(),
+                        operation_contract_version: version,
+                        operation_fingerprint: digest('d'),
+                        provider_id: "provider.cuda.dense_linear.f16.marlin".to_string(),
+                        provider_version: version,
+                        provider_implementation_fingerprint: digest('c'),
+                    },
+                    ferrum_types::NativeOperatorProviderCatalogRow {
+                        operation_id: "operation.quantized_linear".to_string(),
+                        operation_contract_version: version,
+                        operation_fingerprint: digest('e'),
+                        provider_id: "provider.cuda.quantized_linear.gptq_marlin".to_string(),
+                        provider_version: version,
+                        provider_implementation_fingerprint: digest('c'),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        write_json(
+            &abi_path,
+            &NativeOperatorAbiContract {
+                schema_version: ferrum_types::NATIVE_OPERATOR_ABI_CONTRACT_SCHEMA_VERSION,
+                ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
+                descriptor_struct: "FerrumNativeOperatorDescriptorV2".to_string(),
+                descriptor_symbol_policy: "operator_namespaced".to_string(),
+                descriptor_fields: vec![
+                    abi_field("struct_size", "uint32_t"),
+                    abi_field("ferrum_native_abi_version", "uint32_t"),
+                    abi_field("operator_name", "const char *"),
+                    abi_field("operator_abi_version", "const char *"),
+                    abi_field("g03_catalog_sha256", "const char *"),
+                    abi_field("abi_contract_sha256", "const char *"),
+                ],
+            },
+        )
+        .unwrap();
         (source_root, catalog_path, abi_path)
+    }
+
+    fn abi_field(name: &str, c_type: &str) -> ferrum_types::NativeOperatorAbiField {
+        ferrum_types::NativeOperatorAbiField {
+            name: name.to_string(),
+            c_type: c_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn materializes_package_bindings_from_the_live_catalog_and_allows_unbound_leaves() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, catalog_path, _) = fixture_files(root.path());
+        let definition_path = root.path().join("definition.json");
+        let output_path = root.path().join("package-spec.json");
+        let mut definition = NativeOperatorPackageDefinition {
+            schema_version: NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION,
+            operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
+            operator_abi_version: "1".to_string(),
+            backend: NativeOperatorBackend::Cuda,
+            compute_capabilities: vec!["sm_89".to_string()],
+            provider_bindings: vec![NativeOperatorProviderBindingDefinition {
+                operation_id: "operation.dense_linear".to_string(),
+                provider_id: "provider.cuda.dense_linear.f16.marlin".to_string(),
+                entrypoints: vec!["marlin_cuda".to_string()],
+            }],
+            required_exports: CudaNativeBuildUnit::Marlin
+                .required_exports()
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            license_files: vec![NativeOperatorLicenseInput {
+                source_path: "LICENSE".to_string(),
+                output_path: "licenses/LICENSE".to_string(),
+            }],
+            cuda_toolkit: Some("12.4".to_string()),
+            cuda_runtime_min: Some("12.4".to_string()),
+            system_libraries: vec![
+                NativeOperatorSystemLibrary::CudaRuntime,
+                NativeOperatorSystemLibrary::StdCxx,
+            ],
+        };
+        write_json(&definition_path, &definition).unwrap();
+        let spec = materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+            definition_path: definition_path.clone(),
+            g03_catalog_path: catalog_path.clone(),
+            output_path: output_path.clone(),
+        })
+        .unwrap();
+        assert_eq!(spec.operation_bindings.len(), 1);
+        assert_eq!(
+            spec.operation_bindings[0].provider_implementation_fingerprint,
+            digest('c')
+        );
+        assert!(output_path.is_file());
+
+        definition.provider_bindings.clear();
+        let unbound_definition = root.path().join("unbound-definition.json");
+        let unbound_output = root.path().join("unbound-package-spec.json");
+        write_json(&unbound_definition, &definition).unwrap();
+        let unbound = materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+            definition_path: unbound_definition,
+            g03_catalog_path: catalog_path,
+            output_path: unbound_output,
+        })
+        .unwrap();
+        assert!(unbound.operation_bindings.is_empty());
+    }
+
+    #[test]
+    fn package_spec_materialization_rejects_a_provider_absent_from_the_live_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, catalog_path, _) = fixture_files(root.path());
+        let definition_path = root.path().join("definition.json");
+        let output_path = root.path().join("package-spec.json");
+        write_json(
+            &definition_path,
+            &NativeOperatorPackageDefinition {
+                schema_version: NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION,
+                operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
+                operator_abi_version: "1".to_string(),
+                backend: NativeOperatorBackend::Cuda,
+                compute_capabilities: vec!["sm_89".to_string()],
+                provider_bindings: vec![NativeOperatorProviderBindingDefinition {
+                    operation_id: "operation.dense_linear".to_string(),
+                    provider_id: "provider.cuda.missing".to_string(),
+                    entrypoints: vec!["marlin_cuda".to_string()],
+                }],
+                required_exports: CudaNativeBuildUnit::Marlin
+                    .required_exports()
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+                license_files: vec![NativeOperatorLicenseInput {
+                    source_path: "LICENSE".to_string(),
+                    output_path: "licenses/LICENSE".to_string(),
+                }],
+                cuda_toolkit: Some("12.4".to_string()),
+                cuda_runtime_min: Some("12.4".to_string()),
+                system_libraries: vec![
+                    NativeOperatorSystemLibrary::CudaRuntime,
+                    NativeOperatorSystemLibrary::StdCxx,
+                ],
+            },
+        )
+        .unwrap();
+
+        let error = materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+            definition_path,
+            g03_catalog_path: catalog_path,
+            output_path: output_path.clone(),
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("live G03 catalog does not contain"));
+        assert!(!output_path.exists());
     }
 
     fn package_fixture(
@@ -2820,7 +3384,8 @@ mod tests {
         let output_dir = root.join("packages").join(output_name);
         let receipt = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -2978,7 +3543,8 @@ mod tests {
 
         let receipt = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3024,7 +3590,8 @@ mod tests {
 
         let receipt = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3131,7 +3698,8 @@ mod tests {
 
         let error = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3170,7 +3738,8 @@ mod tests {
 
         let error = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3210,7 +3779,8 @@ mod tests {
 
         let error = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3256,7 +3826,8 @@ mod tests {
 
         let error = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3330,7 +3901,8 @@ mod tests {
 
         let error = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3370,7 +3942,8 @@ mod tests {
 
         let error = package_native_operator(&NativeOperatorPackageRequest {
             spec_path,
-            source_root,
+            source_root: source_root.clone(),
+            license_root: source_root,
             source_build_receipt_path: source_build_receipt,
             source_build_plan_path: source_build_plan,
             g03_catalog_path: catalog_path,
@@ -3414,6 +3987,7 @@ mod tests {
             package_native_operator(&NativeOperatorPackageRequest {
                 spec_path: spec_path.clone(),
                 source_root: source_root.clone(),
+                license_root: source_root.clone(),
                 source_build_receipt_path: source_build_receipt.clone(),
                 source_build_plan_path: source_build_plan.clone(),
                 g03_catalog_path: catalog_path.clone(),

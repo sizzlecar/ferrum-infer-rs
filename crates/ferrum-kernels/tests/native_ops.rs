@@ -6,13 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ferrum_kernels::native_ops::{
     compiled_fa2_native_operator_artifact, compiled_fa2_native_operator_artifact_linked,
     compiled_fa2_native_operator_artifact_state, resolve_cuda_fa2_native_operator,
-    NativeOperatorArtifactSpec, FA2_NATIVE_OPERATOR,
+    validate_compiled_native_operator_provider_catalog, NativeOperatorArtifactSpec,
+    FA2_NATIVE_OPERATOR,
 };
 use ferrum_native_ops::{NativeOperatorArtifactFormat, NativeOperatorResolveError};
 use ferrum_types::{
-    NativeOperatorBackend, NativeOperatorBinding, NativeOperatorBuildSummary,
-    NativeOperatorLinkage, NativeOperatorManifest, NativeOperatorSourcePackage,
-    FERRUM_NATIVE_OPERATOR_ABI_VERSION, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+    CompiledNativeOperatorIdentity, NativeOperatorBackend, NativeOperatorBinding,
+    NativeOperatorBuildSummary, NativeOperatorContractVersion, NativeOperatorLinkage,
+    NativeOperatorManifest, NativeOperatorProviderCatalog, NativeOperatorProviderCatalogRow,
+    NativeOperatorSourcePackage, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
+    NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -119,9 +122,9 @@ fn write_manifest(
         descriptor_export: Some("ferrum_native_fa2_descriptor_v2".to_string()),
         operation_bindings: vec![NativeOperatorBinding {
             operation_id: "operation.causal_paged_attention".to_string(),
-            operation_contract_version: 1,
+            operation_contract_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
             provider_id: "provider.cuda.fa2".to_string(),
-            provider_version: 1,
+            provider_version: ferrum_types::NativeOperatorContractVersion::new(1, 0),
             provider_implementation_fingerprint: digest('e'),
             entrypoints: vec!["ferrum_native_fa2_execute_v1".to_string()],
         }],
@@ -170,6 +173,52 @@ fn spec(fixture: &NativeOpFixture) -> NativeOperatorArtifactSpec {
         .with_binary_sha256(fixture.artifact_sha256.clone())
 }
 
+fn live_provider_catalog() -> NativeOperatorProviderCatalog {
+    NativeOperatorProviderCatalog {
+        schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+        backend: NativeOperatorBackend::Cuda,
+        providers: vec![NativeOperatorProviderCatalogRow {
+            operation_id: "operation.causal_paged_attention".to_string(),
+            operation_contract_version: NativeOperatorContractVersion::new(1, 2),
+            operation_fingerprint: digest('a'),
+            provider_id: "provider.cuda.causal_paged_attention.f16".to_string(),
+            provider_version: NativeOperatorContractVersion::new(3, 4),
+            provider_implementation_fingerprint: digest('b'),
+        }],
+    }
+}
+
+fn compiled_provider(catalog: &NativeOperatorProviderCatalog) -> CompiledNativeOperatorIdentity {
+    let provider = &catalog.providers[0];
+    CompiledNativeOperatorIdentity {
+        schema_version: NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+        operator: "ferrum.cuda.vllm_paged_attention_v2".to_string(),
+        operator_abi_version: "1".to_string(),
+        ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
+        backend: NativeOperatorBackend::Cuda,
+        linkage: NativeOperatorLinkage::Static,
+        g03_catalog_sha256: Some(catalog.canonical_sha256().unwrap()),
+        abi_contract_sha256: Some(digest('c')),
+        descriptor_export: Some(
+            "ferrum_native_ferrum_cuda_vllm_paged_attention_v2_descriptor_v2".to_string(),
+        ),
+        operation_bindings: vec![NativeOperatorBinding {
+            operation_id: provider.operation_id.clone(),
+            operation_contract_version: provider.operation_contract_version,
+            provider_id: provider.provider_id.clone(),
+            provider_version: provider.provider_version,
+            provider_implementation_fingerprint: provider
+                .provider_implementation_fingerprint
+                .clone(),
+            entrypoints: vec!["ferrum_vnext_paged_attention".to_string()],
+        }],
+        exports: vec!["ferrum_vnext_paged_attention".to_string()],
+        source_package_sha256: digest('d'),
+        inputs_sha256: digest('e'),
+        binary_sha256: digest('f'),
+    }
+}
+
 #[test]
 fn normal_test_build_does_not_report_fa2_native_artifact_linked() {
     assert!(!compiled_fa2_native_operator_artifact_linked());
@@ -178,6 +227,34 @@ fn normal_test_build_does_not_report_fa2_native_artifact_linked() {
         "not_configured"
     );
     assert!(compiled_fa2_native_operator_artifact().is_none());
+}
+
+#[test]
+fn compiled_native_operator_bindings_match_the_exact_live_catalog() {
+    let catalog = live_provider_catalog();
+    let artifact = compiled_provider(&catalog);
+    validate_compiled_native_operator_provider_catalog(&catalog, &[artifact]).unwrap();
+    validate_compiled_native_operator_provider_catalog(&catalog, &[]).unwrap();
+}
+
+#[test]
+fn compiled_native_operator_bindings_reject_stale_catalog_or_provider_identity() {
+    let catalog = live_provider_catalog();
+    let mut stale_catalog = compiled_provider(&catalog);
+    stale_catalog.g03_catalog_sha256 = Some(digest('0'));
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&catalog, &[stale_catalog])
+            .unwrap_err()
+            .contains("stale")
+    );
+
+    let mut stale_provider = compiled_provider(&catalog);
+    stale_provider.operation_bindings[0].provider_implementation_fingerprint = digest('0');
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&catalog, &[stale_provider])
+            .unwrap_err()
+            .contains("differs from the live provider identity")
+    );
 }
 
 #[test]
