@@ -37,7 +37,10 @@ use super::{
     THREADS_PER_BLOCK, VALUE_ALIGNMENT_BYTES,
 };
 #[cfg(feature = "vllm-marlin")]
-use crate::backend::cuda::vllm_marlin::{launch_marlin_mm_f16_weight, MarlinF16WeightType};
+use crate::backend::cuda::vllm_marlin::{
+    launch_marlin_mm_f16_weight, MarlinF16WeightType, MarlinMmBuffers, MarlinMmExecution,
+    MarlinMmF16WeightRequest, MarlinMmProblem,
+};
 use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 #[cfg(feature = "vllm-marlin")]
 use crate::marlin_fp8_materializer::{
@@ -1144,32 +1147,38 @@ impl MarlinProjectionRuntime {
         }
         .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))?;
         unsafe {
-            launch_marlin_mm_f16_weight(
+            launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
                 weight_type,
-                input as *const c_void,
-                packed_weight as *const c_void,
-                output as *mut c_void,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                scales as *mut c_void,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                rows,
-                output_features,
-                input_features,
-                input_features,
-                workspace as *mut c_void,
-                false,
-                true,
-                1,
-                group_size,
-                self.device_ordinal,
-                stream.cu_stream(),
-                self.multiprocessor_count,
-                false,
-                false,
-            );
+                buffers: MarlinMmBuffers {
+                    a: input as *const c_void,
+                    b: packed_weight as *const c_void,
+                    c: output as *mut c_void,
+                    c_tmp: std::ptr::null_mut(),
+                    a_scales: std::ptr::null_mut(),
+                    b_scales: scales as *mut c_void,
+                    group_index: std::ptr::null_mut(),
+                    permutation: std::ptr::null_mut(),
+                    a_tmp: std::ptr::null_mut(),
+                    workspace: workspace as *mut c_void,
+                },
+                problem: MarlinMmProblem {
+                    m: rows,
+                    n: output_features,
+                    k: input_features,
+                    lda: input_features,
+                    num_groups: 1,
+                    group_size,
+                },
+                execution: MarlinMmExecution {
+                    device: self.device_ordinal,
+                    stream: stream.cu_stream(),
+                    sms: self.multiprocessor_count,
+                    has_act_order: false,
+                    is_k_full: true,
+                    use_atomic_add: false,
+                    use_fp32_reduce: false,
+                },
+            });
         }
         Ok(())
     }
