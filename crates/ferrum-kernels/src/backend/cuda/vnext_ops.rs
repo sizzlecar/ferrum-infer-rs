@@ -302,7 +302,7 @@ impl CudaVNextComposition {
             &native_provider_catalog,
             crate::native_ops::compiled_native_operator_artifacts(),
         )
-        .map_err(contract_error)?;
+        .map_err(CudaDeviceRuntimeError::contract)?;
         Ok(Self {
             runtime,
             registry,
