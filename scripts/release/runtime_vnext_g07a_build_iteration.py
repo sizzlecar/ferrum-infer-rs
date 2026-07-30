@@ -1842,6 +1842,143 @@ def copy_input(
     return artifact_ref(evidence_root, destination, "input-manifest")
 
 
+def native_operator_set_closure(lock_path: Path) -> list[dict[str, Any]]:
+    lock = read_json(lock_path, "native operator set lock")
+    artifacts = lock.get("artifacts")
+    require(
+        isinstance(artifacts, list) and artifacts,
+        "native operator set lock has no artifacts",
+    )
+    root = lock_path.parent.resolve()
+    entries: dict[str, dict[str, Any]] = {}
+
+    def add_entry(
+        raw_path: Any,
+        raw_sha256: Any,
+        raw_size: Any,
+        label: str,
+    ) -> None:
+        require(
+            isinstance(raw_path, str)
+            and raw_path
+            and "\\" not in raw_path,
+            f"{label} path is invalid",
+        )
+        relative = Path(raw_path)
+        require(
+            not relative.is_absolute()
+            and relative.as_posix() == raw_path
+            and all(part not in {"", ".", ".."} for part in relative.parts),
+            f"{label} path is unsafe",
+        )
+        require(
+            isinstance(raw_sha256, str)
+            and SHA256_RE.fullmatch(raw_sha256) is not None,
+            f"{label} SHA256 is invalid",
+        )
+        source = root.joinpath(*relative.parts)
+        require(
+            source.is_file()
+            and not source.is_symlink()
+            and source.resolve().is_relative_to(root),
+            f"{label} file is missing or escapes the lock root: {source}",
+        )
+        size = source.stat().st_size
+        require(
+            raw_size is None
+            or (
+                isinstance(raw_size, int)
+                and not isinstance(raw_size, bool)
+                and raw_size == size
+            ),
+            f"{label} size mismatch",
+        )
+        require(sha256(source) == raw_sha256, f"{label} SHA256 mismatch")
+        row = {
+            "path": raw_path,
+            "sha256": raw_sha256,
+            "size_bytes": size,
+        }
+        previous = entries.get(raw_path)
+        require(
+            previous is None or previous == row,
+            f"{label} has conflicting duplicate evidence: {raw_path}",
+        )
+        entries[raw_path] = row
+
+    def visit_evidence(value: Any, label: str) -> None:
+        if isinstance(value, dict):
+            if set(value) == {"path", "sha256", "size_bytes"}:
+                add_entry(
+                    value["path"],
+                    value["sha256"],
+                    value["size_bytes"],
+                    label,
+                )
+                return
+            for key, child in value.items():
+                visit_evidence(child, f"{label}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit_evidence(child, f"{label}[{index}]")
+
+    for index, artifact in enumerate(artifacts):
+        require(
+            isinstance(artifact, dict),
+            f"native operator set artifact {index} is invalid",
+        )
+        add_entry(
+            artifact.get("artifact_path"),
+            artifact.get("binary_sha256"),
+            None,
+            f"native operator set artifact {index}.artifact",
+        )
+        visit_evidence(artifact, f"native operator set artifact {index}")
+    require(
+        len(entries) >= len(artifacts) * 2,
+        "native operator set closure is unexpectedly small",
+    )
+    return [entries[path] for path in sorted(entries)]
+
+
+def copy_native_operator_set_input(
+    evidence_root: Path,
+    source_lock: Path,
+    *,
+    resume: bool,
+) -> dict[str, Any]:
+    source_rows = native_operator_set_closure(source_lock)
+    inputs_root = evidence_root / "inputs"
+    for row in source_rows:
+        relative = Path(row["path"])
+        source = source_lock.parent.joinpath(*relative.parts)
+        destination = inputs_root.joinpath(*relative.parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            require(
+                resume
+                and destination.is_file()
+                and not destination.is_symlink()
+                and destination.stat().st_size == row["size_bytes"]
+                and sha256(destination) == row["sha256"],
+                f"resumed native operator set member changed: {row['path']}",
+            )
+        else:
+            shutil.copy2(source, destination)
+    lock_ref = copy_input(
+        evidence_root,
+        source_lock,
+        "native-operator-set.lock.json",
+        resume=resume,
+    )
+    copied_lock = evidence_root / lock_ref["path"]
+    require(
+        native_operator_set_closure(copied_lock) == source_rows,
+        "copied native operator set closure differs from its source",
+    )
+    return lock_ref
+
+
 def build_builder(
     *,
     source_root: Path,
@@ -2038,10 +2175,9 @@ def collect(args: argparse.Namespace) -> Path:
             "native-source-bundle.json",
             resume=args.resume,
         ),
-        "native_operator_set_lock": copy_input(
+        "native_operator_set_lock": copy_native_operator_set_input(
             evidence_root,
             native_operator_set_lock,
-            "native-operator-set.lock.json",
             resume=args.resume,
         ),
     }
@@ -2444,6 +2580,45 @@ def self_test() -> None:
             and inventory["entries"][0]["artifact_id"]
             == "core_ptx.add_bias",
             "core PTX cache inventory self-test failed",
+        )
+        native_set = root / "native-set"
+        package = native_set / "packages/fixture"
+        package.mkdir(parents=True)
+        archive = package / "libfixture.a"
+        archive.write_bytes(b"fixture-archive\n")
+        manifest = package / "native_operator_manifest.json"
+        manifest.write_text('{"fixture":true}\n', encoding="utf-8")
+        source_lock = native_set / "native-operators.lock.json"
+        write_json(
+            source_lock,
+            {
+                "artifacts": [
+                    {
+                        "artifact_path": "packages/fixture/libfixture.a",
+                        "binary_sha256": sha256(archive),
+                        "manifest": {
+                            "path": (
+                                "packages/fixture/"
+                                "native_operator_manifest.json"
+                            ),
+                            "sha256": sha256(manifest),
+                            "size_bytes": manifest.stat().st_size,
+                        },
+                    }
+                ]
+            },
+        )
+        set_evidence = root / "native-set-evidence"
+        set_evidence.mkdir()
+        copied_lock_ref = copy_native_operator_set_input(
+            set_evidence,
+            source_lock,
+            resume=False,
+        )
+        copied_lock = set_evidence / copied_lock_ref["path"]
+        require(
+            len(native_operator_set_closure(copied_lock)) == 2,
+            "native operator set closure copy self-test failed",
         )
     print(SELFTEST_PASS_LINE)
 

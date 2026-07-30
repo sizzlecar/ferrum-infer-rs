@@ -1422,6 +1422,107 @@ def nearest_rank(values: list[float], percentile: float) -> float:
     return ordered[math.ceil(percentile * len(ordered)) - 1]
 
 
+def verify_native_operator_set_closure(
+    lock_path: Path,
+    lock: dict[str, Any],
+) -> list[dict[str, Any]]:
+    artifacts = require_list(
+        lock.get("artifacts"),
+        "native operator set artifacts",
+    )
+    require(artifacts, "native operator set lock has no artifacts")
+    root = lock_path.parent.resolve()
+    entries: dict[str, dict[str, Any]] = {}
+
+    def add_entry(
+        raw_path: Any,
+        raw_sha256: Any,
+        raw_size: Any,
+        label: str,
+    ) -> None:
+        require(
+            isinstance(raw_path, str)
+            and raw_path
+            and "\\" not in raw_path,
+            f"{label} path is invalid",
+        )
+        relative = Path(raw_path)
+        require(
+            not relative.is_absolute()
+            and relative.as_posix() == raw_path
+            and all(part not in {"", ".", ".."} for part in relative.parts),
+            f"{label} path is unsafe",
+        )
+        require(
+            isinstance(raw_sha256, str)
+            and SHA256_RE.fullmatch(raw_sha256) is not None,
+            f"{label} SHA256 is invalid",
+        )
+        path = root.joinpath(*relative.parts)
+        require(
+            path.is_file()
+            and not path.is_symlink()
+            and path.resolve().is_relative_to(root),
+            f"{label} file is missing or escapes the lock root",
+        )
+        size = path.stat().st_size
+        require(
+            raw_size is None
+            or (
+                isinstance(raw_size, int)
+                and not isinstance(raw_size, bool)
+                and raw_size == size
+            ),
+            f"{label} size mismatch",
+        )
+        require(sha256(path) == raw_sha256, f"{label} SHA256 mismatch")
+        row = {
+            "path": raw_path,
+            "sha256": raw_sha256,
+            "size_bytes": size,
+        }
+        previous = entries.get(raw_path)
+        require(
+            previous is None or previous == row,
+            f"{label} has conflicting duplicate evidence",
+        )
+        entries[raw_path] = row
+
+    def visit_evidence(value: Any, label: str) -> None:
+        if isinstance(value, dict):
+            if set(value) == {"path", "sha256", "size_bytes"}:
+                add_entry(
+                    value["path"],
+                    value["sha256"],
+                    value["size_bytes"],
+                    label,
+                )
+                return
+            for key, child in value.items():
+                visit_evidence(child, f"{label}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit_evidence(child, f"{label}[{index}]")
+
+    for index, raw_artifact in enumerate(artifacts):
+        artifact = require_dict(
+            raw_artifact,
+            f"native operator set artifact {index}",
+        )
+        add_entry(
+            artifact.get("artifact_path"),
+            artifact.get("binary_sha256"),
+            None,
+            f"native operator set artifact {index}.artifact",
+        )
+        visit_evidence(artifact, f"native operator set artifact {index}")
+    require(
+        len(entries) >= len(artifacts) * 2,
+        "native operator set closure is unexpectedly small",
+    )
+    return [entries[path] for path in sorted(entries)]
+
+
 def verify_dependencies(
     root: Path,
     manifest: dict[str, Any],
@@ -1517,6 +1618,7 @@ def verify_dependencies(
         and len(artifacts) == len(PRODUCT_NATIVE_OPERATORS),
         "native operator set lock is incomplete",
     )
+    verify_native_operator_set_closure(lock_path, lock)
     return policy, members
 
 
@@ -1934,6 +2036,44 @@ def self_test() -> None:
                 "duplicate selftest CUDA summary",
             ),
             "duplicate CUDA summary row",
+        )
+        native_set = root / "native-set"
+        package = native_set / "packages/fixture"
+        package.mkdir(parents=True)
+        archive = package / "libfixture.a"
+        archive.write_bytes(b"fixture-archive\n")
+        native_manifest = package / "native_operator_manifest.json"
+        native_manifest.write_text('{"fixture":true}\n', encoding="utf-8")
+        native_lock = native_set / "native-operators.lock.json"
+        native_lock_payload = {
+            "artifacts": [
+                {
+                    "artifact_path": "packages/fixture/libfixture.a",
+                    "binary_sha256": sha256(archive),
+                    "manifest": {
+                        "path": (
+                            "packages/fixture/"
+                            "native_operator_manifest.json"
+                        ),
+                        "sha256": sha256(native_manifest),
+                        "size_bytes": native_manifest.stat().st_size,
+                    },
+                }
+            ]
+        }
+        native_lock.write_text(
+            json.dumps(native_lock_payload) + "\n",
+            encoding="utf-8",
+        )
+        require(
+            len(
+                verify_native_operator_set_closure(
+                    native_lock,
+                    native_lock_payload,
+                )
+            )
+            == 2,
+            "native operator set closure validator self-test failed",
         )
         cargo = root / "cargo.jsonl"
         cargo.write_text(
