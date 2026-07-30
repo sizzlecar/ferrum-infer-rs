@@ -54,7 +54,7 @@ EXPECTED_ARTIFACT_BUILD_UNITS = {
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION = 1
-CUDA_INPUTS_HASH_RE = re.compile(r"^fnv1a64:[0-9a-f]{16}$")
+CUDA_INPUTS_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class ChainError(RuntimeError):

@@ -86,7 +86,7 @@ DOES_NOT_PROVE = {
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-CUDA_INPUTS_HASH_RE = re.compile(r"^fnv1a64:[0-9a-f]{16}$")
+CUDA_INPUTS_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class VerificationError(RuntimeError):
@@ -2355,7 +2355,7 @@ def self_test() -> None:
                 "status": "artifact",
                 "reason": "native-operator-artifact-set",
                 "elapsed_ms": 0,
-                "inputs_hash": f"fnv1a64:{index:016x}",
+                "inputs_hash": f"sha256:{index:064x}",
             }
             for index, unit in enumerate(sorted(EXPECTED_BUILD_UNITS), start=1)
         ]
