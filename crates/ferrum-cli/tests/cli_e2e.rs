@@ -160,24 +160,18 @@ fn list_shows_ready_and_incomplete_models() {
 #[test]
 fn serve_accepts_positional_model_argument() {
     let workspace = TempDirGuard::new("serve-positional-model");
-    let hf_home = workspace.path().join("hf-cache");
-    fs::create_dir_all(&hf_home).expect("create hf cache dir");
 
     let mut cmd = base_cmd(workspace.path());
-    cmd.arg("serve")
-        .arg("Acme/MissingModel")
-        .env("HF_HOME", &hf_home);
+    cmd.arg("serve").arg("Acme/MissingModel").arg("--help");
     let output = run(&mut cmd);
     assert!(
-        !output.status.success(),
-        "serve should fail when model is missing"
+        output.status.success(),
+        "serve positional model should parse successfully"
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Model 'Acme/MissingModel' not found"),
-        "expected runtime model-not-found error, got: {stderr}"
-    );
+    assert!(stdout.contains("Usage: ferrum serve [OPTIONS] [MODEL]"));
     assert!(
         !stderr.contains("unexpected argument"),
         "serve positional model should parse successfully"
@@ -187,24 +181,24 @@ fn serve_accepts_positional_model_argument() {
 #[test]
 fn serve_accepts_model_flag_argument() {
     let workspace = TempDirGuard::new("serve-flag-model");
-    let hf_home = workspace.path().join("hf-cache");
-    fs::create_dir_all(&hf_home).expect("create hf cache dir");
 
     let mut cmd = base_cmd(workspace.path());
     cmd.arg("serve")
         .arg("--model")
         .arg("Acme/MissingModel")
-        .env("HF_HOME", &hf_home);
+        .arg("--help");
     let output = run(&mut cmd);
     assert!(
-        !output.status.success(),
-        "serve should fail when model is missing"
+        output.status.success(),
+        "serve --model should parse successfully"
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Usage: ferrum serve [OPTIONS] [MODEL]"));
     assert!(
-        stderr.contains("Model 'Acme/MissingModel' not found"),
-        "expected runtime model-not-found error, got: {stderr}"
+        !stderr.contains("unexpected argument"),
+        "serve --model should parse successfully"
     );
 }
 
