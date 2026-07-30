@@ -582,6 +582,20 @@ def fetch_json(port: int, path: str) -> dict[str, Any]:
     return value
 
 
+def served_model_id(models: dict[str, Any]) -> str:
+    data = models.get("data")
+    require(isinstance(data, list), "/v1/models response is missing data")
+    require(len(data) == 1, "S1 collector requires exactly one served model")
+    row = data[0]
+    require(isinstance(row, dict), "/v1/models entry is not an object")
+    model_id = row.get("id")
+    require(
+        isinstance(model_id, str) and model_id.strip() == model_id and model_id,
+        "/v1/models entry has an invalid id",
+    )
+    return model_id
+
+
 def collect_stream(port: int, model_id: str, directory: Path) -> None:
     request = {
         "model": model_id,
@@ -669,10 +683,9 @@ def collect_correctness(
     repo: Path,
     raw: Path,
     model: Path,
-    model_id: str,
     environment: dict[str, str],
     batched_graph: bool = False,
-) -> None:
+) -> str:
     binary = "target/release/ferrum"
     run = raw / "run"
     run.mkdir(parents=True)
@@ -744,7 +757,9 @@ def collect_correctness(
     )
     try:
         server.start()
-        write_json(serve / "models.json", fetch_json(port, "/v1/models"))
+        models = fetch_json(port, "/v1/models")
+        write_json(serve / "models.json", models)
+        model_id = served_model_id(models)
         collect_stream(port, model_id, serve)
         bench_argv = [
             binary,
@@ -793,6 +808,7 @@ def collect_correctness(
     finally:
         server.stop()
     write_json(serve / "server-stop.json", {"stopped": True, "signal": "SIGINT", "exit_code": 0})
+    return model_id
 
 
 def collect_profile_slots(
@@ -1067,12 +1083,10 @@ def collect(args: argparse.Namespace) -> int:
     require("RTX 4090" in hardware_query.stdout, "collector requires one RTX 4090")
     write_text(out / "hardware.csv", hardware_query.stdout)
 
-    model_id = model.name
-    collect_correctness(
+    model_id = collect_correctness(
         repo,
         out,
         model,
-        model_id,
         environment,
         batched_graph=args.batched_graph,
     )
@@ -1124,6 +1138,25 @@ def collect(args: argparse.Namespace) -> int:
 
 
 def self_test() -> int:
+    advertised_model_id = "Qwen/Qwen3.5-4B"
+    require(
+        served_model_id({"data": [{"id": advertised_model_id}]}) == advertised_model_id,
+        "served model identity was derived from something other than /v1/models",
+    )
+    for invalid_models in (
+        {},
+        {"data": []},
+        {"data": [{"id": "first"}, {"id": "second"}]},
+        {"data": [{"id": ""}]},
+        {"data": [{"id": " padded "}]},
+    ):
+        try:
+            served_model_id(invalid_models)
+        except CollectionError:
+            pass
+        else:
+            raise CollectionError(f"invalid served model catalog unexpectedly passed: {invalid_models}")
+
     sample = (
         "0, GPU-1234, P2, 2520, 2520, 10501, 241.50, 450.00, 61, 97, 42, 8123, 24564\n"
     )
