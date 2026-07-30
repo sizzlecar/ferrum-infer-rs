@@ -104,9 +104,9 @@ CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
 RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --lib vnext::execution::tests:: -- --test-threads=1
   23 passed; 0 failed
-RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
+RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --test vnext_contract_tests \
-  --test vnext_resolution_limits_contract_tests -- --test-threads=2
+  --test vnext_resolution_limits_contract_tests -- --test-threads=1
   51 + 12 passed; 0 failed
 RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --test vnext_compile -- --test-threads=1

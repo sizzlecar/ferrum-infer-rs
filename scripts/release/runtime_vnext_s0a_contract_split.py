@@ -24,6 +24,8 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS"
 OWNER_MAP_PASS_PREFIX = "VNEXT PUBLIC OWNER MAP PASS"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 OWNER_MAP_EXAMPLE = "vnext_public_owner_map"
+TEST_THREADS = "1"
+TEST_THREADS_ARG = "--test-threads=1"
 INVENTORY_DOCUMENT = (
     REPO_ROOT / "docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md"
 )
@@ -588,7 +590,7 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
         ]
         started = time.monotonic()
         env = os.environ.copy()
-        env.update({"CARGO_BUILD_JOBS": "4", "RUST_TEST_THREADS": "2"})
+        env.update({"CARGO_BUILD_JOBS": "4", "RUST_TEST_THREADS": TEST_THREADS})
         result = subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -608,7 +610,10 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
         {
             "command": command,
             "cwd": str(REPO_ROOT),
-            "env_overrides": {"CARGO_BUILD_JOBS": "4", "RUST_TEST_THREADS": "2"},
+            "env_overrides": {
+                "CARGO_BUILD_JOBS": "4",
+                "RUST_TEST_THREADS": TEST_THREADS,
+            },
             "returncode": result.returncode,
             "duration_seconds": duration,
         },
@@ -715,14 +720,14 @@ def run_bounded_aggregate(checkpoint_root: Path) -> dict[str, Any]:
         "ferrum-interfaces",
         "--all-targets",
         "--",
-        "--test-threads=2",
+        TEST_THREADS_ARG,
         "--nocapture",
     ]
     env = os.environ.copy()
     env.update(
         {
             "CARGO_BUILD_JOBS": "4",
-            "RUST_TEST_THREADS": "2",
+            "RUST_TEST_THREADS": TEST_THREADS,
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
@@ -793,7 +798,7 @@ def run_bounded_aggregate(checkpoint_root: Path) -> dict[str, Any]:
         "cwd": str(REPO_ROOT),
         "env_overrides": {
             "CARGO_BUILD_JOBS": "4",
-            "RUST_TEST_THREADS": "2",
+            "RUST_TEST_THREADS": TEST_THREADS,
             "PYTHONDONTWRITEBYTECODE": "1",
         },
         "started_at": started_at,
@@ -949,6 +954,10 @@ def self_test() -> int:
     require(sum(len(targets) for targets in TEST_TARGET_GROUPS.values()) == 24, "S0A target matrix drifted")
     require(len(SHARED_TEST_SUPPORT) == 11, "S0A shared test support matrix drifted")
     require(set(PRODUCTION_GROUPS) == {"resource", "execution", "event"}, "S0A production scope drifted")
+    require(
+        TEST_THREADS == "1" and TEST_THREADS_ARG == "--test-threads=1",
+        "S0A bounded test thread policy drifted",
+    )
     validate_public_api_migrations()
     lines = expected_machine_proof_lines()
     require(len(lines) == len(set(lines)) and len(lines) >= 20, "S0A machine proof matrix drifted")

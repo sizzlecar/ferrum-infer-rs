@@ -2900,7 +2900,7 @@ def validate_vnext_g01a_s0a_provenance(
         and compile_evidence.get("env_overrides")
         == {
             "CARGO_BUILD_JOBS": "4",
-            "RUST_TEST_THREADS": "2",
+            "RUST_TEST_THREADS": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         and tests.get("expected_integration_targets") == tests.get("observed_integration_targets")

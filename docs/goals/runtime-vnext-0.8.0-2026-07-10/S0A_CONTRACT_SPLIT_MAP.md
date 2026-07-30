@@ -123,7 +123,7 @@ bound regresses.
 
 `execution.rs` is now an 85-line facade. Every production fragment is below `2,500` lines. The
 existing white-box tests are isolated in a 905-line `execution/tests.rs` module and pass with
-`--test-threads=2`.
+`--test-threads=1`.
 
 The first eight-module split made former same-module coupling observable as one SCC containing all
 eight production owners. Low-level canonical/allocation helpers, provider resource evidence,
@@ -292,7 +292,7 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
 5. `RUST_TEST_THREADS=1 cargo test -p ferrum-interfaces --lib vnext::resource:: -- --test-threads=1`
    passes `92/92` tests.
 6. One bounded cargo invocation with the seven `vnext_resource_*` owner targets and
-   `-- --test-threads=2` passes `12/12` parent tests, including the expected isolated panic-child
+   `-- --test-threads=1` passes `12/12` parent tests, including the expected isolated panic-child
    fault case and all `311` frozen proof cases.
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
 
