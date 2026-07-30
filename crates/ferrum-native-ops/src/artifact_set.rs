@@ -18,7 +18,7 @@ use crate::{
     ResolvedNativeOperator,
 };
 
-pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorArtifactSetLock {
@@ -41,6 +41,7 @@ pub struct NativeOperatorArtifactLock {
     pub package_spec: NativeOperatorEvidenceFile,
     pub source_build_receipt: NativeOperatorEvidenceFile,
     pub source_build_plan: NativeOperatorEvidenceFile,
+    pub source_build_inputs: Vec<NativeOperatorEvidenceFile>,
     pub source_build_logs: Vec<NativeOperatorEvidenceFile>,
     pub source_archive_sha256: String,
     pub package_receipt: NativeOperatorEvidenceFile,
@@ -222,6 +223,14 @@ impl NativeOperatorArtifactSetLock {
                 "source_build_plan",
                 &artifact_lock.source_build_plan,
             )?;
+            for evidence in &artifact_lock.source_build_inputs {
+                verify_evidence_file(
+                    &canonical_root,
+                    &artifact_lock.operator,
+                    "source_build_input",
+                    evidence,
+                )?;
+            }
             for evidence in &artifact_lock.source_build_logs {
                 verify_evidence_file(
                     &canonical_root,
@@ -421,6 +430,20 @@ impl NativeOperatorArtifactSetLock {
                 "source_build_plan",
                 &artifact.source_build_plan,
             )?;
+            if artifact.source_build_inputs.is_empty()
+                || artifact
+                    .source_build_inputs
+                    .windows(2)
+                    .any(|pair| pair[0].path >= pair[1].path)
+            {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.source_build_inputs must be sorted, unique, and non-empty",
+                    artifact.operator
+                )));
+            }
+            for evidence in &artifact.source_build_inputs {
+                validate_evidence_file(&artifact.operator, "source_build_input", evidence)?;
+            }
             if artifact.source_build_logs.is_empty()
                 || artifact
                     .source_build_logs
@@ -789,6 +812,7 @@ mod tests {
         let plan_path = dir.join("source-build.plan.json");
         let log_path = dir.join("source-build.log");
         let package_spec_path = dir.join("package.spec.json");
+        let source_input_path = dir.join("cuda-static-manifest.json");
         let package_receipt_path = dir.join("package.receipt.json");
         let package_log_path = dir.join("package-build.log");
         let license_path = dir.join("LICENSE");
@@ -796,6 +820,7 @@ mod tests {
         fs::write(&plan_path, "{\"schema_version\":2}\n").unwrap();
         fs::write(&log_path, "source build complete\n").unwrap();
         fs::write(&package_spec_path, "{\"schema_version\":2}\n").unwrap();
+        fs::write(&source_input_path, "{\"schema_version\":1}\n").unwrap();
         fs::write(&package_receipt_path, "{\"status\":\"pass\"}\n").unwrap();
         fs::write(&package_log_path, "package build complete\n").unwrap();
         fs::write(&license_path, "fixture license\n").unwrap();
@@ -817,6 +842,7 @@ mod tests {
             package_spec: evidence(&package_spec_path),
             source_build_receipt: evidence(&receipt_path),
             source_build_plan: evidence(&plan_path),
+            source_build_inputs: vec![evidence(&source_input_path)],
             source_build_logs: vec![evidence(&log_path)],
             source_archive_sha256: digest('8'),
             package_receipt: evidence(&package_receipt_path),
@@ -835,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_multiple_schema_v3_artifacts_in_deterministic_order() {
+    fn resolves_multiple_schema_v4_artifacts_in_deterministic_order() {
         let dir = temp_dir("pass");
         let alpha = write_artifact(
             dir.path(),

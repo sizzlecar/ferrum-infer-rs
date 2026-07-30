@@ -26,7 +26,7 @@ use tempfile::{Builder as TempBuilder, NamedTempFile};
 use thiserror::Error;
 
 pub const NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION: u32 = 2;
-pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 4;
 
 pub use source_build::*;
 
@@ -60,6 +60,7 @@ pub struct NativeOperatorPackageReceipt {
     pub package_spec: NativeOperatorEvidenceFile,
     pub source_build_receipt: NativeOperatorEvidenceFile,
     pub source_build_plan: NativeOperatorEvidenceFile,
+    pub source_build_inputs: Vec<NativeOperatorEvidenceFile>,
     pub source_build_logs: Vec<NativeOperatorEvidenceFile>,
     pub source_archive_sha256: String,
     pub source_archive_members: Vec<NativeOperatorArchiveMemberEvidence>,
@@ -275,6 +276,20 @@ pub fn package_native_operator(
         &source_build.receipt,
         staging.path(),
     )?;
+    let source_build_inputs = copy_source_build_inputs(
+        &request.source_build_receipt_path,
+        &source_build.receipt,
+        staging.path(),
+    )?;
+    let source_plan = verify_source_build_receipt_against_plan_portable(
+        &source_build.receipt,
+        &staging.path().join(&source_build_plan.path),
+    )?;
+    verify_source_build_evidence(
+        &source_build.receipt,
+        staging.path().join("provenance").as_path(),
+        &source_plan,
+    )?;
     let artifact_path = staging.path().join(&artifact_file);
     fs::copy(&source_build.archive_path, &artifact_path).map_err(|source| {
         NativeOperatorBuilderError::Io {
@@ -440,6 +455,7 @@ pub fn package_native_operator(
         package_spec,
         source_build_receipt,
         source_build_plan,
+        source_build_inputs,
         source_build_logs,
         source_archive_sha256: source_build.source_archive_sha256.clone(),
         source_archive_members,
@@ -462,10 +478,6 @@ pub fn package_native_operator(
         package_build_logs,
     };
     validate_package_receipt(&receipt)?;
-    let source_plan = verify_source_build_receipt_against_plan_portable(
-        &source_build.receipt,
-        &source_build.plan_path,
-    )?;
     validate_package_semantic_links(
         &receipt,
         &spec,
@@ -519,7 +531,8 @@ fn load_source_build_for_package(
             source,
         })?;
     validate_source_build_for_package(&receipt, spec)?;
-    verify_source_build_receipt_against_plan(&receipt, plan_path, source_root)?;
+    let receipt_root = receipt_path.parent().unwrap_or_else(|| Path::new("."));
+    verify_source_build_receipt_against_plan(&receipt, receipt_root, plan_path, source_root)?;
 
     let archive_file = receipt
         .archive_file
@@ -560,15 +573,33 @@ fn source_build_summary(
             receipt.operator
         ))
     })?;
+    let host_version = toolchain
+        .miss_probe
+        .as_ref()
+        .map(|probe| normalize_tool_version(&probe.host_compiler_version))
+        .unwrap_or_else(|| {
+            normalize_tool_version(&toolchain.static_identity.host_toolchain.compiler_version)
+        });
     Ok(NativeOperatorBuildSummary {
         builder_sha: receipt.builder_sha.clone(),
         elapsed_ms: receipt.elapsed_ms,
-        nvcc_version: Some(normalize_tool_version(&toolchain.nvcc.version)),
+        nvcc_version: Some(
+            toolchain
+                .miss_probe
+                .as_ref()
+                .map(|probe| normalize_tool_version(&probe.nvcc_version))
+                .unwrap_or_else(|| {
+                    format!(
+                        "cuda-toolkit-static {}",
+                        toolchain.static_identity.cuda_toolkit.release_version
+                    )
+                }),
+        ),
         host_compiler: format!(
             "path={};sha256={};version={}",
-            toolchain.host_compiler.path,
-            toolchain.host_compiler.sha256,
-            normalize_tool_version(&toolchain.host_compiler.version)
+            toolchain.static_identity.host_toolchain.compiler.path,
+            toolchain.static_identity.host_toolchain.compiler.sha256,
+            host_version
         ),
     })
 }
@@ -680,14 +711,23 @@ fn validate_source_build_for_package(
             receipt.operator
         ))
     })?;
+    let static_identity = &toolchain.static_identity;
+    if spec.cuda_toolkit.as_deref().is_none_or(|declared| {
+        !cuda_toolkit_version_matches(declared, &static_identity.cuda_toolkit.release_version)
+    }) {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package cuda_toolkit does not match source-build toolkit release {}",
+            receipt.operator, static_identity.cuda_toolkit.release_version
+        )));
+    }
     for (name, tool) in [
-        ("nvcc", &toolchain.nvcc),
-        ("host_compiler", &toolchain.host_compiler),
-        ("archiver", &toolchain.archiver),
+        ("nvcc", &static_identity.cuda_toolkit.nvcc),
+        ("host_compiler", &static_identity.host_toolchain.compiler),
+        ("archiver", &static_identity.archiver),
     ] {
-        if tool.path.trim().is_empty()
-            || tool.version.trim().is_empty()
+        if !Path::new(&tool.path).is_absolute()
             || !is_sha256_digest(&tool.sha256)
+            || tool.size_bytes == 0
         {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "{} source-build {name} identity is incomplete",
@@ -695,14 +735,62 @@ fn validate_source_build_for_package(
             )));
         }
     }
-    if toolchain.host_target.trim().is_empty()
-        || toolchain.host_target.len() > 256
-        || toolchain.host_target.chars().any(char::is_whitespace)
+    if !Path::new(&static_identity.cuda_toolkit.canonical_root).is_absolute()
+        || static_identity
+            .cuda_toolkit
+            .release_version
+            .trim()
+            .is_empty()
+        || static_identity
+            .cuda_toolkit
+            .release_version
+            .chars()
+            .any(|character| !(character.is_ascii_digit() || character == '.'))
+        || !Path::new(&static_identity.cuda_toolkit.nvcc.path)
+            .starts_with(&static_identity.cuda_toolkit.canonical_root)
+        || static_identity.cuda_toolkit.manifest.path != "toolchain/cuda-static-manifest.json"
+        || !is_sha256_digest(&static_identity.cuda_toolkit.manifest.sha256)
+        || static_identity.cuda_toolkit.manifest.size_bytes == 0
+        || static_identity
+            .host_toolchain
+            .compiler_version
+            .trim()
+            .is_empty()
+        || static_identity.host_toolchain.target.trim().is_empty()
+        || static_identity.host_toolchain.target.len() > 256
+        || static_identity
+            .host_toolchain
+            .target
+            .chars()
+            .any(char::is_whitespace)
+        || static_identity.host_toolchain.manifest.path != "toolchain/host-static-manifest.json"
+        || !is_sha256_digest(&static_identity.host_toolchain.manifest.sha256)
+        || static_identity.host_toolchain.manifest.size_bytes == 0
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "{} source-build host target identity is invalid",
+            "{} source-build cuda toolkit identity is invalid",
             receipt.operator
         )));
+    }
+    match &toolchain.miss_probe {
+        Some(probe)
+            if !probe.nvcc_version.trim().is_empty()
+                && !probe.host_compiler_version.trim().is_empty()
+                && !probe.archiver_version.trim().is_empty()
+                && !probe.host_target.trim().is_empty()
+                && probe.host_target.len() <= 256
+                && !probe.host_target.chars().any(char::is_whitespace)
+                && probe.host_compiler_version
+                    == static_identity.host_toolchain.compiler_version
+                && probe.host_target == static_identity.host_toolchain.target
+                && probe.probed_for_misses == receipt.compiled_translation_units => {}
+        None if receipt.compiled_translation_units.is_empty() => {}
+        _ => {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build miss-only toolchain probe does not match compiled translation units",
+            receipt.operator
+        )))
+        }
     }
 
     if receipt.commands.len() < 2 {
@@ -754,6 +842,10 @@ fn validate_source_build_for_package(
                 .is_some_and(is_sha256_digest)
             || command.object_size_bytes.is_none_or(|size| size == 0)
             || command.object_identity.is_none()
+            || !command
+                .dependency_closure_sha256
+                .as_deref()
+                .is_some_and(is_sha256_digest)
             || command
                 .object_cache_entry
                 .as_deref()
@@ -774,12 +866,36 @@ fn validate_source_build_for_package(
         )?;
         match command.object_cache_status {
             Some(NativeOperatorSourceObjectCacheStatus::Hit)
-                if !command.compiler_executed && command.return_code.is_none() =>
+                if !command.compiler_executed
+                    && command.return_code.is_none()
+                    && command.dependency_validation
+                        == Some(NativeOperatorDependencyValidation::CacheProof)
+                    && command
+                        .depfile
+                        .as_deref()
+                        .is_some_and(|path| validate_relative_path(path).is_ok())
+                    && command
+                        .depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
+                    && !command.observed_dependencies.is_empty() =>
             {
                 observed_cache_hits.push(translation_unit.to_string());
             }
             Some(NativeOperatorSourceObjectCacheStatus::Published)
-                if command.compiler_executed && command.return_code == Some(0) =>
+                if command.compiler_executed
+                    && command.return_code == Some(0)
+                    && command.dependency_validation
+                        == Some(NativeOperatorDependencyValidation::Depfile)
+                    && command
+                        .depfile
+                        .as_deref()
+                        .is_some_and(|path| validate_relative_path(path).is_ok())
+                    && command
+                        .depfile_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_digest)
+                    && !command.observed_dependencies.is_empty() =>
             {
                 observed_compiled.push(translation_unit.to_string());
             }
@@ -799,6 +915,11 @@ fn validate_source_build_for_package(
         || archive_command.object_sha256.is_some()
         || archive_command.object_size_bytes.is_some()
         || archive_command.object_identity.is_some()
+        || archive_command.dependency_closure_sha256.is_some()
+        || archive_command.dependency_validation.is_some()
+        || archive_command.depfile.is_some()
+        || archive_command.depfile_sha256.is_some()
+        || !archive_command.observed_dependencies.is_empty()
         || archive_command.return_code != Some(0)
         || archive_command.elapsed_ms.is_none()
     {
@@ -877,6 +998,59 @@ fn copy_source_build_logs(
                 )));
             }
             Ok(evidence)
+        })
+        .collect()
+}
+
+fn copy_source_build_inputs(
+    receipt_path: &Path,
+    receipt: &NativeOperatorSourceBuildReceipt,
+    package_root: &Path,
+) -> Result<Vec<NativeOperatorEvidenceFile>> {
+    let source_build_root = receipt_path.parent().unwrap_or_else(|| Path::new("."));
+    let toolchain = receipt.toolchain.as_ref().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt is missing toolchain provenance",
+            receipt.operator
+        ))
+    })?;
+    let mut inputs = vec![
+        toolchain.static_identity.cuda_toolkit.manifest.path.clone(),
+        toolchain
+            .static_identity
+            .host_toolchain
+            .manifest
+            .path
+            .clone(),
+    ];
+    inputs.extend(
+        receipt
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command.dependency_validation,
+                    Some(
+                        NativeOperatorDependencyValidation::Depfile
+                            | NativeOperatorDependencyValidation::CacheProof
+                    )
+                )
+            })
+            .filter_map(|command| command.depfile.clone()),
+    );
+    inputs.sort();
+    inputs.dedup();
+    if inputs.is_empty() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt contains no input evidence",
+            receipt.operator
+        )));
+    }
+    inputs
+        .into_iter()
+        .map(|relative| {
+            let source = resolve_relative_file(source_build_root, &relative)?;
+            copy_evidence_file(&source, package_root, &format!("provenance/{relative}"))
         })
         .collect()
 }
@@ -1262,20 +1436,30 @@ fn package_build_environment(
     ]
     .iter()
     .filter_map(|path| Path::new(path).parent())
-    .map(|path| path.display().to_string())
+    .map(Path::to_path_buf)
     .collect::<Vec<_>>();
-    path_entries.extend(["/bin".to_string(), "/usr/bin".to_string()]);
+    path_entries.extend([PathBuf::from("/bin"), PathBuf::from("/usr/bin")]);
     path_entries.sort();
     path_entries.dedup();
-    if path_entries.iter().any(|path| path.is_empty()) {
+    if path_entries.iter().any(|path| path.as_os_str().is_empty()) {
         return Err(NativeOperatorBuilderError::Invalid(
             "package tool paths must have parent directories".to_string(),
         ));
     }
+    let path = std::env::join_paths(&path_entries)
+        .map_err(|error| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "package tool PATH cannot be represented: {error}"
+            ))
+        })?
+        .into_string()
+        .map_err(|_| {
+            NativeOperatorBuilderError::Invalid("package tool PATH is not valid UTF-8".to_string())
+        })?;
     Ok(BTreeMap::from([
         ("LANG".to_string(), "C".to_string()),
         ("LC_ALL".to_string(), "C".to_string()),
-        ("PATH".to_string(), path_entries.join(":")),
+        ("PATH".to_string(), path),
         ("SOURCE_DATE_EPOCH".to_string(), "0".to_string()),
         ("TMPDIR".to_string(), "/tmp".to_string()),
         ("TZ".to_string(), "UTC".to_string()),
@@ -1439,6 +1623,11 @@ pub fn assemble_native_operator_set(
             resolve_package_evidence(package_root, &canonical_root, &receipt.source_build_receipt)?;
         let source_build_plan =
             resolve_package_evidence(package_root, &canonical_root, &receipt.source_build_plan)?;
+        let source_build_inputs = receipt
+            .source_build_inputs
+            .iter()
+            .map(|evidence| resolve_package_evidence(package_root, &canonical_root, evidence))
+            .collect::<Result<Vec<_>>>()?;
         let source_build_logs = receipt
             .source_build_logs
             .iter()
@@ -1467,6 +1656,13 @@ pub fn assemble_native_operator_set(
         let packaged_source_plan = verify_source_build_receipt_against_plan_portable(
             &packaged_source_build,
             &source_build_plan_path,
+        )?;
+        verify_source_build_evidence(
+            &packaged_source_build,
+            source_build_receipt_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            &packaged_source_plan,
         )?;
         if manifest_evidence.sha256 != receipt.manifest_sha256 {
             return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -1535,6 +1731,7 @@ pub fn assemble_native_operator_set(
             package_spec,
             source_build_receipt,
             source_build_plan,
+            source_build_inputs,
             source_build_logs,
             source_archive_sha256: receipt.source_archive_sha256,
             package_receipt,
@@ -1610,6 +1807,15 @@ fn validate_package_spec(spec: &NativeOperatorPackageSpec) -> Result<()> {
             "source-build packager currently accepts CUDA artifacts only".to_string(),
         ));
     }
+    if spec
+        .cuda_toolkit
+        .as_deref()
+        .is_none_or(|version| parse_cuda_version(version).is_none())
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "CUDA package spec must declare a numeric major.minor[.patch] cuda_toolkit".to_string(),
+        ));
+    }
     symbol_slug(&spec.operator)?;
     if spec.operator_abi_version.trim().is_empty() {
         return Err(NativeOperatorBuilderError::Invalid(
@@ -1669,6 +1875,27 @@ fn validate_package_spec(spec: &NativeOperatorPackageSpec) -> Result<()> {
     Ok(())
 }
 
+fn cuda_toolkit_version_matches(declared: &str, actual: &str) -> bool {
+    let Some(declared) = parse_cuda_version(declared) else {
+        return false;
+    };
+    let Some(actual) = parse_cuda_version(actual) else {
+        return false;
+    };
+    declared.len() <= actual.len() && declared.iter().zip(actual.iter()).all(|(a, b)| a == b)
+}
+
+fn parse_cuda_version(value: &str) -> Option<Vec<u32>> {
+    let parts = value
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    matches!(parts.len(), 2 | 3)
+        .then_some(parts)
+        .filter(|parts| parts.iter().all(|part| *part <= 999))
+}
+
 fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()> {
     if receipt.schema_version != NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -1686,6 +1913,20 @@ fn validate_package_receipt(receipt: &NativeOperatorPackageReceipt) -> Result<()
     validate_evidence_record("package_spec", &receipt.package_spec)?;
     validate_evidence_record("source_build_receipt", &receipt.source_build_receipt)?;
     validate_evidence_record("source_build_plan", &receipt.source_build_plan)?;
+    if receipt.source_build_inputs.is_empty()
+        || receipt
+            .source_build_inputs
+            .windows(2)
+            .any(|pair| pair[0].path >= pair[1].path)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} package receipt source_build_inputs must be sorted, unique, and non-empty",
+            receipt.operator
+        )));
+    }
+    for evidence in &receipt.source_build_inputs {
+        validate_evidence_record("source_build_input", evidence)?;
+    }
     if receipt.source_build_logs.is_empty()
         || receipt
             .source_build_logs
@@ -1950,6 +2191,51 @@ fn validate_package_semantic_links(
     if actual_source_log_paths != expected_source_log_paths {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} packaged source-build logs do not exactly match its command graph",
+            receipt.operator
+        )));
+    }
+    let toolchain = source_build.toolchain.as_ref().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt is missing toolchain provenance",
+            receipt.operator
+        ))
+    })?;
+    let mut expected_source_input_paths = vec![
+        format!(
+            "provenance/{}",
+            toolchain.static_identity.cuda_toolkit.manifest.path
+        ),
+        format!(
+            "provenance/{}",
+            toolchain.static_identity.host_toolchain.manifest.path
+        ),
+    ];
+    expected_source_input_paths.extend(
+        source_build
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command.dependency_validation,
+                    Some(
+                        NativeOperatorDependencyValidation::Depfile
+                            | NativeOperatorDependencyValidation::CacheProof
+                    )
+                )
+            })
+            .filter_map(|command| command.depfile.as_ref())
+            .map(|relative| format!("provenance/{relative}")),
+    );
+    expected_source_input_paths.sort();
+    expected_source_input_paths.dedup();
+    let actual_source_input_paths = receipt
+        .source_build_inputs
+        .iter()
+        .map(|evidence| evidence.path.clone())
+        .collect::<Vec<_>>();
+    if actual_source_input_paths != expected_source_input_paths {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} packaged source-build inputs do not exactly match toolkit/depfile evidence",
             receipt.operator
         )));
     }
@@ -2351,6 +2637,10 @@ mod tests {
             }],
             translation_units: vec!["fixture.cu".to_string()],
             headers: Vec::new(),
+            dependency_closures: vec![NativeOperatorTranslationUnitDependencies {
+                translation_unit: "fixture.cu".to_string(),
+                headers: Vec::new(),
+            }],
             include_dirs: Vec::new(),
             defines: Vec::new(),
             nvcc_policy: NativeOperatorNvccPolicy {
@@ -2370,26 +2660,80 @@ mod tests {
         write_json(&definition_path, &definition).unwrap();
         lock_native_operator_source_definition(&definition_path, source_root, &plan_path).unwrap();
 
-        let fake_nvcc = root.join(format!("fake-nvcc-{name}"));
+        let fake_cuda_root = root.join(format!("fake-cuda-{name}"));
+        for directory in ["bin/crt", "include", "nvvm/bin", "nvvm/libdevice"] {
+            fs::create_dir_all(fake_cuda_root.join(directory)).unwrap();
+        }
+        for (relative, contents) in [
+            ("bin/bin2c", "fake bin2c\n"),
+            ("bin/crt/link.stub", "fake link stub\n"),
+            ("bin/cudafe++", "fake cudafe\n"),
+            ("bin/ptxas", "fake ptxas\n"),
+            ("bin/fatbinary", "fake fatbinary\n"),
+            ("bin/nvlink", "fake nvlink\n"),
+            ("include/cuda.h", "#define CUDA_VERSION 12040\n"),
+            ("nvvm/bin/cicc", "fake cicc\n"),
+            ("nvvm/libdevice/libdevice.10.bc", "fake libdevice\n"),
+        ] {
+            fs::write(fake_cuda_root.join(relative), contents).unwrap();
+        }
+        let fake_nvcc = fake_cuda_root.join("bin/nvcc");
         fs::write(
             &fake_nvcc,
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo 'fake nvcc 12.4'; exit 0; fi\n\
              src=''\n\
              out=''\n\
+             depfile=''\n\
+             dep_target=''\n\
              while [ \"$#\" -gt 0 ]; do\n\
                case \"$1\" in\n\
                  -c) src=\"$2\"; shift 2 ;;\n\
                  -o) out=\"$2\"; shift 2 ;;\n\
+                 -MF) depfile=\"$2\"; shift 2 ;;\n\
+                 -MT) dep_target=\"$2\"; shift 2 ;;\n\
                  *) shift ;;\n\
                esac\n\
              done\n\
-             exec /usr/bin/cc -x c -c \"$src\" -o \"$out\"\n",
+             exec /usr/bin/cc -x c -MMD -MF \"$depfile\" -MT \"$dep_target\" -c \"$src\" -o \"$out\"\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&fake_nvcc).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&fake_nvcc, permissions).unwrap();
+
+        let fake_host_root = root.join(format!("fake-host-{name}"));
+        fs::create_dir_all(fake_host_root.join("bin")).unwrap();
+        fs::create_dir_all(fake_host_root.join("include")).unwrap();
+        fs::write(
+            fake_host_root.join("include/stddef.h"),
+            "#define FAKE_HOST 1\n",
+        )
+        .unwrap();
+        for program in ["as", "cc1", "cc1plus", "collect2", "ld"] {
+            fs::write(
+                fake_host_root.join("bin").join(program),
+                format!("fake host tool {program}\n"),
+            )
+            .unwrap();
+        }
+        let fake_ccbin = fake_host_root.join("bin/c++");
+        write_executable_script(
+            &fake_ccbin,
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                   --version) echo 'fake host compiler 1.0'; exit 0 ;;\n\
+                   -dumpmachine) echo 'x86_64-ferrum-linux-gnu'; exit 0 ;;\n\
+                   -E) echo '#include <...> search starts here:' >&2; echo ' {}' >&2; echo 'End of search list.' >&2; exit 0 ;;\n\
+                   -###) echo 'fake cc1plus -O2 -x c++' >&2; exit 0 ;;\n\
+                   -print-prog-name=*) name=${{1#*=}}; echo '{}/bin/'\"$name\"; exit 0 ;;\n\
+                 esac\n\
+                 exit 2\n",
+                fake_host_root.join("include").display(),
+                fake_host_root.display(),
+            ),
+        );
 
         let output_dir = root.join("source-builds").join(name);
         run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
@@ -2399,7 +2743,8 @@ mod tests {
             compute_capability: "sm_89".to_string(),
             builder_sha: "7".repeat(40),
             nvcc_path: fake_nvcc,
-            ccbin_path: PathBuf::from("/usr/bin/cc"),
+            cuda_toolkit_root: fake_cuda_root,
+            ccbin_path: fake_ccbin,
             ar_path: PathBuf::from("/usr/bin/ar"),
             nvcc_threads: 2,
             object_cache_dir: root.join("object-cache"),
@@ -2532,6 +2877,19 @@ mod tests {
         );
         assert!(is_sha256_digest(&receipt.source_build_receipt.sha256));
         assert!(is_sha256_digest(&receipt.source_build_plan.sha256));
+        assert_eq!(receipt.source_build_inputs.len(), 3);
+        assert!(receipt
+            .source_build_inputs
+            .iter()
+            .any(|evidence| evidence.path.ends_with("cuda-static-manifest.json")));
+        assert!(receipt
+            .source_build_inputs
+            .iter()
+            .any(|evidence| evidence.path.ends_with("host-static-manifest.json")));
+        assert!(receipt
+            .source_build_inputs
+            .iter()
+            .any(|evidence| evidence.path.ends_with(".d")));
         assert!(!receipt.source_build_logs.is_empty());
         assert!(is_sha256_digest(&receipt.source_archive_sha256));
         assert_eq!(receipt.source_archive_members.len(), 1);
@@ -2713,6 +3071,35 @@ mod tests {
         let error = validate_source_build_for_package(&source_build, &spec).unwrap_err();
 
         assert!(error.to_string().contains("must exactly equal"));
+    }
+
+    #[test]
+    fn rejects_package_toolkit_version_that_differs_from_source_build() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, _, _) = fixture_files(root.path());
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (source_build_receipt, _, _) = run_source_build_fixture(
+            root.path(),
+            &source_root,
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "wrong-toolkit",
+            exports,
+        );
+        let source_build: NativeOperatorSourceBuildReceipt =
+            read_json(&source_build_receipt).unwrap();
+        let mut spec = package_spec(
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+        );
+        spec.cuda_toolkit = Some("12.6".to_string());
+
+        let error = validate_source_build_for_package(&source_build, &spec).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("package cuda_toolkit does not match source-build toolkit release 12.4.0"));
     }
 
     #[test]
@@ -3100,6 +3487,111 @@ mod tests {
         assert!(error
             .to_string()
             .contains("manifest is not the exact semantic projection"));
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn artifact_set_rejects_tampered_toolkit_manifest_with_updated_outer_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (package_dir, mut receipt) = package_fixture(
+            root.path(),
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+            "tampered-toolkit",
+        )
+        .unwrap();
+        let evidence = receipt
+            .source_build_inputs
+            .iter_mut()
+            .find(|evidence| evidence.path.ends_with("cuda-static-manifest.json"))
+            .expect("package carries the cuda toolkit manifest");
+        let manifest_path = package_dir.join(&evidence.path);
+        let mut bytes = fs::read(&manifest_path).unwrap();
+        bytes.extend_from_slice(b" \n");
+        fs::write(&manifest_path, &bytes).unwrap();
+        evidence.sha256 = sha256_bytes(&bytes);
+        evidence.size_bytes = bytes.len().try_into().unwrap();
+        let receipt_path = package_dir.join("package.receipt.json");
+        write_json(&receipt_path, &receipt).unwrap();
+        let lock_path = root.path().join("packages/tampered-toolkit.lock.json");
+
+        let error = assemble_native_operator_set(&NativeOperatorSetRequest {
+            receipt_paths: vec![receipt_path.clone()],
+            expected_receipt_sha256: vec![sha256_file(&receipt_path).unwrap()],
+            expected_g03_catalog_sha256: receipt.g03_catalog_sha256,
+            output_lock_path: lock_path.clone(),
+            compute_capability: "sm_89".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("source-build evidence mismatch"));
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn artifact_set_reparses_depfile_after_coherent_outer_rehash() {
+        let root = tempfile::tempdir().unwrap();
+        let exports = CudaNativeBuildUnit::Marlin.required_exports();
+        let (package_dir, mut receipt) = package_fixture(
+            root.path(),
+            CudaNativeBuildUnit::Marlin.artifact_operator(),
+            "operation.dense_linear",
+            "provider.cuda.dense_linear.f16.marlin",
+            exports,
+            "tampered-depfile",
+        )
+        .unwrap();
+        let source_receipt_path = package_dir.join(&receipt.source_build_receipt.path);
+        let mut source_receipt: NativeOperatorSourceBuildReceipt =
+            read_json(&source_receipt_path).unwrap();
+        let command = &mut source_receipt.commands[0];
+        let depfile_relative = command
+            .depfile
+            .as_deref()
+            .expect("compiled command carries a depfile")
+            .to_string();
+        let depfile_path = source_receipt_path
+            .parent()
+            .unwrap()
+            .join(&depfile_relative);
+        let object_name = Path::new(command.object_file.as_deref().unwrap())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let forged = format!("{object_name}: fixture.cu forged.h\n");
+        fs::write(&depfile_path, forged.as_bytes()).unwrap();
+        command.depfile_sha256 = Some(sha256_bytes(forged.as_bytes()));
+        write_json(&source_receipt_path, &source_receipt).unwrap();
+
+        receipt.source_build_receipt.sha256 = sha256_file(&source_receipt_path).unwrap();
+        receipt.source_build_receipt.size_bytes = fs::metadata(&source_receipt_path).unwrap().len();
+        let packaged_depfile = format!("provenance/{depfile_relative}");
+        let depfile_evidence = receipt
+            .source_build_inputs
+            .iter_mut()
+            .find(|evidence| evidence.path == packaged_depfile)
+            .expect("package carries the compiler depfile");
+        depfile_evidence.sha256 = sha256_file(&depfile_path).unwrap();
+        depfile_evidence.size_bytes = fs::metadata(&depfile_path).unwrap().len();
+
+        let receipt_path = package_dir.join("package.receipt.json");
+        write_json(&receipt_path, &receipt).unwrap();
+        let lock_path = root.path().join("packages/tampered-depfile.lock.json");
+        let error = assemble_native_operator_set(&NativeOperatorSetRequest {
+            receipt_paths: vec![receipt_path.clone()],
+            expected_receipt_sha256: vec![sha256_file(&receipt_path).unwrap()],
+            expected_g03_catalog_sha256: receipt.g03_catalog_sha256,
+            output_lock_path: lock_path.clone(),
+            compute_capability: "sm_89".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("portable depfile differs from locked dependency closure"));
         assert!(!lock_path.exists());
     }
 

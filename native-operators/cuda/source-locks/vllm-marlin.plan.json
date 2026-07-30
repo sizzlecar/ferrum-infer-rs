@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package": {
     "kind": "ferrum-git-tree",
@@ -139,6 +139,774 @@
     {
       "path": "vllm_marlin/torch_stubs.h",
       "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+    }
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "vllm_marlin/gptq_marlin_repack.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        }
+      ],
+      "closure_sha256": "59cc122d22b66817991a03d9206f48c81e27dfa2bd8af64d536ff29b7efa232b"
+    },
+    {
+      "translation_unit": "vllm_marlin/marlin.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/ferrum_marlin_ffi.h",
+          "sha256": "56d69698efb288c9d4b30bbe5627baa96fbf76c069a2578b71689e7696a29606"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/kernel_selector.h",
+          "sha256": "e6519b39ab932372629296e5e13efa5a79d5735bc8a4dc23b7ca97619d3df425"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "625d73faa04f270228ef7945639f82263b5c17066590ed0165aea9f717ad312e"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "2ae8ab9fbee8be734c301cf22cc83f694459a11ac1f0d7d001d3b22b2968e83d"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "7ff7b44da86e21dbc4deae753aa90d8e0470c721b91d2bef171334a7da2d5ae2"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "9e6cae277046614882ab8ac75b712c5f9a890dc15ea9dd84a28f6bc4feaf8c77"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "56ca3d8323df33a4076e13919f54d338d67fbeaa5d683367f71bf3de55a307fc"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "83131d46e948339f82181bb52028ad5f3c13ea91d165eec1743e12292c49ccfe"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_fe2m1f_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "88d67039f71fe07044ad65ed7a951de0ac94f57d1c985354b804304a040d43a2"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_fe4m3fn_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "b7b37207c8d021e7e95b7e33af7706cbc8d468e3190390311d572147002b6f4d"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_u4_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "c953260aeda8751d935c0161cb0da6495f95ac17f519bf66ef89dabe9da3ed91"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_u4b8_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "d6ae218c2d5c2e9e8b83baed14056ae828a0724e4f2372573ef8270d102863cb"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_u8b128_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "e93eeda24a0854bc3d593c25d1ab62c4ff75060d79efa58b3320b1e454bb0abc"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "25925da3e9e2d96757c3a7a5a674abc9ec6de4e08534ee61eed7b69d39706951"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "a959b07c3377601f53ca21c43e10b30f7537eb8c0fb964bb0cdfcf4dde871631"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4b8_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "70ab084566151598a4488ed9198ff9b39bde47acb6c77338ca7330c3a0545809"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4b8_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "357b525a4db8dbe660e664d7e2b5c4e5d3f1f1fc77b04695588b5a2d7389a5e2"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "cd5d71ed14af7780c3505dedef6265db7f292d89e5e8568f073018bdf89b7166"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "ec9e10b120d483f991f7105800960542263d344290f49e5b11f5e822b8a8949a"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "fc8cbc36f50c9fc5252fd1683ae1e65bc2360ebfd78a4a45ffeec178372266c2"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "3da1ef31031d3da47aec020552d187d70ec2ec480a35606596c00c80ecf99988"
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu",
+      "headers": [
+        {
+          "path": "vllm_marlin/dequant.h",
+          "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728"
+        },
+        {
+          "path": "vllm_marlin/kernel.h",
+          "sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
+        },
+        {
+          "path": "vllm_marlin/marlin.cuh",
+          "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+        },
+        {
+          "path": "vllm_marlin/marlin_dtypes.cuh",
+          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+        },
+        {
+          "path": "vllm_marlin/marlin_mma.h",
+          "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+        },
+        {
+          "path": "vllm_marlin/marlin_template.h",
+          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+        },
+        {
+          "path": "vllm_marlin/scalar_type.hpp",
+          "sha256": "3711ca7fdb6a89e741f5225b53115c141873ba00e5e17d1ad7e8948e4c86804b"
+        },
+        {
+          "path": "vllm_marlin/torch_stubs.h",
+          "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
+        }
+      ],
+      "closure_sha256": "1b666bfe8778fd04d4a2da916a5dfd729921b64621cc25c6cd8e72100fbdffcd"
     }
   ],
   "include_dirs": [

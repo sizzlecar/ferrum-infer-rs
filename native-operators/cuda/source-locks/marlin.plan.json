@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "operator": "ferrum.cuda.marlin",
   "source_package": {
     "kind": "ferrum-git-tree",
@@ -20,6 +20,13 @@
     }
   ],
   "headers": [],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/marlin_cuda_kernel.cu",
+      "headers": [],
+      "closure_sha256": "ad63bccfd589a72897d3aa3505f12b9991cda93aeabc5ed9a2c3ccbff857ad83"
+    }
+  ],
   "include_dirs": [],
   "defines": [],
   "nvcc_policy": {

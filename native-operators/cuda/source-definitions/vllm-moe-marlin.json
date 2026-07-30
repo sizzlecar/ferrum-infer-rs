@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "operator": "ferrum.cuda.vllm_moe_marlin",
   "source_package_kind": "ferrum-git-tree",
   "source_package_revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
@@ -22,6 +22,32 @@
     "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
     "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
     "kernels/vllm_marlin_moe/vllm_torch_shim.h"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+      "headers": [
+        "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+        "kernels/vllm_marlin_moe/kernel.h",
+        "kernels/vllm_marlin_moe/marlin_template.h",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+        "kernels/vllm_marlin_moe/vllm_torch_shim.h"
+      ]
+    },
+    {
+      "translation_unit": "kernels/vllm_marlin_moe/ops.cu",
+      "headers": [
+        "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+        "kernels/vllm_marlin_moe/kernel.h",
+        "kernels/vllm_marlin_moe/marlin_template.h",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+        "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+        "kernels/vllm_marlin_moe/vllm_torch_shim.h"
+      ]
+    }
   ],
   "include_dirs": [
     "kernels/vllm_marlin_moe"

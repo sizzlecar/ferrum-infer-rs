@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "operator": "ferrum.cuda.vllm_moe_marlin",
   "source_package": {
     "kind": "ferrum-git-tree",
@@ -51,6 +51,76 @@
     {
       "path": "kernels/vllm_marlin_moe/vllm_torch_shim.h",
       "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
+    }
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+      "headers": [
+        {
+          "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+          "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/kernel.h",
+          "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/marlin_template.h",
+          "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+          "sha256": "8d8de7ec568d47928ff2f4fc833e8365d6afe46ab16b07fdf524a6dc5a1ddf95"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+          "sha256": "02c99b24fde6c1ab0179dfa27034c7ef6ae7b1bd5654b767e4c196dc8ee12a86"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+          "sha256": "bd0e545afa3ecc23fbf919f50826219832258ce81d31d118a30b350e5cb9699a"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+          "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
+        }
+      ],
+      "closure_sha256": "3c561e5e11ea807088af58da08415a8fcca5fb9b5f4876d9dabebe39985c7fe6"
+    },
+    {
+      "translation_unit": "kernels/vllm_marlin_moe/ops.cu",
+      "headers": [
+        {
+          "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+          "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/kernel.h",
+          "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/marlin_template.h",
+          "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+          "sha256": "8d8de7ec568d47928ff2f4fc833e8365d6afe46ab16b07fdf524a6dc5a1ddf95"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+          "sha256": "02c99b24fde6c1ab0179dfa27034c7ef6ae7b1bd5654b767e4c196dc8ee12a86"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+          "sha256": "bd0e545afa3ecc23fbf919f50826219832258ce81d31d118a30b350e5cb9699a"
+        },
+        {
+          "path": "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+          "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
+        }
+      ],
+      "closure_sha256": "ab413099dcc45ea4bc68bc4360f53a317eb541ea57547e365fcec7cc018febc5"
     }
   ],
   "include_dirs": [

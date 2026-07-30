@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package_kind": "ferrum-git-tree",
   "source_package_revision": "5ebeade31e459e4d70adbd9ade0b37bd827017f3",
@@ -44,6 +44,100 @@
     "vllm_marlin/marlin_template.h",
     "vllm_marlin/scalar_type.hpp",
     "vllm_marlin/torch_stubs.h"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "vllm_marlin/gptq_marlin_repack.cu",
+      "headers": ["vllm_marlin/marlin.cuh"]
+    },
+    {
+      "translation_unit": "vllm_marlin/marlin.cu",
+      "headers": [
+        "vllm_marlin/ferrum_marlin_ffi.h",
+        "vllm_marlin/kernel.h",
+        "vllm_marlin/kernel_selector.h",
+        "vllm_marlin/marlin.cuh",
+        "vllm_marlin/marlin_dtypes.cuh",
+        "vllm_marlin/scalar_type.hpp",
+        "vllm_marlin/torch_stubs.h"
+      ]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_fe2m1f_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_fe4m3fn_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_u4_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_u4b8_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_float16_u8b128_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4b8_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm80_kernel_s8_u4b8_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    },
+    {
+      "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu",
+      "headers": ["vllm_marlin/dequant.h", "vllm_marlin/kernel.h", "vllm_marlin/marlin.cuh", "vllm_marlin/marlin_dtypes.cuh", "vllm_marlin/marlin_mma.h", "vllm_marlin/marlin_template.h", "vllm_marlin/scalar_type.hpp", "vllm_marlin/torch_stubs.h"]
+    }
   ],
   "include_dirs": [
     "vllm_marlin"
