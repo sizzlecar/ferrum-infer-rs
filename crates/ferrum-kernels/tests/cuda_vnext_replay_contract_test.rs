@@ -40,6 +40,12 @@ fn product_cuda_build_is_artifact_only_and_fails_closed_without_a_lock() {
     assert!(resolver.contains("if !required_build_units.is_empty()"));
     assert!(resolver.contains("are artifact-only"));
     assert!(resolver.contains("ferrum-native-ops-builder"));
+    assert!(
+        resolver.contains("lock_sha256={}")
+            && resolver.contains("operator_binaries={}")
+            && resolver.contains("sha256_file_digest(&resolved_set.lock_path)"),
+        "native artifact-set build receipt must bind lock and binary content",
+    );
 
     let main = BUILD_SCRIPT_SOURCE
         .split("fn main()")

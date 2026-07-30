@@ -985,12 +985,17 @@ S1 CUDA 基础纵切的 production evidence 通过统一 gate 固化：
 python3 scripts/release/runtime_vnext_s1_cuda_basic_collector.py collect \
   --repo <clean-source-root> \
   --model <qwen35-4b-hf-snapshot> \
+  --native-operator-set-lock <complete-cuda-native-operator-set.lock.json> \
   --out <qwen35-4b-cuda-raw-artifact>
 
 python3 scripts/release/run_gate.py vnext-s1-cuda \
   --s1-artifact <qwen35-4b-cuda-raw-artifact> \
   --out <external-out>
 ```
+
+collector 必须把 schema-5 native operator lock 及其全部相对路径证据闭包复制到
+raw artifact，并从该快照构建。统一 gate 只依赖 raw artifact 独立复验，不允许依赖
+采集机上的外部 lock 目录，也不允许正式 bounded-overhead lane 降级接受 legacy schema。
 
 child validator 必须从原始 `run`、`serve`、stream、`bench-serve`、scheduler trace 和 ABBA-BAAB
 样本重新计算结果，不能信任手工摘要。要求 basic trace 每请求只捕获一个完整 execution frame、operation

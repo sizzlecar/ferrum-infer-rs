@@ -24,15 +24,52 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from runtime_vnext_native_operator_set import (
+    LOCK_FILE_NAME,
+    NativeOperatorSetEvidenceError,
+    create_selftest_native_operator_set,
+    cuda_build_inputs_hash,
+    cuda_native_set_signature,
+    public_identity as native_operator_set_public_identity,
+    stage_native_operator_set,
+    validate_cuda_build_summary,
+    validate_native_operator_set,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR_PATH = Path(__file__).resolve()
 COLLECTOR_RELATIVE_PATH = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TELEMETRY_SCHEMA_VERSION = 2
 GPU_TELEMETRY_POLICY = "single_persistent_process"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTOR SELFTEST PASS"
 COLLECTED_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTED"
+NATIVE_OPERATOR_SET_SNAPSHOT_DIR = "native-operator-set"
+NATIVE_OPERATOR_SET_LOCK_SNAPSHOT = (
+    f"{NATIVE_OPERATOR_SET_SNAPSHOT_DIR}/{LOCK_FILE_NAME}"
+)
+CUDA_BUILD_SUMMARY_RECEIPT = "cuda-build-summary.receipt.json"
+REQUIRED_CUDA_NATIVE_OPERATORS = (
+    "ferrum.cuda.marlin",
+    "ferrum.cuda.vllm_marlin",
+    "ferrum.cuda.vllm_moe_marlin",
+    "ferrum.cuda.vllm_paged_attention_v2",
+)
+REQUIRED_CUDA_NATIVE_BUILD_UNITS = (
+    ("marlin", "marlin", "ferrum.cuda.marlin"),
+    ("vllm_marlin", "vllm_marlin", "ferrum.cuda.vllm_marlin"),
+    (
+        "vllm_moe_marlin",
+        "vllm_moe_marlin",
+        "ferrum.cuda.vllm_moe_marlin",
+    ),
+    (
+        "vllm_paged_attn",
+        "vllm_paged_attention_v2",
+        "ferrum.cuda.vllm_paged_attention_v2",
+    ),
+)
 SLOT_ORDER = (
     "off1",
     "basic1",
@@ -905,6 +942,18 @@ def collect(args: argparse.Namespace) -> int:
     dirty = command_output(["git", "status", "--porcelain"], repo)
     require(not dirty, "collector requires a clean source worktree")
     out.mkdir(parents=True)
+    source_native_lock = args.native_operator_set_lock.expanduser().absolute()
+    staged_native_lock, staged_native_set = stage_native_operator_set(
+        source_native_lock,
+        out / NATIVE_OPERATOR_SET_SNAPSHOT_DIR,
+        REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    native_lock_identity = {
+        "source_input_path": str(source_native_lock),
+        "staged_lock_path": NATIVE_OPERATOR_SET_LOCK_SNAPSHOT,
+        "build_lock_path": str(staged_native_lock),
+        **native_operator_set_public_identity(staged_native_set),
+    }
     environment = product_environment()
     write_text(out / "git.sha", source_sha + "\n")
     write_text(out / "git.status", "")
@@ -916,41 +965,51 @@ def collect(args: argparse.Namespace) -> int:
             "hidden_ferrum_environment_overrides": [],
         },
     )
-    write_json(
-        out / "collection.json",
-        {
-            "schema_version": SCHEMA_VERSION,
-            "artifact_type": "runtime_vnext_s1_cuda_basic_raw_collection",
-            "source_git_sha": source_sha,
-            "collector": {
-                "path": COLLECTOR_RELATIVE_PATH,
-                "sha256": file_sha256(COLLECTOR_PATH),
-            },
-            "model_snapshot_path": str(model),
-            "protocol": {
-                "slot_order": list(SLOT_ORDER),
-                "comparison": "ABBA-BAAB",
-                "concurrency": 1,
-                "random_input_len": 128,
-                "random_output_len": 64,
-                "prompts_per_repeat": PROFILE_REQUESTS_PER_REPEAT,
-                "warmup_requests": PROFILE_WARMUP_REQUESTS,
-                "repeats_per_slot": PROFILE_REPEAT_COUNT,
-                "seed": 9271,
-                "require_ci": True,
-                "fail_on_error": True,
-                "batched_graph": args.batched_graph,
-                "telemetry_interval_ms": args.telemetry_interval_ms,
-                "gpu_telemetry_policy": GPU_TELEMETRY_POLICY,
-                "profile_health_after_bench": True,
-            },
+    collection = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "runtime_vnext_s1_cuda_basic_raw_collection",
+        "source_git_sha": source_sha,
+        "collector": {
+            "path": COLLECTOR_RELATIVE_PATH,
+            "sha256": file_sha256(COLLECTOR_PATH),
         },
-    )
+        "model_snapshot_path": str(model),
+        "native_operator_set_lock": native_lock_identity,
+        "protocol": {
+            "slot_order": list(SLOT_ORDER),
+            "comparison": "ABBA-BAAB",
+            "concurrency": 1,
+            "random_input_len": 128,
+            "random_output_len": 64,
+            "prompts_per_repeat": PROFILE_REQUESTS_PER_REPEAT,
+            "warmup_requests": PROFILE_WARMUP_REQUESTS,
+            "repeats_per_slot": PROFILE_REPEAT_COUNT,
+            "seed": 9271,
+            "require_ci": True,
+            "fail_on_error": True,
+            "batched_graph": args.batched_graph,
+            "telemetry_interval_ms": args.telemetry_interval_ms,
+            "gpu_telemetry_policy": GPU_TELEMETRY_POLICY,
+            "profile_health_after_bench": True,
+        },
+    }
+    write_json(out / "collection.json", collection)
     write_text(out / "started", now_iso() + "\n")
 
     build_environment = dict(environment)
     build_environment["CARGO_BUILD_JOBS"] = "8"
-    write_command(out / "build.command", list(BUILD_ARGV), {"CARGO_BUILD_JOBS": "8"})
+    build_environment["FERRUM_NATIVE_OPERATOR_SET_LOCK"] = str(staged_native_lock)
+    cuda_build_summary = out / CUDA_BUILD_SUMMARY_RECEIPT
+    build_environment["FERRUM_CUDA_BUILD_SUMMARY_RECEIPT"] = str(cuda_build_summary)
+    write_command(
+        out / "build.command",
+        list(BUILD_ARGV),
+        {
+            "CARGO_BUILD_JOBS": "8",
+            "FERRUM_CUDA_BUILD_SUMMARY_RECEIPT": str(cuda_build_summary),
+            "FERRUM_NATIVE_OPERATOR_SET_LOCK": str(staged_native_lock),
+        },
+    )
     write_text(out / "build.started", now_iso() + "\n")
     with (out / "build.log").open("w", encoding="utf-8") as build_log:
         build = subprocess.run(
@@ -965,6 +1024,31 @@ def collect(args: argparse.Namespace) -> int:
     write_text(out / "build.exit", f"{build.returncode}\n")
     write_text(out / "build.finished", now_iso() + "\n")
     require(build.returncode == 0, f"CUDA release build failed: {out / 'build.log'}")
+    lock_identity_after_build = validate_native_operator_set(
+        staged_native_lock,
+        REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    require(
+        native_operator_set_public_identity(lock_identity_after_build)
+        == native_operator_set_public_identity(staged_native_set),
+        "staged native operator set closure changed during the CUDA build",
+    )
+    validated_build_summary = validate_cuda_build_summary(
+        cuda_build_summary,
+        str(staged_native_lock),
+        staged_native_set,
+        REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+    )
+    collection["cuda_build_summary_receipt"] = {
+        "build_path": str(cuda_build_summary),
+        "snapshot_path": CUDA_BUILD_SUMMARY_RECEIPT,
+        **validated_build_summary,
+        "native_operator_set_lock_sha256": staged_native_set["lock_sha256"],
+        "native_operator_set_closure_sha256": staged_native_set["closure"][
+            "index_sha256"
+        ],
+    }
+    write_json(out / "collection.json", collection)
     binary = repo / "target/release/ferrum"
     require(binary.is_file(), "CUDA release binary is missing after build")
     write_text(out / "binary.sha256", f"{file_sha256(binary)}  {binary}\n")
@@ -1108,6 +1192,112 @@ def self_test() -> int:
         "GPU telemetry process policy drifted",
     )
     require(DEFAULT_TELEMETRY_INTERVAL_MS == 1000, "canonical telemetry cadence drifted")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-native-lock-") as temp:
+        root = Path(temp)
+        source_root = root / "source"
+        lock = create_selftest_native_operator_set(
+            source_root,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+        staged_lock, staged = stage_native_operator_set(
+            lock,
+            root / "staged",
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+        require(
+            staged["operators"] == sorted(REQUIRED_CUDA_NATIVE_OPERATORS)
+            and staged["closure"]["member_count"]
+            >= len(REQUIRED_CUDA_NATIVE_OPERATORS) * 9,
+            "native operator set staging self-test lost its closure",
+        )
+        summary = root / CUDA_BUILD_SUMMARY_RECEIPT
+        set_signature = cuda_native_set_signature(
+            str(staged_lock),
+            staged,
+            REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+        )
+        native_units = {
+            "marlin": "ferrum.cuda.marlin",
+            "vllm_marlin": "ferrum.cuda.vllm_marlin",
+            "vllm_moe_marlin": "ferrum.cuda.vllm_moe_marlin",
+            "vllm_paged_attn": "ferrum.cuda.vllm_paged_attention_v2",
+        }
+        write_json(
+            summary,
+            {
+                "schema_version": 1,
+                "artifact_type": "ferrum_cuda_build_summary_receipt",
+                "rows": [
+                    {
+                        "artifact": "native_operator_artifact_set",
+                        "status": "linked",
+                        "reason": "manifest-v3-artifact-set-v5-validated",
+                        "elapsed_ms": 1,
+                        "inputs_hash": cuda_build_inputs_hash(set_signature),
+                    },
+                    *[
+                        {
+                            "artifact": artifact,
+                            "status": "artifact",
+                            "reason": "native-operator-artifact-set",
+                            "elapsed_ms": 0,
+                            "inputs_hash": cuda_build_inputs_hash(operator),
+                        }
+                        for artifact, operator in native_units.items()
+                    ],
+                ],
+            },
+        )
+        validate_cuda_build_summary(
+            summary,
+            str(staged_lock),
+            staged,
+            REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+        )
+
+        source_member = source_root / staged["_members"][0]["path"]
+        source_member.write_bytes(b"mutated source after staging\n")
+        require(
+            native_operator_set_public_identity(
+                validate_native_operator_set(
+                    staged_lock,
+                    REQUIRED_CUDA_NATIVE_OPERATORS,
+                )
+            )
+            == native_operator_set_public_identity(staged),
+            "staged closure remained coupled to a mutable source",
+        )
+        summary_data = json.loads(summary.read_text(encoding="utf-8"))
+        summary_data["rows"][0]["inputs_hash"] = "sha256:" + "0" * 64
+        write_json(summary, summary_data)
+        try:
+            validate_cuda_build_summary(
+                summary,
+                str(staged_lock),
+                staged,
+                REQUIRED_CUDA_NATIVE_BUILD_UNITS,
+            )
+        except NativeOperatorSetEvidenceError as error:
+            require(
+                "did not validate and link" in str(error),
+                "CUDA summary input mutation failed for the wrong reason",
+            )
+        else:
+            raise CollectionError("forged CUDA build input hash unexpectedly passed")
+        staged_member = staged_lock.parent / staged["_members"][0]["path"]
+        staged_member.write_bytes(b"mutated staged closure\n")
+        try:
+            validate_native_operator_set(
+                staged_lock,
+                REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+        except NativeOperatorSetEvidenceError as error:
+            require(
+                "mismatch" in str(error),
+                "staged closure mutation failed for the wrong reason",
+            )
+        else:
+            raise CollectionError("mutated staged native closure unexpectedly passed")
     require(SHA256_RE.fullmatch(file_sha256(COLLECTOR_PATH)) is not None, "collector SHA is malformed")
     print(SELFTEST_PASS_LINE)
     return 0
@@ -1120,6 +1310,12 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--repo", type=Path, default=REPO_ROOT)
     collect_parser.add_argument("--model", type=Path, required=True)
     collect_parser.add_argument("--out", type=Path, required=True)
+    collect_parser.add_argument(
+        "--native-operator-set-lock",
+        type=Path,
+        required=True,
+        help="complete CUDA native operator artifact-set lock used by the product build",
+    )
     collect_parser.add_argument("--port-base", type=int, default=18101)
     collect_parser.add_argument(
         "--telemetry-interval-ms",
@@ -1146,6 +1342,12 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (CollectionError, OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (
+        CollectionError,
+        NativeOperatorSetEvidenceError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTOR FAIL: {error}", file=sys.stderr)
         raise SystemExit(1)
