@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -11,12 +12,32 @@ import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
 
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
+SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 5
+DEPENDENCY_DOMAIN_ORDER = {
+    "source": 0,
+    "backend_toolchain": 1,
+    "host_toolchain": 2,
+}
+REQUIRED_CUDA_TOOLKIT_FILES = {
+    "bin/bin2c",
+    "bin/cudafe++",
+    "bin/fatbinary",
+    "bin/nvcc",
+    "bin/nvlink",
+    "bin/ptxas",
+}
+REQUIRED_CUDA_TOOLKIT_SCOPES = (
+    "bin/crt/",
+    "include/",
+    "nvvm/bin/",
+    "nvvm/libdevice/",
+)
 PACKAGES = {
     "marlin": "ferrum.cuda.marlin",
     "vllm-marlin": "ferrum.cuda.vllm_marlin",
@@ -174,6 +195,566 @@ def verify_evidence_list(root: Path, values: Any, label: str, *, nonempty: bool)
     relative = [path.relative_to(root.resolve()).as_posix() for path in paths]
     require(relative == sorted(set(relative)), f"{label} paths must be sorted and unique")
     return paths
+
+
+DependencyIdentity = tuple[str, str, str]
+
+
+def require_absolute_posix_path(value: Any, label: str) -> str:
+    require(isinstance(value, str) and bool(value), f"{label} must be non-empty")
+    require("\\" not in value, f"{label} must use POSIX separators")
+    path = PurePosixPath(value)
+    require(
+        path.is_absolute()
+        and value == path.as_posix()
+        and all(part not in {"", ".", ".."} for part in path.parts[1:]),
+        f"{label} must be a normalized absolute path: {value!r}",
+    )
+    return value
+
+
+def require_relative_posix_path(value: Any, label: str) -> str:
+    require(isinstance(value, str) and bool(value), f"{label} must be non-empty")
+    require("\\" not in value, f"{label} must use POSIX separators")
+    path = PurePosixPath(value)
+    require(
+        not path.is_absolute()
+        and value == path.as_posix()
+        and all(part not in {"", ".", ".."} for part in path.parts),
+        f"{label} must be a normalized relative path: {value!r}",
+    )
+    return value
+
+
+def normalize_depfile_relative_path(value: str, label: str) -> str:
+    require("\\" not in value, f"{label} contains a non-portable separator")
+    parts: list[str] = []
+    for part in value.split("/"):
+        if part in {"", "."}:
+            continue
+        require(part != "..", f"{label} escapes its working directory: {value!r}")
+        parts.append(part)
+    require(bool(parts), f"{label} is empty after normalization")
+    return require_relative_posix_path("/".join(parts), label)
+
+
+def verify_tool_file_identity(value: Any, label: str) -> dict[str, Any]:
+    row = require_dict(value, label)
+    require(set(row) == {"path", "sha256", "size_bytes"}, f"{label} shape mismatch")
+    require_absolute_posix_path(row.get("path"), f"{label}.path")
+    require_sha(row.get("sha256"), f"{label}.sha256")
+    require(
+        isinstance(row.get("size_bytes"), int) and row["size_bytes"] > 0,
+        f"{label}.size_bytes must be positive",
+    )
+    return row
+
+
+def dependency_identity(value: Any, label: str) -> DependencyIdentity:
+    row = require_dict(value, label)
+    require(set(row) == {"domain", "path", "sha256"}, f"{label} shape mismatch")
+    domain = row.get("domain")
+    require(domain in DEPENDENCY_DOMAIN_ORDER, f"{label}.domain is unsupported: {domain!r}")
+    if domain == "host_toolchain":
+        path = require_absolute_posix_path(row.get("path"), f"{label}.path")
+    else:
+        path = require_relative_posix_path(row.get("path"), f"{label}.path")
+    digest = require_sha(row.get("sha256"), f"{label}.sha256")
+    return (domain, path, digest)
+
+
+def dependency_sort_key(value: DependencyIdentity) -> tuple[int, str, str]:
+    return (DEPENDENCY_DOMAIN_ORDER[value[0]], value[1], value[2])
+
+
+def verify_dependency_rows(values: Any, label: str) -> list[DependencyIdentity]:
+    rows = require_list(values, label)
+    require(bool(rows), f"{label} must not be empty")
+    identities = [
+        dependency_identity(row, f"{label}[{index}]") for index, row in enumerate(rows)
+    ]
+    require(
+        identities == sorted(set(identities), key=dependency_sort_key),
+        f"{label} must be strictly sorted and unique in dependency-domain order",
+    )
+    return identities
+
+
+def insert_toolchain_owner(
+    owners: dict[str, DependencyIdentity],
+    absolute_path: str,
+    identity: DependencyIdentity,
+    label: str,
+) -> None:
+    path = require_absolute_posix_path(absolute_path, label)
+    previous = owners.get(path)
+    require(
+        previous is None or previous == identity,
+        f"toolchain manifests ambiguously own {path}: {previous!r} versus {identity!r}",
+    )
+    owners[path] = identity
+
+
+def posix_join(root: str, relative: str) -> str:
+    return (PurePosixPath(root) / PurePosixPath(relative)).as_posix()
+
+
+def verify_toolchain_manifests(
+    static_identity: Any,
+    cuda_manifest_value: Any,
+    host_manifest_value: Any,
+    label: str,
+) -> tuple[dict[str, DependencyIdentity], set[DependencyIdentity]]:
+    static = require_dict(static_identity, f"{label}.static_identity")
+    require(
+        set(static)
+        == {
+            "backend",
+            "compiler_driver",
+            "cuda_toolkit",
+            "host_toolchain",
+            "archiver",
+        },
+        f"{label}.static_identity shape mismatch",
+    )
+    require(
+        static.get("backend") == "cuda"
+        and static.get("compiler_driver") == "cuda_nvcc",
+        f"{label} must use the explicit CUDA nvcc compiler driver",
+    )
+    verify_tool_file_identity(static.get("archiver"), f"{label}.archiver")
+
+    cuda = require_dict(static.get("cuda_toolkit"), f"{label}.cuda_toolkit")
+    require(
+        set(cuda) == {"canonical_root", "release_version", "nvcc", "manifest"},
+        f"{label}.cuda_toolkit shape mismatch",
+    )
+    cuda_root = require_absolute_posix_path(
+        cuda.get("canonical_root"), f"{label}.cuda_toolkit.canonical_root"
+    )
+    require(
+        isinstance(cuda.get("release_version"), str)
+        and re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", cuda["release_version"]) is not None,
+        f"{label}.cuda_toolkit.release_version is invalid",
+    )
+    nvcc = verify_tool_file_identity(cuda.get("nvcc"), f"{label}.cuda_toolkit.nvcc")
+    cuda_manifest = require_dict(cuda_manifest_value, f"{label}.cuda_manifest")
+    require(
+        set(cuda_manifest) == {"schema_version", "canonical_root", "entries"}
+        and cuda_manifest.get("schema_version") == 1
+        and cuda_manifest.get("canonical_root") == cuda_root,
+        f"{label}.cuda_manifest identity mismatch",
+    )
+    cuda_entries = require_list(cuda_manifest.get("entries"), f"{label}.cuda_manifest.entries")
+    require(bool(cuda_entries), f"{label}.cuda_manifest.entries must not be empty")
+
+    owners: dict[str, DependencyIdentity] = {}
+    allowed: set[DependencyIdentity] = set()
+    logical_paths: list[str] = []
+    selected_nvcc: dict[str, Any] | None = None
+    covered_scopes: set[str] = set()
+    for index, raw in enumerate(cuda_entries):
+        row = require_dict(raw, f"{label}.cuda_manifest.entries[{index}]")
+        require(
+            set(row) == {"logical_path", "resolved_path", "sha256", "size_bytes"},
+            f"{label}.cuda_manifest.entries[{index}] shape mismatch",
+        )
+        logical = require_relative_posix_path(
+            row.get("logical_path"), f"{label}.cuda_manifest.entries[{index}].logical_path"
+        )
+        resolved = require_relative_posix_path(
+            row.get("resolved_path"), f"{label}.cuda_manifest.entries[{index}].resolved_path"
+        )
+        digest = require_sha(
+            row.get("sha256"), f"{label}.cuda_manifest.entries[{index}].sha256"
+        )
+        require(
+            isinstance(row.get("size_bytes"), int) and row["size_bytes"] >= 0,
+            f"{label}.cuda_manifest.entries[{index}].size_bytes is invalid",
+        )
+        logical_paths.append(logical)
+        identity = ("backend_toolchain", logical, digest)
+        allowed.add(identity)
+        for relative in (logical, resolved):
+            absolute = posix_join(cuda_root, relative)
+            insert_toolchain_owner(
+                owners,
+                absolute,
+                identity,
+                f"{label}.cuda_manifest.entries[{index}]",
+            )
+            if absolute == nvcc["path"]:
+                selected_nvcc = row
+        for scope in REQUIRED_CUDA_TOOLKIT_SCOPES:
+            if logical.startswith(scope):
+                covered_scopes.add(scope)
+    require(
+        logical_paths == sorted(set(logical_paths)),
+        f"{label}.cuda_manifest entries must be strictly sorted by logical_path",
+    )
+    require(
+        REQUIRED_CUDA_TOOLKIT_FILES.issubset(logical_paths)
+        and covered_scopes == set(REQUIRED_CUDA_TOOLKIT_SCOPES),
+        f"{label}.cuda_manifest does not cover the required compiler inputs",
+    )
+    require(
+        selected_nvcc is not None
+        and selected_nvcc.get("sha256") == nvcc["sha256"]
+        and selected_nvcc.get("size_bytes") == nvcc["size_bytes"],
+        f"{label}.cuda_manifest does not bind the selected nvcc",
+    )
+
+    host = require_dict(static.get("host_toolchain"), f"{label}.host_toolchain")
+    require(
+        set(host) == {"compiler", "compiler_version", "target", "manifest"},
+        f"{label}.host_toolchain shape mismatch",
+    )
+    compiler = verify_tool_file_identity(host.get("compiler"), f"{label}.host_toolchain.compiler")
+    require(
+        isinstance(host.get("compiler_version"), str) and bool(host["compiler_version"].strip()),
+        f"{label}.host_toolchain.compiler_version is missing",
+    )
+    require(
+        isinstance(host.get("target"), str)
+        and bool(host["target"])
+        and len(host["target"]) <= 256
+        and not any(character.isspace() for character in host["target"]),
+        f"{label}.host_toolchain.target is invalid",
+    )
+    host_manifest = require_dict(host_manifest_value, f"{label}.host_manifest")
+    require(
+        set(host_manifest)
+        == {
+            "schema_version",
+            "compiler",
+            "compiler_version",
+            "target",
+            "executable_inputs",
+            "include_roots",
+            "include_probe_sha256",
+            "driver_probe_sha256",
+            "discovery_roots",
+            "files",
+        }
+        and host_manifest.get("schema_version") == 2
+        and host_manifest.get("compiler") == compiler
+        and host_manifest.get("compiler_version") == host["compiler_version"]
+        and host_manifest.get("target") == host["target"],
+        f"{label}.host_manifest identity mismatch",
+    )
+    require_sha(
+        host_manifest.get("include_probe_sha256"), f"{label}.host_manifest.include_probe_sha256"
+    )
+    require_sha(
+        host_manifest.get("driver_probe_sha256"), f"{label}.host_manifest.driver_probe_sha256"
+    )
+    executable_inputs = [
+        verify_tool_file_identity(row, f"{label}.host_manifest.executable_inputs[{index}]")
+        for index, row in enumerate(
+            require_list(
+                host_manifest.get("executable_inputs"),
+                f"{label}.host_manifest.executable_inputs",
+            )
+        )
+    ]
+    executable_paths = [row["path"] for row in executable_inputs]
+    require(
+        executable_paths == sorted(set(executable_paths)) and compiler in executable_inputs,
+        f"{label}.host_manifest executable inputs are unordered or omit the compiler",
+    )
+    include_roots = [
+        require_absolute_posix_path(row, f"{label}.host_manifest.include_roots[{index}]")
+        for index, row in enumerate(
+            require_list(host_manifest.get("include_roots"), f"{label}.host_manifest.include_roots")
+        )
+    ]
+    discovery_roots = [
+        require_absolute_posix_path(row, f"{label}.host_manifest.discovery_roots[{index}]")
+        for index, row in enumerate(
+            require_list(
+                host_manifest.get("discovery_roots"),
+                f"{label}.host_manifest.discovery_roots",
+            )
+        )
+    ]
+    require(
+        bool(include_roots) and len(include_roots) == len(set(include_roots)),
+        f"{label}.host_manifest include roots must be non-empty and unique",
+    )
+    require(
+        discovery_roots == sorted(set(discovery_roots)) and bool(discovery_roots),
+        f"{label}.host_manifest discovery roots must be sorted, unique, and non-empty",
+    )
+    require(
+        all(
+            PurePosixPath(path).parent.as_posix() in discovery_roots
+            for path in executable_paths
+        )
+        and all(
+            any(PurePosixPath(path).parent.as_posix() == root for path in executable_paths)
+            for root in discovery_roots
+        ),
+        f"{label}.host_manifest does not bind executable inputs to discovery roots",
+    )
+
+    host_files = require_list(host_manifest.get("files"), f"{label}.host_manifest.files")
+    require(bool(host_files), f"{label}.host_manifest.files must not be empty")
+    host_logical_paths: list[str] = []
+    ownership_roots = [PurePosixPath(root) for root in (*include_roots, *discovery_roots)]
+    for index, raw in enumerate(host_files):
+        row = require_dict(raw, f"{label}.host_manifest.files[{index}]")
+        require(
+            set(row) == {"logical_path", "resolved_path", "sha256", "size_bytes"},
+            f"{label}.host_manifest.files[{index}] shape mismatch",
+        )
+        logical = require_absolute_posix_path(
+            row.get("logical_path"), f"{label}.host_manifest.files[{index}].logical_path"
+        )
+        resolved = require_absolute_posix_path(
+            row.get("resolved_path"), f"{label}.host_manifest.files[{index}].resolved_path"
+        )
+        digest = require_sha(row.get("sha256"), f"{label}.host_manifest.files[{index}].sha256")
+        require(
+            isinstance(row.get("size_bytes"), int) and row["size_bytes"] >= 0,
+            f"{label}.host_manifest.files[{index}].size_bytes is invalid",
+        )
+        require(
+            any(PurePosixPath(logical).is_relative_to(root) for root in ownership_roots),
+            f"{label}.host_manifest.files[{index}] is outside declared roots",
+        )
+        host_logical_paths.append(logical)
+        identity = ("host_toolchain", logical, digest)
+        allowed.add(identity)
+        for absolute in (logical, resolved):
+            insert_toolchain_owner(
+                owners,
+                absolute,
+                identity,
+                f"{label}.host_manifest.files[{index}]",
+            )
+    require(
+        host_logical_paths == sorted(set(host_logical_paths)),
+        f"{label}.host_manifest files must be strictly sorted by logical_path",
+    )
+    return owners, allowed
+
+
+def verify_source_plan_dependencies(
+    plan: Any, label: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[set[DependencyIdentity]]]:
+    value = require_dict(plan, label)
+    translation_units = [
+        require_dict(row, f"{label}.translation_units[{index}]")
+        for index, row in enumerate(
+            require_list(value.get("translation_units"), f"{label}.translation_units")
+        )
+    ]
+    headers = [
+        require_dict(row, f"{label}.headers[{index}]")
+        for index, row in enumerate(require_list(value.get("headers"), f"{label}.headers"))
+    ]
+    for collection_name, rows in (
+        ("translation_units", translation_units),
+        ("headers", headers),
+    ):
+        for index, row in enumerate(rows):
+            require(
+                set(row) == {"path", "sha256"},
+                f"{label}.{collection_name}[{index}] shape mismatch",
+            )
+            require_relative_posix_path(
+                row.get("path"), f"{label}.{collection_name}[{index}].path"
+            )
+            require_sha(row.get("sha256"), f"{label}.{collection_name}[{index}].sha256")
+        paths = [row["path"] for row in rows]
+        require(
+            paths == sorted(set(paths)) and (collection_name != "translation_units" or bool(paths)),
+            f"{label}.{collection_name} must be sorted and unique",
+        )
+    header_by_path = {row["path"]: row for row in headers}
+    closures = [
+        require_dict(row, f"{label}.dependency_closures[{index}]")
+        for index, row in enumerate(
+            require_list(value.get("dependency_closures"), f"{label}.dependency_closures")
+        )
+    ]
+    require(
+        len(closures) == len(translation_units),
+        f"{label} must contain one dependency closure per translation unit",
+    )
+    expected_by_unit: list[set[DependencyIdentity]] = []
+    for index, (translation_unit, closure) in enumerate(zip(translation_units, closures)):
+        require(
+            set(closure) == {
+                "translation_unit",
+                "headers",
+                "closure_sha256",
+            }
+            and closure.get("translation_unit") == translation_unit["path"],
+            f"{label}.dependency_closures[{index}] identity mismatch",
+        )
+        closure_headers = [
+            require_dict(row, f"{label}.dependency_closures[{index}].headers[{header_index}]")
+            for header_index, row in enumerate(
+                require_list(
+                    closure.get("headers"),
+                    f"{label}.dependency_closures[{index}].headers",
+                )
+            )
+        ]
+        closure_paths = [row.get("path") for row in closure_headers]
+        require(
+            closure_paths == sorted(set(closure_paths))
+            and all(header_by_path.get(row.get("path")) == row for row in closure_headers),
+            f"{label}.dependency_closures[{index}] contains an unknown or unordered header",
+        )
+        closure_payload = {
+            "translation_unit": translation_unit,
+            "headers": closure_headers,
+        }
+        closure_digest = hashlib.sha256(
+            json.dumps(
+                closure_payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        require(
+            closure.get("closure_sha256") == closure_digest,
+            f"{label}.dependency_closures[{index}] SHA256 mismatch",
+        )
+        expected = {
+            ("source", translation_unit["path"], translation_unit["sha256"]),
+            *(
+                ("source", row["path"], row["sha256"])
+                for row in closure_headers
+            ),
+        }
+        expected_by_unit.append(expected)
+    return translation_units, closures, expected_by_unit
+
+
+def parse_make_words(value: str, label: str) -> list[str]:
+    words: list[str] = []
+    word: list[str] = []
+    escaped = False
+    for character in value:
+        if escaped:
+            word.append(character)
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character.isspace():
+            if word:
+                words.append("".join(word))
+                word = []
+        else:
+            word.append(character)
+    require(not escaped, f"{label} ends with an incomplete escape")
+    if word:
+        words.append("".join(word))
+    return words
+
+
+def parse_make_depfile(raw: str, label: str) -> tuple[str, list[str]]:
+    require(bool(raw.strip()) and "\0" not in raw, f"{label} is empty or contains NUL")
+    normalized = raw.replace("\\\r\n", "").replace("\\\n", "").rstrip("\r\n")
+    require("\n" not in normalized and "\r" not in normalized, f"{label} has multiple rules")
+    escaped = False
+    delimiter: int | None = None
+    for index, character in enumerate(normalized):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == ":":
+            delimiter = index
+            break
+    require(delimiter is not None, f"{label} has no target delimiter")
+    targets = parse_make_words(normalized[:delimiter], label)
+    dependencies = parse_make_words(normalized[delimiter + 1 :], label)
+    require(
+        len(targets) == 1 and bool(dependencies),
+        f"{label} must contain exactly one target and at least one dependency",
+    )
+    return targets[0], dependencies
+
+
+def verify_translation_unit_dependency_evidence(
+    command: dict[str, Any],
+    depfile_path: Path,
+    expected_source: set[DependencyIdentity],
+    toolchain_owners: dict[str, DependencyIdentity],
+    allowed_toolchain: set[DependencyIdentity],
+    label: str,
+) -> list[DependencyIdentity]:
+    working_directory = require_absolute_posix_path(
+        command.get("depfile_producer_working_directory"),
+        f"{label}.depfile_producer_working_directory",
+    )
+    producer_object = require_absolute_posix_path(
+        command.get("depfile_producer_object_file"),
+        f"{label}.depfile_producer_object_file",
+    )
+    current_object = require_absolute_posix_path(command.get("object_file"), f"{label}.object_file")
+    require(
+        PurePosixPath(producer_object).name == PurePosixPath(current_object).name,
+        f"{label} producer object basename differs from the current object",
+    )
+    observed = verify_dependency_rows(command.get("observed_dependencies"), f"{label}.observed")
+    observed_source = {row for row in observed if row[0] == "source"}
+    require(
+        observed_source == expected_source,
+        f"{label} source dependencies differ from the exact translation-unit closure",
+    )
+    require(
+        all(row[0] == "source" or row in allowed_toolchain for row in observed),
+        f"{label} contains a dependency absent from the toolchain manifests",
+    )
+
+    try:
+        raw = depfile_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise VerificationError(f"cannot read {label} depfile: {error}") from error
+    target, dependencies = parse_make_depfile(raw, f"{label}.depfile")
+    require(target == producer_object, f"{label} depfile target differs from its producer object")
+
+    expected_by_path = {row[1]: row for row in expected_source}
+    working = PurePosixPath(working_directory)
+    parsed: set[DependencyIdentity] = set()
+    for raw_dependency in dependencies:
+        path = PurePosixPath(raw_dependency)
+        if path.is_absolute() and not path.is_relative_to(working):
+            identity = toolchain_owners.get(path.as_posix())
+            require(
+                identity is not None,
+                f"{label} depfile contains an unmanifested external dependency: {raw_dependency}",
+            )
+        else:
+            if path.is_absolute():
+                relative_raw = path.relative_to(working).as_posix()
+            else:
+                relative_raw = raw_dependency
+            relative = normalize_depfile_relative_path(
+                relative_raw, f"{label}.depfile dependency"
+            )
+            identity = expected_by_path.get(relative)
+            require(
+                identity is not None,
+                f"{label} depfile contains an undeclared source dependency: {relative}",
+            )
+        require(identity not in parsed, f"{label} depfile contains a duplicate dependency")
+        parsed.add(identity)
+    require(
+        {row for row in parsed if row[0] == "source"} == expected_source,
+        f"{label} depfile differs from the exact translation-unit closure",
+    )
+    parsed_rows = sorted(parsed, key=dependency_sort_key)
+    require(
+        parsed_rows == observed,
+        f"{label} raw depfile semantics differ from typed receipt evidence",
+    )
+    return observed
 
 
 def collect_artifact_index(root: Path) -> list[dict[str, Any]]:
@@ -421,12 +1002,13 @@ def verify_source_build(
     plan_path = source_root / f"native-operators/cuda/source-locks/{name}.plan.json"
     plan = require_dict(read_json(plan_path, f"{name} source plan"), f"{name} source plan")
     require(
-        receipt.get("schema_version") == 4
+        receipt.get("schema_version") == SOURCE_BUILD_RECEIPT_SCHEMA_VERSION
         and receipt.get("status") == "pass"
         and receipt.get("plan_only") is False
         and receipt.get("failure_class") is None,
-        f"{name} source build is not a terminal schema-v4 PASS",
+        f"{name} source build is not a terminal schema-v5 PASS",
     )
+    require(plan.get("schema_version") == 3, f"{name} source plan schema mismatch")
     require(receipt.get("operator") == operator == plan.get("operator"), f"{name} source operator mismatch")
     require(receipt.get("plan_sha256") == sha256(plan_path), f"{name} source plan pin mismatch")
     require(receipt.get("source_package") == plan.get("source_package"), f"{name} source package mismatch")
@@ -442,29 +1024,86 @@ def verify_source_build(
     static_identity = require_dict(receipt["toolchain"].get("static_identity"), f"{name}.toolchain.static_identity")
     cuda_toolkit = require_dict(static_identity.get("cuda_toolkit"), f"{name}.toolchain.cuda_toolkit")
     host_toolchain = require_dict(static_identity.get("host_toolchain"), f"{name}.toolchain.host_toolchain")
-    verify_evidence(build_root, cuda_toolkit.get("manifest"), f"{name}.cuda_toolkit.manifest")
-    verify_evidence(build_root, host_toolchain.get("manifest"), f"{name}.host_toolchain.manifest")
+    cuda_manifest_path = verify_evidence(
+        build_root, cuda_toolkit.get("manifest"), f"{name}.cuda_toolkit.manifest"
+    )
+    host_manifest_path = verify_evidence(
+        build_root, host_toolchain.get("manifest"), f"{name}.host_toolchain.manifest"
+    )
+    toolchain_owners, allowed_toolchain = verify_toolchain_manifests(
+        static_identity,
+        read_json(cuda_manifest_path, f"{name} CUDA toolkit manifest"),
+        read_json(host_manifest_path, f"{name} host toolchain manifest"),
+        f"{name}.toolchain",
+    )
+    translation_units, closures, expected_dependencies = verify_source_plan_dependencies(
+        plan, f"{name}.plan"
+    )
+    locked_source_root = source_root / "crates/ferrum-kernels"
+    for collection in (translation_units, require_list(plan.get("headers"), f"{name}.plan.headers")):
+        for row in collection:
+            path = resolve_relative_file(
+                locked_source_root,
+                row.get("path"),
+                f"{name}.locked_source.{row.get('path')}",
+            )
+            require(
+                sha256(path) == row.get("sha256"),
+                f"{name} locked source SHA mismatch: {row.get('path')}",
+            )
 
     commands = require_list(receipt.get("commands"), f"{name}.commands")
-    require(bool(commands), f"{name} source build commands must not be empty")
-    for index, raw in enumerate(commands):
+    require(
+        len(commands) == len(translation_units) + 1,
+        f"{name} must contain one command per translation unit plus one archive command",
+    )
+    observed_compiled: list[str] = []
+    observed_hits: list[str] = []
+    expected_working_directory: str | None = None
+    for index, (translation_unit, closure, expected_source) in enumerate(
+        zip(translation_units, closures, expected_dependencies)
+    ):
+        raw = commands[index]
         command = require_dict(raw, f"{name}.commands[{index}]")
+        require(
+            command.get("translation_unit") == translation_unit["path"]
+            and command.get("dependency_closure_sha256") == closure["closure_sha256"],
+            f"{name}.commands[{index}] does not bind its exact translation-unit closure",
+        )
+        working_directory = require_absolute_posix_path(
+            command.get("working_directory"), f"{name}.commands[{index}].working_directory"
+        )
+        if expected_working_directory is None:
+            expected_working_directory = working_directory
+        require(
+            working_directory == expected_working_directory,
+            f"{name}.commands[{index}] working directory differs from the build plan",
+        )
         object_file = command.get("object_file")
-        if object_file is None:
-            require(
-                command.get("translation_unit") is None
-                and command.get("compiler_executed") is False
-                and command.get("return_code") == 0
-                and command.get("object_cache_status") is None,
-                f"{name}.commands[{index}] archive execution mismatch",
-            )
-        elif command.get("compiler_executed") is True:
+        require_absolute_posix_path(object_file, f"{name}.commands[{index}].object_file")
+        require_sha(command.get("object_cache_key"), f"{name}.commands[{index}].object_cache_key")
+        require(
+            isinstance(command.get("object_cache_entry"), str)
+            and bool(command["object_cache_entry"]),
+            f"{name}.commands[{index}] object cache entry is missing",
+        )
+        require_sha(command.get("object_sha256"), f"{name}.commands[{index}].object_sha256")
+        require(
+            isinstance(command.get("object_size_bytes"), int)
+            and command["object_size_bytes"] > 0
+            and isinstance(command.get("object_identity"), dict)
+            and isinstance(command.get("elapsed_ms"), int)
+            and command["elapsed_ms"] >= 0,
+            f"{name}.commands[{index}] object identity/timing evidence is incomplete",
+        )
+        if command.get("compiler_executed") is True:
             require(
                 command.get("return_code") == 0
                 and command.get("object_cache_status") == "published"
                 and command.get("dependency_validation") == "depfile",
                 f"{name}.commands[{index}] compiler execution mismatch",
             )
+            observed_compiled.append(translation_unit["path"])
         else:
             require(
                 command.get("compiler_executed") is False
@@ -473,29 +1112,107 @@ def verify_source_build(
                 and command.get("dependency_validation") == "cache_proof",
                 f"{name}.commands[{index}] cache-hit execution mismatch",
             )
+            observed_hits.append(translation_unit["path"])
         for stream in ("stdout_log", "stderr_log"):
             path = resolve_relative_file(build_root, command.get(stream), f"{name}.commands[{index}].{stream}")
             require(path.stat().st_size > 0, f"{name}.commands[{index}].{stream} is empty")
         depfile = command.get("depfile")
-        if depfile is not None:
-            depfile_path = resolve_relative_file(build_root, depfile, f"{name}.commands[{index}].depfile")
-            require_sha(command.get("depfile_sha256"), f"{name}.commands[{index}].depfile_sha256")
-            require(sha256(depfile_path) == command["depfile_sha256"], f"{name}.commands[{index}] depfile SHA mismatch")
-        if object_file is not None:
-            object_path = build_root / "objects" / Path(object_file).name
-            require(object_path.is_file() and not object_path.is_symlink(), f"{name} object is missing: {object_path}")
-            require_sha(command.get("object_sha256"), f"{name}.commands[{index}].object_sha256")
-            require(sha256(object_path) == command["object_sha256"], f"{name}.commands[{index}] object SHA mismatch")
+        depfile_path = resolve_relative_file(
+            build_root, depfile, f"{name}.commands[{index}].depfile"
+        )
+        require_sha(command.get("depfile_sha256"), f"{name}.commands[{index}].depfile_sha256")
+        require(
+            sha256(depfile_path) == command["depfile_sha256"],
+            f"{name}.commands[{index}] depfile SHA mismatch",
+        )
+        verify_translation_unit_dependency_evidence(
+            command,
+            depfile_path,
+            expected_source,
+            toolchain_owners,
+            allowed_toolchain,
+            f"{name}.commands[{index}]",
+        )
+        if command.get("object_cache_status") == "published":
             require(
-                object_path.stat().st_size == command.get("object_size_bytes"),
-                f"{name}.commands[{index}] object size mismatch",
+                command.get("depfile_producer_working_directory") == working_directory
+                and command.get("depfile_producer_object_file") == object_file,
+                f"{name}.commands[{index}] published depfile producer identity mismatch",
             )
+        object_path = build_root / "objects" / PurePosixPath(object_file).name
+        require(
+            object_path.is_file() and not object_path.is_symlink(),
+            f"{name} object is missing: {object_path}",
+        )
+        require(
+            sha256(object_path) == command["object_sha256"],
+            f"{name}.commands[{index}] object SHA mismatch",
+        )
+        require(
+            object_path.stat().st_size == command.get("object_size_bytes"),
+            f"{name}.commands[{index}] object size mismatch",
+        )
 
-    translation_units = [row["path"] for row in require_list(plan.get("translation_units"), f"{name}.plan.translation_units")]
+    archive_command = require_dict(commands[-1], f"{name}.commands.archive")
+    require(
+        archive_command.get("translation_unit") is None
+        and archive_command.get("object_file") is None
+        and archive_command.get("object_cache_key") is None
+        and archive_command.get("object_cache_status") is None
+        and archive_command.get("object_cache_entry") is None
+        and archive_command.get("object_sha256") is None
+        and archive_command.get("object_size_bytes") is None
+        and archive_command.get("object_identity") is None
+        and archive_command.get("dependency_closure_sha256") is None
+        and archive_command.get("dependency_validation") is None
+        and archive_command.get("depfile") is None
+        and archive_command.get("depfile_sha256") is None
+        and archive_command.get("depfile_producer_working_directory") is None
+        and archive_command.get("depfile_producer_object_file") is None
+        and archive_command.get("observed_dependencies") == []
+        and archive_command.get("compiler_executed") is False
+        and archive_command.get("return_code") == 0
+        and isinstance(archive_command.get("elapsed_ms"), int)
+        and archive_command["elapsed_ms"] >= 0,
+        f"{name} archive command is not terminal",
+    )
+    require(
+        archive_command.get("working_directory") == expected_working_directory,
+        f"{name} archive command working directory mismatch",
+    )
+    for stream in ("stdout_log", "stderr_log"):
+        path = resolve_relative_file(
+            build_root, archive_command.get(stream), f"{name}.commands.archive.{stream}"
+        )
+        require(path.stat().st_size > 0, f"{name}.commands.archive.{stream} is empty")
+
     compiled = require_list(receipt.get("compiled_translation_units"), f"{name}.compiled_translation_units")
     hits = require_list(receipt.get("cache_hit_translation_units"), f"{name}.cache_hit_translation_units")
-    require(not set(compiled) & set(hits), f"{name} translation unit is both compiled and cache-hit")
-    require(set(compiled) | set(hits) == set(translation_units), f"{name} source-build coverage mismatch")
+    require(
+        compiled == observed_compiled
+        and hits == observed_hits
+        and compiled == sorted(set(compiled))
+        and hits == sorted(set(hits)),
+        f"{name} compiled/cache-hit summaries differ from command evidence",
+    )
+    miss_probe = receipt["toolchain"].get("miss_probe")
+    if compiled:
+        probe = require_dict(miss_probe, f"{name}.toolchain.miss_probe")
+        require(
+            probe.get("probed_for_misses") == compiled
+            and all(
+                isinstance(probe.get(field), str) and bool(probe[field].strip())
+                for field in (
+                    "nvcc_version",
+                    "host_compiler_version",
+                    "host_target",
+                    "archiver_version",
+                )
+            ),
+            f"{name} miss-only toolchain probe differs from compiled commands",
+        )
+    else:
+        require(miss_probe is None, f"{name} cache-only build unexpectedly ran a miss probe")
     archive_file = receipt.get("archive_file")
     require(archive_file == plan.get("archive_file"), f"{name} archive filename mismatch")
     archive = resolve_relative_file(build_root, archive_file, f"{name}.archive")
@@ -901,6 +1618,279 @@ def self_test() -> None:
         link = root / "payload-link"
         os.symlink(payload.name, link)
         expect_reject(lambda: collect_artifact_index(root), "artifact symlink")
+
+        def digest(value: str) -> str:
+            return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+        cuda_root = "/cuda"
+        cuda_paths = sorted(
+            {
+                *REQUIRED_CUDA_TOOLKIT_FILES,
+                "bin/crt/link.stub",
+                "include/cuda.h",
+                "nvvm/bin/cicc",
+                "nvvm/libdevice/libdevice.10.bc",
+            }
+        )
+        cuda_entries = [
+            {
+                "logical_path": path,
+                "resolved_path": path,
+                "sha256": digest(f"cuda:{path}"),
+                "size_bytes": 1,
+            }
+            for path in cuda_paths
+        ]
+        nvcc_entry = next(row for row in cuda_entries if row["logical_path"] == "bin/nvcc")
+        host_compiler = {
+            "path": "/host/bin/c++",
+            "sha256": digest("host:c++"),
+            "size_bytes": 1,
+        }
+        host_cc1plus = {
+            "path": "/host/bin/cc1plus",
+            "sha256": digest("host:cc1plus"),
+            "size_bytes": 1,
+        }
+        static_identity = {
+            "backend": "cuda",
+            "compiler_driver": "cuda_nvcc",
+            "cuda_toolkit": {
+                "canonical_root": cuda_root,
+                "release_version": "12.4",
+                "nvcc": {
+                    "path": "/cuda/bin/nvcc",
+                    "sha256": nvcc_entry["sha256"],
+                    "size_bytes": 1,
+                },
+                "manifest": {"path": "toolchain/cuda.json", "sha256": digest("cuda"), "size_bytes": 1},
+            },
+            "host_toolchain": {
+                "compiler": host_compiler,
+                "compiler_version": "fixture cc 1.0",
+                "target": "x86_64-ferrum-linux-gnu",
+                "manifest": {"path": "toolchain/host.json", "sha256": digest("host"), "size_bytes": 1},
+            },
+            "archiver": {
+                "path": "/usr/bin/ar",
+                "sha256": digest("ar"),
+                "size_bytes": 1,
+            },
+        }
+        cuda_manifest = {
+            "schema_version": 1,
+            "canonical_root": cuda_root,
+            "entries": cuda_entries,
+        }
+        host_files = [
+            {
+                "logical_path": "/host/bin/c++",
+                "resolved_path": "/host/bin/c++",
+                "sha256": host_compiler["sha256"],
+                "size_bytes": 1,
+            },
+            {
+                "logical_path": "/host/bin/cc1plus",
+                "resolved_path": "/host/bin/cc1plus",
+                "sha256": host_cc1plus["sha256"],
+                "size_bytes": 1,
+            },
+            {
+                "logical_path": "/host/include/stddef.h",
+                "resolved_path": "/host/include/stddef.h",
+                "sha256": digest("host:stddef"),
+                "size_bytes": 1,
+            },
+        ]
+        host_manifest = {
+            "schema_version": 2,
+            "compiler": host_compiler,
+            "compiler_version": "fixture cc 1.0",
+            "target": "x86_64-ferrum-linux-gnu",
+            "executable_inputs": [host_compiler, host_cc1plus],
+            "include_roots": ["/host/include"],
+            "include_probe_sha256": digest("include-probe"),
+            "driver_probe_sha256": digest("driver-probe"),
+            "discovery_roots": ["/host/bin"],
+            "files": host_files,
+        }
+        owners, allowed = verify_toolchain_manifests(
+            static_identity,
+            cuda_manifest,
+            host_manifest,
+            "selftest.toolchain",
+        )
+
+        source_unit = ("source", "kernels/a.cu", digest("a.cu"))
+        source_header = ("source", "kernels/a.h", digest("a.h"))
+        backend_header = (
+            "backend_toolchain",
+            "include/cuda.h",
+            digest("cuda:include/cuda.h"),
+        )
+        host_header = (
+            "host_toolchain",
+            "/host/include/stddef.h",
+            digest("host:stddef"),
+        )
+        identities = [source_unit, source_header, backend_header, host_header]
+        command = {
+            "object_file": "/new/objects/00000000-a.o",
+            "depfile_producer_working_directory": "/src",
+            "depfile_producer_object_file": "/old/objects/00000000-a.o",
+            "observed_dependencies": [
+                {"domain": domain, "path": path, "sha256": dependency_sha}
+                for domain, path, dependency_sha in identities
+            ],
+        }
+        depfile = root / "dependency.d"
+        depfile.write_text(
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        expected_source = {source_unit, source_header}
+        verify_translation_unit_dependency_evidence(
+            command,
+            depfile,
+            expected_source,
+            owners,
+            allowed,
+            "selftest.command",
+        )
+
+        tampered_identity = copy.deepcopy(command)
+        tampered_identity["observed_dependencies"][2]["sha256"] = digest("forged")
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                tampered_identity,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.tampered_identity",
+            ),
+            "typed dependency SHA forgery",
+        )
+        unsorted = copy.deepcopy(command)
+        unsorted["observed_dependencies"].reverse()
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                unsorted,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.unsorted",
+            ),
+            "typed dependency order",
+        )
+        unknown_domain = copy.deepcopy(command)
+        unknown_domain["observed_dependencies"][0]["domain"] = "rocm_guess"
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                unknown_domain,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.unknown_domain",
+            ),
+            "unknown dependency domain",
+        )
+        relative_producer = copy.deepcopy(command)
+        relative_producer["depfile_producer_working_directory"] = "src"
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                relative_producer,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.relative_producer",
+            ),
+            "relative producer root",
+        )
+        depfile.write_text(
+            "/wrong/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                command,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.wrong_target",
+            ),
+            "same-basename wrong-directory target",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/include/cuda.h /host/include/stddef.h /tmp/generated.h\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                command,
+                depfile,
+                expected_source,
+                owners,
+                allowed,
+                "selftest.unmanifested_external",
+            ),
+            "unmanifested external dependency",
+        )
+        depfile.write_text(
+            "/old/objects/00000000-a.o: /src/kernels/a.cu /src/kernels/a.h "
+            "/cuda/include/cuda.h /host/include/stddef.h\n",
+            encoding="utf-8",
+        )
+        expect_reject(
+            lambda: verify_translation_unit_dependency_evidence(
+                command,
+                depfile,
+                {source_unit},
+                owners,
+                allowed,
+                "selftest.wrong_tu_closure",
+            ),
+            "wrong translation-unit closure",
+        )
+
+        wrong_driver = copy.deepcopy(static_identity)
+        wrong_driver["compiler_driver"] = "hip_clang"
+        expect_reject(
+            lambda: verify_toolchain_manifests(
+                wrong_driver,
+                cuda_manifest,
+                host_manifest,
+                "selftest.wrong_driver",
+            ),
+            "backend/compiler-driver rewrite",
+        )
+        colliding_host = copy.deepcopy(host_manifest)
+        colliding_host["include_roots"].append("/cuda/include")
+        colliding_host["files"].append(
+            {
+                "logical_path": "/cuda/include/cuda.h",
+                "resolved_path": "/cuda/include/cuda.h",
+                "sha256": digest("host-owned-cuda-header"),
+                "size_bytes": 1,
+            }
+        )
+        colliding_host["files"].sort(key=lambda row: row["logical_path"])
+        expect_reject(
+            lambda: verify_toolchain_manifests(
+                static_identity,
+                cuda_manifest,
+                colliding_host,
+                "selftest.cross_domain_alias",
+            ),
+            "CUDA/host ownership collision",
+        )
     print("FERRUM RUNTIME VNEXT G07B NATIVE CHAIN VALIDATOR SELFTEST PASS")
 
 

@@ -1075,6 +1075,14 @@ fn validate_source_build_for_package(
                         .depfile_sha256
                         .as_deref()
                         .is_some_and(is_sha256_digest)
+                    && command
+                        .depfile_producer_working_directory
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_absolute())
+                    && command
+                        .depfile_producer_object_file
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_absolute())
                     && !command.observed_dependencies.is_empty() =>
             {
                 observed_cache_hits.push(translation_unit.to_string());
@@ -1092,6 +1100,14 @@ fn validate_source_build_for_package(
                         .depfile_sha256
                         .as_deref()
                         .is_some_and(is_sha256_digest)
+                    && command
+                        .depfile_producer_working_directory
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_absolute())
+                    && command
+                        .depfile_producer_object_file
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_absolute())
                     && !command.observed_dependencies.is_empty() =>
             {
                 observed_compiled.push(translation_unit.to_string());
@@ -1116,6 +1132,8 @@ fn validate_source_build_for_package(
         || archive_command.dependency_validation.is_some()
         || archive_command.depfile.is_some()
         || archive_command.depfile_sha256.is_some()
+        || archive_command.depfile_producer_working_directory.is_some()
+        || archive_command.depfile_producer_object_file.is_some()
         || !archive_command.observed_dependencies.is_empty()
         || archive_command.return_code != Some(0)
         || archive_command.elapsed_ms.is_none()
@@ -3525,12 +3543,10 @@ mod tests {
             "relocated",
             exports,
         );
-        let mut source_build: NativeOperatorSourceBuildReceipt =
-            read_json(&source_build_receipt).unwrap();
-        for command in &mut source_build.commands {
-            command.working_directory = "/workspace/remote/ferrum-infer-rs".to_string();
-        }
-        write_json(&source_build_receipt, &source_build).unwrap();
+        let original_source_build_root = source_build_receipt.parent().unwrap();
+        let relocated_source_build_root = root.path().join("relocated-source-build-evidence");
+        fs::rename(original_source_build_root, &relocated_source_build_root).unwrap();
+        let source_build_receipt = relocated_source_build_root.join("source-build.receipt.json");
         let spec = package_spec(
             CudaNativeBuildUnit::Marlin.artifact_operator(),
             "operation.dense_linear",
@@ -4131,11 +4147,11 @@ mod tests {
             .parent()
             .unwrap()
             .join(&depfile_relative);
-        let object_name = Path::new(command.object_file.as_deref().unwrap())
-            .file_name()
-            .unwrap()
-            .to_string_lossy();
-        let forged = format!("{object_name}: fixture.cu forged.h\n");
+        let producer_object = command
+            .depfile_producer_object_file
+            .as_deref()
+            .expect("compiled command records the depfile producer object");
+        let forged = format!("{producer_object}: fixture.cu forged.h\n");
         fs::write(&depfile_path, forged.as_bytes()).unwrap();
         command.depfile_sha256 = Some(sha256_bytes(forged.as_bytes()));
         write_json(&source_receipt_path, &source_receipt).unwrap();
@@ -4165,7 +4181,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("portable depfile differs from locked dependency closure"));
+            .contains("portable depfile contains an undeclared source dependency: forged.h"));
         assert!(!lock_path.exists());
     }
 
