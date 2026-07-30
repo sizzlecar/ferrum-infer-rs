@@ -87,8 +87,10 @@ PROFILE_REPEAT_COUNT = 3
 PROFILE_REQUESTS_PER_REPEAT = 4
 PROFILE_WARMUP_REQUESTS = 1
 PROFILE_EXPECTED_REQUESTS_PER_SLOT = 15
-PROFILE_EXPECTED_NODES_PER_REQUEST = 131
-PROFILE_EXPECTED_EVENTS_PER_REQUEST = 399
+PROFILE_SELFTEST_NODES_PER_REQUEST = 132
+PRODUCT_REQUEST_PREFIX = "request.product."
+STARTUP_REQUEST_PREFIX = "request.startup."
+DIAGNOSTIC_REQUEST_PREFIX = "request.diagnostic."
 PROFILE_MAX_BYTES_PER_REQUEST = 1024 * 1024
 PROFILE_MAX_OVERHEAD = 0.02
 PROFILE_MAX_CV = 0.05
@@ -324,6 +326,20 @@ def validate_resource_balance(rows: list[dict[str, Any]], label: str) -> dict[st
     }
 
 
+def request_origin(request_id: str, label: str) -> str:
+    prefixes = {
+        "product": PRODUCT_REQUEST_PREFIX,
+        "startup": STARTUP_REQUEST_PREFIX,
+        "diagnostic": DIAGNOSTIC_REQUEST_PREFIX,
+    }
+    matches = [origin for origin, prefix in prefixes.items() if request_id.startswith(prefix)]
+    require(
+        len(matches) == 1 and len(request_id) > len(prefixes[matches[0]]),
+        f"{label}: request id has no typed origin: {request_id}",
+    )
+    return matches[0]
+
+
 def validate_vnext_trace(rows: list[dict[str, Any]], entrypoint: str) -> dict[str, Any]:
     events = [
         row
@@ -333,6 +349,7 @@ def validate_vnext_trace(rows: list[dict[str, Any]], entrypoint: str) -> dict[st
     ]
     require(events, f"{entrypoint}: no typed vNext execution events")
     by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    origins: Counter[str] = Counter()
     kinds: Counter[str] = Counter()
     for row in events:
         require(row.get("schema_version") == 1, f"{entrypoint}: wrong profile schema")
@@ -348,6 +365,19 @@ def validate_vnext_trace(rows: list[dict[str, Any]], entrypoint: str) -> dict[st
         require(isinstance(kind, str), f"{entrypoint}: missing execution event kind")
         require(isinstance(sequence, int) and sequence > 0, f"{entrypoint}: bad sequence")
         require(isinstance(request_id, str) and request_id, f"{entrypoint}: missing request id")
+        origin = request_origin(request_id, entrypoint)
+        require(origin != "diagnostic", f"{entrypoint}: diagnostic request entered product trace")
+        require(
+            attributes.get("execution_request_origin") == origin,
+            f"{entrypoint}: request origin attribute differs from typed identity",
+        )
+        expected_capture = (
+            "lifecycle_only" if origin == "startup" else "first_frame_per_request"
+        )
+        require(
+            attributes.get("execution_capture_policy") == expected_capture,
+            f"{entrypoint}: {origin} request has wrong capture policy",
+        )
         require(attributes.get("run_id"), f"{entrypoint}: missing run id")
         require(attributes.get("span_id"), f"{entrypoint}: missing span id")
         if kind == "operation_submitted":
@@ -368,6 +398,8 @@ def validate_vnext_trace(rows: list[dict[str, Any]], entrypoint: str) -> dict[st
         f"{entrypoint}: node/operation lifecycle imbalance",
     )
     for request_id, request_rows in by_request.items():
+        origin = request_origin(request_id, entrypoint)
+        origins[origin] += 1
         sequences = [row["shape"]["execution_sequence"] for row in request_rows]
         require(
             sequences == list(range(1, len(sequences) + 1)),
@@ -376,9 +408,56 @@ def validate_vnext_trace(rows: list[dict[str, Any]], entrypoint: str) -> dict[st
         request_kinds = [(row.get("attributes") or {}).get("execution_event_kind") for row in request_rows]
         require(request_kinds[0] == "request_accepted", f"{entrypoint}: request does not start accepted")
         require(request_kinds[-1] == "request_completed", f"{entrypoint}: request does not complete")
+        request_counts = Counter(str(kind) for kind in request_kinds)
+        for kind in (
+            "request_accepted",
+            "plan_built",
+            "sequence_completed",
+            "request_completed",
+        ):
+            require(
+                request_counts[kind] == 1,
+                f"{entrypoint}: {request_id} has wrong {kind} count",
+            )
+        output_tokens = request_rows[-1]["shape"].get("event_output_count")
+        if origin == "startup":
+            require(
+                output_tokens == 0,
+                f"{entrypoint}: startup request has non-zero terminal output",
+            )
+            require(
+                len(request_rows) == 4
+                and not {
+                    "frame_started",
+                    "node_started",
+                    "operation_submitted",
+                    "node_retired",
+                    "frame_completed",
+                }.intersection(request_counts),
+                f"{entrypoint}: startup request is not lifecycle-only",
+            )
+        else:
+            require(
+                isinstance(output_tokens, int) and output_tokens > 0,
+                f"{entrypoint}: product request has no terminal output",
+            )
+            require(
+                request_counts["frame_started"]
+                == request_counts["frame_completed"]
+                == 1,
+                f"{entrypoint}: product request has wrong frame lifecycle",
+            )
+            require(
+                request_counts["node_started"]
+                == request_counts["operation_submitted"]
+                == request_counts["node_retired"]
+                > 0,
+                f"{entrypoint}: product request has wrong node lifecycle",
+            )
     return {
         "typed_event_rows": len(events),
         "typed_request_count": len(by_request),
+        "typed_request_origins": dict(sorted(origins.items())),
         "event_counts": dict(sorted(kinds.items())),
     }
 
@@ -1418,7 +1497,7 @@ def validate_bounded_profile_trace(
         and (row.get("attributes") or {}).get("execution_trace_source") == "vnext"
     ]
     by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    terminals: list[int] = []
+    product_terminals: list[int] = []
     counts: Counter[str] = Counter()
     operation_identity_omissions = 0
     for event in events:
@@ -1428,9 +1507,18 @@ def validate_bounded_profile_trace(
         require(isinstance(attributes, dict), f"{label}: event lacks attributes")
         require(isinstance(shape, dict), f"{label}: event lacks shape")
         require(isinstance(request_id, str) and request_id, f"{label}: event lacks request id")
+        origin = request_origin(request_id, label)
+        require(origin != "diagnostic", f"{label}: diagnostic request entered product trace")
         require(
-            attributes.get("execution_capture_policy") == "first_frame_per_request",
-            f"{label}: event is not bounded first-frame capture",
+            attributes.get("execution_request_origin") == origin,
+            f"{label}: request origin attribute differs from typed identity",
+        )
+        expected_capture = (
+            "lifecycle_only" if origin == "startup" else "first_frame_per_request"
+        )
+        require(
+            attributes.get("execution_capture_policy") == expected_capture,
+            f"{label}: {origin} request has wrong capture policy",
         )
         kind = attributes.get("execution_event_kind")
         require(isinstance(kind, str), f"{label}: event lacks kind")
@@ -1442,21 +1530,37 @@ def validate_bounded_profile_trace(
             )
         if kind == "request_completed":
             output = shape.get("event_output_count")
-            require(
-                isinstance(output, int) and 0 < output <= 64,
-                f"{label}: terminal output count is outside 1..64",
-            )
-            terminals.append(output)
+            if origin == "startup":
+                require(output == 0, f"{label}: startup terminal output count is not zero")
+            else:
+                require(
+                    isinstance(output, int) and 0 < output <= 64,
+                    f"{label}: product terminal output count is outside 1..64",
+                )
+                product_terminals.append(output)
 
+    product_requests = {
+        request_id: request_events
+        for request_id, request_events in by_request.items()
+        if request_origin(request_id, label) == "product"
+    }
+    startup_requests = {
+        request_id: request_events
+        for request_id, request_events in by_request.items()
+        if request_origin(request_id, label) == "startup"
+    }
     require(
-        len(by_request) == PROFILE_EXPECTED_REQUESTS_PER_SLOT,
-        f"{label}: expected {PROFILE_EXPECTED_REQUESTS_PER_SLOT} typed requests",
+        len(product_requests) == PROFILE_EXPECTED_REQUESTS_PER_SLOT,
+        f"{label}: expected {PROFILE_EXPECTED_REQUESTS_PER_SLOT} product requests",
     )
+    require(startup_requests, f"{label}: startup request lifecycle is missing")
+    product_node_counts: set[int] = set()
     for request_id, request_events in by_request.items():
+        origin = request_origin(request_id, label)
         sequences = [event["shape"].get("execution_sequence") for event in request_events]
         require(
-            sequences == list(range(1, PROFILE_EXPECTED_EVENTS_PER_REQUEST + 1)),
-            f"{label}: non-contiguous or wrong event count for {request_id}",
+            sequences == list(range(1, len(request_events) + 1)),
+            f"{label}: non-contiguous execution sequence for {request_id}",
         )
         request_counts = Counter(
             str(event["attributes"].get("execution_event_kind")) for event in request_events
@@ -1464,47 +1568,79 @@ def validate_bounded_profile_trace(
         for kind in (
             "request_accepted",
             "plan_built",
-            "frame_started",
-            "frame_completed",
             "sequence_completed",
             "request_completed",
         ):
             require(request_counts[kind] == 1, f"{label}: {request_id} has wrong {kind} count")
-        for kind in ("node_started", "operation_submitted", "node_retired"):
+        if origin == "startup":
             require(
-                request_counts[kind] == PROFILE_EXPECTED_NODES_PER_REQUEST,
-                f"{label}: {request_id} has wrong {kind} count",
+                len(request_events) == 4
+                and not {
+                    "frame_started",
+                    "node_started",
+                    "operation_submitted",
+                    "node_retired",
+                    "frame_completed",
+                }.intersection(request_counts),
+                f"{label}: startup request is not lifecycle-only",
             )
+        else:
+            require(
+                request_counts["frame_started"]
+                == request_counts["frame_completed"]
+                == 1,
+                f"{label}: product request has wrong frame lifecycle",
+            )
+            node_count = request_counts["node_started"]
+            require(node_count > 0, f"{label}: product request has no node execution")
+            for kind in ("operation_submitted", "node_retired"):
+                require(
+                    request_counts[kind] == node_count,
+                    f"{label}: {request_id} has wrong {kind} count",
+                )
+            product_node_counts.add(node_count)
+            require(
+                len(request_events) == 6 + 3 * node_count,
+                f"{label}: product request has wrong event count for {request_id}",
+            )
+    require(
+        len(product_node_counts) == 1,
+        f"{label}: product request node counts are not uniform",
+    )
+    nodes_per_request = next(iter(product_node_counts))
     require(operation_identity_omissions == 0, f"{label}: operation identity omission")
     require(
-        len(events) == PROFILE_EXPECTED_EVENTS_PER_REQUEST * PROFILE_EXPECTED_REQUESTS_PER_SLOT,
-        f"{label}: wrong total typed event count",
-    )
-    require(
-        counts["frame_started"] == counts["frame_completed"] == PROFILE_EXPECTED_REQUESTS_PER_SLOT,
-        f"{label}: repeated or imbalanced frame capture",
+        counts["frame_started"] == counts["frame_completed"] == len(product_requests),
+        f"{label}: repeated or imbalanced first-frame capture",
     )
     stride = PROFILE_WARMUP_REQUESTS + PROFILE_REQUESTS_PER_REPEAT
-    require(len(terminals) == PROFILE_REPEAT_COUNT * stride, f"{label}: terminal count mismatch")
+    require(
+        len(product_terminals) == PROFILE_REPEAT_COUNT * stride,
+        f"{label}: product terminal count mismatch",
+    )
     repeats = report["repeat_metrics"]
     for repeat in range(PROFILE_REPEAT_COUNT):
         start = repeat * stride + PROFILE_WARMUP_REQUESTS
-        measured = terminals[start : start + PROFILE_REQUESTS_PER_REPEAT]
+        measured = product_terminals[start : start + PROFILE_REQUESTS_PER_REPEAT]
         require(
             sum(measured) == repeats[repeat].get("output_tokens"),
             f"{label}: terminal counts differ from usage for repeat {repeat + 1}",
         )
-    bytes_per_request = path.stat().st_size / len(by_request)
+    bytes_per_request = path.stat().st_size / len(product_requests)
     require(
         bytes_per_request <= PROFILE_MAX_BYTES_PER_REQUEST,
         f"{label}: trace bytes/request exceeds {PROFILE_MAX_BYTES_PER_REQUEST}",
     )
     return {
-        "typed_requests": len(by_request),
+        "typed_requests": len(product_requests),
+        "typed_product_requests": len(product_requests),
+        "typed_startup_requests": len(startup_requests),
         "typed_events": len(events),
-        "nodes_per_request": PROFILE_EXPECTED_NODES_PER_REQUEST,
+        "typed_product_events": sum(len(value) for value in product_requests.values()),
+        "typed_startup_events": sum(len(value) for value in startup_requests.values()),
+        "nodes_per_request": nodes_per_request,
         "captured_frames_per_request": 1,
-        "terminal_output_counts": terminals,
+        "terminal_output_counts": product_terminals,
         "usage_reconciled": True,
         "operation_identity_omissions": operation_identity_omissions,
         "trace_bytes": path.stat().st_size,
@@ -1919,24 +2055,96 @@ def require_bounded_overhead_native_evidence(summary: dict[str, Any]) -> None:
     )
 
 
-def profile_event(sequence: int, kind: str, entrypoint: str) -> dict[str, Any]:
+def profile_event(
+    sequence: int,
+    kind: str,
+    entrypoint: str,
+    request_id: str = "request.product.selftest",
+) -> dict[str, Any]:
+    origin = request_origin(request_id, "selftest")
     attrs: dict[str, Any] = {
         "execution_trace_source": "vnext",
         "execution_event_kind": kind,
+        "execution_request_origin": origin,
+        "execution_capture_policy": (
+            "lifecycle_only" if origin == "startup" else "first_frame_per_request"
+        ),
         "run_id": "run.selftest",
         "span_id": f"span.{sequence}",
     }
     if kind == "operation_submitted":
         attrs.update({field: f"{field}.selftest" for field in OPERATION_IDENTITY_FIELDS})
+    shape = {"execution_sequence": sequence}
+    if kind == "request_completed":
+        shape["event_output_count"] = (
+            0 if request_id.startswith(STARTUP_REQUEST_PREFIX) else 2
+        )
     return {
         "schema_version": 1,
-        "request_id": "request.selftest",
+        "request_id": request_id,
         "entrypoint": entrypoint,
         "phase": f"vnext.{kind}",
         "status": "ok",
-        "shape": {"execution_sequence": sequence},
+        "shape": shape,
         "attributes": attrs,
     }
+
+
+def bounded_profile_events(
+    request_id: str,
+    output_tokens: int,
+    node_count: int,
+) -> list[dict[str, Any]]:
+    origin = request_origin(request_id, "selftest")
+    if origin == "startup":
+        kinds = [
+            "request_accepted",
+            "plan_built",
+            "sequence_completed",
+            "request_completed",
+        ]
+    else:
+        kinds = [
+            "request_accepted",
+            "plan_built",
+            "frame_started",
+            *[
+                kind
+                for _ in range(node_count)
+                for kind in ("node_started", "operation_submitted", "node_retired")
+            ],
+            "frame_completed",
+            "sequence_completed",
+            "request_completed",
+        ]
+    rows = []
+    for sequence, kind in enumerate(kinds, 1):
+        attributes: dict[str, Any] = {
+            "execution_trace_source": "vnext",
+            "execution_capture_policy": (
+                "lifecycle_only" if origin == "startup" else "first_frame_per_request"
+            ),
+            "execution_event_kind": kind,
+            "execution_request_origin": origin,
+        }
+        if kind == "operation_submitted":
+            attributes.update(
+                {field: f"{field}.selftest" for field in OPERATION_IDENTITY_FIELDS}
+            )
+        shape = {"execution_sequence": sequence}
+        if kind == "request_completed":
+            shape["event_output_count"] = output_tokens
+        rows.append(
+            {
+                "request_id": request_id,
+                "entrypoint": "serve",
+                "phase": f"vnext.{kind}",
+                "status": "ok",
+                "shape": shape,
+                "attributes": attributes,
+            }
+        )
+    return rows
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -2046,6 +2254,12 @@ def create_selftest_fixture(root: Path) -> None:
         "sequence_completed",
         "request_completed",
     ]
+    startup_event_names = [
+        "request_accepted",
+        "plan_built",
+        "sequence_completed",
+        "request_completed",
+    ]
     resource_rows = [
         {"resource": {"action": "request_open"}},
         {"resource": {"action": "reserve", "owner_kind": "request", "owner_id": "r", "resource_kind": "slot", "amount": 1}},
@@ -2056,9 +2270,22 @@ def create_selftest_fixture(root: Path) -> None:
     for entrypoint in ("run", "serve"):
         directory = root / entrypoint
         write_jsonl(directory / "profile.jsonl", [{"profile": "selftest"}])
+        product_events = [
+            profile_event(index, kind, entrypoint)
+            for index, kind in enumerate(event_names, 1)
+        ]
+        startup_events = [
+            profile_event(
+                index,
+                kind,
+                entrypoint,
+                request_id="request.startup.selftest",
+            )
+            for index, kind in enumerate(startup_event_names, 1)
+        ]
         write_jsonl(
             directory / "scheduler-trace.jsonl",
-            resource_rows + [profile_event(index, kind, entrypoint) for index, kind in enumerate(event_names, 1)],
+            resource_rows + startup_events + product_events,
         )
         (directory / "stderr.log").write_text("")
     (root / "run" / "exit").write_text("0")
@@ -2439,6 +2666,26 @@ def self_test() -> int:
         create_selftest_fixture(root)
         validate(root, "a" * 40)
         validate_product_commands(root)
+        rows = read_jsonl(root / "run" / "scheduler-trace.jsonl")
+        startup_terminal = next(
+            row
+            for row in rows
+            if row.get("request_id") == "request.startup.selftest"
+            and row.get("phase") == "vnext.request_completed"
+        )
+        startup_terminal["shape"]["event_output_count"] = 1
+        write_jsonl(root / "run" / "scheduler-trace.jsonl", rows)
+        try:
+            validate(root, "a" * 40)
+        except ValidationError as error:
+            require(
+                "startup request has non-zero terminal output" in str(error),
+                "startup-output mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("non-zero startup output unexpectedly passed")
+        startup_terminal["shape"]["event_output_count"] = 0
+        write_jsonl(root / "run" / "scheduler-trace.jsonl", rows)
         run_command = command_tokens(root / "run" / "command")
         run_command.remove("--disable-thinking")
         (root / "run" / "command").write_text(shlex.join(run_command) + "\n")
@@ -2461,6 +2708,49 @@ def self_test() -> int:
             require("provider_id" in str(error), "self-test rejected mutation for wrong reason")
         else:
             raise ValidationError("self-test missing-provider mutation unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-bounded-trace-") as temp:
+        directory = Path(temp)
+        rows = [
+            event
+            for request_index in range(PROFILE_EXPECTED_REQUESTS_PER_SLOT)
+            for event in bounded_profile_events(
+                f"request.product.selftest-{request_index}",
+                2,
+                PROFILE_SELFTEST_NODES_PER_REQUEST,
+            )
+        ]
+        rows.extend(bounded_profile_events("request.startup.selftest-1", 0, 132))
+        rows.extend(bounded_profile_events("request.startup.selftest-2", 0, 132))
+        write_jsonl(directory / "scheduler-trace.jsonl", rows)
+        report = {
+            "repeat_metrics": [
+                {"output_tokens": PROFILE_REQUESTS_PER_REPEAT * 2}
+                for _ in range(PROFILE_REPEAT_COUNT)
+            ]
+        }
+        bounded = validate_bounded_profile_trace(directory, "basic-selftest", report)
+        require(
+            bounded["typed_product_requests"] == PROFILE_EXPECTED_REQUESTS_PER_SLOT
+            and bounded["typed_startup_requests"] == 2,
+            "bounded trace did not preserve typed product/startup request accounting",
+        )
+        startup_terminal = next(
+            row
+            for row in rows
+            if row.get("request_id") == "request.startup.selftest-1"
+            and row.get("phase") == "vnext.request_completed"
+        )
+        startup_terminal["shape"]["event_output_count"] = 1
+        write_jsonl(directory / "scheduler-trace.jsonl", rows)
+        try:
+            validate_bounded_profile_trace(directory, "basic-selftest", report)
+        except ValidationError as error:
+            require(
+                "startup terminal output count is not zero" in str(error),
+                "bounded startup-output mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("bounded non-zero startup output unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-prefill-replay-") as temp:
         root = Path(temp)
         create_selftest_fixture(root)
