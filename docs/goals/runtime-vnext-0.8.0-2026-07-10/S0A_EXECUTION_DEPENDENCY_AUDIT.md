@@ -35,9 +35,13 @@ dependency boundary.
 | Provider workspace formula and requirement | `workspace` | Workspace shape is a lower-level resource contract consumed by provider evidence and memory planning |
 | Bound provider resource estimate | `provider_resource` | Estimate provenance and validation precede provider selection and plan assembly |
 | Static/dynamic resource allocation | `allocation` | Allocation validation depends on storage contracts but not on memory-plan construction |
+| Reusable execution policy and derived budgets | `reusable` | Reusable classes and capacity evidence depend on storage identity, not on plan assembly |
+| Completion retention and terminal readback | `checkpoint` | Retention is a lower-level semantic-to-resource contract consumed by policy, payload and planning |
+| Exact execution-weight materialization | `weight` | Weight fidelity and materializer selection precede provider payload and plan construction |
 | Provider selection and execution-plan payload | `provider` | Wire/data ownership remains separate from resolution and revalidation behavior |
 | Per-node provider resolution | `resolution` | Registry lookup is an input-producing boundary, not provider payload data |
-| Untrusted execution-plan revalidation | `validation` | Revalidation consumes a completed plan instead of being mixed into provider data |
+| Execution determinism witness and coverage | `determinism` | Determinism evidence consumes an immutable plan and cannot participate in plan construction |
+| Plan wire decoding and untrusted revalidation | `validation` | Wire/schema checks and semantic rebuild consume a completed plan instead of being mixed into plan construction |
 | Pure planner trait | `planner` | The public orchestration boundary depends on plan and policy, not vice versa |
 | Semantic-program compiler | `compiler` | Terminal consumer that turns model semantics and provider evidence into an immutable executable plan |
 
@@ -46,7 +50,7 @@ sibling-only implementation access remains private to the execution parent.
 
 ## Final Graph
 
-The final production graph has seventeen modules and zero strongly connected components with more
+The final production graph has twenty-one modules and zero strongly connected components with more
 than one member:
 
 ```text
@@ -58,20 +62,25 @@ The complete importer-to-owner edge set is:
 ```text
 allocation: contracts, foundation, storage
 binding: foundation
-compiler: binding, contracts, foundation, plan, policy, provider_resource, resolution, storage
+checkpoint: contracts, foundation
+compiler: binding, checkpoint, contracts, foundation, plan, policy, provider_resource,
+          resolution, storage, weight
 contracts: foundation, provider_resource
+determinism: contracts, foundation, plan, storage, work
 foundation:
-memory: allocation, contracts, foundation, solver, storage
-plan: allocation, binding, contracts, foundation, memory, policy, provider,
-      provider_resource, solver, storage, workspace
+memory: allocation, contracts, foundation, reusable, solver, storage, work
+plan: allocation, binding, checkpoint, contracts, foundation, memory, policy, provider,
+      provider_resource, reusable, solver, storage, weight, workspace
 planner: plan, policy
-policy: foundation, provider
-provider: contracts, memory, provider_resource, workspace
+policy: checkpoint, foundation, provider, reusable, weight
+provider: checkpoint, contracts, memory, provider_resource, weight, workspace
 provider_resource: foundation, workspace
-resolution: binding, contracts, foundation, policy, provider, provider_resource
+resolution: binding, contracts, foundation, policy, provider, provider_resource, weight
+reusable: foundation, storage
 solver: contracts, foundation, provider_resource, storage, work
 storage: contracts, foundation, work
-validation: contracts, foundation, plan, policy, provider
+validation: checkpoint, contracts, foundation, plan, policy, provider, weight
+weight: foundation
 work: foundation
 workspace: foundation, work
 ```
@@ -80,8 +89,8 @@ One valid dependencies-first topological order is:
 
 ```text
 foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
--> allocation -> solver -> memory -> provider -> policy -> plan -> resolution -> validation
--> planner -> compiler
+-> reusable -> checkpoint -> allocation -> solver -> memory -> weight -> provider -> policy
+-> plan -> determinism -> resolution -> validation -> planner -> compiler
 ```
 
 This order proves acyclicity; it does not force unrelated branches into one runtime layer.
@@ -92,9 +101,9 @@ The following validations passed after normalization:
 
 ```text
 CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
-RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --lib vnext::execution::tests:: -- --test-threads=2
-  14 passed; 0 failed
+RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
+  --lib vnext::execution::tests:: -- --test-threads=1
+  23 passed; 0 failed
 RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --test vnext_contract_tests \
   --test vnext_resolution_limits_contract_tests -- --test-threads=2

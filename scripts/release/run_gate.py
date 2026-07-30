@@ -2841,9 +2841,9 @@ def validate_vnext_g01a_s0a_provenance(
         and split_inventory.get("baseline", {}).get("git_commit")
         == child_manifest.get("baseline_commit")
         and inventory_summary.get("facade_count") == 3
-        and inventory_summary.get("production_owner_count") == 46
+        and inventory_summary.get("production_owner_count") == 50
         and inventory_summary.get("contract_test_target_count") == 24
-        and inventory_summary.get("shared_test_support_owner_count") == 10
+        and inventory_summary.get("shared_test_support_owner_count") == 11
         and inventory_summary.get("maximum_facade_physical_lines", 501) <= 500
         and inventory_summary.get("maximum_production_owner_physical_lines", 2501) <= 2500
         and inventory_summary.get("maximum_contract_test_or_support_owner_physical_lines", 2001)

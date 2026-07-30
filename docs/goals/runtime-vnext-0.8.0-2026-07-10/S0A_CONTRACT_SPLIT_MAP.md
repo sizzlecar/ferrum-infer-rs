@@ -5,7 +5,7 @@
 - Work package: S0A structural split plus an explicit baseline-to-current API migration ledger.
 - Current stage: the `resource`, `execution`, and `event` production monoliths are split into real
   owner modules with explicit imports and zero multi-module dependency SCCs. The four oversized
-  resource/event/core/device contract targets are replaced by 24 invariant-owner targets and 10
+  resource/event/core/device contract targets are replaced by 24 invariant-owner targets and 11
   explicit reusable support owners. The structured public owner audit accounts for all `1,490`
   baseline API units: `1,481` preserve the original path/kind and `9` are explicit migrations with
   verified public replacement targets. Unexplained loss, ambiguity, and inaccessible count are `0`.
@@ -100,31 +100,35 @@ bound regresses.
 | Current owner | Lines | Primary responsibility |
 |---|---:|---|
 | `execution/foundation.rs` | 95 | Shared validation, canonical fingerprints, alignment and storage arithmetic |
-| `execution/binding.rs` | 248 | Semantic value/weight binding validation and estimator-input identity |
+| `execution/binding.rs` | 278 | Semantic value/weight binding validation and estimator-input identity |
 | `execution/work.rs` | 735 | Token/page work evidence and bounded dynamic demand formulas |
-| `execution/workspace.rs` | 429 | Provider workspace formula, scope and storage requirement contracts |
-| `execution/provider_resource.rs` | 174 | Bound provider resource estimate evidence and validation |
-| `execution/contracts.rs` | 415 | Plan identity, provider selection evidence and immutable node contracts |
-| `execution/storage.rs` | 882 | Storage compatibility, dynamic pool specifications and descriptors |
+| `execution/workspace.rs` | 457 | Provider workspace formula, scope and storage requirement contracts |
+| `execution/provider_resource.rs` | 199 | Bound provider resource estimate evidence and validation |
+| `execution/contracts.rs` | 441 | Plan identity, provider selection evidence and immutable node contracts |
+| `execution/storage.rs` | 953 | Storage compatibility, dynamic pool specifications and descriptors |
+| `execution/reusable.rs` | 660 | Reusable-execution classes, buckets, capacity policy and derived memory evidence |
+| `execution/checkpoint.rs` | 279 | Completion retention, terminal readback layout and retained-value validation |
 | `execution/allocation.rs` | 121 | Static/dynamic resource allocation contract and validation |
-| `execution/solver.rs` | 416 | Joint provider/storage solver and checked selection helpers |
-| `execution/memory.rs` | 973 | Core-derived memory plan and pool/liveness accounting |
-| `execution/provider.rs` | 251 | Provider selection and serialized execution-plan payload contracts |
-| `execution/policy.rs` | 79 | Typed runtime policy and validated plan-build request boundary |
-| `execution/plan.rs` | 2,177 | Semantic plan construction and deterministic provider/storage selection |
-| `execution/resolution.rs` | 291 | Provider registry resolution into typed per-node evidence |
-| `execution/validation.rs` | 56 | Untrusted execution-plan revalidation boundary |
+| `execution/solver.rs` | 427 | Joint provider/storage solver and checked selection helpers |
+| `execution/memory.rs` | 1,276 | Core-derived memory plan, reusable budgets and pool/liveness accounting |
+| `execution/weight.rs` | 733 | Exact weight-materializer capability, selection and trusted execution-weight plans |
+| `execution/provider.rs` | 271 | Provider selection and serialized execution-plan payload contracts |
+| `execution/policy.rs` | 137 | Typed runtime, reusable-memory, determinism and weight policy boundary |
+| `execution/plan.rs` | 2,399 | Semantic plan construction and deterministic provider/storage selection |
+| `execution/determinism.rs` | 1,199 | Determinism witness, physical coverage and replay-equivalence validation |
+| `execution/resolution.rs` | 327 | Provider registry resolution into typed per-node evidence |
+| `execution/validation.rs` | 243 | Bounded plan wire decoding and semantic revalidation boundary |
 | `execution/planner.rs` | 66 | Pure execution planner trait boundary |
-| `execution/compiler.rs` | 1,014 | Semantic-program compilation into immutable executable plan and node resolutions |
+| `execution/compiler.rs` | 1,139 | Semantic-program compilation into immutable executable plan and node resolutions |
 
-`execution.rs` is now a 72-line facade. Every production fragment is below `2,500` lines. The
-existing 14 white-box tests are isolated in a 744-line `execution/tests.rs` module and pass with
+`execution.rs` is now an 85-line facade. Every production fragment is below `2,500` lines. The
+existing white-box tests are isolated in a 905-line `execution/tests.rs` module and pass with
 `--test-threads=2`.
 
 The first eight-module split made former same-module coupling observable as one SCC containing all
 eight production owners. Low-level canonical/allocation helpers, provider resource evidence,
 serialized payload validation, resolution, and the planner API have now moved to distinct owners.
-The complete seventeen-module production graph has zero multi-module SCCs. Public execution paths
+The complete twenty-one-module production graph has zero multi-module SCCs. Public execution paths
 remain re-exported by the facade and no production fragment uses `use super::*`.
 
 ## Event Ownership
@@ -209,8 +213,10 @@ owners and are each independently below the 2,000-line hard limit.
 
 ## Device Operation Test Ownership
 
-The former 3,799-line device/operation target is replaced by a 1,672-line shared fixture and five
-owner targets:
+The former 3,799-line device/operation target is replaced by two explicit shared fixture owners
+and five invariant-owner targets. `vnext_device_operation_contract/mod.rs` owns the test model,
+provider, device runtime and resource driver in 1,839 lines; its one-way `planning.rs` child owns
+model resolution, plan/resource-session construction and fixture factories in 1,105 lines.
 
 | Target | Owner lines | Tests | Frozen proof cases |
 |---|---:|---:|---:|
@@ -262,8 +268,8 @@ dependencies-first execution order is:
 
 ```text
 foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
--> allocation -> solver -> memory -> provider -> policy -> plan -> resolution -> validation
--> planner -> compiler
+-> reusable -> checkpoint -> allocation -> solver -> memory -> weight -> provider -> policy
+-> plan -> determinism -> resolution -> validation -> planner -> compiler
 ```
 
 The event graph is also acyclic. One valid dependencies-first order is:
@@ -291,7 +297,7 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
 
 For the normalized execution graph, `cargo check -p ferrum-interfaces --all-targets` passes, the
-bounded execution white-box target passes `14/14`, the focused external execution contracts pass
+bounded execution white-box target passes `23/23`, the focused external execution contracts pass
 `51/51 + 12/12`, and all `80` vNext compile-time UI fixtures pass in normal trybuild mode. These
 results establish focused compile, contract, and structural evidence. The canonical S0A gate also
 runs the complete crate through one bounded aggregate and binds its public owner map and split

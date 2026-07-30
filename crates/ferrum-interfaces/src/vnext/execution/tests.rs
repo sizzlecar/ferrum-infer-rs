@@ -7,12 +7,12 @@ use crate::vnext::{
 
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
-    super::plan::validate_execution_plan_wire_size(
+    super::validation::validate_execution_plan_wire_size(
         MAX_EXECUTION_PLAN_WIRE_BYTES,
         "test execution plan wire",
     )
     .expect("the exact wire limit must be accepted");
-    assert!(super::plan::validate_execution_plan_wire_size(
+    assert!(super::validation::validate_execution_plan_wire_size(
         MAX_EXECUTION_PLAN_WIRE_BYTES + 1,
         "test execution plan wire",
     )
