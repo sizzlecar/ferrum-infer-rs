@@ -4270,11 +4270,16 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
             Some(128),
         );
         executor
-            .try_admit_prefill(ExecutorPrefillAdmission::new(
-                &request.id,
-                &tokens,
-                sequence.model_maximum_sequence_tokens(),
-            ))
+            .try_admit_prefill(
+                ExecutorPrefillAdmission::for_product_request(
+                    &request.id,
+                    &tokens,
+                    sequence.model_maximum_sequence_tokens(),
+                    tokens.len(),
+                    0,
+                )
+                .unwrap(),
+            )
             .unwrap();
         request_ids.push(request.id.clone());
         engine
@@ -4353,11 +4358,16 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
             Some(128),
         );
         executor
-            .try_admit_prefill(ExecutorPrefillAdmission::new(
-                &request.id,
-                &tokens,
-                sequence.model_maximum_sequence_tokens(),
-            ))
+            .try_admit_prefill(
+                ExecutorPrefillAdmission::for_product_request(
+                    &request.id,
+                    &tokens,
+                    sequence.model_maximum_sequence_tokens(),
+                    tokens.len(),
+                    0,
+                )
+                .unwrap(),
+            )
             .unwrap();
         request_ids.push(request.id.clone());
         engine

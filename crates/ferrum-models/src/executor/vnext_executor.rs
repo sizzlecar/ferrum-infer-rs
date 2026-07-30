@@ -22,13 +22,13 @@ use ferrum_interfaces::model_executor::{
     ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
     ExecutorMemoryUsage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
     ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
-    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorSamplingOutput,
-    ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
-    MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
-    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
-    PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
-    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimeResourceSnapshot, PrefillChunk,
-    PrefillInput, PrefillOutput,
+    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorRequestOrigin,
+    ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorState, ExecutorStatus,
+    LogitsReturnPolicy, MemoryRequirements, PlanRuntimeBatchDecodeOutcome,
+    PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
+    PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
+    PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimePrefillProduct,
+    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -2230,6 +2230,14 @@ impl<R: DeviceRuntime> VNextSequence<R> {
             self.abort();
             return Err(error);
         }
+        self.complete_with_counts(completion.input_tokens(), completion.output_tokens())
+    }
+
+    fn complete_startup(&self) -> Result<()> {
+        self.complete_with_counts(self.product_prompt_tokens, self.replayed_output_tokens)
+    }
+
+    fn complete_with_counts(&self, input_tokens: u64, output_tokens: u64) -> Result<()> {
         if !self.active.swap(false, Ordering::AcqRel) {
             return Err(FerrumError::already_exists(format!(
                 "vNext request `{}` is already terminal",
@@ -2244,11 +2252,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         if let Some(events) = &self.events {
             events
                 .lock()
-                .complete_sequence(
-                    &receipt,
-                    completion.input_tokens(),
-                    completion.output_tokens(),
-                )
+                .complete_sequence(&receipt, input_tokens, output_tokens)
                 .map_err(|error| {
                     FerrumError::backend(format!("vNext execution journal completion: {error}"))
                 })?;
@@ -3137,28 +3141,70 @@ impl<'executor, R: DeviceRuntime> VNextStartupSequenceGuard<'executor, R> {
         });
     }
 
+    fn complete(mut self) -> Result<()> {
+        self.cancel_pending();
+        let retained = self.take_active_sequences();
+        if retained.iter().any(|(request_id, sequence)| {
+            sequence
+                .as_ref()
+                .is_none_or(|sequence| sequence.request_id != *request_id)
+        }) {
+            for sequence in retained.into_iter().filter_map(|(_, sequence)| sequence) {
+                sequence.abort();
+            }
+            return Err(FerrumError::internal(
+                "vNext startup completion lost synthetic sequence authority",
+            ));
+        }
+        let sequences = retained
+            .into_iter()
+            .map(|(_, sequence)| {
+                sequence.expect("startup sequence authority was checked before completion")
+            })
+            .collect::<Vec<_>>();
+        for (index, sequence) in sequences.iter().enumerate() {
+            if let Err(error) = sequence.complete_startup() {
+                for unfinished in &sequences[index..] {
+                    unfinished.abort();
+                }
+                return Err(FerrumError::backend(format!(
+                    "vNext startup sequence completion: {error}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn cancel_pending(&mut self) {
         if let Some(request_id) = self.pending_request.take() {
             self.executor.sequences.lock().cancel_prefill(&request_id);
         }
+    }
+
+    fn take_active_sequences(&mut self) -> Vec<(RequestId, Option<Arc<VNextSequence<R>>>)> {
+        self.sequences
+            .drain(..)
+            .map(|startup| {
+                let sequence = self
+                    .executor
+                    .sequences
+                    .lock()
+                    .active
+                    .remove(&startup.kv_cache.cache_id());
+                (startup.request_id, sequence)
+            })
+            .collect()
     }
 }
 
 impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
     fn drop(&mut self) {
         self.cancel_pending();
-        let sequences = self
-            .sequences
-            .drain(..)
-            .filter_map(|startup| {
-                self.executor
-                    .sequences
-                    .lock()
-                    .active
-                    .remove(&startup.kv_cache.cache_id())
-            })
-            .collect::<Vec<_>>();
-        for sequence in sequences {
+        for sequence in self
+            .take_active_sequences()
+            .into_iter()
+            .filter_map(|(_, sequence)| sequence)
+        {
             sequence.abort();
         }
     }
@@ -3617,7 +3663,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         resources.begin_request(request_id.clone());
         let mut maintenance_attempts = 0_u32;
         loop {
-            match self.try_admit_prefill(ExecutorPrefillAdmission::new(
+            match self.try_admit_prefill(ExecutorPrefillAdmission::for_startup(
                 &request_id,
                 input_tokens,
                 maximum_sequence_tokens,
@@ -3765,7 +3811,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 resources.sequences.len()
             )));
         }
-        Ok(())
+        resources.complete()
     }
 
     async fn execute_startup_decode_pass(
@@ -3964,7 +4010,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
 
         let synthetic_sequences = resources.sequences.len();
-        drop(resources);
+        resources.complete()?;
 
         let mut captured = replayed;
         for chunk in requested_prefill_chunks.iter().copied() {
@@ -4464,14 +4510,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn resolve_prefill_probe(
         &self,
         request_id: &RequestId,
+        request_origin: ExecutorRequestOrigin,
         maximum_tokens: usize,
         tokens: Vec<u32>,
         product_prompt_tokens: usize,
         replayed_output_tokens: usize,
         work: ResourceWorkShape,
     ) -> Result<VNextPrefillProbeResolution<R>> {
-        let identity = RequestIdentity::new(format!("request.product.{request_id}"))
-            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let identity = RequestIdentity::new(format!(
+            "request.{}.{request_id}",
+            request_origin.namespace()
+        ))
+        .map_err(|error| FerrumError::internal(error.to_string()))?;
         let session = match self.try_admit_sequence(identity, work)? {
             VNextSequenceAdmissionDecision::Admitted(session) => session,
             VNextSequenceAdmissionDecision::Deferred(deferred) => {
@@ -7627,6 +7677,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .begin_prefill_probe(input.request_id, &work)?;
         let resolution = match self.resolve_prefill_probe(
             input.request_id,
+            input.request_origin,
             input.maximum_sequence_tokens,
             tokens,
             input.product_prompt_tokens,
