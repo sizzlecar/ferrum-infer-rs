@@ -53,9 +53,8 @@ EXPECTED_ARTIFACT_BUILD_UNITS = {
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-CUDA_SUMMARY_RE = re.compile(
-    r"\[cuda-build-summary\]\s+artifact=(\S+)\s+status=(\S+)\s+reason=(\S+)"
-)
+CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION = 1
+CUDA_INPUTS_HASH_RE = re.compile(r"^fnv1a64:[0-9a-f]{16}$")
 
 
 class ChainError(RuntimeError):
@@ -247,6 +246,7 @@ def cargo_build_command(
     native_cache: Path,
     compute_capability: str,
     nvcc_threads: int,
+    build_summary_receipt: Path | None,
 ) -> list[str]:
     environment = [
         "env",
@@ -265,6 +265,8 @@ def cargo_build_command(
         )
     else:
         environment.append("FERRUM_CUDA_NATIVE_SOURCE_POLICY=allow")
+    if build_summary_receipt is not None:
+        environment.append(f"FERRUM_CUDA_BUILD_SUMMARY_RECEIPT={build_summary_receipt}")
     return [
         *environment,
         "cargo",
@@ -397,19 +399,42 @@ def validate_chain(
         "compiled native inventory ABI contract pin mismatch",
     )
 
-    artifact_build_log = (
-        (root / "steps/artifact-example-build/stdout.log").read_text(
-            encoding="utf-8", errors="replace"
-        )
-        + "\n"
-        + (root / "steps/artifact-example-build/stderr.log").read_text(
-            encoding="utf-8", errors="replace"
-        )
+    build_summary_path = root / "artifact-build-summary.receipt.json"
+    build_summary_receipt = read_json(
+        build_summary_path, "artifact build summary receipt"
     )
-    summaries = [
-        {"artifact": artifact, "status": status, "reason": reason}
-        for artifact, status, reason in CUDA_SUMMARY_RE.findall(artifact_build_log)
-    ]
+    require(
+        isinstance(build_summary_receipt, dict)
+        and build_summary_receipt.get("schema_version")
+        == CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION
+        and build_summary_receipt.get("artifact_type")
+        == "ferrum_cuda_build_summary_receipt",
+        "artifact build summary receipt identity mismatch",
+    )
+    raw_summaries = build_summary_receipt.get("rows")
+    require(isinstance(raw_summaries, list), "artifact build summary rows must be an array")
+    summaries = []
+    for index, raw_row in enumerate(raw_summaries):
+        require(isinstance(raw_row, dict), f"artifact build summary row {index} must be an object")
+        require(
+            set(raw_row)
+            == {"artifact", "status", "reason", "elapsed_ms", "inputs_hash"},
+            f"artifact build summary row {index} shape mismatch",
+        )
+        require(
+            all(isinstance(raw_row.get(key), str) and raw_row[key] for key in ("artifact", "status", "reason")),
+            f"artifact build summary row {index} text fields are invalid",
+        )
+        require(
+            isinstance(raw_row.get("elapsed_ms"), int) and raw_row["elapsed_ms"] >= 0,
+            f"artifact build summary row {index} elapsed_ms is invalid",
+        )
+        require(
+            isinstance(raw_row.get("inputs_hash"), str)
+            and CUDA_INPUTS_HASH_RE.fullmatch(raw_row["inputs_hash"]) is not None,
+            f"artifact build summary row {index} inputs_hash is invalid",
+        )
+        summaries.append(raw_row)
     artifact_rows = {
         row["artifact"]: row
         for row in summaries
@@ -421,11 +446,22 @@ def validate_chain(
     )
     require(
         all(
+            sum(row["artifact"] == unit for row in summaries) == 1
+            for unit in EXPECTED_ARTIFACT_BUILD_UNITS
+        ),
+        "artifact build summary contains duplicate native build-unit decisions",
+    )
+    require(
+        all(
             row["status"] == "artifact"
             and row["reason"] == "native-operator-artifact-set"
             for row in artifact_rows.values()
         ),
         f"artifact build unexpectedly used native source: {artifact_rows}",
+    )
+    require(
+        not any(row["status"] == "rejected" for row in summaries),
+        "artifact build summary contains a rejected build decision",
     )
 
     return {
@@ -472,6 +508,11 @@ def validate_chain(
             },
         },
         "artifact_build_summaries": summaries,
+        "artifact_build_summary_receipt": {
+            "path": build_summary_path.relative_to(root).as_posix(),
+            "sha256": sha256(build_summary_path),
+            "schema_version": CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION,
+        },
         "does_not_prove": [
             "canonical G03 PASS",
             "canonical G07A PASS",
@@ -575,6 +616,7 @@ def execute(args: argparse.Namespace) -> Path:
             native_cache=native_cache,
             compute_capability=args.compute_capability,
             nvcc_threads=args.nvcc_threads,
+            build_summary_receipt=None,
         ),
         expected_duration_seconds=args.bootstrap_expected_seconds,
         deadline_seconds=args.bootstrap_timeout_seconds,
@@ -719,6 +761,7 @@ def execute(args: argparse.Namespace) -> Path:
             str(lock_path),
         ]
     )
+    build_summary_receipt = out / "artifact-build-summary.receipt.json"
     run_step(
         root=out,
         step_id="assemble-artifact-set",
@@ -742,6 +785,7 @@ def execute(args: argparse.Namespace) -> Path:
             native_cache=native_cache,
             compute_capability=args.compute_capability,
             nvcc_threads=args.nvcc_threads,
+            build_summary_receipt=build_summary_receipt,
         ),
         expected_duration_seconds=args.artifact_build_expected_seconds,
         deadline_seconds=args.artifact_build_timeout_seconds,
