@@ -384,6 +384,14 @@ pub(super) struct ResidentChunkState<B> {
     pub(super) live_segments: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DynamicBackingClaimOccupancy {
+    pub(super) scope: DynamicBackingClaimScope,
+    pub(super) residency: DynamicBackingClaimResidency,
+    pub(super) physical_bytes: u64,
+    pub(super) segment_count: u64,
+}
+
 pub(super) fn rollback_free_extent_journal<B>(
     states: &mut [std::sync::MutexGuard<'_, DynamicBackingPoolState<B>>],
     journals: &[Vec<Vec<BackingSegment>>],
@@ -410,6 +418,7 @@ pub(super) struct DynamicBackingPoolState<B> {
     pub(super) next_chunk_generation: u64,
     pub(super) chunks: BTreeMap<u32, ResidentChunkState<B>>,
     pub(super) allocator: FreeExtentIndex,
+    pub(super) live_occupancy: DynamicPoolLiveOccupancyStatus,
     pub(super) quarantined: Vec<QuarantinedDynamicChunk<B>>,
     pub(super) poisoned: bool,
 }
@@ -469,7 +478,12 @@ where
 
 pub(super) trait BackingExtentOwner: Send + Sync {
     fn instance_id(&self) -> u64;
-    fn release_segments(&self, segments: &[BackingSegment]);
+    fn release_segments(
+        &self,
+        claim_identity: &PhysicalBackingClaimIdentity,
+        occupancy: DynamicBackingClaimOccupancy,
+        segments: &[BackingSegment],
+    );
 }
 
 pub(super) struct BackingSegmentLease {
@@ -477,6 +491,7 @@ pub(super) struct BackingSegmentLease {
     pub(super) owner_instance_id: u64,
     pub(super) claim_identity: PhysicalBackingClaimIdentity,
     pub(super) segment_generation: u64,
+    pub(super) occupancy: DynamicBackingClaimOccupancy,
     pub(super) segments: Vec<BackingSegment>,
     pub(super) size_bytes: u64,
     pub(super) initialization: Option<Arc<BackingInitializationCell>>,
@@ -685,7 +700,8 @@ impl BackingInitializationCell {
 impl Drop for BackingSegmentLease {
     fn drop(&mut self) {
         if !self.released {
-            self.owner.release_segments(&self.segments);
+            self.owner
+                .release_segments(&self.claim_identity, self.occupancy, &self.segments);
             self.released = true;
         }
     }
@@ -699,7 +715,12 @@ where
         self.instance_id
     }
 
-    fn release_segments(&self, segments: &[BackingSegment]) {
+    fn release_segments(
+        &self,
+        claim_identity: &PhysicalBackingClaimIdentity,
+        occupancy: DynamicBackingClaimOccupancy,
+        segments: &[BackingSegment],
+    ) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -711,6 +732,24 @@ where
         if state.poisoned {
             return;
         }
+        let segment_count = u64::try_from(segments.len()).ok();
+        let physical_bytes = segments.iter().try_fold(0_u64, |total, segment| {
+            total.checked_add(segment.length_bytes())
+        });
+        if claim_identity.pool_id() != self.domain.pool_id()
+            || Some(occupancy.segment_count) != segment_count
+            || Some(occupancy.physical_bytes) != physical_bytes
+        {
+            state.poisoned = true;
+            return;
+        }
+        let next_occupancy = match state.live_occupancy.checked_without_claim(occupancy) {
+            Ok(next) => next,
+            Err(_) => {
+                state.poisoned = true;
+                return;
+            }
+        };
         for segment in segments {
             if segment.pool_id() != self.domain.pool_id() {
                 state.poisoned = true;
@@ -736,6 +775,7 @@ where
                 .expect("validated released chunk remains installed");
             chunk.live_segments -= 1;
         }
+        state.live_occupancy = next_occupancy;
         drop(state);
         if self
             .logical_admission
@@ -888,6 +928,7 @@ pub struct DynamicPoolStatus {
     pub(super) largest_contiguous_bytes: u64,
     pub(super) resident_chunks: usize,
     pub(super) live_segments: u64,
+    pub(super) live_occupancy: DynamicPoolLiveOccupancyStatus,
     pub(super) quarantined_chunks: usize,
     pub(super) quarantined_bytes: u64,
     pub(super) descriptor_mismatch_chunks: usize,
@@ -934,6 +975,10 @@ impl DynamicPoolStatus {
 
     pub const fn live_segments(&self) -> u64 {
         self.live_segments
+    }
+
+    pub const fn live_occupancy(&self) -> &DynamicPoolLiveOccupancyStatus {
+        &self.live_occupancy
     }
 
     pub const fn quarantined_chunks(&self) -> usize {
@@ -1143,6 +1188,196 @@ impl From<AllocationLifetime> for DynamicBackingClaimScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DynamicBackingClaimResidency {
+    Transient,
+    LaneStable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolOccupancyCounter {
+    pub(super) claim_count: u64,
+    pub(super) segment_count: u64,
+    pub(super) physical_bytes: u64,
+}
+
+impl DynamicPoolOccupancyCounter {
+    pub const fn claim_count(&self) -> u64 {
+        self.claim_count
+    }
+
+    pub const fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    pub const fn physical_bytes(&self) -> u64 {
+        self.physical_bytes
+    }
+
+    fn checked_add_claim(&mut self, claim: DynamicBackingClaimOccupancy) -> Result<(), VNextError> {
+        self.claim_count = self
+            .claim_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_resource("dynamic live claim count overflows u64"))?;
+        self.segment_count = self
+            .segment_count
+            .checked_add(claim.segment_count)
+            .ok_or_else(|| invalid_resource("dynamic live claim segment count overflows u64"))?;
+        self.physical_bytes = self
+            .physical_bytes
+            .checked_add(claim.physical_bytes)
+            .ok_or_else(|| invalid_resource("dynamic live claim physical bytes overflow u64"))?;
+        Ok(())
+    }
+
+    fn checked_remove_claim(
+        &mut self,
+        claim: DynamicBackingClaimOccupancy,
+    ) -> Result<(), VNextError> {
+        self.claim_count = self
+            .claim_count
+            .checked_sub(1)
+            .ok_or_else(|| invalid_resource("dynamic live claim count underflows u64"))?;
+        self.segment_count = self
+            .segment_count
+            .checked_sub(claim.segment_count)
+            .ok_or_else(|| invalid_resource("dynamic live claim segment count underflows u64"))?;
+        self.physical_bytes = self
+            .physical_bytes
+            .checked_sub(claim.physical_bytes)
+            .ok_or_else(|| invalid_resource("dynamic live claim physical bytes underflow u64"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolResidencyOccupancyStatus {
+    pub(super) total: DynamicPoolOccupancyCounter,
+    pub(super) plan: DynamicPoolOccupancyCounter,
+    pub(super) request: DynamicPoolOccupancyCounter,
+    pub(super) sequence: DynamicPoolOccupancyCounter,
+    pub(super) step: DynamicPoolOccupancyCounter,
+    pub(super) invocation: DynamicPoolOccupancyCounter,
+    pub(super) initial_sequence_bundle: DynamicPoolOccupancyCounter,
+}
+
+impl DynamicPoolResidencyOccupancyStatus {
+    pub const fn total(&self) -> &DynamicPoolOccupancyCounter {
+        &self.total
+    }
+
+    pub const fn plan(&self) -> &DynamicPoolOccupancyCounter {
+        &self.plan
+    }
+
+    pub const fn request(&self) -> &DynamicPoolOccupancyCounter {
+        &self.request
+    }
+
+    pub const fn sequence(&self) -> &DynamicPoolOccupancyCounter {
+        &self.sequence
+    }
+
+    pub const fn step(&self) -> &DynamicPoolOccupancyCounter {
+        &self.step
+    }
+
+    pub const fn invocation(&self) -> &DynamicPoolOccupancyCounter {
+        &self.invocation
+    }
+
+    pub const fn initial_sequence_bundle(&self) -> &DynamicPoolOccupancyCounter {
+        &self.initial_sequence_bundle
+    }
+
+    fn counter_mut_for_scope(
+        &mut self,
+        scope: DynamicBackingClaimScope,
+    ) -> &mut DynamicPoolOccupancyCounter {
+        match scope {
+            DynamicBackingClaimScope::Plan => &mut self.plan,
+            DynamicBackingClaimScope::Request => &mut self.request,
+            DynamicBackingClaimScope::Sequence => &mut self.sequence,
+            DynamicBackingClaimScope::Step => &mut self.step,
+            DynamicBackingClaimScope::Invocation => &mut self.invocation,
+            DynamicBackingClaimScope::InitialSequenceBundle => &mut self.initial_sequence_bundle,
+        }
+    }
+
+    fn checked_with_claim(&self, claim: DynamicBackingClaimOccupancy) -> Result<Self, VNextError> {
+        let mut next = *self;
+        next.total.checked_add_claim(claim)?;
+        next.counter_mut_for_scope(claim.scope)
+            .checked_add_claim(claim)?;
+        Ok(next)
+    }
+
+    fn checked_without_claim(
+        &self,
+        claim: DynamicBackingClaimOccupancy,
+    ) -> Result<Self, VNextError> {
+        let mut next = *self;
+        next.total.checked_remove_claim(claim)?;
+        next.counter_mut_for_scope(claim.scope)
+            .checked_remove_claim(claim)?;
+        Ok(next)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolLiveOccupancyStatus {
+    pub(super) total: DynamicPoolOccupancyCounter,
+    pub(super) transient: DynamicPoolResidencyOccupancyStatus,
+    pub(super) lane_stable: DynamicPoolResidencyOccupancyStatus,
+}
+
+impl DynamicPoolLiveOccupancyStatus {
+    pub const fn total(&self) -> &DynamicPoolOccupancyCounter {
+        &self.total
+    }
+
+    pub const fn transient(&self) -> &DynamicPoolResidencyOccupancyStatus {
+        &self.transient
+    }
+
+    pub const fn lane_stable(&self) -> &DynamicPoolResidencyOccupancyStatus {
+        &self.lane_stable
+    }
+
+    fn residency_mut(
+        &mut self,
+        residency: DynamicBackingClaimResidency,
+    ) -> &mut DynamicPoolResidencyOccupancyStatus {
+        match residency {
+            DynamicBackingClaimResidency::Transient => &mut self.transient,
+            DynamicBackingClaimResidency::LaneStable => &mut self.lane_stable,
+        }
+    }
+
+    pub(super) fn checked_with_claim(
+        &self,
+        claim: DynamicBackingClaimOccupancy,
+    ) -> Result<Self, VNextError> {
+        let mut next = *self;
+        next.total.checked_add_claim(claim)?;
+        let updated = (*next.residency_mut(claim.residency)).checked_with_claim(claim)?;
+        *next.residency_mut(claim.residency) = updated;
+        Ok(next)
+    }
+
+    pub(super) fn checked_without_claim(
+        &self,
+        claim: DynamicBackingClaimOccupancy,
+    ) -> Result<Self, VNextError> {
+        let mut next = *self;
+        next.total.checked_remove_claim(claim)?;
+        let updated = (*next.residency_mut(claim.residency)).checked_without_claim(claim)?;
+        *next.residency_mut(claim.residency) = updated;
+        Ok(next)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicBackingBlocker {
     pub(super) pool_id: DynamicBackingPoolId,
@@ -1347,6 +1582,7 @@ where
     pub(super) pool: Arc<DynamicBackingPool<R>>,
     pub(super) claim_identity: PhysicalBackingClaimIdentity,
     pub(super) segment_generation: u64,
+    pub(super) occupancy: DynamicBackingClaimOccupancy,
     pub(super) segments: Vec<BackingSegment>,
     pub(super) capacity_size_bytes: u64,
     pub(super) projections: Vec<LogicalBackingSliceEvidence>,
@@ -1389,6 +1625,7 @@ where
                 owner,
                 claim_identity: extent.claim_identity,
                 segment_generation: extent.segment_generation,
+                occupancy: extent.occupancy,
                 segments: extent.segments,
                 size_bytes: extent.capacity_size_bytes,
                 initialization,
@@ -1449,7 +1686,11 @@ where
             return;
         }
         for extent in self.extents.iter().rev() {
-            extent.pool.rollback_prepared(&extent.segments);
+            extent.pool.rollback_prepared(
+                &extent.claim_identity,
+                extent.occupancy,
+                &extent.segments,
+            );
         }
     }
 }
@@ -2450,7 +2691,12 @@ where
         state.pending_growth_bytes -= bytes;
     }
 
-    fn rollback_prepared(&self, segments: &[BackingSegment]) {
+    fn rollback_prepared(
+        &self,
+        claim_identity: &PhysicalBackingClaimIdentity,
+        occupancy: DynamicBackingClaimOccupancy,
+        segments: &[BackingSegment],
+    ) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -2462,6 +2708,24 @@ where
         if state.poisoned {
             return;
         }
+        let segment_count = u64::try_from(segments.len()).ok();
+        let physical_bytes = segments.iter().try_fold(0_u64, |total, segment| {
+            total.checked_add(segment.length_bytes())
+        });
+        if claim_identity.pool_id() != self.domain.pool_id()
+            || Some(occupancy.segment_count) != segment_count
+            || Some(occupancy.physical_bytes) != physical_bytes
+        {
+            state.poisoned = true;
+            return;
+        }
+        let next_occupancy = match state.live_occupancy.checked_without_claim(occupancy) {
+            Ok(next) => next,
+            Err(_) => {
+                state.poisoned = true;
+                return;
+            }
+        };
         for segment in segments.iter().rev() {
             let valid = state
                 .chunks
@@ -2479,6 +2743,7 @@ where
                 .expect("validated prepared chunk remains installed")
                 .live_segments -= 1;
         }
+        state.live_occupancy = next_occupancy;
         drop(state);
         if self
             .logical_admission

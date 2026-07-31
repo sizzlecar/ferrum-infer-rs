@@ -157,7 +157,7 @@ where
     pub fn status(&self) -> Result<DynamicPoolMaintenanceStatus, VNextError> {
         let mut pools = Vec::with_capacity(self.pools.pools.len());
         for pool in self.pools.pools.values() {
-            let state = pool
+            let mut state = pool
                 .state
                 .lock()
                 .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
@@ -171,6 +171,19 @@ where
                     .checked_add(chunk.backing._grant.bytes())
                     .ok_or_else(|| invalid_resource("dynamic quarantine bytes overflow u64"))
             })?;
+            let live_occupancy = state.live_occupancy;
+            let used_bytes = state
+                .resident_bytes
+                .checked_sub(state.allocator.free_bytes)
+                .ok_or_else(|| invalid_resource("dynamic pool free bytes exceed residency"))?;
+            if live_occupancy.total().physical_bytes() != used_bytes
+                || live_occupancy.total().segment_count() != live_segments
+            {
+                state.poisoned = true;
+                return Err(invalid_resource(
+                    "dynamic pool live-claim ledger differs from allocator occupancy",
+                ));
+            }
             pools.push(DynamicPoolStatus {
                 pool_id: pool.domain.pool_id().clone(),
                 domain_id: pool.domain.domain_id,
@@ -182,6 +195,7 @@ where
                 largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
                 resident_chunks: state.chunks.len(),
                 live_segments,
+                live_occupancy,
                 quarantined_chunks: state.quarantined.len(),
                 quarantined_bytes,
                 descriptor_mismatch_chunks: state

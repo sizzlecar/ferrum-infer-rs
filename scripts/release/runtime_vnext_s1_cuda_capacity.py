@@ -216,6 +216,117 @@ def executor_snapshot_from_health(path: Path, label: str) -> dict[str, Any]:
     return executor
 
 
+OCCUPANCY_COUNTER_FIELDS = (
+    "claim_count",
+    "segment_count",
+    "physical_bytes",
+)
+OCCUPANCY_SCOPE_FIELDS = (
+    "plan",
+    "request",
+    "sequence",
+    "step",
+    "invocation",
+    "initial_sequence_bundle",
+)
+
+
+def zero_dynamic_pool_occupancy_counter() -> dict[str, int]:
+    return {field: 0 for field in OCCUPANCY_COUNTER_FIELDS}
+
+
+def zero_dynamic_pool_residency_occupancy() -> dict[str, dict[str, int]]:
+    return {
+        field: zero_dynamic_pool_occupancy_counter()
+        for field in ("total", *OCCUPANCY_SCOPE_FIELDS)
+    }
+
+
+def validate_dynamic_pool_occupancy_counter(
+    value: Any, label: str
+) -> dict[str, int]:
+    require(isinstance(value, dict), f"{label}: occupancy counter is missing")
+    require(
+        set(value) == set(OCCUPANCY_COUNTER_FIELDS),
+        f"{label}: occupancy counter fields are not canonical",
+    )
+    normalized: dict[str, int] = {}
+    for field in OCCUPANCY_COUNTER_FIELDS:
+        field_value = value.get(field)
+        require(
+            type(field_value) is int and field_value >= 0,
+            f"{label}: invalid {field}",
+        )
+        normalized[field] = field_value
+    return normalized
+
+
+def validate_dynamic_pool_residency_occupancy(
+    value: Any, label: str
+) -> dict[str, dict[str, int]]:
+    expected_fields = {"total", *OCCUPANCY_SCOPE_FIELDS}
+    require(isinstance(value, dict), f"{label}: residency occupancy is missing")
+    require(
+        set(value) == expected_fields,
+        f"{label}: residency occupancy fields are not canonical",
+    )
+    normalized = {
+        field: validate_dynamic_pool_occupancy_counter(
+            value.get(field), f"{label} {field}"
+        )
+        for field in sorted(expected_fields)
+    }
+    for metric in OCCUPANCY_COUNTER_FIELDS:
+        require(
+            normalized["total"][metric]
+            == sum(normalized[scope][metric] for scope in OCCUPANCY_SCOPE_FIELDS),
+            f"{label}: scope occupancy does not sum to total {metric}",
+        )
+    return normalized
+
+
+def validate_dynamic_pool_live_occupancy(
+    value: Any,
+    label: str,
+    *,
+    used_bytes: int,
+    live_segments: int,
+) -> dict[str, Any]:
+    expected_fields = {"total", "transient", "lane_stable"}
+    require(isinstance(value, dict), f"{label}: typed live occupancy is missing")
+    require(
+        set(value) == expected_fields,
+        f"{label}: typed live occupancy fields are not canonical",
+    )
+    normalized = {
+        "total": validate_dynamic_pool_occupancy_counter(
+            value.get("total"), f"{label} total"
+        ),
+        "transient": validate_dynamic_pool_residency_occupancy(
+            value.get("transient"), f"{label} transient"
+        ),
+        "lane_stable": validate_dynamic_pool_residency_occupancy(
+            value.get("lane_stable"), f"{label} lane_stable"
+        ),
+    }
+    for metric in OCCUPANCY_COUNTER_FIELDS:
+        require(
+            normalized["total"][metric]
+            == normalized["transient"]["total"][metric]
+            + normalized["lane_stable"]["total"][metric],
+            f"{label}: residency occupancy does not sum to total {metric}",
+        )
+    require(
+        normalized["total"]["physical_bytes"] == used_bytes,
+        f"{label}: typed occupancy differs from allocator used bytes",
+    )
+    require(
+        normalized["total"]["segment_count"] == live_segments,
+        f"{label}: typed occupancy differs from allocator live segments",
+    )
+    return normalized
+
+
 def dynamic_pool_occupancy_snapshot(
     executor: dict[str, Any], label: str
 ) -> dict[str, Any]:
@@ -290,12 +401,20 @@ def dynamic_pool_occupancy_snapshot(
             f"{label}: rejected publication remains in {pool_id}",
         )
         require(pool.get("poisoned") is False, f"{label}: pool {pool_id} is poisoned")
+        used_bytes = resident_bytes - free_bytes
+        live_occupancy = validate_dynamic_pool_live_occupancy(
+            pool.get("live_occupancy"),
+            f"{label} {pool_id}",
+            used_bytes=used_bytes,
+            live_segments=live_segments,
+        )
         occupancy[pool_id] = {
             "domain_id": domain_id,
             "resident_bytes": resident_bytes,
             "free_bytes": free_bytes,
-            "used_bytes": resident_bytes - free_bytes,
+            "used_bytes": used_bytes,
             "live_segments": live_segments,
+            "live_occupancy": live_occupancy,
             "resident_chunks": resident_chunks,
             "largest_contiguous_bytes": largest_contiguous_bytes,
             "storage_profile": storage_profile,
@@ -332,8 +451,10 @@ def quiescent_pool_snapshot(
         baseline_pools = {
             pool_id: {
                 **pool,
-                "used_bytes": 0,
-                "live_segments": 0,
+                "live_occupancy": {
+                    **pool["live_occupancy"],
+                    "transient": zero_dynamic_pool_residency_occupancy(),
+                },
             }
             for pool_id, pool in current["pools"].items()
         }
@@ -363,12 +484,9 @@ def quiescent_pool_snapshot(
             f"{label}: pool contract changed from startup baseline for {pool_id}",
         )
         require(
-            pool["used_bytes"] == baseline_pool["used_bytes"],
-            f"{label}: request-owned bytes remain in {pool_id}",
-        )
-        require(
-            pool["live_segments"] == baseline_pool["live_segments"],
-            f"{label}: request-owned live segments remain in {pool_id}",
+            pool["live_occupancy"]["transient"]
+            == baseline_pool["live_occupancy"]["transient"],
+            f"{label}: transient dynamic occupancy differs from startup baseline in {pool_id}",
         )
     return {
         "static_bytes": current["static_bytes"],
@@ -386,6 +504,14 @@ def quiescent_pool_snapshot(
             pool_id: pool["live_segments"]
             for pool_id, pool in current["pools"].items()
         },
+        "pool_transient_occupancy": {
+            pool_id: pool["live_occupancy"]["transient"]
+            for pool_id, pool in current["pools"].items()
+        },
+        "pool_lane_stable_occupancy": {
+            pool_id: pool["live_occupancy"]["lane_stable"]
+            for pool_id, pool in current["pools"].items()
+        },
         "startup_baseline": {
             "pool_used_bytes": {
                 pool_id: pool["used_bytes"]
@@ -393,6 +519,14 @@ def quiescent_pool_snapshot(
             },
             "pool_live_segments": {
                 pool_id: pool["live_segments"]
+                for pool_id, pool in baseline_pools.items()
+            },
+            "pool_transient_occupancy": {
+                pool_id: pool["live_occupancy"]["transient"]
+                for pool_id, pool in baseline_pools.items()
+            },
+            "pool_lane_stable_occupancy": {
+                pool_id: pool["live_occupancy"]["lane_stable"]
                 for pool_id, pool in baseline_pools.items()
             },
         },
@@ -3121,6 +3255,39 @@ def self_test() -> int:
         openai_stream_error({"choices": []}) is None,
         "normal OpenAI SSE chunks were classified as errors",
     )
+
+    def occupancy_counter(
+        claim_count: int,
+        segment_count: int,
+        physical_bytes: int,
+    ) -> dict[str, int]:
+        return {
+            "claim_count": claim_count,
+            "segment_count": segment_count,
+            "physical_bytes": physical_bytes,
+        }
+
+    def live_occupancy_fixture(
+        *claims: tuple[str, str, dict[str, int]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "total": zero_dynamic_pool_occupancy_counter(),
+            "transient": zero_dynamic_pool_residency_occupancy(),
+            "lane_stable": zero_dynamic_pool_residency_occupancy(),
+        }
+        for residency, scope, counter in claims:
+            require(
+                residency in {"transient", "lane_stable"}
+                and scope in OCCUPANCY_SCOPE_FIELDS,
+                "self-test occupancy fixture has invalid ownership",
+            )
+            for metric in OCCUPANCY_COUNTER_FIELDS:
+                result["total"][metric] += counter[metric]
+                result[residency]["total"][metric] += counter[metric]
+                result[residency][scope][metric] += counter[metric]
+        return result
+
+    empty_live_occupancy = live_occupancy_fixture()
     executor = {
         "static_bytes": 7,
         "dynamic_pools": {
@@ -3135,6 +3302,7 @@ def self_test() -> int:
                     "largest_contiguous_bytes": 5,
                     "pending_growth_bytes": 0,
                     "live_segments": 0,
+                    "live_occupancy": empty_live_occupancy,
                     "quarantined_bytes": 0,
                     "quarantined_chunks": 0,
                     "descriptor_mismatch_chunks": 0,
@@ -3151,6 +3319,7 @@ def self_test() -> int:
                     "largest_contiguous_bytes": 7,
                     "pending_growth_bytes": 0,
                     "live_segments": 0,
+                    "live_occupancy": empty_live_occupancy,
                     "quarantined_bytes": 0,
                     "quarantined_chunks": 0,
                     "descriptor_mismatch_chunks": 0,
@@ -3175,6 +3344,9 @@ def self_test() -> int:
     startup_pool["free_bytes"] = 4
     startup_pool["largest_contiguous_bytes"] = 4
     startup_pool["live_segments"] = 1
+    startup_pool["live_occupancy"] = live_occupancy_fixture(
+        ("transient", "request", occupancy_counter(1, 1, 1))
+    )
     grown_quiescent = json.loads(json.dumps(startup_baseline))
     grown_pool = grown_quiescent["dynamic_pools"]["pools"][0]
     grown_pool["resident_bytes"] = 9
@@ -3190,18 +3362,65 @@ def self_test() -> int:
     require(
         baseline_snapshot["pool_used_bytes"]["pool-a"] == 1
         and baseline_snapshot["pool_live_segments"]["pool-a"] == 1
+        and baseline_snapshot["pool_transient_occupancy"]["pool-a"]["total"][
+            "physical_bytes"
+        ]
+        == 1
         and baseline_snapshot["startup_baseline"]["pool_used_bytes"]["pool-a"] == 1
         and baseline_snapshot["startup_baseline"]["pool_live_segments"]["pool-a"] == 1,
         "startup-owned occupancy was not preserved across dynamic growth",
     )
-    for field, value, expected in (
-        ("free_bytes", 7, "request-owned bytes remain"),
-        ("live_segments", 2, "request-owned live segments remain"),
-    ):
-        leaked = json.loads(json.dumps(grown_quiescent))
-        leaked["dynamic_pools"]["pools"][0][field] = value
-        if field == "free_bytes":
-            leaked["dynamic_pools"]["pools"][0]["largest_contiguous_bytes"] = value
+    reusable_changed = json.loads(json.dumps(grown_quiescent))
+    reusable_pool = reusable_changed["dynamic_pools"]["pools"][0]
+    reusable_pool["free_bytes"] = 6
+    reusable_pool["largest_contiguous_bytes"] = 6
+    reusable_pool["live_segments"] = 2
+    reusable_pool["live_occupancy"] = live_occupancy_fixture(
+        ("transient", "request", occupancy_counter(1, 1, 1)),
+        ("lane_stable", "invocation", occupancy_counter(1, 1, 2)),
+    )
+    reusable_snapshot = quiescent_pool_snapshot(
+        reusable_changed,
+        "self-test reusable occupancy drift",
+        baseline_executor=startup_baseline,
+    )
+    require(
+        reusable_snapshot["pool_used_bytes"]["pool-a"] == 3
+        and reusable_snapshot["pool_lane_stable_occupancy"]["pool-a"]["total"][
+            "physical_bytes"
+        ]
+        == 2
+        and reusable_snapshot["pool_transient_occupancy"]["pool-a"]["total"][
+            "physical_bytes"
+        ]
+        == 1,
+        "lane-stable occupancy drift was not preserved as typed evidence",
+    )
+    leaked_variants = []
+    leaked_bytes = json.loads(json.dumps(grown_quiescent))
+    leaked_bytes_pool = leaked_bytes["dynamic_pools"]["pools"][0]
+    leaked_bytes_pool["free_bytes"] = 7
+    leaked_bytes_pool["largest_contiguous_bytes"] = 7
+    leaked_bytes_pool["live_segments"] = 2
+    leaked_bytes_pool["live_occupancy"] = live_occupancy_fixture(
+        ("transient", "request", occupancy_counter(2, 2, 2))
+    )
+    leaked_variants.append(("bytes", leaked_bytes))
+    leaked_segments = json.loads(json.dumps(grown_quiescent))
+    leaked_segments_pool = leaked_segments["dynamic_pools"]["pools"][0]
+    leaked_segments_pool["live_segments"] = 2
+    leaked_segments_pool["live_occupancy"] = live_occupancy_fixture(
+        ("transient", "request", occupancy_counter(1, 2, 1))
+    )
+    leaked_variants.append(("segments", leaked_segments))
+    substituted_scope = json.loads(json.dumps(grown_quiescent))
+    substituted_scope["dynamic_pools"]["pools"][0][
+        "live_occupancy"
+    ] = live_occupancy_fixture(
+        ("transient", "invocation", occupancy_counter(1, 1, 1))
+    )
+    leaked_variants.append(("scope substitution", substituted_scope))
+    for field, leaked in leaked_variants:
         try:
             quiescent_pool_snapshot(
                 leaked,
@@ -3210,7 +3429,22 @@ def self_test() -> int:
             )
             raise AssertionError(f"request leak mutation for {field} unexpectedly passed")
         except CapacityGateError as error:
-            require(expected in str(error), f"request leak failed for the wrong reason: {error}")
+            require(
+                "transient dynamic occupancy differs" in str(error),
+                f"request leak failed for the wrong reason: {error}",
+            )
+    boolean_counter = json.loads(json.dumps(grown_quiescent))
+    boolean_counter["dynamic_pools"]["pools"][0]["live_occupancy"]["total"][
+        "claim_count"
+    ] = True
+    try:
+        dynamic_pool_occupancy_snapshot(boolean_counter, "self-test boolean counter")
+        raise AssertionError("boolean occupancy counter unexpectedly passed")
+    except CapacityGateError as error:
+        require(
+            "invalid claim_count" in str(error),
+            f"boolean occupancy counter failed for the wrong reason: {error}",
+        )
     paged_pool_id = "dynamic-pool/sha256/" + "b" * 64
     b_wait_health = {
         "engine": {"active_requests": 1, "queued_requests": 1},

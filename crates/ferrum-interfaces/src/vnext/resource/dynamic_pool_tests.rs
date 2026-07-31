@@ -1396,6 +1396,16 @@ fn maintenance_status_exposes_typed_pool_contract() {
     assert_eq!(status.maximum_active_sequences(), 8);
     let pool = &status.pools()[0];
     let contract = pool.contract();
+    let occupancy = pool.live_occupancy();
+    assert_eq!(occupancy.total(), &DynamicPoolOccupancyCounter::default());
+    assert_eq!(
+        occupancy.transient().total(),
+        &DynamicPoolOccupancyCounter::default()
+    );
+    assert_eq!(
+        occupancy.lane_stable().total(),
+        &DynamicPoolOccupancyCounter::default()
+    );
     assert_eq!(contract.compatibility().profile(), paged_profile());
     assert_eq!(contract.minimum_request_bytes(), 0);
     assert_eq!(contract.minimum_sequence_bytes(), 64);
@@ -1430,6 +1440,84 @@ fn maintenance_status_exposes_typed_pool_contract() {
         wire["pools"][0]["contract"]["resources"][0]["demand"]["tokens"]["bytes_per_token"],
         json!(64)
     );
+    let live_wire = &wire["pools"][0]["live_occupancy"];
+    let zero_counter = json!({
+        "claim_count": 0,
+        "segment_count": 0,
+        "physical_bytes": 0
+    });
+    assert_eq!(live_wire["total"], zero_counter);
+    assert_eq!(
+        live_wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["lane_stable", "total", "transient"]
+    );
+    for residency in ["transient", "lane_stable"] {
+        let residency_wire = live_wire[residency].as_object().unwrap();
+        assert_eq!(residency_wire.len(), 7);
+        for field in [
+            "total",
+            "plan",
+            "request",
+            "sequence",
+            "step",
+            "invocation",
+            "initial_sequence_bundle",
+        ] {
+            assert_eq!(residency_wire[field], zero_counter);
+        }
+    }
+}
+
+#[test]
+fn prepared_claim_rollback_clears_typed_live_occupancy() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'd',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(runtime, catalog, 64, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let request = evaluated_request(&pool, 64);
+    let BackingPrepareDecision::Prepared(prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("resident request backing must prepare")
+    };
+
+    let prepared_status = harness.root.maintenance_controller.status().unwrap();
+    let prepared_occupancy = prepared_status.pools()[0].live_occupancy();
+    assert_eq!(prepared_occupancy.total().claim_count(), 1);
+    assert_eq!(prepared_occupancy.total().physical_bytes(), 64);
+    assert_eq!(
+        prepared_occupancy.transient().total(),
+        prepared_occupancy.total()
+    );
+    assert_eq!(
+        prepared_occupancy.transient().request(),
+        prepared_occupancy.total()
+    );
+
+    drop(prepared);
+    let rolled_back = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(rolled_back.pools()[0].free_bytes(), 64);
+    assert_eq!(rolled_back.pools()[0].live_segments(), 0);
+    assert_eq!(
+        rolled_back.pools()[0].live_occupancy().total(),
+        &DynamicPoolOccupancyCounter::default()
+    );
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -1622,6 +1710,20 @@ fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
     );
     drop(first_slices);
     drop(first_slot);
+    let retained_status = harness.root.maintenance_controller.status().unwrap();
+    let retained_occupancy = retained_status.pools()[0].live_occupancy();
+    assert_eq!(retained_occupancy.total().claim_count(), 1);
+    assert_eq!(retained_occupancy.total().physical_bytes(), 256);
+    assert_eq!(retained_occupancy.total().segment_count(), 1);
+    assert_eq!(retained_occupancy.transient().total().physical_bytes(), 0);
+    assert_eq!(
+        retained_occupancy.lane_stable().total().physical_bytes(),
+        256
+    );
+    assert_eq!(
+        retained_occupancy.lane_stable().step().physical_bytes(),
+        256
+    );
 
     let (second_demand, second_requests) = binding
         .scoped_demand(
@@ -2182,6 +2284,15 @@ fn initial_bundle_waits_without_partial_request_and_allows_smaller_bypass() {
         InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
         _ => panic!("A must occupy one request and sequence slice"),
     };
+    let active_status = maintenance.status().unwrap();
+    assert!(active_status.pools().iter().all(|pool| {
+        let occupancy = pool.live_occupancy();
+        occupancy.total().claim_count() == 1
+            && occupancy.total().physical_bytes() == pool.resident_bytes() - pool.free_bytes()
+            && occupancy.transient().total() == occupancy.total()
+            && occupancy.lane_stable().total().claim_count() == 0
+            && occupancy.transient().initial_sequence_bundle() == occupancy.total()
+    }));
     let before_b = maintenance.status().unwrap();
     let logical_before_b = harness
         .root
@@ -2292,6 +2403,11 @@ fn initial_bundle_waits_without_partial_request_and_allows_smaller_bypass() {
     drop(deferred);
     drop(bypass);
     drop(active);
+    let released_status = maintenance.status().unwrap();
+    assert!(released_status
+        .pools()
+        .iter()
+        .all(|pool| pool.live_occupancy().total().claim_count() == 0));
     drop(binding);
     close_dynamic_test_root(harness.root);
 }
@@ -3386,11 +3502,28 @@ fn physical_region_retention_prevents_dynamic_extent_reuse() {
     let retained_status = harness.root.maintenance_controller.status().unwrap();
     assert_eq!(retained_status.pools()[0].live_segments(), 1);
     assert_eq!(retained_status.pools()[0].free_bytes(), 0);
+    let retained_occupancy = retained_status.pools()[0].live_occupancy();
+    assert_eq!(retained_occupancy.total().claim_count(), 1);
+    assert_eq!(retained_occupancy.total().physical_bytes(), retained_bytes);
+    assert_eq!(retained_occupancy.total().segment_count(), 1);
+    assert_eq!(
+        retained_occupancy.transient().total(),
+        retained_occupancy.total()
+    );
+    assert_eq!(
+        retained_occupancy.transient().request(),
+        retained_occupancy.total()
+    );
+    assert_eq!(retained_occupancy.lane_stable().total().claim_count(), 0);
 
     drop(retention);
     let released_status = harness.root.maintenance_controller.status().unwrap();
     assert_eq!(released_status.pools()[0].live_segments(), 0);
     assert_eq!(released_status.pools()[0].free_bytes(), retained_bytes);
+    assert_eq!(
+        released_status.pools()[0].live_occupancy().total(),
+        &DynamicPoolOccupancyCounter::default()
+    );
     close_dynamic_test_root(harness.root);
 }
 
