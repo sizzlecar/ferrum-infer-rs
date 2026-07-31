@@ -245,6 +245,32 @@ def demand_is_token_scaled(demand: Any) -> bool:
     )
 
 
+def phase_stable_demand_contract(demand: dict[str, Any]) -> dict[str, Any]:
+    kind, value = next(iter(demand.items()))
+    if kind not in {"tokens", "affine", "pages"} or not isinstance(value, dict):
+        return demand
+    stable = dict(value)
+    stable.pop("maximum_tokens", None)
+    stable.pop("maximum_pages", None)
+    return {kind: stable}
+
+
+def phase_stable_pool_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    provisioning = dict(contract["provisioning"])
+    provisioning.pop("maximum_resident_bytes", None)
+    return {
+        **contract,
+        "resources": [
+            {
+                **resource,
+                "demand": phase_stable_demand_contract(resource["demand"]),
+            }
+            for resource in contract["resources"]
+        ],
+        "provisioning": provisioning,
+    }
+
+
 def validate_typed_pool_contract(
     pool_id: str, envelope: dict[str, Any], label: str
 ) -> dict[str, Any]:
@@ -372,16 +398,17 @@ def derive_target_budget_envelope(
             pool_id, sizing_envelopes[pool_id], "target sizing"
         )
         require(
-            calibration_contract == sizing_contract,
-            f"target sizing typed contract differs for {pool_id}",
+            phase_stable_pool_contract(calibration_contract)
+            == phase_stable_pool_contract(sizing_contract),
+            f"target sizing phase-stable typed contract differs for {pool_id}",
         )
         initial_bundle_floor = (
-            calibration_contract["minimum_request_bytes"]
-            + calibration_contract["minimum_sequence_bytes"]
+            sizing_contract["minimum_request_bytes"]
+            + sizing_contract["minimum_sequence_bytes"]
         ) * maximum_active_sequences
         initial_bundle_floor += (
-            calibration_contract["minimum_step_bytes"]
-            + calibration_contract["minimum_invocation_peak_bytes"]
+            sizing_contract["minimum_step_bytes"]
+            + sizing_contract["minimum_invocation_peak_bytes"]
         )
         require(
             calibration_bytes >= initial_bundle_floor,
@@ -390,20 +417,20 @@ def derive_target_budget_envelope(
         resident_ceiling = max(sizing_bytes, initial_bundle_floor)
         require(
             resident_ceiling
-            <= calibration_contract["provisioning"]["maximum_resident_bytes"],
+            <= sizing_contract["provisioning"]["maximum_resident_bytes"],
             f"typed initial bundle floor exceeds the pool ceiling for {pool_id}",
         )
         if any(
             resource.get("lifetime") == "sequence"
             and demand_is_token_scaled(resource.get("demand"))
-            for resource in calibration_contract["resources"]
+            for resource in sizing_contract["resources"]
         ):
             token_scaled_sequence_pool_ids.append(pool_id)
         sizing_observed_pool_resident_bytes[pool_id] = sizing_bytes
         target_pool_resident_ceiling_bytes[pool_id] = resident_ceiling
         initial_bundle_floor_bytes_by_pool[pool_id] = initial_bundle_floor
         pool_storage_profiles[pool_id] = calibration_profile
-        pool_contracts[pool_id] = calibration_contract
+        pool_contracts[pool_id] = sizing_contract
     require(
         token_scaled_sequence_pool_ids,
         "typed target sizing contains no token-scaled sequence resource",
@@ -2829,8 +2856,16 @@ def self_test() -> int:
             "invocation_liveness_mode": "total_order_reuse",
         },
     }
+    calibration_contracts = json.loads(json.dumps(pool_contracts))
+    calibration_contracts["sequence"]["resources"][0]["demand"]["tokens"][
+        "maximum_tokens"
+    ] = 3
+    calibration_contracts["sequence"]["provisioning"]["maximum_resident_bytes"] = 90
 
-    def pool_snapshot(pools: dict[str, int]) -> dict[str, Any]:
+    def pool_snapshot(
+        pools: dict[str, int],
+        contracts: dict[str, dict[str, Any]] = pool_contracts,
+    ) -> dict[str, Any]:
         resident_bytes = sum(pools.values())
         return {
             "static_bytes": 100,
@@ -2844,13 +2879,15 @@ def self_test() -> int:
                     "resident_chunks": 1,
                     "largest_contiguous_bytes": value,
                     "storage_profile": storage_profiles[pool_id],
-                    "contract": pool_contracts[pool_id],
+                    "contract": contracts[pool_id],
                 }
                 for pool_id, value in pools.items()
             },
         }
 
-    calibration_pool = pool_snapshot({"sequence": 30, "workspace": 8})
+    calibration_pool = pool_snapshot(
+        {"sequence": 30, "workspace": 8}, calibration_contracts
+    )
     sizing_pool = pool_snapshot({"sequence": 20, "workspace": 7})
     target_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
     require(
@@ -2865,6 +2902,7 @@ def self_test() -> int:
         and target_envelope["initial_bundle_floor_bytes_by_pool"]
         == {"sequence": 30, "workspace": 4}
         and target_envelope["token_scaled_sequence_pool_ids"] == ["sequence"]
+        and target_envelope["pool_contracts"] == pool_contracts
         and target_envelope["bootstrap_headroom_bytes"] == 1,
         "self-test lost typed target-sizing provenance",
     )
@@ -2899,6 +2937,26 @@ def self_test() -> int:
     expect_reject(
         lambda: derive_target_budget_envelope(calibration_pool, opaque_sizing),
         "opaque target sizing pool",
+    )
+    coefficient_drift = json.loads(json.dumps(sizing_pool))
+    coefficient_drift["pool_envelopes"]["sequence"]["contract"]["resources"][0][
+        "demand"
+    ]["tokens"]["bytes_per_token"] = 11
+    expect_reject(
+        lambda: derive_target_budget_envelope(calibration_pool, coefficient_drift),
+        "phase-stable token coefficient drift",
+    )
+    target_bound_drift = json.loads(
+        json.dumps(pool_snapshot({"sequence": 32, "workspace": 5}))
+    )
+    target_bound_drift["pool_envelopes"]["sequence"]["contract"]["resources"][0][
+        "demand"
+    ]["tokens"]["maximum_tokens"] = 11
+    expect_reject(
+        lambda: require_target_pool_within_budget_contract(
+            target_bound_drift, target_envelope, 137
+        ),
+        "target runtime-bound contract drift",
     )
 
     wait_condition = {
