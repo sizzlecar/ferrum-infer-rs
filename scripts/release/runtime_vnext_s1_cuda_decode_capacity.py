@@ -1327,7 +1327,8 @@ def validate_rebalance_trace(
         and started_wall_ns <= row["ts_unix_nanos"] <= finished_wall_ns
     ]
     require(maintenance_rows, "target produced no typed prefill backing maintenance")
-    rebalances: list[dict[str, int]] = []
+    maintained_events = 0
+    rebalances: list[dict[str, Any]] = []
     for index, row in enumerate(maintenance_rows):
         require(
             row.get("status") == "ok" and row.get("error") is None,
@@ -1339,11 +1340,9 @@ def validate_rebalance_trace(
         require(isinstance(evidence, dict), f"prefill maintenance {index}: evidence is missing")
         if evidence.get("outcome") != "maintained":
             continue
+        maintained_events += 1
         pools_grown = evidence.get("pools_grown")
         allocated_bytes = evidence.get("allocated_bytes")
-        pools_reclaimed = evidence.get("pools_reclaimed")
-        chunks_reclaimed = evidence.get("chunks_reclaimed")
-        reclaimed_bytes = evidence.get("reclaimed_bytes")
         require(
             isinstance(pools_grown, int)
             and pools_grown > 0
@@ -1351,37 +1350,22 @@ def validate_rebalance_trace(
             and allocated_bytes > 0,
             f"prefill maintenance {index}: maintained growth is invalid",
         )
-        require(
-            isinstance(pools_reclaimed, int)
-            and pools_reclaimed >= 0
-            and isinstance(chunks_reclaimed, int)
-            and chunks_reclaimed >= 0
-            and isinstance(reclaimed_bytes, int)
-            and reclaimed_bytes >= 0,
-            f"prefill maintenance {index}: rebalance receipt is missing",
+        exact = common.validate_maintenance_rebalance_evidence(
+            evidence,
+            f"prefill maintenance {index}",
         )
-        require(
-            (pools_reclaimed == 0 and chunks_reclaimed == 0 and reclaimed_bytes == 0)
-            or (
-                pools_reclaimed > 0
-                and chunks_reclaimed >= pools_reclaimed
-                and reclaimed_bytes > 0
-            ),
-            f"prefill maintenance {index}: rebalance receipt is inconsistent",
-        )
-        if pools_reclaimed > 0:
+        if exact["pools_reclaimed"] > 0:
             rebalances.append(
                 {
                     "pools_grown": pools_grown,
                     "allocated_bytes": allocated_bytes,
-                    "pools_reclaimed": pools_reclaimed,
-                    "chunks_reclaimed": chunks_reclaimed,
-                    "reclaimed_bytes": reclaimed_bytes,
+                    **exact,
                 }
             )
     require(rebalances, "target produced no typed cross-pool rebalance")
     return {
         "maintenance_events": len(maintenance_rows),
+        "maintained_events": maintained_events,
         "rebalance_events": len(rebalances),
         "pools_reclaimed": sum(event["pools_reclaimed"] for event in rebalances),
         "chunks_reclaimed": sum(event["chunks_reclaimed"] for event in rebalances),
@@ -1389,6 +1373,16 @@ def validate_rebalance_trace(
         "allocated_bytes_after_rebalance": sum(
             event["allocated_bytes"] for event in rebalances
         ),
+        "exact_receipt": True,
+        "evidence_owner": common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER,
+        "receipts": [
+            {
+                "pool_ids": event["pool_ids"],
+                "chunk_identities": event["chunk_identities"],
+                "capacity_epochs": event["capacity_epochs"],
+            }
+            for event in rebalances
+        ],
     }
 
 
@@ -2249,6 +2243,9 @@ def validate(root: Path, out: Path) -> int:
         "stop_policy": STOP_POLICY,
         "decode_summary": decode_summary,
         "rebalance_summary": rebalance_summary,
+        "cross_pool_rebalance_evidence_owner": (
+            common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
+        ),
         "target_trace_bytes": target_trace_bytes,
         "calibration_window_ns": [calibration_started, calibration_finished],
         "target_sizing_window_ns": [sizing_started, sizing_finished],
@@ -2781,6 +2778,29 @@ def self_test() -> int:
                     "pools_reclaimed": 1,
                     "chunks_reclaimed": 1,
                     "reclaimed_bytes": 64,
+                    "rebalance": {
+                        "pools": [
+                            {
+                                "pool_id": "dynamic-pool/sha256/" + "a" * 64,
+                                "chunks": [
+                                    {
+                                        "pool_id": (
+                                            "dynamic-pool/sha256/" + "a" * 64
+                                        ),
+                                        "ordinal": 1,
+                                        "generation": 2,
+                                    }
+                                ],
+                                "reclaimed_bytes": 64,
+                                "published_capacity_bytes": 128,
+                            }
+                        ],
+                        "reclaimed_chunks": 1,
+                        "reclaimed_bytes": 64,
+                        "logical_capacity_epoch": 15,
+                        "plan_device_capacity_epoch": 16,
+                        "process_device_capacity_epoch": 17,
+                    },
                 }
             },
         }
@@ -2847,12 +2867,33 @@ def self_test() -> int:
         and rebalance_summary["reclaimed_bytes"] == 64,
         "self-test lost typed cross-pool rebalance evidence",
     )
+    require(
+        rebalance_summary["exact_receipt"] is True
+        and rebalance_summary["evidence_owner"]
+        == common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
+        and rebalance_summary["receipts"]
+        == [
+            {
+                "pool_ids": ["dynamic-pool/sha256/" + "a" * 64],
+                "chunk_identities": [
+                    ["dynamic-pool/sha256/" + "a" * 64, 1, 2]
+                ],
+                "capacity_epochs": {
+                    "logical_capacity_epoch": 15,
+                    "plan_device_capacity_epoch": 16,
+                    "process_device_capacity_epoch": 17,
+                },
+            }
+        ],
+        "self-test lost the exact pool, chunk, or epoch receipt",
+    )
     missing_rebalance = json.loads(json.dumps(rebalance_rows))
     missing_rebalance[-1]["attributes"]["maintenance_evidence"].update(
         {
             "pools_reclaimed": 0,
             "chunks_reclaimed": 0,
             "reclaimed_bytes": 0,
+            "rebalance": None,
         }
     )
     try:
@@ -2862,6 +2903,17 @@ def self_test() -> int:
         raise AssertionError("trace without cross-pool reclaim unexpectedly passed")
     except common.CapacityGateError:
         pass
+    missing_exact_receipt = json.loads(json.dumps(rebalance_rows))
+    missing_exact_receipt[-1]["attributes"]["maintenance_evidence"][
+        "rebalance"
+    ] = None
+    try:
+        validate_rebalance_trace(
+            missing_exact_receipt, started_wall_ns=80, finished_wall_ns=89
+        )
+        raise AssertionError("aggregate-only cross-pool reclaim unexpectedly passed")
+    except common.CapacityGateError:
+        pass
     invalid_rebalance = json.loads(json.dumps(rebalance_rows))
     invalid_rebalance[-1]["attributes"]["maintenance_evidence"]["chunks_reclaimed"] = 0
     try:
@@ -2869,6 +2921,17 @@ def self_test() -> int:
             invalid_rebalance, started_wall_ns=80, finished_wall_ns=89
         )
         raise AssertionError("inconsistent cross-pool reclaim unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    invalid_chunk_identity = json.loads(json.dumps(rebalance_rows))
+    invalid_chunk_identity[-1]["attributes"]["maintenance_evidence"]["rebalance"][
+        "pools"
+    ][0]["chunks"][0]["pool_id"] = "dynamic-pool/sha256/" + "b" * 64
+    try:
+        validate_rebalance_trace(
+            invalid_chunk_identity, started_wall_ns=80, finished_wall_ns=89
+        )
+        raise AssertionError("mismatched exact chunk identity unexpectedly passed")
     except common.CapacityGateError:
         pass
     require(summary["split_events"] == 1, "self-test lost split evidence")

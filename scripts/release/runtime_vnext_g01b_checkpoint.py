@@ -551,6 +551,62 @@ def revalidate_capacity(
         ),
         f"{item['key']} child manifest differs from raw evidence revalidation",
     )
+    owner = regenerated.get("cross_pool_rebalance_evidence_owner")
+    require(
+        owner == capacity_checkpoint.CROSS_POOL_REBALANCE_EVIDENCE_OWNER,
+        f"{item['key']} cross-pool evidence owner is invalid",
+    )
+    if decode:
+        rebalance = require_object(
+            regenerated.get("rebalance_summary"),
+            f"{item['key']} rebalance summary",
+        )
+        receipts = rebalance.get("receipts")
+        require(
+            rebalance.get("exact_receipt") is True
+            and rebalance.get("evidence_owner") == owner
+            and isinstance(rebalance.get("rebalance_events"), int)
+            and rebalance["rebalance_events"] > 0
+            and isinstance(rebalance.get("chunks_reclaimed"), int)
+            and rebalance["chunks_reclaimed"] > 0
+            and isinstance(receipts, list)
+            and len(receipts) == rebalance["rebalance_events"],
+            f"{item['key']} lacks deterministic exact cross-pool evidence",
+        )
+        for index, receipt in enumerate(receipts):
+            require(
+                isinstance(receipt, dict)
+                and isinstance(receipt.get("pool_ids"), list)
+                and bool(receipt["pool_ids"])
+                and isinstance(receipt.get("chunk_identities"), list)
+                and bool(receipt["chunk_identities"])
+                and isinstance(receipt.get("capacity_epochs"), dict)
+                and set(receipt["capacity_epochs"])
+                == {
+                    "logical_capacity_epoch",
+                    "plan_device_capacity_epoch",
+                    "process_device_capacity_epoch",
+                }
+                and all(
+                    isinstance(value, int) and value > 0
+                    for value in receipt["capacity_epochs"].values()
+                ),
+                f"{item['key']} exact cross-pool receipt {index} is incomplete",
+            )
+    else:
+        maintenance = require_object(
+            regenerated.get("maintenance_summary"),
+            f"{item['key']} maintenance summary",
+        )
+        require(
+            isinstance(
+                regenerated.get("cross_pool_rebalance_proved_by_this_lane"),
+                bool,
+            )
+            and isinstance(maintenance.get("maintained_events"), int)
+            and maintenance["maintained_events"] >= 0,
+            f"{item['key']} capacity-pressure evidence ownership is invalid",
+        )
     return {
         "source_git_sha": item["source_git_sha"],
         "binary_sha256": child.get("binary_sha256"),
@@ -561,6 +617,8 @@ def revalidate_capacity(
         "active_decode_progress_under_pressure": True,
         "release_epoch_resume": True,
         "decode_capacity": decode,
+        "cross_pool_rebalance_evidence_owner": owner,
+        "owns_exact_cross_pool_rebalance": decode,
     }
 
 
@@ -1152,6 +1210,11 @@ def self_test() -> int:
     require(len(TEST_SPECS["source-audit"]["expected_tests"]) == 3, "G01B source audit count drifted")
     require(len(TEST_SPECS["plan-snapshots"]["expected_tests"]) == 13, "G01B plan test count drifted")
     require(TEST_SPECS["overhead"]["release"] is True, "G01B overhead must use release mode")
+    require(
+        capacity_checkpoint.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
+        == "vnext-s1-cuda-decode-capacity/rebalance-probe",
+        "G01B cross-pool evidence ownership drifted",
+    )
     require(production_path("crates/ferrum-engine/src/lib.rs"), "production source classification rejected crate src")
     require(production_path("crates/ferrum-kernels/cuda/kernel.cu"), "production source classification rejected native source")
     require(production_path("Cargo.lock"), "production source classification rejected Cargo.lock")

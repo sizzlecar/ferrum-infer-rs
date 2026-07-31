@@ -28,6 +28,9 @@ MAX_PRESSURE_UNCHANGED_SKIPS = 512
 MAX_PRESSURE_TRACE_BYTES = 16 * 1024 * 1024
 MAX_PRESSURE_JOINT_STREAM_SECONDS = 300.0
 CAPACITY_SCENARIO_VERSION = 2
+CROSS_POOL_REBALANCE_EVIDENCE_OWNER = (
+    "vnext-s1-cuda-decode-capacity/rebalance-probe"
+)
 SERVER_MAX_MODEL_LEN = 256
 SEQUENCE_FIT_POLICY = "full-input-must-fit"
 PRESSURE_B_WORD_COUNT = 192
@@ -1978,6 +1981,7 @@ def validate_maintenance_rebalance_evidence(
             "reclaimed_bytes": 0,
             "pool_ids": [],
             "chunk_identities": [],
+            "capacity_epochs": None,
         }
     require(isinstance(rebalance, dict), f"{label}: exact rebalance receipt is missing")
     pools = rebalance.get("pools")
@@ -2058,6 +2062,14 @@ def validate_maintenance_rebalance_evidence(
         "reclaimed_bytes": reclaimed_bytes,
         "pool_ids": pool_ids,
         "chunk_identities": [list(identity) for identity in chunk_identities],
+        "capacity_epochs": {
+            key: rebalance[key]
+            for key in (
+                "logical_capacity_epoch",
+                "plan_device_capacity_epoch",
+                "process_device_capacity_epoch",
+            )
+        },
     }
 
 
@@ -2737,19 +2749,24 @@ def validate(root: Path, out: Path) -> int:
         ),
         "pressure B typed horizon differs from tokenizer usage",
     )
+    maintained_backing = []
     exact_rebalances = []
     for index, row in enumerate(rows):
         if (
             row.get("phase") == "vnext.prefill_backing_maintenance"
             and row.get("shape", {}).get("outcome") == "maintained"
         ):
+            require(
+                row.get("status") == "ok" and row.get("error") is None,
+                f"target maintained backing {index}: event failed",
+            )
             summary = validate_maintenance_rebalance_evidence(
                 row.get("attributes", {}).get("maintenance_evidence"),
                 f"target maintained backing {index}",
             )
+            maintained_backing.append(summary)
             if summary["pools_reclaimed"] > 0:
                 exact_rebalances.append(summary)
-    require(exact_rebalances, "target trace exercised no exact cross-pool rebalance receipt")
     target_trace_bytes = target_trace_path.stat().st_size
     pressure_trace_bytes = trace_bytes_at_or_after(
         target_trace_path, a["started_wall_ns"]
@@ -2962,10 +2979,22 @@ def validate(root: Path, out: Path) -> int:
         },
         "b_typed_input_tokens": b["prompt_tokens"],
         "b_typed_maximum_sequence_tokens": b["prompt_tokens"] + b["max_tokens"] - 1,
+        "maintenance_summary": {
+            "maintained_events": len(maintained_backing),
+            "exact_rebalance_events": len(exact_rebalances),
+            "exact_reclaimed_chunks": sum(
+                summary["chunks_reclaimed"] for summary in exact_rebalances
+            ),
+            "exact_reclaimed_bytes": sum(
+                summary["reclaimed_bytes"] for summary in exact_rebalances
+            ),
+        },
         "exact_rebalance_events": len(exact_rebalances),
         "exact_reclaimed_chunks": sum(
             summary["chunks_reclaimed"] for summary in exact_rebalances
         ),
+        "cross_pool_rebalance_proved_by_this_lane": bool(exact_rebalances),
+        "cross_pool_rebalance_evidence_owner": CROSS_POOL_REBALANCE_EVIDENCE_OWNER,
         "b_unchanged_epoch_skips": len(skipped),
         "target_trace_bytes": target_trace_bytes,
         "pressure_trace_bytes": pressure_trace_bytes,
@@ -3444,6 +3473,51 @@ def self_test() -> int:
             },
             "request_id": "B",
         }
+        exact_rebalance = validate_maintenance_rebalance_evidence(
+            maintained["attributes"]["maintenance_evidence"],
+            "self-test exact maintained backing",
+        )
+        require(
+            exact_rebalance["pool_ids"]
+            == ["dynamic-pool/sha256/" + "a" * 64]
+            and exact_rebalance["chunk_identities"]
+            == [["dynamic-pool/sha256/" + "a" * 64, 1, 2]]
+            and exact_rebalance["capacity_epochs"]
+            == {
+                "logical_capacity_epoch": 15,
+                "plan_device_capacity_epoch": 16,
+                "process_device_capacity_epoch": 17,
+            },
+            "exact maintenance receipt lost pool, chunk, or epoch identity",
+        )
+        no_rebalance = json.loads(
+            json.dumps(maintained["attributes"]["maintenance_evidence"])
+        )
+        no_rebalance.update(
+            {
+                "pools_reclaimed": 0,
+                "chunks_reclaimed": 0,
+                "reclaimed_bytes": 0,
+                "rebalance": None,
+            }
+        )
+        require(
+            validate_maintenance_rebalance_evidence(
+                no_rebalance, "self-test maintained backing without reclaim"
+            )["capacity_epochs"]
+            is None,
+            "maintenance without reclaim invented an exact receipt",
+        )
+        missing_exact_receipt = json.loads(
+            json.dumps(maintained["attributes"]["maintenance_evidence"])
+        )
+        missing_exact_receipt["rebalance"] = None
+        expect_gate_error(
+            lambda: validate_maintenance_rebalance_evidence(
+                missing_exact_receipt, "self-test missing exact receipt"
+            ),
+            "exact rebalance receipt is missing",
+        )
         admitted = {
             "ts_unix_nanos": 30,
             "phase": "vnext.prefill_admission",
