@@ -1024,10 +1024,15 @@ class ServerSession:
         max_num_seqs: int = 4,
         max_num_batched_tokens: int = 1024,
         prefill_first_until_active: int = 4,
+        sequence_fit_policy: str = SEQUENCE_FIT_POLICY,
     ) -> None:
         require(max_model_len > 0, "server max model length must be positive")
         require(max_num_seqs > 0, "server max sequence count must be positive")
         require(max_num_batched_tokens > 0, "server token budget must be positive")
+        require(
+            sequence_fit_policy in {"full-input-must-fit", "immediate-only"},
+            "server sequence fit policy is invalid",
+        )
         require(
             0 < prefill_first_until_active <= max_num_seqs,
             "server prefill-first target must be within the sequence ceiling",
@@ -1057,7 +1062,7 @@ class ServerSession:
             "--max-num-batched-tokens",
             str(max_num_batched_tokens),
             "--sequence-fit-policy",
-            SEQUENCE_FIT_POLICY,
+            sequence_fit_policy,
             "--scheduler-prefill-first-until-active",
             str(prefill_first_until_active),
             "--profile-detail",
