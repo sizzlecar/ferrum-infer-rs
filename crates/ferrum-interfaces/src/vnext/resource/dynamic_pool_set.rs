@@ -11,23 +11,24 @@ use super::{
     BufferRequest, CapacityAvailabilityEpoch, CapacityDomainId, CapacityEntry, CapacityEpochs,
     CapacityUnits, CapacityVector, DeviceAllocationPermit, DeviceBufferRetention,
     DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, Digest, DynamicBackingBlocker,
-    DynamicBackingClaimScope, DynamicBackingDeferralReason, DynamicBackingDeferred,
-    DynamicBackingPool, DynamicBackingPoolId, DynamicBackingPoolState,
-    DynamicChunkQuarantineReason, DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec,
-    DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthIntent, DynamicPoolGrowthReceipt,
-    DynamicPoolIdleReclaim, DynamicPoolRebalanceReceipt, DynamicResourceShape, DynamicStorageView,
-    EvaluatedBackingRequest, ExecutionLane, FreeExtentIndex, IdleChunkReclaimCandidate,
-    InvocationLivenessMode, LaneBackingPrepareDecision, LaneStableArenaEntry,
-    LaneStableArenaEvictionCandidate, LaneStableArenaLane, LaneStableArenaSlot,
-    LaneStableArenaSlotLease, LaneStableArenaState, LogicalAdmissionCoordinator,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, LogicalBackingSliceAllocationEvidence,
-    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard,
-    PlanNode, PlannedDynamicGrowth, PreparedBackingClaim, PreparedBackingExtent,
-    PreparedLaneBackingClaim, ProgramBindingLayout, QuarantinedDynamicChunk, ResidentChunkBacking,
-    ResidentChunkState, ResourceId, ResourceReservation, ResourceRetentionPolicy,
-    ResourceTransactionIdentity, RunId, Sha256, StateInitialization, StaticProvisioningBinding,
-    StepResourceSlotKind, SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout,
-    TransactionId, VNextError, NEXT_DYNAMIC_POOL_INSTANCE_ID,
+    DynamicBackingClaimOccupancy, DynamicBackingClaimResidency, DynamicBackingClaimScope,
+    DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPool, DynamicBackingPoolId,
+    DynamicBackingPoolState, DynamicChunkQuarantineReason, DynamicDeviceCapacityBlocked,
+    DynamicPoolDomainSpec, DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthIntent,
+    DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim, DynamicPoolLiveOccupancyStatus,
+    DynamicPoolRebalanceReceipt, DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest,
+    ExecutionLane, FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode,
+    LaneBackingPrepareDecision, LaneStableArenaEntry, LaneStableArenaEvictionCandidate,
+    LaneStableArenaLane, LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
+    LogicalAdmissionCoordinator, LogicalBackingBufferView, LogicalBackingSegmentBinding,
+    LogicalBackingSliceAllocationEvidence, LogicalBackingSliceAuthority,
+    LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard, PlanNode,
+    PlannedDynamicGrowth, PreparedBackingClaim, PreparedBackingExtent, PreparedLaneBackingClaim,
+    ProgramBindingLayout, QuarantinedDynamicChunk, ResidentChunkBacking, ResidentChunkState,
+    ResourceId, ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId,
+    Sha256, StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
+    SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, TransactionId, VNextError,
+    NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
@@ -108,6 +109,7 @@ where
                     next_chunk_generation: 1,
                     chunks: BTreeMap::new(),
                     allocator: FreeExtentIndex::default(),
+                    live_occupancy: DynamicPoolLiveOccupancyStatus::default(),
                     quarantined: Vec::new(),
                     poisoned: false,
                 }),
@@ -859,7 +861,11 @@ where
             .and_then(|request| request.projections.first())
             .map(|projection| projection.descriptor.lifetime())
             .ok_or_else(|| invalid_resource("dynamic backing request has no projection"))?;
-        self.prepare_claim_scoped(requests, DynamicBackingClaimScope::from(lifetime))
+        self.prepare_claim_scoped(
+            requests,
+            DynamicBackingClaimScope::from(lifetime),
+            DynamicBackingClaimResidency::Transient,
+        )
     }
 
     fn reusable_capacity_shape_for_requests(
@@ -996,7 +1002,11 @@ where
                 }
             }
 
-            match self.prepare_claim(requests)? {
+            match self.prepare_claim_scoped(
+                requests,
+                DynamicBackingClaimScope::from(lifetime),
+                DynamicBackingClaimResidency::LaneStable,
+            )? {
                 BackingPrepareDecision::Prepared(prepared) => {
                     let mut arenas = self
                         .lane_stable_arenas
@@ -1248,13 +1258,18 @@ where
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
     ) -> Result<BackingPrepareDecision<R>, VNextError> {
-        self.prepare_claim_scoped(requests, DynamicBackingClaimScope::InitialSequenceBundle)
+        self.prepare_claim_scoped(
+            requests,
+            DynamicBackingClaimScope::InitialSequenceBundle,
+            DynamicBackingClaimResidency::Transient,
+        )
     }
 
     fn prepare_claim_scoped(
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
         scope: DynamicBackingClaimScope,
+        residency: DynamicBackingClaimResidency,
     ) -> Result<BackingPrepareDecision<R>, VNextError> {
         if requests.is_empty() {
             return Ok(BackingPrepareDecision::Prepared(
@@ -1483,7 +1498,14 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             let mut selections = groups
                 .iter()
-                .map(|_| Vec::<(&EvaluatedBackingRequest<'_>, u64, Vec<BackingSegment>)>::new())
+                .map(|_| {
+                    Vec::<(
+                        &EvaluatedBackingRequest<'_>,
+                        u64,
+                        Vec<BackingSegment>,
+                        DynamicBackingClaimOccupancy,
+                    )>::new()
+                })
                 .collect::<Vec<_>>();
             let mut journals = groups
                 .iter()
@@ -1589,12 +1611,31 @@ where
                     }
                     let generation =
                         segment_generations[group_index][selections[group_index].len()];
-                    selections[group_index].push((request, generation, segments));
+                    let segment_count = match u64::try_from(segments.len()) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            rollback_free_extent_journal(&mut states, &journals)?;
+                            return Err(invalid_resource(
+                                "dynamic backing segment count exceeds portable range",
+                            ));
+                        }
+                    };
+                    selections[group_index].push((
+                        request,
+                        generation,
+                        segments,
+                        DynamicBackingClaimOccupancy {
+                            scope,
+                            residency,
+                            physical_bytes: request.capacity_size_bytes,
+                            segment_count,
+                        },
+                    ));
                 }
             }
 
             for group_selections in &selections {
-                for (request, _, segments) in group_selections {
+                for (request, _, segments, _) in group_selections {
                     for projection in &request.projections {
                         if let Err(error) = backing_segment_range(
                             segments,
@@ -1608,10 +1649,10 @@ where
                 }
             }
 
-            let increments = match (0..groups.len())
+            let accounting_updates = match (0..groups.len())
                 .map(|group_index| {
                     let mut increments = BTreeMap::<u32, u64>::new();
-                    for (_, _, segments) in &selections[group_index] {
+                    for (_, _, segments, _) in &selections[group_index] {
                         for segment in segments {
                             let count = increments.entry(segment.chunk_ordinal()).or_default();
                             *count = count.checked_add(1).ok_or_else(|| {
@@ -1632,17 +1673,22 @@ where
                                 invalid_resource("dynamic chunk live extent count overflowed")
                             })?;
                     }
-                    Ok(increments)
+                    let occupancy = selections[group_index].iter().try_fold(
+                        states[group_index].live_occupancy,
+                        |occupancy, (_, _, _, claim)| occupancy.checked_with_claim(*claim),
+                    )?;
+                    Ok((increments, occupancy))
                 })
                 .collect::<Result<Vec<_>, VNextError>>()
             {
-                Ok(increments) => increments,
+                Ok(updates) => updates,
                 Err(error) => {
                     rollback_free_extent_journal(&mut states, &journals)?;
                     return Err(error);
                 }
             };
-            for (group_index, increments) in increments.into_iter().enumerate() {
+            for (group_index, (increments, occupancy)) in accounting_updates.into_iter().enumerate()
+            {
                 for (ordinal, increment) in increments {
                     states[group_index]
                         .chunks
@@ -1650,11 +1696,12 @@ where
                         .expect("validated reserved dynamic chunk remains installed")
                         .live_segments += increment;
                 }
+                states[group_index].live_occupancy = occupancy;
             }
             drop(states);
             let mut extents = Vec::new();
             for ((pool, _), selections) in groups.into_iter().zip(selections) {
-                for (request, segment_generation, segments) in selections {
+                for (request, segment_generation, segments, occupancy) in selections {
                     let projections = request
                         .projections
                         .iter()
@@ -1700,6 +1747,7 @@ where
                         pool: Arc::clone(&pool),
                         claim_identity: request.claim_identity.clone(),
                         segment_generation,
+                        occupancy,
                         segments,
                         capacity_size_bytes: request.capacity_size_bytes,
                         projections,
