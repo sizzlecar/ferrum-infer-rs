@@ -23,6 +23,7 @@ TARGET_TOKEN_BUDGET = 1024
 MAX_NUM_SEQS = 3
 MAX_MODEL_LEN = 512
 PREFILL_FIRST_UNTIL_ACTIVE = 3
+DECODE_SEQUENCE_FIT_POLICY = "immediate-only"
 CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
 TARGET_MAX_TOKENS = {"A": 128, "B": 384, "C": 384}
 PRESSURE_DECODE_SLOTS = ("A", "B", "C")
@@ -61,6 +62,7 @@ ALLOWED_PRESSURE_YIELD_KINDS = {"peer_handoff", "self_recompute"}
 SERVER_POLICY = {
     "max_model_len": MAX_MODEL_LEN,
     "max_num_seqs": MAX_NUM_SEQS,
+    "sequence_fit_policy": DECODE_SEQUENCE_FIT_POLICY,
     "prefill_first_until_active": PREFILL_FIRST_UNTIL_ACTIVE,
     "calibration_max_num_batched_tokens": CALIBRATION_TOKEN_BUDGET,
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
@@ -137,6 +139,12 @@ def require_executor_identity_shape(executor: dict[str, Any], label: str) -> Non
         isinstance(executor.get("runtime_memory_policy"), dict),
         f"{label}: runtime memory policy is missing",
     )
+    admission = executor.get("runtime_admission_policy")
+    require(
+        isinstance(admission, dict)
+        and admission.get("sequence_fit_policy") == "immediate_only",
+        f"{label}: decode lane did not use ImmediateOnly sequence fit",
+    )
 
 
 def require_same_fields(
@@ -201,6 +209,7 @@ def validate_canonical_server_argv(
         "--max-model-len": str(MAX_MODEL_LEN),
         "--max-num-seqs": str(MAX_NUM_SEQS),
         "--max-num-batched-tokens": str(token_budget),
+        "--sequence-fit-policy": DECODE_SEQUENCE_FIT_POLICY,
         "--scheduler-prefill-first-until-active": str(PREFILL_FIRST_UNTIL_ACTIVE),
     }
     for flag, expected in expected_options.items():
@@ -1832,6 +1841,7 @@ def server_session(
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=max_num_batched_tokens,
         prefill_first_until_active=PREFILL_FIRST_UNTIL_ACTIVE,
+        sequence_fit_policy=DECODE_SEQUENCE_FIT_POLICY,
     )
 
 
@@ -2658,6 +2668,11 @@ def self_test() -> int:
         "target sizing must replay the narrow calibration workload",
     )
     require(
+        SERVER_POLICY["sequence_fit_policy"] == DECODE_SEQUENCE_FIT_POLICY
+        and DECODE_SEQUENCE_FIT_POLICY == "immediate-only",
+        "decode capacity must exercise dynamic sequence extension",
+    )
+    require(
         SERVER_POLICY["target_rebalance_prime_max_tokens"] == CALIBRATION_MAX_TOKENS
         and SERVER_POLICY["target_rebalance_probe_max_tokens"] == 1
         and SERVER_POLICY["target_rebalance_probe_prompt_sha256"]
@@ -2737,6 +2752,9 @@ def self_test() -> int:
                 "reserve_bytes": reserve_bytes,
                 "maximum_active_sequences": MAX_NUM_SEQS,
             },
+            "runtime_admission_policy": {
+                "sequence_fit_policy": "immediate_only",
+            },
         }
 
     calibration_executor = executor_fixture("a", "5", 100)
@@ -2778,6 +2796,16 @@ def self_test() -> int:
         lambda: require_executor_identity_shape(malformed_plan, "malformed plan"),
         "plan id/hash mismatch",
     )
+    wrong_fit_policy = dict(target_executor)
+    wrong_fit_policy["runtime_admission_policy"] = {
+        "sequence_fit_policy": "full_input_must_fit"
+    }
+    expect_reject(
+        lambda: require_executor_identity_shape(
+            wrong_fit_policy, "wrong decode fit policy"
+        ),
+        "prefill fit policy in decode lane",
+    )
 
     canonical_argv = [
         "/tmp/ferrum",
@@ -2791,6 +2819,8 @@ def self_test() -> int:
         str(MAX_NUM_SEQS),
         "--max-num-batched-tokens",
         str(CALIBRATION_TOKEN_BUDGET),
+        "--sequence-fit-policy",
+        DECODE_SEQUENCE_FIT_POLICY,
         "--scheduler-prefill-first-until-active",
         str(PREFILL_FIRST_UNTIL_ACTIVE),
     ]
