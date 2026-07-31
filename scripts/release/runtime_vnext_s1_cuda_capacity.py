@@ -32,6 +32,8 @@ SERVER_MAX_MODEL_LEN = 256
 SEQUENCE_FIT_POLICY = "full-input-must-fit"
 PRESSURE_B_WORD_COUNT = 192
 PRESSURE_MAX_TOKENS = {"A": 224, "B": 32, "C": 16}
+CORRECTNESS_RUN_THINKING_ARGS = ("--disable-thinking",)
+CORRECTNESS_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 PRESSURE_B_PROMPT = (
     "Capacity lane large request. Read every word before answering."
     + " token" * PRESSURE_B_WORD_COUNT
@@ -44,6 +46,11 @@ PRESSURE_WORKLOAD_POLICY = {
     "max_tokens_by_slot": PRESSURE_MAX_TOKENS,
     "b_prompt_sha256": hashlib.sha256(PRESSURE_B_PROMPT.encode("utf-8")).hexdigest(),
     "b_prompt_word_count": PRESSURE_B_WORD_COUNT,
+    "correctness_thinking_control": {
+        "run_args": list(CORRECTNESS_RUN_THINKING_ARGS),
+        "chat_template_kwargs": CORRECTNESS_CHAT_TEMPLATE_KWARGS,
+        "production_default_changed": False,
+    },
 }
 PRESSURE_STOP_POLICY = {
     "no_progress_timeout_seconds": MAX_PRESSURE_NO_PROGRESS_SECONDS,
@@ -554,13 +561,10 @@ def capacity_prompt(workload_slot: str) -> str:
     )
 
 
-def collect_run_smoke(
-    *, repo: Path, binary: Path, model: Path, out_dir: Path, timeout: float
-) -> dict[str, Any]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    trace = out_dir / "scheduler-trace.jsonl"
-    profile = out_dir / "profile.jsonl"
-    command = [
+def run_smoke_command(
+    *, binary: Path, model: Path, profile: Path, trace: Path
+) -> list[str]:
+    return [
         str(binary),
         "run",
         str(model),
@@ -570,6 +574,7 @@ def collect_run_smoke(
         "Respond with only the city name: What is the capital of France?",
         "--max-tokens",
         "16",
+        *CORRECTNESS_RUN_THINKING_ARGS,
         "--sequence-fit-policy",
         SEQUENCE_FIT_POLICY,
         "--temperature",
@@ -587,6 +592,17 @@ def collect_run_smoke(
         "--scheduler-trace-jsonl",
         str(trace),
     ]
+
+
+def collect_run_smoke(
+    *, repo: Path, binary: Path, model: Path, out_dir: Path, timeout: float
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trace = out_dir / "scheduler-trace.jsonl"
+    profile = out_dir / "profile.jsonl"
+    command = run_smoke_command(
+        binary=binary, model=model, profile=profile, trace=trace
+    )
     write_json(out_dir / "command.json", {"argv": command})
     started = time.time_ns()
     try:
@@ -634,6 +650,28 @@ def collect_run_smoke(
     return summary
 
 
+def stream_request_payload(
+    *, model: str, prompt: str, max_tokens: int, role: str
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "seed": 9271,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": dict(CORRECTNESS_CHAT_TEMPLATE_KWARGS),
+        "ignore_eos": True,
+        "user": f"runtime-vnext-capacity-{role}",
+    }
+
+
 def stream_request(
     *,
     port: int,
@@ -671,22 +709,12 @@ def stream_request(
         "error": None,
     }
     body = json.dumps(
-        {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "seed": 9271,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            "ignore_eos": True,
-            "user": f"runtime-vnext-capacity-{role}",
-        }
+        stream_request_payload(
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            role=role,
+        )
     ).encode("utf-8")
     raw_path = out_dir / f"{role}.sse"
     events_path = out_dir / f"{role}.events.jsonl"
@@ -2849,6 +2877,30 @@ def self_test() -> int:
     }
     require(find_executor_snapshot(snapshot) == snapshot["cache"]["prefix_cache"], "snapshot discovery failed")
     require(request_identity_matches("request.product.abc", "abc"), "request identity mapping failed")
+    smoke_command = run_smoke_command(
+        binary=Path("/tmp/ferrum"),
+        model=Path("/tmp/model"),
+        profile=Path("/tmp/profile.jsonl"),
+        trace=Path("/tmp/trace.jsonl"),
+    )
+    stream_payload = stream_request_payload(
+        model="Qwen/Qwen3.5-4B",
+        prompt="prompt",
+        max_tokens=16,
+        role="self-test",
+    )
+    require(
+        smoke_command.count("--disable-thinking") == 1
+        and stream_payload.get("chat_template_kwargs")
+        == {"enable_thinking": False}
+        and PRESSURE_WORKLOAD_POLICY.get("correctness_thinking_control")
+        == {
+            "run_args": ["--disable-thinking"],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "production_default_changed": False,
+        },
+        "capacity correctness paths lost their typed thinking control",
+    )
     executor = {
         "static_bytes": 7,
         "dynamic_pools": {
