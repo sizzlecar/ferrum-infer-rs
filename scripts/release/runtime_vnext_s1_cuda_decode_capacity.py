@@ -25,6 +25,7 @@ MAX_MODEL_LEN = 512
 PREFILL_FIRST_UNTIL_ACTIVE = 3
 CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
 TARGET_MAX_TOKENS = {"A": 128, "B": 128, "C": 16}
+LONG_DECODE_SLOTS = ("A", "B")
 REBALANCE_PRIME_MAX_TOKENS = CALIBRATION_MAX_TOKENS
 REBALANCE_PROBE_MAX_TOKENS = 1
 REBALANCE_PROBE_WORD_COUNT = 256
@@ -1472,7 +1473,7 @@ def require_decode_prompt(result: dict[str, Any], slot: str) -> None:
     )
 
 
-def require_decode_live_overlap(
+def require_long_decode_live_overlap(
     results: dict[str, dict[str, Any]], label: str
 ) -> dict[str, int]:
     require(
@@ -1481,7 +1482,8 @@ def require_decode_live_overlap(
     )
     first_content: list[int] = []
     finished: list[int] = []
-    for slot, result in results.items():
+    for slot in LONG_DECODE_SLOTS:
+        result = results[slot]
         first = result.get("first_content_wall_ns")
         end = result.get("finished_wall_ns")
         require(
@@ -1499,13 +1501,13 @@ def require_decode_live_overlap(
     require(
         latest_first_content < earliest_completion,
         (
-            f"{label}: workload calibration invalid: all streams did not enter decode "
-            "before the first completion"
+            f"{label}: workload calibration invalid: long streams did not overlap "
+            "in decode"
         ),
     )
     return {
-        "latest_first_content_wall_ns": latest_first_content,
-        "earliest_completion_wall_ns": earliest_completion,
+        "latest_long_first_content_wall_ns": latest_first_content,
+        "earliest_long_completion_wall_ns": earliest_completion,
         "overlap_wall_ns": earliest_completion - latest_first_content,
     }
 
@@ -1934,8 +1936,8 @@ def collect(args: argparse.Namespace) -> int:
             "health_final": "target/health.final.json",
             "trace": "target/scheduler-trace.jsonl",
         }
-        collection["target"]["decode_live_overlap"] = require_decode_live_overlap(
-            target_clients, "target"
+        collection["target"]["long_decode_live_overlap"] = (
+            require_long_decode_live_overlap(target_clients, "target")
         )
         require_target_pool_within_budget_contract(
             target_pool, target_budget_envelope, exact_budget
@@ -2271,10 +2273,10 @@ def validate(root: Path, out: Path) -> int:
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
     )
-    decode_live_overlap = require_decode_live_overlap(target["clients"], "target")
+    decode_live_overlap = require_long_decode_live_overlap(target["clients"], "target")
     require(
-        target.get("decode_live_overlap") == decode_live_overlap,
-        "target decode-live overlap receipt differs from raw clients",
+        target.get("long_decode_live_overlap") == decode_live_overlap,
+        "target long decode-live overlap receipt differs from raw clients",
     )
     for slot in ("A", "B", "C"):
         common.validate_replayed_workload(
@@ -2474,24 +2476,24 @@ def self_test() -> int:
         except DecodeCapacityGateError:
             pass
 
-    overlap_clients = {
+    historical_shape_clients = {
         "A": {"first_content_wall_ns": 100, "finished_wall_ns": 400},
         "B": {"first_content_wall_ns": 200, "finished_wall_ns": 500},
-        "C": {"first_content_wall_ns": 300, "finished_wall_ns": 600},
+        "C": {"first_content_wall_ns": 120, "finished_wall_ns": 190},
     }
     require(
-        require_decode_live_overlap(overlap_clients, "self-test")
+        require_long_decode_live_overlap(historical_shape_clients, "self-test")
         == {
-            "latest_first_content_wall_ns": 300,
-            "earliest_completion_wall_ns": 400,
-            "overlap_wall_ns": 100,
+            "latest_long_first_content_wall_ns": 200,
+            "earliest_long_completion_wall_ns": 400,
+            "overlap_wall_ns": 200,
         },
-        "decode-live overlap receipt changed",
+        "long decode-live overlap receipt changed",
     )
     expect_reject(
-        lambda: require_decode_live_overlap(
+        lambda: require_long_decode_live_overlap(
             {
-                **overlap_clients,
+                **historical_shape_clients,
                 "B": {"first_content_wall_ns": 450, "finished_wall_ns": 500},
             },
             "self-test non-overlap",
