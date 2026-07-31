@@ -563,7 +563,8 @@ def revalidate_capacity(
         )
         receipts = rebalance.get("receipts")
         require(
-            rebalance.get("exact_receipt") is True
+            regenerated.get("rebalance_evidence_phase") == "target-sizing"
+            and rebalance.get("exact_receipt") is True
             and rebalance.get("evidence_owner") == owner
             and isinstance(rebalance.get("rebalance_events"), int)
             and rebalance["rebalance_events"] > 0
@@ -593,6 +594,18 @@ def revalidate_capacity(
                 ),
                 f"{item['key']} exact cross-pool receipt {index} is incomplete",
             )
+        probe = require_object(
+            regenerated.get("probe_maintenance_summary"),
+            f"{item['key']} probe maintenance summary",
+        )
+        require(
+            isinstance(probe.get("maintained_events"), int)
+            and probe["maintained_events"] > 0
+            and isinstance(probe.get("allocated_bytes"), int)
+            and probe["allocated_bytes"] > 0
+            and isinstance(probe.get("exact_receipt"), bool),
+            f"{item['key']} probe lacks typed backing growth evidence",
+        )
     else:
         maintenance = require_object(
             regenerated.get("maintenance_summary"),
@@ -1212,7 +1225,7 @@ def self_test() -> int:
     require(TEST_SPECS["overhead"]["release"] is True, "G01B overhead must use release mode")
     require(
         capacity_checkpoint.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
-        == "vnext-s1-cuda-decode-capacity/rebalance-probe",
+        == "vnext-s1-cuda-decode-capacity/target-sizing",
         "G01B cross-pool evidence ownership drifted",
     )
     require(production_path("crates/ferrum-engine/src/lib.rs"), "production source classification rejected crate src")
