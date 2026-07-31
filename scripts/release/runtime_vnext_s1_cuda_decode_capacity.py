@@ -1601,8 +1601,13 @@ def collect(args: argparse.Namespace) -> int:
         calibration_health = calibration.health("health.final.json")
         calibration_executor = common.find_executor_snapshot(calibration_health)
         require(calibration_executor is not None, "calibration health has no vNext executor")
+        calibration_start_executor = common.executor_snapshot_from_health(
+            calibration.out_dir / "health.start.json", "decode calibration startup"
+        )
         calibration_pool = common.quiescent_pool_snapshot(
-            calibration_executor, "decode calibration"
+            calibration_executor,
+            "decode calibration",
+            baseline_executor=calibration_start_executor,
         )
         calibration_budget = calibration_pool["budget_claimed_bytes"]
         collection["calibration"] = {
@@ -1648,8 +1653,14 @@ def collect(args: argparse.Namespace) -> int:
         sizing_health = target_sizing.health("health.final.json")
         sizing_executor = common.find_executor_snapshot(sizing_health)
         require(sizing_executor is not None, "target sizing health has no vNext executor")
+        sizing_start_executor = common.executor_snapshot_from_health(
+            target_sizing.out_dir / "health.start.json",
+            "decode target sizing startup",
+        )
         sizing_pool = common.quiescent_pool_snapshot(
-            sizing_executor, "decode target sizing"
+            sizing_executor,
+            "decode target sizing",
+            baseline_executor=sizing_start_executor,
         )
         collection["target_sizing"] = {
             "clients": sizing_clients,
@@ -1696,8 +1707,13 @@ def collect(args: argparse.Namespace) -> int:
         prime_health = target.health("health.rebalance-prime.json")
         prime_executor = common.find_executor_snapshot(prime_health)
         require(prime_executor is not None, "rebalance prime health has no vNext executor")
+        target_start_executor = common.executor_snapshot_from_health(
+            target.out_dir / "health.start.json", "decode target startup"
+        )
         prime_pool = common.quiescent_pool_snapshot(
-            prime_executor, "decode target rebalance prime"
+            prime_executor,
+            "decode target rebalance prime",
+            baseline_executor=target_start_executor,
         )
         require(
             prime_pool["budget_claimed_bytes"] == exact_budget
@@ -1728,7 +1744,9 @@ def collect(args: argparse.Namespace) -> int:
         probe_executor = common.find_executor_snapshot(probe_health)
         require(probe_executor is not None, "rebalance probe health has no vNext executor")
         probe_pool = common.quiescent_pool_snapshot(
-            probe_executor, "decode target rebalance probe"
+            probe_executor,
+            "decode target rebalance probe",
+            baseline_executor=target_start_executor,
         )
         target_rows = common.read_trace(target.trace_path)
         probe_rebalance_summary = validate_rebalance_trace(
@@ -1757,7 +1775,11 @@ def collect(args: argparse.Namespace) -> int:
         target_health = target.health("health.final.json")
         target_executor = common.find_executor_snapshot(target_health)
         require(target_executor is not None, "target health has no vNext executor")
-        target_pool = common.quiescent_pool_snapshot(target_executor, "decode target")
+        target_pool = common.quiescent_pool_snapshot(
+            target_executor,
+            "decode target",
+            baseline_executor=target_start_executor,
+        )
         target.stop()
         collection["target"] = {
             "rebalance_prime": {
@@ -1987,14 +2009,30 @@ def validate(root: Path, out: Path) -> int:
         calibration_executor.get("model_id") in str(collection.get("model_path")),
         "executor model id is absent from immutable model path",
     )
-    calibration_pool = common.quiescent_pool_snapshot(calibration_executor, "raw decode calibration")
-    sizing_pool = common.quiescent_pool_snapshot(sizing_executor, "raw decode target sizing")
-    target_pool = common.quiescent_pool_snapshot(target_executor, "raw decode target")
+    calibration_pool = common.quiescent_pool_snapshot(
+        calibration_executor,
+        "raw decode calibration",
+        baseline_executor=calibration_start_executor,
+    )
+    sizing_pool = common.quiescent_pool_snapshot(
+        sizing_executor,
+        "raw decode target sizing",
+        baseline_executor=sizing_start_executor,
+    )
+    target_pool = common.quiescent_pool_snapshot(
+        target_executor,
+        "raw decode target",
+        baseline_executor=target_start_executor,
+    )
     prime_pool = common.quiescent_pool_snapshot(
-        prime_executor, "raw decode target rebalance prime"
+        prime_executor,
+        "raw decode target rebalance prime",
+        baseline_executor=target_start_executor,
     )
     probe_pool = common.quiescent_pool_snapshot(
-        probe_executor, "raw decode target rebalance probe"
+        probe_executor,
+        "raw decode target rebalance probe",
+        baseline_executor=target_start_executor,
     )
     calibration_budget = collection.get("calibration_budget_bytes")
     exact_budget = collection.get("exact_budget_bytes")

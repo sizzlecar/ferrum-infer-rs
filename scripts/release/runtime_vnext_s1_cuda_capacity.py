@@ -207,7 +207,15 @@ def find_executor_snapshot(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, Any]:
+def executor_snapshot_from_health(path: Path, label: str) -> dict[str, Any]:
+    executor = find_executor_snapshot(read_json(path))
+    require(executor is not None, f"{label}: health has no vNext executor snapshot")
+    return executor
+
+
+def dynamic_pool_occupancy_snapshot(
+    executor: dict[str, Any], label: str
+) -> dict[str, Any]:
     static_bytes = executor.get("static_bytes")
     dynamic_pools = executor.get("dynamic_pools")
     require(isinstance(static_bytes, int) and static_bytes > 0, f"{label}: invalid static bytes")
@@ -219,20 +227,34 @@ def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, A
         isinstance(budget_claimed_bytes, int) and budget_claimed_bytes >= static_bytes,
         f"{label}: invalid budget claimed bytes",
     )
-    residency: dict[str, int] = {}
-    envelopes: dict[str, dict[str, Any]] = {}
+    occupancy: dict[str, dict[str, Any]] = {}
     for pool in pools:
         require(isinstance(pool, dict), f"{label}: invalid dynamic pool status")
         pool_id = pool.get("pool_id")
+        domain_id = pool.get("domain_id")
         resident_bytes = pool.get("resident_bytes")
+        free_bytes = pool.get("free_bytes")
+        live_segments = pool.get("live_segments")
         resident_chunks = pool.get("resident_chunks")
         largest_contiguous_bytes = pool.get("largest_contiguous_bytes")
         storage_profile = pool.get("storage_profile")
         require(isinstance(pool_id, str) and pool_id, f"{label}: pool id is missing")
-        require(pool_id not in residency, f"{label}: duplicate pool id {pool_id}")
+        require(pool_id not in occupancy, f"{label}: duplicate pool id {pool_id}")
+        require(
+            isinstance(domain_id, int) and domain_id > 0,
+            f"{label}: invalid domain id for {pool_id}",
+        )
         require(
             isinstance(resident_bytes, int) and resident_bytes >= 0,
             f"{label}: invalid resident bytes for {pool_id}",
+        )
+        require(
+            isinstance(free_bytes, int) and 0 <= free_bytes <= resident_bytes,
+            f"{label}: invalid free bytes for {pool_id}",
+        )
+        require(
+            isinstance(live_segments, int) and live_segments >= 0,
+            f"{label}: invalid live segment count for {pool_id}",
         )
         require(
             isinstance(resident_chunks, int)
@@ -242,16 +264,11 @@ def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, A
         )
         require(
             isinstance(largest_contiguous_bytes, int)
-            and 0 <= largest_contiguous_bytes <= resident_bytes,
+            and 0 <= largest_contiguous_bytes <= free_bytes,
             f"{label}: invalid contiguous capacity for {pool_id}",
         )
         require(isinstance(storage_profile, dict), f"{label}: storage profile is missing for {pool_id}")
         require(pool.get("pending_growth_bytes") == 0, f"{label}: pending growth remains in {pool_id}")
-        require(pool.get("live_segments") == 0, f"{label}: live segments remain in {pool_id}")
-        require(
-            pool.get("free_bytes") == resident_bytes,
-            f"{label}: quiescent pool {pool_id} is not fully free",
-        )
         require(pool.get("quarantined_bytes") == 0, f"{label}: quarantined bytes remain in {pool_id}")
         require(pool.get("quarantined_chunks") == 0, f"{label}: quarantined chunks remain in {pool_id}")
         require(
@@ -263,14 +280,17 @@ def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, A
             f"{label}: rejected publication remains in {pool_id}",
         )
         require(pool.get("poisoned") is False, f"{label}: pool {pool_id} is poisoned")
-        residency[pool_id] = resident_bytes
-        envelopes[pool_id] = {
+        occupancy[pool_id] = {
+            "domain_id": domain_id,
             "resident_bytes": resident_bytes,
+            "free_bytes": free_bytes,
+            "used_bytes": resident_bytes - free_bytes,
+            "live_segments": live_segments,
             "resident_chunks": resident_chunks,
             "largest_contiguous_bytes": largest_contiguous_bytes,
             "storage_profile": storage_profile,
         }
-    resident_bytes = sum(residency.values())
+    resident_bytes = sum(pool["resident_bytes"] for pool in occupancy.values())
     require(resident_bytes > 0, f"{label}: no dynamic backing was installed")
     require(
         budget_claimed_bytes == static_bytes + resident_bytes,
@@ -280,8 +300,87 @@ def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, A
         "static_bytes": static_bytes,
         "resident_bytes": resident_bytes,
         "budget_claimed_bytes": budget_claimed_bytes,
-        "pool_resident_bytes": dict(sorted(residency.items())),
-        "pool_envelopes": dict(sorted(envelopes.items())),
+        "pools": dict(sorted(occupancy.items())),
+    }
+
+
+def quiescent_pool_snapshot(
+    executor: dict[str, Any],
+    label: str,
+    *,
+    baseline_executor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = dynamic_pool_occupancy_snapshot(executor, label)
+    if baseline_executor is None:
+        baseline_pools = {
+            pool_id: {
+                **pool,
+                "used_bytes": 0,
+                "live_segments": 0,
+            }
+            for pool_id, pool in current["pools"].items()
+        }
+    else:
+        baseline = dynamic_pool_occupancy_snapshot(
+            baseline_executor, f"{label} startup baseline"
+        )
+        require(
+            baseline["static_bytes"] == current["static_bytes"],
+            f"{label}: static bytes changed from startup baseline",
+        )
+        baseline_pools = baseline["pools"]
+    require(
+        set(current["pools"]) == set(baseline_pools),
+        f"{label}: dynamic pool identity changed from startup baseline",
+    )
+    for pool_id, pool in current["pools"].items():
+        baseline_pool = baseline_pools[pool_id]
+        require(
+            pool["domain_id"] == baseline_pool["domain_id"]
+            and pool["storage_profile"] == baseline_pool["storage_profile"],
+            f"{label}: pool contract changed from startup baseline for {pool_id}",
+        )
+        require(
+            pool["used_bytes"] == baseline_pool["used_bytes"],
+            f"{label}: request-owned bytes remain in {pool_id}",
+        )
+        require(
+            pool["live_segments"] == baseline_pool["live_segments"],
+            f"{label}: request-owned live segments remain in {pool_id}",
+        )
+    return {
+        "static_bytes": current["static_bytes"],
+        "resident_bytes": current["resident_bytes"],
+        "budget_claimed_bytes": current["budget_claimed_bytes"],
+        "pool_resident_bytes": {
+            pool_id: pool["resident_bytes"]
+            for pool_id, pool in current["pools"].items()
+        },
+        "pool_used_bytes": {
+            pool_id: pool["used_bytes"] for pool_id, pool in current["pools"].items()
+        },
+        "pool_live_segments": {
+            pool_id: pool["live_segments"]
+            for pool_id, pool in current["pools"].items()
+        },
+        "startup_baseline": {
+            "pool_used_bytes": {
+                pool_id: pool["used_bytes"]
+                for pool_id, pool in baseline_pools.items()
+            },
+            "pool_live_segments": {
+                pool_id: pool["live_segments"]
+                for pool_id, pool in baseline_pools.items()
+            },
+        },
+        "pool_envelopes": {
+            pool_id: {
+                key: value
+                for key, value in pool.items()
+                if key not in {"used_bytes"}
+            }
+            for pool_id, pool in current["pools"].items()
+        },
     }
 
 
@@ -1420,8 +1519,15 @@ def collect(args: argparse.Namespace) -> int:
         calibration_health = calibration.health("health.final.json")
         executor = find_executor_snapshot(calibration_health)
         require(executor is not None, "calibration health has no vNext executor snapshot")
+        calibration_start_executor = executor_snapshot_from_health(
+            calibration.out_dir / "health.start.json", "calibration startup"
+        )
         require_full_input_fit_policy(executor, "calibration")
-        calibration_pool_snapshot = quiescent_pool_snapshot(executor, "calibration")
+        calibration_pool_snapshot = quiescent_pool_snapshot(
+            executor,
+            "calibration",
+            baseline_executor=calibration_start_executor,
+        )
         static_bytes = calibration_pool_snapshot["static_bytes"]
         resident_bytes = calibration_pool_snapshot["resident_bytes"]
         exact_budget = static_bytes + resident_bytes
@@ -1443,8 +1549,15 @@ def collect(args: argparse.Namespace) -> int:
         warmup_health = target.health("health.warmup.json")
         warmup_executor = find_executor_snapshot(warmup_health)
         require(warmup_executor is not None, "warmup health has no vNext executor snapshot")
+        target_start_executor = executor_snapshot_from_health(
+            target.out_dir / "health.start.json", "target startup"
+        )
         require_full_input_fit_policy(warmup_executor, "warmup replay")
-        warmup_pool_snapshot = quiescent_pool_snapshot(warmup_executor, "warmup replay")
+        warmup_pool_snapshot = quiescent_pool_snapshot(
+            warmup_executor,
+            "warmup replay",
+            baseline_executor=target_start_executor,
+        )
         require_replayed_pool_snapshot(
             calibration_pool_snapshot, warmup_pool_snapshot, exact_budget
         )
@@ -2452,6 +2565,12 @@ def validate(root: Path, out: Path) -> int:
     calibration_executor = find_executor_snapshot(calibration_health)
     warmup_executor = find_executor_snapshot(warmup_health)
     pressure_a_executor = find_executor_snapshot(pressure_a_health)
+    calibration_start_executor = executor_snapshot_from_health(
+        root / "calibration" / "health.start.json", "raw calibration startup"
+    )
+    target_start_executor = executor_snapshot_from_health(
+        root / "target" / "health.start.json", "raw target startup"
+    )
     require(
         calibration_executor is not None
         and warmup_executor is not None
@@ -2462,9 +2581,15 @@ def validate(root: Path, out: Path) -> int:
     require_full_input_fit_policy(warmup_executor, "raw warmup replay")
     require_full_input_fit_policy(pressure_a_executor, "raw pressure A")
     calibration_pool_snapshot = quiescent_pool_snapshot(
-        calibration_executor, "raw calibration"
+        calibration_executor,
+        "raw calibration",
+        baseline_executor=calibration_start_executor,
     )
-    warmup_pool_snapshot = quiescent_pool_snapshot(warmup_executor, "raw warmup replay")
+    warmup_pool_snapshot = quiescent_pool_snapshot(
+        warmup_executor,
+        "raw warmup replay",
+        baseline_executor=target_start_executor,
+    )
     require(
         calibration_pool_snapshot.get("static_bytes") == calibration.get("static_bytes")
         and calibration_pool_snapshot.get("resident_bytes") == calibration.get("resident_bytes")
@@ -2908,6 +3033,7 @@ def self_test() -> int:
             "pools": [
                 {
                     "pool_id": "pool-a",
+                    "domain_id": 1,
                     "resident_bytes": 5,
                     "resident_chunks": 1,
                     "free_bytes": 5,
@@ -2923,6 +3049,7 @@ def self_test() -> int:
                 },
                 {
                     "pool_id": "pool-b",
+                    "domain_id": 2,
                     "resident_bytes": 7,
                     "resident_chunks": 1,
                     "free_bytes": 7,
@@ -2948,6 +3075,47 @@ def self_test() -> int:
         raise AssertionError("per-pool replay drift unexpectedly passed")
     except CapacityGateError:
         pass
+    startup_baseline = json.loads(json.dumps(executor))
+    startup_pool = startup_baseline["dynamic_pools"]["pools"][0]
+    startup_pool["free_bytes"] = 4
+    startup_pool["largest_contiguous_bytes"] = 4
+    startup_pool["live_segments"] = 1
+    grown_quiescent = json.loads(json.dumps(startup_baseline))
+    grown_pool = grown_quiescent["dynamic_pools"]["pools"][0]
+    grown_pool["resident_bytes"] = 9
+    grown_pool["free_bytes"] = 8
+    grown_pool["largest_contiguous_bytes"] = 8
+    grown_pool["resident_chunks"] = 2
+    grown_quiescent["dynamic_pools"]["budget_claimed_bytes"] = 23
+    baseline_snapshot = quiescent_pool_snapshot(
+        grown_quiescent,
+        "self-test startup baseline",
+        baseline_executor=startup_baseline,
+    )
+    require(
+        baseline_snapshot["pool_used_bytes"]["pool-a"] == 1
+        and baseline_snapshot["pool_live_segments"]["pool-a"] == 1
+        and baseline_snapshot["startup_baseline"]["pool_used_bytes"]["pool-a"] == 1
+        and baseline_snapshot["startup_baseline"]["pool_live_segments"]["pool-a"] == 1,
+        "startup-owned occupancy was not preserved across dynamic growth",
+    )
+    for field, value, expected in (
+        ("free_bytes", 7, "request-owned bytes remain"),
+        ("live_segments", 2, "request-owned live segments remain"),
+    ):
+        leaked = json.loads(json.dumps(grown_quiescent))
+        leaked["dynamic_pools"]["pools"][0][field] = value
+        if field == "free_bytes":
+            leaked["dynamic_pools"]["pools"][0]["largest_contiguous_bytes"] = value
+        try:
+            quiescent_pool_snapshot(
+                leaked,
+                "self-test leaked request",
+                baseline_executor=startup_baseline,
+            )
+            raise AssertionError(f"request leak mutation for {field} unexpectedly passed")
+        except CapacityGateError as error:
+            require(expected in str(error), f"request leak failed for the wrong reason: {error}")
     paged_pool_id = "dynamic-pool/sha256/" + "b" * 64
     b_wait_health = {
         "engine": {"active_requests": 1, "queued_requests": 1},
