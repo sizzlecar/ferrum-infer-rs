@@ -370,7 +370,7 @@ def derive_target_budget_envelope(
     )
 
     sizing_observed_pool_resident_bytes: dict[str, int] = {}
-    target_pool_resident_ceiling_bytes: dict[str, int] = {}
+    observed_or_floor_pool_bytes: dict[str, int] = {}
     initial_bundle_floor_bytes_by_pool: dict[str, int] = {}
     pool_storage_profiles: dict[str, Any] = {}
     pool_contracts: dict[str, Any] = {}
@@ -414,9 +414,9 @@ def derive_target_budget_envelope(
             calibration_bytes >= initial_bundle_floor,
             f"calibration did not provision the typed initial bundle floor for {pool_id}",
         )
-        resident_ceiling = max(sizing_bytes, initial_bundle_floor)
+        observed_or_floor_bytes = max(sizing_bytes, initial_bundle_floor)
         require(
-            resident_ceiling
+            initial_bundle_floor
             <= sizing_contract["provisioning"]["maximum_resident_bytes"],
             f"typed initial bundle floor exceeds the pool ceiling for {pool_id}",
         )
@@ -427,7 +427,7 @@ def derive_target_budget_envelope(
         ):
             token_scaled_sequence_pool_ids.append(pool_id)
         sizing_observed_pool_resident_bytes[pool_id] = sizing_bytes
-        target_pool_resident_ceiling_bytes[pool_id] = resident_ceiling
+        observed_or_floor_pool_bytes[pool_id] = observed_or_floor_bytes
         initial_bundle_floor_bytes_by_pool[pool_id] = initial_bundle_floor
         pool_storage_profiles[pool_id] = calibration_profile
         pool_contracts[pool_id] = sizing_contract
@@ -444,17 +444,36 @@ def derive_target_budget_envelope(
         and sizing_resident_bytes == sum(sizing_observed_pool_resident_bytes.values()),
         "target sizing resident total differs from its pool receipts",
     )
-    resident_bytes = sum(target_pool_resident_ceiling_bytes.values())
-    exact_budget = static_bytes + resident_bytes
     calibration_budget = calibration.get("budget_claimed_bytes")
+    calibration_resident_bytes = calibration.get("resident_bytes")
     require(
         target_sizing.get("budget_claimed_bytes") == static_bytes + sizing_resident_bytes,
         "target sizing budget differs from installed backing",
     )
     require(
-        isinstance(calibration_budget, int) and calibration_budget >= exact_budget,
-        "calibration budget is smaller than target sizing backing",
+        isinstance(calibration_budget, int)
+        and isinstance(calibration_resident_bytes, int)
+        and calibration_resident_bytes == sum(calibration_pools.values())
+        and calibration_budget == static_bytes + calibration_resident_bytes,
+        "calibration budget differs from its installed backing",
     )
+    require(
+        sizing_resident_bytes <= calibration_resident_bytes,
+        "target sizing backing exceeds the calibrated resident budget",
+    )
+    minimum_initial_bundle_resident_bytes = sum(
+        initial_bundle_floor_bytes_by_pool.values()
+    )
+    require(
+        minimum_initial_bundle_resident_bytes <= calibration_resident_bytes,
+        "typed initial bundles do not fit the calibrated resident budget",
+    )
+    observed_or_floor_resident_bytes = sum(observed_or_floor_pool_bytes.values())
+    observed_or_floor_budget_gap_bytes = max(
+        0, observed_or_floor_resident_bytes - calibration_resident_bytes
+    )
+    resident_bytes = calibration_resident_bytes
+    exact_budget = calibration_budget
     return {
         "static_bytes": static_bytes,
         "resident_bytes": resident_bytes,
@@ -462,13 +481,21 @@ def derive_target_budget_envelope(
         "maximum_active_sequences": maximum_active_sequences,
         "sizing_observed_resident_bytes": sizing_resident_bytes,
         "sizing_observed_pool_resident_bytes": sizing_observed_pool_resident_bytes,
-        "target_pool_resident_ceiling_bytes": target_pool_resident_ceiling_bytes,
+        "observed_or_floor_pool_bytes": observed_or_floor_pool_bytes,
+        "observed_or_floor_resident_bytes": observed_or_floor_resident_bytes,
+        "observed_or_floor_budget_gap_bytes": observed_or_floor_budget_gap_bytes,
+        "requires_cross_pool_rebalance": observed_or_floor_budget_gap_bytes > 0,
         "initial_bundle_floor_bytes_by_pool": initial_bundle_floor_bytes_by_pool,
+        "minimum_initial_bundle_resident_bytes": minimum_initial_bundle_resident_bytes,
+        "initial_bundle_headroom_bytes": (
+            calibration_resident_bytes - minimum_initial_bundle_resident_bytes
+        ),
         "token_scaled_sequence_pool_ids": token_scaled_sequence_pool_ids,
         "pool_storage_profiles": pool_storage_profiles,
         "pool_contracts": pool_contracts,
         "calibration_budget_claimed_bytes": calibration_budget,
-        "bootstrap_headroom_bytes": calibration_budget - exact_budget,
+        "bootstrap_headroom_bytes": calibration_budget
+        - target_sizing["budget_claimed_bytes"],
     }
 
 
@@ -481,13 +508,13 @@ def require_target_pool_within_budget_contract(
     )
     target_pools = target.get("pool_resident_bytes")
     target_envelopes = target.get("pool_envelopes")
-    sizing_pools = envelope.get("target_pool_resident_ceiling_bytes")
+    floor_pools = envelope.get("initial_bundle_floor_bytes_by_pool")
     profiles = envelope.get("pool_storage_profiles")
     contracts = envelope.get("pool_contracts")
     require(
         isinstance(target_pools, dict)
-        and isinstance(sizing_pools, dict)
-        and target_pools.keys() == sizing_pools.keys(),
+        and isinstance(floor_pools, dict)
+        and target_pools.keys() == floor_pools.keys(),
         "target pool identities differ from its sizing envelope",
     )
     require(
@@ -524,7 +551,7 @@ def require_target_pool_within_budget_contract(
     )
     require(
         target_resident_bytes <= envelope.get("resident_bytes", -1),
-        "target installed dynamic backing exceeded the global sizing envelope",
+        "target installed dynamic backing exceeded the calibrated resident budget",
     )
     require(
         target.get("budget_claimed_bytes")
@@ -2886,48 +2913,54 @@ def self_test() -> int:
         }
 
     calibration_pool = pool_snapshot(
-        {"sequence": 30, "workspace": 8}, calibration_contracts
+        {"sequence": 30, "workspace": 6}, calibration_contracts
     )
     sizing_pool = pool_snapshot({"sequence": 20, "workspace": 7})
     target_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
     require(
-        target_envelope["budget_claimed_bytes"] == 137,
+        target_envelope["budget_claimed_bytes"] == 136
+        and target_envelope["resident_bytes"] == 36,
         "self-test lost typed target budget derivation",
     )
     require(
         target_envelope["sizing_observed_pool_resident_bytes"]
         == {"sequence": 20, "workspace": 7}
-        and target_envelope["target_pool_resident_ceiling_bytes"]
+        and target_envelope["observed_or_floor_pool_bytes"]
         == {"sequence": 30, "workspace": 7}
+        and target_envelope["observed_or_floor_resident_bytes"] == 37
+        and target_envelope["observed_or_floor_budget_gap_bytes"] == 1
+        and target_envelope["requires_cross_pool_rebalance"] is True
         and target_envelope["initial_bundle_floor_bytes_by_pool"]
         == {"sequence": 30, "workspace": 4}
+        and target_envelope["minimum_initial_bundle_resident_bytes"] == 34
+        and target_envelope["initial_bundle_headroom_bytes"] == 2
         and target_envelope["token_scaled_sequence_pool_ids"] == ["sequence"]
         and target_envelope["pool_contracts"] == pool_contracts
-        and target_envelope["bootstrap_headroom_bytes"] == 1,
+        and target_envelope["bootstrap_headroom_bytes"] == 9,
         "self-test lost typed target-sizing provenance",
     )
     require_target_pool_within_budget_contract(
-        pool_snapshot({"sequence": 32, "workspace": 5}), target_envelope, 137
+        pool_snapshot({"sequence": 32, "workspace": 4}), target_envelope, 136
     )
     prime_receipt = rebalance_prime_budget_receipt(
         pool_snapshot({"sequence": 31, "workspace": 4}),
         target_envelope,
-        137,
+        136,
     )
     require(
         prime_receipt
         == {
-            "budget_ceiling_bytes": 137,
+            "budget_ceiling_bytes": 136,
             "claimed_bytes": 135,
-            "headroom_bytes": 2,
-            "resident_ceiling_bytes": 37,
+            "headroom_bytes": 1,
+            "resident_ceiling_bytes": 36,
             "resident_bytes": 35,
         },
         "self-test lost bounded rebalance-prime headroom evidence",
     )
     try:
         require_target_pool_within_budget_contract(
-            pool_snapshot({"sequence": 33, "workspace": 5}), target_envelope, 137
+            pool_snapshot({"sequence": 33, "workspace": 4}), target_envelope, 136
         )
         raise AssertionError("oversized global target residency unexpectedly fit its sizing envelope")
     except common.CapacityGateError:
@@ -2947,14 +2980,14 @@ def self_test() -> int:
         "phase-stable token coefficient drift",
     )
     target_bound_drift = json.loads(
-        json.dumps(pool_snapshot({"sequence": 32, "workspace": 5}))
+        json.dumps(pool_snapshot({"sequence": 32, "workspace": 4}))
     )
     target_bound_drift["pool_envelopes"]["sequence"]["contract"]["resources"][0][
         "demand"
     ]["tokens"]["maximum_tokens"] = 11
     expect_reject(
         lambda: require_target_pool_within_budget_contract(
-            target_bound_drift, target_envelope, 137
+            target_bound_drift, target_envelope, 136
         ),
         "target runtime-bound contract drift",
     )
