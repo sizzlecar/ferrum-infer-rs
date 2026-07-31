@@ -338,6 +338,35 @@ def require_target_pool_within_budget_contract(
     )
 
 
+def rebalance_prime_budget_receipt(
+    prime: dict[str, Any],
+    envelope: dict[str, Any],
+    exact_budget: int,
+) -> dict[str, int]:
+    require_target_pool_within_budget_contract(prime, envelope, exact_budget)
+    claimed_bytes = prime.get("budget_claimed_bytes")
+    resident_bytes = prime.get("resident_bytes")
+    resident_ceiling_bytes = envelope.get("resident_bytes")
+    require(
+        isinstance(claimed_bytes, int)
+        and isinstance(resident_bytes, int)
+        and isinstance(resident_ceiling_bytes, int),
+        "rebalance prime budget receipt is incomplete",
+    )
+    headroom_bytes = exact_budget - claimed_bytes
+    require(
+        0 <= headroom_bytes <= exact_budget,
+        "rebalance prime headroom is outside the exact budget",
+    )
+    return {
+        "budget_ceiling_bytes": exact_budget,
+        "claimed_bytes": claimed_bytes,
+        "headroom_bytes": headroom_bytes,
+        "resident_ceiling_bytes": resident_ceiling_bytes,
+        "resident_bytes": resident_bytes,
+    }
+
+
 def source_key(source: Any) -> str:
     return json.dumps(source, sort_keys=True, separators=(",", ":"))
 
@@ -1709,10 +1738,10 @@ def collect(args: argparse.Namespace) -> int:
             "decode target rebalance prime",
             baseline_executor=target_start_executor,
         )
-        require(
-            prime_pool["budget_claimed_bytes"] == exact_budget
-            and prime_pool["resident_bytes"] == target_budget_envelope["resident_bytes"],
-            "rebalance prime did not saturate the exact dynamic residency budget",
+        prime_budget_receipt = rebalance_prime_budget_receipt(
+            prime_pool,
+            target_budget_envelope,
+            exact_budget,
         )
 
         probe_task = common.StreamTask(
@@ -1780,6 +1809,7 @@ def collect(args: argparse.Namespace) -> int:
                 "clients": prime_clients,
                 "monitor": prime_monitor,
                 "pool_snapshot": prime_pool,
+                "budget_receipt": prime_budget_receipt,
                 "health": "target/health.rebalance-prime.json",
             },
             "rebalance_probe": {
@@ -2086,10 +2116,14 @@ def validate(root: Path, out: Path) -> int:
     require_target_pool_within_budget_contract(
         probe_pool, target_budget_envelope, exact_budget
     )
+    prime_budget_receipt = rebalance_prime_budget_receipt(
+        prime_pool,
+        target_budget_envelope,
+        exact_budget,
+    )
     require(
-        prime_pool["budget_claimed_bytes"] == exact_budget
-        and prime_pool["resident_bytes"] == target_budget_envelope["resident_bytes"],
-        "rebalance prime did not saturate the exact dynamic residency budget",
+        rebalance_prime.get("budget_receipt") == prime_budget_receipt,
+        "rebalance prime budget receipt differs from raw backing",
     )
     sizing_policy = sizing_executor.get("runtime_memory_policy")
     require(isinstance(sizing_policy, dict), "target sizing runtime memory policy is missing")
@@ -2426,6 +2460,22 @@ def self_test() -> int:
     )
     require_target_pool_within_budget_contract(
         pool_snapshot({"sequence": 25, "workspace": 2}), target_envelope, 127
+    )
+    prime_receipt = rebalance_prime_budget_receipt(
+        pool_snapshot({"sequence": 22, "workspace": 2}),
+        target_envelope,
+        127,
+    )
+    require(
+        prime_receipt
+        == {
+            "budget_ceiling_bytes": 127,
+            "claimed_bytes": 124,
+            "headroom_bytes": 3,
+            "resident_ceiling_bytes": 27,
+            "resident_bytes": 24,
+        },
+        "self-test lost bounded rebalance-prime headroom evidence",
     )
     try:
         require_target_pool_within_budget_contract(
