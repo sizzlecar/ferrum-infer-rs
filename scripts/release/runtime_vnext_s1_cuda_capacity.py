@@ -774,6 +774,21 @@ def stream_request_payload(
     }
 
 
+def openai_stream_error(chunk: Any) -> str | None:
+    if not isinstance(chunk, dict):
+        return None
+    error = chunk.get("error")
+    if not isinstance(error, dict):
+        return None
+    error_type = error.get("type")
+    message = error.get("message")
+    if not isinstance(error_type, str) or not error_type:
+        error_type = "unknown_error"
+    if not isinstance(message, str) or not message:
+        message = json.dumps(error, sort_keys=True, separators=(",", ":"))
+    return f"OpenAI stream error ({error_type}): {message}"
+
+
 def stream_request(
     *,
     port: int,
@@ -854,6 +869,13 @@ def stream_request(
                     raise CapacityGateError(
                         f"{role} returned malformed SSE JSON: {error}"
                     ) from error
+                stream_error = openai_stream_error(chunk)
+                if stream_error is not None:
+                    raise CapacityGateError(f"{role} returned {stream_error}")
+                if not isinstance(chunk, dict):
+                    raise CapacityGateError(
+                        f"{role} returned a non-object SSE JSON chunk"
+                    )
                 if isinstance(chunk.get("id"), str):
                     result["stream_id"] = chunk["id"]
                 usage = chunk.get("usage")
@@ -3054,6 +3076,25 @@ def self_test() -> int:
             "production_default_changed": False,
         },
         "capacity correctness paths lost their typed thinking control",
+    )
+    require(
+        openai_stream_error(
+            {
+                "error": {
+                    "type": "internal_server_error",
+                    "message": "model returned a forbidden token",
+                }
+            }
+        )
+        == (
+            "OpenAI stream error (internal_server_error): "
+            "model returned a forbidden token"
+        ),
+        "OpenAI SSE errors are not classified before usage validation",
+    )
+    require(
+        openai_stream_error({"choices": []}) is None,
+        "normal OpenAI SSE chunks were classified as errors",
     )
     executor = {
         "static_bytes": 7,
