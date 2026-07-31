@@ -34,6 +34,22 @@ REBALANCE_PROBE_PROMPT = (
     + " token" * REBALANCE_PROBE_WORD_COUNT
     + " Answer with one word."
 )
+DECODE_PROMPTS = {
+    slot: (
+        f"Capacity lane slot {slot}. Emit deterministic short words until the token "
+        "limit; do not explain the task."
+    )
+    for slot in ("A", "B", "C")
+}
+DECODE_PROMPT_SHA256_BY_SLOT = {
+    slot: hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    for slot, prompt in DECODE_PROMPTS.items()
+}
+CANONICAL_DECODE_PROMPT_SHA256_BY_SLOT = {
+    "A": "e979f692dd73f3d2469ec1152bc012476f205098ca6748b309574cf3f0fb2dc1",
+    "B": "5f651c2e23b18b21ff42f68f66b208210d9423cf9d6f434c7abf844c0912456a",
+    "C": "e3135728e0cc1a68b6c7af061931d5be5fe9dd4bb1ae40e1e778ea2b0fac325c",
+}
 MAX_DECODE_CAPACITY_EVENTS = 2048
 ALLOWED_EXECUTION_STAGES = {
     "sequence_extension",
@@ -57,6 +73,7 @@ SERVER_POLICY = {
     ).hexdigest(),
     "target_rebalance_probe_word_count": REBALANCE_PROBE_WORD_COUNT,
     "target_max_tokens": TARGET_MAX_TOKENS,
+    "decode_prompt_sha256_by_slot": DECODE_PROMPT_SHA256_BY_SLOT,
 }
 STOP_POLICY = {
     "no_progress_timeout_seconds": common.MAX_PRESSURE_NO_PROGRESS_SECONDS,
@@ -1446,6 +1463,53 @@ def validate_rebalance_trace(
     return summary
 
 
+def require_decode_prompt(result: dict[str, Any], slot: str) -> None:
+    require(slot in DECODE_PROMPT_SHA256_BY_SLOT, f"invalid decode workload slot {slot}")
+    require(
+        result.get("workload_slot") == slot
+        and result.get("prompt_sha256") == DECODE_PROMPT_SHA256_BY_SLOT[slot],
+        f"{slot}: decode prompt differs from the canonical workload",
+    )
+
+
+def require_decode_live_overlap(
+    results: dict[str, dict[str, Any]], label: str
+) -> dict[str, int]:
+    require(
+        isinstance(results, dict) and set(results) == {"A", "B", "C"},
+        f"{label}: invalid decode client set",
+    )
+    first_content: list[int] = []
+    finished: list[int] = []
+    for slot, result in results.items():
+        first = result.get("first_content_wall_ns")
+        end = result.get("finished_wall_ns")
+        require(
+            isinstance(first, int) and first > 0,
+            f"{label}-{slot}: first-content timestamp is missing",
+        )
+        require(
+            isinstance(end, int) and end >= first,
+            f"{label}-{slot}: completion timestamp is invalid",
+        )
+        first_content.append(first)
+        finished.append(end)
+    latest_first_content = max(first_content)
+    earliest_completion = min(finished)
+    require(
+        latest_first_content < earliest_completion,
+        (
+            f"{label}: workload calibration invalid: all streams did not enter decode "
+            "before the first completion"
+        ),
+    )
+    return {
+        "latest_first_content_wall_ns": latest_first_content,
+        "earliest_completion_wall_ns": earliest_completion,
+        "overlap_wall_ns": earliest_completion - latest_first_content,
+    }
+
+
 def start_stream_group(
     server: common.ServerSession,
     *,
@@ -1467,6 +1531,7 @@ def start_stream_group(
             max_tokens=max_tokens_by_slot[slot],
             out_dir=out_dir,
             timeout=timeout,
+            prompt=DECODE_PROMPTS[slot],
         )
         for slot in ("A", "B", "C")
     }
@@ -1517,6 +1582,7 @@ def wait_stream_group(
 
     results = {role: task.join(0) for role, task in tasks.items()}
     for role, result in results.items():
+        require_decode_prompt(result, role)
         common.validate_stream(result, role)
     require(
         max(result["started_wall_ns"] for result in results.values())
@@ -1868,6 +1934,9 @@ def collect(args: argparse.Namespace) -> int:
             "health_final": "target/health.final.json",
             "trace": "target/scheduler-trace.jsonl",
         }
+        collection["target"]["decode_live_overlap"] = require_decode_live_overlap(
+            target_clients, "target"
+        )
         require_target_pool_within_budget_contract(
             target_pool, target_budget_envelope, exact_budget
         )
@@ -1922,6 +1991,7 @@ def validate_stream_group(
     require(isinstance(results, dict) and set(results) == {"A", "B", "C"}, f"{phase}: invalid client set")
     for role, result in results.items():
         require(isinstance(result, dict), f"{phase}-{role}: result is invalid")
+        require_decode_prompt(result, role)
         require(
             result.get("max_tokens") == max_tokens_by_slot[role],
             f"{phase}-{role}: max_tokens differs from the canonical workload",
@@ -2201,6 +2271,11 @@ def validate(root: Path, out: Path) -> int:
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
     )
+    decode_live_overlap = require_decode_live_overlap(target["clients"], "target")
+    require(
+        target.get("decode_live_overlap") == decode_live_overlap,
+        "target decode-live overlap receipt differs from raw clients",
+    )
     for slot in ("A", "B", "C"):
         common.validate_replayed_workload(
             slot,
@@ -2381,6 +2456,16 @@ def self_test() -> int:
         == hashlib.sha256(REBALANCE_PROBE_PROMPT.encode("utf-8")).hexdigest(),
         "rebalance phases are not pinned to the canonical product workload",
     )
+    require(
+        SERVER_POLICY["decode_prompt_sha256_by_slot"]
+        == CANONICAL_DECODE_PROMPT_SHA256_BY_SLOT
+        == DECODE_PROMPT_SHA256_BY_SLOT,
+        "decode prompts are not pinned to the decode-capacity lane",
+    )
+    require(
+        DECODE_PROMPTS["B"] != common.capacity_prompt("B"),
+        "decode capacity silently inherited the prefill capacity B prompt",
+    )
 
     def expect_reject(action: Callable[[], None], label: str) -> None:
         try:
@@ -2388,6 +2473,42 @@ def self_test() -> int:
             raise AssertionError(f"self-test unexpectedly accepted {label}")
         except DecodeCapacityGateError:
             pass
+
+    overlap_clients = {
+        "A": {"first_content_wall_ns": 100, "finished_wall_ns": 400},
+        "B": {"first_content_wall_ns": 200, "finished_wall_ns": 500},
+        "C": {"first_content_wall_ns": 300, "finished_wall_ns": 600},
+    }
+    require(
+        require_decode_live_overlap(overlap_clients, "self-test")
+        == {
+            "latest_first_content_wall_ns": 300,
+            "earliest_completion_wall_ns": 400,
+            "overlap_wall_ns": 100,
+        },
+        "decode-live overlap receipt changed",
+    )
+    expect_reject(
+        lambda: require_decode_live_overlap(
+            {
+                **overlap_clients,
+                "B": {"first_content_wall_ns": 450, "finished_wall_ns": 500},
+            },
+            "self-test non-overlap",
+        ),
+        "sequential decode workload",
+    )
+    prompt_result = {
+        "workload_slot": "B",
+        "prompt_sha256": DECODE_PROMPT_SHA256_BY_SLOT["B"],
+    }
+    require_decode_prompt(prompt_result, "B")
+    expect_reject(
+        lambda: require_decode_prompt(
+            {**prompt_result, "prompt_sha256": "0" * 64}, "B"
+        ),
+        "decode prompt drift",
+    )
 
     def executor_fixture(
         plan_digit: str, policy_digit: str, reserve_bytes: int
