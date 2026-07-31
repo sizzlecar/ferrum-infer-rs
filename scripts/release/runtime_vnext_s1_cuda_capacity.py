@@ -225,7 +225,13 @@ def dynamic_pool_occupancy_snapshot(
     require(isinstance(dynamic_pools, dict), f"{label}: dynamic pools are missing")
     pools = dynamic_pools.get("pools")
     budget_claimed_bytes = dynamic_pools.get("budget_claimed_bytes")
+    maximum_active_sequences = dynamic_pools.get("maximum_active_sequences")
     require(isinstance(pools, list) and pools, f"{label}: dynamic pool list is empty")
+    if maximum_active_sequences is not None:
+        require(
+            isinstance(maximum_active_sequences, int) and maximum_active_sequences > 0,
+            f"{label}: invalid dynamic pool sequence ceiling",
+        )
     require(
         isinstance(budget_claimed_bytes, int) and budget_claimed_bytes >= static_bytes,
         f"{label}: invalid budget claimed bytes",
@@ -241,6 +247,7 @@ def dynamic_pool_occupancy_snapshot(
         resident_chunks = pool.get("resident_chunks")
         largest_contiguous_bytes = pool.get("largest_contiguous_bytes")
         storage_profile = pool.get("storage_profile")
+        contract = pool.get("contract")
         require(isinstance(pool_id, str) and pool_id, f"{label}: pool id is missing")
         require(pool_id not in occupancy, f"{label}: duplicate pool id {pool_id}")
         require(
@@ -293,6 +300,12 @@ def dynamic_pool_occupancy_snapshot(
             "largest_contiguous_bytes": largest_contiguous_bytes,
             "storage_profile": storage_profile,
         }
+        if contract is not None:
+            require(
+                isinstance(contract, dict),
+                f"{label}: invalid typed pool contract for {pool_id}",
+            )
+            occupancy[pool_id]["contract"] = contract
     resident_bytes = sum(pool["resident_bytes"] for pool in occupancy.values())
     require(resident_bytes > 0, f"{label}: no dynamic backing was installed")
     require(
@@ -303,6 +316,7 @@ def dynamic_pool_occupancy_snapshot(
         "static_bytes": static_bytes,
         "resident_bytes": resident_bytes,
         "budget_claimed_bytes": budget_claimed_bytes,
+        "maximum_active_sequences": maximum_active_sequences,
         "pools": dict(sorted(occupancy.items())),
     }
 
@@ -331,6 +345,10 @@ def quiescent_pool_snapshot(
             baseline["static_bytes"] == current["static_bytes"],
             f"{label}: static bytes changed from startup baseline",
         )
+        require(
+            baseline["maximum_active_sequences"] == current["maximum_active_sequences"],
+            f"{label}: dynamic pool sequence ceiling changed from startup baseline",
+        )
         baseline_pools = baseline["pools"]
     require(
         set(current["pools"]) == set(baseline_pools),
@@ -340,7 +358,8 @@ def quiescent_pool_snapshot(
         baseline_pool = baseline_pools[pool_id]
         require(
             pool["domain_id"] == baseline_pool["domain_id"]
-            and pool["storage_profile"] == baseline_pool["storage_profile"],
+            and pool["storage_profile"] == baseline_pool["storage_profile"]
+            and pool.get("contract") == baseline_pool.get("contract"),
             f"{label}: pool contract changed from startup baseline for {pool_id}",
         )
         require(
@@ -355,6 +374,7 @@ def quiescent_pool_snapshot(
         "static_bytes": current["static_bytes"],
         "resident_bytes": current["resident_bytes"],
         "budget_claimed_bytes": current["budget_claimed_bytes"],
+        "maximum_active_sequences": current["maximum_active_sequences"],
         "pool_resident_bytes": {
             pool_id: pool["resident_bytes"]
             for pool_id, pool in current["pools"].items()

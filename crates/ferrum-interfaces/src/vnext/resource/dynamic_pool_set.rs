@@ -141,6 +141,10 @@ where
         self.program_binding_layouts.get(bucket_id)
     }
 
+    pub(in crate::vnext::resource) const fn maximum_active_sequences(&self) -> u32 {
+        self.binding.maximum_active_sequences()
+    }
+
     pub(in crate::vnext::resource) fn write_capacity_availability(
         &self,
         out: &mut Vec<CapacityAvailabilityEpoch>,

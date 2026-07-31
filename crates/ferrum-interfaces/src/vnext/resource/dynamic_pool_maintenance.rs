@@ -16,6 +16,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolMaintenanceStatus {
     epochs: CapacityEpochs,
+    maximum_active_sequences: u32,
     device_capacity_bytes: u64,
     effective_device_usable_ceiling_bytes: u64,
     process_claimed_bytes: u64,
@@ -27,6 +28,10 @@ pub struct DynamicPoolMaintenanceStatus {
 impl DynamicPoolMaintenanceStatus {
     pub const fn epochs(&self) -> CapacityEpochs {
         self.epochs
+    }
+
+    pub const fn maximum_active_sequences(&self) -> u32 {
+        self.maximum_active_sequences
     }
 
     pub const fn device_capacity_bytes(&self) -> u64 {
@@ -169,6 +174,7 @@ where
             pools.push(DynamicPoolStatus {
                 pool_id: pool.domain.pool_id().clone(),
                 domain_id: pool.domain.domain_id,
+                contract: super::DynamicPoolContractStatus::from_domain(&pool.domain),
                 storage_profile: pool.domain.pool.compatibility().profile(),
                 resident_bytes: state.resident_bytes,
                 pending_growth_bytes: state.pending_growth_bytes,
@@ -213,6 +219,7 @@ where
             .claimed_bytes;
         Ok(DynamicPoolMaintenanceStatus {
             epochs: self.pools.logical_admission.epochs()?,
+            maximum_active_sequences: self.pools.maximum_active_sequences(),
             device_capacity_bytes: account.device_capacity_bytes,
             effective_device_usable_ceiling_bytes,
             process_claimed_bytes: state.claimed_bytes,

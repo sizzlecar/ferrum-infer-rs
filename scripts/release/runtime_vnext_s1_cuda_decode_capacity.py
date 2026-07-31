@@ -24,8 +24,8 @@ MAX_NUM_SEQS = 3
 MAX_MODEL_LEN = 512
 PREFILL_FIRST_UNTIL_ACTIVE = 3
 CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
-TARGET_MAX_TOKENS = {"A": 128, "B": 128, "C": 16}
-LONG_DECODE_SLOTS = ("A", "B")
+TARGET_MAX_TOKENS = {"A": 128, "B": 384, "C": 384}
+PRESSURE_DECODE_SLOTS = ("A", "B", "C")
 REBALANCE_PRIME_MAX_TOKENS = CALIBRATION_MAX_TOKENS
 REBALANCE_PROBE_MAX_TOKENS = 1
 REBALANCE_PROBE_WORD_COUNT = 256
@@ -66,7 +66,7 @@ SERVER_POLICY = {
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_sizing_max_tokens": CALIBRATION_MAX_TOKENS,
-    "target_budget_derivation": "target_sizing_global_residency",
+    "target_budget_derivation": "typed_initial_bundle_plus_sizing_residency",
     "target_rebalance_prime_max_tokens": REBALANCE_PRIME_MAX_TOKENS,
     "target_rebalance_probe_max_tokens": REBALANCE_PROBE_MAX_TOKENS,
     "target_rebalance_probe_prompt_sha256": hashlib.sha256(
@@ -231,6 +231,89 @@ def read_server_argv(root: Path, phase: str) -> list[str]:
     return argv
 
 
+def demand_is_token_scaled(demand: Any) -> bool:
+    if not isinstance(demand, dict) or len(demand) != 1:
+        return False
+    kind, value = next(iter(demand.items()))
+    if kind in {"tokens", "pages", "bounded_shape_buckets"}:
+        return True
+    return (
+        kind == "affine"
+        and isinstance(value, dict)
+        and isinstance(value.get("bytes_per_token"), int)
+        and value["bytes_per_token"] > 0
+    )
+
+
+def validate_typed_pool_contract(
+    pool_id: str, envelope: dict[str, Any], label: str
+) -> dict[str, Any]:
+    contract = envelope.get("contract")
+    require(isinstance(contract, dict), f"{label}: {pool_id} has no typed pool contract")
+    compatibility = contract.get("compatibility")
+    require(
+        isinstance(compatibility, dict)
+        and compatibility.get("profile") == envelope.get("storage_profile"),
+        f"{label}: {pool_id} compatibility differs from its storage profile",
+    )
+    resources = contract.get("resources")
+    require(
+        isinstance(resources, list) and resources,
+        f"{label}: {pool_id} typed resources are missing",
+    )
+    seen_resources: set[str] = set()
+    for resource in resources:
+        require(
+            isinstance(resource, dict),
+            f"{label}: {pool_id} has an invalid typed resource",
+        )
+        resource_id = resource.get("resource_id")
+        lifetime = resource.get("lifetime")
+        quantum = resource.get("physical_allocation_quantum_bytes")
+        require(
+            isinstance(resource_id, str)
+            and resource_id
+            and resource_id not in seen_resources,
+            f"{label}: {pool_id} has an invalid or duplicate resource id",
+        )
+        seen_resources.add(resource_id)
+        require(
+            lifetime in {"request", "sequence", "step", "invocation"},
+            f"{label}: {pool_id}/{resource_id} has an invalid dynamic lifetime",
+        )
+        require(
+            isinstance(resource.get("demand"), dict)
+            and len(resource["demand"]) == 1,
+            f"{label}: {pool_id}/{resource_id} has no typed demand",
+        )
+        require(
+            isinstance(quantum, int) and quantum > 0,
+            f"{label}: {pool_id}/{resource_id} has an invalid allocation quantum",
+        )
+    minima = (
+        "minimum_request_bytes",
+        "minimum_sequence_bytes",
+        "minimum_step_bytes",
+        "minimum_invocation_peak_bytes",
+    )
+    for key in minima:
+        require(
+            isinstance(contract.get(key), int) and contract[key] >= 0,
+            f"{label}: {pool_id} has invalid {key}",
+        )
+    provisioning = contract.get("provisioning")
+    minimum_resident = sum(contract[key] for key in minima)
+    require(
+        isinstance(provisioning, dict)
+        and provisioning.get("mode") == "demand_driven_elastic"
+        and provisioning.get("minimum_resident_bytes") == minimum_resident
+        and isinstance(provisioning.get("maximum_resident_bytes"), int)
+        and provisioning["maximum_resident_bytes"] >= minimum_resident,
+        f"{label}: {pool_id} has an invalid typed provisioning contract",
+    )
+    return contract
+
+
 def derive_target_budget_envelope(
     calibration: dict[str, Any], target_sizing: dict[str, Any]
 ) -> dict[str, Any]:
@@ -254,9 +337,18 @@ def derive_target_budget_envelope(
         and calibration_envelopes.keys() == sizing_envelopes.keys(),
         "target sizing pool envelopes differ from calibration",
     )
+    maximum_active_sequences = target_sizing.get("maximum_active_sequences")
+    require(
+        maximum_active_sequences == calibration.get("maximum_active_sequences") == MAX_NUM_SEQS,
+        "target sizing typed sequence ceiling differs from the canonical workload",
+    )
 
-    sizing_pool_resident_bytes: dict[str, int] = {}
+    sizing_observed_pool_resident_bytes: dict[str, int] = {}
+    target_pool_resident_ceiling_bytes: dict[str, int] = {}
+    initial_bundle_floor_bytes_by_pool: dict[str, int] = {}
     pool_storage_profiles: dict[str, Any] = {}
+    pool_contracts: dict[str, Any] = {}
+    token_scaled_sequence_pool_ids: list[str] = []
     for pool_id in sorted(calibration_pools):
         calibration_bytes = calibration_pools[pool_id]
         sizing_bytes = sizing_pools[pool_id]
@@ -273,21 +365,63 @@ def derive_target_budget_envelope(
             calibration_profile == sizing_profile,
             f"target sizing storage profile differs for {pool_id}",
         )
-        sizing_pool_resident_bytes[pool_id] = sizing_bytes
+        calibration_contract = validate_typed_pool_contract(
+            pool_id, calibration_envelopes[pool_id], "calibration"
+        )
+        sizing_contract = validate_typed_pool_contract(
+            pool_id, sizing_envelopes[pool_id], "target sizing"
+        )
+        require(
+            calibration_contract == sizing_contract,
+            f"target sizing typed contract differs for {pool_id}",
+        )
+        initial_bundle_floor = (
+            calibration_contract["minimum_request_bytes"]
+            + calibration_contract["minimum_sequence_bytes"]
+        ) * maximum_active_sequences
+        initial_bundle_floor += (
+            calibration_contract["minimum_step_bytes"]
+            + calibration_contract["minimum_invocation_peak_bytes"]
+        )
+        require(
+            calibration_bytes >= initial_bundle_floor,
+            f"calibration did not provision the typed initial bundle floor for {pool_id}",
+        )
+        resident_ceiling = max(sizing_bytes, initial_bundle_floor)
+        require(
+            resident_ceiling
+            <= calibration_contract["provisioning"]["maximum_resident_bytes"],
+            f"typed initial bundle floor exceeds the pool ceiling for {pool_id}",
+        )
+        if any(
+            resource.get("lifetime") == "sequence"
+            and demand_is_token_scaled(resource.get("demand"))
+            for resource in calibration_contract["resources"]
+        ):
+            token_scaled_sequence_pool_ids.append(pool_id)
+        sizing_observed_pool_resident_bytes[pool_id] = sizing_bytes
+        target_pool_resident_ceiling_bytes[pool_id] = resident_ceiling
+        initial_bundle_floor_bytes_by_pool[pool_id] = initial_bundle_floor
         pool_storage_profiles[pool_id] = calibration_profile
+        pool_contracts[pool_id] = calibration_contract
+    require(
+        token_scaled_sequence_pool_ids,
+        "typed target sizing contains no token-scaled sequence resource",
+    )
 
     static_bytes = target_sizing.get("static_bytes")
     require(isinstance(static_bytes, int) and static_bytes > 0, "invalid sizing static bytes")
-    resident_bytes = target_sizing.get("resident_bytes")
+    sizing_resident_bytes = target_sizing.get("resident_bytes")
     require(
-        isinstance(resident_bytes, int)
-        and resident_bytes == sum(sizing_pool_resident_bytes.values()),
+        isinstance(sizing_resident_bytes, int)
+        and sizing_resident_bytes == sum(sizing_observed_pool_resident_bytes.values()),
         "target sizing resident total differs from its pool receipts",
     )
+    resident_bytes = sum(target_pool_resident_ceiling_bytes.values())
     exact_budget = static_bytes + resident_bytes
     calibration_budget = calibration.get("budget_claimed_bytes")
     require(
-        target_sizing.get("budget_claimed_bytes") == exact_budget,
+        target_sizing.get("budget_claimed_bytes") == static_bytes + sizing_resident_bytes,
         "target sizing budget differs from installed backing",
     )
     require(
@@ -298,8 +432,14 @@ def derive_target_budget_envelope(
         "static_bytes": static_bytes,
         "resident_bytes": resident_bytes,
         "budget_claimed_bytes": exact_budget,
-        "sizing_pool_resident_bytes": sizing_pool_resident_bytes,
+        "maximum_active_sequences": maximum_active_sequences,
+        "sizing_observed_resident_bytes": sizing_resident_bytes,
+        "sizing_observed_pool_resident_bytes": sizing_observed_pool_resident_bytes,
+        "target_pool_resident_ceiling_bytes": target_pool_resident_ceiling_bytes,
+        "initial_bundle_floor_bytes_by_pool": initial_bundle_floor_bytes_by_pool,
+        "token_scaled_sequence_pool_ids": token_scaled_sequence_pool_ids,
         "pool_storage_profiles": pool_storage_profiles,
+        "pool_contracts": pool_contracts,
         "calibration_budget_claimed_bytes": calibration_budget,
         "bootstrap_headroom_bytes": calibration_budget - exact_budget,
     }
@@ -314,8 +454,9 @@ def require_target_pool_within_budget_contract(
     )
     target_pools = target.get("pool_resident_bytes")
     target_envelopes = target.get("pool_envelopes")
-    sizing_pools = envelope.get("sizing_pool_resident_bytes")
+    sizing_pools = envelope.get("target_pool_resident_ceiling_bytes")
     profiles = envelope.get("pool_storage_profiles")
+    contracts = envelope.get("pool_contracts")
     require(
         isinstance(target_pools, dict)
         and isinstance(sizing_pools, dict)
@@ -325,9 +466,15 @@ def require_target_pool_within_budget_contract(
     require(
         isinstance(target_envelopes, dict)
         and isinstance(profiles, dict)
+        and isinstance(contracts, dict)
         and target_envelopes.keys() == target_pools.keys()
-        and profiles.keys() == target_pools.keys(),
+        and profiles.keys() == target_pools.keys()
+        and contracts.keys() == target_pools.keys(),
         "target sizing profiles are missing",
+    )
+    require(
+        target.get("maximum_active_sequences") == envelope.get("maximum_active_sequences"),
+        "target dynamic pool sequence ceiling differs from its sizing envelope",
     )
     for pool_id, resident_bytes in target_pools.items():
         require(
@@ -337,6 +484,10 @@ def require_target_pool_within_budget_contract(
         require(
             target_envelopes[pool_id].get("storage_profile") == profiles[pool_id],
             f"target pool {pool_id} changed storage profile",
+        )
+        require(
+            target_envelopes[pool_id].get("contract") == contracts[pool_id],
+            f"target pool {pool_id} changed typed contract",
         )
     target_resident_bytes = target.get("resident_bytes")
     require(
@@ -1473,7 +1624,7 @@ def require_decode_prompt(result: dict[str, Any], slot: str) -> None:
     )
 
 
-def require_long_decode_live_overlap(
+def require_pressure_decode_live_overlap(
     results: dict[str, dict[str, Any]], label: str
 ) -> dict[str, int]:
     require(
@@ -1482,7 +1633,7 @@ def require_long_decode_live_overlap(
     )
     first_content: list[int] = []
     finished: list[int] = []
-    for slot in LONG_DECODE_SLOTS:
+    for slot in PRESSURE_DECODE_SLOTS:
         result = results[slot]
         first = result.get("first_content_wall_ns")
         end = result.get("finished_wall_ns")
@@ -1501,13 +1652,13 @@ def require_long_decode_live_overlap(
     require(
         latest_first_content < earliest_completion,
         (
-            f"{label}: workload calibration invalid: long streams did not overlap "
+            f"{label}: workload calibration invalid: pressure streams did not overlap "
             "in decode"
         ),
     )
     return {
-        "latest_long_first_content_wall_ns": latest_first_content,
-        "earliest_long_completion_wall_ns": earliest_completion,
+        "latest_pressure_first_content_wall_ns": latest_first_content,
+        "earliest_pressure_completion_wall_ns": earliest_completion,
         "overlap_wall_ns": earliest_completion - latest_first_content,
     }
 
@@ -1936,8 +2087,8 @@ def collect(args: argparse.Namespace) -> int:
             "health_final": "target/health.final.json",
             "trace": "target/scheduler-trace.jsonl",
         }
-        collection["target"]["long_decode_live_overlap"] = (
-            require_long_decode_live_overlap(target_clients, "target")
+        collection["target"]["pressure_decode_live_overlap"] = (
+            require_pressure_decode_live_overlap(target_clients, "target")
         )
         require_target_pool_within_budget_contract(
             target_pool, target_budget_envelope, exact_budget
@@ -2273,10 +2424,10 @@ def validate(root: Path, out: Path) -> int:
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
     )
-    decode_live_overlap = require_long_decode_live_overlap(target["clients"], "target")
+    decode_live_overlap = require_pressure_decode_live_overlap(target["clients"], "target")
     require(
-        target.get("long_decode_live_overlap") == decode_live_overlap,
-        "target long decode-live overlap receipt differs from raw clients",
+        target.get("pressure_decode_live_overlap") == decode_live_overlap,
+        "target pressure decode-live overlap receipt differs from raw clients",
     )
     for slot in ("A", "B", "C"):
         common.validate_replayed_workload(
@@ -2444,8 +2595,9 @@ def self_test() -> int:
     require(
         CALIBRATION_MAX_TOKENS["A"] == TARGET_MAX_TOKENS["A"]
         and CALIBRATION_MAX_TOKENS["B"] < TARGET_MAX_TOKENS["B"]
-        and CALIBRATION_MAX_TOKENS["C"] == TARGET_MAX_TOKENS["C"],
-        "calibration must replace only B long-decode demand with a short request",
+        and CALIBRATION_MAX_TOKENS["C"] < TARGET_MAX_TOKENS["C"]
+        and TARGET_MAX_TOKENS["B"] == TARGET_MAX_TOKENS["C"],
+        "target must retain A while extending both pressure-victim lifetimes",
     )
     require(
         SERVER_POLICY["target_sizing_max_tokens"] == CALIBRATION_MAX_TOKENS,
@@ -2476,25 +2628,25 @@ def self_test() -> int:
         except DecodeCapacityGateError:
             pass
 
-    historical_shape_clients = {
-        "A": {"first_content_wall_ns": 100, "finished_wall_ns": 400},
-        "B": {"first_content_wall_ns": 200, "finished_wall_ns": 500},
-        "C": {"first_content_wall_ns": 120, "finished_wall_ns": 190},
+    pressure_shape_clients = {
+        "A": {"first_content_wall_ns": 100, "finished_wall_ns": 600},
+        "B": {"first_content_wall_ns": 200, "finished_wall_ns": 700},
+        "C": {"first_content_wall_ns": 300, "finished_wall_ns": 800},
     }
     require(
-        require_long_decode_live_overlap(historical_shape_clients, "self-test")
+        require_pressure_decode_live_overlap(pressure_shape_clients, "self-test")
         == {
-            "latest_long_first_content_wall_ns": 200,
-            "earliest_long_completion_wall_ns": 400,
-            "overlap_wall_ns": 200,
+            "latest_pressure_first_content_wall_ns": 300,
+            "earliest_pressure_completion_wall_ns": 600,
+            "overlap_wall_ns": 300,
         },
-        "long decode-live overlap receipt changed",
+        "pressure decode-live overlap receipt changed",
     )
     expect_reject(
-        lambda: require_long_decode_live_overlap(
+        lambda: require_pressure_decode_live_overlap(
             {
-                **historical_shape_clients,
-                "B": {"first_content_wall_ns": 450, "finished_wall_ns": 500},
+                **pressure_shape_clients,
+                "C": {"first_content_wall_ns": 650, "finished_wall_ns": 800},
             },
             "self-test non-overlap",
         ),
@@ -2604,7 +2756,79 @@ def self_test() -> int:
         "duplicate canonical option",
     )
 
-    storage_profile = {"allocator": "linear_arena", "view": "contiguous"}
+    storage_profiles = {
+        "sequence": {
+            "allocator": {"fixed_block_arena": {"block_bytes": 1}},
+            "view": {"paged_regions": {"block_bytes": 1}},
+        },
+        "workspace": {"allocator": "linear_arena", "view": "contiguous"},
+    }
+    pool_contracts = {
+        "sequence": {
+            "compatibility": {
+                "version": {"major": 1, "minor": 0},
+                "profile": storage_profiles["sequence"],
+                "usage": "state",
+                "element_type": "u8",
+                "logical_layout_fingerprint": "a" * 64,
+                "alignment_bytes": 1,
+            },
+            "resources": [
+                {
+                    "resource_id": "resource/sequence",
+                    "demand": {
+                        "tokens": {"bytes_per_token": 10, "maximum_tokens": 10}
+                    },
+                    "lifetime": "sequence",
+                    "kind": "value",
+                    "physical_allocation_quantum_bytes": 1,
+                    "initialization": "none",
+                }
+            ],
+            "minimum_request_bytes": 0,
+            "minimum_sequence_bytes": 10,
+            "minimum_step_bytes": 0,
+            "minimum_invocation_peak_bytes": 0,
+            "reusable_workspace_ceiling_bytes": 0,
+            "provisioning": {
+                "mode": "demand_driven_elastic",
+                "minimum_resident_bytes": 10,
+                "maximum_resident_bytes": 100,
+            },
+            "invocation_liveness_mode": "no_invocation_resources",
+        },
+        "workspace": {
+            "compatibility": {
+                "version": {"major": 1, "minor": 0},
+                "profile": storage_profiles["workspace"],
+                "usage": "scratch",
+                "element_type": "u8",
+                "logical_layout_fingerprint": "b" * 64,
+                "alignment_bytes": 1,
+            },
+            "resources": [
+                {
+                    "resource_id": "resource/workspace",
+                    "demand": {"fixed": {"bytes": 4}},
+                    "lifetime": "invocation",
+                    "kind": {"scratch": {"node_id": "node/workspace"}},
+                    "physical_allocation_quantum_bytes": 1,
+                    "initialization": "none",
+                }
+            ],
+            "minimum_request_bytes": 0,
+            "minimum_sequence_bytes": 0,
+            "minimum_step_bytes": 0,
+            "minimum_invocation_peak_bytes": 4,
+            "reusable_workspace_ceiling_bytes": 0,
+            "provisioning": {
+                "mode": "demand_driven_elastic",
+                "minimum_resident_bytes": 4,
+                "maximum_resident_bytes": 100,
+            },
+            "invocation_liveness_mode": "total_order_reuse",
+        },
+    }
 
     def pool_snapshot(pools: dict[str, int]) -> dict[str, Any]:
         resident_bytes = sum(pools.values())
@@ -2612,57 +2836,70 @@ def self_test() -> int:
             "static_bytes": 100,
             "resident_bytes": resident_bytes,
             "budget_claimed_bytes": 100 + resident_bytes,
+            "maximum_active_sequences": MAX_NUM_SEQS,
             "pool_resident_bytes": pools,
             "pool_envelopes": {
                 pool_id: {
                     "resident_bytes": value,
                     "resident_chunks": 1,
                     "largest_contiguous_bytes": value,
-                    "storage_profile": storage_profile,
+                    "storage_profile": storage_profiles[pool_id],
+                    "contract": pool_contracts[pool_id],
                 }
                 for pool_id, value in pools.items()
             },
         }
 
-    calibration_pool = pool_snapshot({"sequence": 30, "workspace": 4})
+    calibration_pool = pool_snapshot({"sequence": 30, "workspace": 8})
     sizing_pool = pool_snapshot({"sequence": 20, "workspace": 7})
     target_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
     require(
-        target_envelope["budget_claimed_bytes"] == 127,
-        "self-test lost global target-sizing budget derivation",
+        target_envelope["budget_claimed_bytes"] == 137,
+        "self-test lost typed target budget derivation",
     )
     require(
-        target_envelope["sizing_pool_resident_bytes"]
+        target_envelope["sizing_observed_pool_resident_bytes"]
         == {"sequence": 20, "workspace": 7}
-        and target_envelope["bootstrap_headroom_bytes"] == 7,
-        "self-test lost target-sizing provenance",
+        and target_envelope["target_pool_resident_ceiling_bytes"]
+        == {"sequence": 30, "workspace": 7}
+        and target_envelope["initial_bundle_floor_bytes_by_pool"]
+        == {"sequence": 30, "workspace": 4}
+        and target_envelope["token_scaled_sequence_pool_ids"] == ["sequence"]
+        and target_envelope["bootstrap_headroom_bytes"] == 1,
+        "self-test lost typed target-sizing provenance",
     )
     require_target_pool_within_budget_contract(
-        pool_snapshot({"sequence": 25, "workspace": 2}), target_envelope, 127
+        pool_snapshot({"sequence": 32, "workspace": 5}), target_envelope, 137
     )
     prime_receipt = rebalance_prime_budget_receipt(
-        pool_snapshot({"sequence": 22, "workspace": 2}),
+        pool_snapshot({"sequence": 31, "workspace": 4}),
         target_envelope,
-        127,
+        137,
     )
     require(
         prime_receipt
         == {
-            "budget_ceiling_bytes": 127,
-            "claimed_bytes": 124,
-            "headroom_bytes": 3,
-            "resident_ceiling_bytes": 27,
-            "resident_bytes": 24,
+            "budget_ceiling_bytes": 137,
+            "claimed_bytes": 135,
+            "headroom_bytes": 2,
+            "resident_ceiling_bytes": 37,
+            "resident_bytes": 35,
         },
         "self-test lost bounded rebalance-prime headroom evidence",
     )
     try:
         require_target_pool_within_budget_contract(
-            pool_snapshot({"sequence": 26, "workspace": 2}), target_envelope, 127
+            pool_snapshot({"sequence": 33, "workspace": 5}), target_envelope, 137
         )
         raise AssertionError("oversized global target residency unexpectedly fit its sizing envelope")
     except common.CapacityGateError:
         pass
+    opaque_sizing = json.loads(json.dumps(sizing_pool))
+    del opaque_sizing["pool_envelopes"]["sequence"]["contract"]
+    expect_reject(
+        lambda: derive_target_budget_envelope(calibration_pool, opaque_sizing),
+        "opaque target sizing pool",
+    )
 
     wait_condition = {
         "coordinator_id": 7,
