@@ -2,10 +2,10 @@ use super::*;
 use crate::vnext::{
     CapacityAvailabilitySource, CopyRegion, DeferredAction, DefinitelyNotSubmitted,
     DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
-    DeviceTerminal, DeviceTerminalReceipt, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec, ReusableExecutionCapacity,
-    ReusableExecutionClassId, ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget,
-    TrustedActiveSequenceBinding,
+    DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand, FenceIndeterminate, FenceQuery,
+    HostTransferLayout, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
+    ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
+    ReusablePoolWorkspaceBudget, TrustedActiveSequenceBinding,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -1371,6 +1371,65 @@ fn theoretical_pool_ceiling_remains_terminal_after_device_budget_accepts_growth(
     assert_eq!(status.pools()[0].resident_bytes(), 64);
     assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
     assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn maintenance_status_exposes_typed_pool_contract() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'c',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let expected_resource_id = catalog.descriptors[0].base_resource_id().clone();
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+
+    let status = harness.root.dynamic_pool_status().unwrap();
+    assert_eq!(status.maximum_active_sequences(), 8);
+    let pool = &status.pools()[0];
+    let contract = pool.contract();
+    assert_eq!(contract.compatibility().profile(), paged_profile());
+    assert_eq!(contract.minimum_request_bytes(), 0);
+    assert_eq!(contract.minimum_sequence_bytes(), 64);
+    assert_eq!(contract.minimum_step_bytes(), 0);
+    assert_eq!(contract.minimum_invocation_peak_bytes(), 0);
+    assert_eq!(contract.provisioning().minimum_resident_bytes(), 64);
+    assert_eq!(contract.provisioning().maximum_resident_bytes(), 256);
+    assert_eq!(contract.resources().len(), 1);
+    let resource = &contract.resources()[0];
+    assert_eq!(resource.resource_id(), &expected_resource_id);
+    assert_eq!(resource.lifetime(), AllocationLifetime::Sequence);
+    assert!(matches!(
+        resource.demand(),
+        DynamicResourceDemand::Tokens {
+            bytes_per_token: 64,
+            maximum_tokens: 4
+        }
+    ));
+    assert_eq!(resource.physical_allocation_quantum_bytes(), 64);
+
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["maximum_active_sequences"], json!(8));
+    assert_eq!(
+        wire["pools"][0]["contract"]["resources"][0]["resource_id"],
+        serde_json::to_value(&expected_resource_id).unwrap()
+    );
+    assert_eq!(
+        wire["pools"][0]["contract"]["resources"][0]["lifetime"],
+        json!("sequence")
+    );
+    assert_eq!(
+        wire["pools"][0]["contract"]["resources"][0]["demand"]["tokens"]["bytes_per_token"],
+        json!(64)
+    );
 }
 
 #[test]
@@ -3764,6 +3823,80 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
         .domains()
         .iter()
         .all(|domain| domain.used().get() == 0));
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn three_initial_sequence_bundles_precede_typed_token_extension_deferral() {
+    let fixed = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'd',
+        1,
+        192,
+        TestDemand::Fixed,
+    );
+    let token_scaled = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'e',
+        1,
+        192,
+        TestDemand::Tokens,
+    );
+    let token_pool_id = token_scaled.pool_id.clone();
+    let catalog = combine_catalogs(&[fixed, token_scaled]);
+    let runtime = new_runtime(&catalog, 384);
+    let harness = harness(runtime, catalog, 384, false);
+    for pool_id in &harness.pool_ids {
+        harness
+            .root
+            .maintenance_controller
+            .grow_pool(pool_id, 192)
+            .unwrap();
+    }
+
+    let first = admitted_sequence_with_ceiling(&harness.root, "typed-pressure-first", 2);
+    let second = admitted_sequence_with_ceiling(&harness.root, "typed-pressure-second", 2);
+    let third = admitted_sequence_with_ceiling(&harness.root, "typed-pressure-third", 2);
+    let session = first.open_session().unwrap();
+    let deferred = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("token-scaled extension must defer after three initial bundles"),
+    };
+    assert_eq!(
+        deferred.evidence().scope(),
+        DynamicBackingClaimScope::Sequence
+    );
+    assert_eq!(deferred.evidence().blockers().len(), 1);
+    assert_eq!(deferred.evidence().blockers()[0].pool_id(), &token_pool_id);
+
+    drop(third);
+    let extended = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("released token-scaled backing must resume the deferred extension"),
+    };
+    assert_eq!(extended.committed_tokens(), 2);
+
+    session.request_cancel().unwrap();
+    session.try_abort().unwrap();
+    drop(deferred);
+    drop(extended);
+    drop(session);
+    drop(second);
+    drop(first);
     close_dynamic_test_root(harness.root);
 }
 

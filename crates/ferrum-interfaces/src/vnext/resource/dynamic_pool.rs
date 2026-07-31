@@ -1,7 +1,7 @@
 use super::{
-    invalid_resource, lane_stable_layout_fingerprint, AllocationLifetime, Arc, AtomicU64, AtomicU8,
-    BTreeMap, BackingChunkIdentity, BackingSegment, BufferDescriptor, BufferUsage,
-    CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
+    invalid_resource, lane_stable_layout_fingerprint, AllocationKind, AllocationLifetime, Arc,
+    AtomicU64, AtomicU8, BTreeMap, BackingChunkIdentity, BackingSegment, BufferDescriptor,
+    BufferUsage, CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
     CapacityWaitCondition, DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot,
     DeviceCapacityGrant, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
     DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
@@ -10,7 +10,8 @@ use super::{
     Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError, Weak,
 };
 use crate::vnext::{
-    DeviceCapacityPressure, DeviceReusableAddressScope, ReusableExecutionBucketId,
+    DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,
+    DynamicResourceDemand, PoolCompatibilityKey, ReusableExecutionBucketId,
     ReusableExecutionMemoryPlan,
 };
 use sha2::{Digest, Sha256};
@@ -760,9 +761,126 @@ pub struct DynamicPoolGrowthReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolResourceContract {
+    pub(super) resource_id: ResourceId,
+    pub(super) demand: DynamicResourceDemand,
+    pub(super) lifetime: AllocationLifetime,
+    pub(super) kind: AllocationKind,
+    pub(super) physical_allocation_quantum_bytes: u64,
+    pub(super) initialization: StateInitialization,
+}
+
+impl DynamicPoolResourceContract {
+    fn from_descriptor(descriptor: &DynamicResourceDescriptor) -> Self {
+        Self {
+            resource_id: descriptor.base_resource_id().clone(),
+            demand: descriptor.demand().clone(),
+            lifetime: descriptor.lifetime(),
+            kind: descriptor.kind().clone(),
+            physical_allocation_quantum_bytes: descriptor.physical_allocation_quantum_bytes(),
+            initialization: descriptor.initialization(),
+        }
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn demand(&self) -> &DynamicResourceDemand {
+        &self.demand
+    }
+
+    pub const fn lifetime(&self) -> AllocationLifetime {
+        self.lifetime
+    }
+
+    pub fn kind(&self) -> &AllocationKind {
+        &self.kind
+    }
+
+    pub const fn physical_allocation_quantum_bytes(&self) -> u64 {
+        self.physical_allocation_quantum_bytes
+    }
+
+    pub const fn initialization(&self) -> StateInitialization {
+        self.initialization
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolContractStatus {
+    pub(super) compatibility: PoolCompatibilityKey,
+    pub(super) resources: Vec<DynamicPoolResourceContract>,
+    pub(super) minimum_request_bytes: u64,
+    pub(super) minimum_sequence_bytes: u64,
+    pub(super) minimum_step_bytes: u64,
+    pub(super) minimum_invocation_peak_bytes: u64,
+    pub(super) reusable_workspace_ceiling_bytes: u64,
+    pub(super) provisioning: DynamicPoolProvisioningPolicy,
+    pub(super) invocation_liveness_mode: InvocationLivenessMode,
+}
+
+impl DynamicPoolContractStatus {
+    pub(super) fn from_domain(domain: &DynamicPoolDomainSpec) -> Self {
+        Self {
+            compatibility: domain.pool.compatibility().clone(),
+            resources: domain
+                .descriptors
+                .iter()
+                .map(DynamicPoolResourceContract::from_descriptor)
+                .collect(),
+            minimum_request_bytes: domain.pool.minimum_request_bytes(),
+            minimum_sequence_bytes: domain.pool.minimum_sequence_bytes(),
+            minimum_step_bytes: domain.pool.minimum_step_bytes(),
+            minimum_invocation_peak_bytes: domain.pool.minimum_invocation_peak_bytes(),
+            reusable_workspace_ceiling_bytes: domain.pool.reusable_workspace_ceiling_bytes(),
+            provisioning: domain.pool.provisioning().clone(),
+            invocation_liveness_mode: domain.pool.invocation_liveness_mode(),
+        }
+    }
+
+    pub fn compatibility(&self) -> &PoolCompatibilityKey {
+        &self.compatibility
+    }
+
+    pub fn resources(&self) -> &[DynamicPoolResourceContract] {
+        &self.resources
+    }
+
+    pub const fn minimum_request_bytes(&self) -> u64 {
+        self.minimum_request_bytes
+    }
+
+    pub const fn minimum_sequence_bytes(&self) -> u64 {
+        self.minimum_sequence_bytes
+    }
+
+    pub const fn minimum_step_bytes(&self) -> u64 {
+        self.minimum_step_bytes
+    }
+
+    pub const fn minimum_invocation_peak_bytes(&self) -> u64 {
+        self.minimum_invocation_peak_bytes
+    }
+
+    pub const fn reusable_workspace_ceiling_bytes(&self) -> u64 {
+        self.reusable_workspace_ceiling_bytes
+    }
+
+    pub fn provisioning(&self) -> &DynamicPoolProvisioningPolicy {
+        &self.provisioning
+    }
+
+    pub const fn invocation_liveness_mode(&self) -> InvocationLivenessMode {
+        self.invocation_liveness_mode
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolStatus {
     pub(super) pool_id: DynamicBackingPoolId,
     pub(super) domain_id: CapacityDomainId,
+    pub(super) contract: DynamicPoolContractStatus,
     pub(super) storage_profile: DynamicStorageProfile,
     pub(super) resident_bytes: u64,
     pub(super) pending_growth_bytes: u64,
@@ -784,6 +902,10 @@ impl DynamicPoolStatus {
 
     pub const fn domain_id(&self) -> CapacityDomainId {
         self.domain_id
+    }
+
+    pub fn contract(&self) -> &DynamicPoolContractStatus {
+        &self.contract
     }
 
     pub const fn storage_profile(&self) -> DynamicStorageProfile {
