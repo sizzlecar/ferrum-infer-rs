@@ -1344,10 +1344,17 @@ def validate_decode_counter_provenance(
     }
 
 
-def validate_rebalance_trace(
-    rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
+def validate_maintenance_trace(
+    rows: list[dict[str, Any]],
+    *,
+    started_wall_ns: int,
+    finished_wall_ns: int,
+    label: str,
 ) -> dict[str, Any]:
-    require(started_wall_ns > 0 and finished_wall_ns >= started_wall_ns, "invalid rebalance window")
+    require(
+        started_wall_ns > 0 and finished_wall_ns >= started_wall_ns,
+        f"{label}: invalid maintenance window",
+    )
     maintenance_rows = [
         row
         for row in rows
@@ -1355,21 +1362,26 @@ def validate_rebalance_trace(
         and isinstance(row.get("ts_unix_nanos"), int)
         and started_wall_ns <= row["ts_unix_nanos"] <= finished_wall_ns
     ]
-    require(maintenance_rows, "target produced no typed prefill backing maintenance")
-    maintained_events = 0
+    require(maintenance_rows, f"{label}: no typed prefill backing maintenance")
+    growths: list[dict[str, Any]] = []
     rebalances: list[dict[str, Any]] = []
     for index, row in enumerate(maintenance_rows):
         require(
             row.get("status") == "ok" and row.get("error") is None,
-            f"prefill maintenance {index}: event failed",
+            f"{label} maintenance {index}: event failed",
         )
         attributes = row.get("attributes")
-        require(isinstance(attributes, dict), f"prefill maintenance {index}: attributes are missing")
+        require(
+            isinstance(attributes, dict),
+            f"{label} maintenance {index}: attributes are missing",
+        )
         evidence = attributes.get("maintenance_evidence")
-        require(isinstance(evidence, dict), f"prefill maintenance {index}: evidence is missing")
+        require(
+            isinstance(evidence, dict),
+            f"{label} maintenance {index}: evidence is missing",
+        )
         if evidence.get("outcome") != "maintained":
             continue
-        maintained_events += 1
         pools_grown = evidence.get("pools_grown")
         allocated_bytes = evidence.get("allocated_bytes")
         require(
@@ -1377,24 +1389,25 @@ def validate_rebalance_trace(
             and pools_grown > 0
             and isinstance(allocated_bytes, int)
             and allocated_bytes > 0,
-            f"prefill maintenance {index}: maintained growth is invalid",
+            f"{label} maintenance {index}: maintained growth is invalid",
         )
         exact = common.validate_maintenance_rebalance_evidence(
             evidence,
-            f"prefill maintenance {index}",
+            f"{label} maintenance {index}",
         )
+        growth = {
+            "pools_grown": pools_grown,
+            "allocated_bytes": allocated_bytes,
+            **exact,
+        }
+        growths.append(growth)
         if exact["pools_reclaimed"] > 0:
-            rebalances.append(
-                {
-                    "pools_grown": pools_grown,
-                    "allocated_bytes": allocated_bytes,
-                    **exact,
-                }
-            )
-    require(rebalances, "target produced no typed cross-pool rebalance")
+            rebalances.append(growth)
+    require(growths, f"{label}: no successful typed backing growth")
     return {
         "maintenance_events": len(maintenance_rows),
-        "maintained_events": maintained_events,
+        "maintained_events": len(growths),
+        "allocated_bytes": sum(event["allocated_bytes"] for event in growths),
         "rebalance_events": len(rebalances),
         "pools_reclaimed": sum(event["pools_reclaimed"] for event in rebalances),
         "chunks_reclaimed": sum(event["chunks_reclaimed"] for event in rebalances),
@@ -1402,8 +1415,10 @@ def validate_rebalance_trace(
         "allocated_bytes_after_rebalance": sum(
             event["allocated_bytes"] for event in rebalances
         ),
-        "exact_receipt": True,
-        "evidence_owner": common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER,
+        "exact_receipt": bool(rebalances),
+        "evidence_owner": (
+            common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER if rebalances else None
+        ),
         "receipts": [
             {
                 "pool_ids": event["pool_ids"],
@@ -1413,6 +1428,22 @@ def validate_rebalance_trace(
             for event in rebalances
         ],
     }
+
+
+def validate_rebalance_trace(
+    rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
+) -> dict[str, Any]:
+    summary = validate_maintenance_trace(
+        rows,
+        started_wall_ns=started_wall_ns,
+        finished_wall_ns=finished_wall_ns,
+        label="cross-pool evidence",
+    )
+    require(
+        summary["rebalance_events"] > 0,
+        "cross-pool evidence produced no typed rebalance",
+    )
+    return summary
 
 
 def start_stream_group(
@@ -1685,10 +1716,22 @@ def collect(args: argparse.Namespace) -> int:
             "decode target sizing",
             baseline_executor=sizing_start_executor,
         )
+        sizing_started = min(
+            result["started_wall_ns"] for result in sizing_clients.values()
+        )
+        sizing_finished = max(
+            result["finished_wall_ns"] for result in sizing_clients.values()
+        )
+        sizing_rebalance_summary = validate_rebalance_trace(
+            common.read_trace(target_sizing.trace_path),
+            started_wall_ns=sizing_started,
+            finished_wall_ns=sizing_finished,
+        )
         collection["target_sizing"] = {
             "clients": sizing_clients,
             "monitor": sizing_monitor,
             "pool_snapshot": sizing_pool,
+            "rebalance_summary": sizing_rebalance_summary,
             "health_final": "target-sizing/health.final.json",
             "trace": "target-sizing/scheduler-trace.jsonl",
         }
@@ -1772,10 +1815,11 @@ def collect(args: argparse.Namespace) -> int:
             baseline_executor=target_start_executor,
         )
         target_rows = common.read_trace(target.trace_path)
-        probe_rebalance_summary = validate_rebalance_trace(
+        probe_maintenance_summary = validate_maintenance_trace(
             target_rows,
             started_wall_ns=probe_client["started_wall_ns"],
             finished_wall_ns=probe_client["finished_wall_ns"],
+            label="target rebalance probe",
         )
 
         target_trace_baseline = target.trace_path.stat().st_size if target.trace_path.is_file() else 0
@@ -1816,7 +1860,7 @@ def collect(args: argparse.Namespace) -> int:
                 "client": probe_client,
                 "pool_snapshot": probe_pool,
                 "health": "target/health.rebalance-probe.json",
-                "rebalance_summary": probe_rebalance_summary,
+                "maintenance_summary": probe_maintenance_summary,
             },
             "clients": target_clients,
             "monitor": target_monitor,
@@ -2187,6 +2231,15 @@ def validate(root: Path, out: Path) -> int:
         ),
         "target sizing unexpectedly hit decode capacity pressure",
     )
+    rebalance_summary = validate_rebalance_trace(
+        sizing_rows,
+        started_wall_ns=sizing_started,
+        finished_wall_ns=sizing_finished,
+    )
+    require(
+        target_sizing.get("rebalance_summary") == rebalance_summary,
+        "target sizing rebalance summary differs from raw trace",
+    )
     target_rows = common.read_trace(root / str(target.get("trace")))
     target_trace_path = root / str(target.get("trace"))
     target_trace_bytes = target_trace_path.stat().st_size
@@ -2215,14 +2268,15 @@ def validate(root: Path, out: Path) -> int:
         finished_wall_ns=target_finished,
     )
     require(target.get("decode_summary") == decode_summary, "decode summary differs from raw trace")
-    rebalance_summary = validate_rebalance_trace(
+    probe_maintenance_summary = validate_maintenance_trace(
         target_rows,
         started_wall_ns=probe_started,
         finished_wall_ns=probe_finished,
+        label="target rebalance probe",
     )
     require(
-        rebalance_probe.get("rebalance_summary") == rebalance_summary,
-        "rebalance summary differs from raw trace",
+        rebalance_probe.get("maintenance_summary") == probe_maintenance_summary,
+        "target rebalance probe maintenance summary differs from raw trace",
     )
 
     counters = target_executor.get("counters")
@@ -2277,6 +2331,8 @@ def validate(root: Path, out: Path) -> int:
         "stop_policy": STOP_POLICY,
         "decode_summary": decode_summary,
         "rebalance_summary": rebalance_summary,
+        "rebalance_evidence_phase": "target-sizing",
+        "probe_maintenance_summary": probe_maintenance_summary,
         "cross_pool_rebalance_evidence_owner": (
             common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
         ),
@@ -2945,6 +3001,21 @@ def self_test() -> int:
             "reclaimed_bytes": 0,
             "rebalance": None,
         }
+    )
+    growth_only_summary = validate_maintenance_trace(
+        missing_rebalance,
+        started_wall_ns=80,
+        finished_wall_ns=89,
+        label="self-test growth-only probe",
+    )
+    require(
+        growth_only_summary["maintained_events"] == 1
+        and growth_only_summary["allocated_bytes"] == 32
+        and growth_only_summary["rebalance_events"] == 0
+        and growth_only_summary["exact_receipt"] is False
+        and growth_only_summary["evidence_owner"] is None
+        and growth_only_summary["receipts"] == [],
+        "self-test lost growth-only maintenance evidence",
     )
     try:
         validate_rebalance_trace(
