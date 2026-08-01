@@ -43,5 +43,6 @@ default = []
 sync = ["std-sync"]
 
 [dev-dependencies]
+proc-macro2 = "1"
 syn = { version = "2", features = ["full", "visit"] }
 trybuild = "1.0"

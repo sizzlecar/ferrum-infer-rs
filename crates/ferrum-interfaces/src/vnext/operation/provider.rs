@@ -11,10 +11,10 @@ use super::super::{
 use super::foundation::{canonical_sha256, invalid_operation};
 use super::{
     DynamicStorageRequirement, ProfilePhase, ProviderStorageBindingRequirement, ResolvedValueRole,
-    MAX_OPERATION_FAILURE_WIRE_BYTES,
 };
 
 pub const PROVIDER_EXECUTION_SEMANTICS_VERSION: ContractVersion = ContractVersion::new(1, 0);
+pub const MAX_OPERATION_FAILURE_WIRE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderExecutionContractFingerprint([u8; 32]);

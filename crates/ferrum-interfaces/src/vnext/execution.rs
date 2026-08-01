@@ -80,6 +80,9 @@ pub use checkpoint::*;
 mod determinism;
 pub use determinism::*;
 
+mod determinism_coverage;
+pub use determinism_coverage::*;
+
 #[cfg(test)]
 #[path = "execution/tests.rs"]
 mod tests;
