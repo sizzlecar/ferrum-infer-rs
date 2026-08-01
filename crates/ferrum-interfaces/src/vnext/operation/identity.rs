@@ -6,7 +6,9 @@ use super::super::{
     BatchInvocationId, BatchStepId, DeviceId, ExecutionIdentityEnvelope, ExecutionLaneId, NodeId,
     OperationId, ParticipantNodeKey, PlanHash, PlanId, ProviderId, VNextError,
 };
-use super::compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
+use super::compiled_identity::{
+    CompiledSubmissionWaveIdentity, SubmissionWaveParticipantIdentitySeed,
+};
 use super::foundation::{canonical_operation_fingerprint, canonical_sha256, invalid_operation};
 use super::ProviderExecutionSemantics;
 
@@ -306,7 +308,7 @@ impl Serialize for BatchOperationNodeFingerprints<'_> {
 
 impl BatchOperationIdentity {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn from_deferred_validated(
+    fn from_deferred_validated(
         batch_step_id: BatchStepId,
         batch_invocation_id: BatchInvocationId,
         plan_id: PlanId,
@@ -633,6 +635,166 @@ impl BatchOperationIdentity {
         self.participants()
             .iter()
             .any(|participant| participant.identity() == identity)
+    }
+}
+
+#[derive(Debug)]
+struct DeferredBatchOperationIdentityRecipe {
+    topology: CompiledSubmissionWaveIdentity,
+    work_shape_fingerprint: String,
+    participant_seeds: Vec<SubmissionWaveParticipantIdentitySeed>,
+    node_identities: Box<[OnceLock<BatchOperationNodeIdentity>]>,
+}
+
+impl DeferredBatchOperationIdentityRecipe {
+    fn work_shape_fingerprint(&self) -> &str {
+        &self.work_shape_fingerprint
+    }
+
+    fn materialize_node(
+        &self,
+        node_index: usize,
+    ) -> Result<BatchOperationNodeIdentity, VNextError> {
+        let node = self
+            .topology
+            .node_at(node_index)
+            .ok_or_else(|| invalid_operation("compiled wave node index is out of bounds"))?;
+        let participant_start = node_index
+            .checked_mul(self.participant_seeds.len())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                invalid_operation("compiled wave participant index space exceeds u32")
+            })?;
+        let participants = self
+            .participant_seeds
+            .iter()
+            .enumerate()
+            .map(|(local_index, seed)| {
+                let local_index = u32::try_from(local_index)
+                    .expect("compiled wave participant count was validated");
+                let frame = seed.frame();
+                let identity = seed
+                    .operation_identity(&self.topology, node_index)
+                    .ok_or_else(|| invalid_operation("compiled wave node identity disappeared"))?;
+                Ok(BatchOperationParticipantIdentity::new(
+                    participant_start
+                        .checked_add(local_index)
+                        .expect("compiled wave participant index was validated"),
+                    ParticipantNodeKey::new(
+                        frame.participant(),
+                        frame.frame_id(),
+                        node.node_id().clone(),
+                    ),
+                    identity,
+                ))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        BatchOperationNodeIdentity::from_validated(
+            node.node_index(),
+            node.node_id().clone(),
+            node.operation_id().clone(),
+            node.provider_id().clone(),
+            node.provider_implementation_fingerprint().to_owned(),
+            node.provider_execution_semantics(),
+            self.work_shape_fingerprint.clone(),
+            participants,
+        )
+    }
+}
+
+impl BatchOperationIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_compiled_wave(
+        topology: CompiledSubmissionWaveIdentity,
+        batch_step_id: BatchStepId,
+        batch_invocation_id: BatchInvocationId,
+        claimed_backing_fingerprint: String,
+        work_shape_fingerprint: String,
+        participant_seeds: Vec<SubmissionWaveParticipantIdentitySeed>,
+    ) -> Result<Self, VNextError> {
+        let participant_count = participant_seeds.len();
+        let participant_projection_count = topology
+            .node_count()
+            .checked_mul(participant_count)
+            .and_then(|count| u32::try_from(count).ok());
+        if topology.node_count() == 0
+            || participant_count == 0
+            || participant_projection_count.is_none()
+            || participant_seeds.windows(2).any(|pair| {
+                let left = pair[0].frame().participant();
+                let right = pair[1].frame().participant();
+                (
+                    left.sequence_authority().sparse_id(),
+                    left.sequence_authority().generation(),
+                    left.request_authority().sparse_id(),
+                    left.request_authority().generation(),
+                ) >= (
+                    right.sequence_authority().sparse_id(),
+                    right.sequence_authority().generation(),
+                    right.request_authority().sparse_id(),
+                    right.request_authority().generation(),
+                )
+            })
+            || participant_seeds.iter().any(|seed| {
+                seed.runtime_implementation_fingerprint()
+                    != topology.runtime_implementation_fingerprint()
+            })
+            || !canonical_sha256(&claimed_backing_fingerprint)
+            || !canonical_sha256(&work_shape_fingerprint)
+        {
+            return Err(invalid_operation(
+                "compiled physical batch identity is empty, non-canonical, or exceeds its participant index space",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            topology_fingerprint: &'a str,
+            claimed_backing_fingerprint: &'a str,
+            work_shape_fingerprint: &'a str,
+            participant_seeds: &'a [SubmissionWaveParticipantIdentitySeed],
+        }
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.compiled-physical-command-batch-identity.v1",
+                batch_step_id,
+                batch_invocation_id,
+                topology_fingerprint: topology.fingerprint(),
+                claimed_backing_fingerprint: &claimed_backing_fingerprint,
+                work_shape_fingerprint: &work_shape_fingerprint,
+                participant_seeds: &participant_seeds,
+            },
+            "compiled physical batch identity encode failed",
+        )?;
+        let node_identities = std::iter::repeat_with(OnceLock::new)
+            .take(topology.node_count())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let plan_id = topology.plan_id().clone();
+        let plan_hash = topology.plan_hash().clone();
+        let device_id = topology.device_id().clone();
+        let runtime_implementation_fingerprint =
+            topology.runtime_implementation_fingerprint().to_owned();
+        let lane_id = topology.lane_id();
+        Ok(Self::from_deferred_validated(
+            batch_step_id,
+            batch_invocation_id,
+            plan_id,
+            plan_hash,
+            device_id,
+            runtime_implementation_fingerprint,
+            lane_id,
+            claimed_backing_fingerprint,
+            DeferredBatchOperationIdentityRecipe {
+                topology,
+                work_shape_fingerprint,
+                participant_seeds,
+                node_identities,
+            },
+            fingerprint,
+        ))
     }
 }
 

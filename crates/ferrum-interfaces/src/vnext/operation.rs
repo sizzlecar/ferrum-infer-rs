@@ -1,6 +1,7 @@
 mod attribute;
 mod buffer_view;
 mod catalog;
+mod compiled_identity;
 mod compiled_submission_wave;
 mod descriptor;
 mod determinism;
@@ -25,7 +26,7 @@ pub use buffer_view::{
     OperationBufferView, OperationPhysicalRegion,
 };
 pub use catalog::CapabilityCatalog;
-pub use compiled_submission_wave::CompiledSubmissionWaveIdentity;
+pub use compiled_identity::CompiledSubmissionWaveIdentity;
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
     ResourcePresenceRequirement, ResourceRequirements,
