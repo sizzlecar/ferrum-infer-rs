@@ -1448,8 +1448,10 @@ fn maintenance_status_exposes_typed_pool_contract() {
         "physical_bytes": 0
     });
     assert_eq!(live_wire["total"], zero_counter);
+    let mut live_occupancy_keys = live_wire.as_object().unwrap().keys().collect::<Vec<_>>();
+    live_occupancy_keys.sort_unstable();
     assert_eq!(
-        live_wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+        live_occupancy_keys,
         vec!["lane_stable", "total", "transient"]
     );
     for residency in ["transient", "lane_stable"] {
