@@ -191,6 +191,39 @@ impl EngineInner {
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
                     deferral,
+                } if deferral.maintenance_progress().is_some() => {
+                    let progress = deferral
+                        .maintenance_progress()
+                        .expect("guarded maintenance progress remains present");
+                    let receipt = self
+                        .scheduler
+                        .defer_retry_after_execution_maintenance(&request_ids, progress)?;
+                    if receipt.deferred_count() != request_ids.len() {
+                        return Err(FerrumError::scheduler(format!(
+                            "PlanRuntime decode maintenance retry retained {} of {} scheduler entries",
+                            receipt.deferred_count(),
+                            request_ids.len()
+                        )));
+                    }
+                    self.trace_executor_decode_capacity_decision(
+                        &request_ids,
+                        &deferral,
+                        "maintenance_retry",
+                        None,
+                    );
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "scheduler_execution_maintenance_retry",
+                        "request_ids": request_ids,
+                        "stage": deferral.stage(),
+                        "maintenance_progress": progress,
+                        "not_before_iteration": receipt.not_before_iteration(),
+                        "latest_capacity_epoch": receipt.latest_capacity_epoch(),
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                }
+                PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids,
+                    deferral,
                 } if request_ids.len() > 1 => {
                     self.trace_executor_decode_capacity_decision(
                         &request_ids,

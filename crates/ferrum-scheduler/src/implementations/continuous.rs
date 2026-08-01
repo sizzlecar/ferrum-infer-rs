@@ -31,7 +31,9 @@ use crate::{
     ScheduledRequest, Scheduler,
 };
 use async_trait::async_trait;
-use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
+use ferrum_interfaces::model_executor::{
+    ExecutorExecutionMaintenanceProgress, ExecutorPrefillAdmissionReceipt,
+};
 use ferrum_interfaces::scheduler::SchedulerMetrics;
 use ferrum_interfaces::vnext::{
     AdmissionRejected, CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
@@ -112,6 +114,29 @@ pub enum ExecutionCapacityAction {
     InvariantViolation {
         violation: PressureInvariantViolation,
     },
+}
+
+/// Scheduler receipt for a voluntary fairness yield backed by real dynamic
+/// pool mutation evidence. This path never opens a capacity-pressure episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecutionMaintenanceRetryReceipt {
+    deferred_count: usize,
+    not_before_iteration: u64,
+    latest_capacity_epoch: u64,
+}
+
+impl ExecutionMaintenanceRetryReceipt {
+    pub const fn deferred_count(&self) -> usize {
+        self.deferred_count
+    }
+
+    pub const fn not_before_iteration(&self) -> u64 {
+        self.not_before_iteration
+    }
+
+    pub const fn latest_capacity_epoch(&self) -> u64 {
+        self.latest_capacity_epoch
+    }
 }
 
 /// Typed terminal disposition of one physical execution-capacity yield.
@@ -246,6 +271,12 @@ impl ExecutionCapacityReleaseSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecutionMaintenanceRetryTicket {
+    not_before_iteration: u64,
+    latest_capacity_epoch: u64,
+}
+
 /// Extended scheduled request with continuous batching metadata
 #[derive(Debug, Clone)]
 pub struct ContinuousBatchRequest {
@@ -286,6 +317,10 @@ pub struct ContinuousBatchRequest {
     pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
     /// Exact PlanRuntime capacity predicate suppressing blind execution retries.
     pub execution_capacity_deferral: Option<AdmissionDeferral>,
+    /// Scheduler-owned fairness yield after a proven physical backing mutation.
+    execution_maintenance_retry: Option<ExecutionMaintenanceRetryTicket>,
+    /// Rejects replay of a previously consumed maintenance mutation receipt.
+    last_execution_maintenance_capacity_epoch: Option<u64>,
 }
 
 impl ContinuousBatchRequest {
@@ -310,6 +345,8 @@ impl ContinuousBatchRequest {
             capacity_deferred_from_decode: false,
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
+            execution_maintenance_retry: None,
+            last_execution_maintenance_capacity_epoch: None,
         }
     }
 
@@ -1559,6 +1596,131 @@ impl ContinuousBatchScheduler {
         self.plan_execution_capacity_pressure(request_ids, deferral, release_snapshot)
     }
 
+    /// Yield active frontiers after the executor has committed its bounded
+    /// backing-maintenance budget. One complete scheduler iteration must pass
+    /// before these frontiers are eligible again, so peers retain fairness and
+    /// a lone request cannot turn maintenance into a tight retry loop.
+    pub fn defer_retry_after_execution_maintenance(
+        &self,
+        request_ids: &[RequestId],
+        progress: &ExecutorExecutionMaintenanceProgress,
+    ) -> Result<ExecutionMaintenanceRetryReceipt> {
+        if progress.mutations().is_empty() {
+            return Err(FerrumError::scheduler(
+                "execution maintenance retry requires physical mutations",
+            ));
+        }
+        self.defer_retry_after_execution_maintenance_epoch(
+            request_ids,
+            progress.latest_capacity_epoch(),
+        )
+    }
+
+    fn defer_retry_after_execution_maintenance_epoch(
+        &self,
+        request_ids: &[RequestId],
+        latest_capacity_epoch: u64,
+    ) -> Result<ExecutionMaintenanceRetryReceipt> {
+        if request_ids.is_empty() || latest_capacity_epoch == 0 {
+            return Err(FerrumError::scheduler(
+                "execution maintenance retry requires active requests and a physical mutation epoch",
+            ));
+        }
+        let requested = request_ids.iter().cloned().collect::<HashSet<_>>();
+        if requested.len() != request_ids.len() {
+            return Err(FerrumError::scheduler(
+                "execution maintenance retry contains duplicate request identities",
+            ));
+        }
+
+        // Hold both active queues across validation and mutation. This makes
+        // ticket installation all-or-nothing even if an index/queue invariant
+        // has already been violated by another lifecycle transition.
+        let mut prefill = self.prefill_queue.write();
+        let mut decode = self.decode_queue.write();
+        let request_index = self.request_index.read();
+        let validate = |request: &ContinuousBatchRequest| -> Result<()> {
+            if request.execution_capacity_deferral.is_some()
+                || request.execution_maintenance_retry.is_some()
+                || request
+                    .last_execution_maintenance_capacity_epoch
+                    .is_some_and(|epoch| epoch >= latest_capacity_epoch)
+            {
+                return Err(FerrumError::scheduler(
+                    "execution maintenance retry reuses stale or concurrently blocked evidence",
+                ));
+            }
+            Ok(())
+        };
+        for request_id in &requested {
+            let prefill_matches = prefill
+                .iter()
+                .filter(|request| request.inner.request.id == *request_id)
+                .count();
+            let decode_request = decode.get(request_id);
+            let request = match request_index.get(request_id) {
+                Some(RequestPhase::Prefilling)
+                    if prefill_matches == 1 && decode_request.is_none() =>
+                {
+                    prefill
+                        .iter()
+                        .find(|request| request.inner.request.id == *request_id)
+                        .expect("validated prefill frontier remains locked")
+                }
+                Some(RequestPhase::Decoding)
+                    if prefill_matches == 0 && decode_request.is_some() =>
+                {
+                    decode_request.expect("validated decode frontier remains locked")
+                }
+                _ => {
+                    return Err(FerrumError::scheduler(
+                        "execution maintenance retry lost an exact active logical frontier",
+                    ));
+                }
+            };
+            validate(request)?;
+        }
+
+        // `current_iteration` points at the next scheduler iteration after the
+        // batch that just yielded. Advancing once more skips exactly that next
+        // iteration and makes the frontier eligible in the following one.
+        let not_before_iteration = self
+            .current_iteration
+            .load(Ordering::Relaxed)
+            .saturating_add(1);
+        let ticket = ExecutionMaintenanceRetryTicket {
+            not_before_iteration,
+            latest_capacity_epoch,
+        };
+        let mut deferred_count = 0;
+        for request in prefill.iter_mut() {
+            if requested.contains(&request.inner.request.id) {
+                request.execution_maintenance_retry = Some(ticket);
+                request.last_execution_maintenance_capacity_epoch = Some(latest_capacity_epoch);
+                deferred_count += 1;
+            }
+        }
+        for request in decode.values_mut() {
+            if requested.contains(&request.inner.request.id) {
+                request.execution_maintenance_retry = Some(ticket);
+                request.last_execution_maintenance_capacity_epoch = Some(latest_capacity_epoch);
+                deferred_count += 1;
+            }
+        }
+        if deferred_count != request_ids.len() {
+            return Err(FerrumError::scheduler(format!(
+                "execution maintenance retry retained {deferred_count} of {} active frontiers",
+                request_ids.len()
+            )));
+        }
+
+        Ok(ExecutionMaintenanceRetryReceipt {
+            deferred_count,
+            not_before_iteration,
+            latest_capacity_epoch,
+        })
+    }
+
     fn plan_execution_capacity_pressure(
         &self,
         request_ids: &[RequestId],
@@ -2494,6 +2656,7 @@ impl ContinuousBatchScheduler {
 
     fn add_prefill_requests_to_batch(
         &self,
+        iteration: u64,
         hint: &BatchHint,
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
@@ -2517,6 +2680,9 @@ impl ContinuousBatchScheduler {
                 break;
             }
             if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+            if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
                 continue;
             }
             if Self::execution_capacity_is_blocked(
@@ -2716,8 +2882,28 @@ impl ContinuousBatchScheduler {
         Ok(false)
     }
 
+    fn execution_maintenance_retry_is_blocked(
+        req: &mut ContinuousBatchRequest,
+        iteration: u64,
+    ) -> Result<bool> {
+        let Some(ticket) = req.execution_maintenance_retry else {
+            return Ok(false);
+        };
+        if req.last_execution_maintenance_capacity_epoch != Some(ticket.latest_capacity_epoch) {
+            return Err(FerrumError::scheduler(
+                "execution maintenance retry ticket lost its mutation generation",
+            ));
+        }
+        if iteration < ticket.not_before_iteration {
+            return Ok(true);
+        }
+        req.execution_maintenance_retry = None;
+        Ok(false)
+    }
+
     fn add_decode_requests_to_batch(
         &self,
+        iteration: u64,
         hint: &BatchHint,
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
@@ -2737,6 +2923,9 @@ impl ContinuousBatchScheduler {
                 break;
             }
             if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+            if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
                 continue;
             }
             if Self::execution_capacity_is_blocked(
@@ -2792,6 +2981,7 @@ impl ContinuousBatchScheduler {
         // spikes in c=32 closed-loop runs.
         if !skip_decode_for_prefill_first {
             self.add_decode_requests_to_batch(
+                iteration,
                 &hint,
                 &mut batch_requests,
                 &mut total_tokens,
@@ -2857,6 +3047,7 @@ impl ContinuousBatchScheduler {
         // activate for cohort prefills (m_total must stay ≤ scratch
         // max_tokens, which is pre-allocated to the same budget).
         self.add_prefill_requests_to_batch(
+            iteration,
             &hint,
             &mut batch_requests,
             &mut total_tokens,
@@ -2946,6 +3137,7 @@ impl ContinuousBatchScheduler {
         // newly admitted prefills do not wait an extra iteration just because
         // the current batch already contains decode work.
         self.add_prefill_requests_to_batch(
+            iteration,
             &hint,
             &mut batch_requests,
             &mut total_tokens,
@@ -2966,6 +3158,7 @@ impl ContinuousBatchScheduler {
         // restore decode work so the release condition can become true.
         if skip_decode_for_prefill_first && batch_requests.is_empty() {
             self.add_decode_requests_to_batch(
+                iteration,
                 &hint,
                 &mut batch_requests,
                 &mut total_tokens,
@@ -3786,6 +3979,92 @@ mod tests {
             scheduler.trace_phase(&request_id),
             Some(RequestPhase::Prefilling)
         );
+    }
+
+    #[tokio::test]
+    async fn execution_maintenance_retry_yields_one_iteration_without_opening_pressure() {
+        let mut config = SchedulerConfig::default();
+        config.max_running_requests = 2;
+        let scheduler = ContinuousBatchScheduler::new(config);
+        let maintained = create_test_request(Priority::Normal);
+        let maintained_id = maintained.id.clone();
+        let peer = create_test_request(Priority::Normal);
+        let peer_id = peer.id.clone();
+        scheduler.submit(maintained).await.unwrap();
+        scheduler.submit(peer).await.unwrap();
+
+        let initial = scheduler
+            .create_iteration_batch(BatchHint::simple(2))
+            .unwrap();
+        assert_eq!(initial.requests.len(), 2);
+
+        let receipt = scheduler
+            .defer_retry_after_execution_maintenance_epoch(std::slice::from_ref(&maintained_id), 7)
+            .unwrap();
+        assert_eq!(receipt.deferred_count(), 1);
+        assert_eq!(receipt.latest_capacity_epoch(), 7);
+
+        let fairness_iteration = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .unwrap();
+        assert_eq!(fairness_iteration.requests.len(), 1);
+        assert_eq!(fairness_iteration.requests[0].request.id, peer_id);
+        let pressure = scheduler.trace_snapshot();
+        assert_eq!(pressure.pressure_active_episodes, 0);
+        assert_eq!(pressure.pressure_pending_release_fences, 0);
+
+        let retry_iteration = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .unwrap();
+        assert_eq!(retry_iteration.requests.len(), 1);
+        assert_eq!(retry_iteration.requests[0].request.id, maintained_id);
+
+        let replay = scheduler
+            .defer_retry_after_execution_maintenance_epoch(std::slice::from_ref(&maintained_id), 7)
+            .unwrap_err();
+        assert!(replay
+            .to_string()
+            .contains("stale or concurrently blocked evidence"));
+    }
+
+    #[tokio::test]
+    async fn execution_maintenance_retry_is_atomic_when_queue_identity_is_inconsistent() {
+        let mut config = SchedulerConfig::default();
+        config.max_running_requests = 2;
+        let scheduler = ContinuousBatchScheduler::new(config);
+        let first = create_test_request(Priority::Normal);
+        let first_id = first.id.clone();
+        let second = create_test_request(Priority::Normal);
+        let second_id = second.id.clone();
+        scheduler.submit(first).await.unwrap();
+        scheduler.submit(second).await.unwrap();
+        scheduler
+            .create_iteration_batch(BatchHint::simple(2))
+            .unwrap();
+
+        let removed = {
+            let mut prefill = scheduler.prefill_queue.write();
+            let position = prefill
+                .iter()
+                .position(|request| request.inner.request.id == second_id)
+                .unwrap();
+            prefill.remove(position).unwrap()
+        };
+        let error = scheduler
+            .defer_retry_after_execution_maintenance_epoch(&[first_id.clone(), second_id], 11)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lost an exact active logical frontier"));
+        let prefill = scheduler.prefill_queue.read();
+        let first = prefill
+            .iter()
+            .find(|request| request.inner.request.id == first_id)
+            .unwrap();
+        assert!(first.execution_maintenance_retry.is_none());
+        assert!(first.last_execution_maintenance_capacity_epoch.is_none());
+        drop(prefill);
+        drop(removed);
     }
 
     #[tokio::test]

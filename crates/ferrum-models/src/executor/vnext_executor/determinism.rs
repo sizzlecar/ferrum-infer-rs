@@ -322,6 +322,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut backing_attempts = 0_u32;
+        let mut maintenance_receipts = Vec::new();
         loop {
             match step
                 .try_prepare_determinism_submission_wave(requests.clone())
@@ -349,6 +350,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         outcome,
                         Some(&deferred),
                         sequences.iter().map(Arc::as_ref),
+                        &mut maintenance_receipts,
                     )? {
                         return Err(Self::execution_capacity_error(&deferred));
                     }
@@ -370,6 +372,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         outcome,
                         None,
                         sequences.iter().map(Arc::as_ref),
+                        &mut maintenance_receipts,
                     )? {
                         return Err(Self::execution_capacity_error(&deferred));
                     }
