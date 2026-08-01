@@ -1,11 +1,12 @@
 use super::*;
 use crate::vnext::{
-    CapacityAvailabilitySource, CopyRegion, DeferredAction, DefinitelyNotSubmitted,
-    DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
-    DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand, FenceIndeterminate, FenceQuery,
-    HostTransferLayout, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
-    ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
-    ReusablePoolWorkspaceBudget, TrustedActiveSequenceBinding,
+    BoundExecutionResourceMaintenance, CapacityAvailabilitySource, CopyRegion, DeferredAction,
+    DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch,
+    DeviceErrorReport, DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand,
+    ExecutionResourceMaintenanceStage, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec, ReusableExecutionCapacity,
+    ReusableExecutionClassId, ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget,
+    TrustedActiveSequenceBinding, EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -3662,6 +3663,7 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
         StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident step backing must defer"),
     };
+    let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     assert_eq!(deferred.participant_count(), 1);
     assert_eq!(
         deferred.work_fingerprint(),
@@ -3671,10 +3673,63 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
     drop(session);
     assert!(session_weak.upgrade().is_some());
 
-    assert!(matches!(
-        deferred.maintain().unwrap(),
-        DynamicDeferredMaintenanceOutcome::Maintained(_)
-    ));
+    let maintenance_receipt = match deferred.maintain().unwrap() {
+        DynamicDeferredMaintenanceOutcome::Maintained(receipt) => receipt,
+        other => panic!("step backing maintenance must install its deferred growth: {other:?}"),
+    };
+    let duplicate_error = BoundExecutionResourceMaintenance::bind(
+        ExecutionResourceMaintenanceStage::StepAdmission,
+        [&active, &active],
+        maintenance_receipt.clone(),
+    )
+    .unwrap_err();
+    assert!(duplicate_error
+        .to_string()
+        .contains("duplicate participants"));
+    let maintenance = BoundExecutionResourceMaintenance::bind(
+        ExecutionResourceMaintenanceStage::StepAdmission,
+        std::iter::once(&active),
+        maintenance_receipt,
+    )
+    .unwrap();
+    assert_eq!(
+        maintenance.schema_version(),
+        EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        maintenance.stage(),
+        ExecutionResourceMaintenanceStage::StepAdmission
+    );
+    assert_eq!(maintenance.plan(), active.plan());
+    assert_eq!(
+        maintenance.receipt().coordinator_id(),
+        active.coordinator_id()
+    );
+    assert!(!maintenance.receipt().growths().is_empty());
+    assert_eq!(maintenance.participants().len(), 1);
+    let participant = &maintenance.participants()[0];
+    assert_eq!(participant.run_id(), active.run_id());
+    assert_eq!(participant.request_id(), active.request_id());
+    assert_eq!(
+        participant.sequence_authority(),
+        active.sequence_authority()
+    );
+    assert_eq!(
+        participant.active_sequence_fingerprint(),
+        active.fingerprint()
+    );
+    assert_eq!(maintenance.fingerprint().len(), 64);
+    let serialized = serde_json::to_value(&maintenance).unwrap();
+    assert_eq!(
+        serialized["schema_version"],
+        EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION
+    );
+    assert_eq!(serialized["stage"], "step_admission");
+    assert_eq!(serialized["participants"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        serialized["receipt"]["coordinator_id"],
+        active.coordinator_id().get()
+    );
     let retained_session = session_weak
         .upgrade()
         .expect("step backing authority retains its exact participant session");

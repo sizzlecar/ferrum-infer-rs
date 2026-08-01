@@ -53,6 +53,9 @@ CANONICAL_DECODE_PROMPT_SHA256_BY_SLOT = {
     "C": "e3135728e0cc1a68b6c7af061931d5be5fe9dd4bb1ae40e1e778ea2b0fac325c",
 }
 MAX_DECODE_CAPACITY_EVENTS = 2048
+PREFILL_MAINTENANCE_PHASE = "vnext.prefill_backing_maintenance"
+EXECUTION_MAINTENANCE_PHASE = "vnext.execution_backing_maintenance"
+EXECUTION_MAINTENANCE_SCHEMA_VERSION = 1
 ALLOWED_EXECUTION_STAGES = {
     "sequence_extension",
     "step_admission",
@@ -1582,7 +1585,12 @@ def validate_maintenance_trace(
     started_wall_ns: int,
     finished_wall_ns: int,
     label: str,
+    phase: str,
 ) -> dict[str, Any]:
+    require(
+        phase in {PREFILL_MAINTENANCE_PHASE, EXECUTION_MAINTENANCE_PHASE},
+        f"{label}: unsupported maintenance phase {phase}",
+    )
     require(
         started_wall_ns > 0 and finished_wall_ns >= started_wall_ns,
         f"{label}: invalid maintenance window",
@@ -1590,11 +1598,11 @@ def validate_maintenance_trace(
     maintenance_rows = [
         row
         for row in rows
-        if row.get("phase") == "vnext.prefill_backing_maintenance"
+        if row.get("phase") == phase
         and isinstance(row.get("ts_unix_nanos"), int)
         and started_wall_ns <= row["ts_unix_nanos"] <= finished_wall_ns
     ]
-    require(maintenance_rows, f"{label}: no typed prefill backing maintenance")
+    require(maintenance_rows, f"{label}: no typed {phase} maintenance")
     growths: list[dict[str, Any]] = []
     rebalances: list[dict[str, Any]] = []
     for index, row in enumerate(maintenance_rows):
@@ -1618,8 +1626,10 @@ def validate_maintenance_trace(
         allocated_bytes = evidence.get("allocated_bytes")
         require(
             isinstance(pools_grown, int)
+            and not isinstance(pools_grown, bool)
             and pools_grown > 0
             and isinstance(allocated_bytes, int)
+            and not isinstance(allocated_bytes, bool)
             and allocated_bytes > 0,
             f"{label} maintenance {index}: maintained growth is invalid",
         )
@@ -1627,9 +1637,17 @@ def validate_maintenance_trace(
             evidence,
             f"{label} maintenance {index}",
         )
+        execution_receipt = None
+        if phase == EXECUTION_MAINTENANCE_PHASE:
+            execution_receipt = validate_execution_maintenance_receipt(
+                row,
+                evidence,
+                f"{label} maintenance {index}",
+            )
         growth = {
             "pools_grown": pools_grown,
             "allocated_bytes": allocated_bytes,
+            "execution_receipt": execution_receipt,
             **exact,
         }
         growths.append(growth)
@@ -1659,6 +1677,166 @@ def validate_maintenance_trace(
             }
             for event in rebalances
         ],
+        "growth_receipts": [
+            event["execution_receipt"]
+            for event in growths
+            if event["execution_receipt"] is not None
+        ],
+    }
+
+
+def validate_execution_maintenance_receipt(
+    row: dict[str, Any], evidence: dict[str, Any], label: str
+) -> dict[str, Any]:
+    require(
+        evidence.get("schema_version") == EXECUTION_MAINTENANCE_SCHEMA_VERSION,
+        f"{label}: execution maintenance schema version is invalid",
+    )
+    stage = evidence.get("stage")
+    require(stage in ALLOWED_EXECUTION_STAGES, f"{label}: execution stage is invalid")
+    shape = row.get("shape")
+    require(isinstance(shape, dict), f"{label}: execution shape is missing")
+    require(
+        shape.get("stage") == stage
+        and shape.get("pools_grown") == evidence.get("pools_grown")
+        and shape.get("allocated_bytes") == evidence.get("allocated_bytes")
+        and shape.get("pools_reclaimed") == evidence.get("pools_reclaimed"),
+        f"{label}: execution shape does not reconcile with evidence",
+    )
+    coordinator_id = evidence.get("coordinator_id")
+    require(
+        isinstance(coordinator_id, int)
+        and not isinstance(coordinator_id, bool)
+        and coordinator_id > 0,
+        f"{label}: execution coordinator is invalid",
+    )
+    receipt = evidence.get("receipt")
+    require(isinstance(receipt, dict), f"{label}: allocator growth receipt is missing")
+    capacity_epoch = receipt.get("capacity_epoch")
+    growth_receipts = receipt.get("growths")
+    require(
+        receipt.get("coordinator_id") == coordinator_id
+        and isinstance(capacity_epoch, int)
+        and not isinstance(capacity_epoch, bool)
+        and capacity_epoch > 0,
+        f"{label}: allocator receipt authority or epoch is invalid",
+    )
+    require(
+        isinstance(growth_receipts, list)
+        and len(growth_receipts) == evidence.get("pools_grown")
+        and growth_receipts,
+        f"{label}: allocator growth receipts do not match the aggregate count",
+    )
+    growth_identities: list[list[Any]] = []
+    allocated_bytes = 0
+    for growth_index, growth in enumerate(growth_receipts):
+        require(
+            isinstance(growth, dict),
+            f"{label}: growth receipt {growth_index} is invalid",
+        )
+        pool_id = growth.get("pool_id")
+        chunk = growth.get("chunk")
+        chunk_bytes = growth.get("chunk_bytes")
+        published_capacity_bytes = growth.get("published_capacity_bytes")
+        require(
+            isinstance(pool_id, str)
+            and pool_id.startswith("dynamic-pool/sha256/")
+            and common.SHA256_RE.fullmatch(
+                pool_id.removeprefix("dynamic-pool/sha256/")
+            )
+            is not None
+            and isinstance(chunk, dict)
+            and chunk.get("pool_id") == pool_id
+            and isinstance(chunk.get("ordinal"), int)
+            and not isinstance(chunk.get("ordinal"), bool)
+            and chunk["ordinal"] > 0
+            and isinstance(chunk.get("generation"), int)
+            and not isinstance(chunk.get("generation"), bool)
+            and chunk["generation"] > 0,
+            f"{label}: growth receipt {growth_index} has an invalid chunk identity",
+        )
+        identity = [pool_id, chunk["ordinal"], chunk["generation"]]
+        require(
+            identity not in growth_identities,
+            f"{label}: allocator growth receipt repeats a chunk identity",
+        )
+        require(
+            isinstance(chunk_bytes, int)
+            and not isinstance(chunk_bytes, bool)
+            and chunk_bytes > 0
+            and isinstance(published_capacity_bytes, int)
+            and not isinstance(published_capacity_bytes, bool)
+            and published_capacity_bytes >= chunk_bytes
+            and growth.get("capacity_epoch") == capacity_epoch,
+            f"{label}: growth receipt {growth_index} has invalid bytes or epoch",
+        )
+        growth_identities.append(identity)
+        allocated_bytes += chunk_bytes
+    require(
+        allocated_bytes == evidence.get("allocated_bytes"),
+        f"{label}: exact growth bytes do not match the aggregate count",
+    )
+    require(
+        receipt.get("rebalance") == evidence.get("rebalance"),
+        f"{label}: allocator and event rebalance receipts differ",
+    )
+    participants = evidence.get("participants")
+    require(
+        isinstance(participants, list)
+        and participants
+        and shape.get("participant_count") == len(participants),
+        f"{label}: execution participants are missing or miscounted",
+    )
+    participant_identities: list[list[Any]] = []
+    for participant_index, participant in enumerate(participants):
+        authority = participant.get("sequence_authority") if isinstance(participant, dict) else None
+        identity = [
+            participant.get("run_id") if isinstance(participant, dict) else None,
+            participant.get("request_id") if isinstance(participant, dict) else None,
+            authority.get("sparse_id") if isinstance(authority, dict) else None,
+            authority.get("generation") if isinstance(authority, dict) else None,
+        ]
+        require(
+            all(isinstance(value, str) and value for value in identity[:2])
+            and isinstance(identity[2], int)
+            and not isinstance(identity[2], bool)
+            and identity[2] >= 0
+            and isinstance(identity[3], int)
+            and not isinstance(identity[3], bool)
+            and identity[3] > 0
+            and common.SHA256_RE.fullmatch(
+                str(participant.get("active_sequence_fingerprint"))
+            )
+            is not None
+            and identity not in participant_identities,
+            f"{label}: participant {participant_index} is invalid or duplicated",
+        )
+        participant_identities.append(identity)
+    fingerprint = evidence.get("event_fingerprint")
+    require(
+        common.SHA256_RE.fullmatch(str(fingerprint)) is not None
+        and row.get("correlation_id") == fingerprint
+        and row.get("event_id")
+        == f"evt-vnext-execution-resource-maintenance-{fingerprint}"
+        and row.get("request_id") == participants[0]["request_id"],
+        f"{label}: execution event identity does not bind to its evidence",
+    )
+    attributes = row.get("attributes")
+    require(
+        attributes.get("execution_trace_source") == "vnext_resource_maintenance"
+        and isinstance(attributes.get("plan_id"), str)
+        and attributes["plan_id"]
+        and common.SHA256_RE.fullmatch(str(attributes.get("plan_hash"))) is not None
+        and attributes.get("run_id") == participants[0]["run_id"],
+        f"{label}: plan or run authority is missing",
+    )
+    return {
+        "stage": stage,
+        "coordinator_id": coordinator_id,
+        "capacity_epoch": capacity_epoch,
+        "growth_chunk_identities": growth_identities,
+        "participant_identities": participant_identities,
+        "event_fingerprint": fingerprint,
     }
 
 
@@ -1674,6 +1852,7 @@ def validate_rebalance_trace(
         started_wall_ns=started_wall_ns,
         finished_wall_ns=finished_wall_ns,
         label=label,
+        phase=EXECUTION_MAINTENANCE_PHASE,
     )
     require(
         summary["rebalance_events"] > 0,
@@ -2014,6 +2193,7 @@ def collect(args: argparse.Namespace) -> int:
             started_wall_ns=sizing_started,
             finished_wall_ns=sizing_finished,
             label="target sizing",
+            phase=PREFILL_MAINTENANCE_PHASE,
         )
         collection["target_sizing"] = {
             "clients": sizing_clients,
@@ -2541,6 +2721,7 @@ def validate(root: Path, out: Path) -> int:
         started_wall_ns=sizing_started,
         finished_wall_ns=sizing_finished,
         label="target sizing",
+        phase=PREFILL_MAINTENANCE_PHASE,
     )
     require(
         target_sizing.get("maintenance_summary") == sizing_maintenance_summary,
@@ -3360,50 +3541,96 @@ def self_test() -> int:
             {"ts_unix_nanos": 164, "phase": "vnext.request_completed", "request_id": "D"},
         ]
     )
+    donor_pool_id = "dynamic-pool/sha256/" + "a" * 64
+    growth_pool_id = "dynamic-pool/sha256/" + "b" * 64
+    event_fingerprint = "c" * 64
+    active_fingerprint = "d" * 64
+    exact_rebalance_receipt = {
+        "pools": [
+            {
+                "pool_id": donor_pool_id,
+                "chunks": [
+                    {
+                        "pool_id": donor_pool_id,
+                        "ordinal": 1,
+                        "generation": 2,
+                    }
+                ],
+                "reclaimed_bytes": 64,
+                "published_capacity_bytes": 128,
+            }
+        ],
+        "reclaimed_chunks": 1,
+        "reclaimed_bytes": 64,
+        "logical_capacity_epoch": 15,
+        "plan_device_capacity_epoch": 16,
+        "process_device_capacity_epoch": 17,
+    }
     rebalance_rows = [
         {
             "ts_unix_nanos": 85,
-            "phase": "vnext.prefill_backing_maintenance",
+            "event_id": (
+                "evt-vnext-execution-resource-maintenance-" + event_fingerprint
+            ),
+            "correlation_id": event_fingerprint,
+            "request_id": "request.self-test",
+            "phase": EXECUTION_MAINTENANCE_PHASE,
             "status": "ok",
             "error": None,
-            "shape": {"outcome": "maintained"},
+            "shape": {
+                "allocated_bytes": 32,
+                "participant_count": 1,
+                "pools_grown": 1,
+                "pools_reclaimed": 1,
+                "stage": "step_admission",
+            },
             "attributes": {
+                "execution_trace_source": "vnext_resource_maintenance",
+                "plan_hash": "e" * 64,
+                "plan_id": "plan.self-test",
+                "run_id": "run.self-test",
                 "maintenance_evidence": {
+                    "schema_version": EXECUTION_MAINTENANCE_SCHEMA_VERSION,
                     "outcome": "maintained",
-                    "current": {
-                        "coordinator_id": 7,
-                        "release_epoch": 15,
-                        "capacity_epoch": 17,
-                    },
+                    "stage": "step_admission",
+                    "coordinator_id": 7,
                     "pools_grown": 1,
                     "allocated_bytes": 32,
                     "pools_reclaimed": 1,
                     "chunks_reclaimed": 1,
                     "reclaimed_bytes": 64,
-                    "rebalance": {
-                        "pools": [
+                    "rebalance": exact_rebalance_receipt,
+                    "receipt": {
+                        "coordinator_id": 7,
+                        "growths": [
                             {
-                                "pool_id": "dynamic-pool/sha256/" + "a" * 64,
-                                "chunks": [
-                                    {
-                                        "pool_id": (
-                                            "dynamic-pool/sha256/" + "a" * 64
-                                        ),
-                                        "ordinal": 1,
-                                        "generation": 2,
-                                    }
-                                ],
-                                "reclaimed_bytes": 64,
-                                "published_capacity_bytes": 128,
+                                "pool_id": growth_pool_id,
+                                "chunk": {
+                                    "pool_id": growth_pool_id,
+                                    "ordinal": 2,
+                                    "generation": 3,
+                                },
+                                "chunk_bytes": 32,
+                                "published_capacity_bytes": 32,
+                                "capacity_epoch": 18,
                             }
                         ],
-                        "reclaimed_chunks": 1,
-                        "reclaimed_bytes": 64,
-                        "logical_capacity_epoch": 15,
-                        "plan_device_capacity_epoch": 16,
-                        "process_device_capacity_epoch": 17,
+                        "capacity_epoch": 18,
+                        "rebalance": exact_rebalance_receipt,
                     },
-                }
+                    "event_fingerprint": event_fingerprint,
+                    "participants": [
+                        {
+                            "run_id": "run.self-test",
+                            "request_id": "request.self-test",
+                            "sequence_authority": {
+                                "sparse_id": 0,
+                                "generation": 1,
+                            },
+                            "active_sequence_fingerprint": active_fingerprint,
+                        }
+                    ],
+                },
             },
         }
     ]
@@ -3489,7 +3716,64 @@ def self_test() -> int:
         ],
         "self-test lost the exact pool, chunk, or epoch receipt",
     )
+    require(
+        rebalance_summary["growth_receipts"]
+        == [
+            {
+                "stage": "step_admission",
+                "coordinator_id": 7,
+                "capacity_epoch": 18,
+                "growth_chunk_identities": [[growth_pool_id, 2, 3]],
+                "participant_identities": [
+                    ["run.self-test", "request.self-test", 0, 1]
+                ],
+                "event_fingerprint": event_fingerprint,
+            }
+        ],
+        "self-test lost the exact growth, participant, or event identity",
+    )
+    prefill_substitution = json.loads(json.dumps(rebalance_rows))
+    prefill_substitution[-1]["phase"] = PREFILL_MAINTENANCE_PHASE
+    try:
+        validate_rebalance_trace(
+            prefill_substitution, started_wall_ns=80, finished_wall_ns=89
+        )
+        raise AssertionError("prefill maintenance substituted for execution evidence")
+    except common.CapacityGateError:
+        pass
+    missing_growth_receipt = json.loads(json.dumps(rebalance_rows))
+    del missing_growth_receipt[-1]["attributes"]["maintenance_evidence"]["receipt"]
+    try:
+        validate_rebalance_trace(
+            missing_growth_receipt, started_wall_ns=80, finished_wall_ns=89
+        )
+        raise AssertionError("execution event without allocator receipt unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    invalid_growth_epoch = json.loads(json.dumps(rebalance_rows))
+    invalid_growth_epoch[-1]["attributes"]["maintenance_evidence"]["receipt"][
+        "growths"
+    ][0]["capacity_epoch"] = 19
+    try:
+        validate_rebalance_trace(
+            invalid_growth_epoch, started_wall_ns=80, finished_wall_ns=89
+        )
+        raise AssertionError("growth with a mismatched capacity epoch unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    mismatched_receipt_rebalance = json.loads(json.dumps(rebalance_rows))
+    mismatched_receipt_rebalance[-1]["attributes"]["maintenance_evidence"][
+        "receipt"
+    ]["rebalance"]["reclaimed_bytes"] = 63
+    try:
+        validate_rebalance_trace(
+            mismatched_receipt_rebalance, started_wall_ns=80, finished_wall_ns=89
+        )
+        raise AssertionError("divergent event and allocator receipts unexpectedly passed")
+    except common.CapacityGateError:
+        pass
     missing_rebalance = json.loads(json.dumps(rebalance_rows))
+    missing_rebalance[-1]["shape"]["pools_reclaimed"] = 0
     missing_rebalance[-1]["attributes"]["maintenance_evidence"].update(
         {
             "pools_reclaimed": 0,
@@ -3498,11 +3782,15 @@ def self_test() -> int:
             "rebalance": None,
         }
     )
+    missing_rebalance[-1]["attributes"]["maintenance_evidence"]["receipt"].pop(
+        "rebalance"
+    )
     growth_only_summary = validate_maintenance_trace(
         missing_rebalance,
         started_wall_ns=80,
         finished_wall_ns=89,
         label="self-test growth-only probe",
+        phase=EXECUTION_MAINTENANCE_PHASE,
     )
     require(
         growth_only_summary["maintained_events"] == 1

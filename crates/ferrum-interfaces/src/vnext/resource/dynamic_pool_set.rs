@@ -589,6 +589,7 @@ where
         }
         if planned.is_empty() {
             return Ok(DynamicPoolGrowthBatchReceipt {
+                coordinator_id: self.logical_admission.id(),
                 growths: Vec::new(),
                 capacity_epoch: self.logical_admission.epochs()?.capacity_epoch(),
                 rebalance: None,
@@ -829,6 +830,7 @@ where
             state.resident_bytes = published_total;
         }
         Ok(DynamicPoolGrowthBatchReceipt {
+            coordinator_id: self.logical_admission.id(),
             growths: planned
                 .iter()
                 .zip(published_totals)

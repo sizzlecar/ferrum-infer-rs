@@ -495,6 +495,131 @@ impl VNextProfileEventContext {
         Ok(profile)
     }
 
+    fn execution_resource_maintenance_profile_event(
+        &self,
+        maintenance: &BoundExecutionResourceMaintenance,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
+        let first = maintenance.participants().first().ok_or_else(|| {
+            ExecutionEventSinkError::new("execution resource maintenance has no participant")
+        })?;
+        let receipt = maintenance.receipt();
+        let allocated_bytes = receipt
+            .growths()
+            .iter()
+            .try_fold(0_u64, |total, growth| {
+                total.checked_add(growth.chunk_bytes())
+            })
+            .ok_or_else(|| {
+                ExecutionEventSinkError::new(
+                    "execution resource maintenance allocated byte count overflow",
+                )
+            })?;
+        let (pools_reclaimed, chunks_reclaimed, reclaimed_bytes) =
+            receipt.rebalance().map_or((0, 0, 0), |rebalance| {
+                (
+                    rebalance.pools().len(),
+                    rebalance.reclaimed_chunks(),
+                    rebalance.reclaimed_bytes(),
+                )
+            });
+        let maintenance_evidence = serde_json::json!({
+            "schema_version": maintenance.schema_version(),
+            "outcome": "maintained",
+            "stage": maintenance.stage().as_str(),
+            "coordinator_id": receipt.coordinator_id(),
+            "pools_grown": receipt.growths().len(),
+            "allocated_bytes": allocated_bytes,
+            "pools_reclaimed": pools_reclaimed,
+            "chunks_reclaimed": chunks_reclaimed,
+            "reclaimed_bytes": reclaimed_bytes,
+            "rebalance": receipt.rebalance(),
+            "receipt": receipt,
+            "event_fingerprint": maintenance.fingerprint(),
+            "participants": maintenance.participants(),
+        });
+        let timestamp_nanos = timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000);
+        let profile = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp_nanos,
+            event_id: format!(
+                "evt-vnext-execution-resource-maintenance-{}",
+                maintenance.fingerprint()
+            ),
+            request_id: first.request_id().to_string(),
+            correlation_id: Some(maintenance.fingerprint().to_owned()),
+            entrypoint: self.entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: "vnext.execution_backing_maintenance".to_string(),
+            event_kind: ProfileEventKind::Instant,
+            timestamp,
+            status: ProfileStatus::Ok,
+            model: Some(self.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: None,
+            replay: None,
+            shape: BTreeMap::from([
+                (
+                    "allocated_bytes".to_string(),
+                    serde_json::json!(allocated_bytes),
+                ),
+                (
+                    "participant_count".to_string(),
+                    serde_json::json!(maintenance.participants().len()),
+                ),
+                (
+                    "pools_grown".to_string(),
+                    serde_json::json!(receipt.growths().len()),
+                ),
+                (
+                    "pools_reclaimed".to_string(),
+                    serde_json::json!(pools_reclaimed),
+                ),
+                (
+                    "stage".to_string(),
+                    serde_json::json!(maintenance.stage().as_str()),
+                ),
+            ]),
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+            ])),
+            attributes: BTreeMap::from([
+                (
+                    "execution_trace_source".to_string(),
+                    serde_json::json!("vnext_resource_maintenance"),
+                ),
+                ("maintenance_evidence".to_string(), maintenance_evidence),
+                (
+                    "plan_hash".to_string(),
+                    serde_json::json!(maintenance.plan().plan_hash()),
+                ),
+                (
+                    "plan_id".to_string(),
+                    serde_json::json!(maintenance.plan().plan_id()),
+                ),
+                ("run_id".to_string(), serde_json::json!(first.run_id())),
+            ]),
+        };
+        profile.validate().map_err(|error| {
+            ExecutionEventSinkError::new(format!(
+                "invalid vNext execution resource maintenance profile event: {error}"
+            ))
+        })?;
+        Ok(profile)
+    }
+
     fn physical_device_submission_timing_event(
         &self,
         completion: &OperationCompletionReceipt,
@@ -1301,6 +1426,20 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         else {
             return Ok(());
         };
+        self.enqueue_profile_batch(vec![event])
+    }
+
+    fn records_execution_resource_maintenance(&self) -> bool {
+        true
+    }
+
+    fn record_execution_resource_maintenance(
+        &self,
+        maintenance: BoundExecutionResourceMaintenance,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let event = self
+            .context
+            .execution_resource_maintenance_profile_event(&maintenance, chrono::Utc::now())?;
         self.enqueue_profile_batch(vec![event])
     }
 
