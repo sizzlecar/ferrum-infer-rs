@@ -2092,6 +2092,97 @@ fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
 }
 
 #[test]
+fn rebalance_preserves_physical_occupancy_plus_pending_bundle_demand() {
+    let first_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let second_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'b',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let first_pool_id = first_catalog.pool_id.clone();
+    let second_pool_id = second_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[first_catalog, second_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(runtime, catalog, 192, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&first_pool_id).unwrap();
+    maintenance.initialize_pool(&second_pool_id).unwrap();
+    maintenance.grow_pool(&second_pool_id, 64).unwrap();
+
+    let first_pool = Arc::clone(&harness.root.dynamic_pools.pools[&first_pool_id]);
+    let second_pool = Arc::clone(&harness.root.dynamic_pools.pools[&second_pool_id]);
+    let held_first = claim_size(&harness.root.dynamic_pools, &first_pool, 64);
+    let held_second = claim_size(&harness.root.dynamic_pools, &second_pool, 64);
+    let requests = vec![
+        evaluated_request(&first_pool, 64),
+        evaluated_request(&second_pool, 64),
+    ];
+
+    let BackingPrepareDecision::Deferred(deferred) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("the occupied first pool must defer the two-pool bundle")
+    };
+    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.blockers()[0].pool_id(), &first_pool_id);
+    assert_eq!(
+        deferred
+            .protected_immediate()
+            .units_for(first_pool.domain.domain_id)
+            .unwrap()
+            .get(),
+        64
+    );
+    assert_eq!(
+        deferred
+            .protected_immediate()
+            .units_for(second_pool.domain.domain_id)
+            .unwrap()
+            .get(),
+        64
+    );
+    let before = maintenance.status().unwrap();
+
+    assert!(matches!(
+        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert_eq!(maintenance.status().unwrap(), before);
+
+    drop(held_second);
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("the exact physical release must make the protected bundle maintainable")
+    };
+    assert_eq!(growth.growths().len(), 1);
+    assert_eq!(growth.growths()[0].pool_id(), &first_pool_id);
+    let rebalance = growth
+        .rebalance()
+        .expect("released donor capacity must be rebalanced into the blocked pool");
+    assert_eq!(rebalance.pools().len(), 1);
+    assert_eq!(rebalance.pools()[0].pool_id(), &second_pool_id);
+    let BackingPrepareDecision::Prepared(prepared) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("maintained capacity must prepare the complete protected bundle")
+    };
+    drop(prepared.commit());
+
+    drop(held_first);
+}
+
+#[test]
 fn live_idle_donor_boundary_waits_then_rebalances_after_exact_release() {
     let donor_catalog = pool_catalog(
         linear_profile(),

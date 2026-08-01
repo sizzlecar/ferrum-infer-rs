@@ -230,11 +230,26 @@ where
                 .get(&pool.domain.domain_id)
                 .copied()
                 .ok_or_else(|| invalid_resource("dynamic pool domain is absent from admission"))?;
+            let physically_occupied = state
+                .resident_bytes
+                .checked_sub(state.allocator.free_bytes)
+                .ok_or_else(|| {
+                    invalid_resource("dynamic pool free bytes exceed resident capacity")
+                })?;
+            if physically_occupied != state.live_occupancy.total().physical_bytes() {
+                return Err(invalid_resource(
+                    "dynamic pool allocator occupancy differs from its typed live occupancy",
+                ));
+            }
             let protected = protected_by_domain
                 .get(&pool.domain.domain_id)
                 .copied()
                 .unwrap_or(0);
-            let coherent_runnable_floor = used.checked_add(protected).ok_or_else(|| {
+            // Logical admission does not own lane-stable or not-yet-committed
+            // physical extents. Reclaim must preserve whichever ownership view
+            // is larger before adding this bundle's uncommitted demand.
+            let owned = used.max(physically_occupied);
+            let coherent_runnable_floor = owned.checked_add(protected).ok_or_else(|| {
                 invalid_resource("dynamic pool protected runnable floor overflows u64")
             })?;
             let resident_floor = pool
