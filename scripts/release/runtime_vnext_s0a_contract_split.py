@@ -133,6 +133,10 @@ TEST_TARGET_GROUPS = {
         "vnext_device_operation_completion_contract_tests",
         "vnext_device_operation_dispatch_contract_tests",
         "vnext_device_operation_legacy_authority_contract_tests",
+        "vnext_device_operation_wave_determinism_contract_tests",
+        "vnext_device_operation_wave_execution_contract_tests",
+        "vnext_device_operation_wave_identity_contract_tests",
+        "vnext_device_operation_wave_workspace_contract_tests",
     ],
 }
 
@@ -141,6 +145,7 @@ SHARED_TEST_SUPPORT = [
     "crates/ferrum-interfaces/tests/vnext_core_contract/mod.rs",
     "crates/ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs",
     "crates/ferrum-interfaces/tests/vnext_device_operation_contract/planning.rs",
+    "crates/ferrum-interfaces/tests/vnext_device_operation_wave_contract/mod.rs",
     "crates/ferrum-interfaces/tests/vnext_event_contract/mod.rs",
     "crates/ferrum-interfaces/tests/vnext_event_contract/event_fixture.rs",
     "crates/ferrum-interfaces/tests/vnext_event_contract/execution_fixture.rs",
@@ -155,6 +160,7 @@ REMOVED_OVERSIZED_TARGETS = [
     "crates/ferrum-interfaces/tests/vnext_resource_contract_tests.rs",
     "crates/ferrum-interfaces/tests/vnext_event_contract_tests.rs",
     "crates/ferrum-interfaces/tests/vnext_device_operation_contract_tests.rs",
+    "crates/ferrum-interfaces/tests/vnext_device_operation_wave_contract_tests.rs",
 ]
 
 
@@ -951,8 +957,8 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
 
 
 def self_test() -> int:
-    require(sum(len(targets) for targets in TEST_TARGET_GROUPS.values()) == 24, "S0A target matrix drifted")
-    require(len(SHARED_TEST_SUPPORT) == 11, "S0A shared test support matrix drifted")
+    require(sum(len(targets) for targets in TEST_TARGET_GROUPS.values()) == 28, "S0A target matrix drifted")
+    require(len(SHARED_TEST_SUPPORT) == 12, "S0A shared test support matrix drifted")
     require(set(PRODUCTION_GROUPS) == {"resource", "execution", "event"}, "S0A production scope drifted")
     require(
         TEST_THREADS == "1" and TEST_THREADS_ARG == "--test-threads=1",
