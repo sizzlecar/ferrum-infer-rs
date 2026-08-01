@@ -1,9 +1,10 @@
 use super::dynamic_pool::{DynamicDeviceCapacityBlocked, DynamicPoolGrowthIntent};
 use super::{
     invalid_resource, AdmissionDeferred, CapacityEpochs, CapacityVector, CapacityWaitCondition,
-    DeviceRuntime, DynamicBackingBlocker, DynamicBackingDeferred, DynamicBackingPoolId,
-    DynamicChunkQuarantineReason, DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthReceipt,
-    DynamicPoolGrowthRequest, DynamicPoolSet, DynamicPoolStatus, VNextError,
+    DeviceRuntime, DynamicBackingBlocker, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
+    DynamicBackingPoolId, DynamicChunkQuarantineReason, DynamicPoolGrowthBatchReceipt,
+    DynamicPoolGrowthReceipt, DynamicPoolGrowthRequest, DynamicPoolSet, DynamicPoolStatus,
+    VNextError,
 };
 use crate::vnext::{
     CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DynamicBackingPressure,
@@ -367,6 +368,7 @@ where
         intents: Vec<DynamicPoolGrowthIntent>,
         capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
         protected_immediate: &CapacityVector,
+        protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
         let retry_intents = intents.clone();
         match self
@@ -383,6 +385,7 @@ where
                     &pressure,
                     &planned_domains,
                     protected_immediate,
+                    protected_packing_envelopes,
                 )?
                 else {
                     return Err(VNextError::DeviceCapacityUnavailable(pressure));
@@ -406,16 +409,6 @@ where
         &self,
         deferred: &DynamicBackingDeferred,
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        self.maintain_for_live_deferred_protecting(deferred, deferred.protected_immediate())
-    }
-
-    /// Maintains one uncommitted multi-scope bundle without reclaiming another
-    /// pool below the exact immediate envelope required by the same bundle.
-    pub(super) fn maintain_for_live_deferred_protecting(
-        &self,
-        deferred: &DynamicBackingDeferred,
-        protected_immediate: &CapacityVector,
-    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
         let coordinator_id = self.pools.logical_admission.id();
         if coordinator_id != deferred.epochs().coordinator_id()
             || coordinator_id != deferred.wait_condition().coordinator_id()
@@ -428,19 +421,6 @@ where
             return Err(invalid_resource(
                 "dynamic backing deferral contains no blocking pool",
             ));
-        }
-        for required in deferred.protected_immediate().entries() {
-            let protected = protected_immediate
-                .entries()
-                .iter()
-                .find(|entry| entry.domain() == required.domain())
-                .map(|entry| entry.units().get())
-                .unwrap_or(0);
-            if protected < required.units().get() {
-                return Err(invalid_resource(
-                    "dynamic bundle protection is smaller than its physical deferral",
-                ));
-            }
         }
         let logical_snapshot = self.wait_snapshot_for_pool_ids(
             deferred
@@ -457,7 +437,8 @@ where
                 .map(DynamicPoolGrowthIntent::RevalidatedDeferral)
                 .collect(),
             &mut capacity_blocked,
-            protected_immediate,
+            deferred.protected_immediate(),
+            deferred.protected_packing_envelopes(),
         );
         match growth {
             Ok(receipt) if receipt.growths().is_empty() => {
@@ -556,6 +537,7 @@ where
                 .collect(),
             &mut capacity_blocked,
             deferred.immediate_requested(),
+            &[],
         );
         match growth {
             Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
