@@ -4702,14 +4702,53 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
     }
 
-    fn execution_maintenance_decision(
+    fn execution_maintenance_decision<'a>(
+        &self,
         stage: ExecutorExecutionCapacityStage,
         outcome: DynamicDeferredMaintenanceOutcome,
         source: Option<&AdmissionDeferred>,
+        participants: impl IntoIterator<Item = &'a VNextSequence<R>>,
     ) -> Result<Option<ExecutorExecutionCapacityDeferral>> {
         match outcome {
-            DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
-            | DynamicDeferredMaintenanceOutcome::Maintained(_) => Ok(None),
+            DynamicDeferredMaintenanceOutcome::RetryAdmission { .. } => Ok(None),
+            DynamicDeferredMaintenanceOutcome::Maintained(receipt) => {
+                let Some(sink) = self.event_sink.read().clone() else {
+                    return Ok(None);
+                };
+                if !sink.records_execution_resource_maintenance() {
+                    return Ok(None);
+                }
+                let stage = match stage {
+                    ExecutorExecutionCapacityStage::SequenceExtension => {
+                        ExecutionResourceMaintenanceStage::SequenceExtension
+                    }
+                    ExecutorExecutionCapacityStage::StepAdmission => {
+                        ExecutionResourceMaintenanceStage::StepAdmission
+                    }
+                    ExecutorExecutionCapacityStage::SubmissionWave => {
+                        ExecutionResourceMaintenanceStage::SubmissionWave
+                    }
+                };
+                let maintenance = BoundExecutionResourceMaintenance::bind(
+                    stage,
+                    participants
+                        .into_iter()
+                        .map(|sequence| sequence.active_binding.as_ref()),
+                    receipt,
+                )
+                .map_err(|error| {
+                    FerrumError::backend(format!(
+                        "vNext execution resource maintenance binding: {error}"
+                    ))
+                })?;
+                sink.record_execution_resource_maintenance(maintenance)
+                    .map_err(|error| {
+                        FerrumError::backend(format!(
+                            "vNext execution resource maintenance event: {error}"
+                        ))
+                    })?;
+                Ok(None)
+            }
             DynamicDeferredMaintenanceOutcome::WaitForRelease {
                 current_epochs,
                 wait_condition,
@@ -4801,10 +4840,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .plan_resources
                         .maintain_for_admission_deferred(&deferred)
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SequenceExtension,
                         outcome,
                         Some(&deferred),
+                        std::iter::once(sequence),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -4824,10 +4864,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SequenceExtension,
                         outcome,
                         None,
+                        std::iter::once(sequence),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -4946,18 +4987,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn begin_step(
         &self,
         batch: &ExecutionBatchParticipants<R>,
+        sequence: &Arc<VNextSequence<R>>,
         span: &TokenSpanWork,
     ) -> Result<Arc<StepResourceLease<R>>> {
-        self.begin_step_for_spans(batch, std::slice::from_ref(span))
+        self.begin_step_for_spans(
+            batch,
+            std::slice::from_ref(sequence),
+            std::slice::from_ref(span),
+        )
     }
 
     fn begin_step_for_spans(
         &self,
         batch: &ExecutionBatchParticipants<R>,
+        sequences: &[Arc<VNextSequence<R>>],
         spans: &[TokenSpanWork],
     ) -> Result<Arc<StepResourceLease<R>>> {
         match self.begin_step_for_spans_with_capacity(
             batch,
+            sequences,
             spans,
             VNextExecutionWaveKind::Decode,
         )? {
@@ -4971,9 +5019,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn begin_step_for_spans_with_capacity(
         &self,
         batch: &ExecutionBatchParticipants<R>,
+        sequences: &[Arc<VNextSequence<R>>],
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<Arc<StepResourceLease<R>>>> {
+        if sequences.is_empty()
+            || sequences.len() != batch.sessions().len()
+            || batch
+                .sessions()
+                .iter()
+                .zip(sequences)
+                .any(|(session, sequence)| !Arc::ptr_eq(session, &sequence.session))
+        {
+            return Err(FerrumError::internal(
+                "vNext step maintenance participants differ from the canonical batch",
+            ));
+        }
         let mut backing_attempts = 0;
         loop {
             match self.try_begin_step_for_spans(batch, spans, kind)? {
@@ -5004,10 +5065,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .plan_resources
                         .maintain_for_admission_deferred(&deferred)
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::StepAdmission,
                         outcome,
                         Some(&deferred),
+                        sequences.iter().map(Arc::as_ref),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -5027,10 +5089,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::StepAdmission,
                         outcome,
                         None,
+                        sequences.iter().map(Arc::as_ref),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -5068,21 +5131,46 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
+    fn validate_step_maintenance_participants(
+        step: &StepResourceLease<R>,
+        sequences: &[Arc<VNextSequence<R>>],
+    ) -> Result<()> {
+        if sequences.is_empty()
+            || step.participant_count() as usize != sequences.len()
+            || step
+                .participants()
+                .zip(sequences)
+                .any(|(resources, sequence)| !Arc::ptr_eq(resources, sequence.session.resources()))
+        {
+            return Err(FerrumError::internal(
+                "vNext submission-wave maintenance participants differ from the exact step",
+            ));
+        }
+        Ok(())
+    }
+
     fn prepare_wave(
         &self,
         step: &Arc<StepResourceLease<R>>,
+        sequence: &Arc<VNextSequence<R>>,
         span: &TokenSpanWork,
     ) -> Result<PreparedStepSubmissionWave<R>> {
-        self.prepare_wave_for_spans(step, std::slice::from_ref(span))
+        self.prepare_wave_for_spans(
+            step,
+            std::slice::from_ref(sequence),
+            std::slice::from_ref(span),
+        )
     }
 
     fn prepare_wave_for_spans(
         &self,
         step: &Arc<StepResourceLease<R>>,
+        sequences: &[Arc<VNextSequence<R>>],
         spans: &[TokenSpanWork],
     ) -> Result<PreparedStepSubmissionWave<R>> {
         match self.prepare_wave_for_spans_with_capacity(
             step,
+            sequences,
             spans,
             VNextExecutionWaveKind::Decode,
         )? {
@@ -5096,9 +5184,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn prepare_wave_for_spans_with_capacity(
         &self,
         step: &Arc<StepResourceLease<R>>,
+        sequences: &[Arc<VNextSequence<R>>],
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<PreparedStepSubmissionWave<R>>> {
+        if sequences.len() != spans.len() {
+            return Err(FerrumError::internal(
+                "vNext submission-wave maintenance participants differ from the work spans",
+            ));
+        }
+        Self::validate_step_maintenance_participants(step, sequences)?;
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _timing = self
@@ -5140,10 +5235,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .plan_resources
                         .maintain_for_admission_deferred(&deferred)
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
                         Some(&deferred),
+                        sequences.iter().map(Arc::as_ref),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -5163,10 +5259,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
                         None,
+                        sequences.iter().map(Arc::as_ref),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -5705,8 +5802,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .start();
             let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let step = self.begin_step(&batch, &span)?;
-            let wave = match self.prepare_wave(&step, &span) {
+            let step = self.begin_step(&batch, sequence, &span)?;
+            let wave = match self.prepare_wave(&step, sequence, &span) {
                 Ok(wave) => wave,
                 Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
             };
@@ -5755,24 +5852,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            let step = match self.begin_step_for_spans_with_capacity(batch, spans, kind)? {
-                VNextExecutionCapacityDecision::Ready(step) => step,
-                VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
-                }
-            };
-            let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans, kind)? {
-                VNextExecutionCapacityDecision::Ready(wave) => wave,
-                VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    step.try_rollback_unsubmitted().map_err(|failure| {
-                        FerrumError::backend(format!(
-                            "vNext capacity-deferred unsubmitted step rollback failed: {}",
-                            failure.error()
-                        ))
-                    })?;
-                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
-                }
-            };
+            let step =
+                match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
+                    VNextExecutionCapacityDecision::Ready(step) => step,
+                    VNextExecutionCapacityDecision::Deferred(deferred) => {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                    }
+                };
+            let wave =
+                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)? {
+                    VNextExecutionCapacityDecision::Ready(wave) => wave,
+                    VNextExecutionCapacityDecision::Deferred(deferred) => {
+                        step.try_rollback_unsubmitted().map_err(|failure| {
+                            FerrumError::backend(format!(
+                                "vNext capacity-deferred unsubmitted step rollback failed: {}",
+                                failure.error()
+                            ))
+                        })?;
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
+                };
             PreparedVNextPrefill { step, wave }
         };
         let participants = sequences

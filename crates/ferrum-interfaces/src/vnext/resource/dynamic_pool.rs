@@ -6,8 +6,9 @@ use super::{
     DeviceCapacityGrant, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
     DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
     DynamicStorageProfile, ElementType, ExecutionLane, ExecutionLaneId, FreeExtentIndex,
-    InvocationLivenessMode, LaneStableArenaSlotIdentity, LogicalAdmissionCoordinator, Mutex,
-    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError, Weak,
+    InvocationLivenessMode, LaneStableArenaSlotIdentity, LogicalAdmissionCoordinator,
+    LogicalAdmissionCoordinatorId, Mutex, Ordering, PlanNode, ResourceId, Serialize,
+    StateInitialization, VNextError, Weak,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,
@@ -1122,6 +1123,7 @@ impl DynamicPoolGrowthRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolGrowthBatchReceipt {
+    pub(super) coordinator_id: LogicalAdmissionCoordinatorId,
     pub(super) growths: Vec<DynamicPoolGrowthReceipt>,
     pub(super) capacity_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1471,6 +1473,10 @@ impl DynamicBackingDeferred {
 }
 
 impl DynamicPoolGrowthBatchReceipt {
+    pub const fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
+        self.coordinator_id
+    }
+
     pub fn growths(&self) -> &[DynamicPoolGrowthReceipt] {
         &self.growths
     }

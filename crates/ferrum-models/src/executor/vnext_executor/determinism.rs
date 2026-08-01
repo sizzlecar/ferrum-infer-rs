@@ -293,8 +293,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn prepare_determinism_wave(
         &self,
         step: &Arc<StepResourceLease<R>>,
+        sequences: &[Arc<VNextSequence<R>>],
         spans: &[TokenSpanWork],
     ) -> Result<PreparedStepSubmissionWave<R>> {
+        if sequences.len() != spans.len() {
+            return Err(FerrumError::internal(
+                "vNext determinism-wave maintenance participants differ from the work spans",
+            ));
+        }
+        Self::validate_step_maintenance_participants(step, sequences)?;
         let work_shape = step
             .shared_all_invocation_work_shape(spans)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
@@ -337,10 +344,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .plan_resources
                         .maintain_for_admission_deferred(&deferred)
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
                         Some(&deferred),
+                        sequences.iter().map(Arc::as_ref),
                     )? {
                         return Err(Self::execution_capacity_error(&deferred));
                     }
@@ -357,10 +365,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    if let Some(deferred) = Self::execution_maintenance_decision(
+                    if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
                         None,
+                        sequences.iter().map(Arc::as_ref),
                     )? {
                         return Err(Self::execution_capacity_error(&deferred));
                     }
@@ -652,6 +661,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Result<Vec<_>>>()?;
         let step = match self.begin_step_for_spans_with_capacity(
             &batch,
+            &sequences,
             &spans,
             spec.phase.wave_kind(),
         )? {
@@ -660,7 +670,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(Self::execution_capacity_error(&deferred))
             }
         };
-        let wave = match self.prepare_determinism_wave(&step, &spans) {
+        let wave = match self.prepare_determinism_wave(&step, &sequences, &spans) {
             Ok(wave) => wave,
             Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
         };

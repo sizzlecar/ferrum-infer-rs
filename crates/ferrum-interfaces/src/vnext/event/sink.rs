@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crate::model_executor::ExecutorRequestOrigin;
 
 use super::{
-    has_active, ExecutionEvent, ExecutionEventCursor, ExecutionEventKind, RequestIdentity, RunId,
-    TrustedExecutionEventContext,
+    has_active, BoundExecutionResourceMaintenance, ExecutionEvent, ExecutionEventCursor,
+    ExecutionEventKind, RequestIdentity, RunId, TrustedExecutionEventContext,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +159,20 @@ pub trait ExecutionEventSink: Send + Sync {
     fn record_physical_device_submission_timing(
         &self,
         _completion: &super::super::OperationCompletionReceipt,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+
+    /// Resource maintenance is a plan/batch event and therefore does not run
+    /// through a per-request execution cursor. Sinks opt in explicitly so a
+    /// disabled profile path performs no event construction or serialization.
+    fn records_execution_resource_maintenance(&self) -> bool {
+        false
+    }
+
+    fn record_execution_resource_maintenance(
+        &self,
+        _maintenance: BoundExecutionResourceMaintenance,
     ) -> Result<(), ExecutionEventSinkError> {
         Ok(())
     }

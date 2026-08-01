@@ -38,6 +38,9 @@ use execution_event::{
     has_aborted, has_active, has_completed, same_operation_authority_except_observation,
 };
 
+mod resource_maintenance;
+pub use resource_maintenance::*;
+
 mod resource_pool;
 pub use resource_pool::*;
 
