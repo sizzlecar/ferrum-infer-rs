@@ -97,8 +97,21 @@ SAFETENSORS_SHARD_RE = re.compile(
 )
 VNEXT_FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
 VNEXT_S0A_PUBLIC_API_ADDED_SHA256 = (
-    "6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41"
+    "9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d"
 )
+VNEXT_S0A_PRODUCTION_GROUPS = {"resource", "execution", "event", "operation"}
+VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS = {
+    "crates/ferrum-interfaces/src/vnext/static_initialization.rs"
+}
+VNEXT_S0A_OWNER_GRAPH_DIAGNOSTIC_FIELDS = {
+    "unresolved_internal_references",
+    "ambiguous_internal_references",
+    "unsupported_internal_globs",
+    "facade_owned_items",
+    "facade_owned_references",
+    "hidden_production_modules",
+    "forbidden_cross_boundary_references",
+}
 VNEXT_G00_FULL_SELFTEST_PASS = (
     "FERRUM RUNTIME VNEXT G00 BASELINE FULL SELFTEST PASS"
 )
@@ -2622,6 +2635,479 @@ def validate_vnext_g00f_provenance(
     }
 
 
+def vnext_s0a_owner_sets_from_inventory(
+    split_inventory: dict[str, Any], *, verify_checkout: bool
+) -> dict[str, set[str]]:
+    owner_sets = {group: set() for group in VNEXT_S0A_PRODUCTION_GROUPS}
+    rows = require_list(split_inventory.get("files"), "vnext-g01a S0A split inventory files")
+    for index, raw in enumerate(rows):
+        row = require_object(raw, f"vnext-g01a S0A split inventory files[{index}]")
+        if row.get("category") != "production_owner":
+            continue
+        relative = Path(
+            require_string(row.get("path"), f"vnext-g01a S0A production owner path[{index}]")
+        )
+        require_gate(
+            len(relative.parts) == 6
+            and relative.parts[:4] == ("crates", "ferrum-interfaces", "src", "vnext")
+            and relative.parts[4] in owner_sets
+            and relative.suffix == ".rs",
+            f"vnext-g01a S0A production owner is outside the declared groups: {relative}",
+        )
+        group = relative.parts[4]
+        owner = relative.stem
+        require_gate(
+            owner not in owner_sets[group],
+            f"vnext-g01a S0A duplicate production owner: {group}/{owner}",
+        )
+        owner_sets[group].add(owner)
+    require_gate(
+        all(owner_sets.values()),
+        "vnext-g01a S0A production group has no physical owners",
+    )
+    if verify_checkout:
+        for group, expected in owner_sets.items():
+            owner_dir = REPO_ROOT / f"crates/ferrum-interfaces/src/vnext/{group}"
+            discovered = {
+                path.stem
+                for path in owner_dir.glob("*.rs")
+                if path.stem != "tests" and not path.stem.endswith("_tests")
+            }
+            require_gate(
+                discovered == expected,
+                f"vnext-g01a S0A {group} inventory differs from the checkout: "
+                f"missing={sorted(discovered - expected)} stale={sorted(expected - discovered)}",
+            )
+    return owner_sets
+
+
+def validate_vnext_s0a_composition_owners(
+    inventory_rows: list[dict[str, Any]], *, verify_checkout: bool
+) -> list[dict[str, Any]]:
+    rows = [
+        row
+        for row in inventory_rows
+        if row.get("category") == "production_composition_owner"
+    ]
+    paths = {
+        require_string(row.get("path"), "vnext-g01a S0A composition owner path")
+        for row in rows
+    }
+    require_gate(
+        len(rows) == len(VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS)
+        and paths == VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS,
+        "vnext-g01a S0A production composition owner set mismatch",
+    )
+    expected_fields = {
+        "path",
+        "category",
+        "physical_lines",
+        "logical_lines",
+        "size_bytes",
+        "sha256",
+        "git_blob",
+    }
+    for row in rows:
+        relative = require_string(row.get("path"), "vnext-g01a S0A composition owner path")
+        physical_lines = row.get("physical_lines")
+        logical_lines = row.get("logical_lines")
+        size_bytes = row.get("size_bytes")
+        require_gate(
+            set(row) == expected_fields
+            and isinstance(physical_lines, int)
+            and not isinstance(physical_lines, bool)
+            and physical_lines > 0
+            and isinstance(logical_lines, int)
+            and not isinstance(logical_lines, bool)
+            and 0 < logical_lines <= physical_lines
+            and isinstance(size_bytes, int)
+            and not isinstance(size_bytes, bool)
+            and size_bytes > 0
+            and SHA256_RE.fullmatch(str(row.get("sha256"))) is not None
+            and re.fullmatch(r"[0-9a-f]{40,64}", str(row.get("git_blob"))) is not None,
+            f"vnext-g01a S0A composition owner identity shape mismatch: {relative}",
+        )
+        if verify_checkout:
+            path = REPO_ROOT / relative
+            require_gate(path.is_file(), f"vnext-g01a S0A composition owner is missing: {relative}")
+            payload = path.read_bytes()
+            require_gate(
+                physical_lines == len(payload.decode("utf-8").splitlines())
+                and size_bytes == len(payload)
+                and row.get("sha256") == hashlib.sha256(payload).hexdigest()
+                and row.get("git_blob") == git_output(["rev-parse", f"HEAD:{relative}"]),
+                f"vnext-g01a S0A composition owner identity is stale: {relative}",
+            )
+    return rows
+
+
+def validate_vnext_s0a_owner_dependency_graph(
+    raw: Any,
+    expected_owner_sets: dict[str, set[str]],
+) -> dict[str, Any]:
+    document = require_object(raw, "vnext-g01a S0A owner dependency graph")
+    require_gate(
+        set(document) == {"schema_version", "artifact_type", "parser", "groups", "summary"},
+        "vnext-g01a S0A owner dependency graph field set mismatch",
+    )
+    require_gate(
+        document.get("schema_version") == 1
+        and document.get("artifact_type") == "runtime_vnext_s0a_owner_dependency_graph",
+        "vnext-g01a S0A owner dependency graph schema mismatch",
+    )
+    require_gate(
+        document.get("parser")
+        == {
+            "kind": "syn_ast",
+            "dependency_scope": "complete_intra_facade_owner_graph",
+            "cfg_test_subtrees_excluded": True,
+            "internal_glob_policy": "reject",
+            "unresolved_internal_reference_policy": "reject",
+            "hidden_production_module_policy": "reject",
+            "facade_semantic_item_policy": "reject",
+            "forbidden_cross_boundary_policy": (
+                "resource_and_operation_must_not_depend_on_model"
+            ),
+        },
+        "vnext-g01a S0A owner dependency parser policy mismatch",
+    )
+    require_gate(
+        set(expected_owner_sets) == VNEXT_S0A_PRODUCTION_GROUPS,
+        "vnext-g01a S0A expected owner group set mismatch",
+    )
+    groups = require_list(document.get("groups"), "vnext-g01a S0A owner dependency groups")
+    graph_by_group: dict[str, dict[str, Any]] = {}
+    total_edges = 0
+    for index, raw_group in enumerate(groups):
+        group_row = require_object(raw_group, f"vnext-g01a S0A dependency groups[{index}]")
+        require_gate(
+            set(group_row)
+            == {
+                "group",
+                "facade",
+                "owners",
+                "edges",
+                "strongly_connected_components",
+                "multi_module_sccs",
+                "topological_order",
+                "diagnostics",
+                "summary",
+            },
+            f"vnext-g01a S0A dependency group field set mismatch: {index}",
+        )
+        group = require_string(group_row.get("group"), f"dependency groups[{index}].group")
+        require_gate(
+            group in expected_owner_sets and group not in graph_by_group,
+            f"vnext-g01a S0A invalid or duplicate dependency group: {group}",
+        )
+        expected_owners = expected_owner_sets[group]
+        require_gate(group_row.get("facade") == f"{group}.rs", f"{group} facade mismatch")
+        owners = require_list(group_row.get("owners"), f"{group} dependency owners")
+        require_gate(
+            all(isinstance(owner, str) and owner for owner in owners)
+            and len(owners) == len(set(owners))
+            and set(owners) == expected_owners,
+            f"vnext-g01a S0A {group} owner set differs from physical inventory",
+        )
+        order = require_list(group_row.get("topological_order"), f"{group} topological order")
+        require_gate(
+            all(isinstance(owner, str) and owner for owner in order)
+            and len(order) == len(set(order))
+            and set(order) == expected_owners,
+            f"vnext-g01a S0A {group} topological order coverage mismatch",
+        )
+        positions = {owner: position for position, owner in enumerate(order)}
+        edges = require_list(group_row.get("edges"), f"{group} dependency edges")
+        edge_pairs: set[tuple[str, str]] = set()
+        for edge_index, raw_edge in enumerate(edges):
+            edge = require_object(raw_edge, f"{group} dependency edges[{edge_index}]")
+            require_gate(
+                set(edge) == {"importer", "dependency", "evidence"},
+                f"vnext-g01a S0A {group} dependency edge field set mismatch: {edge_index}",
+            )
+            importer = require_string(edge.get("importer"), f"{group} edge importer")
+            dependency = require_string(edge.get("dependency"), f"{group} edge dependency")
+            require_gate(
+                importer in expected_owners
+                and dependency in expected_owners
+                and importer != dependency,
+                f"vnext-g01a S0A {group} dependency edge endpoint mismatch: "
+                f"{importer}->{dependency}",
+            )
+            pair = (importer, dependency)
+            require_gate(
+                pair not in edge_pairs,
+                f"vnext-g01a S0A {group} duplicate dependency edge: {pair}",
+            )
+            edge_pairs.add(pair)
+            require_gate(
+                positions[dependency] < positions[importer],
+                f"vnext-g01a S0A {group} dependency order invalid: "
+                f"{dependency} must precede {importer}",
+            )
+            evidence = require_list(edge.get("evidence"), f"{group} edge evidence")
+            require_gate(bool(evidence), f"vnext-g01a S0A {group} edge lacks evidence: {pair}")
+            for evidence_index, raw_evidence in enumerate(evidence):
+                evidence_row = require_object(
+                    raw_evidence, f"{group} edge evidence[{edge_index}][{evidence_index}]"
+                )
+                require_gate(
+                    set(evidence_row) == {"path", "kind", "reference"}
+                    and all(
+                        isinstance(evidence_row.get(field), str) and evidence_row[field]
+                        for field in ("path", "kind", "reference")
+                    ),
+                    f"vnext-g01a S0A {group} edge evidence is incomplete",
+                )
+        total_edges += len(edge_pairs)
+        require_gate(
+            require_list(group_row.get("multi_module_sccs"), f"{group} multi-module SCCs")
+            == [],
+            f"vnext-g01a S0A {group} dependency graph contains a multi-owner SCC",
+        )
+        components = require_list(
+            group_row.get("strongly_connected_components"), f"{group} SCC partition"
+        )
+        singleton_components = []
+        for component_index, raw_component in enumerate(components):
+            component = require_list(raw_component, f"{group} SCC[{component_index}]")
+            require_gate(
+                len(component) == 1 and isinstance(component[0], str),
+                f"vnext-g01a S0A {group} SCC is not a singleton",
+            )
+            singleton_components.append(component[0])
+        require_gate(
+            len(singleton_components) == len(set(singleton_components))
+            and set(singleton_components) == expected_owners,
+            f"vnext-g01a S0A {group} SCC partition coverage mismatch",
+        )
+        diagnostics = require_object(group_row.get("diagnostics"), f"{group} diagnostics")
+        require_gate(
+            set(diagnostics) == VNEXT_S0A_OWNER_GRAPH_DIAGNOSTIC_FIELDS
+            and all(require_list(value, f"{group} diagnostic") == [] for value in diagnostics.values()),
+            f"vnext-g01a S0A {group} owner dependency diagnostics are not empty",
+        )
+        computed_group_summary = {
+            "owner_count": len(expected_owners),
+            "edge_count": len(edge_pairs),
+            "multi_module_scc_count": 0,
+            "diagnostic_count": 0,
+            "pass": True,
+        }
+        require_gate(
+            group_row.get("summary") == computed_group_summary,
+            f"vnext-g01a S0A {group} dependency summary differs from recomputed facts",
+        )
+        graph_by_group[group] = group_row
+    require_gate(
+        set(graph_by_group) == VNEXT_S0A_PRODUCTION_GROUPS,
+        "vnext-g01a S0A owner dependency production group set mismatch",
+    )
+    computed_summary = {
+        "production_group_count": len(graph_by_group),
+        "owner_count": sum(len(owners) for owners in expected_owner_sets.values()),
+        "edge_count": total_edges,
+        "multi_module_scc_count": 0,
+        "diagnostic_count": 0,
+        "pass": True,
+    }
+    require_gate(
+        document.get("summary") == computed_summary,
+        "vnext-g01a S0A owner dependency summary differs from recomputed facts",
+    )
+    return {"summary": computed_summary, "groups": graph_by_group}
+
+
+def selftest_vnext_s0a_owner_dependency_graph() -> None:
+    expected_owner_sets = {
+        "resource": {"capacity", "transaction"},
+        "execution": {"plan"},
+        "event": {"resource_maintenance"},
+        "operation": {"dispatch"},
+    }
+    groups = []
+    for group in sorted(expected_owner_sets):
+        owners = sorted(expected_owner_sets[group])
+        edges = (
+            [
+                {
+                    "importer": "transaction",
+                    "dependency": "capacity",
+                    "evidence": [
+                        {
+                            "path": "resource/transaction.rs",
+                            "kind": "use",
+                            "reference": "super::Capacity",
+                        }
+                    ],
+                }
+            ]
+            if group == "resource"
+            else []
+        )
+        groups.append(
+            {
+                "group": group,
+                "facade": f"{group}.rs",
+                "owners": owners,
+                "edges": edges,
+                "strongly_connected_components": [[owner] for owner in owners],
+                "multi_module_sccs": [],
+                "topological_order": owners,
+                "diagnostics": {
+                    field: [] for field in VNEXT_S0A_OWNER_GRAPH_DIAGNOSTIC_FIELDS
+                },
+                "summary": {
+                    "owner_count": len(owners),
+                    "edge_count": len(edges),
+                    "multi_module_scc_count": 0,
+                    "diagnostic_count": 0,
+                    "pass": True,
+                },
+            }
+        )
+    fixture = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s0a_owner_dependency_graph",
+        "parser": {
+            "kind": "syn_ast",
+            "dependency_scope": "complete_intra_facade_owner_graph",
+            "cfg_test_subtrees_excluded": True,
+            "internal_glob_policy": "reject",
+            "unresolved_internal_reference_policy": "reject",
+            "hidden_production_module_policy": "reject",
+            "facade_semantic_item_policy": "reject",
+            "forbidden_cross_boundary_policy": (
+                "resource_and_operation_must_not_depend_on_model"
+            ),
+        },
+        "groups": groups,
+        "summary": {
+            "production_group_count": 4,
+            "owner_count": 5,
+            "edge_count": 1,
+            "multi_module_scc_count": 0,
+            "diagnostic_count": 0,
+            "pass": True,
+        },
+    }
+    validated = validate_vnext_s0a_owner_dependency_graph(fixture, expected_owner_sets)
+    require_selftest(
+        validated["summary"] == fixture["summary"],
+        "vnext-g01a S0A owner dependency valid fixture mismatch",
+    )
+    resource_index = next(
+        index for index, group in enumerate(fixture["groups"]) if group["group"] == "resource"
+    )
+    mutations: list[tuple[str, Any, str]] = [
+        (
+            "dangling-edge",
+            lambda graph: graph["groups"][resource_index]["edges"][0].update(
+                {"dependency": "missing"}
+            ),
+            "edge endpoint mismatch",
+        ),
+        (
+            "reversed-topology",
+            lambda graph: graph["groups"][resource_index].update(
+                {"topological_order": ["transaction", "capacity"]}
+            ),
+            "dependency order invalid",
+        ),
+        (
+            "non-empty-scc",
+            lambda graph: graph["groups"][resource_index].update(
+                {"multi_module_sccs": [["capacity", "transaction"]]}
+            ),
+            "multi-owner SCC",
+        ),
+        (
+            "non-empty-diagnostic",
+            lambda graph: graph["groups"][resource_index]["diagnostics"][
+                "unresolved_internal_references"
+            ].append("forged"),
+            "diagnostics are not empty",
+        ),
+        (
+            "forged-summary",
+            lambda graph: graph["summary"].update({"edge_count": 0}),
+            "summary differs from recomputed facts",
+        ),
+    ]
+    for name, mutate, marker in mutations:
+        forged = copy.deepcopy(fixture)
+        mutate(forged)
+        try:
+            validate_vnext_s0a_owner_dependency_graph(forged, expected_owner_sets)
+        except GateError as error:
+            require_selftest(marker in str(error), f"{name} rejected unexpectedly: {error}")
+        else:
+            raise AssertionError(f"vnext-g01a S0A owner graph mutation passed: {name}")
+    with tempfile.TemporaryDirectory(prefix="ferrum-s0a-owner-graph-sha-selftest-") as tmp:
+        root = Path(tmp)
+        artifact = root / "owner-dependency-graph.json"
+        artifact.write_text(json.dumps(fixture, sort_keys=True) + "\n")
+        digest = sha256(artifact)
+        index = {
+            artifact.name: {
+                "path": artifact.name,
+                "sha256": digest,
+                "size_bytes": artifact.stat().st_size,
+                "role": "contract-split-evidence",
+            }
+        }
+        require_indexed_artifact(
+            root, index, artifact.name, digest, "vnext-g01a S0A owner graph SHA selftest"
+        )
+        artifact.write_text(json.dumps({**fixture, "summary": {}}, sort_keys=True) + "\n")
+        try:
+            require_indexed_artifact(
+                root, index, artifact.name, digest, "vnext-g01a S0A owner graph SHA selftest"
+            )
+        except GateError as error:
+            require_selftest(
+                "artifact SHA256 mismatch" in str(error),
+                f"owner graph SHA mutation rejected unexpectedly: {error}",
+            )
+        else:
+            raise AssertionError("vnext-g01a S0A owner graph artifact SHA mutation passed")
+
+
+def selftest_vnext_s0a_composition_owners() -> None:
+    fixture = [
+        {
+            "path": "crates/ferrum-interfaces/src/vnext/static_initialization.rs",
+            "category": "production_composition_owner",
+            "physical_lines": 10,
+            "logical_lines": 8,
+            "size_bytes": 100,
+            "sha256": "1" * 64,
+            "git_blob": "2" * 40,
+        }
+    ]
+    validated = validate_vnext_s0a_composition_owners(fixture, verify_checkout=False)
+    require_selftest(validated == fixture, "vnext-g01a S0A composition owner fixture mismatch")
+    mutations: list[tuple[str, Any, str]] = [
+        ("missing", lambda rows: rows.clear(), "owner set mismatch"),
+        (
+            "wrong-path",
+            lambda rows: rows[0].update({"path": "crates/ferrum-interfaces/src/vnext/model.rs"}),
+            "owner set mismatch",
+        ),
+        ("duplicate", lambda rows: rows.append(copy.deepcopy(rows[0])), "owner set mismatch"),
+        ("forged-sha", lambda rows: rows[0].update({"sha256": "invalid"}), "identity shape"),
+    ]
+    for name, mutate, marker in mutations:
+        forged = copy.deepcopy(fixture)
+        mutate(forged)
+        try:
+            validate_vnext_s0a_composition_owners(forged, verify_checkout=False)
+        except GateError as error:
+            require_selftest(marker in str(error), f"{name} rejected unexpectedly: {error}")
+        else:
+            raise AssertionError(f"vnext-g01a S0A composition owner mutation passed: {name}")
+
+
 def validate_vnext_g01a_s0a_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
@@ -2655,6 +3141,7 @@ def validate_vnext_g01a_s0a_provenance(
             "adr_source",
             "public_api_migration_source",
             "public_owner_evidence",
+            "owner_dependency_graph",
             "compile_evidence",
             "artifact_count",
             "artifact_index",
@@ -2729,6 +3216,7 @@ def validate_vnext_g01a_s0a_provenance(
         "contract-map.json",
         "public-api-migrations.json",
         "public-owner-map.json",
+        "owner-dependency-graph.json",
         "split-inventory.json",
         "compile-unit-trybuild.json",
     }
@@ -2803,13 +3291,13 @@ def validate_vnext_g01a_s0a_provenance(
     require_gate(
         owner_map.get("summary")
         == {
-            "baseline_items": 1490,
-            "mapped_items": 1480,
-            "migrated_items": 10,
+            "baseline_items": 1866,
+            "mapped_items": 1852,
+            "migrated_items": 14,
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 598,
+            "added_items": 1068,
             "added_items_sha256": VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
@@ -2833,7 +3321,7 @@ def validate_vnext_g01a_s0a_provenance(
         owner_evidence.get("summary") == owner_map.get("summary")
         and isinstance(owner_evidence.get("pass_line"), str)
         and owner_evidence["pass_line"].startswith(
-            "VNEXT PUBLIC OWNER MAP PASS: mapped=1480/1490 migrated=10"
+            "VNEXT PUBLIC OWNER MAP PASS: mapped=1852/1866 migrated=14"
         ),
         "vnext-g01a S0A public owner evidence binding mismatch",
     )
@@ -2841,8 +3329,8 @@ def validate_vnext_g01a_s0a_provenance(
         owner_migration
         == {"path": "public-api-migrations.json", "sha256": migration_digest}
         and owner_map_migration.get("sha256") == migration_digest
-        and owner_map_migration.get("migration_count") == 10
-        and owner_map_migration.get("expected_added_items") == 598
+        and owner_map_migration.get("migration_count") == 14
+        and owner_map_migration.get("expected_added_items") == 1068
         and owner_map_migration.get("expected_added_items_sha256")
         == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A public owner migration evidence mismatch",
@@ -2854,6 +3342,31 @@ def validate_vnext_g01a_s0a_provenance(
     inventory_summary = require_object(
         split_inventory.get("summary"), "vnext-g01a S0A split inventory summary"
     )
+    inventory_rows = [
+        require_object(row, f"vnext-g01a S0A split inventory row[{index}]")
+        for index, row in enumerate(
+            require_list(split_inventory.get("files"), "vnext-g01a S0A split inventory files")
+        )
+    ]
+    owner_sets = vnext_s0a_owner_sets_from_inventory(
+        split_inventory, verify_checkout=verify_checkout
+    )
+    category_counts: dict[str, int] = {}
+    for row in inventory_rows:
+        category = require_string(row.get("category"), "vnext-g01a S0A inventory category")
+        category_counts[category] = category_counts.get(category, 0) + 1
+    facade_paths = {
+        require_string(row.get("path"), "vnext-g01a S0A facade path")
+        for row in inventory_rows
+        if row.get("category") == "production_facade"
+    }
+    composition_rows = validate_vnext_s0a_composition_owners(
+        inventory_rows, verify_checkout=verify_checkout
+    )
+    composition_paths = {
+        require_string(row.get("path"), "vnext-g01a S0A composition owner path")
+        for row in composition_rows
+    }
     require_gate(
         split_inventory.get("schema_version") == 1
         and split_inventory.get("artifact_type")
@@ -2861,10 +3374,27 @@ def validate_vnext_g01a_s0a_provenance(
         and split_inventory.get("source") == source
         and split_inventory.get("baseline", {}).get("git_commit")
         == child_manifest.get("baseline_commit")
-        and inventory_summary.get("facade_count") == 3
-        and inventory_summary.get("production_owner_count") == 50
-        and inventory_summary.get("contract_test_target_count") == 24
-        and inventory_summary.get("shared_test_support_owner_count") == 11
+        and facade_paths
+        == {
+            f"crates/ferrum-interfaces/src/vnext/{group}.rs"
+            for group in VNEXT_S0A_PRODUCTION_GROUPS
+        }
+        and inventory_summary.get("facade_count")
+        == category_counts.get("production_facade")
+        == len(VNEXT_S0A_PRODUCTION_GROUPS)
+        and inventory_summary.get("production_owner_count")
+        == category_counts.get("production_owner")
+        == sum(len(owners) for owners in owner_sets.values())
+        and composition_paths == VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS
+        and inventory_summary.get("production_composition_owner_count")
+        == category_counts.get("production_composition_owner")
+        == len(VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS)
+        and inventory_summary.get("contract_test_target_count")
+        == category_counts.get("contract_test_target")
+        == 28
+        and inventory_summary.get("shared_test_support_owner_count")
+        == category_counts.get("shared_test_support_owner")
+        == 12
         and inventory_summary.get("maximum_facade_physical_lines", 501) <= 500
         and inventory_summary.get("maximum_production_owner_physical_lines", 2501) <= 2500
         and inventory_summary.get("maximum_contract_test_or_support_owner_physical_lines", 2001)
@@ -2874,6 +3404,58 @@ def validate_vnext_g01a_s0a_provenance(
         and inventory_summary.get("removed_oversized_target_present_count") == 0,
         "vnext-g01a S0A split inventory acceptance mismatch",
     )
+    graph_evidence = require_object(
+        child_manifest.get("owner_dependency_graph"),
+        "vnext-g01a S0A owner dependency graph evidence",
+    )
+    require_gate(
+        set(graph_evidence) == {"command", "duration_seconds", "pass_line", "summary", "artifact"},
+        "vnext-g01a S0A owner dependency graph evidence field set mismatch",
+    )
+    graph_artifact_ref = require_object(
+        graph_evidence.get("artifact"), "vnext-g01a S0A owner dependency graph artifact ref"
+    )
+    graph_path, graph_relative, graph_digest = require_indexed_artifact(
+        checkpoint_root,
+        artifact_index,
+        graph_artifact_ref.get("path"),
+        graph_artifact_ref.get("sha256"),
+        "vnext-g01a S0A owner dependency graph",
+    )
+    require_gate(
+        graph_relative == "owner-dependency-graph.json",
+        "vnext-g01a S0A owner dependency graph path mismatch",
+    )
+    dependency_graph = read_json_object(graph_path, "vnext-g01a S0A owner dependency graph")
+    validated_graph = validate_vnext_s0a_owner_dependency_graph(dependency_graph, owner_sets)
+    graph_summary = validated_graph["summary"]
+    expected_graph_command = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "ferrum-interfaces",
+        "--example",
+        "vnext_owner_dependency_graph",
+        "--",
+        "crates/ferrum-interfaces/src/vnext",
+        str(graph_path),
+    ]
+    expected_graph_pass = (
+        "VNEXT OWNER DEPENDENCY GRAPH PASS: "
+        f"groups={graph_summary['production_group_count']} owners={graph_summary['owner_count']} "
+        f"edges={graph_summary['edge_count']} scc=0 diagnostics=0 output={graph_path}"
+    )
+    require_gate(
+        graph_evidence.get("command") == expected_graph_command
+        and isinstance(graph_evidence.get("duration_seconds"), (int, float))
+        and not isinstance(graph_evidence.get("duration_seconds"), bool)
+        and graph_evidence["duration_seconds"] >= 0
+        and graph_evidence.get("pass_line") == expected_graph_pass
+        and graph_evidence.get("summary") == graph_summary,
+        "vnext-g01a S0A owner dependency graph execution binding mismatch",
+    )
+
     contract_map = read_json_object(
         checkpoint_root / "contract-map.json", "vnext-g01a S0A contract map"
     )
@@ -2884,11 +3466,15 @@ def validate_vnext_g01a_s0a_provenance(
         contract_map.get("schema_version") == 1
         and contract_map.get("artifact_type") == "runtime_vnext_s0a_contract_map"
         and contract_map.get("baseline_commit") == child_manifest.get("baseline_commit")
-        and contract_summary.get("production_group_count") == 3
+        and contract_map.get("owner_dependency_graph")
+        == {"path": graph_relative, "sha256": graph_digest}
+        and contract_summary.get("production_group_count") == len(VNEXT_S0A_PRODUCTION_GROUPS)
+        and contract_summary.get("production_composition_owner_count")
+        == len(VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS)
         and contract_summary.get("multi_module_scc_count") == 0
-        and contract_summary.get("test_target_count") == 24
-        and contract_summary.get("semantic_change_count") == 10
-        and contract_summary.get("added_public_item_count") == 598
+        and contract_summary.get("test_target_count") == 28
+        and contract_summary.get("semantic_change_count") == 14
+        and contract_summary.get("added_public_item_count") == 1068
         and contract_summary.get("added_public_item_sha256")
         == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A contract map acceptance mismatch",
@@ -2896,16 +3482,53 @@ def validate_vnext_g01a_s0a_provenance(
     production_groups = require_list(
         contract_map.get("production_groups"), "vnext-g01a S0A production groups"
     )
+    contract_composition_rows = require_list(
+        contract_map.get("production_composition_owners"),
+        "vnext-g01a S0A production composition owners",
+    )
     require_gate(
-        {row.get("group") for row in production_groups}
-        == {"resource", "execution", "event"}
-        and all(
-            require_object(row.get("dependency_audit"), "vnext-g01a S0A dependency audit").get(
-                "multi_module_scc_count"
-            )
-            == 0
-            for row in production_groups
-        ),
+        contract_composition_rows == composition_rows,
+        "vnext-g01a S0A production composition owner contract mismatch",
+    )
+    contract_groups: dict[str, dict[str, Any]] = {}
+    for index, raw_group in enumerate(production_groups):
+        group_row = require_object(raw_group, f"vnext-g01a S0A contract group[{index}]")
+        group = require_string(group_row.get("group"), f"vnext-g01a S0A contract group[{index}].group")
+        require_gate(
+            group in owner_sets and group not in contract_groups,
+            f"vnext-g01a S0A invalid or duplicate contract group: {group}",
+        )
+        owner_rows = require_list(group_row.get("owners"), f"vnext-g01a S0A {group} contract owners")
+        contract_owner_names = {
+            Path(
+                require_string(
+                    require_object(owner, f"vnext-g01a S0A {group} contract owner").get("path"),
+                    f"vnext-g01a S0A {group} contract owner path",
+                )
+            ).stem
+            for owner in owner_rows
+        }
+        require_gate(
+            contract_owner_names == owner_sets[group]
+            and group_row.get("owner_count") == len(owner_sets[group]),
+            f"vnext-g01a S0A {group} contract owner set mismatch",
+        )
+        dependency_audit = require_object(
+            group_row.get("dependency_audit"), f"vnext-g01a S0A {group} dependency audit"
+        )
+        graph_group = validated_graph["groups"][group]
+        require_gate(
+            dependency_audit.get("kind") == "syn_ast_artifact"
+            and dependency_audit.get("path") == graph_relative
+            and dependency_audit.get("sha256") == graph_digest
+            and dependency_audit.get("multi_module_scc_count") == 0
+            and dependency_audit.get("edge_count") == len(graph_group["edges"])
+            and dependency_audit.get("topological_order") == graph_group["topological_order"],
+            f"vnext-g01a S0A {group} dependency graph binding mismatch",
+        )
+        contract_groups[group] = group_row
+    require_gate(
+        set(contract_groups) == VNEXT_S0A_PRODUCTION_GROUPS,
         "vnext-g01a S0A dependency SCC matrix mismatch",
     )
 
@@ -3031,6 +3654,7 @@ def validate_vnext_g01a_s0a_provenance(
         },
         "source": {"git_sha": source_sha, "git_tree_sha": source_tree},
         "public_owner_summary": owner_map["summary"],
+        "owner_dependency_graph_summary": graph_summary,
         "split_inventory_summary": inventory_summary,
         "contract_map_summary": contract_summary,
         "compile_summary": {
@@ -6694,6 +7318,8 @@ def make_selftest_completion_manifest(path: Path) -> None:
 
 
 def self_test() -> int:
+    selftest_vnext_s0a_owner_dependency_graph()
+    selftest_vnext_s0a_composition_owners()
     require_selftest(
         GIT_BOUNDED_CONFIG
         == ["-c", "core.preloadindex=false", "-c", "index.threads=1"],

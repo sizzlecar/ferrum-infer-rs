@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "baseline_commit": "b5377b12464b60203a3fe57a6de4c9952ed2474b",
-  "expected_added_items": 598,
-  "expected_added_items_sha256": "6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41",
+  "expected_added_items": 1068,
+  "expected_added_items_sha256": "9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d",
   "migrations": [
     {
       "old_path": "ferrum_interfaces::vnext::AdmittedSequenceResources::backing_slices",
@@ -203,6 +203,70 @@
       ],
       "introduced_by_commit": "8d9d6a9a41e7869317c1dd7234861f1cadba7065",
       "rationale": "Provider ordering now records canonical compatibility independently from determinism. The required determinism level and provider execution semantics are validated as separate typed contracts, so the old selection reason conflated ordering with a behavioral guarantee."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::BatchOperationIdentity::node_id",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationIdentity::node_id_at",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationNodeIdentity::node_id",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "7fbb4331d8b8e231732984f0eb0783875f7037c1",
+      "rationale": "A physical submission batch may contain multiple immutable-plan nodes. Callers must select a node index on the batch or read the identity from an explicit node projection instead of assuming a singleton node."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::BatchOperationIdentity::operation_id",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationIdentity::operation_id_at",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationNodeIdentity::operation_id",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "7fbb4331d8b8e231732984f0eb0783875f7037c1",
+      "rationale": "Operation identity is node-local after one submission wave can contain several operations. Indexed batch access and explicit node projections preserve that ownership without an ambiguous first-node fallback."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::BatchOperationIdentity::provider_id",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationIdentity::provider_id_at",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationNodeIdentity::provider_id",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "7fbb4331d8b8e231732984f0eb0783875f7037c1",
+      "rationale": "Provider selection is recorded per node in a multi-operation submission. The replacement APIs require the caller to identify that node rather than projecting one provider onto the whole batch."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::BatchOperationIdentity::work_shape_fingerprint",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationIdentity::work_shape_fingerprint_at",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::BatchOperationNodeIdentity::work_shape_fingerprint",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "7fbb4331d8b8e231732984f0eb0783875f7037c1",
+      "rationale": "Work-shape evidence belongs to each operation node in a physical wave. Indexed batch access and node-local evidence replace the invalid assumption that one fingerprint describes every node."
     }
   ]
 }

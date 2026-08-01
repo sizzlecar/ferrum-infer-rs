@@ -26,6 +26,7 @@ struct ParserPolicy {
     unresolved_internal_reference_policy: &'static str,
     hidden_production_module_policy: &'static str,
     facade_semantic_item_policy: &'static str,
+    forbidden_cross_boundary_policy: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +64,7 @@ struct GraphDiagnostics {
     facade_owned_items: Vec<String>,
     facade_owned_references: Vec<String>,
     hidden_production_modules: Vec<String>,
+    forbidden_cross_boundary_references: Vec<String>,
 }
 
 impl GraphDiagnostics {
@@ -79,6 +81,8 @@ impl GraphDiagnostics {
         self.facade_owned_references.dedup();
         self.hidden_production_modules.sort();
         self.hidden_production_modules.dedup();
+        self.forbidden_cross_boundary_references.sort();
+        self.forbidden_cross_boundary_references.dedup();
     }
 
     fn count(&self) -> usize {
@@ -88,6 +92,7 @@ impl GraphDiagnostics {
             + self.facade_owned_items.len()
             + self.facade_owned_references.len()
             + self.hidden_production_modules.len()
+            + self.forbidden_cross_boundary_references.len()
     }
 }
 
@@ -124,6 +129,8 @@ struct GroupContext<'a> {
     symbol_owners: &'a BTreeMap<String, BTreeSet<String>>,
     facade_bindings: &'a BTreeSet<String>,
     facade_owned: &'a BTreeSet<String>,
+    external_symbol_owners: &'a BTreeMap<String, BTreeSet<String>>,
+    forbidden_external_owners: &'a BTreeSet<String>,
     edges: &'a mut BTreeMap<(String, String), BTreeSet<DependencyEvidence>>,
     diagnostics: &'a mut GraphDiagnostics,
 }
@@ -159,14 +166,31 @@ impl GroupContext<'_> {
                 "{}: `{reference}` resolves `{symbol}` to {:?}",
                 self.source_path, owners
             )),
-            None if strict && !self.facade_bindings.contains(symbol) => self
-                .diagnostics
-                .unresolved_internal_references
-                .push(format!(
-                    "{}: `{reference}` does not resolve in facade `{}`",
-                    self.source_path, self.group
-                )),
-            None => {}
+            None => {
+                if let Some(owners) = self.external_symbol_owners.get(symbol) {
+                    let forbidden = owners
+                        .intersection(self.forbidden_external_owners)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !forbidden.is_empty() {
+                        self.diagnostics
+                            .forbidden_cross_boundary_references
+                            .push(format!(
+                                "{}: {} references `{symbol}` owned by forbidden boundary {:?} via `{reference}`",
+                                self.source_path, self.importer, forbidden
+                            ));
+                        return;
+                    }
+                }
+                if strict && !self.facade_bindings.contains(symbol) {
+                    self.diagnostics
+                        .unresolved_internal_references
+                        .push(format!(
+                            "{}: `{reference}` does not resolve in facade `{}`",
+                            self.source_path, self.group
+                        ));
+                }
+            }
         }
     }
 
@@ -296,9 +320,10 @@ fn run() -> Result<(), String> {
     }
     let current_root = PathBuf::from(&args[0]);
     let output_path = PathBuf::from(&args[1]);
+    let external_symbol_owners = collect_external_symbol_owners(&current_root)?;
     let mut groups = Vec::new();
     for group in GROUPS {
-        groups.push(load_group(&current_root, group)?);
+        groups.push(load_group(&current_root, group, &external_symbol_owners)?);
     }
     let owner_count = groups.iter().map(|group| group.summary.owner_count).sum();
     let edge_count = groups.iter().map(|group| group.summary.edge_count).sum();
@@ -326,6 +351,7 @@ fn run() -> Result<(), String> {
             unresolved_internal_reference_policy: "reject",
             hidden_production_module_policy: "reject",
             facade_semantic_item_policy: "reject",
+            forbidden_cross_boundary_policy: "resource_and_operation_must_not_depend_on_model",
         },
         groups,
         summary: ArtifactSummary {
@@ -364,11 +390,47 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn load_group(current_root: &Path, group: &str) -> Result<GroupGraph, String> {
+fn load_group(
+    current_root: &Path,
+    group: &str,
+    external_symbol_owners: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<GroupGraph, String> {
     let facade_path = current_root.join(format!("{group}.rs"));
     let facade = parse_file(&facade_path)?;
     let owners = load_owner_sources(current_root, group, &facade)?;
-    analyze_group(group, &format!("{group}.rs"), &facade, owners)
+    analyze_group(
+        group,
+        &format!("{group}.rs"),
+        &facade,
+        owners,
+        external_symbol_owners,
+    )
+}
+
+fn collect_external_symbol_owners(
+    current_root: &Path,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let split_groups = GROUPS.into_iter().collect::<BTreeSet<_>>();
+    let mut paths = fs::read_dir(current_root)
+        .map_err(|error| format!("read {}: {error}", current_root.display()))?
+        .map(|entry| entry.map(|value| value.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read {} entry: {error}", current_root.display()))?;
+    paths.sort();
+    let mut symbols = BTreeMap::new();
+    for path in paths {
+        let Some(owner) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|value| value.to_str()) != Some("rs")
+            || owner == "mod"
+            || split_groups.contains(owner)
+        {
+            continue;
+        }
+        collect_owner_symbols(&parse_file(&path)?.items, owner, &mut symbols);
+    }
+    Ok(symbols)
 }
 
 fn load_owner_sources(
@@ -456,6 +518,7 @@ fn analyze_group(
     facade_path: &str,
     facade: &syn::File,
     owners: Vec<OwnerSource>,
+    external_symbol_owners: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<GroupGraph, String> {
     let module_names = owners
         .iter()
@@ -464,6 +527,10 @@ fn analyze_group(
     let mut diagnostics = GraphDiagnostics::default();
     let facade_owned = collect_facade_owned_items(facade_path, facade, &mut diagnostics);
     let facade_bindings = collect_facade_bindings(facade);
+    let forbidden_external_owners = match group {
+        "resource" | "operation" => BTreeSet::from(["model".to_string()]),
+        _ => BTreeSet::new(),
+    };
     let mut symbol_owners = BTreeMap::<String, BTreeSet<String>>::new();
     for owner in &owners {
         collect_owner_symbols(&owner.syntax.items, &owner.name, &mut symbol_owners);
@@ -485,6 +552,8 @@ fn analyze_group(
                 symbol_owners: &symbol_owners,
                 facade_bindings: &facade_bindings,
                 facade_owned: &facade_owned,
+                external_symbol_owners,
+                forbidden_external_owners: &forbidden_external_owners,
                 edges: &mut edge_map,
                 diagnostics: &mut diagnostics,
             },
@@ -933,11 +1002,13 @@ mod tests {
     }
 
     fn graph(facade: &str, owners: Vec<OwnerSource>) -> GroupGraph {
+        let external_symbol_owners = BTreeMap::new();
         analyze_group(
             "sample",
             "sample.rs",
             &syn::parse_file(facade).unwrap(),
             owners,
+            &external_symbol_owners,
         )
         .unwrap()
     }
@@ -1022,6 +1093,31 @@ mod tests {
         );
         assert_eq!(graph.diagnostics.unresolved_internal_references.len(), 1);
         assert_eq!(graph.diagnostics.ambiguous_internal_references.len(), 1);
+        assert!(!graph.summary.pass);
+    }
+
+    #[test]
+    fn lower_level_group_rejects_model_owned_reference() {
+        let mut external_symbol_owners = BTreeMap::new();
+        external_symbol_owners.insert(
+            "ModelValue".to_string(),
+            BTreeSet::from(["model".to_string()]),
+        );
+        let graph = analyze_group(
+            "operation",
+            "operation.rs",
+            &syn::parse_file("mod a; pub use a::*;").unwrap(),
+            vec![owner(
+                "a",
+                "use super::super::ModelValue; pub struct A(pub ModelValue);",
+            )],
+            &external_symbol_owners,
+        )
+        .unwrap();
+        assert_eq!(
+            graph.diagnostics.forbidden_cross_boundary_references.len(),
+            1
+        );
         assert!(!graph.summary.pass);
     }
 }

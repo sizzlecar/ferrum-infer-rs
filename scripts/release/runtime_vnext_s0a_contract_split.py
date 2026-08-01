@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -22,83 +23,46 @@ GOAL_ROOT = REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10"
 BASELINE_COMMIT = "b5377b12464b60203a3fe57a6de4c9952ed2474b"
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS"
 OWNER_MAP_PASS_PREFIX = "VNEXT PUBLIC OWNER MAP PASS"
+OWNER_DEPENDENCY_GRAPH_PASS_PREFIX = "VNEXT OWNER DEPENDENCY GRAPH PASS"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 OWNER_MAP_EXAMPLE = "vnext_public_owner_map"
+OWNER_DEPENDENCY_GRAPH_EXAMPLE = "vnext_owner_dependency_graph"
 TEST_THREADS = "1"
 TEST_THREADS_ARG = "--test-threads=1"
 INVENTORY_DOCUMENT = (
-    REPO_ROOT / "docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md"
+    REPO_ROOT / "docs/release/cleanup/20260802-operation-s0a-inventory.md"
 )
 ADR_DOCUMENT = GOAL_ROOT / "S0A_CONTRACT_SPLIT_MAP.md"
 PUBLIC_API_MIGRATIONS = GOAL_ROOT / "S0A_PUBLIC_API_MIGRATIONS.json"
-PUBLIC_API_ADDED_SHA256 = "6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41"
+PUBLIC_API_ADDED_SHA256 = "9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d"
 
 PRODUCTION_GROUPS = {
     "resource": {
-        "topological_order": [
-            "contracts",
-            "backing_extent",
-            "capacity",
-            "ledger",
-            "work",
-            "allocation",
-            "dynamic_pool",
-            "program_binding",
-            "dynamic_pool_set",
-            "dynamic_pool_maintenance",
-            "runtime_driver",
-            "static_lease",
-            "provisioning",
-            "plan_runtime",
-            "recovery",
-            "transaction",
-            "sequence",
-            "static_initialization",
-            "batch",
-            "invocation",
-            "execution_session",
-        ],
         "audit": "S0A_RESOURCE_DEPENDENCY_AUDIT.md",
     },
     "execution": {
-        "topological_order": [
-            "foundation",
-            "binding",
-            "work",
-            "workspace",
-            "provider_resource",
-            "contracts",
-            "storage",
-            "reusable",
-            "checkpoint",
-            "allocation",
-            "solver",
-            "memory",
-            "weight",
-            "provider",
-            "policy",
-            "plan",
-            "determinism",
-            "resolution",
-            "validation",
-            "planner",
-            "compiler",
-        ],
         "audit": "S0A_EXECUTION_DEPENDENCY_AUDIT.md",
     },
     "event": {
-        "topological_order": [
-            "foundation",
-            "identity",
-            "topology",
-            "sequence_binding",
-            "execution_event",
-            "resource_pool",
-            "replay",
-            "sink",
-        ],
         "audit": "S0A_EVENT_DEPENDENCY_AUDIT.md",
     },
+    "operation": {
+        "audit": "S0A_OPERATION_DEPENDENCY_AUDIT.md",
+    },
+}
+
+PRODUCTION_COMPOSITION_OWNERS = [
+    "crates/ferrum-interfaces/src/vnext/static_initialization.rs",
+]
+
+OWNER_GRAPH_DIAGNOSTIC_FIELDS = {
+    "unresolved_internal_references",
+    "ambiguous_internal_references",
+    "unsupported_internal_globs",
+    "facade_owned_items",
+    "facade_owned_references",
+    "hidden_production_modules",
+    "forbidden_cross_boundary_references",
 }
 
 TEST_TARGET_GROUPS = {
@@ -259,12 +223,12 @@ def validate_public_api_migrations() -> dict[str, Any]:
     require(
         document.get("schema_version") == 1
         and document.get("baseline_commit") == BASELINE_COMMIT
-        and document.get("expected_added_items") == 598
+        and document.get("expected_added_items") == 1068
         and document.get("expected_added_items_sha256") == PUBLIC_API_ADDED_SHA256,
         "S0A public API migration manifest header drifted",
     )
     migrations = document.get("migrations")
-    require(isinstance(migrations, list) and len(migrations) == 10, "S0A migration count drifted")
+    require(isinstance(migrations, list) and len(migrations) == 14, "S0A migration count drifted")
     old_keys: set[tuple[str, str]] = set()
     for migration in migrations:
         require(
@@ -408,6 +372,11 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
                 continue
             production_rows.append(source_row(path, "production_owner"))
 
+    composition_rows = [
+        source_row(REPO_ROOT / path, "production_composition_owner")
+        for path in PRODUCTION_COMPOSITION_OWNERS
+    ]
+
     target_rows = []
     for targets in TEST_TARGET_GROUPS.values():
         for target in targets:
@@ -428,7 +397,7 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
         )
 
     require_bounded(facade_rows, 500, "production facade")
-    require_bounded(production_rows, 2500, "production owner")
+    require_bounded(production_rows + composition_rows, 2500, "production owner")
     require_bounded(
         target_rows + support_rows,
         2000,
@@ -437,7 +406,10 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
     for removed in REMOVED_OVERSIZED_TARGETS:
         require(not (REPO_ROOT / removed).exists(), f"removed oversized target reappeared: {removed}")
 
-    split_paths = [row["path"] for row in facade_rows + production_rows + target_rows + support_rows]
+    split_paths = [
+        row["path"]
+        for row in facade_rows + production_rows + composition_rows + target_rows + support_rows
+    ]
     for relative in split_paths:
         payload = (REPO_ROOT / relative).read_text()
         require("include!(" not in payload, f"split source uses include!: {relative}")
@@ -461,7 +433,7 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
         )
 
     rows = sorted(
-        facade_rows + production_rows + target_rows + support_rows,
+        facade_rows + production_rows + composition_rows + target_rows + support_rows,
         key=lambda row: row["path"],
     )
     return {
@@ -482,10 +454,13 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
             "file_count": len(rows),
             "facade_count": len(facade_rows),
             "production_owner_count": len(production_rows),
+            "production_composition_owner_count": len(composition_rows),
             "contract_test_target_count": len(target_rows),
             "shared_test_support_owner_count": len(support_rows),
             "maximum_facade_physical_lines": max(row["physical_lines"] for row in facade_rows),
-            "maximum_production_owner_physical_lines": max(row["physical_lines"] for row in production_rows),
+            "maximum_production_owner_physical_lines": max(
+                row["physical_lines"] for row in production_rows + composition_rows
+            ),
             "maximum_contract_test_or_support_owner_physical_lines": max(
                 row["physical_lines"] for row in target_rows + support_rows
             ),
@@ -496,9 +471,245 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
+def owner_sets_from_inventory(split_inventory: dict[str, Any]) -> dict[str, set[str]]:
+    owner_sets = {group: set() for group in PRODUCTION_GROUPS}
+    for row in split_inventory["files"]:
+        if row["category"] != "production_owner":
+            continue
+        relative = Path(row["path"])
+        require(
+            len(relative.parts) == 6
+            and relative.parts[:4] == ("crates", "ferrum-interfaces", "src", "vnext")
+            and relative.parts[4] in owner_sets,
+            f"production owner is outside the declared S0A groups: {row['path']}",
+        )
+        group = relative.parts[4]
+        owner = relative.stem
+        require(owner not in owner_sets[group], f"duplicate production owner: {group}/{owner}")
+        owner_sets[group].add(owner)
+    require(
+        all(owner_sets.values()),
+        f"S0A production group has no owners: "
+        f"{sorted(group for group, owners in owner_sets.items() if not owners)}",
+    )
+    return owner_sets
+
+
+def validate_owner_dependency_graph(
+    document: dict[str, Any], split_inventory: dict[str, Any]
+) -> dict[str, Any]:
+    require(
+        set(document) == {"schema_version", "artifact_type", "parser", "groups", "summary"},
+        "owner dependency graph top-level fields drifted",
+    )
+    require(
+        document.get("schema_version") == 1
+        and document.get("artifact_type") == "runtime_vnext_s0a_owner_dependency_graph",
+        "owner dependency graph schema mismatch",
+    )
+    require(
+        document.get("parser")
+        == {
+            "kind": "syn_ast",
+            "dependency_scope": "complete_intra_facade_owner_graph",
+            "cfg_test_subtrees_excluded": True,
+            "internal_glob_policy": "reject",
+            "unresolved_internal_reference_policy": "reject",
+            "hidden_production_module_policy": "reject",
+            "facade_semantic_item_policy": "reject",
+            "forbidden_cross_boundary_policy": (
+                "resource_and_operation_must_not_depend_on_model"
+            ),
+        },
+        "owner dependency graph parser policy mismatch",
+    )
+    owner_sets = owner_sets_from_inventory(split_inventory)
+    raw_groups = document.get("groups")
+    require(isinstance(raw_groups, list), "owner dependency graph groups must be a list")
+    graph_by_group: dict[str, dict[str, Any]] = {}
+    total_edges = 0
+    for raw_group in raw_groups:
+        require(isinstance(raw_group, dict), "owner dependency graph group must be an object")
+        group = raw_group.get("group")
+        require(
+            isinstance(group, str) and group in owner_sets and group not in graph_by_group,
+            f"owner dependency graph has invalid or duplicate group: {group}",
+        )
+        require(raw_group.get("facade") == f"{group}.rs", f"{group} facade mismatch")
+        owners = raw_group.get("owners")
+        require(
+            isinstance(owners, list)
+            and all(isinstance(owner, str) and owner for owner in owners)
+            and len(owners) == len(set(owners))
+            and set(owners) == owner_sets[group],
+            f"{group} owner set differs from the physical split inventory",
+        )
+        order = raw_group.get("topological_order")
+        require(
+            isinstance(order, list)
+            and all(isinstance(owner, str) for owner in order)
+            and len(order) == len(set(order))
+            and set(order) == owner_sets[group],
+            f"{group} topological order does not cover every owner exactly once",
+        )
+        positions = {owner: index for index, owner in enumerate(order)}
+        edges = raw_group.get("edges")
+        require(isinstance(edges, list), f"{group} dependency edges must be a list")
+        edge_pairs: set[tuple[str, str]] = set()
+        for edge in edges:
+            require(isinstance(edge, dict), f"{group} dependency edge must be an object")
+            importer = edge.get("importer")
+            dependency = edge.get("dependency")
+            require(
+                isinstance(importer, str)
+                and isinstance(dependency, str)
+                and importer in owner_sets[group]
+                and dependency in owner_sets[group]
+                and importer != dependency,
+                f"{group} dependency edge has an invalid endpoint: {edge}",
+            )
+            pair = (importer, dependency)
+            require(pair not in edge_pairs, f"{group} dependency edge is duplicated: {pair}")
+            edge_pairs.add(pair)
+            require(
+                positions[dependency] < positions[importer],
+                f"{group} dependency order is invalid: {dependency} must precede {importer}",
+            )
+            evidence = edge.get("evidence")
+            require(
+                isinstance(evidence, list) and evidence,
+                f"{group} dependency edge lacks source evidence: {pair}",
+            )
+        total_edges += len(edge_pairs)
+        require(
+            raw_group.get("multi_module_sccs") == [],
+            f"{group} dependency graph contains a multi-owner SCC",
+        )
+        components = raw_group.get("strongly_connected_components")
+        require(
+            isinstance(components, list)
+            and all(isinstance(component, list) and len(component) == 1 for component in components)
+            and {component[0] for component in components} == owner_sets[group]
+            and len(components) == len(owner_sets[group]),
+            f"{group} strongly connected component partition is invalid",
+        )
+        diagnostics = raw_group.get("diagnostics")
+        require(
+            isinstance(diagnostics, dict)
+            and set(diagnostics) == OWNER_GRAPH_DIAGNOSTIC_FIELDS
+            and all(value == [] for value in diagnostics.values()),
+            f"{group} owner dependency diagnostics are not empty",
+        )
+        computed_group_summary = {
+            "owner_count": len(owner_sets[group]),
+            "edge_count": len(edge_pairs),
+            "multi_module_scc_count": 0,
+            "diagnostic_count": 0,
+            "pass": True,
+        }
+        require(
+            raw_group.get("summary") == computed_group_summary,
+            f"{group} owner dependency summary differs from recomputed facts",
+        )
+        graph_by_group[group] = raw_group
+    require(
+        set(graph_by_group) == set(PRODUCTION_GROUPS),
+        "owner dependency graph production group set mismatch",
+    )
+    computed_summary = {
+        "production_group_count": len(graph_by_group),
+        "owner_count": sum(len(owners) for owners in owner_sets.values()),
+        "edge_count": total_edges,
+        "multi_module_scc_count": 0,
+        "diagnostic_count": 0,
+        "pass": True,
+    }
+    require(
+        document.get("summary") == computed_summary,
+        "owner dependency graph summary differs from recomputed facts",
+    )
+    return {"summary": computed_summary, "groups": graph_by_group}
+
+
+def run_owner_dependency_graph(
+    checkpoint_root: Path, split_inventory: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    output_path = checkpoint_root / "owner-dependency-graph.json"
+    logs = checkpoint_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "ferrum-interfaces",
+        "--example",
+        OWNER_DEPENDENCY_GRAPH_EXAMPLE,
+        "--",
+        "crates/ferrum-interfaces/src/vnext",
+        str(output_path),
+    ]
+    started = time.monotonic()
+    env = os.environ.copy()
+    env.update({"CARGO_BUILD_JOBS": "4", "RUST_TEST_THREADS": TEST_THREADS})
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    duration = time.monotonic() - started
+    if result.stdout:
+        (logs / "owner-dependency-graph.stdout").write_text(result.stdout)
+    if result.stderr:
+        (logs / "owner-dependency-graph.stderr").write_text(result.stderr)
+    write_json(
+        logs / "owner-dependency-graph.command.json",
+        {
+            "command": command,
+            "cwd": str(REPO_ROOT),
+            "env_overrides": {
+                "CARGO_BUILD_JOBS": "4",
+                "RUST_TEST_THREADS": TEST_THREADS,
+            },
+            "returncode": result.returncode,
+            "duration_seconds": duration,
+        },
+    )
+    require(result.returncode == 0, "owner dependency graph command failed")
+    document = read_json(output_path, "owner dependency graph")
+    validated = validate_owner_dependency_graph(document, split_inventory)
+    summary = validated["summary"]
+    expected_line = (
+        f"{OWNER_DEPENDENCY_GRAPH_PASS_PREFIX}: "
+        f"groups={summary['production_group_count']} owners={summary['owner_count']} "
+        f"edges={summary['edge_count']} scc=0 diagnostics=0 output={output_path}"
+    )
+    require(
+        result.stdout.splitlines().count(expected_line) == 1,
+        "owner dependency graph exact PASS line mismatch",
+    )
+    return document, {
+        "command": command,
+        "duration_seconds": duration,
+        "pass_line": expected_line,
+        "summary": summary,
+        "artifact": {
+            "path": "owner-dependency-graph.json",
+            "sha256": sha256(output_path),
+        },
+    }
+
+
+def contract_map(
+    split_inventory: dict[str, Any], dependency_graph: dict[str, Any], graph_sha256: str
+) -> dict[str, Any]:
     groups = []
     inventory_by_path = {row["path"]: row for row in split_inventory["files"]}
+    graph_by_group = {row["group"]: row for row in dependency_graph["groups"]}
     for group, policy in PRODUCTION_GROUPS.items():
         facade_path = f"crates/ferrum-interfaces/src/vnext/{group}.rs"
         owner_prefix = f"crates/ferrum-interfaces/src/vnext/{group}/"
@@ -507,39 +718,47 @@ def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
             for path, row in inventory_by_path.items()
             if path.startswith(owner_prefix) and row["category"] == "production_owner"
         ]
-        owner_names = sorted(Path(row["path"]).stem for row in owners)
-        topological_order = policy["topological_order"]
-        require(
-            len(topological_order) == len(set(topological_order)),
-            f"{group} dependency topology contains duplicate owners",
-        )
-        require(
-            set(owner_names) == set(topological_order),
-            f"{group} dependency topology differs from production owners: "
-            f"missing={sorted(set(owner_names) - set(topological_order))} "
-            f"stale={sorted(set(topological_order) - set(owner_names))}",
-        )
-        audit_path = GOAL_ROOT / policy["audit"]
-        require(audit_path.is_file(), f"dependency audit is missing: {audit_path}")
+        graph = graph_by_group[group]
+        audit_name = policy["audit"]
+        audit_path = GOAL_ROOT / audit_name if audit_name is not None else None
+        if audit_path is not None:
+            require(audit_path.is_file(), f"dependency review is missing: {audit_path}")
+        dependency_audit = {
+            "kind": "syn_ast_artifact",
+            "path": "owner-dependency-graph.json",
+            "sha256": graph_sha256,
+            "multi_module_scc_count": 0,
+            "edge_count": len(graph["edges"]),
+            "topological_order": graph["topological_order"],
+        }
+        if audit_path is not None:
+            dependency_audit["review_document"] = {
+                "path": audit_path.relative_to(REPO_ROOT).as_posix(),
+                "sha256": sha256(audit_path),
+            }
         groups.append(
             {
                 "group": group,
                 "facade": inventory_by_path[facade_path],
                 "owners": sorted(owners, key=lambda row: row["path"]),
                 "owner_count": len(owners),
-                "dependency_audit": {
-                    "path": audit_path.relative_to(REPO_ROOT).as_posix(),
-                    "sha256": sha256(audit_path),
-                    "multi_module_scc_count": 0,
-                    "topological_order": topological_order,
-                },
+                "dependency_audit": dependency_audit,
             }
         )
     return {
         "schema_version": 1,
         "artifact_type": "runtime_vnext_s0a_contract_map",
         "baseline_commit": BASELINE_COMMIT,
+        "owner_dependency_graph": {
+            "path": "owner-dependency-graph.json",
+            "sha256": graph_sha256,
+        },
         "production_groups": groups,
+        "production_composition_owners": [
+            row
+            for row in split_inventory["files"]
+            if row["category"] == "production_composition_owner"
+        ],
         "test_target_groups": TEST_TARGET_GROUPS,
         "shared_test_support": SHARED_TEST_SUPPORT,
         "preserved_invariants": [
@@ -550,15 +769,16 @@ def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
             "capacity waiting preserves register/recheck and avoids global head-of-line blocking",
         ],
         "summary": {
-            "production_group_count": 3,
+            "production_group_count": len(PRODUCTION_GROUPS),
+            "production_composition_owner_count": len(PRODUCTION_COMPOSITION_OWNERS),
             "multi_module_scc_count": 0,
             "test_target_count": sum(len(targets) for targets in TEST_TARGET_GROUPS.values()),
             "public_path_policy": (
                 "facade re-export preserves unchanged ferrum_interfaces::vnext::* paths; "
                 "intentional migrations are manifest-bound"
             ),
-            "semantic_change_count": 10,
-            "added_public_item_count": 598,
+            "semantic_change_count": 14,
+            "added_public_item_count": 1068,
             "added_public_item_sha256": PUBLIC_API_ADDED_SHA256,
         },
     }
@@ -626,8 +846,8 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
     )
     require(result.returncode == 0, "public owner map command failed")
     expected_line = (
-        f"{OWNER_MAP_PASS_PREFIX}: mapped=1480/1490 migrated=10 lost=0 ambiguous=0 "
-        f"inaccessible=0 added=598 added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
+        f"{OWNER_MAP_PASS_PREFIX}: mapped=1852/1866 migrated=14 lost=0 ambiguous=0 "
+        f"inaccessible=0 added=1068 added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
         f"output={output_path}"
     )
     require(result.stdout.splitlines().count(expected_line) == 1, "public owner map exact PASS line mismatch")
@@ -635,13 +855,13 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
     require(
         owner_map.get("summary")
         == {
-            "baseline_items": 1490,
-            "mapped_items": 1480,
-            "migrated_items": 10,
+            "baseline_items": 1866,
+            "mapped_items": 1852,
+            "migrated_items": 14,
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 598,
+            "added_items": 1068,
             "added_items_sha256": PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
@@ -871,7 +1091,14 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
         g00f = bind_g00f(g00f_path, source)
         split_inventory = collect_split_inventory(source)
         write_json(checkpoint_root / "split-inventory.json", split_inventory)
-        write_json(checkpoint_root / "contract-map.json", contract_map(split_inventory))
+        dependency_graph, dependency_graph_evidence = run_owner_dependency_graph(
+            checkpoint_root, split_inventory
+        )
+        dependency_graph_sha256 = sha256(checkpoint_root / "owner-dependency-graph.json")
+        write_json(
+            checkpoint_root / "contract-map.json",
+            contract_map(split_inventory, dependency_graph, dependency_graph_sha256),
+        )
         require(INVENTORY_DOCUMENT.is_file(), "required pre-move inventory document is missing")
         require(ADR_DOCUMENT.is_file(), "S0A ADR/source map is missing")
         require(PUBLIC_API_MIGRATIONS.is_file(), "S0A public API migration manifest is missing")
@@ -886,6 +1113,7 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
             "contract-map.json",
             "public-api-migrations.json",
             "public-owner-map.json",
+            "owner-dependency-graph.json",
             "split-inventory.json",
             "compile-unit-trybuild.json",
         }
@@ -915,6 +1143,7 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
                 "sha256": sha256(PUBLIC_API_MIGRATIONS),
             },
             "public_owner_evidence": owner_evidence,
+            "owner_dependency_graph": dependency_graph_evidence,
             "compile_evidence": {
                 "path": "compile-unit-trybuild.json",
                 "sha256": sha256(checkpoint_root / "compile-unit-trybuild.json"),
@@ -959,12 +1188,120 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
 def self_test() -> int:
     require(sum(len(targets) for targets in TEST_TARGET_GROUPS.values()) == 28, "S0A target matrix drifted")
     require(len(SHARED_TEST_SUPPORT) == 12, "S0A shared test support matrix drifted")
-    require(set(PRODUCTION_GROUPS) == {"resource", "execution", "event"}, "S0A production scope drifted")
+    require(
+        set(PRODUCTION_GROUPS) == {"resource", "execution", "event", "operation"},
+        "S0A production scope drifted",
+    )
+    require(
+        PRODUCTION_COMPOSITION_OWNERS
+        == ["crates/ferrum-interfaces/src/vnext/static_initialization.rs"]
+        and all((REPO_ROOT / path).is_file() for path in PRODUCTION_COMPOSITION_OWNERS),
+        "S0A production composition owner scope drifted",
+    )
+    require(
+        (REPO_ROOT / "crates/ferrum-interfaces/src/vnext/event/resource_maintenance.rs").is_file()
+        and "mod resource_maintenance;"
+        in (REPO_ROOT / "crates/ferrum-interfaces/src/vnext/event.rs").read_text(),
+        "S0A event resource_maintenance owner is not physically declared",
+    )
     require(
         TEST_THREADS == "1" and TEST_THREADS_ARG == "--test-threads=1",
         "S0A bounded test thread policy drifted",
     )
     validate_public_api_migrations()
+    fixture_owners = {
+        "resource": ["capacity", "transaction"],
+        "execution": ["plan"],
+        "event": ["resource_maintenance"],
+        "operation": ["dispatch"],
+    }
+    fixture_inventory = {
+        "files": [
+            {
+                "path": f"crates/ferrum-interfaces/src/vnext/{group}/{owner}.rs",
+                "category": "production_owner",
+            }
+            for group, owners in fixture_owners.items()
+            for owner in owners
+        ]
+    }
+    fixture_groups = []
+    for group, owners in fixture_owners.items():
+        edges = (
+            [{"importer": "transaction", "dependency": "capacity", "evidence": [{"path": "resource/transaction.rs"}]}]
+            if group == "resource"
+            else []
+        )
+        order = ["capacity", "transaction"] if group == "resource" else owners
+        fixture_groups.append(
+            {
+                "group": group,
+                "facade": f"{group}.rs",
+                "owners": owners,
+                "edges": edges,
+                "strongly_connected_components": [[owner] for owner in owners],
+                "multi_module_sccs": [],
+                "topological_order": order,
+                "diagnostics": {field: [] for field in OWNER_GRAPH_DIAGNOSTIC_FIELDS},
+                "summary": {
+                    "owner_count": len(owners),
+                    "edge_count": len(edges),
+                    "multi_module_scc_count": 0,
+                    "diagnostic_count": 0,
+                    "pass": True,
+                },
+            }
+        )
+    fixture_graph = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s0a_owner_dependency_graph",
+        "parser": {
+            "kind": "syn_ast",
+            "dependency_scope": "complete_intra_facade_owner_graph",
+            "cfg_test_subtrees_excluded": True,
+            "internal_glob_policy": "reject",
+            "unresolved_internal_reference_policy": "reject",
+            "hidden_production_module_policy": "reject",
+            "facade_semantic_item_policy": "reject",
+            "forbidden_cross_boundary_policy": (
+                "resource_and_operation_must_not_depend_on_model"
+            ),
+        },
+        "groups": fixture_groups,
+        "summary": {
+            "production_group_count": 4,
+            "owner_count": 5,
+            "edge_count": 1,
+            "multi_module_scc_count": 0,
+            "diagnostic_count": 0,
+            "pass": True,
+        },
+    }
+    validate_owner_dependency_graph(fixture_graph, fixture_inventory)
+    graph_mutations = {
+        "dangling endpoint": lambda graph: graph["groups"][0]["edges"][0].update(
+            {"dependency": "missing"}
+        ),
+        "reversed topology": lambda graph: graph["groups"][0].update(
+            {"topological_order": ["transaction", "capacity"]}
+        ),
+        "non-empty SCC": lambda graph: graph["groups"][0].update(
+            {"multi_module_sccs": [["capacity", "transaction"]]}
+        ),
+        "non-empty diagnostic": lambda graph: graph["groups"][0]["diagnostics"][
+            "unresolved_internal_references"
+        ].append("forged"),
+        "forged summary": lambda graph: graph["summary"].update({"edge_count": 0}),
+    }
+    for name, mutate in graph_mutations.items():
+        forged = copy.deepcopy(fixture_graph)
+        mutate(forged)
+        try:
+            validate_owner_dependency_graph(forged, fixture_inventory)
+        except GateError:
+            pass
+        else:
+            raise GateError(f"S0A owner dependency graph mutation passed: {name}")
     lines = expected_machine_proof_lines()
     require(len(lines) == len(set(lines)) and len(lines) >= 20, "S0A machine proof matrix drifted")
     print("FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT SELFTEST PASS")

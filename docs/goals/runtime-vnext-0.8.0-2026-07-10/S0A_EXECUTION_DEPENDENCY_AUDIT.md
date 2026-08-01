@@ -50,7 +50,7 @@ sibling-only implementation access remains private to the execution parent.
 
 ## Final Graph
 
-The final production graph has twenty-one modules and zero strongly connected components with more
+The final production graph has twenty-two modules and zero strongly connected components with more
 than one member:
 
 ```text
@@ -63,10 +63,10 @@ The complete importer-to-owner edge set is:
 allocation: contracts, foundation, storage
 binding: foundation
 checkpoint: contracts, foundation
-compiler: binding, checkpoint, contracts, foundation, plan, policy, provider_resource,
-          resolution, storage, weight
+compiler: checkpoint, foundation, plan, planner, policy, provider, provider_resource, weight
 contracts: foundation, provider_resource
 determinism: contracts, foundation, plan, storage, work
+determinism_coverage: contracts, determinism, foundation
 foundation:
 memory: allocation, contracts, foundation, reusable, solver, storage, work
 plan: allocation, binding, checkpoint, contracts, foundation, memory, policy, provider,
@@ -88,33 +88,24 @@ workspace: foundation, work
 One valid dependencies-first topological order is:
 
 ```text
-foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
--> reusable -> checkpoint -> allocation -> solver -> memory -> weight -> provider -> policy
--> plan -> determinism -> resolution -> validation -> planner -> compiler
+foundation -> binding -> weight -> work -> workspace -> provider_resource -> contracts
+-> checkpoint -> storage -> allocation -> reusable -> solver -> memory -> provider -> policy
+-> plan -> determinism -> determinism_coverage -> planner -> compiler -> resolution -> validation
 ```
 
 This order proves acyclicity; it does not force unrelated branches into one runtime layer.
 
-## Bounded Validation
+## Bounded Validation Matrix
 
-The following validations passed after normalization:
-
-```text
-CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --lib vnext::execution::tests:: -- --test-threads=1
-  23 passed; 0 failed
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --test vnext_contract_tests \
-  --test vnext_resolution_limits_contract_tests -- --test-threads=1
-  51 + 12 passed; 0 failed
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --test vnext_compile -- --test-threads=1
-  80 UI fixtures passed; 0 mismatches
-```
+The current execution/core contract targets are `vnext_planning_resource_contract_tests`,
+`vnext_plan_wire_contract_tests`, `vnext_provider_selection_contract_tests`,
+`vnext_weight_layout_contract_tests`, `vnext_resolution_contract_tests`,
+`vnext_execution_graph_contract_tests`, and `vnext_source_audit_contract_tests`. The canonical S0A
+aggregate discovers and runs them with every other `ferrum-interfaces` target under the bounded
+single-libtest-thread policy. Its artifact is authoritative for exact test counts.
 
 Seven trybuild snapshots were refreshed because private definition diagnostics now name their real
 resource/execution child-module paths; one affected compiler help block also normalized its
 indentation. A normal, non-overwrite trybuild run accepted all updated snapshots. This audit does
-not claim S0A completion: `event.rs`, remaining oversized test targets, the public owner map,
-bounded aggregate, and final artifact validator remain open.
+not claim S0A completion: the clean-source bounded aggregate and final `vnext-g01a` validator
+remain authoritative.

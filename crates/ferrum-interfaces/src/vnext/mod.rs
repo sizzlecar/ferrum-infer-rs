@@ -16,6 +16,7 @@ mod oracle;
 mod resolved;
 mod resource;
 mod standard_operations;
+mod static_initialization;
 mod weight_source;
 
 pub use admission::*;
@@ -31,4 +32,5 @@ pub use oracle::*;
 pub use resolved::*;
 pub use resource::*;
 pub use standard_operations::*;
+pub use static_initialization::*;
 pub use weight_source::*;

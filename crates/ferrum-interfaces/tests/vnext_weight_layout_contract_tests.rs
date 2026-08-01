@@ -165,6 +165,39 @@ fn physical_weight_layout_tree_accepts_grouped_quantized_axis_index_fixture() {
 }
 
 #[test]
+fn resolved_weight_binding_rejects_noncanonical_wire_and_logical_drift() {
+    let schema = grouped_quantized_axis_index_schema();
+    let resolved = ResolvedWeightBinding::from_schema(&schema, &id("weight.quantized")).unwrap();
+    let wire = serde_json::to_value(&resolved).unwrap();
+
+    let mut reordered = wire.clone();
+    reordered["components"].as_array_mut().unwrap().swap(0, 1);
+    assert!(serde_json::from_value::<ResolvedWeightBinding>(reordered).is_err());
+
+    let mut missing = wire.clone();
+    missing["components"].as_array_mut().unwrap().pop();
+    assert!(serde_json::from_value::<ResolvedWeightBinding>(missing).is_err());
+
+    assert!(resolved
+        .validate_logical(&[8, 7], ElementType::F16)
+        .is_err());
+
+    let mut physical_shape_drift = wire;
+    let scales = physical_shape_drift["components"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|component| component["component_id"] == "component.scales")
+        .unwrap();
+    scales["physical_dimensions"] = serde_json::json!([8, 1]);
+    let physical_shape_drift: ResolvedWeightBinding =
+        serde_json::from_value(physical_shape_drift).unwrap();
+    assert!(physical_shape_drift
+        .validate_logical(&[8, 8], ElementType::F16)
+        .is_err());
+}
+
+#[test]
 fn whole_axis_quantization_keeps_one_abi_across_matrix_shapes() {
     let quantization = QuantizationSpec {
         format_id: id("quantization.channelwise"),

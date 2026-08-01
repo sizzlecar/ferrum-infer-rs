@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{Fields, ImplItem, Item, TraitItem, UseTree, Visibility};
 
-const MODULES: [&str; 3] = ["resource", "execution", "event"];
+const MODULES: [&str; 4] = ["resource", "execution", "event", "operation"];
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SymbolKey {

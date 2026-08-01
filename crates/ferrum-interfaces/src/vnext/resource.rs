@@ -29,9 +29,8 @@ use super::{
     LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
     LogicalBatchCapacityLease, LogicalCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId,
     PlanNode, RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation,
-    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, StateInitialization,
-    StepResourceSlotKind, StreamState, TokenSpanWork, TransactionId, VNextError,
-    MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
+    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, StepResourceSlotKind, StreamState,
+    TokenSpanWork, TransactionId, VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 
 mod contracts;
@@ -58,7 +57,7 @@ pub use program_binding::*;
 mod dynamic_pool;
 pub use dynamic_pool::*;
 mod lane_stable_arena;
-pub use lane_stable_arena::*;
+use lane_stable_arena::*;
 mod dynamic_pool_set;
 use dynamic_pool_set::DynamicPoolSet;
 mod dynamic_pool_maintenance;
@@ -81,8 +80,6 @@ mod execution_session;
 pub use execution_session::*;
 mod transaction;
 pub use transaction::*;
-mod static_initialization;
-pub use static_initialization::*;
 
 #[cfg(test)]
 #[path = "resource/dynamic_pool_tests.rs"]

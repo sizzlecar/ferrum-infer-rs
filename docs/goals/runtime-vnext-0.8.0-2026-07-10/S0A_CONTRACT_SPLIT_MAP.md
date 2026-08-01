@@ -2,328 +2,213 @@
 
 ## Status
 
-- Work package: S0A structural split plus an explicit baseline-to-current API migration ledger.
-- Current stage: the `resource`, `execution`, and `event` production monoliths are split into real
-  owner modules with explicit imports and zero multi-module dependency SCCs. The four oversized
-  resource/event/core/device contract targets are replaced by 24 invariant-owner targets and 11
-  explicit reusable support owners. The structured public owner audit accounts for all `1,490`
-  baseline API units: `1,480` preserve the original path/kind and `10` are explicit migrations with
-  verified public replacement targets. Unexplained loss, ambiguity, and inaccessible count are `0`.
-  All `598` added public units are retained in the artifact and frozen by SHA256
-  `6f68efb12bee49bfd8bb64f5e82b3f67e1185ffccb59d5eecd9223c5f57c6d41`.
-- This map records the implemented ownership structure. Canonical G01A/S0A completion still
-  requires a clean-source `vnext-g00f` binding and bounded aggregate `vnext-g01a` artifact; neither
-  this document nor historical focused test output substitutes for those PASS lines.
+S0A now covers four production contract groups: `resource`, `execution`, `event`, and
+`operation`, plus the root `static_initialization.rs` composition owner. The four domain groups
+contain 75 production owners and 286 importer-to-owner edges. The syntax-tree graph reports zero
+multi-owner strongly connected components and zero diagnostics; the composition owner is bounded
+and identity-checked separately because it intentionally joins otherwise independent domains.
 
-## Source Evidence
+The public owner audit accounts for every baseline API unit:
 
-- Pre-split source: `crates/ferrum-interfaces/src/vnext/resource.rs`
-- Pre-split logical lines: `13,220`
-- Pre-split SHA256:
-  `26b3e035010111b0d1da2f1133b665c207c5802e689ab02b5f3bc35c9933a97d`
-- Pre-split execution source: `crates/ferrum-interfaces/src/vnext/execution.rs`
-- Pre-split execution logical lines: `6,651`
-- Pre-split execution SHA256:
-  `276711236b000f35633df1662751a6acc1182af8e2b98bfe43aa546d18a37f18`
-- Pre-split event source: `crates/ferrum-interfaces/src/vnext/event.rs`
-- Pre-split event logical lines: `4,893`
-- Pre-split event SHA256:
-  `aac28b3bdadf16f15ebcab71ec72d3bab62c3cc28f9b18893c8b8b053c50edcb`
-- Repository inventory:
-  `docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md`
-- Inventory SHA256:
-  `74877fe125242d7044c7381d9c52725683a81ed0a7eccb30b66dfd9078c92f50`
-- Inventory validator result:
-  `INVENTORY PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md`
+```text
+mapped=1852/1866
+migrated=14
+lost=0
+ambiguous=0
+inaccessible=0
+added=1068
+added_sha256=9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d
+unsupported=0
+```
 
-Before module visibility changed, the 13 initial physical fragments concatenated byte-for-byte with the
-original seven-line test-module tail to the pre-split SHA256. The validated implementation now
-uses real `mod` declarations and facade `pub use` exports; it does not use `include!`.
-Unchanged public paths remain available through the facades. Ten deliberate post-split semantic
-changes are recorded in `S0A_PUBLIC_API_MIGRATIONS.json`; the owner audit rejects an absent target,
-an unexplained removal, a redundant migration, or any added-item digest drift. Cross-owner
-implementation details that were implicitly shared by the giant module are explicitly limited to
-the `vnext::resource` parent with `pub(super)`, so they do not become crate-public API. All current
-production owners use explicit symbol imports. Resource normalization now has 21 production owners
-and the complete symbol graph has zero multi-module strongly connected components. The transition
-is recorded in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.
+The 14 migrations are not omissions. Each entry in `S0A_PUBLIC_API_MIGRATIONS.json` names its old
+path and kind, public replacement targets, rationale, and introducing commit. Any unexplained
+loss, redundant migration, inaccessible target, unsupported syntax, or added-item digest drift is
+a gate failure.
 
-As a second mechanical-equivalence check, removing only the added `use super::*` lines and
-`pub(super)` visibility qualifiers, concatenating the production fragments, and applying the same
-`rustfmt` produced byte-identical old/new files with SHA256
-`3fac9f1b587513d77fc796538ae40444cfe9be08992bdf0d8b36f1f88168560b`.
+This document records the implemented ownership design. It is not a G01A PASS artifact. Canonical
+completion requires a clean-source `vnext-g01a` run and both exact PASS lines documented below.
 
-The first execution checkpoint applies the same stronger proof. Concatenating the eight production
-fragments in source order, removing only their explicit import preludes and `pub(super)` qualifiers,
-restoring the original facade imports, and applying the same formatter produces identical old/new
-production SHA256 values:
-`70899c1ef6365b65e1df0a34e7b052a1b605d7228b343d17859cac137eb8cac1`.
-The extracted white-box test module independently produces identical old/new SHA256 values:
-`452bdff62ee00cd91473fb61cfcc5758f98c2d407fce24b3317d56ad30e2712e`.
-The subsequent ownership normalization preserves the parent facade paths while moving misplaced
-helpers and implementations to their lowest valid owner. Its complete dependency transition is
-recorded in `S0A_EXECUTION_DEPENDENCY_AUDIT.md`.
+## Baseline
 
-## Resource Ownership
+The fixed baseline is commit `b5377b12464b60203a3fe57a6de4c9952ed2474b`.
 
-| Current owner | Lines | Primary responsibility |
-|---|---:|---|
-| `resource/contracts.rs` | 565 | Base identifiers, descriptors, shared error/state encodings and reservation contracts |
-| `resource/backing_extent.rs` | 434 | Backing chunk/segment identity, range projection, free-extent indexes, allocation and rollback |
-| `resource/capacity.rs` | 634 | Device capacity authority, accounting, epochs and process-wide claims |
-| `resource/provisioning.rs` | 356 | Static/elastic plan provisioning and admission construction |
-| `resource/allocation.rs` | 555 | Allocation ownership and resource driver contracts |
-| `resource/ledger.rs` | 1,668 | Lease state, transition receipts, allocation ledger and receipt validation |
-| `resource/recovery.rs` | 348 | Abandoned-sequence recovery registry and terminal abort evidence |
-| `resource/dynamic_pool.rs` | 2,373 | Dynamic pool state, physical backing authority, extent claims and lane-stable primitives |
-| `resource/program_binding.rs` | 635 | Immutable reusable-execution binding layouts and projection checks |
-| `resource/dynamic_pool_set.rs` | 1,999 | Cross-pool growth, claim, reclaim, rebalance and backing-view orchestration |
-| `resource/dynamic_pool_maintenance.rs` | 621 | Pressure maintenance, wait/retry decisions and quarantine release |
-| `resource/runtime_driver.rs` | 185 | Dynamic runtime-driver binding and allocation bridge |
-| `resource/static_lease.rs` | 424 | Plan-static lease, owned slots, borrowed buffer views and typed admission requests |
-| `resource/work.rs` | 465 | Step/invocation work-shape admission requests and checked demand derivation |
-| `resource/plan_runtime.rs` | 1,632 | Plan runtime root, close state, capacity waits and pool coordination |
-| `resource/sequence.rs` | 2,101 | Request, sequence and session resource lifetime authorities |
-| `resource/static_initialization.rs` | 1,141 | Static resource initialization transaction and installation evidence |
-| `resource/batch.rs` | 2,010 | Batch participants, step ownership, physical invocation ledger and retirement |
-| `resource/invocation.rs` | 2,455 | Invocation backing, submission-wave leases and definitely-not-submitted retry authority |
-| `resource/execution_session.rs` | 820 | Step admission plus bound stream activation, synchronization and terminal typestate |
-| `resource/transaction.rs` | 1,920 | Sealed transaction typestate, commit/rollback/release and compensation |
-
-`resource.rs` is now an 87-line facade. Every production owner is below the S0A `2,500`
-physical-line limit and the facade is below `500` physical lines. The largest owner is
-`invocation.rs` at 2,455 lines; the gate records the exact offending path and line count if the
-bound regresses.
-
-## Execution Ownership Checkpoint
-
-| Current owner | Lines | Primary responsibility |
-|---|---:|---|
-| `execution/foundation.rs` | 95 | Shared validation, canonical fingerprints, alignment and storage arithmetic |
-| `execution/binding.rs` | 278 | Semantic value/weight binding validation and estimator-input identity |
-| `execution/work.rs` | 735 | Token/page work evidence and bounded dynamic demand formulas |
-| `execution/workspace.rs` | 457 | Provider workspace formula, scope and storage requirement contracts |
-| `execution/provider_resource.rs` | 199 | Bound provider resource estimate evidence and validation |
-| `execution/contracts.rs` | 441 | Plan identity, provider selection evidence and immutable node contracts |
-| `execution/storage.rs` | 953 | Storage compatibility, dynamic pool specifications and descriptors |
-| `execution/reusable.rs` | 660 | Reusable-execution classes, buckets, capacity policy and derived memory evidence |
-| `execution/checkpoint.rs` | 279 | Completion retention, terminal readback layout and retained-value validation |
-| `execution/allocation.rs` | 121 | Static/dynamic resource allocation contract and validation |
-| `execution/solver.rs` | 427 | Joint provider/storage solver and checked selection helpers |
-| `execution/memory.rs` | 1,276 | Core-derived memory plan, reusable budgets and pool/liveness accounting |
-| `execution/weight.rs` | 733 | Exact weight-materializer capability, selection and trusted execution-weight plans |
-| `execution/provider.rs` | 271 | Provider selection and serialized execution-plan payload contracts |
-| `execution/policy.rs` | 137 | Typed runtime, reusable-memory, determinism and weight policy boundary |
-| `execution/plan.rs` | 2,399 | Semantic plan construction and deterministic provider/storage selection |
-| `execution/determinism.rs` | 1,199 | Determinism witness, physical coverage and replay-equivalence validation |
-| `execution/resolution.rs` | 327 | Provider registry resolution into typed per-node evidence |
-| `execution/validation.rs` | 243 | Bounded plan wire decoding and semantic revalidation boundary |
-| `execution/planner.rs` | 66 | Pure execution planner trait boundary |
-| `execution/compiler.rs` | 1,139 | Semantic-program compilation into immutable executable plan and node resolutions |
-
-`execution.rs` is now an 85-line facade. Every production fragment is below `2,500` lines. The
-existing white-box tests are isolated in a 905-line `execution/tests.rs` module and pass with
-`--test-threads=1`.
-
-The first eight-module split made former same-module coupling observable as one SCC containing all
-eight production owners. Low-level canonical/allocation helpers, provider resource evidence,
-serialized payload validation, resolution, and the planner API have now moved to distinct owners.
-The complete twenty-one-module production graph has zero multi-module SCCs. Public execution paths
-remain re-exported by the facade and no production fragment uses `use super::*`.
-
-## Event Ownership
-
-| Current owner | Lines | Primary responsibility |
-|---|---:|---|
-| `event/foundation.rs` | 127 | Event IDs, phases, timestamps, canonical fingerprints and shared validation |
-| `event/identity.rs` | 243 | Validated and unvalidated execution identity envelopes |
-| `event/topology.rs` | 90 | Trusted immutable execution topology derived from a plan |
-| `event/sequence_binding.rs` | 490 | Active, completed and aborted sequence evidence |
-| `event/execution_event.rs` | 1,596 | Execution event wire boundary, context validation and transactional cursor |
-| `event/resource_pool.rs` | 1,125 | Resource-pool events, receipt validation and pool cursor |
-| `event/replay.rs` | 1,128 | Replay evidence closure, cleanup requirements and replay identity |
-| `event/sink.rs` | 156 | Event sink capability, transactional emitter and disabled sink |
-
-`event.rs` is now a 48-line facade. Public paths remain unchanged, every production import is
-symbol-explicit, and no production fragment uses `use super::*`. The complete eight-module graph
-has zero multi-module SCCs. Replay and sink use typed getters or narrowly scoped parent-private
-proof methods instead of reading another owner's private fields.
-
-## Resource Test Ownership
-
-The former 4,289-line `vnext_resource_contract_tests` target is replaced by one shared 1,474-line
-fixture and seven owner targets. The limit below counts the shared fixture against every target;
-it is not hidden from the logical target size.
-
-| Target | Owner lines | With shared fixture | Frozen proof cases |
-|---|---:|---:|---:|
-| `vnext_resource_capacity_contract_tests` | 402 | 1,876 | 33 |
-| `vnext_resource_transaction_lifecycle_tests` | 486 | 1,960 | 70 |
-| `vnext_resource_transaction_evidence_tests` | 503 | 1,977 | 69 |
-| `vnext_resource_sequence_activation_tests` | 376 | 1,850 | 53 |
-| `vnext_resource_sequence_recovery_tests` | 389 | 1,863 | 48 |
-| `vnext_resource_recovery_authority_tests` | 404 | 1,878 | 38 |
-| `vnext_resource_runtime_close_tests` | 424 | 1,898 | standalone close/recovery assertions |
-
-The frozen aggregated resource proof remains `311` cases:
-`13 + 20 + 70 + 69 + 53 + 48 + 38 = 311`. The panic-isolation child stays only in the
-transaction-evidence target. G01A checkpoint consumers now validate the exact seven-target test
-matrix and sum the owner proof lines instead of accepting one monolithic `311/311` line.
-
-## Event Test Ownership
-
-The former 6,210-line event/replay target is replaced by five invariant-owner targets and six
-normal Rust fixture modules. No `include!` source assembly is used.
-
-| Target | Owner responsibility | Frozen proof cases |
-|---|---|---:|
-| `vnext_event_execution_contract_tests` | execution identity, wire validation and cursor state | 54 |
-| `vnext_event_sink_contract_tests` | transactional emission, live witness and sink failure | 28 |
-| `vnext_event_resource_pool_contract_tests` | pool event identity, transition and lease cursors | 27 |
-| `vnext_event_recovery_contract_tests` | failure/recovery continuation and root close evidence | 20 |
-| `vnext_event_replay_contract_tests` | replay closure, terminal evidence and no-static cleanup | 47 |
-
-The frozen counted total remains `54 + 28 + 27 + 20 + 47 = 176`. The no-static replay helper also
-retains its direct assertions. Every target root and every reusable fixture owner is below 2,000
-lines. S0A LOC accounting counts each source owner once: a target and each reusable fixture module
-are independently bounded, while a shared fixture is not duplicated into every consumer's LOC.
-Counting the complete crate dependency graph as target LOC would charge all production contracts
-to every test and is not the ownership/reviewability metric defined by this gate.
-
-## Core Contract Test Ownership
-
-The former 5,445-line `vnext_contract_tests` target is replaced by a 1,648-line shared contract
-fixture and seven invariant-owner targets:
-
-| Target | Owner lines | Test count | Primary invariant owner |
+| Monolith | Physical lines | Logical lines | SHA256 |
 |---|---:|---:|---|
-| `vnext_planning_resource_contract_tests` | 573 | 8 | resource demand, memory and capacity planning |
-| `vnext_plan_wire_contract_tests` | 257 | 9 | deterministic plan build and validated wire reconstruction |
-| `vnext_provider_selection_contract_tests` | 310 | 5 | provider identity, fallback and registry rejection |
-| `vnext_weight_layout_contract_tests` | 659 | 8 | physical weight layout, padding and model program shape |
-| `vnext_resolution_contract_tests` | 1,429 | 11 | typed model resolution, provenance and fail-closed input |
-| `vnext_execution_graph_contract_tests` | 530 | 7 | alias and state-effect dependency graph |
-| `vnext_source_audit_contract_tests` | 59 | 3 | architecture-neutral source and wire-size audit |
+| `resource.rs` | 13,220 | 11,991 | `26b3e035010111b0d1da2f1133b665c207c5802e689ab02b5f3bc35c9933a97d` |
+| `execution.rs` | 6,651 | 6,145 | `276711236b000f35633df1662751a6acc1182af8e2b98bfe43aa546d18a37f18` |
+| `event.rs` | 4,893 | 4,584 | `aac28b3bdadf16f15ebcab71ec72d3bab62c3cc28f9b18893c8b8b053c50edcb` |
+| `operation.rs` | 4,734 | 4,350 | `76e73a93ac091bcab3cf1d4e47145feb011d50b6ade7403c2161b727bd29ae9d` |
 
-The exact test-name union is still `51/51`, with no duplicate owner. The plan proof lines remain
-`100/100` for determinism, round trip and breaking-version rejection; resolution retains
-`VNEXT FAIL CLOSED PASS: 63/63` and `VNEXT MODEL IDENTITY PASS: 5/5`. Both release validators now
-require the seven-target matrix. The target roots and shared core fixture are separate reusable
-owners and are each independently below the 2,000-line hard limit.
+The required pre-move inventory is
+`docs/release/cleanup/20260802-operation-s0a-inventory.md`, with SHA256
+`7ec20f1dc708553e1206bb3ad962b66e1344f2be39910cff971e2420b6357785`.
 
-## Device Operation Test Ownership
+## Size Policy
 
-The former 3,799-line device/operation target is replaced by two explicit shared fixture owners
-and five invariant-owner targets. `vnext_device_operation_contract/mod.rs` owns the test model,
-provider, device runtime and resource driver in 1,839 lines; its one-way `planning.rs` child owns
-model resolution, plan/resource-session construction and fixture factories in 1,105 lines.
+- Production facades: at most 500 physical lines.
+- Production owners, including root composition owners: at most 2,500 physical lines.
+- Contract test targets and reusable support owners: at most 2,000 physical lines each.
+- `include!` source assembly: zero.
+- Wildcard parent imports in production owners: zero, except explicitly excluded test-only modules.
 
-| Target | Owner lines | Tests | Frozen proof cases |
-|---|---:|---:|---:|
-| `vnext_device_operation_dispatch_contract_tests` | 652 | 1 | 70 |
-| `vnext_device_operation_cancel_contract_tests` | 168 | 1 | 16 |
-| `vnext_device_operation_legacy_authority_contract_tests` | 115 | 1 | 13 |
-| `vnext_device_operation_completion_contract_tests` | 1,063 | 2 | 200 plus bounded drop |
-| `vnext_device_operation_batch_contract_tests` | 169 | 1 | standalone 32-participant batch |
+Current maxima before the clean aggregate gate are:
 
-The exact counted proof remains `70 + 16 + 13 + 200 = 299`. The old aggregate test is gone; the
-checkpoint and outer gate require the six exact test names and sum four machine proof lines. Every
-target and the shared device fixture are explicit owners below 2,000 lines; shared code is neither
-hidden nor multiplied by its consumer count.
+| Category | Largest file | Physical lines | Limit |
+|---|---|---:|---:|
+| Facade | `operation.rs` | 101 | 500 |
+| Production owner | `resource/invocation.rs` | 2,455 | 2,500 |
+| Test/support owner | `tests/vnext_device_operation_contract/mod.rs` | 1,839 | 2,000 |
 
-## Preserved Dynamic Resource Invariants
+The final gate recomputes these values from the committed tree. These are ownership and
+reviewability limits, not a target to delete useful dynamic-resource or determinism logic.
 
-This split is not permission to simplify the resource model. The following owners and behavior
-must remain represented after S0B:
+The only root composition owner is
+`crates/ferrum-interfaces/src/vnext/static_initialization.rs` (1,141 physical lines). The gate
+requires this exact path and binds its line count, byte size, SHA256, and Git blob to the clean
+checkout so it cannot escape the production-owner limit.
 
-- `capacity.rs`, `backing_extent.rs`, `dynamic_pool.rs`, and `dynamic_pool_set.rs`: effective capacity is published only
-  from installed, committed backing; extent rollback is journaled and growth/release advance
-  monotonic epochs.
-- `work.rs`, `plan_runtime.rs`, and `transaction.rs`: no provider encode, prefill, or device submit
-  is reachable before a committed lease; temporary pressure remains typed defer and permanent
-  over-capacity remains typed impossible/reject.
-- `sequence.rs`, `batch.rs`, `invocation.rs`, and `execution_session.rs`: request/sequence/session/step/invocation
-  authorities retain exact lifetimes and non-empty participant identity.
-- `ledger.rs`, `recovery.rs`, and `invocation.rs`: possibly-submitted work retains ownership until
-  a typed fence terminal; retry, compensation, release, recovery, and quarantine remain explicit.
-- Capacity waiting must preserve register/recheck lost-wakeup protection and must not introduce
-  global head-of-line blocking.
+## Production Owners
 
-## Dependency Direction
+### Resource
 
-The final resource graph is acyclic. One valid dependencies-first topological order is:
+Resource has 23 owners and 97 edges. It owns capacity publication, physical backing, pool growth
+and reclaim, request/sequence/session/step/invocation lifetimes, transactions, fences, recovery,
+and runtime close. Model-aware static initialization was lifted to the vNext composition root;
+`StateInitialization` remains a low-level resource contract.
+
+Valid dependencies-first order:
 
 ```text
-contracts -> backing_extent -> capacity -> ledger -> work -> allocation -> dynamic_pool
--> program_binding -> dynamic_pool_set -> dynamic_pool_maintenance -> runtime_driver
--> static_lease -> provisioning -> plan_runtime -> recovery -> transaction -> sequence
--> static_initialization -> batch -> invocation -> execution_session
+contracts -> backing_extent -> capacity -> dynamic_pool -> lane_stable_identity
+-> lane_stable_arena -> ledger -> allocation -> program_binding -> dynamic_pool_set
+-> dynamic_pool_maintenance -> provisioning -> runtime_driver -> sequence_state
+-> static_lease -> plan_runtime -> recovery -> transaction -> work -> sequence -> batch
+-> invocation -> execution_session
 ```
 
-Rust module privacy now separates the owners, all newly shared internals are restricted to the
-resource parent, and production imports are symbol-explicit. The SCC audit reports `0` cycles;
-pairwise and the previously hidden three-module cycle are both eliminated. Execution production
-imports are also symbol-explicit and its complete SCC audit reports `0` cycles. A valid
-dependencies-first execution order is:
+Detailed rationale is in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.
+
+### Execution
+
+Execution has 22 owners and 89 edges. It owns semantic bindings, work and workspace formulas,
+provider/resource evidence, storage selection, reusable-memory policy, immutable plans,
+determinism coverage, resolution, validation, and program compilation.
+
+Valid dependencies-first order:
 
 ```text
-foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
--> reusable -> checkpoint -> allocation -> solver -> memory -> weight -> provider -> policy
--> plan -> determinism -> resolution -> validation -> planner -> compiler
+foundation -> binding -> weight -> work -> workspace -> provider_resource -> contracts
+-> checkpoint -> storage -> allocation -> reusable -> solver -> memory -> provider -> policy
+-> plan -> determinism -> determinism_coverage -> planner -> compiler -> resolution -> validation
 ```
 
-The event graph is also acyclic. One valid dependencies-first order is:
+Detailed rationale is in `S0A_EXECUTION_DEPENDENCY_AUDIT.md`.
+
+### Event
+
+Event has 9 owners and 21 edges. It owns event identity, topology, sequence evidence, resource
+maintenance evidence, execution/resource cursors, replay closure, and sinks.
+
+Valid dependencies-first order:
 
 ```text
-foundation -> identity -> topology -> sequence_binding -> execution_event -> resource_pool
--> replay -> sink
+foundation -> identity -> sequence_binding -> resource_maintenance -> topology
+-> execution_event -> resource_pool -> replay -> sink
 ```
 
-S0B may later shrink or break these contracts only against the real Qwen3.5-4B production consumer.
+Detailed rationale is in `S0A_EVENT_DEPENDENCY_AUDIT.md`.
 
-## Validation For This Stage
+### Operation
 
-1. The resource and execution initial reconstructed source SHA256 values equal their pre-split
-   source SHA256 values.
-2. Their normalized old/new production source SHA256 values are identical after stripping only
-   the module visibility/prelude additions and applying the same formatter.
-3. `cargo fmt --all -- --check` accepts the fragments and facade.
-4. `CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets` passes.
-5. `RUST_TEST_THREADS=1 cargo test -p ferrum-interfaces --lib vnext::resource:: -- --test-threads=1`
-   passes `92/92` tests.
-6. One bounded cargo invocation with the seven `vnext_resource_*` owner targets and
-   `-- --test-threads=1` passes `12/12` parent tests, including the expected isolated panic-child
-   fault case and all `311` frozen proof cases.
-7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
+Operation has 21 owners and 79 edges. It owns semantic operation contracts, storage and tensor
+geometry, provider-visible physical weight ABI, provider planning, compiled identity, invocation,
+dispatch, replay/determinism evidence, and compiled submission waves.
 
-For the normalized execution graph, `cargo check -p ferrum-interfaces --all-targets` passes, the
-bounded execution white-box target passes `23/23`, the focused external execution contracts pass
-`51/51 + 12/12`, and all `80` vNext compile-time UI fixtures pass in normal trybuild mode. These
-results establish focused compile, contract, and structural evidence. The canonical S0A gate also
-runs the complete crate through one bounded aggregate and binds its public owner map and split
-inventory to the same clean Git SHA.
-
-For the normalized event graph, `cargo check -p ferrum-interfaces --all-targets` passes and all `80`
-vNext compile-time UI fixtures pass without snapshot changes. The former aggregate is now five
-owner targets whose exact proof lines pass `54/54`, `28/28`, `27/27`, `20/20`, and `47/47`.
-`runtime_vnext_g01a_checkpoint.py` preserves the historical exact five-target matrix and sums it
-back to `176`; the current S0A gate consumes the same proof lines from the bounded aggregate.
-
-After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
-library tests, and all seven external resource owner targets pass. The transaction-evidence
-target's isolated panic-child output is expected fault injection; the parent test exits
-successfully. `runtime_vnext_g01a_checkpoint.py --self-test` and `run_gate.py --self-test` also
-pass with the split matrix.
-
-The canonical clean-source execution is:
+Valid dependencies-first order:
 
 ```text
-python3 scripts/release/run_gate.py vnext-g00f --g00a <fresh-g00a-gate-manifest> \
-  --out <external-g00f-out>
-python3 scripts/release/run_gate.py vnext-g01a --g00f <fresh-g00f-gate-manifest> \
+foundation -> semantic -> attribute -> storage_profile -> tensor_contract -> weight_contract
+-> resolved_value -> buffer_view -> descriptor -> provider -> catalog -> compiled_identity
+-> identity -> dispatch_contract -> invocation -> registry -> determinism
+-> determinism_artifact -> workspace_encoding -> dispatch -> compiled_submission_wave
+```
+
+Detailed rationale is in `S0A_OPERATION_DEPENDENCY_AUDIT.md`.
+
+## Dependency Policy
+
+The canonical graph is generated with `syn`; handwritten dependency lists are review notes only.
+For every group the gate verifies the exact owner set, all edge endpoints and evidence, a
+dependency-first topological order, the complete SCC partition, recomputed summaries, and artifact
+SHA bindings.
+
+`resource` and `operation` are lower-level boundaries and may not reference model-owned root
+symbols. This rule forced two ownership corrections instead of allowlisting violations:
+
+1. `StateInitialization` moved from model schema code to resource contracts.
+2. Provider-visible physical weight encoding/layout/binding moved from model to
+   `operation/weight_contract.rs`; model retains `WeightSchema` and schema-aware construction.
+
+`static_initialization.rs` is a root composition owner because it legitimately joins model weight
+sources with resource transactions. Keeping it under `resource` would invert that dependency.
+
+## Test Ownership
+
+The S0A structural matrix has 28 invariant-owner integration targets and 12 explicit reusable
+support owners. The removed oversized aggregate roots may not reappear. Shared fixtures are counted
+once as real owners rather than hidden through `include!` or multiplied into every consumer.
+
+The canonical aggregate does not run a curated subset. It executes:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=1 \
+  cargo test -p ferrum-interfaces --all-targets -- --test-threads=1 --nocapture
+```
+
+The command is contained by `scripts/release/bounded_command.py`, records a receipt, and must
+execute every integration target discovered in `crates/ferrum-interfaces/tests/`. Machine proof
+lines for plan determinism, version rejection, fail-closed resolution, resource lifecycle, event
+replay, and device operation behavior must each appear exactly once.
+
+## Preserved Invariants
+
+- Dynamic capacity is published only from committed physical backing.
+- Admission is derived from live capacity and distinguishes `Deferred` from `Impossible`.
+- Register-then-recheck waiting prevents lost wakeups; temporary pressure does not globally block
+  active decode or unrelated eligible work.
+- Request, sequence, session, step, and invocation remain distinct owning lifetimes.
+- Possibly submitted device work retains allocations and authority until a typed fence reaches a
+  terminal state; recovery and quarantine remain explicit.
+- Physical weight identity carries component ID, shape, encoding, layout, and schema provenance;
+  providers do not infer layouts from model names.
+- Provider selection is resolved before dispatch. Architecture or backend feature branching is not
+  reintroduced into the operation hot path.
+- Event, replay, and determinism evidence preserve exact request/plan/node/operation/resource
+  attribution.
+
+S0A preserves these semantics while changing ownership. Breaking semantic changes belong to
+S0B/S1 and must be driven by the real CUDA `run` and `serve` consumer.
+
+## Canonical Gate
+
+After committing the split, produce fresh clean-source G00A/G00F evidence for that same SHA, then
+run:
+
+```text
+python3 scripts/release/run_gate.py vnext-g01a \
+  --g00f <fresh-g00f-gate-manifest> \
   --out <external-g01a-out>
 ```
 
-The second command must create `g01a-contract-split/` with the six required core artifacts and
-print both the child contract-split PASS line and `FERRUM GATE vnext-g01a PASS` before S0A is
-complete.
+The run must create `g01a-contract-split/` containing the inventory, ADR, migration manifest,
+public owner map, owner dependency graph, contract map, bounded receipt/logs, aggregate evidence,
+and child manifest. S0A is complete only when both exact lines exist:
+
+```text
+FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS: <out_dir>
+FERRUM GATE vnext-g01a PASS: <out_dir>
+```
+
+This gate unlocks G01B/S1 work. It does not prove model migration, product wiring, performance,
+G01 aggregate completion, or release readiness.

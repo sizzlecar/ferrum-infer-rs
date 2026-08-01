@@ -64,7 +64,7 @@ Sibling-only implementation access uses `pub(super)` and does not widen the crat
 
 ## Final Result
 
-The final production graph contains twenty-one modules and zero strongly connected components with
+The final production graph contains twenty-three modules and zero strongly connected components with
 more than one member:
 
 ```text
@@ -74,43 +74,35 @@ resource_dependency_scc_count=0
 One valid dependencies-first topological order is:
 
 ```text
-contracts -> backing_extent -> capacity -> ledger -> work -> allocation -> dynamic_pool
--> program_binding -> dynamic_pool_set -> dynamic_pool_maintenance -> runtime_driver
--> static_lease -> provisioning -> plan_runtime -> recovery -> transaction -> sequence
--> static_initialization -> batch -> invocation -> execution_session
+contracts -> backing_extent -> capacity -> dynamic_pool -> lane_stable_identity
+-> lane_stable_arena -> ledger -> allocation -> program_binding -> dynamic_pool_set
+-> dynamic_pool_maintenance -> provisioning -> runtime_driver -> sequence_state
+-> static_lease -> plan_runtime -> recovery -> transaction -> work -> sequence -> batch
+-> invocation -> execution_session
 ```
 
 This order is evidence that the graph is acyclic, not a requirement that unrelated modules share
 one linear architectural layer.
 
-The 2026-07-31 split deliberately uses peer `mod` owners rather than nested files. Logical backing
+The split deliberately uses peer `mod` owners rather than nested files. Logical backing
 evidence remains in `dynamic_pool`; `dynamic_pool_set` imports it and never exports a dependency
 back into the lower-level owner. Likewise, `execution_session` consumes `invocation`; invocation
 does not consume session typestate. This keeps both new edges one-way and makes every source owner
 visible to the canonical inventory.
 
-## Bounded Validation
+Lane-stable identity and arena ownership are separate leaf/orchestration owners, and sequence slot
+state is independent of recovery. Model-aware static initialization is now a vNext root composition
+owner rather than a resource child, so the lower-level resource group has no model dependency.
 
-The following validations passed after the ownership corrections:
+## Bounded Validation Matrix
 
-```text
-CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --lib \
-  vnext::resource:: -- --test-threads=1
-  92 passed; 0 failed
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --test vnext_resource_capacity_contract_tests \
-  --test vnext_resource_transaction_lifecycle_tests \
-  --test vnext_resource_transaction_evidence_tests \
-  --test vnext_resource_sequence_activation_tests \
-  --test vnext_resource_sequence_recovery_tests \
-  --test vnext_resource_recovery_authority_tests \
-  --test vnext_resource_runtime_close_tests -- --test-threads=1
-  12 parent tests passed; 0 failed; 311 frozen proof cases preserved
-```
+The current resource contract targets are `vnext_resource_capacity_contract_tests`,
+`vnext_resource_transaction_lifecycle_tests`, `vnext_resource_transaction_evidence_tests`,
+`vnext_resource_sequence_activation_tests`, `vnext_resource_sequence_recovery_tests`,
+`vnext_resource_recovery_authority_tests`, and `vnext_resource_runtime_close_tests`. The canonical
+S0A aggregate discovers and runs them with the resource library tests under the bounded
+single-libtest-thread policy. Its artifact is authoritative for exact test and frozen-proof counts.
 
 The external test target includes an isolated panic-child fault injection. Its child panic output
-is expected; the parent test and target both exited successfully. This audit does not claim S0A
-completion: execution normalization is recorded separately in
-`S0A_EXECUTION_DEPENDENCY_AUDIT.md`; `event.rs`, remaining oversized test targets, the public owner
-map, and the final artifact validator remain open.
+is expected; the parent test and target both exited successfully. This review does not claim S0A
+completion: the clean-source aggregate and final `vnext-g01a` validator remain authoritative.

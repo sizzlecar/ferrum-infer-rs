@@ -5,10 +5,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::super::{
-    DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
-    WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightId,
-};
 use super::{
     defer_device_cleanup, deferred_device_cleanup_status, maintain_deferred_device_cleanups,
     new_deferred_device_cleanup_domain, BufferUsage, DeferredDeviceCleanupDisposition,
@@ -17,6 +13,10 @@ use super::{
     ExecutionPlan, FailureDomain, FailureEnvelope, PlanRuntimeHandoffError, PlanRuntimeResources,
     ResourceId, ResourceTransaction, ResourceTransactionDriver, TransactionCommitted, VNextError,
     MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
+};
+use super::{
+    DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
+    WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightId,
 };
 
 static STATIC_INITIALIZATION_CLEANUP_DOMAIN: OnceLock<DeferredDeviceCleanupDomainId> =
