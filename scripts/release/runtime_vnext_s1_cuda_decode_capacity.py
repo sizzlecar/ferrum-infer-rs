@@ -25,7 +25,7 @@ MAX_MODEL_LEN = 512
 PREFILL_FIRST_UNTIL_ACTIVE = 3
 DECODE_SEQUENCE_FIT_POLICY = "immediate-only"
 CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
-TARGET_MAX_TOKENS = {"A": 128, "B": 384, "C": 384}
+TARGET_MAX_TOKENS = {"A": 384, "B": 384, "C": 384}
 PRESSURE_DECODE_SLOTS = ("A", "B", "C")
 REBALANCE_PRIME_MAX_TOKENS = CALIBRATION_MAX_TOKENS
 REBALANCE_PROBE_MAX_TOKENS = 1
@@ -1105,8 +1105,15 @@ def validate_decode_trace(
     yields = [
         event for event in deferrals if event["decision"] == "pressure_yield_planned"
     ]
+    sequence_yields = [
+        event for event in yields if event["stage"] == "sequence_extension"
+    ]
     require(splits, "target never adaptively split a capacity-blocked decode cohort")
     require(yields, "target never planned a typed execution-capacity yield")
+    require(
+        sequence_yields,
+        "target never planned a typed yield for sequence-extension capacity",
+    )
 
     hold_rows = [
         row
@@ -1493,6 +1500,7 @@ def validate_decode_trace(
         "park_events": len(parks),
         "pressure_yield_events": len(yields),
         "pressure_yield_kinds": sorted({event["yield_kind"] for event in yields}),
+        "pressure_yield_stages": sorted({event["stage"] for event in yields}),
         "pressure_fence_armed_events": len(armed_fences),
         "pressure_fence_completed_events": len(completed_fences),
         "pressure_hold_events": len(holds),
@@ -2853,11 +2861,12 @@ def self_test() -> int:
         "calibration token budget must be a valid product configuration",
     )
     require(
-        CALIBRATION_MAX_TOKENS["A"] == TARGET_MAX_TOKENS["A"]
-        and CALIBRATION_MAX_TOKENS["B"] < TARGET_MAX_TOKENS["B"]
-        and CALIBRATION_MAX_TOKENS["C"] < TARGET_MAX_TOKENS["C"]
-        and TARGET_MAX_TOKENS["B"] == TARGET_MAX_TOKENS["C"],
-        "target must retain A while extending both pressure-victim lifetimes",
+        all(
+            CALIBRATION_MAX_TOKENS[slot] < TARGET_MAX_TOKENS[slot]
+            for slot in PRESSURE_DECODE_SLOTS
+        )
+        and len(set(TARGET_MAX_TOKENS.values())) == 1,
+        "target frontiers must outlive calibration with one long decode horizon",
     )
     require(
         SERVER_POLICY["target_sizing_max_tokens"] == CALIBRATION_MAX_TOKENS,
@@ -3238,6 +3247,7 @@ def self_test() -> int:
         episode_id: int | None = None,
         planned_transition_ordinal: int | None = None,
         yield_kind: str | None = None,
+        execution_stage: str = "step_admission",
     ) -> dict[str, Any]:
         attributes = {
             "request_ids": request_ids,
@@ -3259,7 +3269,7 @@ def self_test() -> int:
             "shape": {
                 "decision": decision,
                 "attempted_decode_width": len(request_ids),
-                "execution_stage": "step_admission",
+                "execution_stage": execution_stage,
                 "decode_submit_observed": False,
             },
             "attributes": attributes,
@@ -3323,6 +3333,7 @@ def self_test() -> int:
             episode_id=1,
             planned_transition_ordinal=3,
             yield_kind="peer_handoff",
+            execution_stage="sequence_extension",
         ),
         {
             "ts_unix_nanos": 141,
@@ -3395,6 +3406,7 @@ def self_test() -> int:
             episode_id=1,
             planned_transition_ordinal=7,
             yield_kind="self_recompute",
+            execution_stage="sequence_extension",
         ),
         {
             "ts_unix_nanos": 147,
@@ -3487,6 +3499,7 @@ def self_test() -> int:
                 episode_id=2,
                 planned_transition_ordinal=13,
                 yield_kind="self_recompute",
+                execution_stage="sequence_extension",
             ),
             {
                 "ts_unix_nanos": 161,
@@ -3640,16 +3653,24 @@ def self_test() -> int:
         started_wall_ns=90,
         finished_wall_ns=170,
         counters={
-            "extension_deferrals": 0,
-            "step_deferrals": summary["deferral_events"],
+            "extension_deferrals": summary["pressure_yield_events"],
+            "step_deferrals": (
+                summary["deferral_events"] - summary["pressure_yield_events"]
+            ),
             "wave_deferrals": 0,
             "backing_deferrals": 0,
         },
     )
     require(
-        direct_counter_provenance["direct_trace_events_by_stage"]["step_admission"]
-        == summary["deferral_events"],
-        "self-test lost direct step-admission counter provenance",
+        direct_counter_provenance["direct_trace_events_by_stage"]
+        == {
+            "sequence_extension": summary["pressure_yield_events"],
+            "step_admission": (
+                summary["deferral_events"] - summary["pressure_yield_events"]
+            ),
+            "submission_wave": 0,
+        },
+        "self-test lost direct per-stage counter provenance",
     )
     backing_rows = json.loads(json.dumps(rows))
     for row in backing_rows:
@@ -3848,6 +3869,10 @@ def self_test() -> int:
         "self-test lost typed yield strategies",
     )
     require(
+        summary["pressure_yield_stages"] == ["sequence_extension"],
+        "self-test lost sequence-extension pressure provenance",
+    )
+    require(
         summary["pressure_fence_armed_events"] == 3
         and summary["pressure_fence_completed_events"] == 3,
         "self-test lost release-fence evidence",
@@ -3890,6 +3915,20 @@ def self_test() -> int:
     try:
         validate_decode_trace(rows[1:], started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("trace without adaptive split unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    non_sequence_yield = json.loads(json.dumps(rows))
+    for row in non_sequence_yield:
+        if (
+            row.get("phase") == "vnext.decode_capacity_deferred"
+            and row.get("shape", {}).get("decision") == "pressure_yield_planned"
+        ):
+            row["shape"]["execution_stage"] = "submission_wave"
+    try:
+        validate_decode_trace(
+            non_sequence_yield, started_wall_ns=90, finished_wall_ns=170
+        )
+        raise AssertionError("non-sequence pressure yield unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_victim = json.loads(json.dumps(rows))
