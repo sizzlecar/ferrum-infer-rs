@@ -3,10 +3,10 @@ use std::sync::{Arc, OnceLock};
 
 use super::{
     canonical_operation_fingerprint, canonical_sha256, invalid_operation, BatchInvocationId,
-    BatchOperationIdentity, BatchOperationIdentityData, BatchOperationNodeIdentity,
-    BatchOperationParticipantIdentity, BatchStepId, DeviceId, DeviceRuntime, ExecutablePlanView,
-    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, NodeId,
-    NodeInvocationId, OperationDispatch, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    BatchOperationIdentity, BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
+    BatchStepId, DeviceId, DeviceRuntime, ExecutablePlanView, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, NodeId, NodeInvocationId,
+    OperationDispatch, OperationId, ParticipantNodeKey, PlanHash, PlanId,
     PreparedStepSubmissionWave, ProviderExecutionSemantics, ProviderId, RequestIdentity,
     ResourcePoolId, RunId, SpanId, StepParticipantFrameAssignment, TransactionId,
     TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
@@ -327,27 +327,23 @@ impl BatchOperationIdentity {
         let runtime_implementation_fingerprint =
             topology.runtime_implementation_fingerprint().to_owned();
         let lane_id = topology.lane_id();
-        Ok(Self {
-            data: Arc::new(BatchOperationIdentityData {
-                batch_step_id,
-                batch_invocation_id,
-                plan_id,
-                plan_hash,
-                device_id,
-                runtime_implementation_fingerprint,
-                lane_id,
-                claimed_backing_fingerprint,
-                nodes: OnceLock::new(),
-                participants: OnceLock::new(),
-                deferred_recipe: Some(DeferredBatchOperationIdentityRecipe {
-                    topology,
-                    work_shape_fingerprint,
-                    participant_seeds,
-                    node_identities,
-                }),
-                fingerprint,
-            }),
-        })
+        Ok(Self::from_deferred_validated(
+            batch_step_id,
+            batch_invocation_id,
+            plan_id,
+            plan_hash,
+            device_id,
+            runtime_implementation_fingerprint,
+            lane_id,
+            claimed_backing_fingerprint,
+            DeferredBatchOperationIdentityRecipe {
+                topology,
+                work_shape_fingerprint,
+                participant_seeds,
+                node_identities,
+            },
+            fingerprint,
+        ))
     }
 }
 

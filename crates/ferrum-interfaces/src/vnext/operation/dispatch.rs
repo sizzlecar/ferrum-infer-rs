@@ -28,13 +28,15 @@ use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
     SubmissionWaveDeterminismRestore,
 };
-use super::{
+use super::invocation::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
+    OperationInvocationResources,
+};
+use super::{
     invalid_operation, BatchOperationIdentity, BatchOperationNodeIdentity,
     BatchOperationParticipantIdentity, BatchedOperationInvocation, BoundOperationProvider,
-    ElementType, OperationFailure, OperationInvocation, OperationInvocationResources,
-    ProviderReplayEquivalence, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, TensorAccess,
+    ElementType, OperationFailure, OperationInvocation, ProviderReplayEquivalence,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, TensorAccess,
 };
 
 pub trait DispatchRetryAuthority: fmt::Debug {
@@ -1036,9 +1038,7 @@ impl OperationDispatch {
             let node = plan_nodes.get(plan_node_index).ok_or_else(|| {
                 invalid_operation("reusable execution wave node is absent from the immutable plan")
             })?;
-            if provider.plan_id != *plan.payload().plan_id()
-                || provider.plan_hash != *plan.plan_hash()
-                || provider.node_id != *node.id()
+            if !provider.matches_plan_node(plan.payload().plan_id(), plan.plan_hash(), node.id())
                 || prepared_node.node_id() != node.id()
             {
                 return Err(invalid_operation(
