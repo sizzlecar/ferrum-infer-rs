@@ -410,6 +410,47 @@ G03/G06 wiring 没有绕过共享 G04 authority；它不是 canonical G04 PASS�
 状态序列、pressure/yield/release-fence、三类 synthetic program 和完整 G04 artifact
 仍保持 Open。
 
+## 2026-08-01 Dynamic Maintenance Retry Source Checkpoint
+
+Historical MoE `703/703` evidence covered the normal dynamic-resource product path but did not
+force overlapping capacity episodes or a frontier that exhausts its bounded backing-maintenance
+budget after committing real pool growth. The first forced sequence-pressure CUDA run at
+`f7728952` therefore exposed an `OverlappingPendingEpisodes` reject instead of proving recovery.
+Its copied-back REJECT artifact is
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-decode-pressure-shape-local-20260801/cuda-reject-f7728952-download/ferrum-s1-f7728952-sequence-yield-20260801/`.
+
+Clean pushed source `ec0888bd` closes the missing source-level loop without treating a global
+capacity epoch or the mere possibility of maintenance as progress:
+
+- executor maintenance records exact growth receipts and reconstructs typed pool/domain/chunk
+  mutations against the authoritative pool status;
+- a retry receipt must match the final blocked pool or `BackingGrowthRequired` domain, and a
+  physical chunk cannot be replayed under another capacity epoch;
+- the scheduler installs the retry ticket atomically across the exact active frontiers, rejects
+  stale/replayed evidence, yields one complete scheduling iteration for peers, and does not open a
+  pressure episode for already-committed growth;
+- a real `WaitForRelease` remains on the ordinary pressure/yield/waiter path;
+- overlapping source ownership is multi-owner, open episodes can be absorbed, and unresolved
+  bridges require a current progress witness, a causal cycle break, or an explicit invariant
+  violation instead of indefinite parking.
+
+Bounded local evidence under
+`/Users/chejinxuan/ferrum-artifacts/pressure-multi-owner-local-20260801/` includes:
+
+- `maintenance-retry-exact-r2.receipt.json`: scheduler retry contracts `2/2` and real dynamic-pool
+  growth reconstruction `1/1` PASS;
+- `maintenance-retry-layered-r1.receipt.json`: scheduler `145/145` and submission-wave resource
+  contracts `9/9` PASS;
+- `maintenance-retry-engine-r1.receipt.json`: four exact engine release/recompute/wait tests PASS;
+- `maintenance-retry-core-libs-r2.receipt.json`: engine `261 pass / 1 ignored`, interfaces
+  `227/227`, and models `263 pass / 2 ignored`.
+
+Commit `937539a4` separately removes a feature-unification-dependent JSON object key-order
+assertion found by the combined crate gate; field-set and value assertions remain exact. These
+artifacts are source-level KEEP evidence, not a G04 or CUDA product PASS. Current-head MoE and
+dense CUDA product-path correctness remain required before this pressure repair is accepted on
+hardware.
+
 ## 性能约束
 
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32
