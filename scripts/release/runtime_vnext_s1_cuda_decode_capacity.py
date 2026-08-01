@@ -1663,17 +1663,21 @@ def validate_maintenance_trace(
 
 
 def validate_rebalance_trace(
-    rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
+    rows: list[dict[str, Any]],
+    *,
+    started_wall_ns: int,
+    finished_wall_ns: int,
+    label: str = "cross-pool evidence",
 ) -> dict[str, Any]:
     summary = validate_maintenance_trace(
         rows,
         started_wall_ns=started_wall_ns,
         finished_wall_ns=finished_wall_ns,
-        label="cross-pool evidence",
+        label=label,
     )
     require(
         summary["rebalance_events"] > 0,
-        "cross-pool evidence produced no typed rebalance",
+        f"{label} produced no typed rebalance",
     )
     return summary
 
@@ -2005,21 +2009,26 @@ def collect(args: argparse.Namespace) -> int:
         sizing_finished = max(
             result["finished_wall_ns"] for result in sizing_clients.values()
         )
-        sizing_rebalance_summary = validate_rebalance_trace(
+        sizing_maintenance_summary = validate_maintenance_trace(
             common.read_trace(target_sizing.trace_path),
             started_wall_ns=sizing_started,
             finished_wall_ns=sizing_finished,
+            label="target sizing",
         )
         collection["target_sizing"] = {
             "clients": sizing_clients,
             "monitor": sizing_monitor,
             "pool_snapshot": sizing_pool,
-            "rebalance_summary": sizing_rebalance_summary,
+            "maintenance_summary": sizing_maintenance_summary,
             "health_final": "target-sizing/health.final.json",
             "trace": "target-sizing/scheduler-trace.jsonl",
         }
         target_budget_envelope = derive_target_budget_envelope(
             calibration_pool, sizing_pool
+        )
+        require(
+            target_budget_envelope["requires_cross_pool_rebalance"] is True,
+            "target sizing envelope does not require the rebalance probe",
         )
         exact_budget = target_budget_envelope["budget_claimed_bytes"]
         collection["target_budget_envelope"] = target_budget_envelope
@@ -2098,7 +2107,7 @@ def collect(args: argparse.Namespace) -> int:
             baseline_executor=target_start_executor,
         )
         target_rows = common.read_trace(target.trace_path)
-        probe_maintenance_summary = validate_maintenance_trace(
+        probe_maintenance_summary = validate_rebalance_trace(
             target_rows,
             started_wall_ns=probe_client["started_wall_ns"],
             finished_wall_ns=probe_client["finished_wall_ns"],
@@ -2416,6 +2425,10 @@ def validate(root: Path, out: Path) -> int:
         "target budget envelope differs from raw sizing receipts",
     )
     require(
+        target_budget_envelope["requires_cross_pool_rebalance"] is True,
+        "target sizing envelope does not require the rebalance probe",
+    )
+    require(
         isinstance(exact_budget, int)
         and exact_budget == target_budget_envelope["budget_claimed_bytes"],
         "exact budget does not match the target-compatible sizing envelope",
@@ -2523,14 +2536,15 @@ def validate(root: Path, out: Path) -> int:
         ),
         "target sizing unexpectedly hit decode capacity pressure",
     )
-    rebalance_summary = validate_rebalance_trace(
+    sizing_maintenance_summary = validate_maintenance_trace(
         sizing_rows,
         started_wall_ns=sizing_started,
         finished_wall_ns=sizing_finished,
+        label="target sizing",
     )
     require(
-        target_sizing.get("rebalance_summary") == rebalance_summary,
-        "target sizing rebalance summary differs from raw trace",
+        target_sizing.get("maintenance_summary") == sizing_maintenance_summary,
+        "target sizing maintenance summary differs from raw trace",
     )
     target_rows = common.read_trace(root / str(target.get("trace")))
     target_trace_path = root / str(target.get("trace"))
@@ -2560,7 +2574,7 @@ def validate(root: Path, out: Path) -> int:
         finished_wall_ns=target_finished,
     )
     require(target.get("decode_summary") == decode_summary, "decode summary differs from raw trace")
-    probe_maintenance_summary = validate_maintenance_trace(
+    probe_maintenance_summary = validate_rebalance_trace(
         target_rows,
         started_wall_ns=probe_started,
         finished_wall_ns=probe_finished,
@@ -2622,8 +2636,9 @@ def validate(root: Path, out: Path) -> int:
         "server_policy": SERVER_POLICY,
         "stop_policy": STOP_POLICY,
         "decode_summary": decode_summary,
-        "rebalance_summary": rebalance_summary,
-        "rebalance_evidence_phase": "target-sizing",
+        "rebalance_summary": probe_maintenance_summary,
+        "rebalance_evidence_phase": "target-rebalance-probe",
+        "sizing_maintenance_summary": sizing_maintenance_summary,
         "probe_maintenance_summary": probe_maintenance_summary,
         "cross_pool_rebalance_evidence_owner": (
             common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER

@@ -563,7 +563,8 @@ def revalidate_capacity(
         )
         receipts = rebalance.get("receipts")
         require(
-            regenerated.get("rebalance_evidence_phase") == "target-sizing"
+            regenerated.get("rebalance_evidence_phase")
+            == "target-rebalance-probe"
             and rebalance.get("exact_receipt") is True
             and rebalance.get("evidence_owner") == owner
             and isinstance(rebalance.get("rebalance_events"), int)
@@ -1225,7 +1226,7 @@ def self_test() -> int:
     require(TEST_SPECS["overhead"]["release"] is True, "G01B overhead must use release mode")
     require(
         capacity_checkpoint.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
-        == "vnext-s1-cuda-decode-capacity/target-sizing",
+        == "vnext-s1-cuda-decode-capacity/target-rebalance-probe",
         "G01B cross-pool evidence ownership drifted",
     )
     require(production_path("crates/ferrum-engine/src/lib.rs"), "production source classification rejected crate src")
