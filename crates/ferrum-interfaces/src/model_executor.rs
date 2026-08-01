@@ -1768,6 +1768,48 @@ impl ExecutorExecutionMaintenanceProgress {
     }
 }
 
+/// Scheduler-consumable proof binding physical maintenance to the exact
+/// logical frontiers whose unsubmitted execution attempt observed it.
+///
+/// Keeping the request scope inside the proof prevents a caller from attaching
+/// one sequence's growth receipt to an unrelated decode cohort.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorExecutionMaintenanceRetry {
+    affected_request_ids: Vec<RequestId>,
+    progress: ExecutorExecutionMaintenanceProgress,
+}
+
+impl ExecutorExecutionMaintenanceRetry {
+    fn new(
+        affected_request_ids: Vec<RequestId>,
+        progress: ExecutorExecutionMaintenanceProgress,
+    ) -> Result<Self> {
+        let unique = affected_request_ids.iter().collect::<HashSet<_>>();
+        if affected_request_ids.is_empty() || unique.len() != affected_request_ids.len() {
+            return Err(FerrumError::internal(
+                "execution maintenance retry requires unique affected requests",
+            ));
+        }
+        if progress.mutations().is_empty() {
+            return Err(FerrumError::internal(
+                "execution maintenance retry requires physical mutations",
+            ));
+        }
+        Ok(Self {
+            affected_request_ids,
+            progress,
+        })
+    }
+
+    pub fn affected_request_ids(&self) -> &[RequestId] {
+        &self.affected_request_ids
+    }
+
+    pub const fn progress(&self) -> &ExecutorExecutionMaintenanceProgress {
+        &self.progress
+    }
+}
+
 /// Scheduler-visible proof that an execution attempt was not submitted and
 /// must not be retried until one of its exact capacity sources changes.
 ///
@@ -1782,7 +1824,7 @@ pub struct ExecutorExecutionCapacityDeferral {
     shortfalls: Vec<crate::vnext::CapacityShortfall>,
     backing_blockers: Vec<crate::vnext::DynamicBackingBlocker>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    maintenance_progress: Option<ExecutorExecutionMaintenanceProgress>,
+    maintenance_retry: Option<ExecutorExecutionMaintenanceRetry>,
 }
 
 impl ExecutorExecutionCapacityDeferral {
@@ -1802,7 +1844,7 @@ impl ExecutorExecutionCapacityDeferral {
             stage,
             shortfalls: Vec::new(),
             backing_blockers: Vec::new(),
-            maintenance_progress: None,
+            maintenance_retry: None,
         })
     }
 
@@ -1863,32 +1905,25 @@ impl ExecutorExecutionCapacityDeferral {
         Ok(result)
     }
 
-    /// Export a fresh growable logical deferral after this executor call has
-    /// already committed its bounded maintenance budget.
-    pub fn from_pending_maintenance_after_progress(
-        deferred: &crate::vnext::AdmissionDeferred,
-        stage: ExecutorExecutionCapacityStage,
-        progress: ExecutorExecutionMaintenanceProgress,
-    ) -> Result<Self> {
-        let result = Self::from_pending_maintenance(deferred, stage)?;
-        result.with_maintenance_progress(progress)
-    }
-
-    /// Export a fresh physical-backing deferral after this executor call has
-    /// already committed its bounded maintenance budget.
-    pub fn from_backing_after_progress(
-        deferred: &crate::vnext::DynamicBackingDeferred,
-        stage: ExecutorExecutionCapacityStage,
-        progress: ExecutorExecutionMaintenanceProgress,
-    ) -> Result<Self> {
-        let result = Self::from_backing(deferred, stage)?;
-        result.with_maintenance_progress(progress)
-    }
-
-    fn with_maintenance_progress(
+    /// Attach a scheduler retry only when this call produced at least one real
+    /// physical mutation relevant to the final blocker. An empty or unrelated
+    /// receipt set is an ordinary typed wait, not an internal error.
+    pub fn with_relevant_maintenance_retry(
         mut self,
-        progress: ExecutorExecutionMaintenanceProgress,
+        attempts: u32,
+        receipts: &[crate::vnext::DynamicPoolGrowthBatchReceipt],
+        pools: &[crate::vnext::DynamicPoolStatus],
+        affected_request_ids: Vec<RequestId>,
     ) -> Result<Self> {
+        if receipts.is_empty() {
+            return Ok(self);
+        }
+        let progress = ExecutorExecutionMaintenanceProgress::from_growth_receipts(
+            attempts,
+            self.observed,
+            receipts,
+            pools,
+        )?;
         if progress.coordinator_id() != self.observed.coordinator_id
             || progress.latest_capacity_epoch() > self.observed.capacity_epoch
             || progress.mutations().is_empty()
@@ -1913,11 +1948,17 @@ impl ExecutorExecutionCapacityDeferral {
             })
         };
         if !relevant_mutation {
+            return Ok(self);
+        }
+        let retry = ExecutorExecutionMaintenanceRetry::new(affected_request_ids, progress)?;
+        if self.stage == ExecutorExecutionCapacityStage::SequenceExtension
+            && retry.affected_request_ids().len() != 1
+        {
             return Err(FerrumError::internal(
-                "execution maintenance progress does not mutate a blocked pool or domain",
+                "sequence-extension maintenance retry must affect exactly one request",
             ));
         }
-        self.maintenance_progress = Some(progress);
+        self.maintenance_retry = Some(retry);
         Ok(self)
     }
 
@@ -1957,8 +1998,49 @@ impl ExecutorExecutionCapacityDeferral {
         &self.backing_blockers
     }
 
-    pub fn maintenance_progress(&self) -> Option<&ExecutorExecutionMaintenanceProgress> {
-        self.maintenance_progress.as_ref()
+    pub fn maintenance_retry(&self) -> Option<&ExecutorExecutionMaintenanceRetry> {
+        self.maintenance_retry.as_ref()
+    }
+
+    /// Validate the bound retry scope against the authoritative logical
+    /// frontiers in the current engine call.
+    pub fn validated_maintenance_retry_scope(
+        &self,
+        current_request_ids: &[RequestId],
+    ) -> Result<Option<&ExecutorExecutionMaintenanceRetry>> {
+        let Some(retry) = self.maintenance_retry.as_ref() else {
+            return Ok(None);
+        };
+        let current = current_request_ids.iter().collect::<HashSet<_>>();
+        if current_request_ids.is_empty() || current.len() != current_request_ids.len() {
+            return Err(FerrumError::internal(
+                "execution maintenance retry received an invalid current request cohort",
+            ));
+        }
+        let affected = retry.affected_request_ids().iter().collect::<HashSet<_>>();
+        if !affected.is_subset(&current) {
+            return Err(FerrumError::internal(
+                "execution maintenance retry affects a request outside the current cohort",
+            ));
+        }
+        match self.stage {
+            ExecutorExecutionCapacityStage::SequenceExtension => {
+                if affected.len() != 1 {
+                    return Err(FerrumError::internal(
+                        "sequence-extension maintenance retry must affect one current request",
+                    ));
+                }
+            }
+            ExecutorExecutionCapacityStage::StepAdmission
+            | ExecutorExecutionCapacityStage::SubmissionWave => {
+                if affected != current {
+                    return Err(FerrumError::internal(
+                        "cohort maintenance retry must cover the complete current cohort",
+                    ));
+                }
+            }
+        }
+        Ok(Some(retry))
     }
 
     /// Return a strictly smaller, capacity-informed prefill width.
@@ -2003,11 +2085,35 @@ impl ExecutorExecutionCapacityDeferral {
 mod execution_capacity_deferral_tests {
     use super::{
         ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+        ExecutorExecutionMaintenanceProgress, ExecutorExecutionMaintenanceRetry,
     };
     use crate::vnext::{
         CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
     };
+    use ferrum_types::RequestId;
     use std::num::NonZeroU64;
+
+    fn test_progress() -> ExecutorExecutionMaintenanceProgress {
+        ExecutorExecutionMaintenanceProgress {
+            attempts: 1,
+            coordinator_id: NonZeroU64::new(19).unwrap(),
+            mutations: Vec::new(),
+            latest_capacity_epoch: 5,
+        }
+    }
+
+    fn test_deferral(stage: ExecutorExecutionCapacityStage) -> ExecutorExecutionCapacityDeferral {
+        let observed =
+            CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 7)
+                .unwrap();
+        let condition = CapacityWaitCondition::from_observation(19, vec![observed]).unwrap();
+        ExecutorExecutionCapacityDeferral::new(
+            ExecutorAdmissionEpochs::new(NonZeroU64::new(19).unwrap(), 3, 5),
+            condition,
+            stage,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn prefill_narrowing_is_strict_bounded_and_stops_at_one_token() {
@@ -2025,6 +2131,64 @@ mod execution_capacity_deferral_tests {
         assert_eq!(deferred.narrower_prefill_tokens(342), Some(171));
         assert_eq!(deferred.narrower_prefill_tokens(2), Some(1));
         assert_eq!(deferred.narrower_prefill_tokens(1), None);
+    }
+
+    #[test]
+    fn empty_maintenance_receipts_remain_an_ordinary_typed_deferral() {
+        let request_id = RequestId::new();
+        let deferred = test_deferral(ExecutorExecutionCapacityStage::SequenceExtension)
+            .with_relevant_maintenance_retry(2, &[], &[], vec![request_id])
+            .unwrap();
+
+        assert!(deferred.maintenance_retry().is_none());
+    }
+
+    #[test]
+    fn maintenance_retry_rejects_empty_duplicate_or_unproven_scope() {
+        let request_id = RequestId::new();
+        assert!(ExecutorExecutionMaintenanceRetry::new(Vec::new(), test_progress()).is_err());
+        assert!(ExecutorExecutionMaintenanceRetry::new(
+            vec![request_id.clone(), request_id.clone()],
+            test_progress(),
+        )
+        .is_err());
+        assert!(ExecutorExecutionMaintenanceRetry::new(vec![request_id], test_progress()).is_err());
+    }
+
+    #[test]
+    fn maintenance_retry_scope_is_fail_closed_for_sequence_and_cohort_stages() {
+        let first = RequestId::new();
+        let second = RequestId::new();
+        let retry = |affected_request_ids| ExecutorExecutionMaintenanceRetry {
+            affected_request_ids,
+            progress: test_progress(),
+        };
+
+        let mut sequence = test_deferral(ExecutorExecutionCapacityStage::SequenceExtension);
+        sequence.maintenance_retry = Some(retry(vec![second.clone()]));
+        assert_eq!(
+            sequence
+                .validated_maintenance_retry_scope(&[first.clone(), second.clone()])
+                .unwrap()
+                .unwrap()
+                .affected_request_ids(),
+            [second.clone()]
+        );
+        sequence.maintenance_retry = Some(retry(vec![first.clone(), second.clone()]));
+        assert!(sequence
+            .validated_maintenance_retry_scope(&[first.clone(), second.clone()])
+            .is_err());
+
+        let mut cohort = test_deferral(ExecutorExecutionCapacityStage::SubmissionWave);
+        cohort.maintenance_retry = Some(retry(vec![second.clone()]));
+        assert!(cohort
+            .validated_maintenance_retry_scope(&[first.clone(), second.clone()])
+            .is_err());
+        cohort.maintenance_retry = Some(retry(vec![first.clone(), second.clone()]));
+        assert!(cohort
+            .validated_maintenance_retry_scope(&[first, second])
+            .unwrap()
+            .is_some());
     }
 }
 

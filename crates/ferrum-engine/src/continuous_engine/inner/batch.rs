@@ -113,7 +113,7 @@ impl EngineInner {
     async fn process_batch_plan_runtime(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
         let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
 
-        let mut batch_prefill_finished = false;
+        let mut per_request_prefill_ids = prefill_ids.clone();
         if prefill_ids.len() > 1 {
             let scheduled = prefill_ids
                 .iter()
@@ -131,7 +131,12 @@ impl EngineInner {
                 })
                 .collect::<Result<Vec<_>>>()?;
             match self.run_plan_runtime_batch_prefill(&scheduled).await {
-                Ok(completed) => batch_prefill_finished = completed,
+                Ok(PlanRuntimeBatchPrefillDisposition::Completed) => {
+                    per_request_prefill_ids.clear();
+                }
+                Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(request_ids)) => {
+                    per_request_prefill_ids = request_ids;
+                }
                 Err(error) => {
                     warn!(
                         "Plan-runtime physical batch prefill failed for {} requests: {}",
@@ -141,32 +146,30 @@ impl EngineInner {
                     for rid in &prefill_ids {
                         self.complete_request(rid, FinishReason::Error).await?;
                     }
-                    batch_prefill_finished = true;
+                    per_request_prefill_ids.clear();
                 }
             }
         }
-        if !batch_prefill_finished {
-            for rid in &prefill_ids {
-                let scheduled = batch
-                    .requests
-                    .iter()
-                    .find(|scheduled| scheduled.request.id == *rid)
-                    .ok_or_else(|| {
-                        FerrumError::internal(format!(
-                            "PlanRuntime batch {:?} lost scheduled request {rid}",
-                            batch.batch_id
-                        ))
-                    })?;
-                if let Err(error) = self.run_plan_runtime_prefill(scheduled).await {
-                    warn!("Plan-runtime prefill failed for {}: {}", rid, error);
-                    if is_resource_exhausted_error(&error) {
-                        warn!(
-                            request_id = %rid,
-                            "Plan-runtime prefill crossed typed admission with insufficient capacity"
-                        );
-                    }
-                    self.complete_request(rid, FinishReason::Error).await?;
+        for rid in &per_request_prefill_ids {
+            let scheduled = batch
+                .requests
+                .iter()
+                .find(|scheduled| scheduled.request.id == *rid)
+                .ok_or_else(|| {
+                    FerrumError::internal(format!(
+                        "PlanRuntime batch {:?} lost scheduled request {rid}",
+                        batch.batch_id
+                    ))
+                })?;
+            if let Err(error) = self.run_plan_runtime_prefill(scheduled).await {
+                warn!("Plan-runtime prefill failed for {}: {}", rid, error);
+                if is_resource_exhausted_error(&error) {
+                    warn!(
+                        request_id = %rid,
+                        "Plan-runtime prefill crossed typed admission with insufficient capacity"
+                    );
                 }
+                self.complete_request(rid, FinishReason::Error).await?;
             }
         }
 

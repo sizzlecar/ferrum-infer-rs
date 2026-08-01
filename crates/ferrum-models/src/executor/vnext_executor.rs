@@ -20,11 +20,11 @@ use ferrum_interfaces::model_executor::{
     ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
     ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
     ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
-    ExecutorExecutionMaintenanceProgress, ExecutorMemoryUsage, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
-    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
-    ExecutorRequestOrigin, ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorState,
-    ExecutorStatus, LogitsReturnPolicy, MemoryRequirements, PlanRuntimeBatchDecodeOutcome,
+    ExecutorMemoryUsage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+    ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
+    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorRequestOrigin,
+    ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorState, ExecutorStatus,
+    LogitsReturnPolicy, MemoryRequirements, PlanRuntimeBatchDecodeOutcome,
     PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
     PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
     PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimePrefillProduct,
@@ -4772,21 +4772,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn execution_maintenance_progress(
+    fn bind_execution_maintenance_retry(
         &self,
+        deferral: ExecutorExecutionCapacityDeferral,
         attempts: u32,
-        observed: CapacityEpochs,
         receipts: &[DynamicPoolGrowthBatchReceipt],
-    ) -> Result<ExecutorExecutionMaintenanceProgress> {
+        affected_request_ids: Vec<RequestId>,
+    ) -> Result<ExecutorExecutionCapacityDeferral> {
+        if receipts.is_empty() {
+            return Ok(deferral);
+        }
         let status = self
             .plan_resources
             .dynamic_pool_status()
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        ExecutorExecutionMaintenanceProgress::from_growth_receipts(
+        deferral.with_relevant_maintenance_retry(
             attempts,
-            ExecutorAdmissionEpochs::from_capacity(observed),
             receipts,
             status.pools(),
+            affected_request_ids,
         )
     }
 
@@ -4850,17 +4854,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(Self::deferred("sequence extension", &deferred));
                     }
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        let progress = self.execution_maintenance_progress(
-                            backing_attempts,
-                            deferred.epochs(),
-                            &maintenance_receipts,
-                        )?;
-                        return ExecutorExecutionCapacityDeferral::from_pending_maintenance_after_progress(
+                        let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SequenceExtension,
-                            progress,
-                        )
-                        .map(VNextExecutionCapacityDecision::Deferred);
+                        )?;
+                        return self
+                            .bind_execution_maintenance_retry(
+                                deferral,
+                                backing_attempts,
+                                &maintenance_receipts,
+                                vec![sequence.request_id.clone()],
+                            )
+                            .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -4882,17 +4887,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        let progress = self.execution_maintenance_progress(
-                            backing_attempts,
-                            deferred.evidence().epochs(),
-                            &maintenance_receipts,
-                        )?;
-                        return ExecutorExecutionCapacityDeferral::from_backing_after_progress(
+                        let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SequenceExtension,
-                            progress,
-                        )
-                        .map(VNextExecutionCapacityDecision::Deferred);
+                        )?;
+                        return self
+                            .bind_execution_maintenance_retry(
+                                deferral,
+                                backing_attempts,
+                                &maintenance_receipts,
+                                vec![sequence.request_id.clone()],
+                            )
+                            .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = deferred
@@ -5090,17 +5096,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(Self::deferred("step admission", &deferred));
                     }
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        let progress = self.execution_maintenance_progress(
-                            backing_attempts,
-                            deferred.epochs(),
-                            &maintenance_receipts,
-                        )?;
-                        return ExecutorExecutionCapacityDeferral::from_pending_maintenance_after_progress(
+                        let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::StepAdmission,
-                            progress,
-                        )
-                        .map(VNextExecutionCapacityDecision::Deferred);
+                        )?;
+                        return self
+                            .bind_execution_maintenance_retry(
+                                deferral,
+                                backing_attempts,
+                                &maintenance_receipts,
+                                sequences
+                                    .iter()
+                                    .map(|sequence| sequence.request_id.clone())
+                                    .collect(),
+                            )
+                            .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -5122,17 +5132,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        let progress = self.execution_maintenance_progress(
-                            backing_attempts,
-                            deferred.evidence().epochs(),
-                            &maintenance_receipts,
-                        )?;
-                        return ExecutorExecutionCapacityDeferral::from_backing_after_progress(
+                        let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::StepAdmission,
-                            progress,
-                        )
-                        .map(VNextExecutionCapacityDecision::Deferred);
+                        )?;
+                        return self
+                            .bind_execution_maintenance_retry(
+                                deferral,
+                                backing_attempts,
+                                &maintenance_receipts,
+                                sequences
+                                    .iter()
+                                    .map(|sequence| sequence.request_id.clone())
+                                    .collect(),
+                            )
+                            .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = deferred
@@ -5275,17 +5289,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(Self::deferred("submission wave", &deferred));
                     }
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        let progress = self.execution_maintenance_progress(
-                            backing_attempts,
-                            deferred.epochs(),
-                            &maintenance_receipts,
-                        )?;
-                        return ExecutorExecutionCapacityDeferral::from_pending_maintenance_after_progress(
+                        let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SubmissionWave,
-                            progress,
-                        )
-                        .map(VNextExecutionCapacityDecision::Deferred);
+                        )?;
+                        return self
+                            .bind_execution_maintenance_retry(
+                                deferral,
+                                backing_attempts,
+                                &maintenance_receipts,
+                                sequences
+                                    .iter()
+                                    .map(|sequence| sequence.request_id.clone())
+                                    .collect(),
+                            )
+                            .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = self
@@ -5307,17 +5325,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        let progress = self.execution_maintenance_progress(
-                            backing_attempts,
-                            deferred.evidence().epochs(),
-                            &maintenance_receipts,
-                        )?;
-                        return ExecutorExecutionCapacityDeferral::from_backing_after_progress(
+                        let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SubmissionWave,
-                            progress,
-                        )
-                        .map(VNextExecutionCapacityDecision::Deferred);
+                        )?;
+                        return self
+                            .bind_execution_maintenance_retry(
+                                deferral,
+                                backing_attempts,
+                                &maintenance_receipts,
+                                sequences
+                                    .iter()
+                                    .map(|sequence| sequence.request_id.clone())
+                                    .collect(),
+                            )
+                            .map(VNextExecutionCapacityDecision::Deferred);
                     }
                     backing_attempts += 1;
                     let outcome = deferred

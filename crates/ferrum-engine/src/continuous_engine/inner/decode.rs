@@ -191,35 +191,46 @@ impl EngineInner {
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
                     deferral,
-                } if deferral.maintenance_progress().is_some() => {
-                    let progress = deferral
-                        .maintenance_progress()
-                        .expect("guarded maintenance progress remains present");
+                } if deferral.maintenance_retry().is_some() => {
+                    let retry = deferral
+                        .validated_maintenance_retry_scope(&request_ids)?
+                        .expect("guarded maintenance retry remains present");
+                    let affected_request_ids = retry.affected_request_ids();
+                    let unaffected_request_ids =
+                        unaffected_maintenance_retry_frontiers(&request_ids, affected_request_ids);
                     let receipt = self
                         .scheduler
-                        .defer_retry_after_execution_maintenance(&request_ids, progress)?;
-                    if receipt.deferred_count() != request_ids.len() {
+                        .defer_retry_after_execution_maintenance(retry)?;
+                    if receipt.deferred_count() != affected_request_ids.len() {
                         return Err(FerrumError::scheduler(format!(
                             "PlanRuntime decode maintenance retry retained {} of {} scheduler entries",
                             receipt.deferred_count(),
-                            request_ids.len()
+                            affected_request_ids.len()
                         )));
                     }
                     self.trace_executor_decode_capacity_decision(
-                        &request_ids,
+                        affected_request_ids,
                         &deferral,
                         "maintenance_retry",
                         None,
                     );
                     self.write_scheduler_trace_event(serde_json::json!({
                         "event": "scheduler_execution_maintenance_retry",
-                        "request_ids": request_ids,
+                        "request_ids": affected_request_ids,
+                        "input_cohort_request_ids": request_ids,
                         "stage": deferral.stage(),
-                        "maintenance_progress": progress,
+                        "observed": deferral.observed(),
+                        "wait_condition": deferral.wait_condition(),
+                        "shortfalls": deferral.shortfalls(),
+                        "backing_blockers": deferral.backing_blockers(),
+                        "maintenance_retry": retry,
                         "not_before_iteration": receipt.not_before_iteration(),
                         "latest_capacity_epoch": receipt.latest_capacity_epoch(),
                         "scheduler": self.scheduler.trace_snapshot(),
                     }));
+                    if !unaffected_request_ids.is_empty() {
+                        stack.push(unaffected_request_ids);
+                    }
                 }
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,

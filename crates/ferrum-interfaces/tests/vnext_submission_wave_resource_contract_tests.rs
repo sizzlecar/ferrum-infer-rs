@@ -640,7 +640,7 @@ fn released_reusable_lane_slot_wakes_capacity_waiter_and_retries_without_growth(
         deferred.evidence().wait_condition()
     );
     assert!(
-        execution_deferral.maintenance_progress().is_none(),
+        execution_deferral.maintenance_retry().is_none(),
         "a busy reusable slot is a real release wait, not maintenance retry evidence"
     );
     let waiter = deferred.register_waiter().unwrap();
