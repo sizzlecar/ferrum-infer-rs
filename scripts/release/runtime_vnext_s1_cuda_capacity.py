@@ -29,7 +29,7 @@ MAX_PRESSURE_TRACE_BYTES = 16 * 1024 * 1024
 MAX_PRESSURE_JOINT_STREAM_SECONDS = 300.0
 CAPACITY_SCENARIO_VERSION = 2
 CROSS_POOL_REBALANCE_EVIDENCE_OWNER = (
-    "vnext-s1-cuda-decode-capacity/target-sizing"
+    "vnext-s1-cuda-decode-capacity/target-rebalance-probe"
 )
 SERVER_MAX_MODEL_LEN = 256
 SEQUENCE_FIT_POLICY = "full-input-must-fit"
