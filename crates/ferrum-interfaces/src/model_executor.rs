@@ -1600,6 +1600,174 @@ pub enum ExecutorExecutionCapacityStage {
     SubmissionWave,
 }
 
+/// One exact physical pool mutation completed while an executor was trying to
+/// make an unsubmitted frontier runnable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorExecutionMaintenanceMutation {
+    pool_id: crate::vnext::DynamicBackingPoolId,
+    domain_id: crate::vnext::CapacityDomainId,
+    chunk: crate::vnext::BackingChunkIdentity,
+    chunk_bytes: u64,
+    published_capacity_bytes: u64,
+    capacity_epoch: u64,
+}
+
+impl ExecutorExecutionMaintenanceMutation {
+    pub fn pool_id(&self) -> &crate::vnext::DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn domain_id(&self) -> crate::vnext::CapacityDomainId {
+        self.domain_id
+    }
+
+    pub fn chunk(&self) -> &crate::vnext::BackingChunkIdentity {
+        &self.chunk
+    }
+
+    pub const fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes
+    }
+
+    pub const fn published_capacity_bytes(&self) -> u64 {
+        self.published_capacity_bytes
+    }
+
+    pub const fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch
+    }
+}
+
+/// Typed proof that a bounded executor call committed relevant backing growth
+/// before yielding the same logical frontier back to the scheduler.
+///
+/// This is deliberately stronger than observing a global capacity epoch. Every
+/// mutation is reconstructed from a real growth receipt and bound back to the
+/// pool's exact capacity domain. The scheduler may grant one fairness-bounded
+/// retry only when this proof is present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorExecutionMaintenanceProgress {
+    attempts: u32,
+    coordinator_id: NonZeroU64,
+    mutations: Vec<ExecutorExecutionMaintenanceMutation>,
+    latest_capacity_epoch: u64,
+}
+
+impl ExecutorExecutionMaintenanceProgress {
+    pub fn from_growth_receipts(
+        attempts: u32,
+        observed: ExecutorAdmissionEpochs,
+        receipts: &[crate::vnext::DynamicPoolGrowthBatchReceipt],
+        pools: &[crate::vnext::DynamicPoolStatus],
+    ) -> Result<Self> {
+        if attempts == 0 || receipts.is_empty() || receipts.len() > attempts as usize {
+            return Err(FerrumError::internal(
+                "execution maintenance retry requires bounded, non-empty growth receipts",
+            ));
+        }
+
+        let mut mutations = Vec::new();
+        let mut previous_capacity_epoch = None;
+        for receipt in receipts {
+            if receipt.coordinator_id().get() != observed.coordinator_id.get() {
+                return Err(FerrumError::internal(
+                    "execution maintenance receipt belongs to another capacity coordinator",
+                ));
+            }
+            if receipt.growths().is_empty()
+                || previous_capacity_epoch
+                    .is_some_and(|previous| receipt.capacity_epoch() <= previous)
+            {
+                return Err(FerrumError::internal(
+                    "execution maintenance receipts contain no new ordered capacity mutation",
+                ));
+            }
+            previous_capacity_epoch = Some(receipt.capacity_epoch());
+
+            for growth in receipt.growths() {
+                let pool = pools
+                    .iter()
+                    .find(|pool| pool.pool_id() == growth.pool_id())
+                    .ok_or_else(|| {
+                        FerrumError::internal(
+                            "execution maintenance receipt references an unknown dynamic pool",
+                        )
+                    })?;
+                if growth.chunk().pool_id() != growth.pool_id()
+                    || growth.chunk_bytes() == 0
+                    || growth.published_capacity_bytes() == 0
+                    || growth.capacity_epoch() != receipt.capacity_epoch()
+                {
+                    return Err(FerrumError::internal(
+                        "execution maintenance receipt contains an invalid pool mutation",
+                    ));
+                }
+                if mutations
+                    .iter()
+                    .any(|mutation: &ExecutorExecutionMaintenanceMutation| {
+                        mutation.pool_id() == growth.pool_id() && mutation.chunk() == growth.chunk()
+                    })
+                {
+                    return Err(FerrumError::internal(
+                        "execution maintenance receipts repeat one physical pool mutation",
+                    ));
+                }
+                mutations.push(ExecutorExecutionMaintenanceMutation {
+                    pool_id: growth.pool_id().clone(),
+                    domain_id: pool.domain_id(),
+                    chunk: growth.chunk().clone(),
+                    chunk_bytes: growth.chunk_bytes(),
+                    published_capacity_bytes: growth.published_capacity_bytes(),
+                    capacity_epoch: growth.capacity_epoch(),
+                });
+            }
+        }
+
+        let latest_capacity_epoch = previous_capacity_epoch.expect("receipts are non-empty");
+        if latest_capacity_epoch > observed.capacity_epoch {
+            return Err(FerrumError::internal(
+                "execution maintenance receipt is newer than the exported capacity observation",
+            ));
+        }
+        mutations.sort_by(|left, right| {
+            (
+                left.capacity_epoch,
+                left.pool_id.as_str(),
+                left.chunk.ordinal(),
+                left.chunk.generation(),
+            )
+                .cmp(&(
+                    right.capacity_epoch,
+                    right.pool_id.as_str(),
+                    right.chunk.ordinal(),
+                    right.chunk.generation(),
+                ))
+        });
+        Ok(Self {
+            attempts,
+            coordinator_id: observed.coordinator_id,
+            mutations,
+            latest_capacity_epoch,
+        })
+    }
+
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub const fn coordinator_id(&self) -> NonZeroU64 {
+        self.coordinator_id
+    }
+
+    pub fn mutations(&self) -> &[ExecutorExecutionMaintenanceMutation] {
+        &self.mutations
+    }
+
+    pub const fn latest_capacity_epoch(&self) -> u64 {
+        self.latest_capacity_epoch
+    }
+}
+
 /// Scheduler-visible proof that an execution attempt was not submitted and
 /// must not be retried until one of its exact capacity sources changes.
 ///
@@ -1613,6 +1781,8 @@ pub struct ExecutorExecutionCapacityDeferral {
     stage: ExecutorExecutionCapacityStage,
     shortfalls: Vec<crate::vnext::CapacityShortfall>,
     backing_blockers: Vec<crate::vnext::DynamicBackingBlocker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maintenance_progress: Option<ExecutorExecutionMaintenanceProgress>,
 }
 
 impl ExecutorExecutionCapacityDeferral {
@@ -1632,6 +1802,7 @@ impl ExecutorExecutionCapacityDeferral {
             stage,
             shortfalls: Vec::new(),
             backing_blockers: Vec::new(),
+            maintenance_progress: None,
         })
     }
 
@@ -1692,6 +1863,64 @@ impl ExecutorExecutionCapacityDeferral {
         Ok(result)
     }
 
+    /// Export a fresh growable logical deferral after this executor call has
+    /// already committed its bounded maintenance budget.
+    pub fn from_pending_maintenance_after_progress(
+        deferred: &crate::vnext::AdmissionDeferred,
+        stage: ExecutorExecutionCapacityStage,
+        progress: ExecutorExecutionMaintenanceProgress,
+    ) -> Result<Self> {
+        let result = Self::from_pending_maintenance(deferred, stage)?;
+        result.with_maintenance_progress(progress)
+    }
+
+    /// Export a fresh physical-backing deferral after this executor call has
+    /// already committed its bounded maintenance budget.
+    pub fn from_backing_after_progress(
+        deferred: &crate::vnext::DynamicBackingDeferred,
+        stage: ExecutorExecutionCapacityStage,
+        progress: ExecutorExecutionMaintenanceProgress,
+    ) -> Result<Self> {
+        let result = Self::from_backing(deferred, stage)?;
+        result.with_maintenance_progress(progress)
+    }
+
+    fn with_maintenance_progress(
+        mut self,
+        progress: ExecutorExecutionMaintenanceProgress,
+    ) -> Result<Self> {
+        if progress.coordinator_id() != self.observed.coordinator_id
+            || progress.latest_capacity_epoch() > self.observed.capacity_epoch
+            || progress.mutations().is_empty()
+        {
+            return Err(FerrumError::internal(
+                "execution maintenance progress does not match the exported deferral",
+            ));
+        }
+        let relevant_mutation = if self.backing_blockers.is_empty() {
+            progress.mutations().iter().any(|mutation| {
+                self.shortfalls.iter().any(|shortfall| {
+                    shortfall.kind() == crate::vnext::CapacityShortfallKind::BackingGrowthRequired
+                        && shortfall.domain() == Some(mutation.domain_id())
+                })
+            })
+        } else {
+            progress.mutations().iter().any(|mutation| {
+                self.backing_blockers.iter().any(|blocker| {
+                    blocker.pool_id() == mutation.pool_id()
+                        && blocker.domain_id() == mutation.domain_id()
+                })
+            })
+        };
+        if !relevant_mutation {
+            return Err(FerrumError::internal(
+                "execution maintenance progress does not mutate a blocked pool or domain",
+            ));
+        }
+        self.maintenance_progress = Some(progress);
+        Ok(self)
+    }
+
     pub fn from_maintenance(
         source: &crate::vnext::AdmissionDeferred,
         observed: ExecutorAdmissionEpochs,
@@ -1726,6 +1955,10 @@ impl ExecutorExecutionCapacityDeferral {
 
     pub fn backing_blockers(&self) -> &[crate::vnext::DynamicBackingBlocker] {
         &self.backing_blockers
+    }
+
+    pub fn maintenance_progress(&self) -> Option<&ExecutorExecutionMaintenanceProgress> {
+        self.maintenance_progress.as_ref()
     }
 
     /// Return a strictly smaller, capacity-informed prefill width.

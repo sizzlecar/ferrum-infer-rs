@@ -3,7 +3,8 @@ mod resource_support;
 mod vnext_core_contract;
 
 use ferrum_interfaces::model_executor::{
-    ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+    ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+    ExecutorExecutionMaintenanceProgress,
 };
 use ferrum_interfaces::vnext::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -638,6 +639,10 @@ fn released_reusable_lane_slot_wakes_capacity_waiter_and_retries_without_growth(
         execution_deferral.wait_condition(),
         deferred.evidence().wait_condition()
     );
+    assert!(
+        execution_deferral.maintenance_progress().is_none(),
+        "a busy reusable slot is a real release wait, not maintenance retry evidence"
+    );
     let waiter = deferred.register_waiter().unwrap();
     assert!(!waiter.recheck().unwrap().changed_since_registration());
 
@@ -839,10 +844,35 @@ fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
         .to_string()
         .contains("step cannot finalize while an invocation or scheduler clone retains it"));
     let step = failure.into_step();
-    assert!(matches!(
-        deferred.maintain().unwrap(),
-        DynamicDeferredMaintenanceOutcome::Maintained(_)
-    ));
+    let maintenance_receipt = match deferred.maintain().unwrap() {
+        DynamicDeferredMaintenanceOutcome::Maintained(receipt) => receipt,
+        _ => panic!("the exact backing deferral must publish physical growth"),
+    };
+    let mut availability = Vec::new();
+    let observed = root
+        .write_dynamic_capacity_availability(&mut availability)
+        .unwrap();
+    let status = root.dynamic_pool_status().unwrap();
+    let progress = ExecutorExecutionMaintenanceProgress::from_growth_receipts(
+        1,
+        ExecutorAdmissionEpochs::from_capacity(observed),
+        std::slice::from_ref(&maintenance_receipt),
+        status.pools(),
+    )
+    .unwrap();
+    assert_eq!(progress.attempts(), 1);
+    assert_eq!(progress.latest_capacity_epoch(), observed.capacity_epoch());
+    assert_eq!(
+        progress.mutations().len(),
+        maintenance_receipt.growths().len()
+    );
+    assert!(progress.mutations().iter().all(|mutation| {
+        maintenance_receipt.growths().iter().any(|growth| {
+            growth.pool_id() == mutation.pool_id()
+                && growth.chunk() == mutation.chunk()
+                && growth.capacity_epoch() == mutation.capacity_epoch()
+        })
+    }));
     drop(deferred);
 
     let wave = match step.try_prepare_submission_wave(requests).unwrap() {

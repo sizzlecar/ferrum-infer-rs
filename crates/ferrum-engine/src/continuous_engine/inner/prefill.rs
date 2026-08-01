@@ -428,6 +428,30 @@ impl EngineInner {
             }
             PlanRuntimePrefillOutcome::Deferred(deferral) => {
                 drop(workspace_lease);
+                if let Some(progress) = deferral.maintenance_progress() {
+                    let receipt = self.scheduler.defer_retry_after_execution_maintenance(
+                        std::slice::from_ref(request_id),
+                        progress,
+                    )?;
+                    if receipt.deferred_count() != 1 {
+                        return Err(FerrumError::scheduler(format!(
+                            "PlanRuntime prefill maintenance retry retained {} scheduler entries for {request_id}",
+                            receipt.deferred_count()
+                        )));
+                    }
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "scheduler_prefill_execution_maintenance_retry",
+                        "request_id": request_id,
+                        "tokens_processed": chunk.tokens_processed(),
+                        "tokens_to_process": chunk.tokens_to_process(),
+                        "stage": deferral.stage(),
+                        "maintenance_progress": progress,
+                        "not_before_iteration": receipt.not_before_iteration(),
+                        "latest_capacity_epoch": receipt.latest_capacity_epoch(),
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                    return Ok(());
+                }
                 let observed = deferral.observed();
                 let scheduler_deferral = AdmissionDeferral::new(
                     DeferredAction::WaitForRelease,
