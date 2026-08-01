@@ -1,5 +1,3 @@
-use std::ops::Range;
-
 use super::super::ResourceTransactionIdentity;
 use super::{
     invalid_operation, BufferDescriptor, BufferUsage, DeviceBufferRetention, DeviceRuntime,

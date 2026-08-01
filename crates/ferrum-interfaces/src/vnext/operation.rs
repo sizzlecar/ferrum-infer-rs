@@ -1,26 +1,24 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Write};
 
 use super::{
-    classify_device_error, AdmittedSequenceResources, AllocationLifetime, BatchInvocationId,
-    BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
-    BufferDescriptor, BufferUsage, CanonicalRational, CapabilityId, ClaimedSubmissionWaveBacking,
-    ContractVersion, DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm,
-    DeviceBufferRetention, DeviceCommandBatch, DeviceCommandLogicalWork, DeviceId,
-    DeviceReusableAddressScope, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DynamicResourceDemand, DynamicResourceShape, EncodedDeviceOperation,
-    EncodedReusableExecutionBindings, ExecutablePlanView, ExecutionIdentityEnvelope,
-    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, HostTransferLayout,
-    InvocationResourceLease, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    AdmittedSequenceResources, AllocationLifetime, BatchInvocationId, BatchParticipantAuthority,
+    BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
+    CanonicalRational, CapabilityId, ClaimedSubmissionWaveBacking, ContractVersion,
+    DeviceBufferRetention, DeviceId, DeviceReusableAddressScope,
+    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DynamicResourceDemand,
+    DynamicResourceShape, EncodedDeviceOperation, EncodedReusableExecutionBindings,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    ExecutionLaneId, InvocationResourceLease, LeasedBufferView, LogicalAdmissionCoordinatorId,
     LogicalBackingBufferView, LogicalBackingSegmentBinding, LogicalBackingSliceAuthority,
     MemoryPlan, NodeId, NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey,
     PlanHash, PlanId, PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave,
     ProgramBindingNodeBinding, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, QuantizationFormatId, RequestIdentity, ResolvedWeightBinding,
-    ResourceId, ResourcePoolId, ResourceWorkShape, RunId, SemanticValue, SequenceBackingSnapshot,
+    ResourceId, ResourcePoolId, RunId, SemanticValue, SequenceBackingSnapshot,
     SequenceSessionEpoch, SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment,
     StepResourceLease, TransactionId, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence,
     UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
@@ -33,10 +31,12 @@ mod compiled_submission_wave;
 mod determinism;
 mod determinism_artifact;
 mod dispatch;
+mod dispatch_contract;
 mod identity;
 mod invocation;
 mod provider;
 mod registry;
+mod workspace_encoding;
 
 pub use buffer_view::{
     OperationBufferRegionIter, OperationBufferRegions, OperationBufferStorageKind,
@@ -58,11 +58,12 @@ pub use determinism_artifact::{
     SubmissionWaveDeterminismArtifactPhysicalCommand,
     SubmissionWaveDeterminismArtifactReplayedSegment, SubmissionWaveDeterminismArtifactWitness,
 };
-pub use dispatch::{
-    BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatch,
-    OperationDispatchError, ProfiledSubmissionHandle, SubmissionExecutionPolicy,
-    SubmissionScratchInitialization, SubmissionWaveDispatchError, SubmissionWaveDispatchStage,
-    SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
+pub use dispatch::OperationDispatch;
+pub use dispatch_contract::{
+    BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatchError,
+    ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,
+    SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
+    SubmissionWaveInputUpload,
 };
 pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,
