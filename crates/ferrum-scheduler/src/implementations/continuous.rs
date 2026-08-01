@@ -480,6 +480,8 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub dynamic_backing_growth_requested: u64,
     pub dynamic_admission_failed: u64,
     pub pressure_episodes_created: u64,
+    pub pressure_episodes_merged: u64,
+    pub pressure_episode_bridges_deferred: u64,
     pub pressure_active_episodes: usize,
     pub pressure_pending_release_fences: usize,
     pub pressure_candidate_scans: u64,
@@ -884,6 +886,8 @@ impl ContinuousBatchScheduler {
                 .load(Ordering::Relaxed),
             dynamic_admission_failed: self.dynamic_admission_failed.load(Ordering::Relaxed),
             pressure_episodes_created: pressure.episodes_created,
+            pressure_episodes_merged: pressure.episodes_merged,
+            pressure_episode_bridges_deferred: pressure.episode_bridges_deferred,
             pressure_active_episodes: pressure.active_episodes,
             pressure_pending_release_fences: pressure.pending_release_fences,
             pressure_candidate_scans: pressure.candidate_scans,
@@ -3906,6 +3910,90 @@ mod tests {
         assert_eq!(trace.dynamic_admission_probes, 3);
         assert_eq!(trace.dynamic_admission_skipped_unchanged, 1);
         assert_eq!(trace.dynamic_admission_deferred, 1);
+    }
+
+    #[tokio::test]
+    async fn open_pressure_episode_closes_after_resumed_decode_commits_progress() {
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
+            CapacityWaitCondition, DeferredAction,
+        };
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let blocked = create_test_request(Priority::Normal);
+        let blocked_id = blocked.id.clone();
+        let peer = create_test_request(Priority::Normal);
+        let peer_id = peer.id.clone();
+        scheduler.submit(blocked).await.unwrap();
+        scheduler.submit(peer).await.unwrap();
+
+        let source = CapacityAvailabilitySource::Domain(CapacityDomainId::new(8).unwrap());
+        let availability0 = [CapacityAvailabilityEpoch::new(source, 1).unwrap()];
+        let wake0 = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 0, 0, 0);
+        let admitted = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake0, &availability0),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.size(), 2);
+        scheduler.mark_prefill_complete(&blocked_id, 1);
+        scheduler.mark_prefill_complete(&peer_id, 1);
+
+        let condition =
+            CapacityWaitCondition::from_observation(29, availability0.to_vec()).unwrap();
+        assert_eq!(
+            scheduler
+                .defer_decode_for_execution_capacity(
+                    std::slice::from_ref(&blocked_id),
+                    AdmissionDeferral::new(DeferredAction::WaitForRelease, wake0, condition),
+                    &ExecutionCapacityReleaseSnapshot::default(),
+                )
+                .unwrap(),
+            ExecutionCapacityAction::Deferred { count: 1 }
+        );
+        assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 1);
+
+        let availability1 = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
+        let wake1 = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
+        let resumed = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake1, &availability1),
+                &mut |_| panic!("decode resume must not probe waiting admission"),
+            )
+            .unwrap()
+            .expect("the exact-source wake must make the blocked decode schedulable");
+        assert!(resumed
+            .requests
+            .iter()
+            .any(|request| request.request.id == blocked_id));
+        assert_eq!(
+            scheduler.trace_snapshot().pressure_active_episodes,
+            1,
+            "an epoch change permits retry but is not execution-success evidence"
+        );
+
+        scheduler.update_decode_progress(&blocked_id, 1);
+        let snapshot = scheduler.trace_snapshot();
+        assert_eq!(snapshot.pressure_active_episodes, 0);
+        let journal = scheduler.pressure_transition_journal();
+        let satisfied = journal
+            .iter()
+            .find(|transition| transition.kind() == PressureTransitionKind::WaitSatisfied)
+            .unwrap();
+        let closed = journal
+            .iter()
+            .find(|transition| transition.kind() == PressureTransitionKind::Closed)
+            .unwrap();
+        assert!(satisfied.ordinal() < closed.ordinal());
     }
 
     #[tokio::test]

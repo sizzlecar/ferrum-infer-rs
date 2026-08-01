@@ -196,6 +196,9 @@ pub enum PressureEpisodeState {
 pub enum PressureTransitionKind {
     Opened,
     FrontierBlocked,
+    WaitSatisfied,
+    EpisodeMerged,
+    EpisodeBridgeDeferred,
     YieldPlanned,
     YieldAborted,
     ReleaseFenceArmed,
@@ -215,6 +218,8 @@ pub struct PressureTransition {
     kind: PressureTransitionKind,
     request_id: Option<RequestId>,
     peer_request_id: Option<RequestId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    related_episode_id: Option<PressureEpisodeId>,
     state: PressureEpisodeState,
 }
 
@@ -237,6 +242,10 @@ impl PressureTransition {
 
     pub fn peer_request_id(&self) -> Option<&RequestId> {
         self.peer_request_id.as_ref()
+    }
+
+    pub const fn related_episode_id(&self) -> Option<PressureEpisodeId> {
+        self.related_episode_id
     }
 
     pub const fn state(&self) -> PressureEpisodeState {
@@ -288,6 +297,7 @@ struct PressureParticipant {
 
 #[derive(Debug)]
 struct PressureEpisode {
+    coordinator_id: LogicalAdmissionCoordinatorId,
     state: PressureEpisodeState,
     observed: BTreeMap<CapacityAvailabilitySource, u64>,
     participants: HashMap<RequestId, PressureParticipant>,
@@ -302,6 +312,7 @@ struct PressureEpisode {
 impl PressureEpisode {
     fn new(condition: &CapacityWaitCondition) -> PressureEpisode {
         Self {
+            coordinator_id: condition.coordinator_id(),
             state: PressureEpisodeState::Open,
             observed: observed_map(condition),
             participants: HashMap::new(),
@@ -313,6 +324,27 @@ impl PressureEpisode {
             last_release_condition: None,
         }
     }
+
+    fn is_mergeable_open(&self) -> bool {
+        self.state == PressureEpisodeState::Open
+            && self.handoff_generation == 0
+            && self.progress_owner.is_none()
+            && self.last_transaction_victim.is_none()
+            && self.owner_admission_pending_ordinal.is_none()
+            && self.last_release_condition.is_none()
+            && self.participants.values().all(|participant| {
+                matches!(
+                    participant.state,
+                    ParticipantState::Runnable | ParticipantState::Blocked { .. }
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressureEpisodeResolution {
+    Ready(PressureEpisodeId),
+    BridgeDeferred(PressureEpisodeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -507,6 +539,8 @@ struct ReleasedHold {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct PressureCoordinatorStats {
     pub(crate) episodes_created: u64,
+    pub(crate) episodes_merged: u64,
+    pub(crate) episode_bridges_deferred: u64,
     pub(crate) candidate_scans: u64,
     pub(crate) active_episodes: usize,
     pub(crate) pending_release_fences: usize,
@@ -646,7 +680,15 @@ impl PressureCoordinator {
             .candidate_scans
             .saturating_add(u64::try_from(candidates.len()).unwrap_or(u64::MAX));
 
-        let episode_id = self.find_or_open_episode_for(condition, request_ids)?;
+        let episode_id = match self.find_or_open_episode_for(condition, request_ids)? {
+            PressureEpisodeResolution::Ready(episode_id) => episode_id,
+            PressureEpisodeResolution::BridgeDeferred(episode_id) => {
+                return Ok(PressureDecision::Deferred {
+                    episode_id,
+                    count: requested.len(),
+                });
+            }
+        };
         let current_observed = observed_map(condition);
         let previous_state = self
             .episodes
@@ -1091,8 +1133,31 @@ impl PressureCoordinator {
         let Some(episode) = self.episodes.get_mut(&episode_id) else {
             return Ok(());
         };
+        let wait_satisfied = episode.state == PressureEpisodeState::Open
+            && episode
+                .participants
+                .get(request_id)
+                .is_some_and(|participant| {
+                    matches!(participant.state, ParticipantState::Blocked { .. })
+                        && progress > participant.progress
+                });
         if let Some(participant) = episode.participants.get_mut(request_id) {
             participant.progress = participant.progress.max(progress);
+        }
+        if wait_satisfied {
+            self.record_transition(
+                episode_id,
+                PressureTransitionKind::WaitSatisfied,
+                Some(request_id.clone()),
+                None,
+                PressureEpisodeState::Open,
+            )?;
+            // An Open episode is only a connected liveness observation. Once a
+            // blocked frontier commits useful work, that observation is over.
+            // Close the whole episode because its source index is an episode
+            // union rather than per-participant ownership; other exact-source
+            // deferrals remain installed and can open a fresh episode if needed.
+            self.close_episode(episode_id, None)?;
         }
         // Logical token progress consumes resident capacity; it does not prove
         // that a held peer can be re-admitted. Keep the peer held until the
@@ -1325,7 +1390,7 @@ impl PressureCoordinator {
         &mut self,
         condition: &CapacityWaitCondition,
         request_ids: &[RequestId],
-    ) -> Result<PressureEpisodeId, PressureCoordinatorError> {
+    ) -> Result<PressureEpisodeResolution, PressureCoordinatorError> {
         let mut existing = condition
             .observed()
             .iter()
@@ -1344,9 +1409,60 @@ impl PressureCoordinator {
         existing.sort_unstable();
         existing.dedup();
         if existing.len() > 1 {
-            return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
+            let same_coordinator = existing.iter().all(|episode_id| {
+                self.episodes
+                    .get(episode_id)
+                    .is_some_and(|episode| episode.coordinator_id == condition.coordinator_id())
+            });
+            if !same_coordinator {
+                return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
+            }
+            let all_mergeable = existing.iter().all(|episode_id| {
+                self.episodes
+                    .get(episode_id)
+                    .is_some_and(PressureEpisode::is_mergeable_open)
+            });
+            if all_mergeable {
+                let canonical = existing[0];
+                self.merge_open_episodes(canonical, &existing[1..])?;
+                for source in condition
+                    .observed()
+                    .iter()
+                    .filter(|source| is_request_release_source(source.source()))
+                {
+                    self.source_index
+                        .insert((condition.coordinator_id(), source.source()), canonical);
+                }
+                return Ok(PressureEpisodeResolution::Ready(canonical));
+            }
+
+            let canonical = existing[0];
+            self.stats.episode_bridges_deferred =
+                self.stats.episode_bridges_deferred.saturating_add(1);
+            for related in existing.iter().copied().skip(1) {
+                let state = self
+                    .episodes
+                    .get(&canonical)
+                    .map_or(PressureEpisodeState::Closed, |episode| episode.state);
+                self.record_related_transition(
+                    canonical,
+                    PressureTransitionKind::EpisodeBridgeDeferred,
+                    request_ids.first().cloned(),
+                    None,
+                    Some(related),
+                    state,
+                )?;
+            }
+            return Ok(PressureEpisodeResolution::BridgeDeferred(canonical));
         }
         if let Some(id) = existing.first().copied() {
+            let episode = self
+                .episodes
+                .get(&id)
+                .ok_or(PressureCoordinatorError::UnknownEpisode(id))?;
+            if episode.coordinator_id != condition.coordinator_id() {
+                return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
+            }
             for source in condition
                 .observed()
                 .iter()
@@ -1355,7 +1471,7 @@ impl PressureCoordinator {
                 self.source_index
                     .insert((condition.coordinator_id(), source.source()), id);
             }
-            return Ok(id);
+            return Ok(PressureEpisodeResolution::Ready(id));
         }
 
         let id = PressureEpisodeId(self.next_episode_id);
@@ -1381,7 +1497,57 @@ impl PressureCoordinator {
             None,
             PressureEpisodeState::Open,
         )?;
-        Ok(id)
+        Ok(PressureEpisodeResolution::Ready(id))
+    }
+
+    fn merge_open_episodes(
+        &mut self,
+        canonical_id: PressureEpisodeId,
+        absorbed_ids: &[PressureEpisodeId],
+    ) -> Result<(), PressureCoordinatorError> {
+        for absorbed_id in absorbed_ids.iter().copied() {
+            let absorbed = self
+                .episodes
+                .remove(&absorbed_id)
+                .ok_or(PressureCoordinatorError::UnknownEpisode(absorbed_id))?;
+            let canonical = self
+                .episodes
+                .get_mut(&canonical_id)
+                .ok_or(PressureCoordinatorError::UnknownEpisode(canonical_id))?;
+            debug_assert!(canonical.is_mergeable_open());
+            debug_assert!(absorbed.is_mergeable_open());
+            debug_assert_eq!(canonical.coordinator_id, absorbed.coordinator_id);
+
+            for (source, epoch) in absorbed.observed {
+                canonical
+                    .observed
+                    .entry(source)
+                    .and_modify(|current| *current = (*current).max(epoch))
+                    .or_insert(epoch);
+            }
+            for (request_id, participant) in absorbed.participants {
+                canonical
+                    .participants
+                    .entry(request_id.clone())
+                    .or_insert(participant);
+                self.request_index.insert(request_id, canonical_id);
+            }
+            self.source_index.values_mut().for_each(|episode_id| {
+                if *episode_id == absorbed_id {
+                    *episode_id = canonical_id;
+                }
+            });
+            self.stats.episodes_merged = self.stats.episodes_merged.saturating_add(1);
+            self.record_related_transition(
+                canonical_id,
+                PressureTransitionKind::EpisodeMerged,
+                None,
+                None,
+                Some(absorbed_id),
+                PressureEpisodeState::Open,
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_transaction(
@@ -1470,6 +1636,18 @@ impl PressureCoordinator {
         peer_request_id: Option<RequestId>,
         state: PressureEpisodeState,
     ) -> Result<PressureTransitionOrdinal, PressureCoordinatorError> {
+        self.record_related_transition(episode_id, kind, request_id, peer_request_id, None, state)
+    }
+
+    fn record_related_transition(
+        &mut self,
+        episode_id: PressureEpisodeId,
+        kind: PressureTransitionKind,
+        request_id: Option<RequestId>,
+        peer_request_id: Option<RequestId>,
+        related_episode_id: Option<PressureEpisodeId>,
+        state: PressureEpisodeState,
+    ) -> Result<PressureTransitionOrdinal, PressureCoordinatorError> {
         let ordinal = PressureTransitionOrdinal(self.next_transition_ordinal);
         self.next_transition_ordinal = self
             .next_transition_ordinal
@@ -1486,6 +1664,7 @@ impl PressureCoordinator {
             kind,
             request_id,
             peer_request_id,
+            related_episode_id,
             state,
         });
         self.stats.last_transition_ordinal = ordinal.get();
@@ -1627,14 +1806,18 @@ mod tests {
         let only_b = condition_for(&[(source_b, 1)]);
         let mut coordinator = PressureCoordinator::default();
 
-        let episode = coordinator.find_or_open_episode_for(&only_a, &[]).unwrap();
+        let PressureEpisodeResolution::Ready(episode) =
+            coordinator.find_or_open_episode_for(&only_a, &[]).unwrap()
+        else {
+            panic!("a new source must open an episode");
+        };
         assert_eq!(
             coordinator.find_or_open_episode_for(&a_and_b, &[]).unwrap(),
-            episode
+            PressureEpisodeResolution::Ready(episode)
         );
         assert_eq!(
             coordinator.find_or_open_episode_for(&only_b, &[]).unwrap(),
-            episode
+            PressureEpisodeResolution::Ready(episode)
         );
         assert_eq!(coordinator.stats().active_episodes, 1);
     }
@@ -1661,12 +1844,18 @@ mod tests {
         let mut coordinator = PressureCoordinator::default();
 
         assert!(!waits_overlap(&domain_two, &domain_four));
-        let first = coordinator
+        let PressureEpisodeResolution::Ready(first) = coordinator
             .find_or_open_episode_for(&domain_two, &[])
-            .unwrap();
-        let second = coordinator
+            .unwrap()
+        else {
+            panic!("the first disjoint source must open an episode");
+        };
+        let PressureEpisodeResolution::Ready(second) = coordinator
             .find_or_open_episode_for(&domain_four, &[])
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("the second disjoint source must open an episode");
+        };
 
         assert_ne!(first, second);
         assert_eq!(coordinator.stats().active_episodes, 2);
@@ -1675,6 +1864,181 @@ mod tests {
             .source_index
             .keys()
             .all(|(_, source)| is_request_release_source(*source)));
+    }
+
+    #[test]
+    fn two_preopened_open_episodes_bridge_into_oldest_episode() {
+        let request_a = RequestId::new();
+        let request_b = RequestId::new();
+        let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
+        let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
+        let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
+            CapacityWaitCondition::from_observation(
+                41,
+                sources
+                    .iter()
+                    .map(|(source, epoch)| CapacityAvailabilityEpoch::new(*source, *epoch).unwrap())
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let only_a = condition_for(&[(source_a, 1)]);
+        let only_b = condition_for(&[(source_b, 1)]);
+        let bridge = condition_for(&[(source_a, 1), (source_b, 1)]);
+        let mut coordinator = PressureCoordinator::default();
+
+        assert!(matches!(
+            coordinator
+                .plan_failure(
+                    std::slice::from_ref(&request_a),
+                    &only_a,
+                    &[candidate(
+                        &request_a,
+                        LogicalWorkKind::Decode,
+                        3,
+                        false,
+                        None,
+                    )],
+                )
+                .unwrap(),
+            PressureDecision::Deferred { count: 1, .. }
+        ));
+        let first_episode = coordinator.request_index[&request_a];
+        assert!(matches!(
+            coordinator
+                .plan_failure(
+                    std::slice::from_ref(&request_b),
+                    &only_b,
+                    &[candidate(
+                        &request_b,
+                        LogicalWorkKind::Decode,
+                        5,
+                        false,
+                        None,
+                    )],
+                )
+                .unwrap(),
+            PressureDecision::Deferred { count: 1, .. }
+        ));
+        let second_episode = coordinator.request_index[&request_b];
+        assert_ne!(first_episode, second_episode);
+
+        assert_eq!(
+            coordinator
+                .find_or_open_episode_for(&bridge, std::slice::from_ref(&request_a))
+                .unwrap(),
+            PressureEpisodeResolution::Ready(first_episode)
+        );
+        assert_eq!(coordinator.request_index[&request_a], first_episode);
+        assert_eq!(coordinator.request_index[&request_b], first_episode);
+        assert!(coordinator
+            .source_index
+            .values()
+            .all(|episode_id| *episode_id == first_episode));
+        assert_eq!(coordinator.stats().active_episodes, 1);
+        assert_eq!(coordinator.stats().episodes_merged, 1);
+        assert!(coordinator.journal().iter().any(|transition| {
+            transition.kind() == PressureTransitionKind::EpisodeMerged
+                && transition.episode_id() == first_episode
+                && transition.related_episode_id() == Some(second_episode)
+        }));
+    }
+
+    #[test]
+    fn transactional_episode_bridge_defers_without_invalidating_transaction() {
+        let owner = RequestId::new();
+        let victim = RequestId::new();
+        let independent = RequestId::new();
+        let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
+        let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
+        let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
+            CapacityWaitCondition::from_observation(
+                41,
+                sources
+                    .iter()
+                    .map(|(source, epoch)| CapacityAvailabilityEpoch::new(*source, *epoch).unwrap())
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let only_a = condition_for(&[(source_a, 1)]);
+        let only_b = condition_for(&[(source_b, 1)]);
+        let bridge = condition_for(&[(source_a, 1), (source_b, 1)]);
+        let mut coordinator = PressureCoordinator::default();
+
+        coordinator
+            .plan_failure(
+                std::slice::from_ref(&owner),
+                &only_a,
+                &[
+                    candidate(&owner, LogicalWorkKind::Decode, 3, true, None),
+                    candidate(&victim, LogicalWorkKind::Decode, 5, true, None),
+                ],
+            )
+            .unwrap();
+        let transaction = match coordinator
+            .plan_failure(
+                std::slice::from_ref(&victim),
+                &only_a,
+                &[
+                    candidate(
+                        &owner,
+                        LogicalWorkKind::Decode,
+                        3,
+                        true,
+                        Some(only_a.clone()),
+                    ),
+                    candidate(&victim, LogicalWorkKind::Decode, 5, true, None),
+                ],
+            )
+            .unwrap()
+        {
+            PressureDecision::YieldPlanned(transaction) => transaction,
+            other => panic!("expected a pending release transaction, got {other:?}"),
+        };
+        assert!(matches!(
+            coordinator
+                .plan_failure(
+                    std::slice::from_ref(&independent),
+                    &only_b,
+                    &[candidate(
+                        &independent,
+                        LogicalWorkKind::Decode,
+                        7,
+                        false,
+                        None,
+                    )],
+                )
+                .unwrap(),
+            PressureDecision::Deferred { count: 1, .. }
+        ));
+        let independent_episode = coordinator.request_index[&independent];
+
+        assert!(matches!(
+            coordinator
+                .plan_failure(
+                    std::slice::from_ref(&independent),
+                    &bridge,
+                    &[candidate(
+                        &independent,
+                        LogicalWorkKind::Decode,
+                        7,
+                        false,
+                        Some(only_b),
+                    )],
+                )
+                .unwrap(),
+            PressureDecision::Deferred { count: 1, .. }
+        ));
+        assert_eq!(coordinator.stats().active_episodes, 2);
+        assert_eq!(coordinator.stats().episodes_merged, 0);
+        assert_eq!(coordinator.stats().episode_bridges_deferred, 1);
+        assert_eq!(coordinator.request_index[&independent], independent_episode);
+        assert!(coordinator.journal().iter().any(|transition| {
+            transition.kind() == PressureTransitionKind::EpisodeBridgeDeferred
+                && transition.related_episode_id().is_some()
+        }));
+        coordinator.arm_release_fence(&transaction).unwrap();
     }
 
     #[test]
@@ -1778,6 +2142,52 @@ mod tests {
         };
         assert_eq!(transaction.progress_owner_id(), &oldest);
         assert_eq!(transaction.victim_request_id(), &newer);
+    }
+
+    #[test]
+    fn blocked_open_episode_retires_only_after_strict_logical_progress() {
+        let request_id = RequestId::new();
+        let wait = condition(7);
+        let mut coordinator = PressureCoordinator::default();
+
+        assert!(matches!(
+            coordinator
+                .plan_failure(
+                    std::slice::from_ref(&request_id),
+                    &wait,
+                    &[candidate(
+                        &request_id,
+                        LogicalWorkKind::Decode,
+                        3,
+                        false,
+                        None,
+                    )],
+                )
+                .unwrap(),
+            PressureDecision::Deferred { count: 1, .. }
+        ));
+        coordinator
+            .record_progress(&request_id, LogicalWorkGeneration(3))
+            .unwrap();
+        assert_eq!(coordinator.stats().active_episodes, 1);
+
+        coordinator
+            .record_progress(&request_id, LogicalWorkGeneration(4))
+            .unwrap();
+
+        assert_eq!(coordinator.stats().active_episodes, 0);
+        assert!(coordinator.request_index.is_empty());
+        assert!(coordinator.source_index.is_empty());
+        let journal = coordinator.journal();
+        let satisfied = journal
+            .iter()
+            .find(|transition| transition.kind() == PressureTransitionKind::WaitSatisfied)
+            .expect("strict logical progress must satisfy the Open wait");
+        let closed = journal
+            .iter()
+            .find(|transition| transition.kind() == PressureTransitionKind::Closed)
+            .expect("the satisfied Open episode must close");
+        assert!(satisfied.ordinal() < closed.ordinal());
     }
 
     #[test]
