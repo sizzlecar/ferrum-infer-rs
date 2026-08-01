@@ -14,9 +14,13 @@ use super::foundation::{invalid_operation, operation_error_for_node};
 use super::{
     EngineProviderDescriptor, OperationDescriptor, OperationProviderDescriptor, OracleSpec,
     ProviderCompatibilityRejectReason, ProviderCompatibilityRejection, ProviderCompatibilityReport,
-    ProviderCompatibilityRequest, MAX_ENGINE_PROVIDER_ROWS, MAX_OPERATION_CATALOG_ROWS,
-    MAX_OPERATION_PROVIDER_ROWS, MAX_REFERENCE_ORACLE_DEPTH,
+    ProviderCompatibilityRequest,
 };
+
+pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
+pub const MAX_OPERATION_PROVIDER_ROWS: usize = 16384;
+pub const MAX_ENGINE_PROVIDER_ROWS: usize = 4096;
+pub const MAX_REFERENCE_ORACLE_DEPTH: usize = 64;
 
 /// Deterministically ordered provider capabilities consumed once by planning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

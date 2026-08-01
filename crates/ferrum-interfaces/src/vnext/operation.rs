@@ -14,18 +14,20 @@ mod invocation;
 mod provider;
 mod registry;
 mod resolved_value;
+mod semantic;
 mod storage_profile;
 mod tensor_contract;
 mod workspace_encoding;
 
-pub use attribute::{
-    AttributeConstraint, AttributeId, AttributeSchema, AttributeSpec, AttributeValueKind,
-};
+pub use attribute::{AttributeConstraint, AttributeSchema, AttributeSpec};
 pub use buffer_view::{
     OperationBufferRegionIter, OperationBufferRegions, OperationBufferStorageKind,
     OperationBufferView, OperationPhysicalRegion,
 };
-pub use catalog::CapabilityCatalog;
+pub use catalog::{
+    CapabilityCatalog, MAX_ENGINE_PROVIDER_ROWS, MAX_OPERATION_CATALOG_ROWS,
+    MAX_OPERATION_PROVIDER_ROWS, MAX_REFERENCE_ORACLE_DEPTH,
+};
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
@@ -63,7 +65,7 @@ pub use provider::{
     ProviderCompatibilityReport, ProviderCompatibilityRequest,
     ProviderExecutionContractFingerprint, ProviderExecutionRepeatability,
     ProviderExecutionSemantics, ProviderReplayEquivalence, UnvalidatedOperationFailure,
-    PROVIDER_EXECUTION_SEMANTICS_VERSION,
+    MAX_OPERATION_FAILURE_WIRE_BYTES, PROVIDER_EXECUTION_SEMANTICS_VERSION,
 };
 pub(crate) use registry::OperationRegistryAuthority;
 pub use registry::{
@@ -76,6 +78,7 @@ pub use resolved_value::{
     ProviderStorageBindingRequirement, ResolvedStorageComponent, ResolvedValueBinding,
     ResolvedValueRole, ResolvedValueStorage,
 };
+pub use semantic::{AttributeId, AttributeValueKind, CanonicalRational, SemanticValue};
 pub use storage_profile::{
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
     ElementType,
@@ -84,9 +87,3 @@ pub use tensor_contract::{
     AliasPolicy, BlockedTensorPadding, DimensionConstraint, LayoutConstraint, ResolvedTensorLayout,
     ResolvedTensorSpec, StrideConstraint, TensorAccess, TensorContract,
 };
-
-pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
-pub const MAX_OPERATION_PROVIDER_ROWS: usize = 16384;
-pub const MAX_ENGINE_PROVIDER_ROWS: usize = 4096;
-pub const MAX_OPERATION_FAILURE_WIRE_BYTES: usize = 16 * 1024;
-pub const MAX_REFERENCE_ORACLE_DEPTH: usize = 64;

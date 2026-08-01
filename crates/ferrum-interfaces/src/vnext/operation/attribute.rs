@@ -1,74 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::super::{CanonicalRational, SemanticValue, VNextError};
+use super::super::VNextError;
 use super::foundation::invalid_operation;
-
-/// Stable semantic attribute identity. Attribute names are data, not ad-hoc
-/// strings interpreted by an individual provider.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct AttributeId(String);
-
-impl AttributeId {
-    pub fn new(value: impl Into<String>) -> Result<Self, VNextError> {
-        let value = value.into();
-        if value.is_empty() || value.len() > 160 {
-            return Err(VNextError::InvalidIdentity {
-                kind: "operation attribute",
-                value,
-                reason: "identity must contain between 1 and 160 bytes",
-            });
-        }
-        if !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
-        }) {
-            return Err(VNextError::InvalidIdentity {
-                kind: "operation attribute",
-                value,
-                reason: "identity contains a non-portable character",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for AttributeId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl TryFrom<String> for AttributeId {
-    type Error = VNextError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<AttributeId> for String {
-    fn from(value: AttributeId) -> Self {
-        value.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttributeValueKind {
-    Bool,
-    Integer,
-    Unsigned,
-    Rational,
-    Text,
-    Integers,
-}
+use super::{AttributeId, AttributeValueKind, CanonicalRational, SemanticValue};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

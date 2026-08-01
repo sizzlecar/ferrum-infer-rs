@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::super::is_canonical_sha256;
+use super::is_canonical_sha256;
 use crate::vnext::{
     CapabilityCatalog, ContractVersion, DeviceId, ExternalModelMetadataId, NodeId, OperationId,
     PlanHash, ProviderExecutionContractFingerprint, ProviderId, ProviderReplayEquivalence,

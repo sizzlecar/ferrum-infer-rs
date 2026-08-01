@@ -13,9 +13,6 @@ use crate::vnext::{
     BatchParticipantTokenRange, ProviderExecutionContractFingerprint, ProviderReplayEquivalence,
 };
 
-mod coverage;
-pub use coverage::*;
-
 pub const EXECUTION_DETERMINISM_WITNESS_VERSION: ContractVersion = ContractVersion::new(4, 0);
 const MAX_EXECUTION_DETERMINISM_WITNESS_WIRE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXECUTION_DETERMINISM_WITNESS_NODES: usize = 65_536;
@@ -596,7 +593,7 @@ impl ExecutionDeterminismWitnessPlan {
         Ok(plan)
     }
 
-    fn validate_shape(&self) -> Result<(), VNextError> {
+    pub(super) fn validate_shape(&self) -> Result<(), VNextError> {
         if self.schema_version != EXECUTION_DETERMINISM_WITNESS_VERSION
             || self.node_ids.is_empty()
             || self.node_ids.len() > MAX_EXECUTION_DETERMINISM_WITNESS_NODES

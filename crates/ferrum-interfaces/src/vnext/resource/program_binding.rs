@@ -1,7 +1,7 @@
 use super::{
     invalid_resource, AllocationKind, AllocationLifetime, Arc, BTreeMap, BufferUsage,
-    DynamicPoolDomainSpec, DynamicStorageView, ElementType, EvaluatedBackingRequest,
-    ExecutionLaneId, InvocationLivenessMode, LogicalBackingSliceAuthority, NodeId,
+    DynamicPoolDomainSpec, DynamicStorageView, ElementType, InvocationLivenessMode,
+    LaneStableArenaSlotIdentity, LogicalBackingSliceAuthority, NodeId,
     PhysicalBackingClaimIdentity, PlanHash, PlanNode, ResourceId, Serialize,
     SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, VNextError,
 };
@@ -82,53 +82,6 @@ impl ProgramBindingLayout {
             .binary_search_by_key(&node_index, ProgramBindingSlot::node_index)
             .ok()
             .and_then(|index| self.slots.get(index))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LaneStableArenaSlotIdentity {
-    lane_id: ExecutionLaneId,
-    lifetime: AllocationLifetime,
-    reusable_execution_bucket_id: ReusableExecutionBucketId,
-    layout_fingerprint: String,
-    slot_id: u64,
-}
-
-impl LaneStableArenaSlotIdentity {
-    pub(super) fn new(
-        lane_id: ExecutionLaneId,
-        lifetime: AllocationLifetime,
-        reusable_execution_bucket_id: ReusableExecutionBucketId,
-        layout_fingerprint: String,
-        slot_id: u64,
-    ) -> Self {
-        Self {
-            lane_id,
-            lifetime,
-            reusable_execution_bucket_id,
-            layout_fingerprint,
-            slot_id,
-        }
-    }
-
-    pub const fn lane_id(&self) -> ExecutionLaneId {
-        self.lane_id
-    }
-
-    pub const fn lifetime(&self) -> AllocationLifetime {
-        self.lifetime
-    }
-
-    pub fn reusable_execution_bucket_id(&self) -> &ReusableExecutionBucketId {
-        &self.reusable_execution_bucket_id
-    }
-
-    pub fn layout_fingerprint(&self) -> &str {
-        &self.layout_fingerprint
-    }
-
-    pub const fn slot_id(&self) -> u64 {
-        self.slot_id
     }
 }
 
@@ -430,63 +383,6 @@ pub(super) fn compile_program_binding_layouts(
             Ok((bucket_id.clone(), layout))
         })
         .collect()
-}
-
-pub(super) fn lane_stable_layout_fingerprint(
-    lifetime: AllocationLifetime,
-    bucket_id: &ReusableExecutionBucketId,
-    requests: &[&EvaluatedBackingRequest<'_>],
-) -> Result<String, VNextError> {
-    #[derive(Serialize)]
-    struct Projection<'a> {
-        resource_id: &'a ResourceId,
-        physical_offset_bytes: u64,
-        capacity_size_bytes: u64,
-    }
-
-    #[derive(Serialize)]
-    struct Request<'a> {
-        claim_identity: &'a PhysicalBackingClaimIdentity,
-        capacity_size_bytes: u64,
-        projections: Vec<Projection<'a>>,
-    }
-
-    #[derive(Serialize)]
-    struct Material<'a> {
-        domain: &'static str,
-        lifetime: AllocationLifetime,
-        reusable_execution_bucket_id: &'a ReusableExecutionBucketId,
-        requests: Vec<Request<'a>>,
-    }
-
-    let material = Material {
-        domain: "ferrum.runtime-vnext.lane-stable-layout.v1",
-        lifetime,
-        reusable_execution_bucket_id: bucket_id,
-        requests: requests
-            .iter()
-            .map(|request| Request {
-                claim_identity: &request.claim_identity,
-                capacity_size_bytes: request.capacity_size_bytes,
-                projections: request
-                    .projections
-                    .iter()
-                    .map(|projection| Projection {
-                        resource_id: projection.descriptor.base_resource_id(),
-                        physical_offset_bytes: projection.physical_offset_bytes,
-                        capacity_size_bytes: projection.capacity_size_bytes,
-                    })
-                    .collect(),
-            })
-            .collect(),
-    };
-    serde_json::to_vec(&material)
-        .map(|bytes| format!("sha256/{:x}", Sha256::digest(bytes)))
-        .map_err(|error| {
-            invalid_resource(format!(
-                "lane-stable layout fingerprint encode failed: {error}"
-            ))
-        })
 }
 
 #[cfg(test)]
