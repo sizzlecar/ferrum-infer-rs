@@ -7,20 +7,68 @@ use vnext_core_contract::*;
 struct UnsupportedSuccessVisitor {
     function_stack: Vec<String>,
     unsupported_depth: usize,
+    panic_boundary_depth: usize,
     violations: Vec<String>,
     downcasts: Vec<String>,
 }
 
+fn type_path_ends_with(ty: &syn::Type, expected: &str) -> bool {
+    matches!(ty, syn::Type::Path(path)
+        if path.path.segments.last().is_some_and(|segment| segment.ident == expected))
+}
+
+fn is_panic_payload_boundary(signature: &syn::Signature) -> bool {
+    let Some(syn::FnArg::Typed(argument)) = signature.inputs.first() else {
+        return false;
+    };
+    let syn::Type::Path(box_type) = argument.ty.as_ref() else {
+        return false;
+    };
+    let Some(box_segment) = box_type.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &box_segment.arguments else {
+        return false;
+    };
+    let Some(syn::GenericArgument::Type(syn::Type::TraitObject(payload))) = arguments.args.first()
+    else {
+        return false;
+    };
+    let mut bounds = payload
+        .bounds
+        .iter()
+        .filter_map(|bound| match bound {
+            syn::TypeParamBound::Trait(bound) => bound
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    bounds.sort();
+    signature.ident == "panic_message"
+        && signature.inputs.len() == 1
+        && box_segment.ident == "Box"
+        && arguments.args.len() == 1
+        && bounds == ["Any", "Send"]
+        && matches!(&signature.output, syn::ReturnType::Type(_, output)
+            if type_path_ends_with(output, "String"))
+}
+
 impl UnsupportedSuccessVisitor {
-    fn enter(&mut self, name: &syn::Ident) -> bool {
-        let unsupported = name.to_string().contains("unsupported");
-        self.function_stack.push(name.to_string());
+    fn enter(&mut self, signature: &syn::Signature) -> (bool, bool) {
+        let unsupported = signature.ident.to_string().contains("unsupported");
+        let panic_boundary = is_panic_payload_boundary(signature);
+        self.function_stack.push(signature.ident.to_string());
         self.unsupported_depth += usize::from(unsupported);
-        unsupported
+        self.panic_boundary_depth += usize::from(panic_boundary);
+        (unsupported, panic_boundary)
     }
 
-    fn leave(&mut self, unsupported: bool) {
+    fn leave(&mut self, unsupported: bool, panic_boundary: bool) {
         self.unsupported_depth -= usize::from(unsupported);
+        self.panic_boundary_depth -= usize::from(panic_boundary);
         self.function_stack.pop();
     }
 
@@ -34,21 +82,21 @@ impl UnsupportedSuccessVisitor {
 
 impl<'ast> Visit<'ast> for UnsupportedSuccessVisitor {
     fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
-        let unsupported = self.enter(&function.sig.ident);
+        let (unsupported, panic_boundary) = self.enter(&function.sig);
         visit::visit_item_fn(self, function);
-        self.leave(unsupported);
+        self.leave(unsupported, panic_boundary);
     }
 
     fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
-        let unsupported = self.enter(&function.sig.ident);
+        let (unsupported, panic_boundary) = self.enter(&function.sig);
         visit::visit_impl_item_fn(self, function);
-        self.leave(unsupported);
+        self.leave(unsupported, panic_boundary);
     }
 
     fn visit_trait_item_fn(&mut self, function: &'ast syn::TraitItemFn) {
-        let unsupported = self.enter(&function.sig.ident);
+        let (unsupported, panic_boundary) = self.enter(&function.sig);
         visit::visit_trait_item_fn(self, function);
-        self.leave(unsupported);
+        self.leave(unsupported, panic_boundary);
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -63,17 +111,11 @@ impl<'ast> Visit<'ast> for UnsupportedSuccessVisitor {
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "downcast_ref" {
+        if call.method == "downcast_ref" && self.panic_boundary_depth == 0 {
             self.downcasts.push(self.current_function());
         }
         visit::visit_expr_method_call(self, call);
     }
-}
-
-fn downcasts_are_panic_boundary_only(path: &std::path::Path, downcasts: &[String]) -> bool {
-    downcasts.is_empty()
-        || (path.ends_with("resource/static_initialization.rs")
-            && downcasts == ["panic_message", "panic_message"])
 }
 
 fn vnext_source_files() -> Vec<PathBuf> {
@@ -122,7 +164,7 @@ fn silent_success_defaults_are_absent() {
             visitor.violations
         );
         assert!(
-            downcasts_are_panic_boundary_only(&path, &visitor.downcasts),
+            visitor.downcasts.is_empty(),
             "{} has non-panic-boundary downcast_ref calls: {:?}",
             path.display(),
             visitor.downcasts
