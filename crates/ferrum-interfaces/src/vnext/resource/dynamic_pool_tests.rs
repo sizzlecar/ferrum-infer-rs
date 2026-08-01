@@ -2183,6 +2183,172 @@ fn rebalance_preserves_physical_occupancy_plus_pending_bundle_demand() {
 }
 
 #[test]
+fn rebalance_preserves_contiguous_packability_for_pending_bundle() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'c',
+        1,
+        192,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'd',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+
+    let donor_pool = Arc::clone(&harness.root.dynamic_pools.pools[&donor_pool_id]);
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+
+    // Retain two half-chunk claims around one completely idle chunk. The donor
+    // has 64 bytes free in aggregate outside that idle chunk, but no remaining
+    // contiguous 64-byte extent if maintenance reclaims the idle chunk.
+    let donor_first_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    let donor_released_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    let donor_middle = claim_size(&harness.root.dynamic_pools, &donor_pool, 64);
+    let donor_last_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    let donor_other_released_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    drop(donor_released_half);
+    drop(donor_middle);
+    drop(donor_other_released_half);
+
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let requests = vec![
+        evaluated_request(&donor_pool, 64),
+        evaluated_request(&target_pool, 64),
+    ];
+    let BackingPrepareDecision::Deferred(deferred) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("the occupied target pool must defer the two-pool bundle")
+    };
+    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.blockers()[0].pool_id(), &target_pool_id);
+    let before = maintenance.status().unwrap();
+
+    assert!(matches!(
+        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert_eq!(maintenance.status().unwrap(), before);
+
+    drop(held_target);
+    drop(donor_first_half);
+    drop(donor_last_half);
+}
+
+#[test]
+fn plan_backing_deferral_preserves_lane_stable_bundle_packability() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'e',
+        1,
+        192,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'f',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.two-pool-packing-envelope").unwrap(),
+        ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let mut pool_budgets = vec![
+        ReusablePoolWorkspaceBudget::new(donor_pool_id.clone(), 64, 0).unwrap(),
+        ReusablePoolWorkspaceBudget::new(target_pool_id.clone(), 64, 0).unwrap(),
+    ];
+    pool_budgets.sort_by(|left, right| left.pool_id().cmp(right.pool_id()));
+    let resolved = ResolvedReusableExecutionBucket::new(bucket.clone(), pool_budgets).unwrap();
+    let memory_plan = ReusableExecutionMemoryPlan::new(1, 1, vec![resolved]).unwrap();
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(runtime, catalog, 256, memory_plan);
+    let lane = harness.root.create_execution_lane().unwrap();
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+
+    let donor_pool = Arc::clone(&harness.root.dynamic_pools.pools[&donor_pool_id]);
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let donor_first_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    let donor_released_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    let donor_middle = claim_size(&harness.root.dynamic_pools, &donor_pool, 64);
+    let donor_last_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    let donor_other_released_half = claim_size(&harness.root.dynamic_pools, &donor_pool, 32);
+    drop(donor_released_half);
+    drop(donor_middle);
+    drop(donor_other_released_half);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+
+    let mut donor_request = evaluated_request(&donor_pool, 64);
+    donor_request.reusable_execution_bucket_id = Some(bucket.bucket_id().clone());
+    let mut target_request = evaluated_request(&target_pool, 64);
+    target_request.reusable_execution_bucket_id = Some(bucket.bucket_id().clone());
+    let requests = vec![donor_request, target_request];
+    let LaneBackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &requests)
+        .unwrap()
+    else {
+        panic!("the occupied target pool must defer the lane-stable bundle")
+    };
+    let deferral = PlanBackingDeferral::new(Arc::clone(&harness.root), deferred).unwrap();
+    let before = maintenance.status().unwrap();
+    assert!(matches!(
+        deferral.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert_eq!(maintenance.status().unwrap(), before);
+
+    drop(held_target);
+    assert!(matches!(
+        deferral.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+    drop(deferral);
+    let LaneBackingPrepareDecision::Prepared(prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &requests)
+        .unwrap()
+    else {
+        panic!("the exact release must make the lane-stable bundle prepare")
+    };
+    drop(prepared.commit());
+
+    drop(donor_first_half);
+    drop(donor_last_half);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn live_idle_donor_boundary_waits_then_rebalances_after_exact_release() {
     let donor_catalog = pool_catalog(
         linear_profile(),

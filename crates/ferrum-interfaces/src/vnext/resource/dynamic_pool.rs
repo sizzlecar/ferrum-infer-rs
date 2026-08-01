@@ -1428,12 +1428,69 @@ impl DynamicBackingBlocker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicBackingPackingEnvelope {
+    pub(super) pool_id: DynamicBackingPoolId,
+    pub(super) domain_id: CapacityDomainId,
+    pub(super) claim_bytes_descending: Vec<u64>,
+}
+
+impl DynamicBackingPackingEnvelope {
+    pub(super) fn new(
+        pool_id: DynamicBackingPoolId,
+        domain_id: CapacityDomainId,
+        mut claim_bytes_descending: Vec<u64>,
+    ) -> Result<Self, VNextError> {
+        if claim_bytes_descending.is_empty() || claim_bytes_descending.contains(&0) {
+            return Err(invalid_resource(
+                "dynamic backing packing envelope contains empty or zero-sized demand",
+            ));
+        }
+        claim_bytes_descending.sort_unstable_by(|left, right| right.cmp(left));
+        claim_bytes_descending
+            .iter()
+            .try_fold(0_u64, |total, bytes| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    invalid_resource("dynamic backing packing envelope bytes overflow u64")
+                })
+            })?;
+        Ok(Self {
+            pool_id,
+            domain_id,
+            claim_bytes_descending,
+        })
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn domain_id(&self) -> CapacityDomainId {
+        self.domain_id
+    }
+
+    pub fn claim_bytes_descending(&self) -> &[u64] {
+        &self.claim_bytes_descending
+    }
+
+    pub(super) fn total_bytes(&self) -> Result<u64, VNextError> {
+        self.claim_bytes_descending
+            .iter()
+            .try_fold(0_u64, |total, bytes| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    invalid_resource("dynamic backing packing envelope bytes overflow u64")
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicBackingDeferred {
     pub(super) blockers: Vec<DynamicBackingBlocker>,
     pub(super) epochs: CapacityEpochs,
     pub(super) wait_condition: CapacityWaitCondition,
     pub(super) scope: DynamicBackingClaimScope,
     pub(super) protected_immediate: CapacityVector,
+    pub(super) protected_packing_envelopes: Vec<DynamicBackingPackingEnvelope>,
 }
 
 impl DynamicBackingDeferred {
@@ -1469,6 +1526,12 @@ impl DynamicBackingDeferred {
     /// runnable while maintenance rebalances other pools.
     pub fn protected_immediate(&self) -> &CapacityVector {
         &self.protected_immediate
+    }
+
+    /// Exact per-pool physical claim shapes that must remain packable while
+    /// maintenance rebalances unreferenced chunks for this deferred bundle.
+    pub fn protected_packing_envelopes(&self) -> &[DynamicBackingPackingEnvelope] {
+        &self.protected_packing_envelopes
     }
 }
 

@@ -12,14 +12,15 @@ use super::{
     CapacityUnits, CapacityVector, DeviceAllocationPermit, DeviceBufferRetention,
     DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, Digest, DynamicBackingBlocker,
     DynamicBackingClaimOccupancy, DynamicBackingClaimResidency, DynamicBackingClaimScope,
-    DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPool, DynamicBackingPoolId,
-    DynamicBackingPoolState, DynamicChunkQuarantineReason, DynamicDeviceCapacityBlocked,
-    DynamicPoolDomainSpec, DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthIntent,
-    DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim, DynamicPoolLiveOccupancyStatus,
-    DynamicPoolRebalanceReceipt, DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest,
-    ExecutionLane, FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode,
-    LaneBackingPrepareDecision, LaneStableArenaEntry, LaneStableArenaEvictionCandidate,
-    LaneStableArenaLane, LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
+    DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
+    DynamicBackingPool, DynamicBackingPoolId, DynamicBackingPoolState,
+    DynamicChunkQuarantineReason, DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec,
+    DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthIntent, DynamicPoolGrowthReceipt,
+    DynamicPoolIdleReclaim, DynamicPoolLiveOccupancyStatus, DynamicPoolRebalanceReceipt,
+    DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest, ExecutionLane,
+    FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode, LaneBackingPrepareDecision,
+    LaneStableArenaEntry, LaneStableArenaEvictionCandidate, LaneStableArenaLane,
+    LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
     LogicalAdmissionCoordinator, LogicalBackingBufferView, LogicalBackingSegmentBinding,
     LogicalBackingSliceAllocationEvidence, LogicalBackingSliceAuthority,
     LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard, PlanNode,
@@ -167,6 +168,7 @@ where
         pressure: &DeviceCapacityPressure,
         excluded_domains: &[CapacityDomainId],
         protected_immediate: &CapacityVector,
+        protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
     ) -> Result<Option<DynamicPoolRebalanceReceipt>, VNextError> {
         if pressure.device_id() != self.runtime.descriptor().id.to_string() {
             return Err(invalid_resource(
@@ -215,6 +217,15 @@ where
             .iter()
             .map(|entry| (entry.domain(), entry.units().get()))
             .collect::<BTreeMap<_, _>>();
+        let protected_packing_by_domain = protected_packing_envelopes
+            .iter()
+            .map(|envelope| (envelope.domain_id(), envelope))
+            .collect::<BTreeMap<_, _>>();
+        if protected_packing_by_domain.len() != protected_packing_envelopes.len() {
+            return Err(invalid_resource(
+                "dynamic backing protection contains duplicate packing domains",
+            ));
+        }
 
         let mut candidates = Vec::new();
         let mut reclaimable_by_pool = vec![0_u64; pools.len()];
@@ -245,6 +256,40 @@ where
                 .get(&pool.domain.domain_id)
                 .copied()
                 .unwrap_or(0);
+            let protected_chunks = match protected_packing_by_domain.get(&pool.domain.domain_id) {
+                Some(envelope) => {
+                    if envelope.pool_id() != pool.domain.pool_id()
+                        || envelope.total_bytes()? != protected
+                    {
+                        return Err(invalid_resource(
+                            "dynamic backing byte and packing protection diverged",
+                        ));
+                    }
+                    let mut allocator = state.allocator.clone();
+                    let mut chunks = std::collections::BTreeSet::new();
+                    for &claim_bytes in envelope.claim_bytes_descending() {
+                        let segments = match pool.domain.pool.compatibility().profile().view() {
+                            DynamicStorageView::Contiguous => allocator
+                                .allocate_contiguous(pool.domain.pool_id(), claim_bytes)?
+                                .map(|segment| vec![segment]),
+                            DynamicStorageView::PagedRegions { block_bytes } => allocator
+                                .allocate_paged(pool.domain.pool_id(), claim_bytes, block_bytes)?,
+                        };
+                        let Some(segments) = segments else {
+                            chunks.clear();
+                            break;
+                        };
+                        chunks.extend(segments.iter().map(BackingSegment::chunk_ordinal));
+                    }
+                    if chunks.is_empty() && protected != 0 {
+                        continue;
+                    }
+                    chunks
+                }
+                // Logical admission deferrals protect aggregate capacity before
+                // an exact physical packing attempt exists.
+                None => std::collections::BTreeSet::new(),
+            };
             // Logical admission does not own lane-stable or not-yet-committed
             // physical extents. Reclaim must preserve whichever ownership view
             // is larger before adding this bundle's uncommitted demand.
@@ -268,6 +313,7 @@ where
                 let full_extent = state.allocator.by_offset.get(&(ordinal, 0));
                 if chunk.live_segments != 0
                     || Arc::strong_count(&chunk.backing) != 1
+                    || protected_chunks.contains(&ordinal)
                     || chunk_bytes > reclaimable
                     || chunk.backing.descriptor.size_bytes != chunk_bytes
                     || full_extent.is_none_or(|extent| {
@@ -1318,18 +1364,27 @@ where
             })?;
             groups.push((pool, requests));
         }
+        let protected_packing_envelopes = groups
+            .iter()
+            .map(|(pool, requests)| {
+                DynamicBackingPackingEnvelope::new(
+                    pool.domain.pool_id().clone(),
+                    pool.domain.domain_id,
+                    requests
+                        .iter()
+                        .map(|request| request.capacity_size_bytes)
+                        .collect(),
+                )
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
         let protected_immediate = CapacityVector::new(
-            groups
+            protected_packing_envelopes
                 .iter()
-                .map(|(pool, requests)| {
-                    let bytes = requests.iter().try_fold(0_u64, |total, request| {
-                        total
-                            .checked_add(request.capacity_size_bytes)
-                            .ok_or_else(|| {
-                                invalid_resource("dynamic backing protection bytes overflow u64")
-                            })
-                    })?;
-                    CapacityEntry::new(pool.domain.domain_id, CapacityUnits::new(bytes))
+                .map(|envelope| {
+                    CapacityEntry::new(
+                        envelope.domain_id(),
+                        CapacityUnits::new(envelope.total_bytes()?),
+                    )
                 })
                 .collect::<Result<Vec<_>, VNextError>>()?,
         )?;
@@ -1490,9 +1545,12 @@ where
                 .collect::<Vec<_>>();
             if !blockers.is_empty() {
                 drop(states);
-                if let Some(deferred) =
-                    self.confirm_backing_deferral(blockers, scope, protected_immediate.clone())?
-                {
+                if let Some(deferred) = self.confirm_backing_deferral(
+                    blockers,
+                    scope,
+                    protected_immediate.clone(),
+                    protected_packing_envelopes.clone(),
+                )? {
                     return Ok(BackingPrepareDecision::Deferred(deferred));
                 }
                 continue 'prepare;
@@ -1603,6 +1661,7 @@ where
                             vec![blocker],
                             scope,
                             protected_immediate.clone(),
+                            protected_packing_envelopes.clone(),
                         )? {
                             return Ok(BackingPrepareDecision::Deferred(deferred));
                         }
@@ -1794,6 +1853,7 @@ where
         blockers: Vec<DynamicBackingBlocker>,
         scope: DynamicBackingClaimScope,
         protected_immediate: CapacityVector,
+        protected_packing_envelopes: Vec<DynamicBackingPackingEnvelope>,
     ) -> Result<Option<DynamicBackingDeferred>, VNextError> {
         let wait_snapshot = self
             .logical_admission
@@ -1823,6 +1883,7 @@ where
             wait_condition: wait_snapshot.wait_condition().clone(),
             scope,
             protected_immediate,
+            protected_packing_envelopes,
         }))
     }
 
