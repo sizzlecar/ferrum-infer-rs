@@ -11,7 +11,8 @@ use super::super::{
     DeviceSubmissionTimingSink, DeviceTimingMeasurement, HostTransferLayout, IdentifiedFailure,
     IndeterminateSubmissionHandle, NodeId, VNextError,
 };
-use super::{invalid_operation, BatchOperationIdentity, OperationFailure};
+use super::foundation::invalid_operation;
+use super::{BatchOperationIdentity, OperationFailure};
 
 pub trait DispatchRetryAuthority: fmt::Debug {
     fn prior_attempt(&self) -> BatchInvocationId;

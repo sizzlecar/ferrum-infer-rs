@@ -2,17 +2,19 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::super::DeviceDescriptor;
+use super::super::{
+    BatchWorkShape, ClaimedSubmissionWaveBacking, ContractVersion, DeviceDescriptor,
+    DeviceReusableAddressScope, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
+    EncodedDeviceOperation, EncodedReusableExecutionBindings, ExecutablePlanView,
+    LogicalBackingSliceAuthority, MemoryPlan, NodeId, OperationId, PlanHash, PlanId, ProviderId,
+    ProviderWorkspaceRequirement, SemanticValue, VNextError,
+};
+use super::foundation::{canonical_sha256, invalid_operation};
 use super::invocation::PreparedOperationDispatchBinding;
 use super::{
-    canonical_sha256, invalid_operation, AttributeId, BatchWorkShape, BatchedOperationInvocation,
-    CapabilityCatalog, ClaimedSubmissionWaveBacking, ContractVersion, DeviceReusableAddressScope,
-    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, EncodedDeviceOperation,
-    EncodedReusableExecutionBindings, EngineProviderDescriptor, ExecutablePlanView,
-    LogicalBackingSliceAuthority, MemoryPlan, NodeId, OperationContract, OperationDescriptor,
-    OperationFailure, OperationId, OperationProviderDescriptor, PlanHash, PlanId, ProviderId,
-    ProviderWorkspaceRequirement, ResolvedValueBinding, ResolvedValueRole, SemanticValue,
-    VNextError,
+    AttributeId, BatchedOperationInvocation, CapabilityCatalog, EngineProviderDescriptor,
+    OperationContract, OperationDescriptor, OperationFailure, OperationProviderDescriptor,
+    ResolvedValueBinding, ResolvedValueRole,
 };
 
 /// Exact semantic input presented to a selected provider's resource estimator.

@@ -7,14 +7,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::{
-    DeviceDescriptor, WeightMaterializerDescriptor, WeightMaterializerId, MAX_WEIGHT_MATERIALIZERS,
+    ContractVersion, DeviceDescriptor, NodeId, OperationId, ProviderId, VNextError,
+    WeightMaterializerDescriptor, WeightMaterializerId, MAX_WEIGHT_MATERIALIZERS,
 };
+use super::foundation::{invalid_operation, operation_error_for_node};
 use super::{
-    invalid_operation, operation_error_for_node, ContractVersion, EngineProviderDescriptor, NodeId,
-    OperationDescriptor, OperationId, OperationProviderDescriptor, OracleSpec,
+    EngineProviderDescriptor, OperationDescriptor, OperationProviderDescriptor, OracleSpec,
     ProviderCompatibilityRejectReason, ProviderCompatibilityRejection, ProviderCompatibilityReport,
-    ProviderCompatibilityRequest, ProviderId, VNextError, MAX_ENGINE_PROVIDER_ROWS,
-    MAX_OPERATION_CATALOG_ROWS, MAX_OPERATION_PROVIDER_ROWS, MAX_REFERENCE_ORACLE_DEPTH,
+    ProviderCompatibilityRequest, MAX_ENGINE_PROVIDER_ROWS, MAX_OPERATION_CATALOG_ROWS,
+    MAX_OPERATION_PROVIDER_ROWS, MAX_REFERENCE_ORACLE_DEPTH,
 };
 
 /// Deterministically ordered provider capabilities consumed once by planning.

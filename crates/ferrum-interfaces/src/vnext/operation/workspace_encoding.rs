@@ -2,17 +2,15 @@ use super::super::{
     classify_device_error, BufferDescriptor, BufferUsage, CompletionReservation,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceRuntime, ExecutablePlanView, HostTransferLayout,
-    ResourceWorkShape,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ResourceWorkShape,
 };
 use super::buffer_view::OperationBufferView;
 use super::dispatch_contract::{
     DispatchRetryAuthority, OperationDispatchError, SubmissionScratchInitialization,
     SubmissionWaveDispatchError,
 };
-use super::{
-    invalid_operation, BatchOperationIdentity, BatchOperationNodeIdentity, ElementType,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-};
+use super::foundation::invalid_operation;
+use super::{BatchOperationIdentity, BatchOperationNodeIdentity, ElementType};
 
 pub(super) fn encode_provider_workspace_initialization<R, Retry>(
     runtime: &R,

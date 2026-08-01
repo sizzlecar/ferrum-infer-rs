@@ -2,12 +2,13 @@ use serde::{ser::SerializeSeq, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-use super::compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
-use super::{
-    canonical_operation_fingerprint, canonical_sha256, invalid_operation, BatchInvocationId,
-    BatchStepId, DeviceId, ExecutionIdentityEnvelope, ExecutionLaneId, NodeId, OperationId,
-    ParticipantNodeKey, PlanHash, PlanId, ProviderExecutionSemantics, ProviderId, VNextError,
+use super::super::{
+    BatchInvocationId, BatchStepId, DeviceId, ExecutionIdentityEnvelope, ExecutionLaneId, NodeId,
+    OperationId, ParticipantNodeKey, PlanHash, PlanId, ProviderId, VNextError,
 };
+use super::compiled_submission_wave::DeferredBatchOperationIdentityRecipe;
+use super::foundation::{canonical_operation_fingerprint, canonical_sha256, invalid_operation};
+use super::ProviderExecutionSemantics;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct BatchOperationParticipantIdentityData {
