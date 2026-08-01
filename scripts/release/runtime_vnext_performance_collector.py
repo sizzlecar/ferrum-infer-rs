@@ -126,6 +126,16 @@ def atomic_write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -1949,7 +1959,7 @@ def collect_run_sample(
                 hardware_id=context["hardware"]["id"],
                 stderr_path=stderr_path,
             )
-            barrier_release.write_text("release\n", encoding="utf-8")
+            atomic_write_text(barrier_release, "release\n")
             wait_for_process_exec(process, binary, 30.0)
             process_receipt = write_process_receipt(
                 root,
@@ -2546,7 +2556,7 @@ def self_test() -> int:
             barrier_marker, _ = process_identity(barrier_process.pid)
             time.sleep(0.05)
             require(barrier_process.poll() is None, "exec barrier child did not wait for release")
-            release_file.write_text("release\n", encoding="utf-8")
+            atomic_write_text(release_file, "release\n")
             wait_for_process_exec(barrier_process, Path("/bin/sleep"), 5.0)
             exec_marker, _ = process_identity(barrier_process.pid)
             require(exec_marker == barrier_marker, "exec barrier changed the product PID identity")
