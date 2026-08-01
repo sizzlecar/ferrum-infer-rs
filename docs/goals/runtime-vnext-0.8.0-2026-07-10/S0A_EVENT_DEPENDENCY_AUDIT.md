@@ -34,12 +34,13 @@ contract owner.
 | Execution identity envelope | `identity` | Independent validated/unvalidated identity boundary |
 | Plan-derived topology | `topology` | Immutable execution graph evidence, independent of event cursors |
 | Sequence disposition evidence | `sequence_binding` | Resource/session authority remains below event validation |
+| Resource maintenance evidence | `resource_maintenance` | Typed maintenance outcomes are independent from execution-event cursors |
 | Execution event and cursor | `execution_event` | Owns event shape, context validation and request lifecycle state |
 | Resource pool event and cursor | `resource_pool` | Owns receipt validation and pool lifecycle state |
 | Replay identity | `replay` | Consumes completed execution/resource evidence without owning it |
 | Sink and emitter | `sink` | Consumes validated events and transactional cursor updates |
 
-Existing public paths are preserved by the 48-line facade. Cross-owner reads now use existing typed
+Existing public paths are preserved by the 51-line facade. Cross-owner reads now use existing typed
 getters where available. Replay-only context constructors, sequence liveness checks and pool proof
 queries are parent-private methods; fields were not broadly widened.
 
@@ -52,9 +53,10 @@ execution_event: foundation, identity, sequence_binding, topology
 foundation:
 identity: foundation
 replay: execution_event, foundation, identity, resource_pool, sequence_binding, topology
+resource_maintenance: foundation, sequence_binding
 resource_pool: foundation, sequence_binding, topology
 sequence_binding: foundation
-sink: execution_event, foundation
+sink: execution_event, foundation, resource_maintenance
 topology: foundation
 ```
 
@@ -67,31 +69,26 @@ event_dependency_multi_module_scc_count=0
 One valid dependencies-first topological order is:
 
 ```text
-foundation -> identity -> topology -> sequence_binding -> execution_event -> resource_pool
--> replay -> sink
+foundation -> identity -> sequence_binding -> resource_maintenance -> topology
+-> execution_event -> resource_pool -> replay -> sink
 ```
 
 The linear spelling is only a proof of acyclicity; `execution_event` and `resource_pool`, and
 `replay` and `sink`, remain independent branches where the edge set permits it.
 
-## Bounded Validation
+## Bounded Validation Matrix
 
-```text
-CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
-  PASS
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --test vnext_event_contract_tests -- --test-threads=1
-  1 passed; 0 failed
-RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
-  --test vnext_compile -- --test-threads=1
-  80 UI fixtures passed; 0 mismatches
-```
+The current event contract targets are `vnext_event_execution_contract_tests`,
+`vnext_event_sink_contract_tests`, `vnext_event_resource_pool_contract_tests`,
+`vnext_event_recovery_contract_tests`, and `vnext_event_replay_contract_tests`. The canonical S0A
+aggregate discovers and runs them with `RUST_TEST_THREADS=1` and `--test-threads=1`; its artifact,
+not a copied count in this review, is the source of truth for the exact results.
 
 The event aggregate originally failed only because two source-shape assertions still read the old
 monolithic path. They now inspect `event/sink.rs` and `event/resource_pool.rs` while preserving the
 same invariants. `#[track_caller]` on the aggregate assertion helper now reports the actual failing
 invariant line rather than the shared helper line.
 
-This audit does not claim S0A completion. The 6,208-line event aggregate test still requires
-owner-aligned splitting, and the public owner map, bounded aggregate, and final S0A artifact
-validator remain open.
+The former aggregate is split into five invariant-owner targets and explicit reusable fixtures.
+This review does not claim S0A completion: the clean-source bounded aggregate and final
+`vnext-g01a` validator remain authoritative.

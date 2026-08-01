@@ -4,10 +4,9 @@ use super::{
     CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitCondition,
     DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot, DeviceCapacityGrant, DeviceRuntime,
     DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
-    DynamicStorageAllocator, DynamicStorageProfile, ElementType, ExecutionLane, ExecutionLaneId,
-    FreeExtentIndex, InvocationLivenessMode, LaneStableArenaSlotIdentity,
-    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, Ordering, PlanNode,
-    ResourceId, Serialize, StateInitialization, VNextError, Weak,
+    DynamicStorageAllocator, DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex,
+    InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
+    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,

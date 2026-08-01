@@ -17,6 +17,7 @@ mod resolved_value;
 mod semantic;
 mod storage_profile;
 mod tensor_contract;
+mod weight_contract;
 mod workspace_encoding;
 
 pub use attribute::{AttributeConstraint, AttributeSchema, AttributeSpec};
@@ -86,4 +87,15 @@ pub use storage_profile::{
 pub use tensor_contract::{
     AliasPolicy, BlockedTensorPadding, DimensionConstraint, LayoutConstraint, ResolvedTensorLayout,
     ResolvedTensorSpec, StrideConstraint, TensorAccess, TensorContract,
+};
+pub(crate) use weight_contract::{
+    checked_elements, physical_component_ids, validate_physical_layout_budget,
+    ResolvedWeightLogicalValidation,
+};
+pub use weight_contract::{
+    AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, PhysicalStorageLayout,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedWeightBinding,
+    ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,
+    MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
 };

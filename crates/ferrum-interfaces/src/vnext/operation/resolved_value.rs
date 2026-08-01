@@ -2,12 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::super::{
-    BufferUsage, ProgramValueId, ResolvedWeightBinding, ResourceId, VNextError, WeightId,
-};
+use super::super::{BufferUsage, ProgramValueId, ResourceId, VNextError, WeightId};
 use super::foundation::invalid_operation;
 use super::{
-    AliasPolicy, DynamicStorageRequirement, ElementType, ResolvedTensorSpec, TensorAccess,
+    AliasPolicy, DynamicStorageRequirement, ElementType, ResolvedTensorSpec, ResolvedWeightBinding,
+    ResolvedWeightLogicalValidation, TensorAccess,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -368,7 +367,11 @@ impl ResolvedValueBinding {
         }
         match (usage, weight.as_ref()) {
             (BufferUsage::Weights, Some(weight)) => {
-                weight.validate_logical(tensor.dimensions(), tensor.element_type())?;
+                ResolvedWeightLogicalValidation::validate_logical_contract(
+                    weight,
+                    tensor.dimensions(),
+                    tensor.element_type(),
+                )?;
                 validate_resolved_weight_storage(weight, &storage)?;
             }
             (BufferUsage::Weights, None) => {

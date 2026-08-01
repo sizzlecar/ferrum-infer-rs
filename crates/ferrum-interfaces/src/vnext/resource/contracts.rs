@@ -12,6 +12,18 @@ pub const MAX_RESOURCE_TRANSITION_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESOURCE_LEASE_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const SEQUENCE_DISPATCH_POISONED_BIT: u64 = 1 << 63;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateInitialization {
+    /// Core does not initialize the backing. The first consumer must fully
+    /// define every byte before it is read.
+    None,
+    /// Core zeroes each exact Sequence backing acquisition before its first
+    /// state consumer in the same ordered submission. Request-scope zeroing is
+    /// reserved until initialization dependencies can defer sibling sequences.
+    Zero,
+}
+
 pub(super) fn invalid_resource(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
