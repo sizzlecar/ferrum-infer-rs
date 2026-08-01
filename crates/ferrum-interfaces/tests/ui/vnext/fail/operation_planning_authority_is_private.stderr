@@ -4,7 +4,7 @@ error[E0624]: method `authority` is private
 4 |     let _ = handle.authority();
   |                    ^^^^^^^^^ private method
   |
- ::: src/vnext/operation.rs
+ ::: src/vnext/operation/registry.rs
   |
   |     pub(crate) fn authority(&self) -> &OperationRegistryAuthority {
   |     ------------------------------------------------------------- private method defined here

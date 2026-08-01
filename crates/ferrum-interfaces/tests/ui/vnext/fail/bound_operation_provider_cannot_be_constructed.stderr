@@ -4,7 +4,7 @@ error[E0308]: mismatched types
 10 |         provider,
    |         ^^^^^^^^ expected `BoundOperationProviderSource<'_, _>`, found `&dyn OperationProvider<R>`
    |
-   = note:   expected enum `vnext::operation::BoundOperationProviderSource<'_, _>`
+   = note:   expected enum `vnext::operation::registry::BoundOperationProviderSource<'_, _>`
            found reference `&'static (dyn ferrum_interfaces::vnext::OperationProvider<R> + 'static)`
 
 error: cannot construct `ferrum_interfaces::vnext::BoundOperationProvider<'_, _>` with struct literal syntax due to private fields
