@@ -428,11 +428,12 @@ impl EngineInner {
             }
             PlanRuntimePrefillOutcome::Deferred(deferral) => {
                 drop(workspace_lease);
-                if let Some(progress) = deferral.maintenance_progress() {
-                    let receipt = self.scheduler.defer_retry_after_execution_maintenance(
-                        std::slice::from_ref(request_id),
-                        progress,
-                    )?;
+                if let Some(retry) =
+                    deferral.validated_maintenance_retry_scope(std::slice::from_ref(request_id))?
+                {
+                    let receipt = self
+                        .scheduler
+                        .defer_retry_after_execution_maintenance(retry)?;
                     if receipt.deferred_count() != 1 {
                         return Err(FerrumError::scheduler(format!(
                             "PlanRuntime prefill maintenance retry retained {} scheduler entries for {request_id}",
@@ -445,7 +446,11 @@ impl EngineInner {
                         "tokens_processed": chunk.tokens_processed(),
                         "tokens_to_process": chunk.tokens_to_process(),
                         "stage": deferral.stage(),
-                        "maintenance_progress": progress,
+                        "observed": deferral.observed(),
+                        "wait_condition": deferral.wait_condition(),
+                        "shortfalls": deferral.shortfalls(),
+                        "backing_blockers": deferral.backing_blockers(),
+                        "maintenance_retry": retry,
                         "not_before_iteration": receipt.not_before_iteration(),
                         "latest_capacity_epoch": receipt.latest_capacity_epoch(),
                         "scheduler": self.scheduler.trace_snapshot(),
@@ -718,14 +723,14 @@ impl EngineInner {
         }
     }
 
-    /// Returns `true` only when every retained participant completed through
-    /// one physical prefill batch. An unsupported backend or a pre-submit
-    /// aggregate-capacity deferral returns `false`, allowing the caller to use
-    /// the existing per-request dynamic-capacity path without duplicating work.
+    /// Returns the exact participants that may fall back to the per-request
+    /// path in this scheduler iteration. A maintenance retry removes its bound
+    /// affected frontiers from that set after installing their scheduler
+    /// ticket, so they cannot be retried in the same iteration.
     pub(super) async fn run_plan_runtime_batch_prefill(
         &self,
         scheduled: &[&ferrum_interfaces::scheduler::ScheduledRequest],
-    ) -> Result<bool> {
+    ) -> Result<PlanRuntimeBatchPrefillDisposition> {
         use ferrum_interfaces::model_executor::PrefillChunk;
 
         struct Work {
@@ -771,7 +776,9 @@ impl EngineInner {
             });
         }
         if inputs.len() < 2 {
-            return Ok(false);
+            return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
+                work.into_iter().map(|item| item.request_id).collect(),
+            ));
         }
 
         let workspace_lease = self.acquire_backend_workspace_lease(
@@ -789,12 +796,46 @@ impl EngineInner {
                 completions
             }
             PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral) => {
+                let request_ids = work
+                    .iter()
+                    .map(|item| item.request_id.clone())
+                    .collect::<Vec<_>>();
+                if let Some(retry) = deferral.validated_maintenance_retry_scope(&request_ids)? {
+                    let affected_request_ids = retry.affected_request_ids();
+                    let fallback_request_ids =
+                        unaffected_maintenance_retry_frontiers(&request_ids, affected_request_ids);
+                    let receipt = self
+                        .scheduler
+                        .defer_retry_after_execution_maintenance(retry)?;
+                    if receipt.deferred_count() != affected_request_ids.len() {
+                        return Err(FerrumError::scheduler(format!(
+                            "PlanRuntime batch prefill maintenance retry retained {} of {} scheduler entries",
+                            receipt.deferred_count(),
+                            affected_request_ids.len()
+                        )));
+                    }
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "scheduler_batch_prefill_execution_maintenance_retry",
+                        "request_ids": affected_request_ids,
+                        "input_cohort_request_ids": request_ids,
+                        "stage": deferral.stage(),
+                        "observed": deferral.observed(),
+                        "wait_condition": deferral.wait_condition(),
+                        "shortfalls": deferral.shortfalls(),
+                        "backing_blockers": deferral.backing_blockers(),
+                        "maintenance_retry": retry,
+                        "not_before_iteration": receipt.not_before_iteration(),
+                        "latest_capacity_epoch": receipt.latest_capacity_epoch(),
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                    drop(workspace_lease);
+                    return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
+                        fallback_request_ids,
+                    ));
+                }
                 self.write_scheduler_trace_event(serde_json::json!({
                     "event": "scheduler_batch_prefill_execution_capacity_defer",
-                    "request_ids": work
-                        .iter()
-                        .map(|item| item.request_id.to_string())
-                        .collect::<Vec<_>>(),
+                    "request_ids": request_ids,
                     "stage": deferral.stage(),
                     "observed": deferral.observed(),
                     "wait_condition": deferral.wait_condition(),
@@ -803,11 +844,15 @@ impl EngineInner {
                     "scheduler": self.scheduler.trace_snapshot(),
                 }));
                 drop(workspace_lease);
-                return Ok(false);
+                return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
+                    work.into_iter().map(|item| item.request_id).collect(),
+                ));
             }
             PlanRuntimeBatchPrefillOutcome::Unsupported => {
                 drop(workspace_lease);
-                return Ok(false);
+                return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
+                    work.into_iter().map(|item| item.request_id).collect(),
+                ));
             }
         };
         if completions.len() != work.len() {
@@ -872,7 +917,7 @@ impl EngineInner {
                 return Err(error);
             }
         }
-        Ok(true)
+        Ok(PlanRuntimeBatchPrefillDisposition::Completed)
     }
 
     /// Run prefill for multiple requests as ONE batched forward pass.

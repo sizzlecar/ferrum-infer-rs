@@ -8,8 +8,50 @@ mod completion;
 mod decode;
 mod prefill;
 
+#[derive(Debug)]
+pub(super) enum PlanRuntimeBatchPrefillDisposition {
+    Completed,
+    PerRequestFallback(Vec<RequestId>),
+}
+
 pub(super) fn is_resource_exhausted_error(error: &FerrumError) -> bool {
     matches!(error, FerrumError::ResourceExhausted { .. })
+}
+
+pub(super) fn unaffected_maintenance_retry_frontiers(
+    current_request_ids: &[RequestId],
+    affected_request_ids: &[RequestId],
+) -> Vec<RequestId> {
+    current_request_ids
+        .iter()
+        .filter(|request_id| !affected_request_ids.contains(request_id))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod maintenance_retry_scope_tests {
+    use super::unaffected_maintenance_retry_frontiers;
+    use ferrum_types::RequestId;
+
+    #[test]
+    fn maintenance_retry_keeps_healthy_cohort_frontiers_runnable() {
+        let healthy = RequestId::new();
+        let affected = RequestId::new();
+
+        assert_eq!(
+            unaffected_maintenance_retry_frontiers(
+                &[healthy.clone(), affected.clone()],
+                std::slice::from_ref(&affected),
+            ),
+            [healthy]
+        );
+        assert!(unaffected_maintenance_retry_frontiers(
+            std::slice::from_ref(&affected),
+            std::slice::from_ref(&affected),
+        )
+        .is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -877,12 +919,16 @@ impl EngineInner {
             (
                 "capacity_evidence".to_string(),
                 serde_json::json!({
+                    "stage": deferral.stage(),
                     "observed": {
                         "coordinator_id": observed.coordinator_id,
                         "release_epoch": observed.release_epoch,
                         "capacity_epoch": observed.capacity_epoch,
                     },
                     "wait_condition": deferral.wait_condition(),
+                    "shortfalls": deferral.shortfalls(),
+                    "backing_blockers": deferral.backing_blockers(),
+                    "maintenance_retry": deferral.maintenance_retry(),
                 }),
             ),
         ]);

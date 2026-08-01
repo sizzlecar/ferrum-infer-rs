@@ -32,7 +32,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use ferrum_interfaces::model_executor::{
-    ExecutorExecutionMaintenanceProgress, ExecutorPrefillAdmissionReceipt,
+    ExecutorExecutionMaintenanceRetry, ExecutorPrefillAdmissionReceipt,
 };
 use ferrum_interfaces::scheduler::SchedulerMetrics;
 use ferrum_interfaces::vnext::{
@@ -1602,16 +1602,16 @@ impl ContinuousBatchScheduler {
     /// a lone request cannot turn maintenance into a tight retry loop.
     pub fn defer_retry_after_execution_maintenance(
         &self,
-        request_ids: &[RequestId],
-        progress: &ExecutorExecutionMaintenanceProgress,
+        retry: &ExecutorExecutionMaintenanceRetry,
     ) -> Result<ExecutionMaintenanceRetryReceipt> {
+        let progress = retry.progress();
         if progress.mutations().is_empty() {
             return Err(FerrumError::scheduler(
                 "execution maintenance retry requires physical mutations",
             ));
         }
         self.defer_retry_after_execution_maintenance_epoch(
-            request_ids,
+            retry.affected_request_ids(),
             progress.latest_capacity_epoch(),
         )
     }
