@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::dispatch::{BoundDeviceSubmissionAttribution, ProfiledSubmissionHandle};
+use super::dispatch_contract::{BoundDeviceSubmissionAttribution, ProfiledSubmissionHandle};
 use super::{
     invalid_operation, BatchOperationIdentity, BatchedOperationInvocation, BoundOperationProvider,
     ElementType,
