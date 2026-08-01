@@ -4,9 +4,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::dispatch_contract::{BoundDeviceSubmissionAttribution, ProfiledSubmissionHandle};
+use super::foundation::invalid_operation;
 use super::{
-    invalid_operation, BatchOperationIdentity, BatchedOperationInvocation, BoundOperationProvider,
-    ElementType,
+    BatchOperationIdentity, BatchedOperationInvocation, BoundOperationProvider, ElementType,
 };
 use crate::vnext::{
     BatchInvocationId, BufferUsage, CompletionHandle, CompletionReadbackBatchRequest,

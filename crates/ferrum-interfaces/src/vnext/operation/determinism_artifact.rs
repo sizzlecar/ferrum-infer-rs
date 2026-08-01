@@ -5,7 +5,8 @@ use crate::vnext::{
     ExecutionDeterminismWitnessKind, TensorAccess, VNextError,
 };
 
-use super::{invalid_operation, SubmissionWaveDeterminismEvidence};
+use super::foundation::invalid_operation;
+use super::SubmissionWaveDeterminismEvidence;
 
 const MAX_ARTIFACT_EXECUTION_ID_BYTES: usize = 128;
 

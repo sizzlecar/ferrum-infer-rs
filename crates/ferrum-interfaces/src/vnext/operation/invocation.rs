@@ -1,23 +1,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use super::super::{
+    AdmittedSequenceResources, AllocationLifetime, BatchInvocationId, BatchParticipantAuthority,
+    BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
+    DeviceId, DeviceRuntime, EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope,
+    InvocationResourceLease, LogicalAdmissionCoordinatorId, LogicalBackingBufferView, NodeId,
+    NodeWorkContract, PlanHash, PlanId, PlanNode, PreparedStepSubmissionNode,
+    PreparedStepSubmissionWave, ProgramBindingNodeBinding, ProviderId,
+    ProviderWorkspaceRequirement, ResourceId, SemanticValue, SequenceBackingSnapshot,
+    SequenceSessionEpoch, SequenceSessionFingerprint, StepParticipantFrameAssignment,
+    StepResourceLease, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence, VNextError,
+};
 use super::buffer_view::{
     sequence_execution_shape, validate_value_binding_physical_coverage,
     ValueBindingPhysicalCoverage,
 };
+use super::foundation::invalid_operation;
 use super::{
-    invalid_operation, AdmittedSequenceResources, AllocationLifetime, AttributeId,
-    BatchInvocationId, BatchOperationIdentity, BatchOperationNodeIdentity,
-    BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
-    BufferDescriptor, BufferUsage, DeviceId, DeviceRuntime, ElementType, EncodedDeviceOperation,
-    ExecutablePlanView, ExecutionIdentityEnvelope, InvocationResourceLease,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, NodeId, NodeWorkContract,
-    OperationBufferView, OperationDescriptor, OperationProviderDescriptor, PlanHash, PlanId,
-    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ProviderId, ProviderWorkspaceRequirement, ResolvedValueBinding, ResourceId, SemanticValue,
-    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
-    StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
-    TrustedPlanRuntimeEvidence, VNextError,
+    AttributeId, BatchOperationIdentity, BatchOperationNodeIdentity, ElementType,
+    OperationBufferView, OperationDescriptor, OperationProviderDescriptor, ResolvedValueBinding,
 };
 
 pub(super) enum OperationInvocationResources<'a, R: DeviceRuntime> {

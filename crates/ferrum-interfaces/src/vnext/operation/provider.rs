@@ -3,11 +3,14 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
+use super::super::{
+    CapabilityId, ContractVersion, DeviceId, ExecutionIdentityEnvelope, NodeId, OperationId,
+    ProviderId, QuantizationFormatId, UnvalidatedExecutionIdentityParts, VNextError,
+    WeightFormatId,
+};
+use super::foundation::{canonical_sha256, invalid_operation};
 use super::{
-    canonical_sha256, invalid_operation, CapabilityId, ContractVersion, DeviceId,
-    DynamicStorageRequirement, ExecutionIdentityEnvelope, NodeId, OperationId, ProfilePhase,
-    ProviderId, ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedValueRole,
-    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
+    DynamicStorageRequirement, ProfilePhase, ProviderStorageBindingRequirement, ResolvedValueRole,
     MAX_OPERATION_FAILURE_WIRE_BYTES,
 };
 
@@ -322,7 +325,7 @@ impl OperationProviderDescriptor {
         let resource_estimator_id = resource_estimator_id.into();
         let resource_estimator_implementation_fingerprint =
             resource_estimator_implementation_fingerprint.into();
-        dynamic_storage_bindings.sort_by_key(|binding| binding.canonical_key());
+        dynamic_storage_bindings.sort_by_key(|binding| (binding.role(), binding.ordinal()));
         if version.major == 0
             || !canonical_sha256(&operation_fingerprint)
             || !canonical_sha256(&provider_implementation_fingerprint)
@@ -334,9 +337,9 @@ impl OperationProviderDescriptor {
             || resource_estimator_version.major == 0
             || !canonical_sha256(&resource_estimator_implementation_fingerprint)
             || dynamic_storage_bindings.is_empty()
-            || dynamic_storage_bindings
-                .windows(2)
-                .any(|pair| pair[0].canonical_key() == pair[1].canonical_key())
+            || dynamic_storage_bindings.windows(2).any(|pair| {
+                (pair[0].role(), pair[0].ordinal()) == (pair[1].role(), pair[1].ordinal())
+            })
         {
             return Err(invalid_operation(
                 "operation provider or resource-estimator identity is invalid",
@@ -410,7 +413,9 @@ impl OperationProviderDescriptor {
         ordinal: u32,
     ) -> Option<&DynamicStorageRequirement> {
         self.dynamic_storage_bindings
-            .binary_search_by_key(&(role, ordinal), |binding| binding.canonical_key())
+            .binary_search_by_key(&(role, ordinal), |binding| {
+                (binding.role(), binding.ordinal())
+            })
             .ok()
             .map(|index| self.dynamic_storage_bindings[index].storage())
     }

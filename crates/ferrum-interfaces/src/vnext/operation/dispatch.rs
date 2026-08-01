@@ -25,15 +25,16 @@ use super::dispatch_contract::{
     SubmissionWaveDispatchStage, SubmissionWaveDispatchStageTimer,
     SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
+use super::foundation::invalid_operation;
 use super::invocation::OperationInvocationResources;
 use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
 };
 use super::{
-    invalid_operation, BatchOperationIdentity, BatchOperationNodeIdentity,
-    BatchOperationParticipantIdentity, BatchedOperationInvocation, BoundOperationProvider,
-    ElementType, OperationInvocation, ProviderReplayEquivalence, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, TensorAccess,
+    BatchOperationIdentity, BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
+    BatchedOperationInvocation, BoundOperationProvider, ElementType, OperationInvocation,
+    ProviderReplayEquivalence, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, TensorAccess,
 };
 
 /// The only public path from a resolved plan to an operation kernel.

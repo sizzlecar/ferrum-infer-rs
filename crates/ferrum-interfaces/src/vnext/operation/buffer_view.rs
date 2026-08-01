@@ -1,10 +1,10 @@
-use super::super::ResourceTransactionIdentity;
-use super::{
-    invalid_operation, BufferDescriptor, BufferUsage, DeviceBufferRetention, DeviceRuntime,
-    DynamicResourceDemand, DynamicResourceShape, DynamicStorageView, LeasedBufferView,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeWorkContract,
-    ResolvedStorageComponent, ResolvedValueBinding, ResourceId, VNextError,
+use super::super::{
+    BufferDescriptor, BufferUsage, DeviceBufferRetention, DeviceRuntime, DynamicResourceDemand,
+    DynamicResourceShape, LeasedBufferView, LogicalBackingBufferView, LogicalBackingSegmentBinding,
+    NodeWorkContract, ResourceId, ResourceTransactionIdentity, VNextError,
 };
+use super::foundation::invalid_operation;
+use super::{DynamicStorageView, ResolvedStorageComponent, ResolvedValueBinding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ValueBindingPhysicalCoverage {
@@ -527,16 +527,16 @@ impl<'a, B> OperationBufferView<'a, B> {
 
 #[cfg(test)]
 mod operation_buffer_region_tests {
-    use super::super::{
-        AliasPolicy, BufferDescriptor, BufferUsage, DeviceBufferRetention, DynamicResourceDemand,
-        DynamicResourceShape, ElementType, NodeWorkContract, ProgramValueId, ResolvedTensorLayout,
-        ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage,
-        ResourceId, TensorAccess,
-    };
     use super::{
         sequence_execution_shape, translate_paged_segment, validate_dynamic_binding_layout,
         validate_value_binding_physical_coverage, OperationBufferCoverage, OperationBufferRegions,
         OperationBufferStorageKind, OperationRegionSource, ValueBindingPhysicalCoverage,
+    };
+    use crate::vnext::{
+        AliasPolicy, BufferDescriptor, BufferUsage, DeviceBufferRetention, DynamicResourceDemand,
+        DynamicResourceShape, ElementType, NodeWorkContract, ProgramValueId, ResolvedTensorLayout,
+        ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage,
+        ResourceId, TensorAccess,
     };
     use std::sync::atomic::Ordering;
     use std::sync::Arc;

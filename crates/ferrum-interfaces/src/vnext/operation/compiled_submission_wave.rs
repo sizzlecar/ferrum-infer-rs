@@ -1,15 +1,18 @@
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
 
+use super::super::{
+    BatchInvocationId, BatchStepId, DeviceId, DeviceRuntime, ExecutablePlanView,
+    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, NodeId,
+    NodeInvocationId, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PreparedStepSubmissionWave, ProviderId, RequestIdentity, ResourcePoolId, RunId, SpanId,
+    StepParticipantFrameAssignment, TransactionId, TrustedActiveSequenceBinding, VNextError,
+    EXECUTION_IDENTITY_VERSION,
+};
+use super::foundation::{canonical_operation_fingerprint, canonical_sha256, invalid_operation};
 use super::{
-    canonical_operation_fingerprint, canonical_sha256, invalid_operation, BatchInvocationId,
     BatchOperationIdentity, BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
-    BatchStepId, DeviceId, DeviceRuntime, ExecutablePlanView, ExecutionIdentityEnvelope,
-    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, NodeId, NodeInvocationId,
-    OperationDispatch, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PreparedStepSubmissionWave, ProviderExecutionSemantics, ProviderId, RequestIdentity,
-    ResourcePoolId, RunId, SpanId, StepParticipantFrameAssignment, TransactionId,
-    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    OperationDispatch, ProviderExecutionSemantics,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
