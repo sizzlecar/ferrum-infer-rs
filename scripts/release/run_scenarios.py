@@ -3315,13 +3315,20 @@ class ScenarioRunner:
             secret = str(scenario.get("secret") or "ferrum-blue")
             prompts = [f"Code: {secret}.", "Reply with only the code."]
         input_text = "\n".join(str(prompt) for prompt in prompts) + "\n/bye\n"
+        use_default_max_tokens = scenario.get("use_default_max_tokens", False)
+        require(
+            isinstance(use_default_max_tokens, bool),
+            "run_multiturn.use_default_max_tokens must be boolean",
+        )
         cmd = [
             str(self.ferrum_bin),
             "run",
             "--backend",
             str(scenario.get("backend") or self.backend),
-            "--max-tokens",
-            str(scenario.get("max_tokens", 192)),
+        ]
+        if not use_default_max_tokens:
+            cmd.extend(["--max-tokens", str(scenario.get("max_tokens", 192))])
+        cmd.extend([
             "--temperature",
             str(scenario.get("temperature", 0)),
             "--output-format",
@@ -3330,7 +3337,7 @@ class ScenarioRunner:
             str(out / "effective_config.json"),
             "--decision-trace-jsonl",
             str(out / "decision_trace.jsonl"),
-        ]
+        ])
         if self.observability_enabled():
             root = out / "observability"
             cmd.extend(self.observability_args(root))
@@ -3393,7 +3400,12 @@ class ScenarioRunner:
             )
         isolated = [event for event in assistants if str(event.get("content") or "").strip() == "</think>"]
         require(not isolated, "run_multiturn emitted isolated </think>")
-        return {"status": "pass", "assistant_turns": len(assistants), "length_finishes": 0}
+        return {
+            "status": "pass",
+            "assistant_turns": len(assistants),
+            "length_finishes": 0,
+            "used_default_max_tokens": use_default_max_tokens,
+        }
 
     def run_first_token_ux(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
         if os.name != "posix":
