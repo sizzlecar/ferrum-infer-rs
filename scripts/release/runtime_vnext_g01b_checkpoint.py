@@ -814,6 +814,32 @@ def validate_bounded_receipt(path: Path) -> dict[str, Any]:
     return receipt
 
 
+def parse_serial_libtest_results(output: str, label: str) -> set[str]:
+    observed: dict[str, str] = {}
+    pending: str | None = None
+    for line in output.splitlines():
+        match = re.fullmatch(r"test ([A-Za-z0-9_]+) \.\.\.\s*(.*)", line)
+        if match is not None:
+            require(pending is None, f"{label} test output is interleaved")
+            name, outcome = match.groups()
+            require(name not in observed, f"{label} duplicate test result: {name}")
+            outcome = outcome.strip()
+            if outcome:
+                observed[name] = outcome
+            else:
+                pending = name
+            continue
+        if pending is not None and line.strip() in {"ok", "FAILED", "ignored"}:
+            observed[pending] = line.strip()
+            pending = None
+    require(pending is None, f"{label} test result is unterminated: {pending}")
+    rejected = {
+        name: outcome for name, outcome in observed.items() if outcome != "ok"
+    }
+    require(not rejected, f"{label} contains non-pass test results: {rejected}")
+    return set(observed)
+
+
 def run_contract_test(checkpoint_root: Path, name: str) -> dict[str, Any]:
     spec = TEST_SPECS[name]
     logs = checkpoint_root / "logs" / name
@@ -894,9 +920,7 @@ def run_contract_test(checkpoint_root: Path, name: str) -> dict[str, Any]:
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
     combined = f"{output}\n{stderr}"
     require("test result: FAILED" not in combined, f"{name} contains a failed test result")
-    observed_tests = set(
-        re.findall(r"^test ([A-Za-z0-9_]+) \.\.\. ok$", combined, flags=re.MULTILINE)
-    )
+    observed_tests = parse_serial_libtest_results(combined, name)
     require(observed_tests == spec["expected_tests"], f"{name} exact test set mismatch: {sorted(observed_tests)}")
     summary_pattern = (
         rf"test result: ok\. {len(spec['expected_tests'])} passed; "
@@ -1452,6 +1476,32 @@ def self_test() -> int:
     require(len(TEST_SPECS["source-audit"]["expected_tests"]) == 3, "G01B source audit count drifted")
     require(len(TEST_SPECS["plan-snapshots"]["expected_tests"]) == 13, "G01B plan test count drifted")
     require(TEST_SPECS["overhead"]["release"] is True, "G01B overhead must use release mode")
+    require(
+        parse_serial_libtest_results(
+            "test quiet_case ... ok\n"
+            "test proof_case ... \n"
+            "MACHINE PROOF PASS: 100/100\n"
+            "ok\n",
+            "selftest",
+        )
+        == {"quiet_case", "proof_case"},
+        "G01B serial libtest parser lost a nocapture proof case",
+    )
+    for payload, fragment in (
+        ("test failed_case ... FAILED\n", "non-pass test results"),
+        ("test ignored_case ... ignored\n", "non-pass test results"),
+        ("test duplicate ... ok\ntest duplicate ... ok\n", "duplicate test result"),
+        ("test pending ... \n", "test result is unterminated"),
+        ("test pending ... \ntest next ... ok\n", "test output is interleaved"),
+    ):
+        try:
+            parse_serial_libtest_results(payload, "selftest")
+            raise AssertionError(f"serial libtest parser accepted: {fragment}")
+        except GateError as error:
+            require(
+                fragment in str(error),
+                f"serial libtest parser rejected for the wrong reason: {error}",
+            )
     strict_sha = "1" * 40
     independent_sha = "2" * 40
     for key in ("g00f", "g01a"):
