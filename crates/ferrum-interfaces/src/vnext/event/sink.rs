@@ -223,8 +223,12 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         run_id: RunId,
         request_id: RequestIdentity,
     ) -> Self {
-        let capture_policy = sink.capture_policy();
         let sink_enablement = sink.enablement();
+        let capture_policy = if sink_enablement == ExecutionEventSinkEnablement::None {
+            ExecutionEventCapturePolicy::AllFrames
+        } else {
+            sink.capture_policy()
+        };
         Self {
             sink: ExecutionEventSinkHandle::Borrowed(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
@@ -243,8 +247,13 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         run_id: RunId,
         request_id: RequestIdentity,
     ) -> ExecutionEventEmitter<'static> {
-        let capture_policy = sink.capture_policy();
-        Self::from_shared_with_capture_policy(sink, run_id, request_id, capture_policy)
+        let sink_enablement = sink.enablement();
+        let capture_policy = if sink_enablement == ExecutionEventSinkEnablement::None {
+            ExecutionEventCapturePolicy::AllFrames
+        } else {
+            sink.capture_policy()
+        };
+        Self::from_shared_parts(sink, run_id, request_id, capture_policy, sink_enablement)
     }
 
     pub fn from_shared_with_capture_policy(
@@ -254,6 +263,16 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         capture_policy: ExecutionEventCapturePolicy,
     ) -> ExecutionEventEmitter<'static> {
         let sink_enablement = sink.enablement();
+        Self::from_shared_parts(sink, run_id, request_id, capture_policy, sink_enablement)
+    }
+
+    fn from_shared_parts(
+        sink: Arc<dyn ExecutionEventSink>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        capture_policy: ExecutionEventCapturePolicy,
+        sink_enablement: ExecutionEventSinkEnablement,
+    ) -> ExecutionEventEmitter<'static> {
         ExecutionEventEmitter {
             sink: ExecutionEventSinkHandle::Shared(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
@@ -279,29 +298,37 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         event: &ExecutionEvent,
         context: &TrustedExecutionEventContext<'_>,
     ) -> Result<(), ExecutionEventSinkError> {
-        let requires_open_sequence = matches!(
-            event.kind(),
-            ExecutionEventKind::FrameStarted | ExecutionEventKind::NodeStarted
-        );
-        let requires_live_sequence = matches!(
-            event.kind(),
+        match event.kind() {
+            ExecutionEventKind::FrameStarted | ExecutionEventKind::NodeStarted => context
+                .active_binding()
+                .ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "active execution emission lacks live sequence evidence",
+                    )
+                })?
+                .ensure_open_for_emission()
+                .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?,
             ExecutionEventKind::OperationSubmitted
-                | ExecutionEventKind::NodeRetired
-                | ExecutionEventKind::FrameCompleted
-        ) || event.kind() == ExecutionEventKind::FailureObserved
-            && has_active(event.identity().parts());
-        if requires_open_sequence || requires_live_sequence {
-            let active = context.active_binding().ok_or_else(|| {
-                ExecutionEventSinkError::new(
-                    "active execution emission lacks live sequence evidence",
-                )
-            })?;
-            let live = if requires_open_sequence {
-                active.ensure_open_for_emission()
-            } else {
-                active.ensure_live_for_emission()
-            };
-            live.map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
+            | ExecutionEventKind::NodeRetired
+            | ExecutionEventKind::FrameCompleted => context
+                .active_binding()
+                .ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "active execution emission lacks live sequence evidence",
+                    )
+                })?
+                .ensure_live_for_emission()
+                .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?,
+            ExecutionEventKind::FailureObserved if has_active(event.identity().parts()) => context
+                .active_binding()
+                .ok_or_else(|| {
+                    ExecutionEventSinkError::new(
+                        "active execution emission lacks live sequence evidence",
+                    )
+                })?
+                .ensure_live_for_emission()
+                .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?,
+            _ => {}
         }
         cursor
             .observe_candidate_in_place(event, context)
@@ -313,6 +340,12 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         event: ExecutionEvent,
         context: &TrustedExecutionEventContext<'_>,
     ) -> Result<(), ExecutionEventSinkError> {
+        if self.sink_enablement == ExecutionEventSinkEnablement::None {
+            let mut next_cursor = self.cursor.clone();
+            Self::validate_next(&mut next_cursor, &event, context)?;
+            self.cursor = next_cursor;
+            return Ok(());
+        }
         if self.sink_failed {
             return Err(ExecutionEventSinkError::new(
                 "execution event emitter is sealed after a sink failure",
@@ -320,10 +353,6 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         }
         let mut next_cursor = self.cursor.clone();
         Self::validate_next(&mut next_cursor, &event, context)?;
-        if self.sink_enablement == ExecutionEventSinkEnablement::None {
-            self.cursor = next_cursor;
-            return Ok(());
-        }
         if self.records_event(&event) {
             let permit = EventEmissionPermit {
                 event,
@@ -343,6 +372,22 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         events: Vec<ExecutionEvent>,
         contexts: &[TrustedExecutionEventContext<'_>],
     ) -> Result<(), ExecutionEventSinkError> {
+        if self.sink_enablement == ExecutionEventSinkEnablement::None {
+            if events.len() != contexts.len() {
+                return Err(ExecutionEventSinkError::new(
+                    "execution event batch context count differs from event count",
+                ));
+            }
+            if events.is_empty() {
+                return Ok(());
+            }
+            let mut next_cursor = self.cursor.clone();
+            for (event, context) in events.iter().zip(contexts) {
+                Self::validate_next(&mut next_cursor, event, context)?;
+            }
+            self.cursor = next_cursor;
+            return Ok(());
+        }
         if self.sink_failed {
             return Err(ExecutionEventSinkError::new(
                 "execution event emitter is sealed after a sink failure",
@@ -360,10 +405,6 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         let mut next_cursor = self.cursor.clone();
         for (event, context) in events.iter().zip(contexts) {
             Self::validate_next(&mut next_cursor, event, context)?;
-        }
-        if self.sink_enablement == ExecutionEventSinkEnablement::None {
-            self.cursor = next_cursor;
-            return Ok(());
         }
 
         let all_enabled = events.iter().all(|event| self.records_event(event));
