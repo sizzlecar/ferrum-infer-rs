@@ -212,6 +212,10 @@ G06 或 G08 分母。S2 aggregate 必须显式消费下列同一 clean source id
    `H12.4`；每项必须绑定 catalog identity、冻结 bad input 或 mutation/revert、当前修复路径和
    mutation/revert kill receipt，并按 catalog 适用范围覆盖 `run`/`serve`。`H15.1/H15.2` 是
    Qwen3.5-35B c32/G08B 投影，不计入 S2。
+   `run_gate.py vnext-s2-historical-resource-source` 只收集上述五项的 content-addressed historical
+   replay、resource invariant 和七个精确当前源码测试，必须打印
+   `FERRUM RUNTIME VNEXT S2 HISTORICAL RESOURCE SOURCE PASS: <out_dir>`；该 source PASS 不能替代
+   S1 capacity/decode-capacity、S2 五轮默认预算与 abort/release 的实际 Qwen3.5-4B CUDA 证据。
 6. M1 CUDA latency/first-failure attribution artifact：typed `latency` preset 可从产品 CLI/config
    到达；请求 identity 至少贯穿 request/sequence/plan/node/op/resource/backend event；成功样本包含
    prompt/output/total token、token source、E2E，stream 还包含 TTFT/ITL；注入的 blocking/resource
