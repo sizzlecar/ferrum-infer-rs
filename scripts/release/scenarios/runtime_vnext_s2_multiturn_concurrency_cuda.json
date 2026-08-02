@@ -1,0 +1,59 @@
+{
+  "backend": "cuda",
+  "ferrum_bin": "target/release/ferrum",
+  "goal_scope": {
+    "full_s2": false,
+    "multiturn_concurrency_sentinel": true
+  },
+  "model": "Qwen/Qwen3.5-4B",
+  "observability": {
+    "enabled": true,
+    "profile_detail": "basic",
+    "profile_sample_rate": 1.0
+  },
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--backend",
+      "cuda"
+    ],
+    "mode": "start"
+  },
+  "timeout_sec": 600,
+  "scenarios": [
+    {
+      "name": "m1_s2_run_multiturn_recall",
+      "type": "run_multiturn",
+      "backend": "cuda",
+      "enable_thinking": false,
+      "secret": "ferrum-s2-blue",
+      "expected_recall": "ferrum-s2-blue",
+      "min_assistant_turns": 2,
+      "max_tokens": 128,
+      "temperature": 0.0,
+      "prompts": [
+        "Remember the exact code ferrum-s2-blue. Reply with only OK.",
+        "What was the exact code? Reply with only the code."
+      ]
+    },
+    {
+      "name": "m1_s2_serve_multiturn_recall",
+      "type": "serve_multiturn_recall",
+      "secret": "ferrum-s2-blue",
+      "first_prompt": "Remember the exact code ferrum-s2-blue. Reply with only OK.",
+      "second_prompt": "What was the exact code? Reply with only the code.",
+      "enable_thinking": false,
+      "max_tokens": 128,
+      "temperature": 0.0
+    },
+    {
+      "name": "m1_s2_serve_concurrency_quality",
+      "type": "serve_concurrency_quality",
+      "enable_thinking": false,
+      "concurrency_cells": [
+        1,
+        4
+      ]
+    }
+  ]
+}

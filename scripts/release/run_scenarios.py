@@ -74,6 +74,14 @@ C20_REMOTE_MEDIA_URL = (
     "cff4c47765ef3259b8a04890187d99c60da86394/"
     "docs/bench/framework-validation-2026-05-25/m3_layerwise.png"
 )
+RECORDED_CHILD_ENV_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "NO_COLOR",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+)
 
 
 class ScenarioError(Exception):
@@ -116,6 +124,18 @@ def repo_root() -> Path:
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def sanitized_product_environment() -> tuple[dict[str, str], list[str], dict[str, str]]:
+    removed = sorted(key for key in os.environ if key.startswith("FERRUM_"))
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FERRUM_")
+    }
+    child["NO_COLOR"] = "1"
+    recorded = {key: child[key] for key in RECORDED_CHILD_ENV_KEYS if key in child}
+    return child, removed, recorded
 
 
 def git_output(args: list[str], default: str = "unknown") -> str:
@@ -1485,12 +1505,9 @@ class ScenarioRunner:
             gpu_rows = [row.strip() for row in hardware["stdout"].splitlines() if row.strip()]
             require(len(gpu_rows) == 1, f"CUDA S2 requires exactly one GPU: {gpu_rows!r}")
             require("RTX 4090" in gpu_rows[0], f"CUDA S2 requires RTX 4090: {gpu_rows[0]!r}")
-        child_env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("FERRUM_")
-        }
-        child_env["NO_COLOR"] = "1"
+        child_env, removed_hidden_env_names, recorded_child_env = (
+            sanitized_product_environment()
+        )
         self.execution_receipt.update(
             {
                 "mode": "start",
@@ -1498,20 +1515,8 @@ class ScenarioRunner:
                 "binary_path": str(binary_path),
                 "binary_sha256": binary_sha256,
                 "hardware": hardware,
-                "removed_hidden_env_names": sorted(
-                    key for key in os.environ if key.startswith("FERRUM_")
-                ),
-                "child_env": {
-                    key: child_env[key]
-                    for key in (
-                        "CUDA_VISIBLE_DEVICES",
-                        "HF_HOME",
-                        "HF_HUB_CACHE",
-                        "RUST_BACKTRACE",
-                        "RUST_LOG",
-                    )
-                    if key in child_env
-                },
+                "removed_hidden_env_names": removed_hidden_env_names,
+                "child_env": recorded_child_env,
             }
         )
         self.started_server = StartedServer(cmd, self.out / "server.log", child_env)
@@ -1559,7 +1564,7 @@ class ScenarioRunner:
         inputs.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path(__file__).resolve(), inputs / "run_scenarios.py")
         shutil.copyfile(self.args.manifest.resolve(), inputs / "scenario_manifest.json")
-        self.execution_receipt["input_artifacts"] = {
+        input_artifacts = {
             "runner": {
                 "path": str(inputs / "run_scenarios.py"),
                 "sha256": file_sha256(inputs / "run_scenarios.py"),
@@ -1569,8 +1574,22 @@ class ScenarioRunner:
                 "sha256": file_sha256(inputs / "scenario_manifest.json"),
             },
         }
-        started_at = iso_now()
         scenarios = self.scenarios()
+        if any(
+            str(scenario.get("type")) == "serve_concurrency_quality"
+            for scenario in scenarios
+        ):
+            helper_source = Path(__file__).resolve().with_name(
+                "openai_concurrency_quality_regression.py"
+            )
+            helper_copy = inputs / helper_source.name
+            shutil.copyfile(helper_source, helper_copy)
+            input_artifacts["concurrency_quality_helper"] = {
+                "path": str(helper_copy),
+                "sha256": file_sha256(helper_copy),
+            }
+        self.execution_receipt["input_artifacts"] = input_artifacts
+        started_at = iso_now()
         selected = selected_scenarios(scenarios, self.args.only)
         self.execution_receipt.update(
             {
@@ -1866,6 +1885,10 @@ class ScenarioRunner:
             max_tokens=int(scenario.get("max_tokens", 192)),
             temperature=float(scenario.get("temperature", 0)),
         )
+        thinking = scenario.get("enable_thinking")
+        if isinstance(thinking, bool):
+            payload["chat_template_kwargs"] = {"enable_thinking": thinking}
+        write_json(path.with_name(f"{path.stem}.request.json"), payload)
         status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
         path.write_text(body, errors="replace")
         return parse_json_response(label, status, body)
@@ -2772,6 +2795,11 @@ class ScenarioRunner:
             out,
             [int(cell) for cell in cells],
             timeout=self.timeout,
+            enable_thinking=(
+                scenario.get("enable_thinking")
+                if isinstance(scenario.get("enable_thinking"), bool)
+                else None
+            ),
         )
         return {"status": "pass", "cells": result.get("cells", [])}
 
@@ -2926,7 +2954,34 @@ class ScenarioRunner:
             root = out / "observability"
             cmd.extend(self.observability_args(root))
             self.run_observability_roots.append(root)
+        thinking = scenario.get("enable_thinking")
+        if thinking is False:
+            cmd.append("--disable-thinking")
+        elif thinking is True:
+            cmd.append("--enable-thinking")
         cmd.append(self.model)
+        binary_path = self.ferrum_bin
+        if not binary_path.is_absolute():
+            binary_path = repo_root() / binary_path
+        binary_path = binary_path.resolve(strict=True)
+        cmd[0] = str(binary_path)
+        (out / "input.txt").write_text(input_text, encoding="utf-8")
+        child_env, removed_hidden_env_names, recorded_child_env = (
+            sanitized_product_environment()
+        )
+        write_json(
+            out / "command.json",
+            {
+                "argv": cmd,
+                "binary_sha256": file_sha256(binary_path),
+                "child_env": recorded_child_env,
+                "cwd": str(Path.cwd().resolve()),
+                "env_policy": "remove_FERRUM_prefix",
+                "removed_hidden_env_names": removed_hidden_env_names,
+                "stdin_path": str(out / "input.txt"),
+                "stdin_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+            },
+        )
         proc = subprocess.run(
             cmd,
             input=input_text,
@@ -2935,7 +2990,7 @@ class ScenarioRunner:
             stderr=subprocess.PIPE,
             timeout=int(scenario.get("timeout_sec", self.timeout * 3)),
             check=False,
-            env={**os.environ, "NO_COLOR": "1"},
+            env=child_env,
         )
         (out / "stdout.jsonl").write_text(proc.stdout, errors="replace")
         (out / "stderr.log").write_text(proc.stderr, errors="replace")
@@ -2977,12 +3032,13 @@ class ScenarioRunner:
             self.model,
         ]
         master, slave = pty.openpty()
+        child_env, _, _ = sanitized_product_environment()
         proc = subprocess.Popen(
             cmd,
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "NO_COLOR": "1"},
+            env=child_env,
             close_fds=True,
         )
         os.close(slave)
@@ -3532,6 +3588,25 @@ def run_selftest_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def self_test() -> int:
+    hidden_key = "FERRUM_RUN_SCENARIOS_SELFTEST_HIDDEN"
+    previous_hidden = os.environ.get(hidden_key)
+    os.environ[hidden_key] = "must-not-reach-child"
+    try:
+        child_env, removed_env, recorded_env = sanitized_product_environment()
+        if (
+            hidden_key in child_env
+            or hidden_key not in removed_env
+            or any(key.startswith("FERRUM_") for key in recorded_env)
+            or recorded_env.get("NO_COLOR") != "1"
+        ):
+            raise AssertionError(
+                {"child_env": child_env, "removed": removed_env, "recorded": recorded_env}
+            )
+    finally:
+        if previous_hidden is None:
+            os.environ.pop(hidden_key, None)
+        else:
+            os.environ[hidden_key] = previous_hidden
     if not exact_text_matches("  ferrum-blue\n", "ferrum-blue"):
         raise AssertionError("exact text matcher rejected surrounding whitespace")
     if exact_text_matches(
@@ -3831,6 +3906,23 @@ def self_test() -> int:
                 != file_sha256(out / "execution_receipt.json")
             ):
                 raise AssertionError(receipt)
+            input_artifacts = receipt.get("input_artifacts")
+            if not isinstance(input_artifacts, dict) or set(input_artifacts) != {
+                "runner",
+                "manifest",
+                "concurrency_quality_helper",
+            }:
+                raise AssertionError(input_artifacts)
+            helper_input = out / "inputs" / "openai_concurrency_quality_regression.py"
+            if (
+                Path(str(input_artifacts["concurrency_quality_helper"].get("path"))).resolve(
+                    strict=False
+                )
+                != helper_input.resolve(strict=False)
+                or input_artifacts["concurrency_quality_helper"].get("sha256")
+                != file_sha256(helper_input)
+            ):
+                raise AssertionError(input_artifacts["concurrency_quality_helper"])
             tree = load_json_object(out / "artifact_tree.json")
             tree_sha = tree.pop("canonical_sha256", None)
             if json_fingerprint(tree) != tree_sha:
@@ -3901,6 +3993,18 @@ def self_test() -> int:
                 or disconnect_result.get("scheduler_tick_limit") != 2
             ):
                 raise AssertionError(disconnect_result)
+            for turn in ("turn1", "turn2"):
+                if not (out / "multiturn" / f"{turn}.request.json").is_file():
+                    raise AssertionError(f"missing persisted multi-turn request: {turn}")
+            concurrency_cell = load_json_object(out / "concurrency" / "c4.quality.json")
+            if (
+                concurrency_cell.get("worker_limit") != 32
+                or concurrency_cell.get("worker_count") != 4
+                or concurrency_cell.get("synchronized_start") is not True
+                or int(concurrency_cell.get("overlap_pair_count") or 0) < 1
+                or int(concurrency_cell.get("max_in_flight") or 0) < 2
+            ):
+                raise AssertionError(concurrency_cell)
             matrix_contract = load_json_object(out / "response_format_matrix_contract.json")
             if matrix_contract.get("case_counts") != {"json_schema": 4, "json_object": 2}:
                 raise AssertionError(matrix_contract)
