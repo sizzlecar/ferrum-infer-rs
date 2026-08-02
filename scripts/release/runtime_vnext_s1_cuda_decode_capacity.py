@@ -19,6 +19,7 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS"
 COLLECT_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY COLLECTED"
 FAIL_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY FAIL"
 MODEL_ID = "Qwen/Qwen3.5-4B"
+MODEL_CACHE_COMPONENT = "models--Qwen--Qwen3.5-4B"
 CALIBRATION_TOKEN_BUDGET = 3
 TARGET_TOKEN_BUDGET = 1024
 MAX_NUM_SEQS = 3
@@ -111,6 +112,26 @@ class DecodeCapacityGateError(common.CapacityGateError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise DecodeCapacityGateError(message)
+
+
+def model_revision_from_snapshot(path: object) -> str:
+    parts = Path(str(path)).parts
+    require(
+        MODEL_CACHE_COMPONENT in parts,
+        f"model snapshot is not {MODEL_ID}: {path}",
+    )
+    require("snapshots" in parts, f"model path is not a Hugging Face snapshot: {path}")
+    snapshot_index = parts.index("snapshots")
+    require(
+        snapshot_index + 1 < len(parts),
+        f"model snapshot revision is missing: {path}",
+    )
+    revision = parts[snapshot_index + 1]
+    require(
+        common.GIT_SHA_RE.fullmatch(revision) is not None,
+        f"invalid model snapshot revision: {revision}",
+    )
+    return revision
 
 
 def require_executor_identity_shape(executor: dict[str, Any], label: str) -> None:
@@ -727,6 +748,17 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         coordinator_id=observed["coordinator_id"],
         label=label,
     )
+    shortfalls = evidence.get("shortfalls")
+    backing_blockers = evidence.get("backing_blockers")
+    require(isinstance(shortfalls, list), f"{label}: logical shortfalls are missing")
+    require(
+        isinstance(backing_blockers, list),
+        f"{label}: physical backing blockers are missing",
+    )
+    require(
+        bool(shortfalls) != bool(backing_blockers),
+        f"{label}: capacity evidence has no unique logical/backing owner",
+    )
     scheduler_snapshot = attributes.get("scheduler_snapshot")
     require(isinstance(scheduler_snapshot, dict), f"{label}: scheduler snapshot is missing")
     return {
@@ -743,6 +775,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "yield_kind": yield_kind,
         "observed": observed,
         "wait_condition": wait_condition,
+        "evidence_owner": "backing" if backing_blockers else "logical",
     }
 
 
@@ -1557,12 +1590,7 @@ def validate_decode_counter_provenance(
     direct_by_stage = {stage: 0 for stage in counter_by_stage}
     backing_events = 0
     for event in deferrals:
-        sources = {
-            entry["source"]
-            for entry in event["wait_condition"]["observed"]
-            if isinstance(entry.get("source"), str)
-        }
-        if sources & {"plan_device_budget", "process_device_capacity"}:
+        if event["evidence_owner"] == "backing":
             backing_events += 1
         else:
             direct_by_stage[event["stage"]] += 1
@@ -1876,6 +1904,43 @@ def require_decode_prompt(result: dict[str, Any], slot: str) -> None:
         result.get("workload_slot") == slot
         and result.get("prompt_sha256") == DECODE_PROMPT_SHA256_BY_SLOT[slot],
         f"{slot}: decode prompt differs from the canonical workload",
+    )
+
+
+def validate_replayed_decode_workload(
+    slot: str, labeled_results: dict[str, dict[str, Any]]
+) -> None:
+    expected_max_tokens = {
+        "calibration": CALIBRATION_MAX_TOKENS[slot],
+        "target-sizing": CALIBRATION_MAX_TOKENS[slot],
+        "target-rebalance-prime": REBALANCE_PRIME_MAX_TOKENS[slot],
+        "target": TARGET_MAX_TOKENS[slot],
+    }
+    require(
+        labeled_results.keys() == expected_max_tokens.keys(),
+        f"workload slot {slot} has an invalid replay phase set",
+    )
+    prompt_token_counts: set[int] = set()
+    for phase, result in labeled_results.items():
+        require_decode_prompt(result, slot)
+        prompt_tokens = result.get("prompt_tokens")
+        require(
+            isinstance(prompt_tokens, int) and prompt_tokens > 0,
+            f"{phase}: prompt token count is missing",
+        )
+        max_tokens = expected_max_tokens[phase]
+        require(
+            result.get("max_tokens") == max_tokens,
+            f"{phase}: max_tokens does not match decode workload slot {slot}",
+        )
+        require(
+            prompt_tokens + max_tokens <= MAX_MODEL_LEN,
+            f"{phase}: decode workload slot {slot} exceeds the model-length ceiling",
+        )
+        prompt_token_counts.add(prompt_tokens)
+    require(
+        len(prompt_token_counts) == 1,
+        f"workload slot {slot} changed its tokenized prompt length across phases",
     )
 
 
@@ -2496,7 +2561,7 @@ def validate(root: Path, out: Path) -> int:
         isinstance(gpu_rows, list) and len(gpu_rows) == 1 and "RTX 4090" in gpu_rows[0],
         "artifact is not from exactly one RTX 4090",
     )
-    require("Qwen3.5-4B" in str(collection.get("model_path")), "artifact model is not Qwen3.5-4B")
+    model_revision_from_snapshot(collection.get("model_path"))
 
     calibration = collection.get("calibration")
     target_sizing = collection.get("target_sizing")
@@ -2557,10 +2622,6 @@ def validate(root: Path, out: Path) -> int:
                 ("target final", target_executor),
             ],
         }
-    )
-    require(
-        calibration_executor.get("model_id") in str(collection.get("model_path")),
-        "executor model id is absent from immutable model path",
     )
     calibration_pool = common.quiescent_pool_snapshot(
         calibration_executor,
@@ -2696,7 +2757,7 @@ def validate(root: Path, out: Path) -> int:
         "target pressure decode-live overlap receipt differs from raw clients",
     )
     for slot in ("A", "B", "C"):
-        common.validate_replayed_workload(
+        validate_replayed_decode_workload(
             slot,
             {
                 "calibration": calibration["clients"][slot],
@@ -2938,6 +2999,26 @@ def self_test() -> int:
         ),
         "decode prompt drift",
     )
+    replay_results = {
+        phase: {
+            **prompt_result,
+            "prompt_tokens": 8,
+            "max_tokens": max_tokens,
+        }
+        for phase, max_tokens in {
+            "calibration": CALIBRATION_MAX_TOKENS["B"],
+            "target-sizing": CALIBRATION_MAX_TOKENS["B"],
+            "target-rebalance-prime": REBALANCE_PRIME_MAX_TOKENS["B"],
+            "target": TARGET_MAX_TOKENS["B"],
+        }.items()
+    }
+    validate_replayed_decode_workload("B", replay_results)
+    wrong_replay_tokens = json.loads(json.dumps(replay_results))
+    wrong_replay_tokens["target"]["max_tokens"] -= 1
+    expect_reject(
+        lambda: validate_replayed_decode_workload("B", wrong_replay_tokens),
+        "decode replay token-budget drift",
+    )
 
     def executor_fixture(
         plan_digit: str, policy_digit: str, reserve_bytes: int
@@ -3017,6 +3098,19 @@ def self_test() -> int:
     expect_reject(
         lambda: require_executor_identity_shape(wrong_model, "wrong model"),
         "non-canonical model identity",
+    )
+    valid_snapshot = (
+        f"/tmp/hub/{MODEL_CACHE_COMPONENT}/snapshots/" + "e" * 40
+    )
+    require(
+        model_revision_from_snapshot(valid_snapshot) == "e" * 40,
+        "canonical model snapshot revision changed",
+    )
+    expect_reject(
+        lambda: model_revision_from_snapshot(
+            "/tmp/hub/models--Qwen--another-model/snapshots/" + "e" * 40
+        ),
+        "wrong model snapshot",
     )
 
     canonical_argv = [
@@ -3241,6 +3335,17 @@ def self_test() -> int:
     capacity_evidence = {
         "observed": {"coordinator_id": 7, "release_epoch": 11, "capacity_epoch": 13},
         "wait_condition": wait_condition,
+        "shortfalls": [
+            {
+                "domain": 5,
+                "kind": "fit_availability",
+                "requested": 2,
+                "available": 1,
+                "current_total": 1,
+                "maximum_total": 2,
+            }
+        ],
+        "backing_blockers": [],
     }
 
     def deferral(
@@ -3683,9 +3788,19 @@ def self_test() -> int:
     for row in backing_rows:
         if row.get("phase") != "vnext.decode_capacity_deferred":
             continue
-        row["attributes"]["capacity_evidence"]["wait_condition"]["observed"].append(
-            {"source": "plan_device_budget", "epoch": 9}
-        )
+        evidence = row["attributes"]["capacity_evidence"]
+        evidence["shortfalls"] = []
+        evidence["backing_blockers"] = [
+            {
+                "pool_id": "dynamic-pool/sha256/" + "a" * 64,
+                "domain_id": 5,
+                "reason": "growth_required",
+                "requested_bytes": 64,
+                "free_bytes": 0,
+                "largest_contiguous_bytes": 0,
+                "free_extent_layout_fingerprint": "sha256/" + "b" * 64,
+            }
+        ]
     backing_counter_provenance = validate_decode_counter_provenance(
         backing_rows,
         started_wall_ns=90,
@@ -3715,6 +3830,31 @@ def self_test() -> int:
             },
         ),
         "missing backing deferral counter provenance",
+    )
+    ambiguous_rows = json.loads(json.dumps(backing_rows))
+    ambiguous_rows[0]["attributes"]["capacity_evidence"]["shortfalls"] = [
+        {
+            "domain": 5,
+            "kind": "fit_availability",
+            "requested": 2,
+            "available": 1,
+            "current_total": 1,
+            "maximum_total": 2,
+        }
+    ]
+    expect_reject(
+        lambda: validate_decode_counter_provenance(
+            ambiguous_rows,
+            started_wall_ns=90,
+            finished_wall_ns=170,
+            counters={
+                "extension_deferrals": 1,
+                "step_deferrals": 1,
+                "wave_deferrals": 0,
+                "backing_deferrals": summary["deferral_events"],
+            },
+        ),
+        "ambiguous logical/backing deferral ownership",
     )
     rebalance_summary = validate_rebalance_trace(
         rebalance_rows, started_wall_ns=80, finished_wall_ns=89
