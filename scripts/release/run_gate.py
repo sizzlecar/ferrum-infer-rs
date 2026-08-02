@@ -990,17 +990,18 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             provenance_kind="vnext-g01",
         )
     if lane == "vnext-g02-core":
+        child_out = out_dir / "g02-core"
         return LaneCommand(
             cmd=[
                 sys.executable,
                 "scripts/release/runtime_vnext_g02_core.py",
                 "--out",
-                str(out_dir),
+                str(child_out),
             ],
             expected_child_pass_line=(
-                f"FERRUM RUNTIME VNEXT G02 CORE L0 L1 PASS: {out_dir}"
+                f"FERRUM RUNTIME VNEXT G02 CORE L0 L1 PASS: {child_out}"
             ),
-            child_manifest_path=out_dir / "manifest.json",
+            child_manifest_path=child_out / "manifest.json",
             provenance_kind="vnext-g02-core",
         )
     if lane == "vnext-g07a":
@@ -8112,6 +8113,7 @@ def self_test() -> int:
             cuda_manifest,
         )
         g02_core_out = (root / "vnext-g02-core-dry-run").resolve()
+        g02_core_child_out = g02_core_out / "g02-core"
         g02_core = run_selftest_command(
             [
                 sys.executable,
@@ -8137,10 +8139,10 @@ def self_test() -> int:
                 sys.executable,
                 "scripts/release/runtime_vnext_g02_core.py",
                 "--out",
-                str(g02_core_out),
+                str(g02_core_child_out),
             ]
             and g02_core_manifest["child_pass_line"]
-            == f"FERRUM RUNTIME VNEXT G02 CORE L0 L1 PASS: {g02_core_out}",
+            == f"FERRUM RUNTIME VNEXT G02 CORE L0 L1 PASS: {g02_core_child_out}",
             g02_core_manifest,
         )
         g08b_root = root / "g08b-artifact-root"
