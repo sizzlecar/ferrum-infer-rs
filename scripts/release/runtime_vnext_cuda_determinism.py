@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -26,11 +27,18 @@ try:
 except ModuleNotFoundError:
     from scripts.release import runtime_vnext_hardware_probe as hardware_probe
 
+try:
+    import runtime_vnext_baseline_scenarios as baseline_scenarios
+except ModuleNotFoundError:
+    from scripts.release import runtime_vnext_baseline_scenarios as baseline_scenarios
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_CATALOG_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_models.json"
 HARDWARE_PROBE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
-PASS_PREFIX = "FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS"
+EVIDENCE_COLLECTOR_PATH = (
+    REPO_ROOT / "scripts/release/runtime_vnext_cuda_determinism_collect.py"
+)
 ARTIFACT_TYPE = "runtime_vnext_cuda_determinism_evidence"
 VALIDATOR_ARTIFACT_TYPE = "runtime_vnext_cuda_determinism_validation"
 PRIMARY_MODEL_LANES = {
@@ -39,13 +47,31 @@ PRIMARY_MODEL_LANES = {
     "m3-qwen3-30b-a3b": "M3-CUDA",
 }
 PRIMARY_MODELS = set(PRIMARY_MODEL_LANES)
-REQUIRED_PARTITIONS = {
+RELEASE_SCOPE = "release-full"
+M1_S2_FOCUSED_SCOPE = "m1-s2-focused"
+M1_MODEL = "m1-qwen35-4b"
+RELEASE_PARTITIONS = {
     ("prefill", "single_token"),
     ("prefill", "multi_token"),
     ("prefill", "chunk_boundary"),
     ("decode", "c1"),
     ("decode", "multi_participant"),
     ("decode", "c32"),
+}
+M1_S2_FOCUSED_PARTITIONS = RELEASE_PARTITIONS - {("decode", "c32")}
+SCOPE_CONTRACTS = {
+    RELEASE_SCOPE: {
+        "models": PRIMARY_MODELS,
+        "partitions": RELEASE_PARTITIONS,
+        "pass_prefix": "FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS",
+        "lane": "runtime-vnext-cuda-determinism",
+    },
+    M1_S2_FOCUSED_SCOPE: {
+        "models": {M1_MODEL},
+        "partitions": M1_S2_FOCUSED_PARTITIONS,
+        "pass_prefix": "FERRUM RUNTIME VNEXT M1 S2 CUDA DETERMINISM FOCUSED PASS",
+        "lane": "runtime-vnext-m1-s2-cuda-determinism-focused",
+    },
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -57,19 +83,60 @@ MAX_COMPARISONS_PER_KIND = 32
 MAX_ROOT_JSON_BYTES = 4 * 1024 * 1024
 MAX_RECEIPT_JSON_BYTES = 4 * 1024 * 1024
 MAX_MODEL_LOCK_JSON_BYTES = 64 * 1024 * 1024
+MAX_MODEL_VERIFICATION_JSON_BYTES = 64 * 1024 * 1024
 MAX_DENOMINATOR_JSON_BYTES = 128 * 1024 * 1024
 MAX_CASE_JSON_BYTES = 32 * 1024 * 1024
 MAX_LOG_BYTES = 128 * 1024 * 1024
 MAX_BINARY_BYTES = 1024 * 1024 * 1024
+BUILD_PROVENANCE_ROOT = Path("build-provenance")
+CANDIDATE_BUILD_RECEIPT_PATH = (
+    BUILD_PROVENANCE_ROOT / "build/candidate/candidate-build-receipt.json"
+)
+CANDIDATE_BUILD_BINARY_PATH = BUILD_PROVENANCE_ROOT / "build/candidate/ferrum"
+NATIVE_OPERATOR_SET_LOCK_PATH = (
+    BUILD_PROVENANCE_ROOT
+    / baseline_scenarios.CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL
+)
+DETERMINISM_WORKER_ENVIRONMENT = {
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "8",
+    "TOKIO_WORKER_THREADS": "8",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
+DETERMINISM_FIXED_ENVIRONMENT = {
+    **DETERMINISM_WORKER_ENVIRONMENT,
+    "CUDA_VISIBLE_DEVICES": "0",
+}
+DETERMINISM_ENVIRONMENT_PASSTHROUGH = frozenset(
+    {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LD_LIBRARY_PATH",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "NVIDIA_REQUIRE_CUDA",
+        "NVIDIA_VISIBLE_DEVICES",
+        "PATH",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    }
+)
 
 ROOT_FIELDS = frozenset(
     {
         "schema_version",
         "artifact_type",
         "backend",
+        "scope",
         "source",
         "hardware",
         "models_lock",
+        "model_verification",
+        "collector",
         "denominator",
         "models",
         "runner",
@@ -81,9 +148,10 @@ SOURCE_FIELDS = frozenset(
         "git_sha",
         "git_tree_sha",
         "dirty_status",
-        "build_command",
         "binary_path",
         "binary",
+        "candidate_build_receipt",
+        "native_operator_set_lock",
     }
 )
 HARDWARE_FIELDS = frozenset({"probe", "fingerprint"})
@@ -102,15 +170,64 @@ MODEL_FIELDS = frozenset(
     }
 )
 MODEL_FILE_FIELDS = frozenset({"path", "sha256", "size_bytes"})
+MODEL_VERIFICATION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "artifact_type",
+        "scope",
+        "source_git_sha",
+        "source_tree_sha",
+        "collector",
+        "verified_at",
+        "models",
+    }
+)
+MODEL_VERIFICATION_COLLECTOR_FIELDS = frozenset({"path", "sha256"})
+MODEL_VERIFICATION_MODEL_FIELDS = frozenset(
+    {"model_key", "model_dir", "files", "consumed_files"}
+)
 RUNNER_FIELDS = frozenset(
     {
         "command",
+        "environment",
+        "repository_root",
         "started_at",
         "finished_at",
         "exit_code",
         "receipt",
         "stdout",
         "stderr",
+    }
+)
+COLLECTOR_FIELDS = frozenset(
+    {
+        "schema_version",
+        "artifact_type",
+        "status",
+        "backend",
+        "scope",
+        "models_lock",
+        "hardware_probe",
+        "device_fingerprint",
+        "binary",
+        "denominator",
+        "models",
+        "cases",
+        "case_count",
+        "execution_count",
+        "comparison_count",
+        "pass_line",
+    }
+)
+COLLECTOR_MODEL_FIELDS = frozenset(
+    {
+        "model_key",
+        "model_dir",
+        "resolved_plan_fingerprint",
+        "plan_hash",
+        "dtype",
+        "quantization",
+        "case_count",
     }
 )
 BOUNDED_RECEIPT_FIELDS = frozenset(
@@ -454,6 +571,12 @@ def require(condition: bool, message: str) -> None:
         raise DeterminismArtifactError(message)
 
 
+def scope_contract(scope: str) -> dict[str, Any]:
+    contract = SCOPE_CONTRACTS.get(scope)
+    require(contract is not None, f"unknown determinism scope: {scope}")
+    return contract
+
+
 def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -596,10 +719,15 @@ def validate_file_ref(
     label: str,
     *,
     max_size_bytes: int = MAX_DENOMINATOR_JSON_BYTES,
+    allow_empty: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     ref = exact_object(value, FILE_REF_FIELDS, label)
     path = safe_artifact_file(root, ref["path"], label)
-    size = integer(ref["size_bytes"], f"{label}.size_bytes", minimum=1)
+    size = integer(
+        ref["size_bytes"],
+        f"{label}.size_bytes",
+        minimum=0 if allow_empty else 1,
+    )
     require(size <= max_size_bytes, f"{label}.size_bytes exceeds {max_size_bytes}")
     require(path.stat().st_size == size, f"{label}.size_bytes differs from the file")
     digest = sha256_text(ref["sha256"], f"{label}.sha256")
@@ -643,6 +771,8 @@ def validate_bounded_receipt(
     receipt: dict[str, Any],
     *,
     command: list[str],
+    repository_root: Path,
+    recorded_artifact_root: Path,
     started_at: str,
     finished_at: str,
     exit_code: int,
@@ -655,7 +785,11 @@ def validate_bounded_receipt(
         "runner.receipt schema is invalid",
     )
     require(receipt["command"] == command, "runner.receipt command differs from runner.command")
-    text(receipt["cwd"], "runner.receipt.cwd")
+    receipt_cwd = Path(text(receipt["cwd"], "runner.receipt.cwd"))
+    require(
+        receipt_cwd.is_absolute() and receipt_cwd == repository_root,
+        "runner receipt cwd differs from the recorded repository root",
+    )
     pid = integer(receipt["pid"], "runner.receipt.pid", minimum=1)
     require(receipt["pgid"] == pid, "runner.receipt must own its process group")
 
@@ -679,11 +813,10 @@ def validate_bounded_receipt(
         "runner.receipt.limits.max_per_process_threads",
         minimum=1,
     )
-    require(max_processes <= 64, "runner receipt process bound exceeds 64")
-    require(max_group_threads <= 1024, "runner receipt group-thread bound exceeds 1024")
     require(
-        max_per_process_threads <= 512,
-        "runner receipt per-process thread bound exceeds 512",
+        (max_processes, max_group_threads, max_per_process_threads)
+        == (16, 128, 64),
+        "runner receipt must use the fixed 16/128/64 process-thread bounds",
     )
     number(
         limits["sample_interval_seconds"],
@@ -763,7 +896,12 @@ def validate_bounded_receipt(
         output = exact_object(
             receipt[name], BOUNDED_OUTPUT_FIELDS, f"runner.receipt.{name}"
         )
-        text(output["path"], f"runner.receipt.{name}.path")
+        output_path = Path(text(output["path"], f"runner.receipt.{name}.path"))
+        require(
+            output_path
+            == recorded_artifact_root / "runner" / f"{name}.log",
+            f"runner receipt {name} path differs from the canonical artifact path",
+        )
         require(
             output["sha256"] == expected["sha256"]
             and output["size_bytes"] == expected["size_bytes"],
@@ -771,7 +909,168 @@ def validate_bounded_receipt(
         )
 
 
-def validate_coverage(value: dict[str, Any]) -> dict[str, Any]:
+def validate_runner_environment(value: Any) -> dict[str, str]:
+    require(isinstance(value, dict), "evidence.runner.environment must be an object")
+    allowed = set(DETERMINISM_FIXED_ENVIRONMENT) | set(
+        DETERMINISM_ENVIRONMENT_PASSTHROUGH
+    )
+    require(
+        set(value) <= allowed and "PATH" in value,
+        "runner environment contains an undeclared variable or lacks PATH",
+    )
+    environment: dict[str, str] = {}
+    for key in sorted(value):
+        require(
+            isinstance(key, str)
+            and key
+            and isinstance(value[key], str)
+            and len(value[key]) <= 16_384,
+            f"runner environment value is invalid for {key!r}",
+        )
+        environment[key] = value[key]
+    require(
+        all(environment.get(key) == expected for key, expected in DETERMINISM_FIXED_ENVIRONMENT.items()),
+        "runner environment does not enforce the fixed CUDA/worker limits",
+    )
+    return environment
+
+
+def canonical_determinism_environment(source: Mapping[str, str]) -> dict[str, str]:
+    environment = {
+        key: source[key]
+        for key in sorted(DETERMINISM_ENVIRONMENT_PASSTHROUGH)
+        if key in source
+    }
+    environment.update(DETERMINISM_FIXED_ENVIRONMENT)
+    return validate_runner_environment(environment)
+
+
+def exact_collector_pass_line(scope: str, artifact_root: str) -> str:
+    prefix = (
+        "FERRUM VNEXT M1 S2 FOCUSED DETERMINISM COLLECTOR PASS"
+        if scope == M1_S2_FOCUSED_SCOPE
+        else "FERRUM VNEXT DETERMINISM COLLECTOR PASS"
+    )
+    return f"{prefix}: {artifact_root}"
+
+
+def validate_collector_manifest(
+    root: Path,
+    value: Any,
+    *,
+    scope: str,
+    expected_models: set[str],
+    runner_command: list[str],
+    runner_stdout_path: Path,
+    binary_ref: dict[str, Any],
+    models_lock_ref: dict[str, Any],
+    hardware_probe_ref: dict[str, Any],
+    device_fingerprint: str,
+    denominator_ref: dict[str, Any],
+    denominator: dict[str, Any],
+    model_directories: dict[str, str],
+    case_refs: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    collector_ref, collector_path = validate_file_ref(
+        root,
+        value,
+        "evidence.collector",
+        max_size_bytes=MAX_ROOT_JSON_BYTES,
+    )
+    require(
+        collector_ref["path"] == "collector.json",
+        "evidence.collector must reference collector.json",
+    )
+    collector = exact_object(
+        read_json(collector_path, max_bytes=MAX_ROOT_JSON_BYTES),
+        COLLECTOR_FIELDS,
+        "collector",
+    )
+    require(
+        collector["schema_version"] == 1
+        and collector["artifact_type"] == "runtime_vnext_cuda_determinism_collector"
+        and collector["status"] == "pass"
+        and collector["backend"] == "cuda"
+        and collector["scope"] == scope,
+        "collector identity, status, backend, or scope is invalid",
+    )
+    expected_pass = exact_collector_pass_line(scope, runner_command[5])
+    require(collector["pass_line"] == expected_pass, "collector PASS line is invalid")
+    require(
+        expected_pass
+        in runner_stdout_path.read_text(encoding="utf-8", errors="strict").splitlines(),
+        "runner stdout lacks the exact Rust collector PASS line",
+    )
+    require(
+        collector["models_lock"] == models_lock_ref,
+        "collector models.lock reference differs from evidence",
+    )
+    require(
+        collector["hardware_probe"] == hardware_probe_ref
+        and collector["device_fingerprint"] == device_fingerprint,
+        "collector hardware identity differs from evidence",
+    )
+    require(
+        collector["denominator"] == denominator_ref,
+        "collector denominator reference differs from evidence",
+    )
+    collector_binary = exact_object(
+        collector["binary"], FILE_REF_FIELDS, "collector.binary"
+    )
+    require(
+        collector_binary
+        == {
+            "path": runner_command[0],
+            "sha256": binary_ref["sha256"],
+            "size_bytes": binary_ref["size_bytes"],
+        },
+        "collector binary identity differs from the executed release binary",
+    )
+
+    expected_case_count = len(expected_models) * len(scope_contract(scope)["partitions"]) * 4
+    require(
+        integer(collector["case_count"], "collector.case_count", minimum=1)
+        == expected_case_count
+        and collector["cases"] == case_refs,
+        "collector case references or exact denominator differ from evidence",
+    )
+    integer(collector["execution_count"], "collector.execution_count", minimum=1)
+    integer(collector["comparison_count"], "collector.comparison_count", minimum=1)
+
+    rows = collector["models"]
+    require(isinstance(rows, list), "collector.models must be a list")
+    cases_per_model = len(scope_contract(scope)["partitions"]) * 4
+    indexed: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(rows):
+        label = f"collector.models[{index}]"
+        row = exact_object(raw, COLLECTOR_MODEL_FIELDS, label)
+        model_key = text(row["model_key"], f"{label}.model_key", portable=True)
+        require(
+            model_key in expected_models and model_key not in indexed,
+            f"{label}.model_key is invalid or duplicated",
+        )
+        planned = denominator["models"][model_key]
+        require(
+            row["model_dir"] == model_directories[model_key]
+            and row["resolved_plan_fingerprint"]
+            == planned["resolved_plan_fingerprint"]
+            and row["plan_hash"] == planned["plan_hash"]
+            and row["case_count"] == cases_per_model,
+            f"{label} differs from the verified model binding or denominator",
+        )
+        text(row["dtype"], f"{label}.dtype", portable=True)
+        text(row["quantization"], f"{label}.quantization", portable=True)
+        indexed[model_key] = row
+    require(
+        list(indexed) == sorted(expected_models),
+        "collector model set or ordering differs from the selected scope",
+    )
+    return collector, indexed
+
+
+def validate_coverage(
+    value: dict[str, Any], expected_models: set[str]
+) -> dict[str, Any]:
     coverage = exact_object(value, COVERAGE_FIELDS, "coverage")
     require(validate_version(coverage["schema_version"], "coverage.schema_version") == (1, 0),
             "coverage.schema_version must be 1.0")
@@ -787,12 +1086,18 @@ def validate_coverage(value: dict[str, Any]) -> dict[str, Any]:
 
     models_raw = coverage["models"]
     require(isinstance(models_raw, list), "coverage.models must be a list")
-    require(len(models_raw) == len(PRIMARY_MODELS), "coverage must contain the three primary models")
+    require(
+        len(models_raw) == len(expected_models),
+        "coverage model cardinality differs from the selected scope",
+    )
     models: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(models_raw):
         model = exact_object(raw, COVERAGE_MODEL_FIELDS, f"coverage.models[{index}]")
         key = text(model["model_key"], f"coverage.models[{index}].model_key", portable=True)
-        require(key in PRIMARY_MODELS and key not in models, "coverage model key is invalid or duplicated")
+        require(
+            key in expected_models and key not in models,
+            "coverage model key is invalid or duplicated for the selected scope",
+        )
         text(model["external_metadata_id"], f"coverage.models[{index}].external_metadata_id", portable=True)
         sha256_text(
             model["resolved_plan_fingerprint"],
@@ -806,6 +1111,7 @@ def validate_coverage(value: dict[str, Any]) -> dict[str, Any]:
         )
         models[key] = model
     require(list(models) == sorted(models), "coverage.models must use canonical model-key order")
+    require(set(models) == expected_models, "coverage model set differs from the selected scope")
 
     requirements_raw = coverage["provider_requirements"]
     require(
@@ -814,7 +1120,7 @@ def validate_coverage(value: dict[str, Any]) -> dict[str, Any]:
     )
     requirements: dict[tuple[str, str], dict[str, Any]] = {}
     previous_key: tuple[str, str] | None = None
-    model_nodes: dict[str, set[str]] = {key: set() for key in PRIMARY_MODELS}
+    model_nodes: dict[str, set[str]] = {key: set() for key in expected_models}
     for index, raw in enumerate(requirements_raw):
         label = f"coverage.provider_requirements[{index}]"
         requirement = exact_object(raw, PROVIDER_REQUIREMENT_FIELDS, label)
@@ -1133,18 +1439,20 @@ def validate_witness_plan(
     }
 
 
-def validate_denominator(value: dict[str, Any]) -> dict[str, Any]:
+def validate_denominator(
+    value: dict[str, Any], expected_models: set[str]
+) -> dict[str, Any]:
     denominator = exact_object(value, DENOMINATOR_FIELDS, "denominator")
     require(
         validate_version(denominator["schema_version"], "denominator.schema_version")
         == (1, 0),
         "denominator.schema_version must be 1.0",
     )
-    coverage = validate_coverage(denominator["coverage"])
+    coverage = validate_coverage(denominator["coverage"], expected_models)
     evidence_rows = denominator["provider_evidence"]
     require(
         isinstance(evidence_rows, list)
-        and 0 < len(evidence_rows) <= len(PRIMARY_MODELS) * 512,
+        and 0 < len(evidence_rows) <= len(expected_models) * 512,
         "denominator.provider_evidence cardinality is invalid",
     )
     scopes: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -1331,12 +1639,116 @@ def validate_models_lock(
     return indexed
 
 
+def validate_model_verification(
+    root: Path,
+    value: Any,
+    *,
+    expected_scope: str,
+    expected_models: set[str],
+    expected_source: dict[str, Any],
+    locked_models: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    _, path = validate_file_ref(
+        root,
+        value,
+        "evidence.model_verification",
+        max_size_bytes=MAX_MODEL_VERIFICATION_JSON_BYTES,
+    )
+    document = exact_object(
+        read_json(path, max_bytes=MAX_MODEL_VERIFICATION_JSON_BYTES),
+        MODEL_VERIFICATION_FIELDS,
+        "evidence.model_verification.document",
+    )
+    require(
+        document["schema_version"] == 1
+        and document["artifact_type"]
+        == "runtime_vnext_cuda_determinism_model_verification",
+        "model verification schema or artifact type is invalid",
+    )
+    require(
+        text(document["scope"], "model verification scope") == expected_scope,
+        "model verification scope differs from evidence",
+    )
+    require(
+        document["source_git_sha"] == expected_source["git_sha"]
+        and document["source_tree_sha"] == expected_source["git_tree_sha"],
+        "model verification source identity is stale",
+    )
+    collector = exact_object(
+        document["collector"],
+        MODEL_VERIFICATION_COLLECTOR_FIELDS,
+        "model verification collector",
+    )
+    require(
+        collector
+        == {
+            "path": EVIDENCE_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(),
+            "sha256": file_sha256(EVIDENCE_COLLECTOR_PATH),
+        },
+        "model verification collector identity is stale",
+    )
+    validate_timestamp(document["verified_at"], "model verification verified_at")
+    rows = document["models"]
+    require(isinstance(rows, list), "model verification models must be a list")
+    directories: dict[str, str] = {}
+    for index, raw in enumerate(rows):
+        label = f"model verification models[{index}]"
+        row = exact_object(raw, MODEL_VERIFICATION_MODEL_FIELDS, label)
+        model_key = text(row["model_key"], f"{label}.model_key", portable=True)
+        require(
+            model_key in expected_models and model_key not in directories,
+            f"{label}.model_key is invalid or duplicated",
+        )
+        model_dir = text(row["model_dir"], f"{label}.model_dir")
+        require(Path(model_dir).is_absolute(), f"{label}.model_dir must be absolute")
+        files = row["files"]
+        require(isinstance(files, list) and files, f"{label}.files must be non-empty")
+        normalized_files = []
+        for file_index, file_raw in enumerate(files):
+            file_label = f"{label}.files[{file_index}]"
+            model_file = exact_object(file_raw, MODEL_FILE_FIELDS, file_label)
+            normalized_files.append(
+                {
+                    "path": text(model_file["path"], f"{file_label}.path"),
+                    "sha256": sha256_text(
+                        model_file["sha256"], f"{file_label}.sha256"
+                    ),
+                    "size_bytes": integer(
+                        model_file["size_bytes"],
+                        f"{file_label}.size_bytes",
+                        minimum=1,
+                    ),
+                }
+            )
+        require(
+            normalized_files == locked_models[model_key]["files"],
+            f"{label}.files differ from models.lock",
+        )
+        consumed_files = validate_string_list(
+            row["consumed_files"],
+            f"{label}.consumed_files",
+        )
+        locked_paths = {item["path"] for item in normalized_files}
+        require(
+            set(consumed_files) <= locked_paths
+            and {"config.json", "tokenizer.json"} <= set(consumed_files)
+            and any(path.endswith(".safetensors") for path in consumed_files),
+            f"{label}.consumed_files is not a locked production loader closure",
+        )
+        directories[model_key] = model_dir
+    require(
+        list(directories) == sorted(expected_models),
+        "model verification model set differs from the selected scope",
+    )
+    return directories
+
+
 def validate_hardware(
     root: Path,
     value: Any,
     *,
     source: dict[str, Any],
-) -> str:
+) -> tuple[str, str]:
     hardware = exact_object(value, HARDWARE_FIELDS, "evidence.hardware")
     _, probe_path = validate_file_ref(
         root,
@@ -1447,23 +1859,77 @@ def validate_hardware(
         recomputed == normalized,
         "hardware normalized facts are not derived from raw command outputs",
     )
-    return fingerprint
+    hardware_id = text(probe["hardware_id"], "hardware probe hardware_id", portable=True)
+    return fingerprint, hardware_id
 
 
-def validate_build_command(value: Any) -> list[str]:
-    require(isinstance(value, list) and value, "source.build_command must be a non-empty argv list")
-    command = [text(item, f"source.build_command[{index}]") for index, item in enumerate(value)]
-    require(command[:2] == ["cargo", "build"], "source.build_command must invoke cargo build")
-    require("--release" in command, "source.build_command must be a release build")
-    require("--features" in command, "source.build_command must declare CUDA release features")
-    feature_index = command.index("--features") + 1
-    require(feature_index < len(command), "source.build_command has no feature value")
-    features = set(command[feature_index].split(","))
-    require(
-        {"cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"} <= features,
-        "source.build_command lacks required CUDA release features",
+def validate_candidate_build_provenance(
+    root: Path,
+    source: dict[str, Any],
+    *,
+    hardware_id: str,
+    binary_ref: dict[str, Any],
+    allow_internal_fixture: bool,
+) -> dict[str, Any]:
+    receipt_ref, receipt_path = validate_file_ref(
+        root,
+        source["candidate_build_receipt"],
+        "evidence.source.candidate_build_receipt",
+        max_size_bytes=MAX_RECEIPT_JSON_BYTES,
     )
-    return command
+    require(
+        receipt_ref["path"] == CANDIDATE_BUILD_RECEIPT_PATH.as_posix(),
+        "candidate build receipt is outside the canonical imported layout",
+    )
+    provenance_root = root / BUILD_PROVENANCE_ROOT
+    nested_ref = {
+        "kind": "raw-json",
+        "path": receipt_path.relative_to(provenance_root).as_posix(),
+        "sha256": receipt_ref["sha256"],
+    }
+    try:
+        receipt, _, _, imported_binary_path = (
+            baseline_scenarios.validate_candidate_build_receipt(
+                provenance_root,
+                nested_ref,
+                expected={
+                    "source_git_sha": source["git_sha"],
+                    "source_tree_sha": source["git_tree_sha"],
+                    "hardware_id": hardware_id,
+                    "backend": "cuda",
+                    "binary_sha256": binary_ref["sha256"],
+                },
+                allow_internal_fixture=allow_internal_fixture,
+            )
+        )
+    except baseline_scenarios.ScenarioError as error:
+        raise DeterminismArtifactError(
+            f"candidate build receipt is invalid: {error}"
+        ) from error
+    require(
+        imported_binary_path == root / CANDIDATE_BUILD_BINARY_PATH
+        and imported_binary_path.stat().st_size == binary_ref["size_bytes"],
+        "candidate build binary differs from the canonical imported binary",
+    )
+
+    lock_ref, _ = validate_file_ref(
+        root,
+        source["native_operator_set_lock"],
+        "evidence.source.native_operator_set_lock",
+        max_size_bytes=MAX_MODEL_LOCK_JSON_BYTES,
+    )
+    require(
+        lock_ref["path"] == NATIVE_OPERATOR_SET_LOCK_PATH.as_posix(),
+        "native operator set lock is outside the canonical imported layout",
+    )
+    recorded_lock = receipt.get("native_operator_set_lock")
+    require(
+        isinstance(recorded_lock, dict)
+        and lock_ref["sha256"] == recorded_lock.get("sha256")
+        and lock_ref["size_bytes"] == recorded_lock.get("size_bytes"),
+        "imported native operator set lock differs from the candidate build receipt",
+    )
+    return receipt
 
 
 def validate_token_shape(value: Any, phase: str, label: str) -> tuple[str, int]:
@@ -1484,27 +1950,20 @@ def validate_token_shape(value: Any, phase: str, label: str) -> tuple[str, int]:
         all(start < end and end - start == tokens for start, end, tokens in zip(starts, ends, immediate)),
         f"{label} source ranges differ from immediate token counts",
     )
-    if phase == "prefill":
-        require(partition in {"single_token", "multi_token", "chunk_boundary"},
-                f"{label}.partition is invalid for prefill")
-        if partition == "single_token":
-            require(participant_count == 1 and immediate == [1] and starts == [0],
-                    f"{label} single_token shape is invalid")
-        elif partition == "multi_token":
-            require(sum(immediate) > 1 and all(start == 0 for start in starts),
-                    f"{label} multi_token shape is invalid")
-        else:
-            require(any(start > 0 for start in starts), f"{label} chunk_boundary lacks a non-zero source start")
-    else:
-        require(partition in {"c1", "multi_participant", "c32"},
-                f"{label}.partition is invalid for decode")
-        require(all(tokens == 1 for tokens in immediate), f"{label} decode must use one immediate token per participant")
-        if partition == "c1":
-            require(participant_count == 1, f"{label} c1 must contain one participant")
-        elif partition == "multi_participant":
-            require(1 < participant_count < 32, f"{label} multi_participant width must be 2..31")
-        else:
-            require(participant_count == 32, f"{label} c32 must contain 32 participants")
+    exact_shapes = {
+        ("prefill", "single_token"): (1, [1], [0], [1]),
+        ("prefill", "multi_token"): (1, [4], [0], [4]),
+        ("prefill", "chunk_boundary"): (1, [4], [4], [8]),
+        ("decode", "c1"): (1, [1], [8], [9]),
+        ("decode", "multi_participant"): (4, [1] * 4, [8] * 4, [9] * 4),
+        ("decode", "c32"): (32, [1] * 32, [8] * 32, [9] * 32),
+    }
+    expected = exact_shapes.get((phase, partition))
+    require(expected is not None, f"{label}.partition is invalid for {phase}")
+    require(
+        (participant_count, immediate, starts, ends) == expected,
+        f"{label} differs from the canonical Rust shape fixture",
+    )
     return partition, participant_count
 
 
@@ -1545,7 +2004,10 @@ def validate_target(
     )
     require(selection is not None, f"{label} provider is not selected by model {model_key}")
     node_ids = set(validate_string_list(target["node_ids"], f"{label}.node_ids", portable=True))
-    require(node_ids <= set(selection["node_ids"]), f"{label}.node_ids escape the selected provider")
+    require(
+        node_ids == set(selection["node_ids"]),
+        f"{label}.node_ids differ from the exact selected provider nodes",
+    )
     scope = denominator["scopes"].get((model_key, key[0], key[1]))
     require(scope is not None, f"{label} has no typed witness denominator")
     require(
@@ -2169,7 +2631,16 @@ def validate_case(
     }
 
 
-def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, Any]:
+def validate_artifact(
+    root: Path,
+    expected_source: dict[str, Any],
+    expected_scope: str = RELEASE_SCOPE,
+    *,
+    allow_internal_fixture: bool = False,
+) -> dict[str, Any]:
+    contract = scope_contract(expected_scope)
+    expected_models = set(contract["models"])
+    required_partitions = set(contract["partitions"])
     root = root.resolve()
     require(root.is_dir() and not root.is_symlink(), "artifact root must be a real directory")
     manifest_path = root / "evidence.json"
@@ -2182,6 +2653,10 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
     require(manifest["schema_version"] == 1, "evidence.schema_version must be 1")
     require(manifest["artifact_type"] == ARTIFACT_TYPE, "evidence.artifact_type is invalid")
     require(manifest["backend"] == "cuda", "evidence.backend must be cuda")
+    require(
+        text(manifest["scope"], "evidence.scope") == expected_scope,
+        "evidence.scope differs from the requested validator scope",
+    )
 
     source = exact_object(manifest["source"], SOURCE_FIELDS, "evidence.source")
     git_sha = text(source["git_sha"], "evidence.source.git_sha")
@@ -2197,7 +2672,6 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
         "evidence.source commit or tree identity is stale",
     )
     require(source["dirty_status"] == [], "evidence.source.dirty_status must be empty")
-    validate_build_command(source["build_command"])
     text(source["binary_path"], "evidence.source.binary_path")
     binary_ref, binary_path = validate_file_ref(
         root,
@@ -2209,10 +2683,31 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
         binary_path.stat().st_mode & 0o111 != 0,
         "evidence.source.binary must preserve an executable mode",
     )
+    require(
+        binary_ref["path"] == "binary/ferrum",
+        "evidence.source.binary must use the canonical binary/ferrum path",
+    )
     binary_sha256 = binary_ref["sha256"]
 
-    device_fingerprint = validate_hardware(root, manifest["hardware"], source=source)
+    device_fingerprint, hardware_id = validate_hardware(
+        root, manifest["hardware"], source=source
+    )
+    candidate_build_receipt = validate_candidate_build_provenance(
+        root,
+        source,
+        hardware_id=hardware_id,
+        binary_ref=binary_ref,
+        allow_internal_fixture=allow_internal_fixture,
+    )
     locked_models = validate_models_lock(root, manifest["models_lock"])
+    verified_model_dirs = validate_model_verification(
+        root,
+        manifest["model_verification"],
+        expected_scope=expected_scope,
+        expected_models=expected_models,
+        expected_source=source,
+        locked_models=locked_models,
+    )
 
     denominator_ref = exact_object(
         manifest["denominator"],
@@ -2234,7 +2729,8 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
         "evidence.denominator fingerprint differs from the exact Rust bytes",
     )
     denominator = validate_denominator(
-        read_json(denominator_path, max_bytes=MAX_DENOMINATOR_JSON_BYTES)
+        read_json(denominator_path, max_bytes=MAX_DENOMINATOR_JSON_BYTES),
+        expected_models,
     )
 
     models_raw = manifest["models"]
@@ -2286,9 +2782,30 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
             f"{label} differs from the live denominator model identity",
         )
         model_keys.append(model_key)
-    require(model_keys == sorted(PRIMARY_MODELS), "evidence.models must contain the three primary models")
+    require(
+        model_keys == sorted(expected_models),
+        "evidence.models differ from the selected scope model set",
+    )
 
     runner = exact_object(manifest["runner"], RUNNER_FIELDS, "evidence.runner")
+    validate_runner_environment(runner["environment"])
+    repository_root = Path(
+        text(runner["repository_root"], "evidence.runner.repository_root")
+    )
+    require(
+        repository_root.is_absolute(),
+        "evidence.runner.repository_root must be absolute",
+    )
+    candidate_repository_root = Path(
+        text(
+            candidate_build_receipt["repository_root"],
+            "candidate build repository_root",
+        )
+    )
+    require(
+        repository_root == candidate_repository_root,
+        "runner repository root differs from the candidate build repository root",
+    )
     require(isinstance(runner["command"], list) and runner["command"], "evidence.runner.command must be non-empty")
     runner_command = [
         text(item, f"evidence.runner.command[{index}]")
@@ -2298,20 +2815,58 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
         runner_command[0] == source["binary_path"],
         "evidence.runner.command must execute the recorded release binary",
     )
+    canonical_prefix = [
+        source["binary_path"],
+        "vnext-determinism",
+        "--models-lock",
+        runner_command[3] if len(runner_command) > 3 else "",
+        "--artifact-root",
+        runner_command[5] if len(runner_command) > 5 else "",
+    ]
     require(
-        len(runner_command) == 12
-        and runner_command[1] == "vnext-determinism"
-        and runner_command[2] == "--models-lock"
-        and runner_command[4] == "--artifact-root"
-        and runner_command[6::2] == ["--model", "--model", "--model"],
-        "evidence.runner.command is not the canonical vnext-determinism collector command",
+        runner_command[:6] == canonical_prefix,
+        "evidence.runner.command is not the canonical vnext-determinism collector prefix",
     )
-    model_arguments = runner_command[7::2]
+    recorded_artifact_root = Path(runner_command[5])
+    require(
+        recorded_artifact_root.is_absolute()
+        and Path(runner_command[3]) == recorded_artifact_root / "models.lock.json"
+        and Path(source["binary_path"])
+        == recorded_artifact_root / "binary" / "ferrum",
+        "runner binary, model lock and artifact root do not share the canonical layout",
+    )
+    argument_offset = 6
+    if expected_scope == M1_S2_FOCUSED_SCOPE:
+        require(
+            runner_command[6:8] == ["--scope", M1_S2_FOCUSED_SCOPE],
+            "focused evidence.runner.command lacks the explicit typed scope",
+        )
+        argument_offset = 8
+    else:
+        require(
+            "--scope" not in runner_command,
+            "release-full evidence must use the default canonical collector scope",
+        )
+    model_tail = runner_command[argument_offset:]
+    require(
+        len(model_tail) == 2 * len(expected_models)
+        and model_tail[::2] == ["--model"] * len(expected_models),
+        "evidence.runner.command has a non-canonical model binding tail",
+    )
+    model_arguments = model_tail[1::2]
     require(
         sorted(argument.split("=", 1)[0] for argument in model_arguments)
-        == sorted(PRIMARY_MODELS)
+        == sorted(expected_models)
         and all("=" in argument and argument.split("=", 1)[1] for argument in model_arguments),
-        "evidence.runner.command must bind exactly the three primary model directories",
+        "evidence.runner.command model bindings differ from the selected scope",
+    )
+    runner_model_dirs = {
+        argument.split("=", 1)[0]: argument.split("=", 1)[1]
+        for argument in model_arguments
+    }
+    require(
+        runner_model_dirs == verified_model_dirs,
+        "runner model directories differ from the hash-verified directories",
     )
     started = validate_timestamp(runner["started_at"], "evidence.runner.started_at")
     finished = validate_timestamp(runner["finished_at"], "evidence.runner.finished_at")
@@ -2321,13 +2876,13 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
         "evidence.runner timestamps are not increasing",
     )
     require(runner["exit_code"] == 0, "evidence.runner.exit_code must be 0")
-    _, receipt_path = validate_file_ref(
+    receipt_ref, receipt_path = validate_file_ref(
         root,
         runner["receipt"],
         "evidence.runner.receipt",
         max_size_bytes=MAX_RECEIPT_JSON_BYTES,
     )
-    stdout_ref, _ = validate_file_ref(
+    stdout_ref, stdout_path = validate_file_ref(
         root,
         runner["stdout"],
         "evidence.runner.stdout",
@@ -2338,10 +2893,19 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
         runner["stderr"],
         "evidence.runner.stderr",
         max_size_bytes=MAX_LOG_BYTES,
+        allow_empty=True,
+    )
+    require(
+        receipt_ref["path"] == "runner/receipt.json"
+        and stdout_ref["path"] == "runner/stdout.log"
+        and stderr_ref["path"] == "runner/stderr.log",
+        "runner evidence references do not use the canonical runner paths",
     )
     validate_bounded_receipt(
         read_json(receipt_path, max_bytes=MAX_RECEIPT_JSON_BYTES),
         command=runner_command,
+        repository_root=repository_root,
+        recorded_artifact_root=recorded_artifact_root,
         started_at=started,
         finished_at=finished,
         exit_code=runner["exit_code"],
@@ -2350,9 +2914,28 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
     )
 
     case_refs = manifest["cases"]
+    expected_case_count = len(expected_models) * len(required_partitions) * 4
     require(
-        isinstance(case_refs, list) and 0 < len(case_refs) <= MAX_CASES,
+        isinstance(case_refs, list)
+        and len(case_refs) == expected_case_count
+        and len(case_refs) <= MAX_CASES,
         "evidence.cases cardinality is invalid",
+    )
+    collector, collector_models = validate_collector_manifest(
+        root,
+        manifest["collector"],
+        scope=expected_scope,
+        expected_models=expected_models,
+        runner_command=runner_command,
+        runner_stdout_path=stdout_path,
+        binary_ref=binary_ref,
+        models_lock_ref=manifest["models_lock"],
+        hardware_probe_ref=manifest["hardware"]["probe"],
+        device_fingerprint=device_fingerprint,
+        denominator_ref=manifest["denominator"],
+        denominator=denominator,
+        model_directories=verified_model_dirs,
+        case_refs=case_refs,
     )
     case_paths: list[str] = []
     cases: list[dict[str, Any]] = []
@@ -2377,6 +2960,16 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
             denominator=denominator,
         )
         require(case["case_id"] not in case_ids, "evidence contains duplicate case ids")
+        require(
+            ref["path"] == f"cases/{case['case_id']}.json",
+            "case reference path differs from its canonical case_id path",
+        )
+        collector_model = collector_models[case["model_key"]]
+        require(
+            case["dtype"] == collector_model["dtype"]
+            and case["quantization"] == collector_model["quantization"],
+            "case dtype or quantization differs from collector model identity",
+        )
         case_ids.add(case["case_id"])
         cases.append(case)
     require(case_paths == sorted(set(case_paths)), "evidence.cases must be sorted and unique")
@@ -2388,9 +2981,9 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
     require(actual_case_paths == case_paths, "case file set differs from evidence references")
 
     partitions_by_model: dict[str, set[tuple[str, str]]] = {
-        key: set() for key in PRIMARY_MODELS
+        key: set() for key in expected_models
     }
-    state_by_model: dict[str, set[str]] = {key: set() for key in PRIMARY_MODELS}
+    state_by_model: dict[str, set[str]] = {key: set() for key in expected_models}
     coverage_nodes: dict[tuple[str, tuple[str, str]], set[str]] = {}
     poisons: dict[tuple[str, tuple[str, str]], set[str]] = {}
     phases: dict[tuple[str, tuple[str, str]], set[str]] = {}
@@ -2438,9 +3031,9 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
             f"workspace poison changed raw witness bytes for {poison_pair_key}",
         )
 
-    for model_key in PRIMARY_MODELS:
+    for model_key in expected_models:
         require(
-            partitions_by_model[model_key] == REQUIRED_PARTITIONS,
+            partitions_by_model[model_key] == required_partitions,
             f"model {model_key} shape partition coverage is incomplete",
         )
         require(
@@ -2477,7 +3070,7 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
                 phases.get(selection_key) == {"prefill", "decode"},
                 f"provider selection {selection_key} lacks prefill/decode proof",
             )
-            for phase, partition in REQUIRED_PARTITIONS:
+            for phase, partition in required_partitions:
                 require(
                     fixture_matrix.get(
                         (selection["model_key"], requirement_key, phase, partition)
@@ -2491,17 +3084,26 @@ def validate_artifact(root: Path, expected_source: dict[str, Any]) -> dict[str, 
                     f"provider selection {selection_key} lacks the exact state/poison cross-product for {phase}/{partition}",
                 )
 
+    execution_count = sum(case["execution_count"] for case in cases)
+    comparison_count = sum(case["comparison_count"] for case in cases)
+    require(
+        collector["execution_count"] == execution_count
+        and collector["comparison_count"] == comparison_count,
+        "collector execution/comparison counts differ from validated cases",
+    )
+
     return {
         "source_git_sha": git_sha,
         "source_tree_sha": git_tree_sha,
         "binary_sha256": binary_sha256,
         "denominator_fingerprint": denominator_fingerprint,
         "device_fingerprint": device_fingerprint,
-        "model_keys": sorted(PRIMARY_MODELS),
+        "scope": expected_scope,
+        "model_keys": sorted(expected_models),
         "provider_requirement_count": len(denominator["requirements"]),
         "case_count": len(cases),
-        "execution_count": sum(case["execution_count"] for case in cases),
-        "comparison_count": sum(case["comparison_count"] for case in cases),
+        "execution_count": execution_count,
+        "comparison_count": comparison_count,
         "witness_count": sum(case["witness_count"] for case in cases),
         "input_manifest_sha256": file_sha256(manifest_path),
     }
@@ -2526,7 +3128,7 @@ def git_stdout(*args: str) -> str:
 def current_git_state() -> dict[str, str]:
     git_sha = git_stdout("rev-parse", "HEAD")
     git_tree_sha = git_stdout("rev-parse", "HEAD^{tree}")
-    status = git_stdout("status", "--short", "--untracked-files=no")
+    status = git_stdout("status", "--short", "--untracked-files=all")
     require(GIT_SHA_RE.fullmatch(git_sha) is not None, "current git SHA is invalid")
     require(GIT_SHA_RE.fullmatch(git_tree_sha) is not None, "current git tree SHA is invalid")
     require(
@@ -2541,11 +3143,13 @@ def validation_manifest(
     out_dir: Path,
     summary: dict[str, Any],
 ) -> dict[str, Any]:
-    pass_line = f"{PASS_PREFIX}: {out_dir}"
+    scope = text(summary.get("scope"), "validation summary scope")
+    contract = scope_contract(scope)
+    pass_line = f"{contract['pass_prefix']}: {out_dir}"
     return {
         "schema_version": 1,
         "artifact_type": VALIDATOR_ARTIFACT_TYPE,
-        "lane": "runtime-vnext-cuda-determinism",
+        "lane": contract["lane"],
         "status": "pass",
         "pass_line": pass_line,
         "artifact_dir": str(out_dir),
@@ -2575,6 +3179,7 @@ def write_rejection_manifest(
     artifact_root: Path,
     out_dir: Path,
     error: Exception,
+    scope: str,
 ) -> None:
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2586,7 +3191,8 @@ def write_rejection_manifest(
             {
                 "schema_version": 1,
                 "artifact_type": VALIDATOR_ARTIFACT_TYPE,
-                "lane": "runtime-vnext-cuda-determinism",
+                "lane": scope_contract(scope)["lane"],
+                "scope": scope,
                 "status": "reject",
                 "failure_class": rejection_failure_class(error),
                 "message": str(error),
@@ -2722,11 +3328,12 @@ def selftest_witness_plan(
 
 def make_selftest_denominator(
     root: Path,
+    model_keys: set[str],
 ) -> tuple[dict[str, Any], str, dict[tuple[str, str], str]]:
     models = []
     primary_selections = []
     secondary_selections = []
-    for index, model_key in enumerate(sorted(PRIMARY_MODELS), 1):
+    for index, model_key in enumerate(sorted(model_keys), 1):
         node_ids = [
             f"node.{model_key}.primary",
             f"node.{model_key}.secondary",
@@ -3016,16 +3623,16 @@ def make_selftest_case(
         starts = [0]
     elif partition == "chunk_boundary":
         participants = 1
-        immediate = [2]
+        immediate = [4]
         starts = [4]
     elif partition == "multi_participant":
-        participants = 2
-        immediate = [1, 1]
-        starts = [8, 13]
+        participants = 4
+        immediate = [1] * participants
+        starts = [8] * participants
     else:
         participants = 32
         immediate = [1] * participants
-        starts = list(range(32))
+        starts = [8] * participants
     ends = [start + tokens for start, tokens in zip(starts, immediate)]
     executions = [
         make_selftest_execution(
@@ -3237,6 +3844,11 @@ def make_selftest_models_lock(
                 "sha256": f"{index + 3}" * 64,
                 "size_bytes": 4096 + index,
             },
+            {
+                "path": "tokenizer.json",
+                "sha256": f"{index + 6}" * 64,
+                "size_bytes": 2048 + index,
+            },
         ]
         lane = {
             "catalog_lane_id": PRIMARY_MODEL_LANES[model_key],
@@ -3268,9 +3880,13 @@ def make_selftest_models_lock(
 def make_selftest_artifact(
     root: Path,
     expected_source: dict[str, str],
+    scope: str = RELEASE_SCOPE,
 ) -> None:
+    contract = scope_contract(scope)
+    selected_models = set(contract["models"])
+    selected_partitions = set(contract["partitions"])
     denominator, denominator_fingerprint, witness_fingerprints = (
-        make_selftest_denominator(root)
+        make_selftest_denominator(root, selected_models)
     )
     denominator_ref = selftest_file_ref(root, root / "denominator.json")
     binary_path = root / "binary" / "ferrum"
@@ -3282,19 +3898,13 @@ def make_selftest_artifact(
     hardware_ref, device_fingerprint = make_selftest_hardware_probe(
         root, expected_source
     )
-    stdout_path = root / "runner.stdout"
-    stderr_path = root / "runner.stderr"
-    stdout_path.write_text("synthetic determinism collector completed\n", encoding="utf-8")
-    stderr_path.write_text("synthetic diagnostic stderr\n", encoding="utf-8")
+    runner_root = root / "runner"
+    runner_root.mkdir()
+    stdout_path = runner_root / "stdout.log"
+    stderr_path = runner_root / "stderr.log"
+    stderr_path.write_bytes(b"")
     case_refs = []
-    case_shapes = [
-        ("prefill", "single_token"),
-        ("prefill", "multi_token"),
-        ("prefill", "chunk_boundary"),
-        ("decode", "c1"),
-        ("decode", "multi_participant"),
-        ("decode", "c32"),
-    ]
+    case_shapes = sorted(selected_partitions)
     for model in denominator["coverage"]["models"]:
         for phase, partition in case_shapes:
             for state_kind in ("zero", "nonzero"):
@@ -3334,32 +3944,67 @@ def make_selftest_artifact(
             }
         )
     runner_command = [
-        "/workspace/ferrum/target/release/ferrum",
+        "/workspace/artifacts/binary/ferrum",
         "vnext-determinism",
         "--models-lock",
         "/workspace/artifacts/models.lock.json",
         "--artifact-root",
         "/workspace/artifacts",
-        "--model",
-        "m1-qwen35-4b=/workspace/models/m1",
-        "--model",
-        "m2-qwen35-35b-a3b=/workspace/models/m2",
-        "--model",
-        "m3-qwen3-30b-a3b=/workspace/models/m3",
     ]
+    if scope == M1_S2_FOCUSED_SCOPE:
+        runner_command.extend(["--scope", scope])
+    for model_key in sorted(selected_models):
+        runner_command.extend(
+            ["--model", f"{model_key}=/workspace/models/{model_key}"]
+        )
+    collector_pass = exact_collector_pass_line(scope, runner_command[5])
+    stdout_path.write_text(collector_pass + "\n", encoding="utf-8")
+    model_verification_path = root / "model-verification.json"
+    write_json(
+        model_verification_path,
+        {
+            "schema_version": 1,
+            "artifact_type": "runtime_vnext_cuda_determinism_model_verification",
+            "scope": scope,
+            "source_git_sha": expected_source["git_sha"],
+            "source_tree_sha": expected_source["git_tree_sha"],
+            "collector": {
+                "path": EVIDENCE_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(),
+                "sha256": file_sha256(EVIDENCE_COLLECTOR_PATH),
+            },
+            "verified_at": "2026-07-27T00:00:00Z",
+            "models": [
+                {
+                    "model_key": model_key,
+                    "model_dir": f"/workspace/models/{model_key}",
+                    "files": locked_models_by_key[model_key]["files"],
+                    "consumed_files": [
+                        "config.json",
+                        "model.safetensors",
+                        "tokenizer.json",
+                    ],
+                }
+                for model_key in sorted(selected_models)
+            ],
+        },
+    )
     started_at = "2026-07-27T00:00:00Z"
     finished_at = "2026-07-27T00:01:00Z"
+    repository_root = REPO_ROOT.resolve()
+    runner_environment = canonical_determinism_environment(
+        {"HOME": "/workspace", "PATH": "/usr/local/bin:/usr/bin:/bin"}
+    )
     receipt = {
         "schema": "ferrum.bounded-command-receipt.v1",
         "command": runner_command,
-        "cwd": "/workspace/ferrum",
+        "cwd": str(repository_root),
         "pid": 4242,
         "pgid": 4242,
         "limits": {
             "wall_timeout_seconds": 3600.0,
             "max_processes": 16,
-            "max_group_threads": 256,
-            "max_per_process_threads": 128,
+            "max_group_threads": 128,
+            "max_per_process_threads": 64,
             "sample_interval_seconds": 0.05,
             "max_sampling_errors": 3,
             "term_grace_seconds": 2.0,
@@ -3383,45 +4028,117 @@ def make_selftest_artifact(
         "termination": {"signals": [], "errors": []},
         "cleanup": {"process_group_gone": True},
         "stdout": {
-            "path": "/workspace/artifacts/runner.stdout",
+            "path": "/workspace/artifacts/runner/stdout.log",
             "sha256": file_sha256(stdout_path),
             "size_bytes": stdout_path.stat().st_size,
         },
         "stderr": {
-            "path": "/workspace/artifacts/runner.stderr",
+            "path": "/workspace/artifacts/runner/stderr.log",
             "sha256": file_sha256(stderr_path),
             "size_bytes": stderr_path.stat().st_size,
         },
     }
-    receipt_path = root / "runner.receipt.json"
+    receipt_path = runner_root / "receipt.json"
     write_json(receipt_path, receipt)
+    build_provenance_root = root / BUILD_PROVENANCE_ROOT
+    candidate_binary = build_provenance_root / "build/candidate/ferrum"
+    candidate_binary.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(binary_path, candidate_binary)
+    baseline_scenarios.make_candidate_build_receipt_fixture(
+        build_provenance_root,
+        {
+            "backend": "cuda",
+            "source_git_sha": expected_source["git_sha"],
+            "source_tree_sha": expected_source["git_tree_sha"],
+            "hardware_id": "selftest-cuda-rtx4090",
+            "binary_artifact": baseline_scenarios.existing_artifact_ref(
+                build_provenance_root,
+                candidate_binary,
+                "binary",
+            ),
+            "binary_sha256": binary_ref["sha256"],
+        },
+    )
+    fixture_lock = root / NATIVE_OPERATOR_SET_LOCK_PATH
+    require(fixture_lock.is_file(), "candidate fixture native operator lock is missing")
+
+    evidence_models_by_key = {row["model_key"]: row for row in models}
+    collector_models = []
+    for model_key in sorted(selected_models):
+        sample_case_ref = next(
+            ref
+            for ref in case_refs
+            if ref["path"].startswith(f"cases/{model_key}.")
+        )
+        sample_case = read_json(root / sample_case_ref["path"])
+        planned = evidence_models_by_key[model_key]
+        collector_models.append(
+            {
+                "model_key": model_key,
+                "model_dir": f"/workspace/models/{model_key}",
+                "resolved_plan_fingerprint": planned[
+                    "resolved_plan_fingerprint"
+                ],
+                "plan_hash": planned["plan_hash"],
+                "dtype": sample_case["dtype"],
+                "quantization": sample_case["quantization"],
+                "case_count": len(selected_partitions) * 4,
+            }
+        )
+    collector = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_cuda_determinism_collector",
+        "status": "pass",
+        "backend": "cuda",
+        "scope": scope,
+        "models_lock": models_lock_ref,
+        "hardware_probe": hardware_ref,
+        "device_fingerprint": device_fingerprint,
+        "binary": {
+            "path": runner_command[0],
+            "sha256": binary_ref["sha256"],
+            "size_bytes": binary_ref["size_bytes"],
+        },
+        "denominator": {
+            **denominator_ref,
+            "fingerprint": denominator_fingerprint,
+        },
+        "models": collector_models,
+        "cases": case_refs,
+        "case_count": len(case_refs),
+        "execution_count": len(case_refs) * 12,
+        "comparison_count": len(case_refs) * 15,
+        "pass_line": collector_pass,
+    }
+    collector_path = root / "collector.json"
+    write_json(collector_path, collector)
     evidence = {
         "schema_version": 1,
         "artifact_type": ARTIFACT_TYPE,
         "backend": "cuda",
+        "scope": scope,
         "source": {
             "git_sha": expected_source["git_sha"],
             "git_tree_sha": expected_source["git_tree_sha"],
             "dirty_status": [],
-            "build_command": [
-                "cargo",
-                "build",
-                "--release",
-                "-p",
-                "ferrum-cli",
-                "--bin",
-                "ferrum",
-                "--features",
-                "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
-            ],
-            "binary_path": "/workspace/ferrum/target/release/ferrum",
+            "binary_path": "/workspace/artifacts/binary/ferrum",
             "binary": binary_ref,
+            "candidate_build_receipt": selftest_file_ref(
+                root,
+                root / CANDIDATE_BUILD_RECEIPT_PATH,
+            ),
+            "native_operator_set_lock": selftest_file_ref(
+                root,
+                root / NATIVE_OPERATOR_SET_LOCK_PATH,
+            ),
         },
         "hardware": {
             "probe": hardware_ref,
             "fingerprint": device_fingerprint,
         },
         "models_lock": models_lock_ref,
+        "model_verification": selftest_file_ref(root, model_verification_path),
+        "collector": selftest_file_ref(root, collector_path),
         "denominator": {
             **denominator_ref,
             "fingerprint": denominator_fingerprint,
@@ -3429,6 +4146,8 @@ def make_selftest_artifact(
         "models": models,
         "runner": {
             "command": runner_command,
+            "environment": runner_environment,
+            "repository_root": str(repository_root),
             "started_at": started_at,
             "finished_at": finished_at,
             "exit_code": 0,
@@ -3445,27 +4164,66 @@ def make_selftest_artifact(
 
 def refresh_case_ref(root: Path, case_path: Path) -> None:
     evidence = read_json(root / "evidence.json")
+    collector_path = root / "collector.json"
+    collector = read_json(collector_path)
     relative = case_path.relative_to(root).as_posix()
-    for ref in evidence["cases"]:
-        if ref["path"] == relative:
-            ref["sha256"] = file_sha256(case_path)
-            ref["size_bytes"] = case_path.stat().st_size
-            break
+    refreshed = selftest_file_ref(root, case_path)
+    for refs in (evidence["cases"], collector["cases"]):
+        for index, ref in enumerate(refs):
+            if ref["path"] == relative:
+                refs[index] = refreshed
+                break
+    write_json(collector_path, collector)
+    evidence["collector"] = selftest_file_ref(root, collector_path)
     write_json(root / "evidence.json", evidence)
 
 
 def run_self_test() -> None:
     expected_source = {
-        "git_sha": "1" * 40,
-        "git_tree_sha": "2" * 40,
+        "git_sha": git_stdout("rev-parse", "HEAD"),
+        "git_tree_sha": git_stdout("rev-parse", "HEAD^{tree}"),
     }
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-cuda-determinism-") as temporary:
         base = Path(temporary) / "base"
         base.mkdir()
         make_selftest_artifact(base, expected_source)
-        summary = validate_artifact(base, expected_source)
+        summary = validate_artifact(
+            base,
+            expected_source,
+            allow_internal_fixture=True,
+        )
         require(summary["case_count"] == 72, "self-test case denominator drifted")
         require(summary["comparison_count"] == 1080, "self-test comparison denominator drifted")
+
+        focused = Path(temporary) / "focused"
+        focused.mkdir()
+        make_selftest_artifact(focused, expected_source, M1_S2_FOCUSED_SCOPE)
+        focused_summary = validate_artifact(
+            focused,
+            expected_source,
+            M1_S2_FOCUSED_SCOPE,
+            allow_internal_fixture=True,
+        )
+        require(
+            focused_summary["model_keys"] == [M1_MODEL]
+            and focused_summary["case_count"] == 20
+            and focused_summary["comparison_count"] == 300,
+            "focused self-test denominator drifted",
+        )
+        try:
+            validate_artifact(
+                focused,
+                expected_source,
+                RELEASE_SCOPE,
+                allow_internal_fixture=True,
+            )
+        except DeterminismArtifactError as error:
+            require(
+                "scope differs" in str(error),
+                f"focused artifact was rejected for the wrong full-gate reason: {error}",
+            )
+        else:
+            raise AssertionError("focused artifact unexpectedly passed the release-full gate")
 
         mutations: list[tuple[str, Callable[[Path], None], str]] = []
 
@@ -3487,7 +4245,7 @@ def run_self_test() -> None:
         replay_case = "cases/m1-qwen35-4b.decode.c1.zero.00.json"
 
         def mutate_receipt_sampling_error(root: Path) -> None:
-            receipt_path = root / "runner.receipt.json"
+            receipt_path = root / "runner/receipt.json"
             receipt = read_json(receipt_path)
             receipt["sampling_error_count"] = 1
             receipt["sampling_errors"] = [
@@ -3507,6 +4265,68 @@ def run_self_test() -> None:
             with (root / "binary" / "ferrum").open("a", encoding="utf-8") as handle:
                 handle.write("# tampered\n")
 
+        def mutate_candidate_build_receipt(root: Path) -> None:
+            receipt_path = root / CANDIDATE_BUILD_RECEIPT_PATH
+            receipt = read_json(receipt_path)
+            receipt["returncode"] = 1
+            write_json(receipt_path, receipt)
+            evidence = read_json(root / "evidence.json")
+            evidence["source"]["candidate_build_receipt"] = selftest_file_ref(
+                root, receipt_path
+            )
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_collector_case_count(root: Path) -> None:
+            collector_path = root / "collector.json"
+            collector = read_json(collector_path)
+            collector["case_count"] += 1
+            write_json(collector_path, collector)
+            evidence = read_json(root / "evidence.json")
+            evidence["collector"] = selftest_file_ref(root, collector_path)
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_runner_environment(root: Path) -> None:
+            evidence = read_json(root / "evidence.json")
+            evidence["runner"]["environment"]["RAYON_NUM_THREADS"] = "64"
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_runner_undeclared_environment(root: Path) -> None:
+            evidence = read_json(root / "evidence.json")
+            evidence["runner"]["environment"]["LD_PRELOAD"] = "/tmp/forged.so"
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_runner_repository_root(root: Path) -> None:
+            evidence = read_json(root / "evidence.json")
+            evidence["runner"]["repository_root"] = "/workspace/forged"
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_runner_repository_root_and_receipt(root: Path) -> None:
+            mutate_runner_repository_root(root)
+            receipt_path = root / "runner/receipt.json"
+            receipt = read_json(receipt_path)
+            receipt["cwd"] = "/workspace/forged"
+            write_json(receipt_path, receipt)
+            evidence = read_json(root / "evidence.json")
+            evidence["runner"]["receipt"] = selftest_file_ref(root, receipt_path)
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_runner_stdout_reference(root: Path) -> None:
+            redirected = root / "redirected/stdout.log"
+            redirected.parent.mkdir()
+            shutil.copy2(root / "runner/stdout.log", redirected)
+            evidence = read_json(root / "evidence.json")
+            evidence["runner"]["stdout"] = selftest_file_ref(root, redirected)
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_receipt_stdout_path(root: Path) -> None:
+            receipt_path = root / "runner/receipt.json"
+            receipt = read_json(receipt_path)
+            receipt["stdout"]["path"] = "/workspace/forged/stdout.log"
+            write_json(receipt_path, receipt)
+            evidence = read_json(root / "evidence.json")
+            evidence["runner"]["receipt"] = selftest_file_ref(root, receipt_path)
+            write_json(root / "evidence.json", evidence)
+
         def mutate_models_lock_catalog(root: Path) -> None:
             lock_path = root / "models.lock.json"
             lock = read_json(lock_path)
@@ -3514,6 +4334,17 @@ def run_self_test() -> None:
             write_json(lock_path, lock)
             evidence = read_json(root / "evidence.json")
             evidence["models_lock"] = selftest_file_ref(root, lock_path)
+            write_json(root / "evidence.json", evidence)
+
+        def mutate_verified_model_directory(root: Path) -> None:
+            verification_path = root / "model-verification.json"
+            verification = read_json(verification_path)
+            verification["models"][0]["model_dir"] = "/workspace/models/forged"
+            write_json(verification_path, verification)
+            evidence = read_json(root / "evidence.json")
+            evidence["model_verification"] = selftest_file_ref(
+                root, verification_path
+            )
             write_json(root / "evidence.json", evidence)
 
         def mutate_hardware_raw_output(root: Path) -> None:
@@ -3553,9 +4384,54 @@ def run_self_test() -> None:
                     "source.binary.size_bytes differs",
                 ),
                 (
+                    "candidate-build-receipt-tamper",
+                    mutate_candidate_build_receipt,
+                    "candidate build returncode must be 0",
+                ),
+                (
+                    "collector-case-count-tamper",
+                    mutate_collector_case_count,
+                    "collector case references or exact denominator differ",
+                ),
+                (
+                    "runner-worker-environment-tamper",
+                    mutate_runner_environment,
+                    "fixed CUDA/worker limits",
+                ),
+                (
+                    "runner-undeclared-environment-tamper",
+                    mutate_runner_undeclared_environment,
+                    "undeclared variable",
+                ),
+                (
+                    "runner-repository-root-tamper",
+                    mutate_runner_repository_root,
+                    "candidate build repository root",
+                ),
+                (
+                    "runner-repository-root-joint-tamper",
+                    mutate_runner_repository_root_and_receipt,
+                    "candidate build repository root",
+                ),
+                (
+                    "runner-stdout-reference-redirect",
+                    mutate_runner_stdout_reference,
+                    "canonical runner paths",
+                ),
+                (
+                    "runner-receipt-stdout-path-tamper",
+                    mutate_receipt_stdout_path,
+                    "canonical artifact path",
+                ),
+                (
                     "models-lock-stale",
                     mutate_models_lock_catalog,
                     "models.lock is stale",
+                ),
+                (
+                    "verified-model-directory-drift",
+                    mutate_verified_model_directory,
+                    "runner model directories differ",
                 ),
                 (
                     "hardware-raw-tamper",
@@ -3581,6 +4457,19 @@ def run_self_test() -> None:
                         ),
                     ),
                     "runtime fingerprint is stale",
+                ),
+                (
+                    "shape-fixture-drift",
+                    mutate_case(
+                        first_case,
+                        lambda value: value["token_shape"].update(
+                            {
+                                "immediate_tokens": [2],
+                                "source_end_tokens": [2],
+                            }
+                        ),
+                    ),
+                    "canonical Rust shape fixture",
                 ),
                 (
                     "missing-node-witness",
@@ -3709,14 +4598,12 @@ def run_self_test() -> None:
         ) -> Callable[[Path], None]:
             def apply(root: Path) -> None:
                 evidence = read_json(root / "evidence.json")
-                for ref in evidence["cases"]:
-                    path = root / ref["path"]
+                paths = [root / ref["path"] for ref in evidence["cases"]]
+                for path in paths:
                     value = read_json(path)
                     mutation(value)
                     write_json(path, value)
-                    ref["sha256"] = file_sha256(path)
-                    ref["size_bytes"] = path.stat().st_size
-                write_json(root / "evidence.json", evidence)
+                    refresh_case_ref(root, path)
 
             return apply
 
@@ -3765,7 +4652,7 @@ def run_self_test() -> None:
                 (
                     "missing-c32",
                     remove_cases(lambda path: ".decode.c32." in path),
-                    "shape partition coverage",
+                    "cardinality is invalid",
                 ),
                 (
                     "missing-provider",
@@ -3775,12 +4662,12 @@ def run_self_test() -> None:
                 (
                     "single-poison",
                     remove_cases(lambda path: path.endswith(".a5.json")),
-                    "lacks an exact counterpart",
+                    "cardinality is invalid",
                 ),
                 (
                     "zero-state-only",
                     remove_cases(lambda path: ".nonzero." in path),
-                    "lacks zero/nonzero state-effect evidence",
+                    "cardinality is invalid",
                 ),
             ]
         )
@@ -3790,7 +4677,11 @@ def run_self_test() -> None:
             shutil.copytree(base, case)
             mutation(case)
             try:
-                validate_artifact(case, expected_source)
+                validate_artifact(
+                    case,
+                    expected_source,
+                    allow_internal_fixture=True,
+                )
             except DeterminismArtifactError as error:
                 require(
                     marker.lower() in str(error).lower(),
@@ -3805,6 +4696,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("artifact_root", nargs="?", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--scope",
+        choices=sorted(SCOPE_CONTRACTS),
+        default=RELEASE_SCOPE,
+    )
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -3820,15 +4716,19 @@ def main() -> int:
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         require(not any(out_dir.iterdir()), "--out must be empty")
-        summary = validate_artifact(args.artifact_root, current_git_state())
+        summary = validate_artifact(
+            args.artifact_root,
+            current_git_state(),
+            args.scope,
+        )
         manifest = validation_manifest(args.artifact_root, out_dir, summary)
         write_json(out_dir / "manifest.json", manifest, exclusive=True)
         print(manifest["pass_line"])
         return 0
     except (DeterminismArtifactError, OSError) as error:
-        write_rejection_manifest(args.artifact_root, out_dir, error)
+        write_rejection_manifest(args.artifact_root, out_dir, error, args.scope)
         print(
-            f"FERRUM RUNTIME VNEXT CUDA DETERMINISM REJECT: {error}",
+            f"{scope_contract(args.scope)['pass_prefix'].removesuffix(' PASS')} REJECT: {error}",
             file=sys.stderr,
         )
         return 1

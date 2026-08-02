@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 
 import bounded_command
 import runtime_vnext_baseline_scenarios as matrix
+import runtime_vnext_native_operator_set as native_operator_set
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -325,6 +326,10 @@ def build_candidate(
     native_operator_set_lock: Path | None,
 ) -> Path:
     require(hardware_id.strip() == hardware_id and hardware_id, "hardware id must be non-empty and trimmed")
+    receipt_path = root / BUILD_RECEIPT_REL
+    binary_path = root / BUILD_BINARY_REL
+    require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
+    require(not binary_path.exists(), f"candidate build binary already exists: {binary_path}")
     if spec.backend == "cuda":
         require(
             native_operator_set_lock is not None,
@@ -335,9 +340,28 @@ def build_candidate(
             and native_operator_set_lock.is_file(),
             "CUDA native operator set lock must be a regular non-symlink file",
         )
-        native_operator_set_lock = native_operator_set_lock.resolve()
-        native_operator_set_lock_identity = (
-            matrix.native_operator_set_lock_identity(native_operator_set_lock)
+        source_native_operator_set_lock = native_operator_set_lock.resolve()
+        canonical_native_operator_set_lock = (
+            root / matrix.CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL
+        ).resolve()
+        try:
+            native_operator_set_lock, staged_native_operator_set = (
+                native_operator_set.stage_native_operator_set(
+                    source_native_operator_set_lock,
+                    canonical_native_operator_set_lock.parent,
+                    matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+                )
+            )
+        except native_operator_set.NativeOperatorSetEvidenceError as error:
+            raise PreparationError(
+                f"cannot stage CUDA native operator set: {error}"
+            ) from error
+        require(
+            native_operator_set_lock == canonical_native_operator_set_lock,
+            "staged CUDA native operator set lock path is not canonical",
+        )
+        native_operator_set_lock_identity = matrix.native_operator_set_lock_identity(
+            native_operator_set_lock
         )
     else:
         require(
@@ -349,10 +373,6 @@ def build_candidate(
         spec.backend,
         native_operator_set_lock,
     )
-    receipt_path = root / BUILD_RECEIPT_REL
-    binary_path = root / BUILD_BINARY_REL
-    require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
-    require(not binary_path.exists(), f"candidate build binary already exists: {binary_path}")
     before = source_observation(spec)
     probes = {
         name: capture_probe(root, name, argv)
@@ -388,6 +408,26 @@ def build_candidate(
         after == before,
         f"candidate source changed during the {spec.backend.upper()} build",
     )
+    if native_operator_set_lock_identity is not None:
+        require(
+            matrix.native_operator_set_lock_identity(native_operator_set_lock)
+            == native_operator_set_lock_identity,
+            "staged CUDA native operator set lock changed during the build",
+        )
+        try:
+            staged_after = native_operator_set.validate_native_operator_set(
+                native_operator_set_lock,
+                matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+        except native_operator_set.NativeOperatorSetEvidenceError as error:
+            raise PreparationError(
+                f"staged CUDA native operator set changed during the build: {error}"
+            ) from error
+        require(
+            native_operator_set.public_identity(staged_after)
+            == native_operator_set.public_identity(staged_native_operator_set),
+            "staged CUDA native operator set identity changed during the build",
+        )
     cargo_metadata = json.loads(
         run_text(["cargo", "metadata", "--format-version", "1", "--no-deps"])
     )
@@ -722,8 +762,43 @@ def self_test(spec: BackendSpec) -> None:
                 )
             else:
                 raise AssertionError("CUDA candidate build accepted a missing native lock")
-            native_lock = (root / "native-operator-set.lock.json").resolve()
-            native_lock.write_text('{"schema_version":1}\n', encoding="utf-8")
+            source_native_lock = native_operator_set.create_selftest_native_operator_set(
+                root / "native-source",
+                matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+            canonical_native_root = (
+                root.resolve() / matrix.CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL
+            ).parent
+            native_lock, staged_native = native_operator_set.stage_native_operator_set(
+                source_native_lock,
+                canonical_native_root,
+                matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+            require(
+                native_lock
+                == (root / matrix.CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL).resolve()
+                and len(staged_native["_members"]) > 1,
+                "CUDA self-test native operator closure was not staged canonically",
+            )
+            broken_native_root = root / "broken-native"
+            shutil.copytree(native_lock.parent, broken_native_root)
+            broken_native_lock = broken_native_root / native_operator_set.LOCK_FILE_NAME
+            broken_member = Path(staged_native["_members"][0]["path"])
+            broken_native_root.joinpath(*broken_member.parts).unlink()
+            try:
+                native_operator_set.validate_native_operator_set(
+                    broken_native_lock,
+                    matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+                )
+            except native_operator_set.NativeOperatorSetEvidenceError as error:
+                require(
+                    "missing" in str(error).lower(),
+                    f"missing staged CUDA member failed ambiguously: {error}",
+                )
+            else:
+                raise AssertionError(
+                    "CUDA native operator closure accepted a missing staged member"
+                )
             candidate_command = matrix.candidate_build_command("cuda", native_lock)
             require(
                 candidate_command[:2]

@@ -48,6 +48,11 @@ except ModuleNotFoundError:
     from scripts.release import runtime_vnext_plan_reference as plan_reference
 
 try:
+    import runtime_vnext_native_operator_set as native_operator_set
+except ModuleNotFoundError:
+    from scripts.release import runtime_vnext_native_operator_set as native_operator_set
+
+try:
     from jsonl_product_session import JsonlProductSession, JsonlSessionError, SessionCase
 except ModuleNotFoundError:
     from scripts.release.jsonl_product_session import (
@@ -115,6 +120,15 @@ LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
 EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
+CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL = Path(
+    "build/candidate/native-operator-set.lock.json"
+)
+CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS = (
+    "ferrum.cuda.marlin",
+    "ferrum.cuda.vllm_marlin",
+    "ferrum.cuda.vllm_moe_marlin",
+    "ferrum.cuda.vllm_paged_attention_v2",
+)
 CUDA_CORRECTNESS_BUILD_MODE = "cuda-correctness-cache-only"
 CUDA_CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
 CUDA_CORRECTNESS_SCHEMA_VERSION = 5
@@ -1522,6 +1536,14 @@ def validate_candidate_build_receipt(
             )
         return receipt, receipt_path, file_sha256(receipt_path), binary_path
     require(build_mode == "release", "candidate build mode is unsupported")
+    recorded_artifact_root = Path(
+        require_string(receipt.get("artifact_root"), "candidate build artifact_root")
+    )
+    recorded_repository_root = Path(
+        require_string(receipt.get("repository_root"), "candidate build repository_root")
+    )
+    require(recorded_artifact_root.is_absolute(), "candidate build artifact_root must be absolute")
+    require(recorded_repository_root.is_absolute(), "candidate build repository_root must be absolute")
     if backend == "cuda":
         native_operator_set_lock = require_object(
             receipt.get("native_operator_set_lock"),
@@ -1552,6 +1574,34 @@ def validate_candidate_build_receipt(
             ),
             "candidate CUDA native operator set lock identity is invalid",
         )
+        recorded_native_lock_path = Path(native_operator_set_lock["path"])
+        require(
+            recorded_native_lock_path
+            == recorded_artifact_root / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL,
+            "candidate CUDA native operator set lock path is not canonical",
+        )
+        portable_native_lock_path = (
+            root.resolve() / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL
+        )
+        portable_native_lock = native_operator_set_lock_identity(
+            portable_native_lock_path
+        )
+        require(
+            portable_native_lock["sha256"]
+            == native_operator_set_lock["sha256"]
+            and portable_native_lock["size_bytes"]
+            == native_operator_set_lock["size_bytes"],
+            "candidate CUDA portable native operator set lock differs from the build input",
+        )
+        try:
+            native_operator_set.validate_native_operator_set(
+                portable_native_lock_path,
+                CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+        except native_operator_set.NativeOperatorSetEvidenceError as error:
+            raise ScenarioError(
+                f"candidate CUDA native operator set closure is invalid: {error}"
+            ) from error
         build_command = [
             "env",
             (
@@ -1568,14 +1618,6 @@ def validate_candidate_build_receipt(
         build_command = CANDIDATE_BUILD_COMMANDS[backend]
     require(receipt.get("command") == build_command, "candidate build command is not canonical")
     require(receipt.get("returncode") == 0, "candidate build returncode must be 0")
-    recorded_artifact_root = Path(
-        require_string(receipt.get("artifact_root"), "candidate build artifact_root")
-    )
-    recorded_repository_root = Path(
-        require_string(receipt.get("repository_root"), "candidate build repository_root")
-    )
-    require(recorded_artifact_root.is_absolute(), "candidate build artifact_root must be absolute")
-    require(recorded_repository_root.is_absolute(), "candidate build repository_root must be absolute")
     source_observations = require_object(
         receipt.get("source_observations"),
         "candidate build source_observations",
@@ -11072,13 +11114,9 @@ def make_candidate_build_receipt_fixture(
     native_operator_set_lock: dict[str, Any] | None = None
     native_operator_set_lock_path: Path | None = None
     if backend == "cuda":
-        native_operator_set_lock_path = (
-            build_root / "fixture-native-operator-set.lock.json"
-        ).resolve()
-        native_operator_set_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        native_operator_set_lock_path.write_text(
-            '{"schema_version":1,"fixture":true}\n',
-            encoding="utf-8",
+        native_operator_set_lock_path = native_operator_set.create_selftest_native_operator_set(
+            (root.resolve() / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL).parent,
+            CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
         )
         native_operator_set_lock = native_operator_set_lock_identity(
             native_operator_set_lock_path
