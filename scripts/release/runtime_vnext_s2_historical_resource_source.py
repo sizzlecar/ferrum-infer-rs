@@ -394,13 +394,71 @@ def validate_historical_cases(
 ) -> dict[str, Any]:
     historical_root = historical_root.resolve(strict=True)
     require(historical_root.is_dir() and not historical_root.is_symlink(), "historical corpus root is invalid")
-    context = historical_corpus.load_context()
-    corpus_document = historical_corpus.validate_existing(context, historical_root)
+    corpus_path = historical_root / "historical-bug-corpus.json"
+    corpus_document = read_json(corpus_path, "historical corpus")
     require(corpus_document.get("status") == "complete", "historical corpus is incomplete")
     require(
         corpus_document.get("catalog_sha256") == sha256_file(BUG_CATALOG_PATH),
         "historical corpus catalog binding is stale",
     )
+    require(
+        corpus_document.get("concrete_case_count") == 28
+        and corpus_document.get("complete_case_count") == 28
+        and corpus_document.get("incomplete_case_count") == 0,
+        "historical corpus denominator is incomplete",
+    )
+    collector = corpus_document.get("collector")
+    require(
+        isinstance(collector, dict)
+        and collector.get("dirty_status")
+        == {"is_dirty": False, "status_short": []},
+        "historical corpus was not captured from a clean checkout",
+    )
+    assembler = corpus_document.get("assembler")
+    require(
+        isinstance(assembler, dict)
+        and assembler.get("path")
+        == "scripts/release/runtime_vnext_historical_corpus.py"
+        and assembler.get("sha256")
+        == sha256_file(REPO_ROOT / assembler["path"]),
+        "historical corpus assembler binding is stale",
+    )
+    freshness = corpus_document.get("freshness")
+    require(isinstance(freshness, dict), "historical corpus freshness is missing")
+    stale_full_inputs: list[dict[str, str]] = []
+    for raw in freshness.get("inputs", []):
+        require(isinstance(raw, dict), "historical corpus freshness input is invalid")
+        relative = raw.get("path")
+        require(
+            isinstance(relative, str)
+            and relative
+            and ".." not in Path(relative).parts,
+            "historical corpus freshness path is invalid",
+        )
+        path = REPO_ROOT / relative
+        current_sha = sha256_file(path)
+        if current_sha != raw.get("sha256"):
+            stale_full_inputs.append(
+                {
+                    "path": relative,
+                    "recorded_sha256": str(raw.get("sha256")),
+                    "current_sha256": current_sha,
+                }
+            )
+
+    frozen_cases: dict[str, dict[str, Any]] = {}
+    families = corpus_document.get("families")
+    require(isinstance(families, list), "historical corpus families are missing")
+    for family in families:
+        require(isinstance(family, dict), "historical corpus family is invalid")
+        for case in family.get("cases", []):
+            require(isinstance(case, dict), "historical corpus case is invalid")
+            case_id = case.get("id")
+            require(
+                isinstance(case_id, str) and case_id not in frozen_cases,
+                f"historical corpus case is duplicate or invalid: {case_id}",
+            )
+            frozen_cases[case_id] = case
 
     rows: list[dict[str, Any]] = []
     for case_id in CASE_IDS:
@@ -412,6 +470,15 @@ def validate_historical_cases(
         replay_input = read_json(target_dir / "input.json", f"{case_id} input")
         mutation = read_json(target_dir / "mutation.json", f"{case_id} mutation")
         expected = config["cases"][case_id]
+        frozen = frozen_cases.get(case_id)
+        require(
+            isinstance(frozen, dict)
+            and frozen.get("status") == "frozen"
+            and frozen.get("failure_class") == expected["failure_class"]
+            and frozen.get("expected_failure_layer")
+            == expected["expected_failure_layer"],
+            f"historical corpus case contract mismatch: {case_id}",
+        )
         require(
             evidence.get("case_id")
             == replay_input.get("case_id")
@@ -437,6 +504,75 @@ def validate_historical_cases(
             == expected["mutation_kind"],
             f"historical replay contract mismatch: {case_id}",
         )
+        require(
+            evidence.get("catalog_sha256") == sha256_file(BUG_CATALOG_PATH)
+            and evidence.get("freshness", {}).get("catalog_sha256")
+            == sha256_file(BUG_CATALOG_PATH)
+            and evidence.get("freshness", {}).get("mode")
+            == "content_addressed"
+            and evidence.get("freshness", {}).get("invalidated_by") == []
+            and evidence.get("freshness", {}).get("binding_sha256")
+            == historical_corpus.receipt_binding_sha256(evidence),
+            f"historical receipt binding is stale: {case_id}",
+        )
+        frozen_receipt = frozen.get("evidence_receipt")
+        require(
+            isinstance(frozen_receipt, dict)
+            and frozen_receipt.get("path")
+            == f"historical-bugs/{case_id}/evidence.json"
+            and frozen_receipt.get("sha256")
+            == sha256_file(target_dir / "evidence.json")
+            and frozen_receipt.get("binding_sha256")
+            == evidence["freshness"]["binding_sha256"],
+            f"historical corpus/receipt binding mismatch: {case_id}",
+        )
+        reproducer = evidence.get("reproducer")
+        require(isinstance(reproducer, dict), f"historical reproducer is missing: {case_id}")
+        for field, filename in (
+            ("input", "input.json"),
+            ("mutation", "mutation.json"),
+            ("failure_log", "failure.log"),
+        ):
+            ref = reproducer.get(field)
+            require(
+                isinstance(ref, dict)
+                and ref.get("path") == f"historical-bugs/{case_id}/{filename}"
+                and ref.get("sha256") == sha256_file(target_dir / filename)
+                and ref.get("size_bytes") == (target_dir / filename).stat().st_size,
+                f"historical reproducer file binding mismatch: {case_id}/{field}",
+            )
+        for source in evidence.get("source_evidence", []):
+            require(isinstance(source, dict), f"historical source evidence is invalid: {case_id}")
+            if source.get("kind") == "commit":
+                commit = source.get("ref")
+                require(
+                    isinstance(commit, str)
+                    and GIT_SHA_RE.fullmatch(commit) is not None
+                    and subprocess.run(
+                        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+                        cwd=REPO_ROOT,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    ).returncode
+                    == 0,
+                    f"historical fix commit is missing: {case_id}",
+                )
+            elif source.get("kind") == "artifact":
+                relative = source.get("ref")
+                require(
+                    isinstance(relative, str)
+                    and ".." not in Path(relative).parts,
+                    f"historical source artifact path is invalid: {case_id}",
+                )
+                path = REPO_ROOT / relative
+                require(
+                    source.get("sha256") == sha256_file(path)
+                    and source.get("size_bytes") == path.stat().st_size,
+                    f"historical source artifact binding is stale: {case_id}",
+                )
+            else:
+                raise GateError(f"historical source evidence kind is invalid: {case_id}")
 
         command = [
             sys.executable,
@@ -496,9 +632,11 @@ def validate_historical_cases(
         )
     return {
         "source_root": str(historical_root),
-        "corpus": file_ref(
-            historical_root / "historical-bug-corpus.json", historical_root
-        ),
+        "corpus": file_ref(corpus_path, historical_root),
+        "full_corpus_policy_current": not stale_full_inputs,
+        "full_corpus_stale_inputs": stale_full_inputs,
+        "reuse_scope": list(CASE_IDS),
+        "reuse_mode": "selected_content_addressed_receipts",
         "case_count": len(rows),
         "cases": rows,
     }
