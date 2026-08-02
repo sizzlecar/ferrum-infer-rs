@@ -817,6 +817,7 @@ def validate_bounded_receipt(path: Path) -> dict[str, Any]:
 def parse_serial_libtest_results(output: str, label: str) -> set[str]:
     observed: dict[str, str] = {}
     pending: str | None = None
+    terminal_outcomes = {"ok", "FAILED", "ignored"}
     for line in output.splitlines():
         match = re.fullmatch(r"test ([A-Za-z0-9_]+) \.\.\.\s*(.*)", line)
         if match is not None:
@@ -824,12 +825,12 @@ def parse_serial_libtest_results(output: str, label: str) -> set[str]:
             name, outcome = match.groups()
             require(name not in observed, f"{label} duplicate test result: {name}")
             outcome = outcome.strip()
-            if outcome:
+            if outcome in terminal_outcomes:
                 observed[name] = outcome
             else:
                 pending = name
             continue
-        if pending is not None and line.strip() in {"ok", "FAILED", "ignored"}:
+        if pending is not None and line.strip() in terminal_outcomes:
             observed[pending] = line.strip()
             pending = None
     require(pending is None, f"{label} test result is unterminated: {pending}")
@@ -1481,10 +1482,13 @@ def self_test() -> int:
             "test quiet_case ... ok\n"
             "test proof_case ... \n"
             "MACHINE PROOF PASS: 100/100\n"
+            "ok\n"
+            "test noisy_case ... G01B OVERHEAD JSON: {\"sample_count\":30}\n"
+            "G01B DISABLED EVENT SINK PASS: 30/30\n"
             "ok\n",
             "selftest",
         )
-        == {"quiet_case", "proof_case"},
+        == {"quiet_case", "proof_case", "noisy_case"},
         "G01B serial libtest parser lost a nocapture proof case",
     )
     for payload, fragment in (
@@ -1492,6 +1496,10 @@ def self_test() -> int:
         ("test ignored_case ... ignored\n", "non-pass test results"),
         ("test duplicate ... ok\ntest duplicate ... ok\n", "duplicate test result"),
         ("test pending ... \n", "test result is unterminated"),
+        (
+            "test pending ... G01B OVERHEAD JSON: {\"sample_count\":30}\n",
+            "test result is unterminated",
+        ),
         ("test pending ... \ntest next ... ok\n", "test output is interleaved"),
     ):
         try:
