@@ -3653,8 +3653,12 @@ fn assert_plan_runtime_decode_cohort_unchanged(
 
 #[tokio::test]
 async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
+    let trace_path = resource_trace_temp_path("plan-runtime-authoritative-batch-decode");
+    let _ = std::fs::remove_file(&trace_path);
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        Some(trace_path.clone()),
+    );
     let (request_ids, initial_tokens, cache_ids) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
     let decode_batch = scheduler
@@ -3676,6 +3680,24 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
         assert_eq!(sequence.model_cache_id(), Some(cache_id.as_str()));
         assert_eq!(sequence.tokens_this_iteration, 1);
     }
+    drop(sequences);
+    flush_engine_profile_events(&engine);
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let events = trace
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<FerrumProfileEvent>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        events.iter().all(|event| {
+            event
+                .resource
+                .as_ref()
+                .is_none_or(|resource| resource.resource_kind != "backend_workspace")
+        }),
+        "PlanRuntime must not publish the legacy synthetic backend_workspace ledger"
+    );
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[tokio::test]
@@ -4772,6 +4794,15 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
 
     flush_engine_profile_events(&engine);
     let events = read_engine_profile_events(&trace_path);
+    assert!(
+        events.iter().all(|event| {
+            event
+                .resource
+                .as_ref()
+                .is_none_or(|resource| resource.resource_kind != "backend_workspace")
+        }),
+        "PlanRuntime must not publish the legacy synthetic backend_workspace ledger"
+    );
     let deferred_index = events
         .iter()
         .position(|event| {
