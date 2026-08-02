@@ -18,6 +18,7 @@ import runtime_vnext_s1_cuda_capacity as common
 PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS"
 COLLECT_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY COLLECTED"
 FAIL_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY FAIL"
+MODEL_ID = "Qwen/Qwen3.5-4B"
 CALIBRATION_TOKEN_BUDGET = 3
 TARGET_TOKEN_BUDGET = 1024
 MAX_NUM_SEQS = 3
@@ -114,7 +115,7 @@ def require(condition: bool, message: str) -> None:
 
 def require_executor_identity_shape(executor: dict[str, Any], label: str) -> None:
     require(
-        common.GIT_SHA_RE.fullmatch(str(executor.get("model_id"))) is not None,
+        executor.get("model_id") == MODEL_ID,
         f"{label}: invalid model id",
     )
     for field in (
@@ -2943,7 +2944,7 @@ def self_test() -> int:
     ) -> dict[str, Any]:
         plan_hash = plan_digit * 64
         return {
-            "model_id": "1" * 40,
+            "model_id": MODEL_ID,
             "family_fingerprint": "2" * 64,
             "program_fingerprint": "3" * 64,
             "runtime_fingerprint": "4" * 64,
@@ -3010,6 +3011,12 @@ def self_test() -> int:
             wrong_fit_policy, "wrong decode fit policy"
         ),
         "prefill fit policy in decode lane",
+    )
+    wrong_model = dict(target_executor)
+    wrong_model["model_id"] = "Qwen/not-the-collected-model"
+    expect_reject(
+        lambda: require_executor_identity_shape(wrong_model, "wrong model"),
+        "non-canonical model identity",
     )
 
     canonical_argv = [
