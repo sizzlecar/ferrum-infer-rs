@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -55,6 +56,8 @@ TOOL_REQUIRED_PROMPT = (
 )
 TOOL_SEED = 9271
 TOOL_RESULT_MAX_TOKENS = 64
+TOOL_RESULT_TEMPERATURE = 22
+TOOL_RESULT_RECEIPT = "wx-r9271-4b"
 
 
 def write(path: Path, text: str) -> None:
@@ -106,7 +109,9 @@ def tool_calls_from_message(msg: dict[str, Any]) -> list[dict[str, Any]]:
     calls = msg.get("tool_calls")
     if not isinstance(calls, list) or not calls:
         raise RuntimeError(f"expected non-empty tool_calls, got: {msg}")
-    return [call for call in calls if isinstance(call, dict)]
+    if not all(isinstance(call, dict) for call in calls):
+        raise RuntimeError(f"tool_calls contains a non-object entry: {calls}")
+    return calls
 
 
 def assert_no_forbidden_text(label: str, text: str) -> None:
@@ -137,7 +142,14 @@ def assert_weather_tool_call(label: str, choice: dict[str, Any]) -> dict[str, An
     if content.strip():
         raise RuntimeError(f"{label}: tool-call turn leaked text content: {content[:500]!r}")
     calls = tool_calls_from_message(msg)
+    if len(calls) != 1:
+        raise RuntimeError(f"{label}: expected exactly one tool call, got: {calls}")
     call = calls[0]
+    call_id = call.get("id")
+    if not isinstance(call_id, str) or not call_id.strip() or len(call_id) > 256:
+        raise RuntimeError(f"{label}: invalid tool call id: {call_id!r}")
+    if call.get("type") != "function":
+        raise RuntimeError(f"{label}: tool call type is not function: {call}")
     function = call.get("function")
     if not isinstance(function, dict):
         raise RuntimeError(f"{label}: missing function object: {call}")
@@ -156,6 +168,8 @@ def assert_weather_tool_call(label: str, choice: dict[str, Any]) -> dict[str, An
         raise RuntimeError(f"{label}: city argument is unexpectedly long: {args}")
     if "北京" not in city and "beijing" not in city:
         raise RuntimeError(f"{label}: city argument does not identify Beijing: {args}")
+    if args.get("unit") != "celsius":
+        raise RuntimeError(f"{label}: unit argument is not celsius: {args}")
     return call
 
 
@@ -178,7 +192,13 @@ def assert_auto_tool_choice_response(label: str, choice: dict[str, Any]) -> dict
     return {"outcome": "content", "finish_reason": choice.get("finish_reason")}
 
 
-def tool_payload(model: str, *, tool_choice: Any | None, prompt: str = TOOL_USER_PROMPT) -> dict[str, Any]:
+def tool_payload(
+    model: str,
+    *,
+    tool_choice: Any | None,
+    prompt: str = TOOL_USER_PROMPT,
+    enable_thinking: bool | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "temperature": 0,
@@ -194,17 +214,114 @@ def tool_payload(model: str, *, tool_choice: Any | None, prompt: str = TOOL_USER
     }
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+    if enable_thinking is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
     return payload
 
 
-def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, Any]:
+def tool_result_payload(
+    model: str,
+    required_choice: dict[str, Any],
+    tool_call_id: str,
+    *,
+    enable_thinking: bool | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "seed": TOOL_SEED,
+        "tools": TOOLS,
+        "tool_choice": "none",
+        "messages": [
+            {
+                "role": "user",
+                "content": TOOL_USER_PROMPT,
+            },
+            message(required_choice),
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(
+                    {
+                        "city": "北京",
+                        "temp": TOOL_RESULT_TEMPERATURE,
+                        "unit": "celsius",
+                        "desc": "晴",
+                        "receipt": TOOL_RESULT_RECEIPT,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Use the tool result above to answer the original question in one short "
+                    "sentence. Include the city, numeric temperature, unit, and exact opaque "
+                    "receipt from the tool result."
+                ),
+            },
+        ],
+        "max_tokens": TOOL_RESULT_MAX_TOKENS,
+    }
+    if enable_thinking is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    return payload
+
+
+def assert_tool_result_response(
+    label: str,
+    choice: dict[str, Any],
+    *,
+    enable_thinking: bool | None = None,
+) -> dict[str, Any]:
+    msg = message(choice)
+    text = str(msg.get("content") or "")
+    assert_no_forbidden_text(label, text)
+    assert_not_duplicate_answer(label, text)
+    if choice.get("finish_reason") != "stop":
+        raise RuntimeError(f"{label}: unexpected finish_reason: {choice}")
+    if not text.strip():
+        raise RuntimeError(f"{label}: final answer is empty")
+    if msg.get("tool_calls") not in (None, []):
+        raise RuntimeError(f"{label}: final answer repeated a tool call: {msg}")
+    if enable_thinking is False and (
+        msg.get("reasoning") not in (None, "")
+        or msg.get("reasoning_content") not in (None, "")
+    ):
+        raise RuntimeError(f"{label}: reasoning leaked into no-thinking response: {msg}")
+    if re.search(rf"(?<!\d){TOOL_RESULT_TEMPERATURE}(?!\d)", text) is None:
+        raise RuntimeError(f"{label}: answer did not use the exact temperature: {text[:500]}")
+    if TOOL_RESULT_RECEIPT not in text:
+        raise RuntimeError(f"{label}: answer did not use the opaque receipt: {text[:500]}")
+    lowered = text.lower()
+    if "北京" not in text and "beijing" not in lowered:
+        raise RuntimeError(f"{label}: answer did not use the result city: {text[:500]}")
+    if not any(unit in lowered for unit in ("celsius", "摄氏", "℃")):
+        raise RuntimeError(f"{label}: answer did not use the result unit: {text[:500]}")
+    return {"passed": True, "finish_reason": "stop"}
+
+
+def run_tool_call_regression(
+    base_url: str,
+    model: str,
+    out: Path,
+    *,
+    enable_thinking: bool | None = None,
+) -> dict[str, Any]:
     out.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {"model": model, "checks": {}}
 
     # Omitting tool_choice defaults to auto. Like vLLM/OpenAI, auto may either
     # select a tool or return ordinary content; it must not return an empty or
     # unparsed protocol response.
-    status, body = post(base_url, tool_payload(model, tool_choice=None))
+    omitted_payload = tool_payload(
+        model, tool_choice=None, enable_thinking=enable_thinking
+    )
+    write(
+        out / "01_omitted_tool_choice.request.json",
+        json.dumps(omitted_payload, ensure_ascii=False, indent=2) + "\n",
+    )
+    status, body = post(base_url, omitted_payload)
     write(out / "01_omitted_tool_choice.response.json", body)
     omitted = first_choice(parsed_json("omitted_tool_choice", status, body))
     omitted_result = assert_auto_tool_choice_response("omitted_tool_choice", omitted)
@@ -212,7 +329,14 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
 
     # Explicit auto must also work. Keep the prompt identical to the omitted
     # tool_choice case so this checks request handling rather than prompt wording.
-    status, body = post(base_url, tool_payload(model, tool_choice="auto"))
+    explicit_auto_payload = tool_payload(
+        model, tool_choice="auto", enable_thinking=enable_thinking
+    )
+    write(
+        out / "01b_explicit_auto_tool_choice.request.json",
+        json.dumps(explicit_auto_payload, ensure_ascii=False, indent=2) + "\n",
+    )
+    status, body = post(base_url, explicit_auto_payload)
     write(out / "01b_explicit_auto_tool_choice.response.json", body)
     explicit_auto = first_choice(parsed_json("explicit_auto_tool_choice", status, body))
     explicit_auto_result = assert_auto_tool_choice_response(
@@ -225,10 +349,17 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
 
     # Required must produce one of the declared tools. This is the portable
     # cross-model correctness contract for forced tool use.
-    status, body = post(
-        base_url,
-        tool_payload(model, tool_choice="required", prompt=TOOL_REQUIRED_PROMPT),
+    required_payload = tool_payload(
+        model,
+        tool_choice="required",
+        prompt=TOOL_REQUIRED_PROMPT,
+        enable_thinking=enable_thinking,
     )
+    write(
+        out / "02_required_tool_choice.request.json",
+        json.dumps(required_payload, ensure_ascii=False, indent=2) + "\n",
+    )
+    status, body = post(base_url, required_payload)
     write(out / "02_required_tool_choice.response.json", body)
     required = first_choice(parsed_json("required_tool_choice", status, body))
     required_call = assert_weather_tool_call("required_tool_choice", required)
@@ -237,10 +368,17 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     # Named choice must bind the exact requested function. Keep this separate
     # from `required`; the two choices have different OpenAI semantics.
     named_choice = {"type": "function", "function": {"name": "get_weather"}}
-    status, body = post(
-        base_url,
-        tool_payload(model, tool_choice=named_choice, prompt=TOOL_REQUIRED_PROMPT),
+    named_payload = tool_payload(
+        model,
+        tool_choice=named_choice,
+        prompt=TOOL_REQUIRED_PROMPT,
+        enable_thinking=enable_thinking,
     )
+    write(
+        out / "02b_named_tool_choice.request.json",
+        json.dumps(named_payload, ensure_ascii=False, indent=2) + "\n",
+    )
+    status, body = post(base_url, named_payload)
     write(out / "02b_named_tool_choice.response.json", body)
     named = first_choice(parsed_json("named_tool_choice", status, body))
     assert_weather_tool_call("named_tool_choice", named)
@@ -248,42 +386,10 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
 
     # BUG-2: Feeding a tool result back must not leak chat-template markers such as
     # <|assistant|>, classname=..., or auto_tool_response into the final answer.
-    tool_call_id = str(required_call.get("id") or "call_0")
-    fill_payload = {
-        "model": model,
-        "temperature": 0,
-        "seed": TOOL_SEED,
-        "tools": TOOLS,
-        "tool_choice": "none",
-        "messages": [
-            {
-                "role": "user",
-                "content": TOOL_USER_PROMPT,
-            },
-            message(required),
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": json.dumps(
-                    {
-                        "city": "北京",
-                        "temp": 22,
-                        "unit": "celsius",
-                        "desc": "晴",
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Use the tool result above to answer the original question in one short "
-                    "sentence. Include the numeric temperature from the tool result."
-                ),
-            },
-        ],
-        "max_tokens": TOOL_RESULT_MAX_TOKENS,
-    }
+    tool_call_id = str(required_call["id"])
+    fill_payload = tool_result_payload(
+        model, required, tool_call_id, enable_thinking=enable_thinking
+    )
     write(
         out / "03_tool_result_fill.request.json",
         json.dumps(fill_payload, ensure_ascii=False, indent=2) + "\n",
@@ -291,20 +397,9 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     status, body = post(base_url, fill_payload)
     write(out / "03_tool_result_fill.response.json", body)
     fill = first_choice(parsed_json("tool_result_fill", status, body))
-    fill_msg = message(fill)
-    fill_text = str(fill_msg.get("content") or "")
-    assert_no_forbidden_text("tool_result_fill", fill_text)
-    assert_not_duplicate_answer("tool_result_fill", fill_text)
-    if not fill_text.strip():
-        raise RuntimeError("tool_result_fill: final answer is empty")
-    if "22" not in fill_text:
-        raise RuntimeError(f"tool_result_fill: answer did not use tool result: {fill_text[:500]}")
-    if fill.get("finish_reason") not in {"stop", "length"}:
-        raise RuntimeError(f"tool_result_fill: unexpected finish_reason: {fill}")
-    results["checks"]["tool_result_fill"] = {
-        "passed": True,
-        "finish_reason": fill.get("finish_reason"),
-    }
+    results["checks"]["tool_result_fill"] = assert_tool_result_response(
+        "tool_result_fill", fill, enable_thinking=enable_thinking
+    )
 
     results["status"] = "pass"
     write(out / "tool_call_regression.json", json.dumps(results, ensure_ascii=False, indent=2) + "\n")

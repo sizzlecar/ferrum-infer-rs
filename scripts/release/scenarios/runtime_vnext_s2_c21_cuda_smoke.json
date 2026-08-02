@@ -28,6 +28,11 @@
       "enable_thinking": false,
       "marker_prefix": "vnext-c21",
       "max_tokens": 256
+    },
+    {
+      "name": "s2_tool_call_lifecycle",
+      "type": "serve_tool_call",
+      "enable_thinking": false
     }
   ]
 }

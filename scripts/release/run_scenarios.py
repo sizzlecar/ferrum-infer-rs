@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai_concurrency_quality_regression import run_concurrency_quality_regression
-from openai_tool_call_regression import run_tool_call_regression
+from openai_tool_call_regression import TOOL_RESULT_RECEIPT, run_tool_call_regression
 
 
 BAD_TEXT = [
@@ -1588,6 +1588,16 @@ class ScenarioRunner:
                 "path": str(helper_copy),
                 "sha256": file_sha256(helper_copy),
             }
+        if any(str(scenario.get("type")) == "serve_tool_call" for scenario in scenarios):
+            helper_source = Path(__file__).resolve().with_name(
+                "openai_tool_call_regression.py"
+            )
+            helper_copy = inputs / helper_source.name
+            shutil.copyfile(helper_source, helper_copy)
+            input_artifacts["tool_call_helper"] = {
+                "path": str(helper_copy),
+                "sha256": file_sha256(helper_copy),
+            }
         self.execution_receipt["input_artifacts"] = input_artifacts
         started_at = iso_now()
         selected = selected_scenarios(scenarios, self.args.only)
@@ -1815,7 +1825,7 @@ class ScenarioRunner:
         if typ == "serve_tool_schema_priority":
             return self.serve_tool_schema_priority(scenario, out)
         if typ == "serve_tool_call":
-            return self.serve_tool_call(out)
+            return self.serve_tool_call(scenario, out)
         if typ == "serve_python_openai_sdk":
             return self.serve_python_openai_sdk(scenario, out)
         if typ == "run_multiturn":
@@ -2941,8 +2951,18 @@ class ScenarioRunner:
 
         return {"status": "pass", "case_count": len(results), "cases": results}
 
-    def serve_tool_call(self, out: Path) -> dict[str, Any]:
-        result = run_tool_call_regression(self.require_base_url(), self.model, out)
+    def serve_tool_call(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        enable_thinking = scenario.get("enable_thinking")
+        require(
+            enable_thinking is None or isinstance(enable_thinking, bool),
+            "serve_tool_call.enable_thinking must be boolean when present",
+        )
+        result = run_tool_call_regression(
+            self.require_base_url(),
+            self.model,
+            out,
+            enable_thinking=enable_thinking,
+        )
         return {"status": "pass", "checks": result.get("checks", {})}
 
     def serve_python_openai_sdk(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
@@ -3374,7 +3394,7 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         if payload.get("tools") and any(msg.get("role") == "tool" for msg in payload.get("messages", [])):
-            self.send_chat("北京 22 celsius 晴")
+            self.send_chat(f"北京 22 celsius 晴 receipt {TOOL_RESULT_RECEIPT}")
             return
         if payload.get("tools"):
             self.send_tool_call()
@@ -3472,6 +3492,8 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             {
                 "id": "chatcmpl_mock",
                 "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": "mock-model",
                 "choices": [
                     {
                         "index": 0,
@@ -3491,6 +3513,10 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         self.send_json(
             200,
             {
+                "id": "chatcmpl_tool_mock",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": "mock-model",
                 "choices": [
                     {
                         "index": 0,
@@ -3510,7 +3536,8 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                         },
                         "finish_reason": "tool_calls",
                     }
-                ]
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             },
         )
 
@@ -3962,6 +3989,7 @@ def self_test() -> int:
                 "runner",
                 "manifest",
                 "concurrency_quality_helper",
+                "tool_call_helper",
             }:
                 raise AssertionError(input_artifacts)
             helper_input = out / "inputs" / "openai_concurrency_quality_regression.py"
@@ -3974,6 +4002,16 @@ def self_test() -> int:
                 != file_sha256(helper_input)
             ):
                 raise AssertionError(input_artifacts["concurrency_quality_helper"])
+            tool_helper_input = out / "inputs" / "openai_tool_call_regression.py"
+            if (
+                Path(str(input_artifacts["tool_call_helper"].get("path"))).resolve(
+                    strict=False
+                )
+                != tool_helper_input.resolve(strict=False)
+                or input_artifacts["tool_call_helper"].get("sha256")
+                != file_sha256(tool_helper_input)
+            ):
+                raise AssertionError(input_artifacts["tool_call_helper"])
             tree = load_json_object(out / "artifact_tree.json")
             tree_sha = tree.pop("canonical_sha256", None)
             if json_fingerprint(tree) != tree_sha:

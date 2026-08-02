@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import openai_tool_call_regression as tool_regression
+
 from runtime_vnext_s2_stream_disconnect_checkpoint import (
     GIT_SHA_RE,
     SHA256_RE,
@@ -40,10 +42,20 @@ CHECKPOINT_ID = "runtime-vnext-s2-tool-schema-priority-sentinel"
 SCOPE = "S2/C21-required-tool-strict-response-format-priority-sentinel"
 SCENARIO_NAME = "c21_required_tool_schema_priority"
 SCENARIO_TYPE = "serve_tool_schema_priority"
+TOOL_LIFECYCLE_NAME = "s2_tool_call_lifecycle"
+TOOL_LIFECYCLE_TYPE = "serve_tool_call"
+SCENARIOS = (
+    (SCENARIO_NAME, SCENARIO_TYPE),
+    (TOOL_LIFECYCLE_NAME, TOOL_LIFECYCLE_TYPE),
+)
 MODEL = "Qwen/Qwen3.5-4B"
 CASE_COUNT = 4
 TRANSPORT_COUNT = CASE_COUNT * 2
+TOOL_LIFECYCLE_REQUEST_COUNT = 5
+TOTAL_REQUEST_COUNT = TRANSPORT_COUNT + TOOL_LIFECYCLE_REQUEST_COUNT
+TOOL_ENABLE_THINKING = False
 RUNNER_PATH = Path(__file__).resolve().parent / "run_scenarios.py"
+TOOL_HELPER_PATH = Path(__file__).resolve().parent / "openai_tool_call_regression.py"
 SCENARIO_MANIFEST_PATH = (
     Path(__file__).resolve().parent
     / "scenarios/runtime_vnext_s2_c21_cuda_smoke.json"
@@ -66,8 +78,6 @@ DOES_NOT_PROVE = [
     "generic serve-stream",
     "standalone strict-schema",
     "json_object",
-    "auto-tool",
-    "tool-result continuation",
     "full S2",
     "full MODEL_MATRIX C21",
 ]
@@ -456,9 +466,9 @@ def validate_identity(
         require(git_sha == expected_git_sha, "artifact git SHA differs from expected SHA")
     require(summary.get("dirty_status") == {"is_dirty": False, "status_short": []}, "artifact source was dirty")
     require(summary.get("failed") == 0 and summary.get("skipped") == 0, "summary contains failed/skipped scenarios")
-    require(summary.get("scenario_count") == summary.get("manifest_scenario_count") == 1, "summary scenario count mismatch")
+    require(summary.get("scenario_count") == summary.get("manifest_scenario_count") == 2, "summary scenario count mismatch")
     require(summary.get("requested_scenarios") == [], "checkpoint must run the full manifest")
-    require(summary.get("selected_scenarios") == [SCENARIO_NAME], "selected scenario mismatch")
+    require(summary.get("selected_scenarios") == [name for name, _ in SCENARIOS], "selected scenario mismatch")
     artifact_dir = summary.get("artifact_dir")
     require(isinstance(artifact_dir, str) and Path(artifact_dir).is_absolute(), "recorded artifact root invalid")
     recorded = Path(artifact_dir)
@@ -477,8 +487,17 @@ def validate_identity(
     require(receipt.get("mode") == "start" and receipt.get("git_sha") == git_sha, "execution receipt identity mismatch")
     require(receipt.get("dirty_status") == summary.get("dirty_status"), "receipt dirty status mismatch")
     require(receipt.get("backend") == "cuda" and receipt.get("model") == MODEL, "receipt model/backend mismatch")
-    require(receipt.get("selected_scenarios") == [SCENARIO_NAME], "receipt scenarios mismatch")
-    require(receipt.get("scenario_count") == 1 and receipt.get("failed") == receipt.get("skipped") == 0, "receipt outcome mismatch")
+    require(receipt.get("selected_scenarios") == [name for name, _ in SCENARIOS], "receipt scenarios mismatch")
+    require(receipt.get("scenario_count") == 2 and receipt.get("failed") == receipt.get("skipped") == 0, "receipt outcome mismatch")
+    phases = receipt.get("scenario_execution_phases")
+    require(
+        isinstance(phases, list)
+        and len(phases) == 1
+        and isinstance(phases[0], dict)
+        and phases[0].get("phase") == "serve"
+        and phases[0].get("scenarios") == [name for name, _ in SCENARIOS],
+        "receipt serve execution phase mismatch",
+    )
     binary_sha = receipt.get("binary_sha256")
     require(isinstance(binary_sha, str) and SHA256_RE.fullmatch(binary_sha), "binary SHA invalid")
     binary_path = receipt.get("binary_path")
@@ -516,15 +535,27 @@ def validate_identity(
         require(summary_receipt.get(key) == receipt.get(key), f"summary/receipt {key} mismatch")
     inputs = receipt.get("input_artifacts")
     require(isinstance(inputs, dict), "receipt input artifacts missing")
+    require(
+        set(inputs) == {"runner", "manifest", "tool_call_helper"},
+        "receipt input artifact set mismatch",
+    )
     for name, filename, sha_key, current in (
         ("runner", "run_scenarios.py", "runner_sha256", RUNNER_PATH),
         ("manifest", "scenario_manifest.json", "manifest_sha256", SCENARIO_MANIFEST_PATH),
+        (
+            "tool_call_helper",
+            "openai_tool_call_regression.py",
+            None,
+            TOOL_HELPER_PATH,
+        ),
     ):
         item = inputs.get(name)
         require(isinstance(item, dict), f"receipt input {name} missing")
         path = resolve_member(source, recorded, item.get("path"), f"receipt input {name}")
         require(path == source / "inputs" / filename, f"receipt input {name} path mismatch")
-        require(item.get("sha256") == file_sha256(path) == receipt.get(sha_key), f"receipt input {name} SHA mismatch")
+        require(item.get("sha256") == file_sha256(path), f"receipt input {name} SHA mismatch")
+        if sha_key is not None:
+            require(file_sha256(path) == receipt.get(sha_key), f"receipt {name} SHA mismatch")
         require(file_sha256(path) == file_sha256(current), f"artifact {name} differs from current checked-in source")
     runner_argv = receipt.get("runner_argv")
     require(isinstance(runner_argv, list) and "--manifest" in runner_argv and "--out" in runner_argv, "runner argv missing manifest/out")
@@ -564,8 +595,17 @@ def validate_identity(
     require(manifest.get("observability") == {"enabled": True, "profile_detail": "basic", "profile_sample_rate": 1.0}, "input manifest observability mismatch")
     require(manifest.get("server") == {"args": ["--backend", "cuda"], "mode": "start"}, "input manifest must start typed CUDA server")
     scenarios = manifest.get("scenarios")
-    require(isinstance(scenarios, list) and len(scenarios) == 1, "input manifest scenario count mismatch")
+    require(isinstance(scenarios, list) and len(scenarios) == 2, "input manifest scenario count mismatch")
     require(scenarios[0] == {"name": SCENARIO_NAME, "type": SCENARIO_TYPE, "case_count": 4, "enable_thinking": False, "marker_prefix": "vnext-c21", "max_tokens": 256}, "input manifest scenario contract mismatch")
+    require(
+        scenarios[1]
+        == {
+            "name": TOOL_LIFECYCLE_NAME,
+            "type": TOOL_LIFECYCLE_TYPE,
+            "enable_thinking": TOOL_ENABLE_THINKING,
+        },
+        "input tool lifecycle scenario contract mismatch",
+    )
     evidence = receipt.get("evidence_files")
     require(isinstance(evidence, dict), "execution evidence bindings missing")
     expected_evidence = {
@@ -596,6 +636,186 @@ def validate_identity(
     return summary, recorded, receipt
 
 
+def tool_response(path: Path, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    response = read_json(path)
+    require(response.get("object") == "chat.completion", f"{label}: object mismatch")
+    response_id = response.get("id")
+    require(
+        isinstance(response_id, str) and response_id,
+        f"{label}: response id missing",
+    )
+    require(response.get("model") == MODEL, f"{label}: response model mismatch")
+    created = response.get("created")
+    require(
+        isinstance(created, int) and not isinstance(created, bool) and created > 0,
+        f"{label}: created timestamp invalid",
+    )
+    validate_usage(response.get("usage"), label)
+    choices = response.get("choices")
+    require(
+        isinstance(choices, list) and len(choices) == 1,
+        f"{label}: expected exactly one choice",
+    )
+    try:
+        choice = tool_regression.first_choice(response)
+        response_message = tool_regression.message(choice)
+    except RuntimeError as error:
+        raise ValidationError(f"{label}: {error}") from error
+    require(choice.get("index") == 0, f"{label}: choice index mismatch")
+    require(
+        response_message.get("role") == "assistant",
+        f"{label}: assistant role mismatch",
+    )
+    return response, choice
+
+
+def validate_tool_lifecycle(
+    source: Path,
+    recorded: Path,
+    summary_row: dict[str, Any],
+) -> dict[str, Any]:
+    root = source / TOOL_LIFECYCLE_NAME
+    require(
+        summary_row.get("name") == TOOL_LIFECYCLE_NAME
+        and summary_row.get("type") == TOOL_LIFECYCLE_TYPE
+        and summary_row.get("status") == "pass",
+        "tool lifecycle summary identity/status mismatch",
+    )
+    require(
+        resolve_member(
+            source,
+            recorded,
+            summary_row.get("artifact"),
+            "tool lifecycle summary artifact",
+        )
+        == root / "result.json",
+        "tool lifecycle summary artifact path mismatch",
+    )
+    persisted_result = read_json(root / "result.json")
+    require(persisted_result == summary_row, "tool lifecycle summary/result mismatch")
+
+    expected_files = {
+        "01_omitted_tool_choice.request.json",
+        "01_omitted_tool_choice.response.json",
+        "01b_explicit_auto_tool_choice.request.json",
+        "01b_explicit_auto_tool_choice.response.json",
+        "02_required_tool_choice.request.json",
+        "02_required_tool_choice.response.json",
+        "02b_named_tool_choice.request.json",
+        "02b_named_tool_choice.response.json",
+        "03_tool_result_fill.request.json",
+        "03_tool_result_fill.response.json",
+        "tool_call_regression.json",
+        "result.json",
+    }
+    require(
+        {path.name for path in root.iterdir() if path.is_file() and not path.is_symlink()}
+        == expected_files,
+        "tool lifecycle artifact file set mismatch",
+    )
+
+    omitted_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice=None,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    auto_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice="auto",
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    required_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice="required",
+        prompt=tool_regression.TOOL_REQUIRED_PROMPT,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    named_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        prompt=tool_regression.TOOL_REQUIRED_PROMPT,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    for filename, expected in (
+        ("01_omitted_tool_choice.request.json", omitted_request),
+        ("01b_explicit_auto_tool_choice.request.json", auto_request),
+        ("02_required_tool_choice.request.json", required_request),
+        ("02b_named_tool_choice.request.json", named_request),
+    ):
+        require(read_json(root / filename) == expected, f"{filename}: request contract mismatch")
+
+    observed_checks: dict[str, dict[str, Any]] = {}
+    _, omitted = tool_response(
+        root / "01_omitted_tool_choice.response.json", "omitted_tool_choice"
+    )
+    _, explicit_auto = tool_response(
+        root / "01b_explicit_auto_tool_choice.response.json",
+        "explicit_auto_tool_choice",
+    )
+    _, required = tool_response(
+        root / "02_required_tool_choice.response.json", "required_tool_choice"
+    )
+    _, named = tool_response(
+        root / "02b_named_tool_choice.response.json", "named_tool_choice"
+    )
+    try:
+        omitted_observed = tool_regression.assert_auto_tool_choice_response(
+            "omitted_tool_choice", omitted
+        )
+        auto_observed = tool_regression.assert_auto_tool_choice_response(
+            "explicit_auto_tool_choice", explicit_auto
+        )
+        required_call = tool_regression.assert_weather_tool_call(
+            "required_tool_choice", required
+        )
+        tool_regression.assert_weather_tool_call("named_tool_choice", named)
+    except RuntimeError as error:
+        raise ValidationError(f"tool lifecycle response invalid: {error}") from error
+    observed_checks["omitted_tool_choice"] = {"passed": True, **omitted_observed}
+    observed_checks["explicit_auto_tool_choice"] = {"passed": True, **auto_observed}
+    observed_checks["required_tool_choice"] = {"passed": True}
+    observed_checks["named_tool_choice"] = {"passed": True}
+
+    tool_call_id = str(required_call["id"])
+    expected_fill_request = tool_regression.tool_result_payload(
+        MODEL,
+        required,
+        tool_call_id,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    require(
+        read_json(root / "03_tool_result_fill.request.json") == expected_fill_request,
+        "tool-result continuation request contract mismatch",
+    )
+    _, fill = tool_response(
+        root / "03_tool_result_fill.response.json", "tool_result_fill"
+    )
+    try:
+        fill_observed = tool_regression.assert_tool_result_response(
+            "tool_result_fill",
+            fill,
+            enable_thinking=TOOL_ENABLE_THINKING,
+        )
+    except RuntimeError as error:
+        raise ValidationError(f"tool-result continuation invalid: {error}") from error
+    observed_checks["tool_result_fill"] = fill_observed
+
+    aggregate = read_json(root / "tool_call_regression.json")
+    require(
+        aggregate
+        == {"model": MODEL, "checks": observed_checks, "status": "pass"},
+        "tool lifecycle aggregate mismatch",
+    )
+    require(
+        summary_row.get("checks") == observed_checks,
+        "tool lifecycle summary checks mismatch",
+    )
+    return {
+        "request_count": TOOL_LIFECYCLE_REQUEST_COUNT,
+        "checks": observed_checks,
+    }
+
+
 def validate_observability(
     source: Path,
     recorded: Path,
@@ -620,7 +840,10 @@ def partition_bundles(root: Path) -> tuple[Path, list[Path]]:
     startup = [path for path in bundles if path.name.startswith("serve-startup-")]
     requests = [path for path in bundles if not path.name.startswith("serve-startup-")]
     require(len(startup) == 1, f"expected one startup request dump, found {len(startup)}")
-    require(len(requests) == TRANSPORT_COUNT, f"expected eight scenario request dumps, found {len(requests)}")
+    require(
+        len(requests) == TOTAL_REQUEST_COUNT,
+        f"expected {TOTAL_REQUEST_COUNT} scenario request dumps, found {len(requests)}",
+    )
     return startup[0], requests
 
 
@@ -642,6 +865,84 @@ def redacted_request_body(marker: str, ordinal: int, stream: bool) -> dict[str, 
     return body
 
 
+def redacted_tool_request_body(body: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(body)
+
+    # Ferrum deserializes the request into ChatCompletionsRequest before writing
+    # the replay bundle. Mirror the observable ChatMessage normalization here so
+    # the validator compares against the server-owned shape, not raw client JSON.
+    for message in result.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        allowed = {
+            "role",
+            "content",
+            "reasoning",
+            "name",
+            "tool_calls",
+            "tool_call_id",
+            "function_call",
+        }
+        for key in tuple(message):
+            if key not in allowed or (key != "content" and message[key] is None):
+                message.pop(key)
+        if message.get("content") is None:
+            message["content"] = ""
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                if call.get("index") is None:
+                    call.pop("index", None)
+
+    def redact(value: Any) -> None:
+        if isinstance(value, dict):
+            for field in ("content", "arguments"):
+                text = value.get(field)
+                if isinstance(text, str):
+                    value[field] = "[redacted]"
+                    value[f"{field}_redacted"] = True
+                    value[f"{field}_chars"] = len(text)
+            for child in value.values():
+                redact(child)
+        elif isinstance(value, list):
+            for child in value:
+                redact(child)
+
+    redact(result)
+    return result
+
+
+def expected_request_dump_bodies(source: Path) -> dict[str, dict[str, Any]]:
+    expected: dict[str, dict[str, Any]] = {}
+
+    def register(label: str, body: dict[str, Any]) -> None:
+        require(
+            not any(body == existing for existing in expected.values()),
+            f"duplicate expected request body: {label}",
+        )
+        expected[label] = body
+
+    for ordinal in range(CASE_COUNT):
+        marker = f"vnext-c21-{ordinal:03d}"
+        for stream in (False, True):
+            register(
+                f"priority:{ordinal}:{'stream' if stream else 'sync'}",
+                redacted_request_body(marker, ordinal, stream),
+            )
+    tool_root = source / TOOL_LIFECYCLE_NAME
+    for label, filename in (
+        ("tool:omitted", "01_omitted_tool_choice.request.json"),
+        ("tool:auto", "01b_explicit_auto_tool_choice.request.json"),
+        ("tool:required", "02_required_tool_choice.request.json"),
+        ("tool:named", "02b_named_tool_choice.request.json"),
+        ("tool:result", "03_tool_result_fill.request.json"),
+    ):
+        register(label, redacted_tool_request_body(read_json(tool_root / filename)))
+    return expected
+
+
 def validate_request_dumps(
     source: Path,
     trace_rows: list[dict[str, Any]],
@@ -656,7 +957,8 @@ def validate_request_dumps(
     require("http" not in startup_request, "startup bundle masquerades as an HTTP request")
     validate_bundle_members(startup, startup.name)
 
-    observed: dict[tuple[str, bool], str] = {}
+    expected_bodies = expected_request_dump_bodies(source)
+    observed: dict[str, str] = {}
     request_ids: set[str] = set()
     for bundle in bundles:
         request = read_json(bundle / "request.json")
@@ -671,20 +973,18 @@ def validate_request_dumps(
         require(isinstance(http, dict) and http.get("method") == "POST" and http.get("path") == "/v1/chat/completions", f"{bundle}: HTTP identity mismatch")
         body = http.get("body")
         require(isinstance(body, dict), f"{bundle}: HTTP body missing")
-        response_format = body.get("response_format", {}).get("json_schema", {}).get("schema", {})
-        marker = response_format.get("properties", {}).get("result", {}).get("const")
+        matching_labels = [
+            label for label, expected in expected_bodies.items() if body == expected
+        ]
         require(
-            isinstance(marker, str) and re.fullmatch(r"vnext-c21-[0-9]{3}", marker),
-            f"{bundle}: marker missing",
+            len(matching_labels) == 1,
+            f"{bundle}: request body is outside or ambiguous in the S2 tool matrix",
         )
-        ordinal = int(marker.rsplit("-", 1)[1])
-        require(0 <= ordinal < CASE_COUNT, f"{bundle}: marker ordinal out of range")
+        label = matching_labels[0]
         stream = body.get("stream") is True
-        require(body == redacted_request_body(marker, ordinal, stream), f"{bundle}: redacted request body mismatch")
         require(request.get("stream") is stream, f"{bundle}: stream identity mismatch")
-        key = (marker, stream)
-        require(key not in observed, f"duplicate request dump key: {key}")
-        observed[key] = request_id
+        require(label not in observed, f"duplicate request dump key: {label}")
+        observed[label] = request_id
         validate_bundle_members(bundle, request_id)
         resource_rows = [row for row in trace_rows if row.get("request_id") == request_id]
         require(resource_rows, f"request dump has no scheduler trace: {request_id}")
@@ -744,21 +1044,34 @@ def validate_request_dumps(
                 and attributes.get("device_id") == "device.cuda.0",
                 f"request vNext operation lacks CUDA provider identity: {request_id}",
             )
-    expected = {
-        (f"vnext-c21-{ordinal:03d}", stream)
-        for ordinal in range(CASE_COUNT)
-        for stream in (False, True)
+    require(
+        set(observed) == set(expected_bodies),
+        "request dump tool/schema/lifecycle matrix incomplete",
+    )
+    return {
+        "startup_request_id": startup_id,
+        "request_count": len(request_ids),
+        "priority_request_count": TRANSPORT_COUNT,
+        "tool_lifecycle_request_count": TOOL_LIFECYCLE_REQUEST_COUNT,
     }
-    require(set(observed) == expected, "request dump tool/schema matrix incomplete")
-    return {"startup_request_id": startup_id, "request_count": len(request_ids)}
 
 
 def validate_source(source: Path, expected_git_sha: str | None) -> dict[str, Any]:
     source = source.resolve(strict=True)
     summary, recorded, receipt = validate_identity(source, expected_git_sha)
     scenarios = summary.get("scenarios")
-    require(isinstance(scenarios, list) and len(scenarios) == 1 and isinstance(scenarios[0], dict), "summary scenario missing")
+    require(
+        isinstance(scenarios, list)
+        and len(scenarios) == 2
+        and all(isinstance(row, dict) for row in scenarios),
+        "summary scenarios missing",
+    )
+    require(
+        [(row.get("name"), row.get("type")) for row in scenarios] == list(SCENARIOS),
+        "summary scenario identity/order mismatch",
+    )
     cases = validate_scenario(source, recorded, scenarios[0])
+    tool_lifecycle = validate_tool_lifecycle(source, recorded, scenarios[1])
     trace_rows = read_jsonl(source / "observability/serve/scheduler_trace.jsonl")
     observability = validate_observability(source, recorded, summary, trace_rows)
     request_dumps = validate_request_dumps(source, trace_rows)
@@ -777,6 +1090,7 @@ def validate_source(source: Path, expected_git_sha: str | None) -> dict[str, Any
         "transport_execution_count": TRANSPORT_COUNT,
         "does_not_prove": DOES_NOT_PROVE,
         "cases": cases,
+        "tool_lifecycle": tool_lifecycle,
         "observability": observability,
         "request_dumps": request_dumps,
         "artifact_tree": tree,
@@ -935,11 +1249,119 @@ def make_sse(marker: str, response_id: str) -> str:
     return "".join(f"data: {json.dumps(row, separators=(',', ':'))}\n\n" for row in rows) + "data: [DONE]\n\n"
 
 
+def fixture_weather_response(response_id: str) -> dict[str, Any]:
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call-{response_id}",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps(
+                                    {"city": "Beijing", "unit": "celsius"},
+                                    separators=(",", ":"),
+                                ),
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+    }
+
+
+def fixture_content_response(response_id: str, content: str) -> dict[str, Any]:
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": content},
+            }
+        ],
+        "usage": {"prompt_tokens": 32, "completion_tokens": 8, "total_tokens": 40},
+    }
+
+
+def fixture_lifecycle_rows(request_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = [
+        {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_open", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "request_open"}},
+        {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_slot_reserve", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "reserve", "amount": 1, "before": 0, "after": 1}},
+        {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_slot_commit", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "commit", "amount": 1, "before": 0, "after": 1}},
+        {"request_id": request_id, "correlation_id": request_id, "phase": "vnext.prefill_admission", "status": "ok"},
+        {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_slot_release", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0}},
+        {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_close", "shape": {"resource_owner_outstanding_count": 0}, "attributes": {"resource_owner_outstanding_count": 0}, "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "request_close"}},
+    ]
+    execution_id = f"request.product.{request_id}"
+    for phase in sorted(EXECUTION_PHASES):
+        attributes: dict[str, Any] = {
+            "actual_model_smoke": True,
+            "backend_device": "CUDA(0)",
+            "diagnostic_only": False,
+            "execution_trace_source": "vnext",
+            "l0_only": False,
+        }
+        if phase == "vnext.operation_submitted":
+            attributes.update(
+                {
+                    "device_id": "device.cuda.0",
+                    "execution_phase": "execution",
+                    "provider_id": "provider.cuda.fixture.f16",
+                }
+            )
+        rows.append(
+            {
+                "request_id": execution_id,
+                "correlation_id": execution_id,
+                "entrypoint": "serve",
+                "backend": "actual",
+                "phase": phase,
+                "status": "ok",
+                "backend_detail": {
+                    "backend_device": "CUDA(0)",
+                    "backend_type": "Candle",
+                },
+                "attributes": attributes,
+            }
+        )
+    return rows
+
+
+def write_fixture_request_bundle(
+    dump_root: Path,
+    request_id: str,
+    body: dict[str, Any],
+) -> None:
+    bundle = dump_root / request_id
+    bundle.mkdir()
+    stream = body.get("stream") is True
+    write_json(bundle / "request.json", {"schema_version": 1, "entrypoint": "serve", "request_id": request_id, "model": MODEL, "backend": "actual", "endpoint": "/v1/chat/completions", "method": "POST", "stream": stream, "actual_model_smoke": True, "sanitized": True, "http": {"method": "POST", "path": "/v1/chat/completions", "body": redacted_tool_request_body(body)}})
+    write_json(bundle / "backend_selection.json", {"schema_version": 1, "request_id": request_id, "backend": "actual", "model": MODEL, "actual_model_smoke": True})
+    write_json(bundle / "bad_output_scan.json", {"schema_version": 1, "request_id": request_id, "bad_output": False, "bad_text_count": 0, "reasons": []})
+
+
 def make_fixture(root: Path, git_sha: str) -> None:
     root.mkdir(parents=True)
     (root / "inputs").mkdir()
     shutil.copyfile(RUNNER_PATH, root / "inputs/run_scenarios.py")
     shutil.copyfile(SCENARIO_MANIFEST_PATH, root / "inputs/scenario_manifest.json")
+    shutil.copyfile(TOOL_HELPER_PATH, root / "inputs/openai_tool_call_regression.py")
     scenario_root = root / SCENARIO_NAME
     scenario_root.mkdir()
     aggregate_cases: list[dict[str, Any]] = []
@@ -975,60 +1397,8 @@ def make_fixture(root: Path, git_sha: str) -> None:
             aggregate_cases.append(row)
 
             request_id = f"request-{ordinal:03d}-{mode}"
-            bundle = dump_root / request_id
-            bundle.mkdir()
-            write_json(bundle / "request.json", {"schema_version": 1, "entrypoint": "serve", "request_id": request_id, "model": MODEL, "backend": "actual", "endpoint": "/v1/chat/completions", "method": "POST", "stream": stream, "actual_model_smoke": True, "sanitized": True, "http": {"method": "POST", "path": "/v1/chat/completions", "body": redacted_request_body(marker, ordinal, stream)}})
-            write_json(bundle / "backend_selection.json", {"schema_version": 1, "request_id": request_id, "backend": "actual", "model": MODEL, "actual_model_smoke": True})
-            write_json(bundle / "bad_output_scan.json", {"schema_version": 1, "request_id": request_id, "bad_output": False, "bad_text_count": 0, "reasons": []})
-            trace_rows.extend(
-                [
-                    {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_open", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "request_open"}},
-                    {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_slot_reserve", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "reserve", "amount": 1, "before": 0, "after": 1}},
-                    {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_slot_commit", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "commit", "amount": 1, "before": 0, "after": 1}},
-                    {"request_id": request_id, "correlation_id": request_id, "phase": "vnext.prefill_admission", "status": "ok"},
-                    {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_slot_release", "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "release", "amount": 1, "before": 1, "after": 0}},
-                    {"request_id": request_id, "correlation_id": request_id, "phase": "engine_request_close", "shape": {"resource_owner_outstanding_count": 0}, "attributes": {"resource_owner_outstanding_count": 0}, "resource": {"owner_kind": "request", "owner_id": request_id, "resource_kind": "request_slot", "action": "request_close"}},
-                ]
-            )
-            execution_id = f"request.product.{request_id}"
-            for phase in (
-                "vnext.request_accepted",
-                "vnext.plan_built",
-                "vnext.frame_started",
-                "vnext.operation_submitted",
-                "vnext.frame_completed",
-                "vnext.request_completed",
-            ):
-                attributes: dict[str, Any] = {
-                    "actual_model_smoke": True,
-                    "backend_device": "CUDA(0)",
-                    "diagnostic_only": False,
-                    "execution_trace_source": "vnext",
-                    "l0_only": False,
-                }
-                if phase == "vnext.operation_submitted":
-                    attributes.update(
-                        {
-                            "device_id": "device.cuda.0",
-                            "execution_phase": "execution",
-                            "provider_id": "provider.cuda.fixture.f16",
-                        }
-                    )
-                trace_rows.append(
-                    {
-                        "request_id": execution_id,
-                        "correlation_id": execution_id,
-                        "entrypoint": "serve",
-                        "backend": "actual",
-                        "phase": phase,
-                        "status": "ok",
-                        "backend_detail": {
-                            "backend_device": "CUDA(0)",
-                            "backend_type": "Candle",
-                        },
-                        "attributes": attributes,
-                    }
-                )
+            write_fixture_request_bundle(dump_root, request_id, request)
+            trace_rows.extend(fixture_lifecycle_rows(request_id))
 
     scenario_result = {
         "status": "pass",
@@ -1040,6 +1410,116 @@ def make_fixture(root: Path, git_sha: str) -> None:
         "duration_sec": 1.0,
     }
     write_json(scenario_root / "result.json", scenario_result)
+
+    tool_root = root / TOOL_LIFECYCLE_NAME
+    tool_root.mkdir()
+    omitted_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice=None,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    auto_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice="auto",
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    required_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice="required",
+        prompt=tool_regression.TOOL_REQUIRED_PROMPT,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    named_request = tool_regression.tool_payload(
+        MODEL,
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        prompt=tool_regression.TOOL_REQUIRED_PROMPT,
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    omitted_response = fixture_content_response(
+        "tool-omitted", "Weather lookup is available."
+    )
+    auto_response = fixture_weather_response("tool-auto")
+    required_response = fixture_weather_response("tool-required")
+    named_response = fixture_weather_response("tool-named")
+    required_choice = required_response["choices"][0]
+    required_call = required_choice["message"]["tool_calls"][0]
+    fill_request = tool_regression.tool_result_payload(
+        MODEL,
+        required_choice,
+        required_call["id"],
+        enable_thinking=TOOL_ENABLE_THINKING,
+    )
+    fill_response = fixture_content_response(
+        "tool-result",
+        f"北京当前{tool_regression.TOOL_RESULT_TEMPERATURE}摄氏度，晴；"
+        f"receipt {tool_regression.TOOL_RESULT_RECEIPT}。",
+    )
+    tool_cases = (
+        (
+            "tool-omitted",
+            "01_omitted_tool_choice",
+            omitted_request,
+            omitted_response,
+        ),
+        (
+            "tool-auto",
+            "01b_explicit_auto_tool_choice",
+            auto_request,
+            auto_response,
+        ),
+        (
+            "tool-required",
+            "02_required_tool_choice",
+            required_request,
+            required_response,
+        ),
+        (
+            "tool-named",
+            "02b_named_tool_choice",
+            named_request,
+            named_response,
+        ),
+        (
+            "tool-result",
+            "03_tool_result_fill",
+            fill_request,
+            fill_response,
+        ),
+    )
+    for request_id_suffix, filename, request, response in tool_cases:
+        write_json(tool_root / f"{filename}.request.json", request)
+        write_json(tool_root / f"{filename}.response.json", response)
+        request_id = f"request-{request_id_suffix}"
+        write_fixture_request_bundle(dump_root, request_id, request)
+        trace_rows.extend(fixture_lifecycle_rows(request_id))
+    tool_checks = {
+        "omitted_tool_choice": {
+            "passed": True,
+            "outcome": "content",
+            "finish_reason": "stop",
+        },
+        "explicit_auto_tool_choice": {
+            "passed": True,
+            "outcome": "tool_call",
+            "finish_reason": "tool_calls",
+        },
+        "required_tool_choice": {"passed": True},
+        "named_tool_choice": {"passed": True},
+        "tool_result_fill": {"passed": True, "finish_reason": "stop"},
+    }
+    write_json(
+        tool_root / "tool_call_regression.json",
+        {"model": MODEL, "checks": tool_checks, "status": "pass"},
+    )
+    tool_result = {
+        "status": "pass",
+        "checks": tool_checks,
+        "name": TOOL_LIFECYCLE_NAME,
+        "type": TOOL_LIFECYCLE_TYPE,
+        "artifact": str(tool_root / "result.json"),
+        "duration_sec": 1.0,
+    }
+    write_json(tool_root / "result.json", tool_result)
     observability_root = root / "observability/serve"
     (observability_root / "profile.jsonl").write_text('{"event":"fixture"}\n', encoding="utf-8")
     (observability_root / "memory_profile.jsonl").write_text('{"event":"fixture"}\n', encoding="utf-8")
@@ -1101,6 +1581,7 @@ def make_fixture(root: Path, git_sha: str) -> None:
     binary_sha = "b" * 64
     runner_sha = file_sha256(root / "inputs/run_scenarios.py")
     manifest_sha = file_sha256(root / "inputs/scenario_manifest.json")
+    tool_helper_sha = file_sha256(root / "inputs/openai_tool_call_regression.py")
     receipt = self_hash(
         {
             "schema_version": 1,
@@ -1113,10 +1594,11 @@ def make_fixture(root: Path, git_sha: str) -> None:
             "cwd": str(Path.cwd().resolve()),
             "git_sha": git_sha,
             "dirty_status": {"is_dirty": False, "status_short": []},
-            "input_artifacts": {"runner": {"path": str(root / "inputs/run_scenarios.py"), "sha256": runner_sha}, "manifest": {"path": str(root / "inputs/scenario_manifest.json"), "sha256": manifest_sha}},
+            "input_artifacts": {"runner": {"path": str(root / "inputs/run_scenarios.py"), "sha256": runner_sha}, "manifest": {"path": str(root / "inputs/scenario_manifest.json"), "sha256": manifest_sha}, "tool_call_helper": {"path": str(root / "inputs/openai_tool_call_regression.py"), "sha256": tool_helper_sha}},
             "backend": "cuda",
             "model": MODEL,
-            "selected_scenarios": [SCENARIO_NAME],
+            "selected_scenarios": [name for name, _ in SCENARIOS],
+            "scenario_execution_phases": [{"phase": "serve", "scenarios": [name for name, _ in SCENARIOS], "started_at": iso_now(), "finished_at": iso_now()}],
             "mode": "start",
             "server_argv": server_argv,
             "binary_path": binary_path,
@@ -1127,7 +1609,7 @@ def make_fixture(root: Path, git_sha: str) -> None:
             "server_started_at": iso_now(),
             "server_finished_at": iso_now(),
             "server_returncode": -15,
-            "scenario_count": 1,
+            "scenario_count": 2,
             "failed": 0,
             "skipped": 0,
             "evidence_files": evidence_files,
@@ -1146,13 +1628,13 @@ def make_fixture(root: Path, git_sha: str) -> None:
         "dirty_status": {"is_dirty": False, "status_short": []},
         "started_at": iso_now(),
         "finished_at": iso_now(),
-        "scenario_count": 1,
-        "manifest_scenario_count": 1,
+        "scenario_count": 2,
+        "manifest_scenario_count": 2,
         "requested_scenarios": [],
-        "selected_scenarios": [SCENARIO_NAME],
+        "selected_scenarios": [name for name, _ in SCENARIOS],
         "failed": 0,
         "skipped": 0,
-        "scenarios": [scenario_result],
+        "scenarios": [scenario_result, tool_result],
         "response_format_matrix_contract": {"artifact": str(root / "response_format_matrix_contract.json"), "case_counts": {"json_schema": 0, "json_object": 0}, "unique_json_schema_count": 0},
         "observability": observability,
         "execution_receipt": {"artifact": str(root / "execution_receipt.json"), "artifact_sha256": file_sha256(root / "execution_receipt.json"), "canonical_sha256": receipt["canonical_sha256"], "mode": "start", "runner_sha256": runner_sha, "manifest_sha256": manifest_sha, "binary_sha256": binary_sha},
@@ -1180,7 +1662,27 @@ def self_test() -> None:
         root = Path(temporary) / "fixture"
         make_fixture(root, "a" * 40)
         evidence = validate_source(root, "a" * 40)
-        require(evidence["logical_case_count"] == 4 and evidence["transport_execution_count"] == 8, "selftest evidence denominator mismatch")
+        require(
+            evidence["logical_case_count"] == 4
+            and evidence["transport_execution_count"] == 8
+            and evidence["tool_lifecycle"]["request_count"] == 5
+            and evidence["request_dumps"]["request_count"] == 13,
+            "selftest evidence denominator mismatch",
+        )
+        polluting_out = root / "checkpoint-output"
+        try:
+            run_checkpoint(root, polluting_out, "a" * 40)
+        except ValidationError as error:
+            require(
+                "output must not equal or be inside source artifact root" in str(error),
+                "source pollution mutation failed for wrong reason",
+            )
+        else:
+            raise ValidationError("source pollution layout unexpectedly passed")
+        require(
+            not polluting_out.exists(),
+            "source pollution layout created output before rejection",
+        )
         try:
             validate_source(root, "c" * 40)
         except ValidationError as error:
@@ -1234,11 +1736,107 @@ def self_test() -> None:
                 ),
             )
 
+        def mutate_tool_result_superstring(path: Path) -> None:
+            response_path = (
+                path / TOOL_LIFECYCLE_NAME / "03_tool_result_fill.response.json"
+            )
+            response = read_json(response_path)
+            response["choices"][0]["message"]["content"] = (
+                f"北京当前122 celsius；receipt {tool_regression.TOOL_RESULT_RECEIPT}。"
+            )
+            write_json(response_path, response)
+
+        def mutate_tool_result_receipt(path: Path) -> None:
+            response_path = (
+                path / TOOL_LIFECYCLE_NAME / "03_tool_result_fill.response.json"
+            )
+            response = read_json(response_path)
+            response["choices"][0]["message"]["content"] = (
+                "北京当前22 celsius；receipt wx-forged。"
+            )
+            write_json(response_path, response)
+
+        def mutate_required_extra_call(path: Path) -> None:
+            response_path = (
+                path / TOOL_LIFECYCLE_NAME / "02_required_tool_choice.response.json"
+            )
+            response = read_json(response_path)
+            calls = response["choices"][0]["message"]["tool_calls"]
+            calls.append(copy.deepcopy(calls[0]))
+            write_json(response_path, response)
+
+        def mutate_required_non_object_call(path: Path) -> None:
+            response_path = (
+                path / TOOL_LIFECYCLE_NAME / "02_required_tool_choice.response.json"
+            )
+            response = read_json(response_path)
+            response["choices"][0]["message"]["tool_calls"] = [None]
+            write_json(response_path, response)
+
+        def mutate_required_unit(path: Path) -> None:
+            response_path = (
+                path / TOOL_LIFECYCLE_NAME / "02_required_tool_choice.response.json"
+            )
+            response = read_json(response_path)
+            function = response["choices"][0]["message"]["tool_calls"][0]["function"]
+            arguments = json.loads(function["arguments"])
+            arguments["unit"] = "fahrenheit"
+            function["arguments"] = json.dumps(arguments, separators=(",", ":"))
+            write_json(response_path, response)
+
+        def mutate_response_envelope(path: Path) -> None:
+            response_path = (
+                path / TOOL_LIFECYCLE_NAME / "02_required_tool_choice.response.json"
+            )
+            response = read_json(response_path)
+            response["choices"][0]["index"] = 99
+            write_json(response_path, response)
+
+        def mutate_tool_helper(path: Path) -> None:
+            helper_path = path / "inputs/openai_tool_call_regression.py"
+            helper_path.write_text(
+                read_text(helper_path) + "\n# stale helper fixture\n", encoding="utf-8"
+            )
+            digest = file_sha256(helper_path)
+            mutate_receipt(
+                path,
+                lambda receipt: receipt["input_artifacts"]["tool_call_helper"].update(
+                    {"sha256": digest}
+                ),
+            )
+
         expect_reject(root, mutate_request, "request contract mismatch")
         expect_reject(root, mutate_stream, "[DONE] count mismatch")
         expect_reject(root, mutate_trace, "resources outstanding at close")
         expect_reject(root, mutate_execution_source, "vNext execution source mismatch")
         expect_reject(root, mutate_runner, "artifact runner differs from current checked-in source")
+        expect_reject(
+            root,
+            mutate_tool_result_superstring,
+            "answer did not use the exact temperature",
+        )
+        expect_reject(
+            root,
+            mutate_tool_result_receipt,
+            "answer did not use the opaque receipt",
+        )
+        expect_reject(
+            root,
+            mutate_required_extra_call,
+            "expected exactly one tool call",
+        )
+        expect_reject(
+            root,
+            mutate_required_non_object_call,
+            "tool_calls contains a non-object entry",
+        )
+        expect_reject(root, mutate_required_unit, "unit argument is not celsius")
+        expect_reject(root, mutate_response_envelope, "choice index mismatch")
+        expect_reject(
+            root,
+            mutate_tool_helper,
+            "artifact tool_call_helper differs from current checked-in source",
+        )
         expect_reject(
             root,
             mutate_runner_identity,
@@ -1250,7 +1848,12 @@ def self_test() -> None:
 def run_checkpoint(source: Path, out: Path, expected_git_sha: str | None) -> int:
     started_at = iso_now()
     started = time.monotonic()
+    source = source.resolve(strict=False)
     out = out.resolve(strict=False)
+    require(
+        out != source and source not in out.parents,
+        "checkpoint output must not equal or be inside source artifact root",
+    )
     out.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = {
         "schema_version": 1,
@@ -1259,7 +1862,7 @@ def run_checkpoint(source: Path, out: Path, expected_git_sha: str | None) -> int
         "full_s2": False,
         "model_matrix_c21_complete": False,
         "does_not_prove": DOES_NOT_PROVE,
-        "source_root": str(source.resolve(strict=False)),
+        "source_root": str(source),
         "artifact_dir": str(out),
         "started_at": started_at,
     }
