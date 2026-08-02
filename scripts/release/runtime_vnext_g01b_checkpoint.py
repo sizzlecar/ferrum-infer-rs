@@ -969,10 +969,37 @@ def run_contract_test(checkpoint_root: Path, name: str) -> dict[str, Any]:
     }
 
 
-def parse_overhead(evidence: dict[str, Any]) -> dict[str, Any]:
-    matches = re.findall(r"^G01B OVERHEAD JSON: (\{.*\})$", evidence.pop("_combined"), re.MULTILINE)
+def extract_overhead_report(output: str) -> str:
+    marker = "G01B OVERHEAD JSON: "
+    test_name = next(iter(TEST_SPECS["overhead"]["expected_tests"]))
+    libtest_prefix = f"test {test_name} ... "
+    matches = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if marker not in line:
+            continue
+        require(
+            line.count(marker) == 1,
+            "overhead command emitted an ambiguous JSON report line",
+        )
+        prefix, payload = line.split(marker, 1)
+        require(
+            prefix in {"", libtest_prefix},
+            "overhead JSON report has an unexpected output prefix",
+        )
+        require(bool(payload), "overhead command emitted an empty JSON report")
+        matches.append(payload)
     require(len(matches) == 1, "overhead command must emit exactly one JSON report")
-    report = require_object(json.loads(matches[0]), "G01B overhead report")
+    return matches[0]
+
+
+def parse_overhead(evidence: dict[str, Any]) -> dict[str, Any]:
+    payload = extract_overhead_report(evidence.pop("_combined"))
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise GateError(f"G01B overhead report is invalid JSON: {error}") from error
+    report = require_object(decoded, "G01B overhead report")
     require(report.get("sample_count") == 30, "G01B overhead sample count mismatch")
     disabled = report.get("disabled_sink_median_overhead")
     basic = report.get("basic_sink_median_overhead")
@@ -1509,6 +1536,54 @@ def self_test() -> int:
             require(
                 fragment in str(error),
                 f"serial libtest parser rejected for the wrong reason: {error}",
+            )
+    overhead_report = {
+        "sample_count": 30,
+        "disabled_sink_median_overhead": 0.005,
+        "basic_sink_median_overhead": 0.015,
+        "provider_median_overhead": 0.005,
+        "provider_median_delta_per_call_ns": 0.5,
+    }
+    overhead_payload = json.dumps(overhead_report, separators=(",", ":"))
+    overhead_test = next(iter(TEST_SPECS["overhead"]["expected_tests"]))
+    parsed_overhead = parse_overhead(
+        {
+            "_combined": (
+                f"test {overhead_test} ... G01B OVERHEAD JSON: {overhead_payload}\n"
+                "G01B BASIC EVENT SINK PASS: 30/30\n"
+                "ok\n"
+            )
+        }
+    )
+    require(
+        parsed_overhead["report"] == overhead_report,
+        "G01B overhead parser lost an inline nocapture report",
+    )
+    require(
+        parse_overhead({"_combined": f"G01B OVERHEAD JSON: {overhead_payload}\n"})[
+            "report"
+        ]
+        == overhead_report,
+        "G01B overhead parser lost a standalone report",
+    )
+    for payload, fragment in (
+        (
+            f"G01B OVERHEAD JSON: {overhead_payload}\n"
+            f"G01B OVERHEAD JSON: {overhead_payload}\n",
+            "exactly one JSON report",
+        ),
+        (
+            f"unexpected G01B OVERHEAD JSON: {overhead_payload}\n",
+            "unexpected output prefix",
+        ),
+    ):
+        try:
+            parse_overhead({"_combined": payload})
+            raise AssertionError(f"overhead parser accepted: {fragment}")
+        except GateError as error:
+            require(
+                fragment in str(error),
+                f"overhead parser rejected for the wrong reason: {error}",
             )
     strict_sha = "1" * 40
     independent_sha = "2" * 40
