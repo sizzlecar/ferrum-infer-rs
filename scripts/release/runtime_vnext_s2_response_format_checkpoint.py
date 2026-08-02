@@ -23,6 +23,10 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT PASS"
 FAIL_PREFIX = "FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT FAIL"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT SELFTEST PASS"
 CHECKPOINT_ID = "runtime-vnext-s2-response-format-c14-c15"
+RUNNER_PATH = Path(__file__).resolve().parent / "run_scenarios.py"
+SCENARIO_MANIFEST_PATH = (
+    Path(__file__).resolve().parent / "scenarios/runtime_vnext_s2_c14_c15_cuda.json"
+)
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 QWEN35_4B_CACHE_RE = re.compile(
@@ -937,7 +941,9 @@ def validate_summary(
     return git_sha, model, rows, execution_evidence
 
 
-def validate_source(source: Path) -> dict[str, Any]:
+def validate_source(
+    source: Path, expected_git_sha: str | None = None
+) -> dict[str, Any]:
     require(source.exists() and source.is_dir(), f"source root is not a directory: {source}")
     require(not source.is_symlink(), f"source root must not be a symlink: {source}")
     source_root = source.resolve(strict=True)
@@ -946,6 +952,21 @@ def validate_source(source: Path) -> dict[str, Any]:
     contract_path = source_root / "response_format_matrix_contract.json"
     summary = read_json(summary_path)
     git_sha, model, rows, execution_evidence = validate_summary(source_root, summary)
+    if expected_git_sha is not None:
+        require(
+            git_sha == expected_git_sha,
+            "artifact git SHA differs from the validation candidate",
+        )
+    require(
+        file_sha256(source_root / "inputs/run_scenarios.py")
+        == file_sha256(RUNNER_PATH),
+        "artifact runner differs from the current checked-in runner",
+    )
+    require(
+        file_sha256(source_root / "inputs/scenario_manifest.json")
+        == file_sha256(SCENARIO_MANIFEST_PATH),
+        "artifact scenario manifest differs from the current checked-in manifest",
+    )
     require(len(rows) == 140, "validated case count must be 140")
     request_fingerprints = [row["request_fingerprint"] for row in rows]
     require(
@@ -1011,13 +1032,15 @@ def base_manifest(source: Path, out: Path, started_at: str) -> dict[str, Any]:
     }
 
 
-def run_checkpoint(source: Path, out: Path) -> int:
+def run_checkpoint(
+    source: Path, out: Path, expected_git_sha: str | None = None
+) -> int:
     started_at = iso_now()
     started = time.monotonic()
     out.mkdir(parents=True, exist_ok=True)
     manifest = base_manifest(source, out, started_at)
     try:
-        evidence = validate_source(source)
+        evidence = validate_source(source, expected_git_sha)
     except (OSError, ValidationError) as error:
         manifest.update(
             {
@@ -1143,16 +1166,8 @@ def fixture_execution_receipt(source_root: Path, model: str) -> dict[str, Any]:
     input_root.mkdir(parents=True, exist_ok=True)
     runner_path = input_root / "run_scenarios.py"
     manifest_path = input_root / "scenario_manifest.json"
-    runner_path.write_text("# frozen fixture runner input\n", encoding="utf-8")
-    write_json(
-        manifest_path,
-        {
-            "schema_version": 1,
-            "backend": "cuda",
-            "model": model,
-            "scenarios": [{"name": name} for name in SCENARIOS],
-        },
-    )
+    shutil.copyfile(RUNNER_PATH, runner_path)
+    shutil.copyfile(SCENARIO_MANIFEST_PATH, manifest_path)
     effective_path = source_root / "server.effective_config.json"
     write_json(
         effective_path,
@@ -1403,7 +1418,25 @@ def mutate_wrong_binary_hash(source_root: Path) -> None:
     write_json(summary_path, summary)
 
 
-def run_selftest_process(source: Path, out: Path) -> subprocess.CompletedProcess[str]:
+def mutate_stale_runner(source_root: Path) -> None:
+    (source_root / "inputs/run_scenarios.py").write_text(
+        "# stale runner fixture\n", encoding="utf-8"
+    )
+
+
+def mutate_stale_scenario_manifest(source_root: Path) -> None:
+    path = source_root / "inputs/scenario_manifest.json"
+    value = read_json(path)
+    value["timeout_sec"] = int(value["timeout_sec"]) + 1
+    write_json(path, value)
+
+
+def run_selftest_process(
+    source: Path,
+    out: Path,
+    *,
+    expected_git_sha: str = "a" * 40,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -1412,6 +1445,8 @@ def run_selftest_process(source: Path, out: Path) -> subprocess.CompletedProcess
             str(source),
             "--out",
             str(out),
+            "--expected-git-sha",
+            expected_git_sha,
         ],
         text=True,
         stdout=subprocess.PIPE,
@@ -1428,6 +1463,8 @@ def self_test() -> int:
         ("dirty-summary", mutate_dirty_summary),
         ("empty-log", mutate_empty_log),
         ("wrong-binary-hash", mutate_wrong_binary_hash),
+        ("stale-runner", mutate_stale_runner),
+        ("stale-scenario-manifest", mutate_stale_scenario_manifest),
     ]
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-s2-response-format-") as temporary:
         root = Path(temporary)
@@ -1441,6 +1478,15 @@ def self_test() -> int:
         baseline_manifest = read_json(baseline_out / "manifest.json")
         require(baseline_manifest.get("status") == "pass", "self-test baseline manifest did not pass")
         require(baseline_manifest.get("full_s2") is False, "checkpoint must not claim full S2")
+        stale_out = root / "stale-source-out"
+        stale_proc = run_selftest_process(
+            baseline, stale_out, expected_git_sha="b" * 40
+        )
+        require(stale_proc.returncode != 0, "stale source SHA unexpectedly passed")
+        require(
+            "validation candidate" in (stale_proc.stderr + stale_proc.stdout),
+            "stale source SHA failed for the wrong reason",
+        )
         for name, mutate in mutations:
             source = root / name
             create_fixture(source)
@@ -1460,13 +1506,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", "--artifact-root", dest="source", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--expected-git-sha")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.self_test:
-        if args.source is not None or args.out is not None:
-            parser.error("--self-test cannot be combined with --source/--out")
+        if (
+            args.source is not None
+            or args.out is not None
+            or args.expected_git_sha is not None
+        ):
+            parser.error(
+                "--self-test cannot be combined with --source/--out/--expected-git-sha"
+            )
     elif args.source is None or args.out is None:
         parser.error("--source and --out are required")
+    elif (
+        args.expected_git_sha is not None
+        and GIT_SHA_RE.fullmatch(args.expected_git_sha) is None
+    ):
+        parser.error("--expected-git-sha must be 40 lowercase hex characters")
     return args
 
 
@@ -1478,7 +1536,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValidationError) as error:
             print(f"{SELFTEST_PASS_LINE.replace(' PASS', ' FAIL')}: {error}", file=sys.stderr)
             return 1
-    return run_checkpoint(args.source, args.out)
+    return run_checkpoint(args.source, args.out, args.expected_git_sha)
 
 
 if __name__ == "__main__":

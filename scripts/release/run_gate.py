@@ -63,6 +63,9 @@ LANES = (
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
     "vnext-s1-cuda-decode-capacity",
+    "vnext-s2-response-format",
+    "vnext-s2-api-modality",
+    "vnext-s2-stream-disconnect",
     "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
@@ -1071,6 +1074,66 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s1-cuda-decode-capacity",
+        )
+    if lane == "vnext-s2-response-format":
+        if args.s2_artifact_root is None:
+            raise GateError("vnext-s2-response-format requires --s2-artifact-root")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_response_format_checkpoint.py",
+                "--source",
+                str(args.s2_artifact_root.resolve()),
+                "--expected-git-sha",
+                git_sha(),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-response-format",
+        )
+    if lane == "vnext-s2-api-modality":
+        if args.s2_artifact_root is None:
+            raise GateError("vnext-s2-api-modality requires --s2-artifact-root")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_api_modality_checkpoint.py",
+                "--source",
+                str(args.s2_artifact_root.resolve()),
+                "--expected-git-sha",
+                git_sha(),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S2 API MODALITY PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-api-modality",
+        )
+    if lane == "vnext-s2-stream-disconnect":
+        if args.s2_artifact_root is None:
+            raise GateError("vnext-s2-stream-disconnect requires --s2-artifact-root")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_stream_disconnect_checkpoint.py",
+                "--artifact-dir",
+                str(args.s2_artifact_root.resolve()),
+                "--expected-git-sha",
+                git_sha(),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-stream-disconnect",
         )
     if lane == "vnext-cuda-determinism":
         if args.cuda_determinism_artifact_root is None:
@@ -8805,6 +8868,98 @@ def self_test() -> int:
             s1_manifest,
         )
 
+        s2_raw = (root / "s2-raw").resolve()
+        s2_lane_specs = {
+            "vnext-s2-response-format": (
+                "scripts/release/runtime_vnext_s2_response_format_checkpoint.py",
+                "--source",
+                "FERRUM RUNTIME VNEXT S2 RESPONSE FORMAT PASS",
+            ),
+            "vnext-s2-api-modality": (
+                "scripts/release/runtime_vnext_s2_api_modality_checkpoint.py",
+                "--source",
+                "FERRUM RUNTIME VNEXT S2 API MODALITY PASS",
+            ),
+            "vnext-s2-stream-disconnect": (
+                "scripts/release/runtime_vnext_s2_stream_disconnect_checkpoint.py",
+                "--artifact-dir",
+                "FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT PASS",
+            ),
+        }
+        for lane, (script, source_flag, child_prefix) in s2_lane_specs.items():
+            lane_out = (root / f"{lane}-dry-run").resolve()
+            proc = run_selftest_command(
+                [
+                    sys.executable,
+                    str(this_script),
+                    lane,
+                    "--s2-artifact-root",
+                    str(s2_raw),
+                    "--out",
+                    str(lane_out),
+                    "--dry-run",
+                ]
+            )
+            require_selftest(proc.returncode == 0, proc.stderr or proc.stdout)
+            lane_manifest = json.loads(
+                (lane_out / "gate.manifest.json").read_text()
+            )
+            require_selftest(
+                lane_manifest["status"] == "dry-run"
+                and lane_manifest["lane"] == lane
+                and lane_manifest["delegated_command_line"]
+                == [
+                    sys.executable,
+                    script,
+                    source_flag,
+                    str(s2_raw),
+                    "--expected-git-sha",
+                    git_sha(),
+                    "--out",
+                    str(lane_out),
+                ]
+                and lane_manifest["child_pass_line"]
+                == f"{child_prefix}: {lane_out}",
+                lane_manifest,
+            )
+        missing_s2 = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s2-response-format",
+                "--out",
+                str(root / "vnext-s2-missing-input"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            missing_s2.returncode != 0
+            and "--s2-artifact-root"
+            in (missing_s2.stderr + missing_s2.stdout),
+            missing_s2.stderr or missing_s2.stdout,
+        )
+        in_tree_s2_out = REPO_ROOT / (
+            f".run-gate-vnext-s2-selftest-{os.getpid()}-{time.monotonic_ns()}"
+        )
+        in_tree_s2 = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s2-response-format",
+                "--s2-artifact-root",
+                str(s2_raw),
+                "--out",
+                str(in_tree_s2_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            in_tree_s2.returncode != 0
+            and "must resolve outside the Git source tree" in in_tree_s2.stderr
+            and not in_tree_s2_out.exists(),
+            in_tree_s2.stderr or in_tree_s2.stdout,
+        )
+
         g00a_provenance_root = root / "vnext-g00a-provenance"
         g00a_lane = make_selftest_vnext_g00a_artifact(g00a_provenance_root)
         g00a_child_manifest = read_json_object(
@@ -9364,6 +9519,7 @@ def main() -> int:
     parser.add_argument("--s1-capacity", type=Path)
     parser.add_argument("--s1-decode-capacity", type=Path)
     parser.add_argument("--s1-artifact", type=Path)
+    parser.add_argument("--s2-artifact-root", type=Path)
     parser.add_argument("--g07a-evidence-root", type=Path)
     parser.add_argument("--source-gate", type=Path)
     parser.add_argument("--semantic-plan-equivalence", type=Path)
@@ -9395,6 +9551,9 @@ def main() -> int:
         "vnext-g01b",
         "vnext-g01",
         "vnext-g07a",
+        "vnext-s2-response-format",
+        "vnext-s2-api-modality",
+        "vnext-s2-stream-disconnect",
     }:
         try:
             require_external_vnext_g00_output(out_dir)

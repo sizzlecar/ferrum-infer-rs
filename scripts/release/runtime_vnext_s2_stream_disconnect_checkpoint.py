@@ -23,6 +23,10 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT PASS"
 FAIL_PREFIX = "FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT FAIL"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT SELFTEST PASS"
 CHECKPOINT_ID = "runtime-vnext-s2-stream-disconnect-sentinel"
+RUNNER_PATH = Path(__file__).resolve().parent / "run_scenarios.py"
+SCENARIO_MANIFEST_PATH = (
+    Path(__file__).resolve().parent / "scenarios/runtime_vnext_s2_remaining_cuda.json"
+)
 MODEL = "Qwen/Qwen3.5-4B"
 UNICODE_NAME = "m1_s2_stream_equivalence_unicode"
 DISCONNECT_NAME = "m1_s2_disconnect_release"
@@ -750,6 +754,15 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
         require(path == source / "inputs" / filename, f"receipt input {name} path mismatch")
         require(item.get("sha256") == file_sha256(path) == receipt.get(sha_key), f"receipt input {name} SHA mismatch")
     manifest = read_json(source / "inputs" / "scenario_manifest.json")
+    require(
+        file_sha256(source / "inputs/run_scenarios.py") == file_sha256(RUNNER_PATH),
+        "artifact runner differs from the current checked-in runner",
+    )
+    require(
+        file_sha256(source / "inputs/scenario_manifest.json")
+        == file_sha256(SCENARIO_MANIFEST_PATH),
+        "artifact scenario manifest differs from the current checked-in manifest",
+    )
     require(manifest.get("model") == MODEL and manifest.get("backend") == "cuda", "input manifest model/backend mismatch")
     require(manifest.get("goal_scope") == {"full_s2": False, "model_matrix_c09_complete": False, "model_matrix_c17_complete": False}, "input manifest overclaims S2/C09/C17")
     manifest_scenarios = manifest.get("scenarios")
