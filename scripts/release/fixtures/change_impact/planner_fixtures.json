@@ -216,6 +216,20 @@
       "expect_invalidated": []
     },
     {
+      "id": "vnext_reference_runtime_source",
+      "changed_files": [
+        "crates/ferrum-kernels/src/backend/reference/runtime.rs",
+        "crates/ferrum-models/tests/vnext_l1_reference_runtime.rs"
+      ],
+      "expect_domains": ["reference_runtime"],
+      "expect_required_gates": ["planner_selftest", "unit", "vnext_g02_core"],
+      "expect_invalidated": [
+        "vnext_g02_core",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "expect_unknown_files": []
+    },
+    {
       "id": "unknown_path",
       "changed_files": ["crates/ferrum-new-crate/src/lib.rs"],
       "expect_status": "fail",

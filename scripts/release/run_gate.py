@@ -59,6 +59,7 @@ LANES = (
     "vnext-g01a",
     "vnext-g01b",
     "vnext-g01",
+    "vnext-g02-core",
     "vnext-g07a",
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
@@ -987,6 +988,20 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "g01-contracts" / "manifest.json",
             provenance_kind="vnext-g01",
+        )
+    if lane == "vnext-g02-core":
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g02_core.py",
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G02 CORE L0 L1 PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g02-core",
         )
     if lane == "vnext-g07a":
         required = {
@@ -7605,6 +7620,19 @@ def self_test() -> int:
         == "FERRUM RUNTIME VNEXT G01 CORE CONTRACTS SELFTEST PASS",
         g01_selftest.stderr or g01_selftest.stdout,
     )
+    g02_core_selftest = run_selftest_command(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/release/runtime_vnext_g02_core.py"),
+            "--self-test",
+        ]
+    )
+    require_selftest(
+        g02_core_selftest.returncode == 0
+        and g02_core_selftest.stdout.strip()
+        == "FERRUM RUNTIME VNEXT G02 CORE L0 L1 SELFTEST PASS",
+        g02_core_selftest.stderr or g02_core_selftest.stdout,
+    )
     g01a_checkpoint = runpy.run_path(
         str(REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py")
     )
@@ -8082,6 +8110,38 @@ def self_test() -> int:
                 str(native_lock.resolve()),
             ],
             cuda_manifest,
+        )
+        g02_core_out = (root / "vnext-g02-core-dry-run").resolve()
+        g02_core = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g02-core",
+                "--out",
+                str(g02_core_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g02_core.returncode == 0,
+            g02_core.stderr or g02_core.stdout,
+        )
+        g02_core_manifest = json.loads(
+            (g02_core_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g02_core_manifest["status"] == "dry-run"
+            and g02_core_manifest["lane"] == "vnext-g02-core"
+            and g02_core_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g02_core.py",
+                "--out",
+                str(g02_core_out),
+            ]
+            and g02_core_manifest["child_pass_line"]
+            == f"FERRUM RUNTIME VNEXT G02 CORE L0 L1 PASS: {g02_core_out}",
+            g02_core_manifest,
         )
         g08b_root = root / "g08b-artifact-root"
         determinism_root = root / "cuda-determinism-artifact-root"
@@ -9745,6 +9805,7 @@ def main() -> int:
         "vnext-g01a",
         "vnext-g01b",
         "vnext-g01",
+        "vnext-g02-core",
         "vnext-g07a",
         "vnext-s2-response-format",
         "vnext-s2-api-modality",

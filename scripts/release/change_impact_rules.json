@@ -243,6 +243,24 @@
       "reason": "Metal backend-local changes require Metal sentinel and cheap cross-backend boundary evidence"
     },
     {
+      "id": "vnext-reference-runtime",
+      "path_globs": [
+        "crates/ferrum-kernels/src/backend/mod.rs",
+        "crates/ferrum-kernels/src/backend/reference/**",
+        "crates/ferrum-models/tests/vnext_l1_reference_runtime.rs",
+        "scripts/release/runtime_vnext_g02_core.py"
+      ],
+      "domains": ["reference_runtime"],
+      "required_gates": ["unit", "vnext_g02_core", "planner_selftest"],
+      "release_invalidation": [
+        "vnext_g02_core",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "the model-independent runtime oracle and its real-weight L1 contract are mandatory S2 inputs"
+    },
+    {
       "id": "native-operator",
       "path_globs": [
         "crates/ferrum-native-ops/**",
