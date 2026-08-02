@@ -69,6 +69,7 @@ LANES = (
     "vnext-s2-tool-schema",
     "vnext-s2-multiturn-concurrency",
     "vnext-s2-historical-resource-source",
+    "vnext-s2-m1-determinism",
     "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
@@ -1197,6 +1198,29 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s2-historical-resource-source",
+        )
+    if lane == "vnext-s2-m1-determinism":
+        if args.cuda_determinism_artifact_root is None:
+            raise GateError(
+                "vnext-s2-m1-determinism requires "
+                "--cuda-determinism-artifact-root"
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_cuda_determinism.py",
+                str(args.cuda_determinism_artifact_root.resolve()),
+                "--scope",
+                "m1-s2-focused",
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                "FERRUM RUNTIME VNEXT M1 S2 CUDA DETERMINISM FOCUSED PASS: "
+                f"{out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-m1-determinism",
         )
     if lane == "vnext-cuda-determinism":
         if args.cuda_determinism_artifact_root is None:
@@ -8105,6 +8129,44 @@ def self_test() -> int:
             ),
             determinism_manifest,
         )
+        focused_determinism_out = root / "s2-m1-determinism-dry-run"
+        focused_determinism_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s2-m1-determinism",
+                "--cuda-determinism-artifact-root",
+                str(determinism_root),
+                "--out",
+                str(focused_determinism_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            focused_determinism_dry.returncode == 0,
+            focused_determinism_dry.stderr or focused_determinism_dry.stdout,
+        )
+        focused_determinism_manifest = json.loads(
+            (focused_determinism_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            focused_determinism_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_cuda_determinism.py",
+                str(determinism_root.resolve()),
+                "--scope",
+                "m1-s2-focused",
+                "--out",
+                str(focused_determinism_out.resolve()),
+            ]
+            and focused_determinism_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT M1 S2 CUDA DETERMINISM FOCUSED PASS: "
+                f"{focused_determinism_out.resolve()}"
+            ),
+            focused_determinism_manifest,
+        )
         g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
         g08b_out = root / "g08b-cuda-dry-run"
         g08b_dry = run_selftest_command(
@@ -9690,6 +9752,7 @@ def main() -> int:
         "vnext-s2-tool-schema",
         "vnext-s2-multiturn-concurrency",
         "vnext-s2-historical-resource-source",
+        "vnext-s2-m1-determinism",
     }:
         try:
             require_external_vnext_g00_output(out_dir)

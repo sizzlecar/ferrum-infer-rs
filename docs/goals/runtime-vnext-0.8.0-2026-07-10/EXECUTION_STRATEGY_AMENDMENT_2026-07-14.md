@@ -200,7 +200,15 @@ G06 或 G08 分母。S2 aggregate 必须显式消费下列同一 clean source id
    validator，禁止人工复用 stale artifact。
 2. M1 CUDA determinism focused witness，以及 G02 core 的 L0/L1 bounded receipt。S2 不得打印完整
    `FERRUM RUNTIME VNEXT G02 TEST EVIDENCE PASS`；16-family historical、完整 planner/timing/mutation
-   分母仍在 S6。
+   分母仍在 S6。focused witness 必须由
+   `runtime_vnext_cuda_determinism_collect.py --scope m1-s2-focused` 生成，绑定逐文件 hash 的
+   M1 production-consumed model closure、与 collector 同一 clean checkout root 生成且可搬迁复验的
+   release candidate build receipt、
+   native operator set lock 原始字节及其完整 content-addressed member closure、固定小上限的
+   Tokio/Rayon/BLAS worker 环境、硬件 probe、
+   bounded receipt 和 Rust collector exact 20-case denominator，再由
+   `run_gate.py vnext-s2-m1-determinism` 验收；手工组装 JSON 或 release-full/focused scope 混用
+   必须 fail closed。
 3. 当前 M1 CUDA product checkpoints：response-format、negative API/text-only modality、Unicode
    stream equivalence、tool/schema priority 与 tool-result lifecycle、run/serve multi-turn 和 c1/c4
    concurrent isolation。

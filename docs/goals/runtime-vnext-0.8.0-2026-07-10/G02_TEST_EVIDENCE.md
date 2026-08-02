@@ -123,10 +123,37 @@ runner 从当前实际 CUDA catalog 和三个主模型的 resolved plans 计算 
 coverage registry 完整性，不能打印硬件 PASS。真实 CUDA runner/validator 的唯一 PASS 行是：
 
 ```text
+# GPU host: import and revalidate a canonical release candidate build receipt,
+# hash the production-consumed locked model closure, collect the hardware probe,
+# run the Rust collector under bounded_command.py, and assemble evidence.json.
+python3 scripts/release/runtime_vnext_cuda_determinism_collect.py \
+  --artifact-root <runner_artifact> \
+  --candidate-build-root <candidate_build_artifact> \
+  --models-lock <models.lock.json> \
+  --hardware-id <instance-id> \
+  --model m1-qwen35-4b=<model-dir> \
+  --model m2-qwen35-35b-a3b=<model-dir> \
+  --model m3-qwen3-30b-a3b=<model-dir>
+
+# Same clean source identity: revalidate the assembled artifact and emit PASS.
 python3 scripts/release/run_gate.py vnext-cuda-determinism \
   --cuda-determinism-artifact-root <runner_artifact> \
   --out <out_dir>
 ```
+
+collector 只打印 `FERRUM RUNTIME VNEXT CUDA DETERMINISM EVIDENCE READY`，不能冒充正式
+hardware gate PASS。`evidence.json` 必须引用逐文件 hash 的 `model-verification.json`；其 model
+directory 必须与 bounded runner 的 typed `--model` 参数精确一致。candidate build artifact 必须
+包含可再次验证的 `build/candidate/candidate-build-receipt.json`、binary、bounded receipt、build
+logs、toolchain/GPU probes、native operator set lock 原始字节及其完整 content-addressed member
+closure；任意手工传入 binary 不构成来源证据。collector 在首次启动 worker 前固定
+Tokio/Rayon/BLAS 上限，runner evidence 必须记录实际传入的完整 allowlisted 环境。S2 的 M1
+focused lane 还要求 candidate build 与 collector 使用同一 clean source checkout root。该 lane 使用
+`--scope m1-s2-focused` 且只绑定 M1；该 artifact 会被 full validator fail-closed 拒绝。
+
+该 validator 的信任根是 clean Git SHA/tree 与 candidate build receipt；它会 fail closed 地重验
+artifact closure 的来源、内容和交叉引用，但不声称能对抗攻击者联合重写整套 unsigned JSON。
+密码学签名和远程 attestation 属于 release supply-chain gate，不能由本地一致性 validator 冒充。
 
 ```text
 FERRUM RUNTIME VNEXT CUDA DETERMINISM PASS: <out_dir>

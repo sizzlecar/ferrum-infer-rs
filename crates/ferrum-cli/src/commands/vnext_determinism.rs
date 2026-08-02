@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 #[cfg(feature = "cuda")]
 use ferrum_models::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismPhase,
@@ -21,10 +21,46 @@ use ferrum_models::{
 use ferrum_types::{FerrumError, Result};
 
 const PRIMARY_MODEL_KEYS: [&str; 3] = ["m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"];
+const M1_MODEL_KEYS: [&str; 1] = ["m1-qwen35-4b"];
 #[cfg(feature = "cuda")]
 const EXECUTIONS_PER_MODE: usize = 6;
 #[cfg(any(feature = "cuda", test))]
-const EXPECTED_CASES: usize = 72;
+const RELEASE_EXPECTED_CASES: usize = 72;
+#[cfg(any(feature = "cuda", test))]
+const M1_S2_FOCUSED_EXPECTED_CASES: usize = 20;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum VNextDeterminismScope {
+    #[default]
+    #[value(name = "release-full")]
+    ReleaseFull,
+    #[value(name = "m1-s2-focused")]
+    M1S2Focused,
+}
+
+impl VNextDeterminismScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReleaseFull => "release-full",
+            Self::M1S2Focused => "m1-s2-focused",
+        }
+    }
+
+    const fn model_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::ReleaseFull => &PRIMARY_MODEL_KEYS,
+            Self::M1S2Focused => &M1_MODEL_KEYS,
+        }
+    }
+
+    #[cfg(any(feature = "cuda", test))]
+    const fn expected_case_count(self) -> usize {
+        match self {
+            Self::ReleaseFull => RELEASE_EXPECTED_CASES,
+            Self::M1S2Focused => M1_S2_FOCUSED_EXPECTED_CASES,
+        }
+    }
+}
 
 #[derive(Args, Clone, Debug)]
 pub struct VNextDeterminismCommand {
@@ -35,6 +71,10 @@ pub struct VNextDeterminismCommand {
     /// Existing artifact root containing `hardware-probe/probe.json`.
     #[arg(long, value_name = "DIR")]
     pub artifact_root: PathBuf,
+
+    /// Evidence denominator: full three-model release matrix or the bounded M1 S2 witness.
+    #[arg(long, value_enum, default_value_t = VNextDeterminismScope::ReleaseFull)]
+    pub scope: VNextDeterminismScope,
 
     /// Primary model binding in `MODEL_KEY=/absolute/model/directory` form.
     #[arg(
@@ -155,7 +195,7 @@ fn validate_command(command: &VNextDeterminismCommand) -> Result<Vec<ModelBindin
         &command.artifact_root.join("hardware-probe/probe.json"),
         "hardware-probe/probe.json",
     )?;
-    parse_model_bindings(&command.models, true)
+    parse_model_bindings(&command.models, command.scope, true)
 }
 
 fn require_regular_file(path: &Path, label: &str) -> Result<()> {
@@ -174,8 +214,13 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_model_bindings(values: &[String], require_directories: bool) -> Result<Vec<ModelBinding>> {
-    let expected = PRIMARY_MODEL_KEYS.into_iter().collect::<BTreeSet<_>>();
+fn parse_model_bindings(
+    values: &[String],
+    scope: VNextDeterminismScope,
+    require_directories: bool,
+) -> Result<Vec<ModelBinding>> {
+    let model_keys = scope.model_keys();
+    let expected = model_keys.iter().copied().collect::<BTreeSet<_>>();
     let mut indexed = BTreeMap::new();
     for value in values {
         let (key, raw_directory) = value.split_once('=').ok_or_else(|| {
@@ -205,10 +250,12 @@ fn parse_model_bindings(values: &[String], require_directories: bool) -> Result<
     if actual != expected {
         let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
         return Err(FerrumError::invalid_parameter(format!(
-            "--model must bind exactly the three primary CUDA models; missing {missing:?}"
+            "--model must bind exactly the {} model set for scope {}; missing {missing:?}",
+            model_keys.len(),
+            scope.as_str(),
         )));
     }
-    Ok(PRIMARY_MODEL_KEYS
+    Ok(model_keys
         .iter()
         .map(|key| ModelBinding {
             key: (*key).to_owned(),
@@ -220,7 +267,7 @@ fn parse_model_bindings(values: &[String], require_directories: bool) -> Result<
 }
 
 #[cfg(any(feature = "cuda", test))]
-fn release_shape_fixtures() -> Vec<ShapeFixture> {
+fn shape_fixtures(scope: VNextDeterminismScope) -> Vec<ShapeFixture> {
     let prefill = |partition, token_count, immediate_start| ShapeFixture {
         phase: ShapePhase::Prefill,
         partition,
@@ -239,14 +286,17 @@ fn release_shape_fixtures() -> Vec<ShapeFixture> {
             })
             .collect(),
     };
-    vec![
+    let mut fixtures = vec![
         prefill("single_token", 1, 0),
         prefill("multi_token", 4, 0),
         prefill("chunk_boundary", 8, 4),
         decode("c1", 1),
         decode("multi_participant", 4),
-        decode("c32", MAX_VNEXT_DETERMINISM_PARTICIPANTS),
-    ]
+    ];
+    if scope == VNextDeterminismScope::ReleaseFull {
+        fixtures.push(decode("c32", MAX_VNEXT_DETERMINISM_PARTICIPANTS));
+    }
+    fixtures
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -462,6 +512,7 @@ mod cuda {
         artifact_type: &'static str,
         status: &'static str,
         backend: &'static str,
+        scope: &'static str,
         models_lock: FileReference,
         hardware_probe: FileReference,
         device_fingerprint: String,
@@ -512,6 +563,9 @@ mod cuda {
         command: &VNextDeterminismCommand,
         bindings: &[ModelBinding],
     ) -> Result<String> {
+        let fixtures = shape_fixtures(command.scope);
+        let expected_case_count = command.scope.expected_case_count();
+        let cases_per_model = fixtures.len() * 4;
         reject_existing_outputs(&command.artifact_root)?;
         let models_lock = file_reference(
             &command.artifact_root,
@@ -626,7 +680,9 @@ mod cuda {
                 &binding.key,
                 &dtype,
                 &quantization,
-                model_ordinal * 24,
+                &fixtures,
+                model_ordinal * cases_per_model,
+                expected_case_count,
                 &progress_cases,
             )
             .await?;
@@ -692,6 +748,8 @@ mod cuda {
             &denominator_fingerprint,
             &device_runtime_fingerprint,
             &hardware_probe.fingerprint,
+            command.scope,
+            expected_case_count,
             models_lock,
             hardware_probe_ref,
             binary,
@@ -732,11 +790,13 @@ mod cuda {
         model_key: &str,
         dtype: &str,
         quantization: &str,
+        fixtures: &[ShapeFixture],
         completed_before_model: usize,
+        expected_case_count: usize,
         progress_cases: &Path,
     ) -> Result<Vec<PendingCase>> {
-        let mut cases = Vec::with_capacity(24);
-        for fixture in release_shape_fixtures() {
+        let mut cases = Vec::with_capacity(fixtures.len() * 4);
+        for fixture in fixtures {
             for (initial_state, initial_state_kind) in [
                 (VNextDeterminismInitialState::Zero, "zero"),
                 (VNextDeterminismInitialState::Nonzero, "nonzero"),
@@ -754,7 +814,11 @@ mod cuda {
                 )
                 .await?;
                 write_case_progress(progress_cases, &zero)?;
-                print_case_progress(completed_before_model + cases.len() + 1, &zero);
+                print_case_progress(
+                    completed_before_model + cases.len() + 1,
+                    expected_case_count,
+                    &zero,
+                );
                 let a5 = collect_case(
                     collector,
                     model_key,
@@ -768,7 +832,11 @@ mod cuda {
                 )
                 .await?;
                 write_case_progress(progress_cases, &a5)?;
-                print_case_progress(completed_before_model + cases.len() + 2, &a5);
+                print_case_progress(
+                    completed_before_model + cases.len() + 2,
+                    expected_case_count,
+                    &a5,
+                );
                 ensure_poison_equivalence(&zero, &a5)?;
                 cases.extend([zero, a5]);
             }
@@ -815,10 +883,10 @@ mod cuda {
         )
     }
 
-    fn print_case_progress(completed: usize, case: &PendingCase) {
+    fn print_case_progress(completed: usize, expected_case_count: usize, case: &PendingCase) {
         println!(
             "FERRUM VNEXT DETERMINISM PROGRESS case={} complete={}/{}",
-            case.case_id, completed, EXPECTED_CASES
+            case.case_id, completed, expected_case_count
         );
     }
 
@@ -1026,6 +1094,8 @@ mod cuda {
         denominator_fingerprint: &str,
         device_runtime_fingerprint: &str,
         device_fingerprint: &str,
+        scope: VNextDeterminismScope,
+        expected_case_count: usize,
         models_lock: FileReference,
         hardware_probe: FileReference,
         binary: FileReference,
@@ -1045,7 +1115,7 @@ mod cuda {
         }
 
         let binary_sha256 = binary.sha256.clone();
-        let mut case_refs = Vec::with_capacity(EXPECTED_CASES);
+        let mut case_refs = Vec::with_capacity(expected_case_count);
         let mut model_summaries = Vec::with_capacity(collected_models.len());
         let mut execution_count = 0;
         let mut comparison_count = 0;
@@ -1127,14 +1197,20 @@ mod cuda {
             }
         }
         case_refs.sort_by(|left, right| left.path.cmp(&right.path));
-        if case_refs.len() != EXPECTED_CASES {
+        if case_refs.len() != expected_case_count {
             return Err(FerrumError::internal(format!(
-                "determinism collector produced {} cases, expected {EXPECTED_CASES}",
-                case_refs.len()
+                "determinism collector produced {} cases, expected {expected_case_count}",
+                case_refs.len(),
             )));
         }
+        let pass_prefix = match scope {
+            VNextDeterminismScope::ReleaseFull => "FERRUM VNEXT DETERMINISM COLLECTOR PASS",
+            VNextDeterminismScope::M1S2Focused => {
+                "FERRUM VNEXT M1 S2 FOCUSED DETERMINISM COLLECTOR PASS"
+            }
+        };
         let pass_line = format!(
-            "FERRUM VNEXT DETERMINISM COLLECTOR PASS: {}",
+            "{pass_prefix}: {}",
             stage
                 .parent()
                 .expect("stage is inside artifact root")
@@ -1145,6 +1221,7 @@ mod cuda {
             artifact_type: ARTIFACT_TYPE,
             status: "pass",
             backend: "cuda",
+            scope: scope.as_str(),
             models_lock,
             hardware_probe,
             device_fingerprint: device_fingerprint.to_owned(),
@@ -1152,7 +1229,7 @@ mod cuda {
             denominator: denominator_ref,
             models: model_summaries,
             cases: case_refs,
-            case_count: EXPECTED_CASES,
+            case_count: expected_case_count,
             execution_count,
             comparison_count,
             pass_line,
@@ -1405,7 +1482,8 @@ mod tests {
             "m1-qwen35-4b=/models/m1".to_owned(),
             "m2-qwen35-35b-a3b=/models/m2".to_owned(),
         ];
-        let bindings = parse_model_bindings(&values, false).unwrap();
+        let bindings =
+            parse_model_bindings(&values, VNextDeterminismScope::ReleaseFull, false).unwrap();
         assert_eq!(
             bindings
                 .iter()
@@ -1421,7 +1499,7 @@ mod tests {
             "m1-qwen35-4b=/models/m1".to_owned(),
             "m2-qwen35-35b-a3b=/models/m2".to_owned(),
         ];
-        assert!(parse_model_bindings(&missing, false).is_err());
+        assert!(parse_model_bindings(&missing, VNextDeterminismScope::ReleaseFull, false).is_err());
 
         let duplicate = vec![
             "m1-qwen35-4b=/models/m1".to_owned(),
@@ -1429,19 +1507,43 @@ mod tests {
             "m2-qwen35-35b-a3b=/models/m2".to_owned(),
             "m3-qwen3-30b-a3b=/models/m3".to_owned(),
         ];
-        assert!(parse_model_bindings(&duplicate, false).is_err());
+        assert!(
+            parse_model_bindings(&duplicate, VNextDeterminismScope::ReleaseFull, false).is_err()
+        );
 
         let unknown = vec![
             "m1-qwen35-4b=/models/m1".to_owned(),
             "m2-qwen35-35b-a3b=/models/m2".to_owned(),
             "llama=/models/llama".to_owned(),
         ];
-        assert!(parse_model_bindings(&unknown, false).is_err());
+        assert!(parse_model_bindings(&unknown, VNextDeterminismScope::ReleaseFull, false).is_err());
+    }
+
+    #[test]
+    fn focused_scope_accepts_only_m1_and_cannot_bind_release_models() {
+        assert_eq!(
+            VNextDeterminismScope::from_str("m1-s2-focused", false).unwrap(),
+            VNextDeterminismScope::M1S2Focused
+        );
+        assert!(VNextDeterminismScope::from_str("m1s2-focused", false).is_err());
+
+        let m1 = vec!["m1-qwen35-4b=/models/m1".to_owned()];
+        let bindings =
+            parse_model_bindings(&m1, VNextDeterminismScope::M1S2Focused, false).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].key, "m1-qwen35-4b");
+
+        let release = vec![
+            "m1-qwen35-4b=/models/m1".to_owned(),
+            "m2-qwen35-35b-a3b=/models/m2".to_owned(),
+            "m3-qwen3-30b-a3b=/models/m3".to_owned(),
+        ];
+        assert!(parse_model_bindings(&release, VNextDeterminismScope::M1S2Focused, false).is_err());
     }
 
     #[test]
     fn release_shapes_cover_the_exact_bounded_partition_matrix() {
-        let fixtures = release_shape_fixtures();
+        let fixtures = shape_fixtures(VNextDeterminismScope::ReleaseFull);
         assert_eq!(fixtures.len(), 6);
         assert_eq!(
             fixtures
@@ -1484,10 +1586,25 @@ mod tests {
         ];
         assert_eq!(
             PRIMARY_MODEL_KEYS.len()
-                * release_shape_fixtures().len()
+                * shape_fixtures(VNextDeterminismScope::ReleaseFull).len()
                 * states.len()
                 * poisons.len(),
-            EXPECTED_CASES
+            RELEASE_EXPECTED_CASES
+        );
+    }
+
+    #[test]
+    fn focused_denominator_is_m1_without_c32() {
+        let fixtures = shape_fixtures(VNextDeterminismScope::M1S2Focused);
+        assert_eq!(fixtures.len(), 5);
+        assert!(fixtures.iter().all(|fixture| fixture.partition != "c32"));
+        assert_eq!(
+            M1_MODEL_KEYS.len() * fixtures.len() * 2 * 2,
+            M1_S2_FOCUSED_EXPECTED_CASES
+        );
+        assert_eq!(
+            VNextDeterminismScope::M1S2Focused.expected_case_count(),
+            M1_S2_FOCUSED_EXPECTED_CASES
         );
     }
 }
