@@ -30,6 +30,8 @@ pub use buffer::CudaBuf;
 
 pub mod cpu;
 
+pub mod reference;
+
 #[cfg(feature = "metal")]
 pub mod metal;
 
