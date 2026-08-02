@@ -67,6 +67,7 @@ LANES = (
     "vnext-s2-api-modality",
     "vnext-s2-stream-disconnect",
     "vnext-s2-tool-schema",
+    "vnext-s2-multiturn-concurrency",
     "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
@@ -1155,6 +1156,26 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s2-tool-schema",
+        )
+    if lane == "vnext-s2-multiturn-concurrency":
+        if args.s2_artifact_root is None:
+            raise GateError("vnext-s2-multiturn-concurrency requires --s2-artifact-root")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py",
+                "--source",
+                str(args.s2_artifact_root.resolve()),
+                "--expected-git-sha",
+                git_sha(),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S2 MULTITURN CONCURRENCY PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-multiturn-concurrency",
         )
     if lane == "vnext-cuda-determinism":
         if args.cuda_determinism_artifact_root is None:
@@ -8911,6 +8932,11 @@ def self_test() -> int:
                 "--artifact-dir",
                 "FERRUM RUNTIME VNEXT S2 TOOL SCHEMA PRIORITY PASS",
             ),
+            "vnext-s2-multiturn-concurrency": (
+                "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py",
+                "--source",
+                "FERRUM RUNTIME VNEXT S2 MULTITURN CONCURRENCY PASS",
+            ),
         }
         for lane, (script, source_flag, child_prefix) in s2_lane_specs.items():
             lane_out = (root / f"{lane}-dry-run").resolve()
@@ -9581,6 +9607,7 @@ def main() -> int:
         "vnext-s2-api-modality",
         "vnext-s2-stream-disconnect",
         "vnext-s2-tool-schema",
+        "vnext-s2-multiturn-concurrency",
     }:
         try:
             require_external_vnext_g00_output(out_dir)

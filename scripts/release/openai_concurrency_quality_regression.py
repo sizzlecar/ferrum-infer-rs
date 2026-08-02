@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,10 +26,22 @@ FORBIDDEN_TEXT = [
     "classname=",
 ]
 
+# Keep native worker creation independently bounded even when a caller asks for
+# a wider request-concurrency cell. Extra requests remain queued in the pool.
+MAX_CONCURRENCY_WORKERS = 32
+
 
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", errors="replace")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def post_json(base_url: str, payload: dict[str, Any], timeout: int = 180) -> tuple[int, str]:
@@ -110,6 +125,7 @@ def run_concurrency_quality_regression(
     concurrency_cells: list[int],
     *,
     timeout: int = 180,
+    enable_thinking: bool | None = None,
 ) -> dict[str, Any]:
     out.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {"model": model, "cells": []}
@@ -117,13 +133,20 @@ def run_concurrency_quality_regression(
 
     for concurrency in concurrency_cells:
         prefix = f"c{concurrency}.quality"
+        worker_count = min(concurrency, MAX_CONCURRENCY_WORKERS)
+        start_barrier = (
+            threading.Barrier(worker_count, timeout=min(float(timeout), 10.0))
+            if concurrency <= MAX_CONCURRENCY_WORKERS and worker_count > 1
+            else None
+        )
+
         def call(i: int) -> dict[str, Any]:
             marker = f"ferrum{concurrency:02d}{i:02d}"
             value = i + 1
             answer = f"S{value * value:04d}"
             payload = {
                 "model": model,
-                "temperature": 0,
+                "temperature": 0.0,
                 "max_tokens": 128,
                 "tools": [marker_tool(marker, answer)],
                 "tool_choice": "required",
@@ -138,7 +161,29 @@ def run_concurrency_quality_regression(
                     }
                 ],
             }
-            status, body = post_json(base_url, payload, timeout=timeout)
+            if enable_thinking is not None:
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": enable_thinking
+                }
+            request_path = out / f"{prefix}.{i:03d}.request.json"
+            response_path = out / f"{prefix}.{i:03d}.response.txt"
+            write(
+                request_path,
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            )
+            if start_barrier is not None:
+                try:
+                    start_barrier.wait()
+                except threading.BrokenBarrierError as error:
+                    raise RuntimeError(
+                        f"c={concurrency} synchronized start barrier failed"
+                    ) from error
+            started_monotonic_ns = time.monotonic_ns()
+            try:
+                status, body = post_json(base_url, payload, timeout=timeout)
+            finally:
+                finished_monotonic_ns = time.monotonic_ns()
+            write(response_path, body)
             content = ""
             finish_reason = None
             json_ok = False
@@ -181,14 +226,62 @@ def run_concurrency_quality_regression(
                 "finish_reason": finish_reason,
                 "forbidden_text": forbidden,
                 "content_head": body[:500],
+                "request_artifact": str(request_path),
+                "request_sha256": file_sha256(request_path),
+                "response_artifact": str(response_path),
+                "response_sha256": file_sha256(response_path),
+                "response_size": response_path.stat().st_size,
+                "started_monotonic_ns": started_monotonic_ns,
+                "finished_monotonic_ns": finished_monotonic_ns,
+                "duration_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000,
             }
 
         rows: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(call, i) for i in range(concurrency)]
-            for future in as_completed(futures):
-                rows.append(future.result())
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = []
+            try:
+                for i in range(concurrency):
+                    futures.append(executor.submit(call, i))
+            except BaseException:
+                if start_barrier is not None:
+                    start_barrier.abort()
+                for future in futures:
+                    future.cancel()
+                raise
+            try:
+                for future in as_completed(futures):
+                    rows.append(future.result())
+            except BaseException:
+                if start_barrier is not None:
+                    start_barrier.abort()
+                for future in futures:
+                    future.cancel()
+                raise
         rows.sort(key=lambda row: int(row.get("i") or 0))
+
+        overlap_pair_count = 0
+        for left_index, left in enumerate(rows):
+            for right in rows[left_index + 1 :]:
+                if max(left["started_monotonic_ns"], right["started_monotonic_ns"]) < min(
+                    left["finished_monotonic_ns"], right["finished_monotonic_ns"]
+                ):
+                    overlap_pair_count += 1
+        timeline = sorted(
+            [
+                (row["started_monotonic_ns"], 1)
+                for row in rows
+            ]
+            + [
+                (row["finished_monotonic_ns"], -1)
+                for row in rows
+            ],
+            key=lambda event: (event[0], event[1]),
+        )
+        active = 0
+        max_in_flight = 0
+        for _, delta in timeline:
+            active += delta
+            max_in_flight = max(max_in_flight, active)
 
         markers = {row["i"]: row["marker"] for row in rows}
         crosstalk = 0
@@ -207,6 +300,11 @@ def run_concurrency_quality_regression(
         forbidden_count = sum(1 for row in rows if row.get("forbidden_text"))
         cell = {
             "concurrency": concurrency,
+            "worker_count": worker_count,
+            "worker_limit": MAX_CONCURRENCY_WORKERS,
+            "synchronized_start": start_barrier is not None,
+            "overlap_pair_count": overlap_pair_count,
+            "max_in_flight": max_in_flight,
             "requests": concurrency,
             "status_200": status_200,
             "json_ok": json_ok,
@@ -225,6 +323,7 @@ def run_concurrency_quality_regression(
                 and crosstalk == 0
                 and length_finishes == 0
                 and forbidden_count == 0
+                and (concurrency == 1 or max_in_flight >= 2)
             ),
             "rows": rows,
         }
@@ -235,7 +334,8 @@ def run_concurrency_quality_regression(
                 f"c={concurrency} status_200={status_200}/{concurrency} "
                 f"marker_ok={marker_ok}/{concurrency} square_ok={square_ok}/{concurrency} "
                 f"format_ok={format_ok}/{concurrency} crosstalk={crosstalk} "
-                f"length_finishes={length_finishes} forbidden={forbidden_count}"
+                f"length_finishes={length_finishes} forbidden={forbidden_count} "
+                f"overlap_pairs={overlap_pair_count} max_in_flight={max_in_flight}"
             )
 
     result["status"] = "fail" if failed else "pass"
