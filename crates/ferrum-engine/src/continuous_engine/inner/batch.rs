@@ -358,6 +358,7 @@ impl EngineInner {
                         seq.generated_tokens.push(token);
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
+                        seq.record_generated_token_commit();
                         Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
                             token,
                             model_cache_update,
@@ -814,6 +815,7 @@ impl EngineInner {
                     num_tokens,
                     true,
                 );
+                seq.record_generated_token_commit();
                 Ok::<Option<(TokenId, u64, ModelCacheRefUpdate)>, FerrumError>(Some((
                     token,
                     seq.start_time.elapsed().as_micros() as u64,
@@ -938,6 +940,7 @@ impl EngineInner {
                 // model's internal paged_pool is what actually grows), so
                 // the previous `make_kv_handle_with_seq` write was a
                 // silent no-op for production handles.
+                seq.record_generated_token_commit();
                 Ok::<Option<TokenId>, FerrumError>(Some(token))
             })();
             let next_token = match next_token_result {

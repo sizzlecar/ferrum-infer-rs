@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,22 @@ DEFAULT_PROFILE_FIXTURES = REPO_ROOT / "scripts/release/fixtures/observability_p
 DEFAULT_NATIVE_FIXTURES = REPO_ROOT / "scripts/release/fixtures/native_operator"
 PASS_LINE = "FERRUM PROFILE ANALYZER PASS"
 SELFTEST_PASS_LINE = "FERRUM PROFILE ANALYZER SELFTEST PASS"
+ENGINE_TIMING_PROFILE_DETAILS = {"latency", "kernel", "replay", "verify", "full"}
+ENGINE_TIMING_ATTRIBUTE_KEYS = {
+    "engine_token_clock_source",
+    "engine_token_wall_anchor_unix_nanos",
+    "clock_conversion_max_error_nanos",
+    "engine_token_commit_nanos_since_request_start",
+    "engine_token_commit_count",
+    "itl_source",
+    "itl_interval_count",
+    "itl_nanos",
+    "engine_decode_ready_nanos_since_request_start",
+    "engine_decode_wall_nanos",
+    "clock_conversion_error_ppm",
+    "decode_wall_timing_eligible",
+    "decode_wall_timing_unavailable_reason",
+}
 
 
 class ValidationError(RuntimeError):
@@ -132,7 +149,7 @@ def validate_profile_event(event: Any, context: str) -> None:
         require_non_empty_string(error, "kind", f"{context}.error")
         require_non_empty_string(error, "message", f"{context}.error")
         blocking = error.get("blocking")
-        if blocking is not None and not isinstance(blocking, bool):
+        if not isinstance(blocking, bool):
             raise ValidationError(f"{context}.error.blocking must be a boolean")
     if "replay" in event:
         replay = event["replay"]
@@ -156,6 +173,301 @@ def error_kind(event: dict[str, Any]) -> str:
         return ""
     kind = error.get("kind")
     return kind if isinstance(kind, str) else ""
+
+
+def is_non_negative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def event_order_key(event: dict[str, Any]) -> tuple[int, int, int, int, str]:
+    attributes = event_attributes(event)
+    monotonic = attributes.get("monotonic_nanos_since_run_start")
+    sequence = attributes.get("execution_sequence")
+    if not is_non_negative_int(sequence):
+        shape = event.get("shape")
+        sequence = shape.get("execution_sequence") if isinstance(shape, dict) else None
+    sequence_value = sequence if is_non_negative_int(sequence) else (1 << 63) - 1
+    timestamp = event.get("ts_unix_nanos")
+    timestamp_value = timestamp if is_non_negative_int(timestamp) else (1 << 63) - 1
+    event_id = str(event.get("event_id", ""))
+    if is_non_negative_int(monotonic):
+        return (0, monotonic, sequence_value, timestamp_value, event_id)
+    if is_non_negative_int(sequence):
+        return (1, sequence, sequence_value, timestamp_value, event_id)
+    return (2, timestamp_value, sequence_value, timestamp_value, event_id)
+
+
+def event_strictly_after(
+    later: dict[str, Any], earlier: dict[str, Any]
+) -> bool:
+    later_attributes = event_attributes(later)
+    earlier_attributes = event_attributes(earlier)
+    later_run_id = later_attributes.get("run_id")
+    earlier_run_id = earlier_attributes.get("run_id")
+    later_monotonic = later_attributes.get("monotonic_nanos_since_run_start")
+    earlier_monotonic = earlier_attributes.get("monotonic_nanos_since_run_start")
+    if (
+        isinstance(later_run_id, str)
+        and later_run_id
+        and later_run_id == earlier_run_id
+        and is_non_negative_int(later_monotonic)
+        and is_non_negative_int(earlier_monotonic)
+    ):
+        return later_monotonic > earlier_monotonic
+
+    later_timestamp = later.get("ts_unix_nanos")
+    earlier_timestamp = earlier.get("ts_unix_nanos")
+    if is_non_negative_int(later_timestamp) and is_non_negative_int(earlier_timestamp):
+        return later_timestamp > earlier_timestamp
+    return False
+
+
+def deduplicate_profile_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    observed: dict[tuple[str, str, str, str], str] = {}
+    unique: list[dict[str, Any]] = []
+    for event in events:
+        key = (
+            str(event.get("event_id", "")),
+            str(event.get("request_id", "")),
+            str(event.get("entrypoint", "")),
+            str(event.get("phase", "")),
+        )
+        payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        previous = observed.get(key)
+        if previous is not None:
+            if previous != payload:
+                raise ValidationError(
+                    "profile aliases contain conflicting payloads for "
+                    f"event identity {key}"
+                )
+            continue
+        observed[key] = payload
+        unique.append(event)
+    return unique
+
+
+def logical_request_groups(
+    events: list[dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    unique = deduplicate_profile_events(events)
+    candidates: dict[str, set[str]] = {}
+    for event in unique:
+        entrypoint = str(event.get("entrypoint", ""))
+        attributes = event_attributes(event)
+        request_id = str(event.get("request_id", ""))
+        execution_id = attributes.get("execution_request_id")
+        if isinstance(execution_id, str) and execution_id.strip():
+            execution_id = execution_id.strip()
+            if request_id != execution_id and not execution_id.endswith(f".{request_id}"):
+                raise ValidationError(
+                    f"{event.get('event_id', '<unknown>')} execution_request_id "
+                    f"{execution_id!r} does not map request_id {request_id!r}"
+                )
+            candidates.setdefault(entrypoint, set()).add(execution_id)
+        elif request_id.startswith("request."):
+            candidates.setdefault(entrypoint, set()).add(request_id)
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for event in unique:
+        entrypoint = str(event.get("entrypoint", ""))
+        attributes = event_attributes(event)
+        request_id = str(event.get("request_id", ""))
+        explicit = attributes.get("execution_request_id")
+        if isinstance(explicit, str) and explicit.strip():
+            logical_id = explicit.strip()
+        elif request_id.startswith("request."):
+            logical_id = request_id
+        else:
+            matches = sorted(
+                candidate
+                for candidate in candidates.get(entrypoint, set())
+                if candidate.endswith(f".{request_id}")
+            )
+            if len(matches) > 1:
+                raise ValidationError(
+                    f"{event.get('event_id', '<unknown>')} request_id {request_id!r} "
+                    f"has ambiguous execution identities {matches}"
+                )
+            if matches:
+                logical_id = matches[0]
+            elif entrypoint in {"run", "serve"} and event.get("backend") == "actual":
+                logical_id = f"request.product.{request_id}"
+            else:
+                logical_id = request_id
+        groups.setdefault((entrypoint, logical_id), []).append(event)
+
+    for key, group in groups.items():
+        run_ids = {
+            event_attributes(event).get("run_id")
+            for event in group
+            if isinstance(event_attributes(event).get("run_id"), str)
+            and event_attributes(event)["run_id"].strip()
+        }
+        if len(run_ids) > 1:
+            raise ValidationError(f"logical request {key} mixes run_id values {sorted(run_ids)}")
+    return groups
+
+
+def validate_engine_token_timing_attributes(
+    attributes: dict[str, Any], context: str
+) -> None:
+    if attributes.get("engine_token_clock_source") != "rust_std_instant":
+        raise ValidationError(
+            f"{context} attributes.engine_token_clock_source must be rust_std_instant"
+        )
+    wall_anchor = attributes.get("engine_token_wall_anchor_unix_nanos")
+    if type(wall_anchor) is not int or wall_anchor <= 0:
+        raise ValidationError(
+            f"{context} attributes.engine_token_wall_anchor_unix_nanos must be positive"
+        )
+    max_error = attributes.get("clock_conversion_max_error_nanos")
+    if not is_non_negative_int(max_error):
+        raise ValidationError(
+            f"{context} attributes.clock_conversion_max_error_nanos must be non-negative"
+        )
+    output_tokens = attributes.get("output_token_count")
+    completion_tokens = attributes.get("completion_token_count")
+    if not is_non_negative_int(output_tokens):
+        raise ValidationError(f"{context} attributes.output_token_count must be non-negative")
+    if completion_tokens != output_tokens:
+        raise ValidationError(
+            f"{context} completion_token_count={completion_tokens!r} does not match "
+            f"output_token_count={output_tokens}"
+        )
+    commits = attributes.get("engine_token_commit_nanos_since_request_start")
+    if not isinstance(commits, list) or not all(is_non_negative_int(value) for value in commits):
+        raise ValidationError(f"{context} engine token commits must be non-negative integers")
+    if any(right < left for left, right in zip(commits, commits[1:])):
+        raise ValidationError(f"{context} engine token commits must be monotonic")
+    commit_count = attributes.get("engine_token_commit_count")
+    if commit_count != len(commits) or commit_count != output_tokens:
+        raise ValidationError(
+            f"{context} engine token commit count must equal raw commits and output tokens"
+        )
+
+    intervals = [right - left for left, right in zip(commits, commits[1:])]
+    if attributes.get("itl_source") != "engine_token_commit":
+        raise ValidationError(f"{context} attributes.itl_source must be engine_token_commit")
+    if attributes.get("itl_nanos") != intervals:
+        raise ValidationError(f"{context} attributes.itl_nanos does not match commit deltas")
+    if attributes.get("itl_interval_count") != max(output_tokens - 1, 0):
+        raise ValidationError(f"{context} attributes.itl_interval_count is inconsistent")
+    expected_itl_us = (sum(intervals) // len(intervals) // 1_000) if intervals else 0
+    if attributes.get("itl_us_avg") != expected_itl_us:
+        raise ValidationError(f"{context} attributes.itl_us_avg is not commit-derived")
+    if commits:
+        if attributes.get("ttft_us") != commits[0] // 1_000:
+            raise ValidationError(f"{context} attributes.ttft_us is not commit-derived")
+    elif "ttft_us" in attributes:
+        raise ValidationError(f"{context} zero-token timing must not contain ttft_us")
+
+    decode_ready = attributes.get("engine_decode_ready_nanos_since_request_start")
+    expected_reason: str | None = None
+    decode_wall: int | None = None
+    if not commits:
+        expected_reason = "no_token_commits"
+    elif decode_ready is None:
+        expected_reason = "decode_not_entered"
+    elif not is_non_negative_int(decode_ready):
+        raise ValidationError(f"{context} engine decode-ready timestamp must be non-negative")
+    elif commits[-1] <= decode_ready:
+        expected_reason = "no_positive_decode_commit_interval"
+    else:
+        decode_wall = commits[-1] - decode_ready
+
+    eligible = attributes.get("decode_wall_timing_eligible")
+    if decode_wall is None:
+        if eligible is not False:
+            raise ValidationError(f"{context} decode wall timing must be marked ineligible")
+        if attributes.get("decode_wall_timing_unavailable_reason") != expected_reason:
+            raise ValidationError(f"{context} decode wall unavailable reason is inconsistent")
+        for key in ("engine_decode_wall_nanos", "clock_conversion_error_ppm"):
+            if key in attributes:
+                raise ValidationError(f"{context} ineligible decode timing contains attributes.{key}")
+        return
+
+    if eligible is not True:
+        raise ValidationError(f"{context} decode wall timing must be marked eligible")
+    if attributes.get("engine_decode_wall_nanos") != decode_wall:
+        raise ValidationError(f"{context} attributes.engine_decode_wall_nanos is inconsistent")
+    expected_ppm = max_error * 1_000_000 // decode_wall
+    if attributes.get("clock_conversion_error_ppm") != expected_ppm:
+        raise ValidationError(f"{context} clock conversion ppm is inconsistent")
+    if max_error * 200 > decode_wall:
+        raise ValidationError(f"{context} clock conversion error exceeds 0.5% decode wall")
+    if "decode_wall_timing_unavailable_reason" in attributes:
+        raise ValidationError(f"{context} eligible decode timing contains an unavailable reason")
+
+
+def has_engine_token_timing_attributes(attributes: dict[str, Any]) -> bool:
+    return any(key in attributes for key in ENGINE_TIMING_ATTRIBUTE_KEYS)
+
+
+def validate_failure_semantics(events: list[dict[str, Any]], context: str) -> None:
+    for logical_key, group in logical_request_groups(events).items():
+        failures = [event for event in group if event.get("status") == "failure"]
+        if not failures:
+            continue
+        first_failures: list[dict[str, Any]] = []
+        terminal_failures: list[dict[str, Any]] = []
+        for event in failures:
+            event_context = f"{context}:{event.get('event_id', '<unknown>')}"
+            attributes = event_attributes(event)
+            error = event.get("error") if isinstance(event.get("error"), dict) else {}
+            blocking = error.get("blocking")
+            first = attributes.get("first_failure_event") is True
+            terminal = attributes.get("terminal_failure_event") is True
+            if blocking is True:
+                if not first:
+                    raise ValidationError(
+                        f"{event_context} blocking failure requires first_failure_event=true"
+                    )
+                if terminal:
+                    raise ValidationError(
+                        f"{event_context} blocking failure cannot be terminal_failure_event"
+                    )
+                first_failures.append(event)
+            else:
+                if first:
+                    raise ValidationError(
+                        f"{event_context} nonblocking failure cannot be first_failure_event"
+                    )
+                if terminal:
+                    terminal_failures.append(event)
+
+        if len(first_failures) != 1:
+            raise ValidationError(
+                f"{context} logical request {logical_key} requires exactly one first failure; "
+                f"observed {len(first_failures)}"
+            )
+        first = first_failures[0]
+        snapshots = [event for event in group if "memory" in event or "resource" in event]
+        if not snapshots:
+            raise ValidationError(
+                f"{context}:{first.get('event_id')} first failure requires a same-request "
+                "memory or resource snapshot"
+            )
+        first_fingerprint = event_attributes(first).get("first_failure_fingerprint")
+        for terminal in terminal_failures:
+            terminal_fingerprint = event_attributes(terminal).get("first_failure_fingerprint")
+            if (
+                terminal_fingerprint is not None
+                and terminal_fingerprint != first_fingerprint
+            ):
+                raise ValidationError(
+                    f"{context}:{terminal.get('event_id')} terminal failure fingerprint "
+                    "does not match first failure"
+                )
+            if not event_strictly_after(terminal, first):
+                raise ValidationError(
+                    f"{context}:{terminal.get('event_id')} terminal failure precedes first failure"
+                )
+
+        if any(error_kind(event) in {"cuda_oom", "metal_oom", "oom", "silent_oom"} for event in failures):
+            if not any(has_capacity_explanation(event) for event in group):
+                raise ValidationError(
+                    f"{context} logical request {logical_key} OOM requires capacity evidence"
+                )
 
 
 def has_capacity_explanation(event: dict[str, Any]) -> bool:
@@ -221,6 +533,8 @@ def validate_request_token_latency_summary(
         raise ValidationError(
             f"{context} attributes.token_count_source must be one of: {allowed}"
         )
+    if event_attrs.get("profile_detail") in ENGINE_TIMING_PROFILE_DETAILS:
+        validate_engine_token_timing_attributes(event_attrs, context)
 
 
 def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None:
@@ -249,8 +563,11 @@ def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None
             raise ValidationError(f"{context} reports resource_leak_count={attrs['resource_leak_count']}")
         profile_detail = attrs.get("profile_detail")
         diagnostic_only = attrs.get("diagnostic_only")
+        if has_engine_token_timing_attributes(attrs):
+            validate_engine_token_timing_attributes(attrs, context)
         if attrs.get("performance_claim") is True and (
-            profile_detail in {"debug", "replay", "verify", "full"} or diagnostic_only is True
+            profile_detail in {"kernel", "debug", "replay", "verify", "full"}
+            or diagnostic_only is True
         ):
             raise ValidationError(f"{context} uses diagnostic profile as performance claim")
         profile_count = attrs.get("profile_completed_requests")
@@ -275,27 +592,15 @@ def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None
         ):
             validate_run_generation_profile_event(attrs, context)
 
-    failure_events = [event for event in events if event.get("status") == "failure"]
-    capacity_events_by_request: dict[str, bool] = {}
     for event in events:
-        if has_capacity_explanation(event):
-            capacity_events_by_request[event.get("request_id", "")] = True
-    for event in failure_events:
+        if event.get("status") != "failure":
+            continue
         kind = error_kind(event)
-        attrs = event_attributes(event)
         context = f"{path}:{event.get('event_id', '<unknown>')}"
-        blocking = (event.get("error") or {}).get("blocking") is True
-        if blocking and attrs.get("first_failure_event") is not True:
-            raise ValidationError(f"{context} blocking failure requires first_failure_event=true")
-        if blocking and "memory" not in event and "resource" not in event:
-            raise ValidationError(f"{context} blocking failure requires memory or resource snapshot")
         if kind in {"bad_output", "bad_text", "missing_done", "duplicate_done", "malformed_sse"}:
             if "replay" not in event:
                 raise ValidationError(f"{context} correctness failure requires replay command")
-        if kind in {"cuda_oom", "metal_oom", "oom", "silent_oom"}:
-            request_id = event.get("request_id", "")
-            if not capacity_events_by_request.get(request_id):
-                raise ValidationError(f"{context} OOM failure requires admission/defer/reject evidence")
+    validate_failure_semantics(events, str(path))
 
 
 def validate_profile_jsonl(path: Path) -> dict[str, Any]:
@@ -376,6 +681,136 @@ def fixture_files(root: Path, suffix: str) -> tuple[list[Path], list[Path]]:
     return pass_files, fail_files
 
 
+def run_semantic_contract_selftest(profile_root: Path) -> dict[str, Any]:
+    base_path = profile_root / "pass/basic_profile.jsonl"
+    base_events = [
+        json.loads(line)
+        for line in base_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    timed = next(event for event in base_events if event.get("event_kind") == "timed_span")
+    execution_id = "request.product.semantic-selftest"
+
+    snapshot = copy.deepcopy(timed)
+    snapshot.update(
+        {
+            "event_id": "evt-semantic-snapshot",
+            "request_id": "semantic-selftest",
+            "phase": "vnext.capacity_snapshot",
+            "ts_unix_nanos": 30,
+        }
+    )
+    snapshot["attributes"] = {
+        "execution_request_id": execution_id,
+        "monotonic_nanos_since_run_start": 10,
+        "run_id": "run.semantic-selftest",
+    }
+
+    first = copy.deepcopy(timed)
+    first.pop("memory", None)
+    first.update(
+        {
+            "event_id": "evt-semantic-first",
+            "request_id": execution_id,
+            "phase": "vnext.failure_observed",
+            "event_kind": "error",
+            "status": "failure",
+            "error": {"blocking": True, "kind": "resource_exhausted", "message": "blocked"},
+            "ts_unix_nanos": 40,
+        }
+    )
+    first["attributes"] = {
+        "execution_request_id": execution_id,
+        "first_failure_event": True,
+        "first_failure_fingerprint": "failure.semantic",
+        "monotonic_nanos_since_run_start": 20,
+        "run_id": "run.semantic-selftest",
+    }
+
+    terminal = copy.deepcopy(first)
+    terminal.update(
+        {
+            "event_id": "evt-semantic-terminal",
+            "request_id": "semantic-selftest",
+            "phase": "actual_run_generation_failed",
+            "error": {"blocking": False, "kind": "request_failed", "message": "terminated"},
+            "ts_unix_nanos": 50,
+        }
+    )
+    terminal["attributes"] = {
+        "execution_request_id": execution_id,
+        "terminal_failure_event": True,
+    }
+    validate_profile_semantics(
+        Path("semantic-first-failure-pass"),
+        [terminal, snapshot, first],
+    )
+
+    duplicate = copy.deepcopy(first)
+    duplicate["event_id"] = "evt-semantic-first-duplicate"
+    duplicate["attributes"]["monotonic_nanos_since_run_start"] = 21
+    try:
+        validate_failure_semantics(
+            [snapshot, first, duplicate, terminal],
+            "semantic-duplicate-first",
+        )
+    except ValidationError:
+        duplicate_rejected = True
+    else:
+        raise ValidationError("duplicate first-failure semantic self-test unexpectedly passed")
+
+    reversed_terminal = copy.deepcopy(terminal)
+    reversed_terminal["event_id"] = "evt-semantic-terminal-reversed"
+    reversed_terminal["ts_unix_nanos"] = 35
+    try:
+        validate_failure_semantics(
+            [snapshot, first, reversed_terminal],
+            "semantic-terminal-order",
+        )
+    except ValidationError:
+        reversed_terminal_rejected = True
+    else:
+        raise ValidationError("reversed terminal semantic self-test unexpectedly passed")
+
+    timing = {
+        "profile_detail": "latency",
+        "output_token_count": 3,
+        "completion_token_count": 3,
+        "engine_token_clock_source": "rust_std_instant",
+        "engine_token_wall_anchor_unix_nanos": 1_700_000_000_000_000_000,
+        "clock_conversion_max_error_nanos": 400,
+        "engine_token_commit_nanos_since_request_start": [1_000_000, 2_500_000, 5_000_000],
+        "engine_token_commit_count": 3,
+        "itl_source": "engine_token_commit",
+        "itl_nanos": [1_500_000, 2_500_000],
+        "itl_interval_count": 2,
+        "itl_us_avg": 2_000,
+        "ttft_us": 1_000,
+        "engine_decode_ready_nanos_since_request_start": 2_000_000,
+        "engine_decode_wall_nanos": 3_000_000,
+        "clock_conversion_error_ppm": 133,
+        "decode_wall_timing_eligible": True,
+    }
+    validate_engine_token_timing_attributes(timing, "semantic-valid-timing")
+    forged = copy.deepcopy(timing)
+    forged["itl_us_avg"] = 2_001
+    try:
+        validate_engine_token_timing_attributes(forged, "semantic-forged-timing")
+    except ValidationError:
+        forged_timing_rejected = True
+    else:
+        raise ValidationError("forged engine timing semantic self-test unexpectedly passed")
+
+    return {
+        "out_of_order_terminal_join": "pass",
+        "separate_snapshot_join": "pass",
+        "duplicate_first_rejected": duplicate_rejected,
+        "reversed_terminal_rejected": reversed_terminal_rejected,
+        "engine_timing_recomputed": "pass",
+        "forged_timing_rejected": forged_timing_rejected,
+    }
+
+
 def run_fixture_selftest(profile_root: Path, native_root: Path) -> dict[str, Any]:
     profile_pass, profile_fail = fixture_files(profile_root, ".jsonl")
     native_pass, native_fail = fixture_files(native_root, ".json")
@@ -384,6 +819,7 @@ def run_fixture_selftest(profile_root: Path, native_root: Path) -> dict[str, Any
         "profile_fail": [expect_fail(path, validate_profile_jsonl) for path in profile_fail],
         "native_pass": [expect_pass(path, validate_native_manifest) for path in native_pass],
         "native_fail": [expect_fail(path, validate_native_manifest) for path in native_fail],
+        "semantic_contracts": run_semantic_contract_selftest(profile_root),
     }
 
 

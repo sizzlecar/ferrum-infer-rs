@@ -1078,6 +1078,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             .unified_product_profile_enabled()
             .then(|| profile_jsonl.clone())
             .flatten(),
+        profile_detail: product_observability.profile_detail,
         memory_profile_jsonl: product_observability
             .unified_product_profile_enabled()
             .then(|| memory_profile_jsonl.clone())

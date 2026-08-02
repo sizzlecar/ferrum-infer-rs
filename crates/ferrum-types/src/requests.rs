@@ -19,12 +19,82 @@ pub const DEFAULT_MAX_TOKENS_METADATA_KEY: &str = "ferrum_default_max_tokens";
 pub struct InferenceEvidenceRequest {
     #[serde(default)]
     pub capture_prompt_token_ids: bool,
+    /// Capture engine token-commit timestamps from the request's monotonic
+    /// clock. Disabled by default so ordinary inference does not allocate or
+    /// read an additional clock in the token hot path.
+    #[serde(default)]
+    pub capture_engine_token_timing: bool,
+}
+
+/// Engine-boundary timing for one inference request.
+///
+/// Every token timestamp is an offset from the same `std::time::Instant`
+/// captured at request admission. The wall anchor exists only to correlate
+/// this monotonic domain with profile events; durations and ITL must be
+/// computed from `token_commit_nanos_since_request_start`, never by
+/// subtracting wall-clock timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineTokenTimingEvidence {
+    pub clock_source: String,
+    pub wall_anchor_unix_nanos: i64,
+    pub wall_anchor_max_error_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ready_nanos_since_request_start: Option<u64>,
+    pub token_commit_nanos_since_request_start: Vec<u64>,
+}
+
+impl EngineTokenTimingEvidence {
+    pub fn validate(&self, output_tokens: usize) -> Result<(), String> {
+        if self.clock_source != "rust_std_instant" {
+            return Err("engine token timing clock_source must be rust_std_instant".to_string());
+        }
+        if self.wall_anchor_unix_nanos <= 0 {
+            return Err("engine token timing wall anchor must be positive".to_string());
+        }
+        if self.token_commit_nanos_since_request_start.len() != output_tokens {
+            return Err(format!(
+                "engine token timing has {} commits for {output_tokens} output tokens",
+                self.token_commit_nanos_since_request_start.len()
+            ));
+        }
+        if self
+            .token_commit_nanos_since_request_start
+            .windows(2)
+            .any(|window| window[1] < window[0])
+        {
+            return Err("engine token commit timestamps must be monotonic".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn ttft_nanos(&self) -> Option<u64> {
+        self.token_commit_nanos_since_request_start.first().copied()
+    }
+
+    pub fn inter_token_nanos(&self) -> Vec<u64> {
+        self.token_commit_nanos_since_request_start
+            .windows(2)
+            .map(|window| window[1].saturating_sub(window[0]))
+            .collect()
+    }
+
+    pub fn decode_wall_nanos(&self) -> Option<u64> {
+        let start = self.decode_ready_nanos_since_request_start?;
+        let end = self
+            .token_commit_nanos_since_request_start
+            .last()
+            .copied()?;
+        (end >= start).then_some(end - start)
+    }
 }
 
 /// Evidence captured at the engine execution boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InferenceExecutionEvidence {
+    #[serde(default)]
     pub prompt_token_ids: Vec<TokenId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_token_timing: Option<EngineTokenTimingEvidence>,
 }
 
 /// Inference request
@@ -797,6 +867,12 @@ impl InferenceRequest {
     /// Request prompt-token evidence from the execution boundary.
     pub fn with_prompt_token_evidence(mut self) -> Self {
         self.evidence_request.capture_prompt_token_ids = true;
+        self
+    }
+
+    /// Request engine token-commit timing evidence.
+    pub fn with_engine_token_timing_evidence(mut self) -> Self {
+        self.evidence_request.capture_engine_token_timing = true;
         self
     }
 

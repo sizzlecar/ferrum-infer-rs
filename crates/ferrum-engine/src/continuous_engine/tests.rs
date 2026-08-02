@@ -6256,6 +6256,183 @@ fn basic_vnext_profile_keeps_startup_lifecycle_without_repeated_frame_detail() {
 }
 
 #[test]
+fn staged_vnext_profiles_separate_resource_latency_and_kernel_costs() {
+    let cases = [
+        (
+            ObservabilityProfileDetail::Resource,
+            ferrum_interfaces::vnext::DeviceTimingMode::Off,
+            false,
+        ),
+        (
+            ObservabilityProfileDetail::Latency,
+            ferrum_interfaces::vnext::DeviceTimingMode::Completion,
+            false,
+        ),
+        (
+            ObservabilityProfileDetail::Kernel,
+            ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
+            true,
+        ),
+    ];
+
+    for (detail, expected_timing, diagnostic_only) in cases {
+        let trace_path = resource_trace_temp_path(detail.as_str());
+        let _ = std::fs::remove_file(&trace_path);
+        let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+        let mut config = EngineConfig::default();
+        config.runtime.profile_detail = detail;
+        let sink =
+            VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+
+        assert_eq!(
+            sink.capture_policy(),
+            ExecutionEventCapturePolicy::AllFrames
+        );
+        assert_eq!(sink.device_timing_mode(), expected_timing);
+        let (_, _, accepted) = vnext_profile_test_event();
+        let profile = sink.profile_event(&accepted).unwrap();
+        assert_eq!(
+            profile.attributes.get("profile_detail"),
+            Some(&serde_json::json!(detail.as_str()))
+        );
+        assert_eq!(
+            profile.attributes.get("diagnostic_only"),
+            Some(&serde_json::json!(diagnostic_only))
+        );
+
+        drop(sink);
+        journal.close().unwrap();
+        let _ = std::fs::remove_file(trace_path);
+    }
+}
+
+#[test]
+fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
+    let input = vec![TokenId::new(1), TokenId::new(2)];
+    let mut disabled = SequenceState::new(policy_request(), input.clone());
+    disabled.generated_tokens.push(TokenId::new(3));
+    disabled.record_generated_token_commit();
+    assert!(disabled.take_execution_evidence().unwrap().is_none());
+
+    let mut request = policy_request();
+    request.evidence_request.capture_prompt_token_ids = true;
+    request.evidence_request.capture_engine_token_timing = true;
+    let mut enabled = SequenceState::new(request, input.clone());
+    enabled.record_decode_ready();
+    enabled.generated_tokens.push(TokenId::new(3));
+    enabled.record_generated_token_commit();
+    enabled.generated_tokens.push(TokenId::new(4));
+    enabled.record_generated_token_commit();
+
+    let evidence = enabled
+        .take_execution_evidence()
+        .unwrap()
+        .expect("requested execution evidence");
+    assert_eq!(evidence.prompt_token_ids, input);
+    let timing = evidence.engine_token_timing.expect("engine token timing");
+    timing.validate(2).unwrap();
+    assert_eq!(timing.token_commit_nanos_since_request_start.len(), 2);
+    assert!(
+        timing.token_commit_nanos_since_request_start[1]
+            >= timing.token_commit_nanos_since_request_start[0]
+    );
+    assert!(timing.decode_wall_nanos().is_some());
+}
+
+#[test]
+fn vnext_profile_marks_only_failure_observed_as_blocking_first_failure() {
+    use ferrum_interfaces::vnext::{
+        ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
+        ExecutionPhase, FailureDomain, FailureEnvelope, IdentifiedFailure, MonotonicTimestamp,
+    };
+
+    let trace_path = resource_trace_temp_path("vnext-first-failure");
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let config = EngineConfig::default();
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+    let (_, _, accepted) =
+        vnext_profile_test_event_for_request("request.product.engine-profile-test");
+    let mut observed_parts = accepted.identity().parts().clone();
+    observed_parts.sequence = 2;
+    let observed_identity = ExecutionIdentityEnvelope::new(observed_parts).unwrap();
+    let failure = IdentifiedFailure::new(
+        observed_identity.clone(),
+        FailureEnvelope::new(
+            FailureDomain::Product,
+            "capacity_exhausted",
+            "capacity exhausted before admission",
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fingerprint = failure.fingerprint();
+    let observed = ExecutionEvent::new(
+        MonotonicTimestamp {
+            nanos_since_run_start: 2,
+        },
+        ExecutionPhase::Resolution,
+        ExecutionEventKind::FailureObserved,
+        observed_identity,
+        ExecutionEventDetail::Failure(failure),
+    )
+    .unwrap();
+
+    let mut terminal_parts = accepted.identity().parts().clone();
+    terminal_parts.sequence = 3;
+    let terminal = ExecutionEvent::new(
+        MonotonicTimestamp {
+            nanos_since_run_start: 3,
+        },
+        ExecutionPhase::Resolution,
+        ExecutionEventKind::RequestFailed,
+        ExecutionIdentityEnvelope::new(terminal_parts).unwrap(),
+        ExecutionEventDetail::FailureTerminal {
+            first_failure_fingerprint: fingerprint.clone(),
+        },
+    )
+    .unwrap();
+
+    let observed_profile = sink.profile_event(&observed).unwrap();
+    assert!(observed_profile.error.as_ref().unwrap().blocking);
+    assert_eq!(
+        observed_profile.attributes["first_failure_event"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        observed_profile.attributes["first_failure_fingerprint"],
+        serde_json::json!(fingerprint)
+    );
+    assert_eq!(
+        observed_profile.attributes["failure_domain"],
+        serde_json::json!("product")
+    );
+    assert_eq!(
+        observed_profile.attributes["execution_request_origin"],
+        serde_json::json!("product")
+    );
+    assert_eq!(
+        observed_profile.attributes["execution_request_id"],
+        serde_json::json!("request.product.engine-profile-test")
+    );
+
+    let terminal_profile = sink.profile_event(&terminal).unwrap();
+    assert!(!terminal_profile.error.as_ref().unwrap().blocking);
+    assert!(terminal_profile
+        .attributes
+        .get("first_failure_event")
+        .is_none());
+    assert_eq!(
+        terminal_profile.attributes["terminal_failure_event"],
+        serde_json::json!(true)
+    );
+    drop(sink);
+    journal.close().unwrap();
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
 fn vnext_execution_events_fan_out_to_profile_and_scheduler_journals() {
     let profile_path = resource_trace_temp_path("vnext-profile-fanout");
     let scheduler_path = resource_trace_temp_path("vnext-scheduler-fanout");

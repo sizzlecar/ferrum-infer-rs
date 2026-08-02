@@ -11,7 +11,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-from analyze_ferrum_profile import ValidationError, validate_profile_event
+from analyze_ferrum_profile import (
+    ENGINE_TIMING_PROFILE_DETAILS,
+    ValidationError,
+    deduplicate_profile_events,
+    event_attributes,
+    has_engine_token_timing_attributes,
+    logical_request_groups,
+    run_semantic_contract_selftest,
+    validate_engine_token_timing_attributes,
+    validate_failure_semantics,
+    validate_profile_event,
+)
 from request_replay_bundle_gate import BundleError, validate_bundle_root
 
 
@@ -136,8 +147,13 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
             "resource_leak_count"
         ] > 0:
             raise GateError(f"{context} reports resource_leak_count={event_attrs['resource_leak_count']}")
+        if has_engine_token_timing_attributes(event_attrs):
+            try:
+                validate_engine_token_timing_attributes(event_attrs, context)
+            except ValidationError as exc:
+                raise GateError(str(exc)) from exc
         if event_attrs.get("performance_claim") is True and (
-            event_attrs.get("profile_detail") in {"debug", "replay", "verify", "full"}
+            event_attrs.get("profile_detail") in {"kernel", "debug", "replay", "verify", "full"}
             or event_attrs.get("diagnostic_only") is True
         ):
             raise GateError(f"{context} uses diagnostic profile as performance claim")
@@ -164,22 +180,20 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
             validate_run_generation_profile_event(event_attrs, context)
         validate_resource_owner_close_summary(event, event_attrs, context)
 
-    capacity_by_request = capacity_events(events)
+
+
+def validate_gate_failure_semantics(events: list[dict[str, Any]], context: str) -> None:
+    try:
+        validate_failure_semantics(events, context)
+    except ValidationError as exc:
+        raise GateError(str(exc)) from exc
     for event in events:
         if event.get("status") != "failure":
             continue
         kind = err_kind(event)
-        event_attrs = attrs(event)
-        context = f"{path}:{event.get('event_id', '<unknown>')}"
-        error = event.get("error") if isinstance(event.get("error"), dict) else {}
-        if error.get("blocking") is True and event_attrs.get("first_failure_event") is not True:
-            raise GateError(f"{context} blocking failure requires first_failure_event=true")
-        if error.get("blocking") is True and "memory" not in event and "resource" not in event:
-            raise GateError(f"{context} blocking failure requires memory or resource snapshot")
+        event_context = f"{context}:{event.get('event_id', '<unknown>')}"
         if kind in BAD_TEXT_KINDS and "replay" not in event:
-            raise GateError(f"{context} correctness failure requires replay command")
-        if kind in OOM_KINDS and str(event.get("request_id", "")) not in capacity_by_request:
-            raise GateError(f"{context} OOM failure requires admission/defer/reject evidence")
+            raise GateError(f"{event_context} correctness failure requires replay command")
 
 
 def validate_resource_owner_close_summary(
@@ -305,13 +319,26 @@ def validate_request_token_latency_summary(
     if token_count_source not in allowed_token_sources:
         allowed = ", ".join(sorted(allowed_token_sources))
         raise GateError(f"{context} attributes.token_count_source must be one of: {allowed}")
+    if event_attrs.get("profile_detail") in ENGINE_TIMING_PROFILE_DETAILS:
+        try:
+            validate_engine_token_timing_attributes(event_attrs, context)
+        except ValidationError as exc:
+            raise GateError(str(exc)) from exc
 
 
 def event_summary(event: dict[str, Any]) -> dict[str, Any]:
     error = event.get("error") if isinstance(event.get("error"), dict) else None
+    event_attrs = attrs(event)
     return {
         "event_id": event.get("event_id"),
         "request_id": event.get("request_id"),
+        "execution_request_id": event_attrs.get("execution_request_id"),
+        "run_id": event_attrs.get("run_id"),
+        "ts_unix_nanos": event.get("ts_unix_nanos"),
+        "monotonic_nanos_since_run_start": event_attrs.get(
+            "monotonic_nanos_since_run_start"
+        ),
+        "execution_sequence": (event.get("shape") or {}).get("execution_sequence"),
         "entrypoint": event.get("entrypoint"),
         "backend": event.get("backend"),
         "phase": event.get("phase"),
@@ -322,21 +349,13 @@ def event_summary(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def summarize_events(profile_paths: list[Path], events_by_path: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    seen_event_keys: set[tuple[str, str, str, str]] = set()
-    all_events: list[dict[str, Any]] = []
-    for events in events_by_path.values():
-        for event in events:
-            key = (
-                str(event.get("event_id", "")),
-                str(event.get("request_id", "")),
-                str(event.get("entrypoint", "")),
-                str(event.get("phase", "")),
-            )
-            if key in seen_event_keys:
-                continue
-            seen_event_keys.add(key)
-            all_events.append(event)
-    request_ids = {str(event.get("request_id")) for event in all_events if event.get("request_id")}
+    try:
+        all_events = deduplicate_profile_events(
+            [event for events in events_by_path.values() for event in events]
+        )
+        request_groups = logical_request_groups(all_events)
+    except ValidationError as exc:
+        raise GateError(str(exc)) from exc
     failed_events = [event for event in all_events if event.get("status") == "failure"]
     durations = sorted(
         int(event["duration_us"])
@@ -364,7 +383,32 @@ def summarize_events(profile_paths: list[Path], events_by_path: dict[str, list[d
         key=lambda event: int(event["duration_us"]),
         reverse=True,
     )[:5]
-    first_failure = event_summary(failed_events[0]) if failed_events else None
+    first_failures_by_request = []
+    for (entrypoint, execution_request_id), group in sorted(request_groups.items()):
+        first_candidates = [
+            event
+            for event in group
+            if event.get("status") == "failure"
+            and event_attributes(event).get("first_failure_event") is True
+        ]
+        if first_candidates:
+            first_failures_by_request.append(
+                {
+                    "logical_request": {
+                        "entrypoint": entrypoint,
+                        "execution_request_id": execution_request_id,
+                    },
+                    "event": event_summary(first_candidates[0]),
+                }
+            )
+    presentation_order = sorted(
+        first_failures_by_request,
+        key=lambda item: (
+            int(item["event"].get("ts_unix_nanos", 0) or 0),
+            str(item["event"].get("event_id", "")),
+        ),
+    )
+    first_failure = presentation_order[0]["event"] if presentation_order else None
     replay_commands = []
     for event in all_events:
         replay = event.get("replay")
@@ -404,7 +448,7 @@ def summarize_events(profile_paths: list[Path], events_by_path: dict[str, list[d
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
-        "request_count": len(request_ids),
+        "request_count": len(request_groups),
         "failed_count": len(failed_events),
         "corrupted_count": corrupted_count,
         "bad_text_count": bad_text_count,
@@ -435,6 +479,7 @@ def summarize_events(profile_paths: list[Path], events_by_path: dict[str, list[d
             for event in slow_events
         ],
         "first_failure_event": first_failure,
+        "first_failure_events_by_request": first_failures_by_request,
         "replay_commands": replay_commands,
         "entrypoints": entrypoints,
         "profile_paths": [str(path) for path in profile_paths],
@@ -452,6 +497,10 @@ def validate_passing_profile_summary(summary: dict[str, Any], label: str) -> Non
             raise GateError(f"{label}.{field} must be 0 for a passing product profile")
     if summary.get("first_failure_event") is not None:
         raise GateError(f"{label}.first_failure_event must be null when failed_count is 0")
+    if summary.get("first_failure_events_by_request") != []:
+        raise GateError(
+            f"{label}.first_failure_events_by_request must be empty when failed_count is 0"
+        )
     replay_commands = summary.get("replay_commands")
     if not isinstance(replay_commands, list) or not replay_commands:
         raise GateError(f"{label}.replay_commands must contain at least one replay command")
@@ -557,6 +606,10 @@ def load_and_validate_profiles(profile_paths: list[Path]) -> dict[str, list[dict
         events = read_jsonl(path)
         validate_gate_semantics(path, events)
         events_by_path[str(path)] = events
+    validate_gate_failure_semantics(
+        [event for events in events_by_path.values() for event in events],
+        "observability-profile-inputs",
+    )
     return events_by_path
 
 
@@ -591,6 +644,7 @@ def run_fixture_selftest(root: Path) -> dict[str, Any]:
         "fail_fixture_count": len(fail_results),
         "pass_fixtures": [str(path) for path in pass_files],
         "fail_fixtures": fail_results,
+        "semantic_contracts": run_semantic_contract_selftest(root),
     }
 
 

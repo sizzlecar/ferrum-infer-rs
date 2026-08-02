@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -20,6 +21,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GOAL = "release-regression-hardening-2026-06-28"
 PASS_LINE = "PRODUCT OBSERVABILITY WIRING PASS"
 SELFTEST_PASS_LINE = "PRODUCT OBSERVABILITY WIRING SELFTEST PASS"
+PROFILE_DETAIL_CHOICES = [
+    "basic",
+    "resource",
+    "latency",
+    "kernel",
+    "debug",
+    "replay",
+    "verify",
+    "full",
+]
 SCHEMA_VERSION = 1
 SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "KEY")
 SAFE_ENV_NAMES = {"CI", "CARGO_HOME", "HF_HOME", "HOME", "PATH", "RUSTFLAGS", "RUST_BACKTRACE", "RUST_LOG"}
@@ -361,6 +372,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_self_test() -> None:
+    required_details = {"basic", "resource", "latency", "kernel", "replay"}
+    if not required_details.issubset(PROFILE_DETAIL_CHOICES):
+        raise GateError("typed product profile detail choices are incomplete")
     with tempfile.TemporaryDirectory(prefix="ferrum-product-observability-selftest-") as tmp:
         root = Path(tmp)
         entry = root / "run"
@@ -399,6 +413,7 @@ def write_selftest_replay_bundle(request_dump_root: Path, entrypoint: str) -> No
     request_id = f"req-{entrypoint}"
     bundle = request_dump_root / request_id
     bundle.mkdir(parents=True, exist_ok=True)
+    output_text = b"synthetic ok\n"
     replay_argv = [
         "cargo",
         "run",
@@ -474,7 +489,7 @@ def write_selftest_replay_bundle(request_dump_root: Path, entrypoint: str) -> No
             "reasons": [],
             "first_bad_text_span": None,
             "failure_kind": None,
-            "output_sha256": "0" * 64,
+            "output_sha256": hashlib.sha256(output_text).hexdigest(),
         },
         "replay.command.json": {
             "schema_version": SCHEMA_VERSION,
@@ -494,14 +509,14 @@ def write_selftest_replay_bundle(request_dump_root: Path, entrypoint: str) -> No
     }
     for name, data in files.items():
         write_json(bundle / name, data)
-    (bundle / "output_text.txt").write_text("synthetic ok\n", encoding="utf-8")
+    (bundle / "output_text.txt").write_bytes(output_text)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path)
     parser.add_argument("--ferrum-bin", type=Path)
-    parser.add_argument("--profile-detail", default="basic", choices=["basic", "debug", "full"])
+    parser.add_argument("--profile-detail", default="basic", choices=PROFILE_DETAIL_CHOICES)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()

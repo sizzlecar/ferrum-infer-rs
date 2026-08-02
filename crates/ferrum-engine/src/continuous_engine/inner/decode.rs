@@ -119,6 +119,7 @@ impl EngineInner {
                     };
                     sequence.generated_tokens.push(token);
                     sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
+                    sequence.record_generated_token_commit();
                     Ok::<TokenId, FerrumError>(token)
                 })
             };
@@ -541,6 +542,7 @@ impl EngineInner {
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
                 seq.commit_decode_step_physical_resources(model_kv)?;
+                seq.record_generated_token_commit();
                 // pos_offset is sourced from SequenceState bookkeeping
                 // (see process_batch_unified). The engine-side KV handle's
                 // sequence_length is not used for position tracking
@@ -704,6 +706,7 @@ impl EngineInner {
                     .clone()
                     .or(input_recurrent_state),
             );
+            seq.record_generated_token_commit();
             Ok::<TokenId, FerrumError>(token)
         })();
         let next_token = match next_token_result {
@@ -957,6 +960,7 @@ impl EngineInner {
                     seq.generated_tokens.push(tok);
                     *seq.token_frequencies.entry(tok).or_insert(0) += 1;
                     seq.tokens_this_iteration += 1;
+                    seq.record_generated_token_commit();
                 }
             }
             last_emitted = tok;

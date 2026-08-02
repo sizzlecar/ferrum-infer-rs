@@ -1,6 +1,6 @@
 //! Product-path observability profile event schema.
 
-use crate::resource_trace::ResourceTraceEvent;
+use crate::{requests::EngineTokenTimingEvidence, resource_trace::ResourceTraceEvent};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +13,100 @@ pub const SYNTHETIC_RUNTIME_PRESET_HASH: &str =
     "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc";
 pub const ENGINE_RUNTIME_TRACE_PRESET_HASH: &str =
     "sha256:30c1be62aa61858deca261ebcbfb4115918c1d6d0466f7ad5ffd7bc8d901e782";
+
+pub fn engine_token_timing_profile_attributes(
+    timing: &EngineTokenTimingEvidence,
+) -> BTreeMap<String, Value> {
+    let intervals = timing.inter_token_nanos();
+    let total_itl_nanos = intervals
+        .iter()
+        .fold(0_u128, |total, interval| total + u128::from(*interval));
+    let average_itl_nanos = if intervals.is_empty() {
+        0
+    } else {
+        u64::try_from(total_itl_nanos / intervals.len() as u128).unwrap_or(u64::MAX)
+    };
+    let mut attributes = BTreeMap::from([
+        (
+            "engine_token_clock_source".to_string(),
+            serde_json::json!(timing.clock_source),
+        ),
+        (
+            "engine_token_wall_anchor_unix_nanos".to_string(),
+            serde_json::json!(timing.wall_anchor_unix_nanos),
+        ),
+        (
+            "clock_conversion_max_error_nanos".to_string(),
+            serde_json::json!(timing.wall_anchor_max_error_nanos),
+        ),
+        (
+            "engine_token_commit_nanos_since_request_start".to_string(),
+            serde_json::json!(timing.token_commit_nanos_since_request_start),
+        ),
+        (
+            "engine_token_commit_count".to_string(),
+            serde_json::json!(timing.token_commit_nanos_since_request_start.len()),
+        ),
+        (
+            "itl_source".to_string(),
+            serde_json::json!("engine_token_commit"),
+        ),
+        (
+            "itl_interval_count".to_string(),
+            serde_json::json!(intervals.len()),
+        ),
+        ("itl_nanos".to_string(), serde_json::json!(intervals)),
+        (
+            "itl_us_avg".to_string(),
+            serde_json::json!(average_itl_nanos / 1_000),
+        ),
+    ]);
+    if let Some(ttft_nanos) = timing.ttft_nanos() {
+        attributes.insert("ttft_us".to_string(), serde_json::json!(ttft_nanos / 1_000));
+    }
+    if let Some(decode_ready_nanos) = timing.decode_ready_nanos_since_request_start {
+        attributes.insert(
+            "engine_decode_ready_nanos_since_request_start".to_string(),
+            serde_json::json!(decode_ready_nanos),
+        );
+    }
+    if let Some(decode_wall_nanos) = timing.decode_wall_nanos().filter(|value| *value > 0) {
+        let conversion_error_ppm = u64::try_from(
+            u128::from(timing.wall_anchor_max_error_nanos).saturating_mul(1_000_000)
+                / u128::from(decode_wall_nanos),
+        )
+        .unwrap_or(u64::MAX);
+        attributes.insert(
+            "engine_decode_wall_nanos".to_string(),
+            serde_json::json!(decode_wall_nanos),
+        );
+        attributes.insert(
+            "clock_conversion_error_ppm".to_string(),
+            serde_json::json!(conversion_error_ppm),
+        );
+        attributes.insert(
+            "decode_wall_timing_eligible".to_string(),
+            serde_json::json!(true),
+        );
+    } else {
+        let reason = if timing.token_commit_nanos_since_request_start.is_empty() {
+            "no_token_commits"
+        } else if timing.decode_ready_nanos_since_request_start.is_none() {
+            "decode_not_entered"
+        } else {
+            "no_positive_decode_commit_interval"
+        };
+        attributes.insert(
+            "decode_wall_timing_eligible".to_string(),
+            serde_json::json!(false),
+        );
+        attributes.insert(
+            "decode_wall_timing_unavailable_reason".to_string(),
+            serde_json::json!(reason),
+        );
+    }
+    attributes
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +162,9 @@ pub enum ObservabilityProfileDetail {
     #[default]
     Off,
     Basic,
+    Resource,
+    Latency,
+    Kernel,
     Debug,
     Replay,
     Verify,
@@ -79,6 +176,9 @@ impl ObservabilityProfileDetail {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
             "basic" => Some(Self::Basic),
+            "resource" => Some(Self::Resource),
+            "latency" => Some(Self::Latency),
+            "kernel" => Some(Self::Kernel),
             "debug" => Some(Self::Debug),
             "replay" => Some(Self::Replay),
             "verify" => Some(Self::Verify),
@@ -91,6 +191,9 @@ impl ObservabilityProfileDetail {
         match self {
             Self::Off => "off",
             Self::Basic => "basic",
+            Self::Resource => "resource",
+            Self::Latency => "latency",
+            Self::Kernel => "kernel",
             Self::Debug => "debug",
             Self::Replay => "replay",
             Self::Verify => "verify",
@@ -99,7 +202,17 @@ impl ObservabilityProfileDetail {
     }
 
     pub fn diagnostic_only(self) -> bool {
-        matches!(self, Self::Debug | Self::Replay | Self::Verify | Self::Full)
+        matches!(
+            self,
+            Self::Kernel | Self::Debug | Self::Replay | Self::Verify | Self::Full
+        )
+    }
+
+    pub fn captures_engine_token_timing(self) -> bool {
+        matches!(
+            self,
+            Self::Latency | Self::Kernel | Self::Replay | Self::Verify | Self::Full
+        )
     }
 }
 
@@ -414,6 +527,66 @@ mod tests {
         assert_eq!(ObservabilityProfileDetail::Replay.as_str(), "replay");
         assert!(ObservabilityProfileDetail::Replay.diagnostic_only());
         assert!(!ObservabilityProfileDetail::Basic.diagnostic_only());
+    }
+
+    #[test]
+    fn staged_product_profile_details_are_typed_with_distinct_claim_status() {
+        for (name, expected) in [
+            ("resource", ObservabilityProfileDetail::Resource),
+            ("latency", ObservabilityProfileDetail::Latency),
+            ("kernel", ObservabilityProfileDetail::Kernel),
+        ] {
+            assert_eq!(ObservabilityProfileDetail::parse(name), Some(expected));
+            assert_eq!(expected.as_str(), name);
+        }
+        assert!(!ObservabilityProfileDetail::Resource.diagnostic_only());
+        assert!(!ObservabilityProfileDetail::Latency.diagnostic_only());
+        assert!(ObservabilityProfileDetail::Kernel.diagnostic_only());
+        assert!(!ObservabilityProfileDetail::Resource.captures_engine_token_timing());
+        assert!(ObservabilityProfileDetail::Latency.captures_engine_token_timing());
+        assert!(ObservabilityProfileDetail::Kernel.captures_engine_token_timing());
+    }
+
+    #[test]
+    fn engine_token_timing_preserves_exact_commit_intervals() {
+        let timing = EngineTokenTimingEvidence {
+            clock_source: "rust_std_instant".to_string(),
+            wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
+            wall_anchor_max_error_nanos: 400,
+            decode_ready_nanos_since_request_start: Some(2_000_000),
+            token_commit_nanos_since_request_start: vec![1_000_000, 2_500_000, 5_000_000],
+        };
+        timing.validate(3).unwrap();
+        assert!(timing.validate(2).is_err());
+
+        let attributes = engine_token_timing_profile_attributes(&timing);
+        assert_eq!(
+            attributes["engine_token_commit_count"],
+            serde_json::json!(3)
+        );
+        assert_eq!(attributes["ttft_us"], serde_json::json!(1_000));
+        assert_eq!(attributes["itl_interval_count"], serde_json::json!(2));
+        assert_eq!(
+            attributes["itl_nanos"],
+            serde_json::json!([1_500_000, 2_500_000])
+        );
+        assert_eq!(attributes["itl_us_avg"], serde_json::json!(2_000));
+        assert_eq!(
+            attributes["engine_decode_wall_nanos"],
+            serde_json::json!(3_000_000)
+        );
+        assert_eq!(
+            attributes["clock_conversion_error_ppm"],
+            serde_json::json!(133)
+        );
+        assert_eq!(
+            attributes["decode_wall_timing_eligible"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            attributes["itl_source"],
+            serde_json::json!("engine_token_commit")
+        );
     }
 
     #[test]

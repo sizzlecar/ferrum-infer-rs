@@ -226,7 +226,10 @@ impl VNextProfileExecutionEventSink {
                 profile_detail: config.runtime.profile_detail,
                 capture_policy: if matches!(
                     config.runtime.profile_detail,
-                    ObservabilityProfileDetail::Replay
+                    ObservabilityProfileDetail::Resource
+                        | ObservabilityProfileDetail::Latency
+                        | ObservabilityProfileDetail::Kernel
+                        | ObservabilityProfileDetail::Replay
                         | ObservabilityProfileDetail::Verify
                         | ObservabilityProfileDetail::Full
                 ) {
@@ -328,7 +331,7 @@ impl VNextProfileEventContext {
             } => Some(ProfileError {
                 kind: "vnext_request_failed".to_string(),
                 message: format!("request terminated after failure {first_failure_fingerprint}"),
-                blocking: true,
+                blocking: false,
             }),
             _ => None,
         };
@@ -413,6 +416,42 @@ impl VNextProfileEventContext {
                 "execution_request_origin".to_string(),
                 serde_json::json!(origin.namespace()),
             );
+            attributes.insert(
+                "execution_request_id".to_string(),
+                serde_json::json!(identity.request_id.to_string()),
+            );
+        }
+        match event.detail() {
+            ExecutionEventDetail::Failure(failure) => {
+                attributes.insert("first_failure_event".to_string(), serde_json::json!(true));
+                attributes.insert(
+                    "first_failure_fingerprint".to_string(),
+                    serde_json::json!(failure.fingerprint()),
+                );
+                attributes.insert(
+                    "failure_domain".to_string(),
+                    serde_json::json!(
+                        format!("{:?}", failure.failure().domain()).to_ascii_lowercase()
+                    ),
+                );
+                attributes.insert(
+                    "failure_retryable".to_string(),
+                    serde_json::json!(failure.failure().retryable()),
+                );
+            }
+            ExecutionEventDetail::FailureTerminal {
+                first_failure_fingerprint,
+            } => {
+                attributes.insert(
+                    "terminal_failure_event".to_string(),
+                    serde_json::json!(true),
+                );
+                attributes.insert(
+                    "first_failure_fingerprint".to_string(),
+                    serde_json::json!(first_failure_fingerprint),
+                );
+            }
+            _ => {}
         }
         for (key, value) in [
             (
@@ -765,7 +804,9 @@ impl VNextProfileEventContext {
                 "execution_path_policy".to_string(),
                 serde_json::json!(match self.profile_detail {
                     ObservabilityProfileDetail::Verify => "compiled_bindings_eager_commands",
-                    ObservabilityProfileDetail::Full => "logical_commands_reusable_segments",
+                    ObservabilityProfileDetail::Kernel | ObservabilityProfileDetail::Full => {
+                        "logical_commands_reusable_segments"
+                    }
                     _ => "production_selection",
                 }),
             ),
@@ -1378,8 +1419,12 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
 
     fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
         match self.context.profile_detail {
-            ObservabilityProfileDetail::Off => ferrum_interfaces::vnext::DeviceTimingMode::Off,
-            ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
+            ObservabilityProfileDetail::Off | ObservabilityProfileDetail::Resource => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Off
+            }
+            ObservabilityProfileDetail::Basic
+            | ObservabilityProfileDetail::Latency
+            | ObservabilityProfileDetail::Debug => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Completion
             }
             ObservabilityProfileDetail::Replay => {
@@ -1388,7 +1433,9 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
             ObservabilityProfileDetail::Verify => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Verification
             }
-            ObservabilityProfileDetail::Full => ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
+            ObservabilityProfileDetail::Kernel | ObservabilityProfileDetail::Full => {
+                ferrum_interfaces::vnext::DeviceTimingMode::Kernel
+            }
         }
     }
 

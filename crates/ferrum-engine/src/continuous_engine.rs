@@ -54,13 +54,13 @@ use ferrum_scheduler::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
 };
 use ferrum_types::{
-    DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
-    InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
-    Priority, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
-    ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary, Result, SamplingParams,
-    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-    PROMPT_TOKENS_METADATA_KEY,
+    DataType, Device, EngineConfig, EngineStatus, EngineTokenTimingEvidence, FerrumError,
+    FerrumProfileEvent, FinishReason, InferenceExecutionEvidence, InferenceRequest,
+    InferenceResponse, ObservabilityProfileDetail, Priority, ProfileEntrypoint, ProfileError,
+    ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent,
+    ResponseCompletionBoundary, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
@@ -75,7 +75,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 

@@ -195,7 +195,7 @@ impl EngineConfig {
             self.runtime.profile_detail =
                 ObservabilityProfileDetail::parse(value).ok_or_else(|| {
                     format!(
-                    "FERRUM_PROFILE_DETAIL: expected one of off, basic, debug, replay, full; got {value:?}"
+                    "FERRUM_PROFILE_DETAIL: expected one of off, basic, resource, latency, kernel, debug, replay, verify, full; got {value:?}"
                     )
                 })?;
         }
@@ -1020,6 +1020,21 @@ mod tests {
         assert_eq!(
             config.runtime.profile_detail,
             ObservabilityProfileDetail::Full
+        );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_latency_profile_detail_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_DETAIL", "latency")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("latency profile detail should apply");
+
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Latency
         );
     }
 

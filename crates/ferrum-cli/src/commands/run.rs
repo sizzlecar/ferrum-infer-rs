@@ -361,6 +361,7 @@ struct CollectedRunGeneration {
     token_count: usize,
     token_ids: Vec<u32>,
     chunk_count: usize,
+    execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
 }
 
 impl CollectedRunGeneration {
@@ -377,6 +378,7 @@ impl CollectedRunGeneration {
                 .map(|token| token.get())
                 .collect(),
             chunk_count: 1,
+            execution_evidence: response.execution_evidence,
         }
     }
 }
@@ -398,8 +400,9 @@ async fn collect_run_stream(
     let mut token_count = 0usize;
     let mut token_ids = Vec::new();
     let mut chunk_count = 0usize;
+    let mut execution_evidence = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let mut chunk = chunk?;
         let chunk_request_id = chunk.request_id.to_string();
         if chunk_request_id != expected_request_id {
             return Err(FerrumError::internal(format!(
@@ -438,6 +441,13 @@ async fn collect_run_stream(
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason;
         }
+        if let Some(evidence) = chunk.execution_evidence.take() {
+            if execution_evidence.replace(evidence).is_some() {
+                return Err(FerrumError::internal(
+                    "run stream emitted engine execution evidence more than once",
+                ));
+            }
+        }
     }
     Ok(CollectedRunGeneration {
         request_id: request_id.unwrap_or_else(|| expected_request_id.to_string()),
@@ -447,6 +457,7 @@ async fn collect_run_stream(
         token_count,
         token_ids,
         chunk_count,
+        execution_evidence,
     })
 }
 
@@ -1040,7 +1051,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             session_id: None,
             created_at: Utc::now(),
             api_request: None,
-            evidence_request: Default::default(),
+            evidence_request: ferrum_types::InferenceEvidenceRequest {
+                capture_engine_token_timing: product_observability
+                    .profile_detail
+                    .captures_engine_token_timing(),
+                ..Default::default()
+            },
             metadata,
         };
         let profile_request_id = request.id.to_string();
@@ -1125,6 +1141,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             token_count: tokens,
             token_ids: output_token_ids,
             chunk_count,
+            execution_evidence,
         } = generation;
         if response_request_id != request_id_text {
             return Err(FerrumError::internal(format!(
@@ -1205,6 +1222,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 prompt_chars,
                 response_chars: raw_response.chars().count(),
                 response_text: raw_response,
+                execution_evidence,
                 memory,
                 memory_stages: actual_run_memory_stages(
                     product_memory_enabled,
@@ -1342,7 +1360,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     session_id: None,
                     created_at: Utc::now(),
                     api_request: None,
-                    evidence_request: Default::default(),
+                    evidence_request: ferrum_types::InferenceEvidenceRequest {
+                        capture_engine_token_timing: product_observability
+                            .profile_detail
+                            .captures_engine_token_timing(),
+                        ..Default::default()
+                    },
                     metadata,
                 };
 
@@ -2548,6 +2571,26 @@ mod tests {
         assert_eq!(
             engine.runtime.profile_detail,
             ferrum_types::ObservabilityProfileDetail::Full
+        );
+    }
+
+    #[test]
+    fn run_latency_profile_detail_reaches_typed_engine_config() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Latency;
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+
+        engine
+            .apply_runtime_config_snapshot(&effective)
+            .expect("latency profile detail should apply");
+
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Latency
         );
     }
 
