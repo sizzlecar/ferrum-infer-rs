@@ -12,18 +12,19 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 const SYNTHETIC_MODEL: &str = "synthetic/no-weight";
 const SYNTHETIC_BACKEND: &str = "synthetic";
-static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum ProfileDetailArg {
     #[default]
     Off,
     Basic,
+    Resource,
+    Latency,
+    Kernel,
     Debug,
     Replay,
     Verify,
@@ -35,6 +36,9 @@ impl ProfileDetailArg {
         match self {
             Self::Off => "off",
             Self::Basic => "basic",
+            Self::Resource => "resource",
+            Self::Latency => "latency",
+            Self::Kernel => "kernel",
             Self::Debug => "debug",
             Self::Replay => "replay",
             Self::Verify => "verify",
@@ -48,6 +52,9 @@ impl From<ProfileDetailArg> for ObservabilityProfileDetail {
         match value {
             ProfileDetailArg::Off => Self::Off,
             ProfileDetailArg::Basic => Self::Basic,
+            ProfileDetailArg::Resource => Self::Resource,
+            ProfileDetailArg::Latency => Self::Latency,
+            ProfileDetailArg::Kernel => Self::Kernel,
             ProfileDetailArg::Debug => Self::Debug,
             ProfileDetailArg::Replay => Self::Replay,
             ProfileDetailArg::Verify => Self::Verify,
@@ -82,6 +89,7 @@ pub struct ActualRunObservation {
     pub prompt_chars: usize,
     pub response_chars: usize,
     pub response_text: String,
+    pub execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     pub memory_stages: Vec<ActualMemoryStageObservation>,
 }
@@ -234,29 +242,14 @@ pub fn write_synthetic_product_observability(
     );
     let replay_command = replay_command(config);
     let events = product_events(config, &request_id, &replay_command);
-    let mut written = Vec::new();
-    if let Some(path) = &config.profile_jsonl {
-        write_profile_jsonl(path, &events)?;
-        written.push(path.clone());
-    }
-    if let Some(path) = &config.memory_profile_jsonl {
-        let memory_events: Vec<_> = events
-            .iter()
-            .filter(|event| event.memory.is_some())
-            .cloned()
-            .collect();
-        write_profile_jsonl(path, &memory_events)?;
-        written.push(path.clone());
-    }
-    if let Some(path) = &config.scheduler_trace_jsonl {
-        let scheduler_events: Vec<_> = events
-            .iter()
-            .filter(|event| event.resource.is_some())
-            .cloned()
-            .collect();
-        write_profile_jsonl(path, &scheduler_events)?;
-        written.push(path.clone());
-    }
+    let mut written = write_profile_outputs(
+        config,
+        &events,
+        ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+        true,
+        true,
+        true,
+    )?;
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
         written.extend(write_replay_bundle(
@@ -291,6 +284,15 @@ pub fn write_actual_run_observability(
         return Ok(Vec::new());
     }
     config.validate()?;
+    if let Some(timing) = observation
+        .execution_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.engine_token_timing.as_ref())
+    {
+        timing
+            .validate(observation.output_tokens)
+            .map_err(FerrumError::invalid_parameter)?;
+    }
     let replay_command = replay_command(config);
     let events = actual_run_events(config, observation, &replay_command);
     write_actual_run_artifacts(config, &events, observation, &replay_command)
@@ -342,16 +344,14 @@ pub fn append_actual_serve_memory_stage_observability(
     config.validate()?;
     let request_id = format!("serve-memory-{}", Uuid::new_v4().simple());
     let events = actual_memory_stage_events(config, &request_id, &[stage], Utc::now());
-    let mut written = Vec::new();
-    if let Some(path) = &config.profile_jsonl {
-        append_profile_jsonl(path, &events)?;
-        written.push(path.clone());
-    }
-    if let Some(path) = &config.memory_profile_jsonl {
-        append_profile_jsonl(path, &events)?;
-        written.push(path.clone());
-    }
-    Ok(written)
+    write_profile_outputs(
+        config,
+        &events,
+        ferrum_bench_core::JsonlJournalOpenMode::Append,
+        true,
+        true,
+        false,
+    )
 }
 
 fn write_actual_run_artifacts(
@@ -430,29 +430,14 @@ fn write_actual_artifacts(
     request_id: &str,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
-    let mut written = Vec::new();
-    if let Some(path) = &config.profile_jsonl {
-        write_profile_jsonl(path, events)?;
-        written.push(path.clone());
-    }
-    if let Some(path) = &config.memory_profile_jsonl {
-        let memory_events: Vec<_> = events
-            .iter()
-            .filter(|event| event.memory.is_some())
-            .cloned()
-            .collect();
-        write_profile_jsonl(path, &memory_events)?;
-        written.push(path.clone());
-    }
-    if let Some(path) = &config.scheduler_trace_jsonl {
-        let scheduler_events: Vec<_> = events
-            .iter()
-            .filter(|event| event.resource.is_some())
-            .cloned()
-            .collect();
-        append_profile_jsonl(path, &scheduler_events)?;
-        written.push(path.clone());
-    }
+    let mut written = write_profile_outputs(
+        config,
+        events,
+        ferrum_bench_core::JsonlJournalOpenMode::Append,
+        true,
+        true,
+        true,
+    )?;
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
         written.extend(write_replay_bundle(
@@ -477,6 +462,80 @@ fn write_actual_artifacts(
                 failure_diagnostics: None,
             },
         )?);
+    }
+    Ok(written)
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProfileOutputRoles {
+    profile: bool,
+    memory: bool,
+    scheduler: bool,
+}
+
+fn add_profile_output_target(
+    targets: &mut BTreeMap<PathBuf, ProfileOutputRoles>,
+    path: Option<&PathBuf>,
+    role: fn(&mut ProfileOutputRoles) -> &mut bool,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let normalized = ferrum_bench_core::normalize_jsonl_path(path).map_err(|error| {
+        FerrumError::io(format!(
+            "normalize observability JSONL path {}: {error}",
+            path.display()
+        ))
+    })?;
+    *role(targets.entry(normalized).or_default()) = true;
+    Ok(())
+}
+
+fn write_profile_outputs(
+    config: &ProductObservabilityConfig,
+    events: &[FerrumProfileEvent],
+    mode: ferrum_bench_core::JsonlJournalOpenMode,
+    include_profile: bool,
+    include_memory: bool,
+    include_scheduler: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut targets = BTreeMap::<PathBuf, ProfileOutputRoles>::new();
+    if include_profile {
+        add_profile_output_target(&mut targets, config.profile_jsonl.as_ref(), |roles| {
+            &mut roles.profile
+        })?;
+    }
+    if include_memory {
+        add_profile_output_target(
+            &mut targets,
+            config.memory_profile_jsonl.as_ref(),
+            |roles| &mut roles.memory,
+        )?;
+    }
+    if include_scheduler {
+        add_profile_output_target(
+            &mut targets,
+            config.scheduler_trace_jsonl.as_ref(),
+            |roles| &mut roles.scheduler,
+        )?;
+    }
+
+    let mut written = Vec::with_capacity(targets.len());
+    for (path, roles) in targets {
+        let selected = events
+            .iter()
+            .filter(|event| {
+                roles.profile
+                    || (roles.memory && event.memory.is_some())
+                    || (roles.scheduler && event.resource.is_some())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        write_profile_events(&path, mode, &selected)?;
+        written.push(path);
     }
     Ok(written)
 }
@@ -729,6 +788,15 @@ fn actual_run_events(
         "finish_reason".to_string(),
         json!(observation.finish_reason.as_deref().unwrap_or("unknown")),
     );
+    if let Some(timing) = observation
+        .execution_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.engine_token_timing.as_ref())
+    {
+        generation
+            .attributes
+            .extend(ferrum_types::engine_token_timing_profile_attributes(timing));
+    }
 
     let release = actual_resource_event(
         config,
@@ -860,7 +928,7 @@ fn actual_run_failure_events(
     failure.error = Some(ProfileError {
         kind: observation.error_kind.clone(),
         message: observation.error_message.clone(),
-        blocking: true,
+        blocking: false,
     });
     failure.replay = Some(ReplayReference {
         command: replay_command.to_string(),
@@ -876,7 +944,7 @@ fn actual_run_failure_events(
     );
     failure
         .attributes
-        .insert("first_failure_event".to_string(), json!(true));
+        .insert("terminal_failure_event".to_string(), json!(true));
     failure
         .attributes
         .insert("prompt_chars".to_string(), json!(observation.prompt_chars));
@@ -1126,6 +1194,10 @@ fn actual_base_event(
     let mut event = base_event(config, request_id, phase, event_kind, timestamp);
     event.backend = "actual".to_string();
     event.attributes = actual_attrs(config);
+    event.attributes.insert(
+        "execution_request_id".to_string(),
+        json!(format!("request.product.{request_id}")),
+    );
     event
 }
 
@@ -1770,70 +1842,39 @@ fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
     }
 }
 
+#[cfg(test)]
 fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    let body = serialize_profile_jsonl_events(events)?;
-    let _guard = profile_jsonl_file_lock()
-        .lock()
-        .map_err(|err| FerrumError::internal(format!("profile JSONL file lock poisoned: {err}")))?;
-    fs_write(path, body)
+    write_profile_events(
+        path,
+        ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+        events,
+    )
 }
 
+#[cfg(test)]
 fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    let body = serialize_profile_jsonl_events(events)?;
-    let _guard = profile_jsonl_file_lock()
-        .lock()
-        .map_err(|err| FerrumError::internal(format!("profile JSONL file lock poisoned: {err}")))?;
-    append_profile_jsonl_body(path, &body)
+    write_profile_events(
+        path,
+        ferrum_bench_core::JsonlJournalOpenMode::Append,
+        events,
+    )
 }
 
-fn serialize_profile_jsonl_events(events: &[FerrumProfileEvent]) -> Result<String> {
+fn write_profile_events(
+    path: &Path,
+    mode: ferrum_bench_core::JsonlJournalOpenMode,
+    events: &[FerrumProfileEvent],
+) -> Result<()> {
     if events.is_empty() {
         return Err(FerrumError::internal("profile event set must be non-empty"));
     }
-    let mut body = String::new();
     for event in events {
         event.validate().map_err(|err| {
             FerrumError::internal(format!("invalid product observability event: {err}"))
         })?;
-        body.push_str(&serde_json::to_string(event).map_err(|err| {
-            FerrumError::serialization(format!("failed to serialize profile event: {err}"))
-        })?);
-        body.push('\n');
     }
-    Ok(body)
-}
-
-fn profile_jsonl_file_lock() -> &'static Mutex<()> {
-    PROFILE_JSONL_FILE_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn append_profile_jsonl_body(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs_create_dir_all(parent)?;
-    }
-    use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| {
-            FerrumError::internal(format!(
-                "failed to open profile JSONL {} for append: {err}",
-                path.display()
-            ))
-        })?;
-    file.write_all(body.as_bytes()).map_err(|err| {
-        FerrumError::internal(format!(
-            "failed to append profile JSONL {}: {err}",
-            path.display()
-        ))
-    })?;
-    file.flush().map_err(|err| {
-        FerrumError::internal(format!(
-            "failed to flush profile JSONL {}: {err}",
-            path.display()
-        ))
-    })
+    ferrum_bench_core::write_jsonl_records(path, mode, events)
+        .map_err(|error| FerrumError::io(error.to_string()))
 }
 
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
@@ -1952,6 +1993,49 @@ mod tests {
         let engine_argv = replay["engine_replay"]["argv"].as_array().unwrap();
         assert!(engine_argv.iter().any(|item| item == "replay-bundle"));
         assert_eq!(replay["engine_replay"]["requires_http_server"], false);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn aliased_profile_roles_write_each_event_once() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-product-observability-alias-{}",
+            Uuid::new_v4().simple()
+        ));
+        let combined = root.join("combined.jsonl");
+        let memory_alias = root.join(".").join("combined.jsonl");
+        let scheduler_alias = root.join("not-created").join("..").join("combined.jsonl");
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            SYNTHETIC_MODEL,
+            Some(&combined),
+            ProfileDetailArg::Resource,
+            Some(&memory_alias),
+            Some(&scheduler_alias),
+            None,
+            1.0,
+        );
+
+        let written = write_synthetic_product_observability(&config).unwrap();
+        assert_eq!(written.len(), 1);
+        let events = fs::read_to_string(&combined)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            6,
+            "aliased roles duplicated events: {events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event["event_id"].as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            6
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -2202,7 +2286,8 @@ mod tests {
         .unwrap();
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         assert!(profile.contains("\"status\":\"failure\""));
-        assert!(profile.contains("\"first_failure_event\":true"));
+        assert!(profile.contains("\"terminal_failure_event\":true"));
+        assert!(!profile.contains("\"first_failure_event\":true"));
         let bundle_dir = root.join("request_dump").join(&request_id);
         assert!(bundle_dir.join("failure_diagnostics.json").is_file());
         let scan: serde_json::Value = serde_json::from_str(
@@ -2232,13 +2317,21 @@ mod tests {
             ProfileEntrypoint::Run,
             "Qwen/Qwen3-0.6B",
             Some(&root.join("profile.jsonl")),
-            ProfileDetailArg::Basic,
+            ProfileDetailArg::Latency,
             Some(&root.join("memory.jsonl")),
             Some(&root.join("scheduler.jsonl")),
             Some(&root.join("request_dump")),
             1.0,
         );
         let request_id = "req-run-test".to_string();
+        let native_event = actual_base_event(
+            &config,
+            &request_id,
+            "vnext.request_accepted",
+            ProfileEventKind::Instant,
+            Utc::now(),
+        );
+        write_profile_jsonl(&root.join("profile.jsonl"), &[native_event]).unwrap();
         write_actual_run_observability(
             &config,
             &ActualRunObservation {
@@ -2254,6 +2347,20 @@ mod tests {
                 prompt_chars: 12,
                 response_chars: 2,
                 response_text: "OK".to_string(),
+                execution_evidence: Some(ferrum_types::InferenceExecutionEvidence {
+                    prompt_token_ids: vec![
+                        ferrum_types::TokenId::new(7),
+                        ferrum_types::TokenId::new(8),
+                        ferrum_types::TokenId::new(9),
+                    ],
+                    engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
+                        clock_source: "rust_std_instant".to_string(),
+                        wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
+                        wall_anchor_max_error_nanos: 500,
+                        decode_ready_nanos_since_request_start: Some(1_000_000),
+                        token_commit_nanos_since_request_start: vec![2_000_000, 4_000_000],
+                    }),
+                }),
                 memory: None,
                 memory_stages: vec![
                     ActualMemoryStageObservation::new(
@@ -2305,6 +2412,10 @@ mod tests {
         );
         assert_eq!(scan["classified_output_sha256"], sha256_hex(b"OK"));
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
+        assert!(profile.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|event| event["phase"] == "vnext.request_accepted")
+        }));
         let generation = profile
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -2320,6 +2431,35 @@ mod tests {
             "rendered_prompt_and_generated_tokens"
         );
         assert_eq!(generation["attributes"]["e2e_duration_us"], 42);
+        assert_eq!(generation["attributes"]["profile_detail"], "latency");
+        assert_eq!(
+            generation["attributes"]["engine_token_commit_nanos_since_request_start"],
+            serde_json::json!([2_000_000, 4_000_000])
+        );
+        assert_eq!(generation["attributes"]["engine_token_commit_count"], 2);
+        assert_eq!(
+            generation["attributes"]["itl_source"],
+            "engine_token_commit"
+        );
+        assert_eq!(
+            generation["attributes"]["itl_nanos"],
+            serde_json::json!([2_000_000])
+        );
+        assert_eq!(generation["attributes"]["ttft_us"], 2_000);
+        assert_eq!(generation["attributes"]["itl_us_avg"], 2_000);
+        assert_eq!(
+            generation["attributes"]["engine_decode_ready_nanos_since_request_start"],
+            1_000_000
+        );
+        assert_eq!(
+            generation["attributes"]["engine_decode_wall_nanos"],
+            3_000_000
+        );
+        assert_eq!(generation["attributes"]["clock_conversion_error_ppm"], 166);
+        assert_eq!(
+            generation["attributes"]["decode_wall_timing_eligible"],
+            true
+        );
         let memory_profile = fs::read_to_string(root.join("memory.jsonl")).unwrap();
         let memory_stages = memory_profile
             .lines()

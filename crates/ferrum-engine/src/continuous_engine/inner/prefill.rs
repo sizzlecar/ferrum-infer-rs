@@ -92,6 +92,7 @@ impl EngineInner {
                     seq.generated_tokens.push(token);
                     let model_cache_update =
                         seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
+                    seq.record_generated_token_commit();
                     Ok::<(TokenId, ModelCacheRefUpdate), FerrumError>((token, model_cache_update))
                 })();
                 let (first_token, model_cache_update) = match prefix_hit_result {
@@ -328,6 +329,7 @@ impl EngineInner {
                 recurrent_state,
                 recurrent_admission.fresh_slots(),
             );
+            seq.record_generated_token_commit();
             Ok::<(TokenId, ModelCacheRefUpdate), FerrumError>((token, model_cache_update))
         })();
         let (first_token, model_cache_update) = match first_token_result {
@@ -638,6 +640,7 @@ impl EngineInner {
                 chunk.end(),
                 true,
             );
+            seq.record_generated_token_commit();
             Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((token, update)))
         })();
         let Some((first_token, model_cache_update)) = (match commit_result {
@@ -1007,6 +1010,7 @@ impl EngineInner {
                         seq.generated_tokens.push(token);
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
+                        seq.record_generated_token_commit();
                         Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
                             token,
                             model_cache_update,
@@ -1197,6 +1201,7 @@ impl EngineInner {
                     recurrent_state,
                     pending.recurrent_state.fresh_slots(),
                 );
+                seq.record_generated_token_commit();
                 Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
                     token,
                     model_cache_update,

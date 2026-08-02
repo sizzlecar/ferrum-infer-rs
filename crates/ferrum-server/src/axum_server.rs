@@ -39,7 +39,6 @@ use std::{
     collections::{BTreeMap, HashMap},
     error::Error as StdError,
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -63,7 +62,6 @@ const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"];
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
-static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static JSON_SCHEMA_VALIDATOR_CACHE: OnceLock<Mutex<HashMap<String, Arc<jsonschema::Validator>>>> =
     OnceLock::new();
 
@@ -348,6 +346,7 @@ pub struct AppState {
     pub served_model_registry: Arc<ServedModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
+    pub profile_detail: ferrum_types::ObservabilityProfileDetail,
     pub memory_profile_jsonl: Option<Arc<PathBuf>>,
     pub first_request_memory_recorded: Arc<AtomicBool>,
     cache: Arc<CacheRuntimeState>,
@@ -417,6 +416,14 @@ impl AppState {
 
     pub fn with_profile_jsonl(mut self, profile_jsonl: Option<PathBuf>) -> Self {
         self.profile_jsonl = profile_jsonl.map(Arc::new);
+        self
+    }
+
+    pub fn with_profile_detail(
+        mut self,
+        profile_detail: ferrum_types::ObservabilityProfileDetail,
+    ) -> Self {
+        self.profile_detail = profile_detail;
         self
     }
 
@@ -975,6 +982,7 @@ impl HttpServer for AxumServer {
                 .clone()
                 .with_request_dump_dir(config.request_dump_dir.clone())
                 .with_profile_jsonl(config.profile_jsonl.clone())
+                .with_profile_detail(config.profile_detail)
                 .with_memory_profile_jsonl(config.memory_profile_jsonl.clone()),
         );
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -1134,6 +1142,9 @@ async fn chat_completions_handler(
     if state.request_dump_dir.is_some() {
         inference_request.evidence_request.capture_prompt_token_ids = true;
     }
+    inference_request
+        .evidence_request
+        .capture_engine_token_timing = state.profile_detail.captures_engine_token_timing();
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
@@ -1404,6 +1415,13 @@ fn write_chat_prompt_token_evidence(
     )
 }
 
+#[derive(Clone, Copy, Default)]
+struct ChatRequestProfileTiming<'a> {
+    engine_evidence: Option<&'a InferenceExecutionEvidence>,
+    first_engine_chunk_received_us: Option<u64>,
+    first_sse_enqueue_us: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_chat_request_profile_event(
     state: &AppState,
@@ -1412,7 +1430,7 @@ fn write_chat_request_profile_event(
     stream: bool,
     phase: &str,
     started_at: Instant,
-    first_token_latency_us: Option<u64>,
+    timing: ChatRequestProfileTiming<'_>,
     output_token_count: usize,
     usage: Option<&TokenUsage>,
     finish_reason: Option<&str>,
@@ -1430,7 +1448,10 @@ fn write_chat_request_profile_event(
     let duration_us = elapsed_us_since(started_at);
     let mut attributes = BTreeMap::from([
         ("actual_model_smoke".to_string(), serde_json::json!(true)),
-        ("diagnostic_only".to_string(), serde_json::json!(false)),
+        (
+            "diagnostic_only".to_string(),
+            serde_json::json!(state.profile_detail.diagnostic_only()),
+        ),
         (
             "endpoint".to_string(),
             serde_json::json!("/v1/chat/completions"),
@@ -1440,11 +1461,18 @@ fn write_chat_request_profile_event(
             serde_json::json!(duration_us),
         ),
         ("l0_only".to_string(), serde_json::json!(false)),
-        ("profile_detail".to_string(), serde_json::json!("basic")),
+        (
+            "profile_detail".to_string(),
+            serde_json::json!(state.profile_detail.as_str()),
+        ),
         ("stream".to_string(), serde_json::json!(stream)),
         (
             "output_token_count".to_string(),
             serde_json::json!(output_token_count),
+        ),
+        (
+            "execution_request_id".to_string(),
+            serde_json::json!(format!("request.product.{request_id}")),
         ),
     ]);
     if let Some(usage) = usage {
@@ -1475,29 +1503,55 @@ fn write_chat_request_profile_event(
             serde_json::json!("generated_tokens"),
         );
     }
-    if let Some(ttft_us) = first_token_latency_us {
-        attributes.insert("ttft_us".to_string(), serde_json::json!(ttft_us));
-        if output_token_count > 1 {
-            attributes.insert(
-                "itl_us_avg".to_string(),
-                serde_json::json!(
-                    duration_us.saturating_sub(ttft_us) / (output_token_count - 1) as u64
-                ),
-            );
-        } else {
-            attributes.insert("itl_us_avg".to_string(), serde_json::json!(0_u64));
-        }
-    } else if stream && status == ProfileStatus::Ok {
+    if let Some(engine_timing) = timing
+        .engine_evidence
+        .and_then(|evidence| evidence.engine_token_timing.as_ref())
+    {
+        engine_timing
+            .validate(output_token_count)
+            .map_err(|error| format!("invalid engine token timing evidence: {error}"))?;
+        attributes.extend(ferrum_types::engine_token_timing_profile_attributes(
+            engine_timing,
+        ));
+    } else if status == ProfileStatus::Ok && state.profile_detail.captures_engine_token_timing() {
+        return Err(format!(
+            "{} profile completed without required engine token timing evidence",
+            state.profile_detail.as_str()
+        ));
+    }
+    if let Some(received_us) = timing.first_engine_chunk_received_us {
         attributes.insert(
-            "ttft_unavailable_reason".to_string(),
-            serde_json::json!("stream emitted no measured output token before completion"),
+            "engine_stream_first_chunk_received_us".to_string(),
+            serde_json::json!(received_us),
+        );
+    }
+    if let Some(enqueue_us) = timing.first_sse_enqueue_us {
+        attributes.insert(
+            "http_first_sse_enqueue_us".to_string(),
+            serde_json::json!(enqueue_us),
+        );
+    }
+    if stream {
+        attributes.insert(
+            "http_stream_flush_unavailable_reason".to_string(),
+            serde_json::json!(
+                "socket flush completion is outside the axum handler observation boundary"
+            ),
         );
     }
     if let Some(reason) = finish_reason {
         attributes.insert("finish_reason".to_string(), serde_json::json!(reason));
     }
-    if status == ProfileStatus::Failure {
-        attributes.insert("first_failure_event".to_string(), serde_json::json!(true));
+    if let Some(error) = error.as_ref() {
+        attributes.insert(
+            if error.blocking {
+                "first_failure_event"
+            } else {
+                "terminal_failure_event"
+            }
+            .to_string(),
+            serde_json::json!(true),
+        );
     }
 
     let replay = state.request_dump_dir.as_ref().map(|root| {
@@ -1584,7 +1638,10 @@ fn maybe_write_first_request_memory_stage(
     let timestamp = chrono::Utc::now();
     let mut attributes = BTreeMap::from([
         ("actual_model_smoke".to_string(), serde_json::json!(true)),
-        ("diagnostic_only".to_string(), serde_json::json!(false)),
+        (
+            "diagnostic_only".to_string(),
+            serde_json::json!(state.profile_detail.diagnostic_only()),
+        ),
         (
             "endpoint".to_string(),
             serde_json::json!("/v1/chat/completions"),
@@ -1594,7 +1651,10 @@ fn maybe_write_first_request_memory_stage(
             "memory_stage".to_string(),
             serde_json::json!("first_request_done"),
         ),
-        ("profile_detail".to_string(), serde_json::json!("basic")),
+        (
+            "profile_detail".to_string(),
+            serde_json::json!(state.profile_detail.as_str()),
+        ),
         ("stream".to_string(), serde_json::json!(stream)),
     ]);
     let memory_snapshot = if let Some(memory) = &memory {
@@ -1678,24 +1738,12 @@ fn append_profile_event(
     event: &FerrumProfileEvent,
 ) -> std::result::Result<(), String> {
     event.validate().map_err(|err| err.to_string())?;
-    let line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
-    let body = format!("{line}\n");
-    let _guard = PROFILE_JSONL_FILE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|err| format!("profile JSONL file lock poisoned: {err}"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| err.to_string())?;
-    file.write_all(body.as_bytes())
-        .and_then(|_| file.flush())
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    ferrum_bench_core::write_jsonl_records(
+        path,
+        ferrum_bench_core::JsonlJournalOpenMode::Append,
+        std::slice::from_ref(event),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn elapsed_us_since(started_at: Instant) -> u64 {
@@ -2252,14 +2300,14 @@ async fn handle_chat_completions_stream(
                 true,
                 "chat_completions_stream_start",
                 profile_started_at,
-                None,
+                ChatRequestProfileTiming::default(),
                 0,
                 None,
                 Some("error"),
                 Some(ProfileError {
                     kind: error_kind.to_string(),
                     message: error_message.clone(),
-                    blocking: true,
+                    blocking: false,
                 }),
             ) {
                 warn!("failed to write chat stream failure profile event: {}", err);
@@ -2298,7 +2346,8 @@ async fn handle_chat_completions_stream(
     tokio::spawn(async move {
         let mut current_text = String::new();
         let mut output_token_ids = Vec::new();
-        let mut first_token_latency_us = None;
+        let mut first_engine_chunk_received_us = None;
+        let mut first_sse_enqueue_us = None;
         let mut sent_reasoning_len = 0usize;
         let mut sent_content_len = 0usize;
 
@@ -2313,10 +2362,10 @@ async fn handle_chat_completions_stream(
             };
             match result {
                 Ok(chunk) => {
-                    if first_token_latency_us.is_none()
+                    if first_engine_chunk_received_us.is_none()
                         && (chunk.token.is_some() || !chunk.text.is_empty())
                     {
-                        first_token_latency_us = Some(elapsed_us_since(profile_started_at));
+                        first_engine_chunk_received_us = Some(elapsed_us_since(profile_started_at));
                     }
                     if let Some(token) = chunk.token {
                         output_token_ids.push(token);
@@ -2371,6 +2420,8 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
+                            first_sse_enqueue_us
+                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         }
                     }
 
@@ -2480,6 +2531,8 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
+                            first_sse_enqueue_us
+                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
                         {
@@ -2520,6 +2573,8 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
+                            first_sse_enqueue_us
+                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         }
                         // Send final chunk. OpenAI-style streaming
                         // clients (e.g. `vllm bench serve`) blindly
@@ -2560,7 +2615,10 @@ async fn handle_chat_completions_stream(
                         let final_event = Event::default()
                             .json_data(&final_chunk)
                             .unwrap_or_else(|_| Event::default().data("error"));
-                        let _ = tx.send(Ok(final_event));
+                        if tx.send(Ok(final_event)).is_ok() {
+                            first_sse_enqueue_us
+                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
+                        }
                         if let Err(err) = write_chat_request_completion_replay_bundle(
                             request_dump_dir.as_ref().map(|root| root.as_path()),
                             &replay_request_id,
@@ -2577,7 +2635,11 @@ async fn handle_chat_completions_stream(
                             true,
                             "chat_completions_stream_complete",
                             profile_started_at,
-                            first_token_latency_us,
+                            ChatRequestProfileTiming {
+                                engine_evidence: chunk.execution_evidence.as_ref(),
+                                first_engine_chunk_received_us,
+                                first_sse_enqueue_us,
+                            },
                             output_token_ids.len(),
                             chunk.usage.as_ref(),
                             final_finish_reason.as_deref(),
@@ -2630,14 +2692,18 @@ async fn handle_chat_completions_stream(
                         true,
                         "chat_completions_stream_next",
                         profile_started_at,
-                        first_token_latency_us,
+                        ChatRequestProfileTiming {
+                            engine_evidence: None,
+                            first_engine_chunk_received_us,
+                            first_sse_enqueue_us,
+                        },
                         output_token_ids.len(),
                         None,
                         Some("error"),
                         Some(ProfileError {
                             kind: error_kind.to_string(),
                             message: error_message.clone(),
-                            blocking: true,
+                            blocking: false,
                         }),
                     ) {
                         warn!("failed to write chat stream chunk profile event: {}", err);
@@ -2772,7 +2838,10 @@ async fn handle_chat_completions_sync(
                         false,
                         "chat_completions_sync_tool_contract",
                         profile_started_at,
-                        None,
+                        ChatRequestProfileTiming {
+                            engine_evidence: execution_evidence.as_ref(),
+                            ..Default::default()
+                        },
                         tokens.len(),
                         Some(&usage),
                         Some("error"),
@@ -2806,7 +2875,10 @@ async fn handle_chat_completions_sync(
                     false,
                     "chat_completions_sync_tool_choice",
                     profile_started_at,
-                    None,
+                    ChatRequestProfileTiming {
+                        engine_evidence: execution_evidence.as_ref(),
+                        ..Default::default()
+                    },
                     tokens.len(),
                     Some(&usage),
                     Some("error"),
@@ -2832,7 +2904,10 @@ async fn handle_chat_completions_sync(
                     false,
                     "chat_completions_sync_structured_output",
                     profile_started_at,
-                    None,
+                    ChatRequestProfileTiming {
+                        engine_evidence: execution_evidence.as_ref(),
+                        ..Default::default()
+                    },
                     tokens.len(),
                     Some(&usage),
                     Some("error"),
@@ -2862,7 +2937,10 @@ async fn handle_chat_completions_sync(
                 false,
                 "chat_completions_sync_complete",
                 profile_started_at,
-                None,
+                ChatRequestProfileTiming {
+                    engine_evidence: execution_evidence.as_ref(),
+                    ..Default::default()
+                },
                 tokens.len(),
                 Some(&usage),
                 Some(&openai_finish_reason),
@@ -2916,14 +2994,14 @@ async fn handle_chat_completions_sync(
                 false,
                 "chat_completions_sync",
                 profile_started_at,
-                None,
+                ChatRequestProfileTiming::default(),
                 0,
                 None,
                 Some("error"),
                 Some(ProfileError {
                     kind: error_kind.to_string(),
                     message: error_message.clone(),
-                    blocking: true,
+                    blocking: false,
                 }),
             ) {
                 warn!("failed to write chat sync failure profile event: {}", err);
@@ -5155,7 +5233,7 @@ mod tests {
         EmbedEngine, InferenceEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine,
     };
     use ferrum_types::{
-        EngineConfig, EngineMetrics, EngineStatus, FinishReason,
+        EngineConfig, EngineMetrics, EngineStatus, EngineTokenTimingEvidence, FinishReason,
         HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse, MemoryUsage,
         ModelId, StreamChunk, TokenId, TokenUsage,
     };
@@ -5256,6 +5334,7 @@ mod tests {
             Self {
                 text: chunks.concat(),
                 stream_chunks: Some(chunks.iter().map(|chunk| (*chunk).to_string()).collect()),
+                stream_usage: Some(TokenUsage::new(5, chunks.len())),
                 ..Self::new("")
             }
         }
@@ -5265,6 +5344,7 @@ mod tests {
                 text: chunks.concat(),
                 stream_chunks: Some(chunks.iter().map(|chunk| (*chunk).to_string()).collect()),
                 stream_final_chunk_separate: true,
+                stream_usage: Some(TokenUsage::new(5, chunks.len())),
                 ..Self::new("")
             }
         }
@@ -5730,17 +5810,40 @@ mod tests {
         }
     }
 
+    fn stub_execution_evidence(
+        request: &InferenceRequest,
+        output_token_count: usize,
+    ) -> Option<InferenceExecutionEvidence> {
+        let requested = &request.evidence_request;
+        if !requested.capture_prompt_token_ids && !requested.capture_engine_token_timing {
+            return None;
+        }
+        Some(InferenceExecutionEvidence {
+            prompt_token_ids: requested
+                .capture_prompt_token_ids
+                .then(|| vec![TokenId::new(101), TokenId::new(202), TokenId::new(303)])
+                .unwrap_or_default(),
+            engine_token_timing: requested.capture_engine_token_timing.then(|| {
+                EngineTokenTimingEvidence {
+                    clock_source: "rust_std_instant".to_string(),
+                    wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
+                    wall_anchor_max_error_nanos: 500,
+                    decode_ready_nanos_since_request_start: Some(1_000_000),
+                    token_commit_nanos_since_request_start: (1..=output_token_count)
+                        .map(|ordinal| ordinal as u64 * 1_000_000)
+                        .collect(),
+                }
+            }),
+        })
+    }
+
     #[async_trait]
     impl LlmInferenceEngine for StubLlm {
         async fn infer(
             &self,
             request: InferenceRequest,
         ) -> ferrum_types::Result<InferenceResponse> {
-            let execution_evidence = request.evidence_request.capture_prompt_token_ids.then(|| {
-                InferenceExecutionEvidence {
-                    prompt_token_ids: vec![TokenId::new(101), TokenId::new(202), TokenId::new(303)],
-                }
-            });
+            let execution_evidence = stub_execution_evidence(&request, 2);
             Ok(InferenceResponse {
                 request_id: request.id,
                 text: self.text.clone(),
@@ -5761,17 +5864,13 @@ mod tests {
         ) -> ferrum_types::Result<
             Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
         > {
-            let execution_evidence = request.evidence_request.capture_prompt_token_ids.then(|| {
-                InferenceExecutionEvidence {
-                    prompt_token_ids: vec![TokenId::new(101), TokenId::new(202), TokenId::new(303)],
-                }
-            });
             if let Some(drop_notify) = self.pending_stream_drop_notify.as_ref() {
                 return Ok(Box::pin(PendingDropStream {
                     drop_notify: Arc::clone(drop_notify),
                 }));
             }
             if let Some(chunks) = &self.stream_chunks {
+                let execution_evidence = stub_execution_evidence(&request, chunks.len());
                 let request_id = request.id;
                 let mut stream_chunks = Vec::with_capacity(
                     chunks.len() + usize::from(self.stream_final_chunk_separate),
@@ -5813,6 +5912,7 @@ mod tests {
                 return Ok(Box::pin(stream::iter(stream_chunks)));
             }
 
+            let execution_evidence = stub_execution_evidence(&request, 1);
             let chunk = StreamChunk {
                 request_id: request.id,
                 text: self.text.clone(),
@@ -5928,6 +6028,7 @@ mod tests {
             AppState::default()
                 .with_llm(Arc::new(StubLlm::new(text)))
                 .with_request_dump_dir(Some(request_dump_dir))
+                .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
         )
         .build_router()
@@ -5958,6 +6059,7 @@ mod tests {
             AppState::default()
                 .with_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
                 .with_request_dump_dir(Some(request_dump_dir))
+                .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
         )
         .build_router()
@@ -8875,6 +8977,8 @@ mod tests {
         assert_eq!(event["status"], "ok");
         assert_eq!(event["phase"], "chat_completions_sync_complete");
         assert_eq!(event["attributes"]["actual_model_smoke"], true);
+        assert_eq!(event["attributes"]["profile_detail"], "latency");
+        assert_eq!(event["attributes"]["diagnostic_only"], false);
         assert_eq!(event["attributes"]["stream"], false);
         assert_eq!(event["attributes"]["output_token_count"], 2);
         assert_eq!(event["attributes"]["prompt_token_count"], 7);
@@ -8882,6 +8986,15 @@ mod tests {
         assert_eq!(event["attributes"]["total_token_count"], 9);
         assert_eq!(event["attributes"]["token_count_source"], "usage");
         assert_eq!(event["attributes"]["finish_reason"], "stop");
+        assert_eq!(
+            event["attributes"]["engine_token_clock_source"],
+            "rust_std_instant"
+        );
+        assert_eq!(event["attributes"]["engine_token_commit_count"], 2);
+        assert_eq!(event["attributes"]["itl_interval_count"], 1);
+        assert_eq!(event["attributes"]["ttft_us"], 1_000);
+        assert_eq!(event["attributes"]["itl_us_avg"], 1_000);
+        assert!(event["attributes"]["http_first_sse_enqueue_us"].is_null());
         assert!(event["duration_us"].as_u64().unwrap_or_default() > 0);
         assert!(
             event["attributes"]["e2e_duration_us"]
@@ -9025,11 +9138,13 @@ mod tests {
         assert_eq!(event["status"], "ok");
         assert_eq!(event["phase"], "chat_completions_stream_complete");
         assert_eq!(event["attributes"]["actual_model_smoke"], true);
+        assert_eq!(event["attributes"]["profile_detail"], "latency");
+        assert_eq!(event["attributes"]["diagnostic_only"], false);
         assert_eq!(event["attributes"]["stream"], true);
         assert_eq!(event["attributes"]["output_token_count"], 2);
         assert_eq!(event["attributes"]["prompt_token_count"], 5);
-        assert_eq!(event["attributes"]["completion_token_count"], 1);
-        assert_eq!(event["attributes"]["total_token_count"], 6);
+        assert_eq!(event["attributes"]["completion_token_count"], 2);
+        assert_eq!(event["attributes"]["total_token_count"], 7);
         assert_eq!(event["attributes"]["token_count_source"], "usage");
         assert_eq!(event["attributes"]["finish_reason"], "stop");
         assert!(event["duration_us"].as_u64().unwrap_or_default() > 0);
@@ -9041,6 +9156,21 @@ mod tests {
         );
         assert!(event["attributes"]["ttft_us"].as_u64().is_some());
         assert!(event["attributes"]["itl_us_avg"].as_u64().is_some());
+        assert_eq!(
+            event["attributes"]["engine_token_commit_nanos_since_request_start"],
+            json!([1_000_000, 2_000_000])
+        );
+        assert_eq!(event["attributes"]["itl_interval_count"], 1);
+        assert_eq!(event["attributes"]["itl_source"], "engine_token_commit");
+        assert!(event["attributes"]["engine_stream_first_chunk_received_us"]
+            .as_u64()
+            .is_some());
+        assert!(event["attributes"]["http_first_sse_enqueue_us"]
+            .as_u64()
+            .is_some());
+        assert!(event["attributes"]["http_stream_flush_unavailable_reason"]
+            .as_str()
+            .is_some());
         assert_eq!(
             event["replay"]["bundle_dir"].as_str(),
             Some(root.to_string_lossy().as_ref())

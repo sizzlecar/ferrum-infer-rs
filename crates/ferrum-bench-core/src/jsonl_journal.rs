@@ -1,13 +1,63 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::marker::PhantomData;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+static JSONL_JOURNAL_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<JsonlJournalInner>>>> =
+    OnceLock::new();
+
+/// Return one stable physical identity for a JSONL output path, including
+/// paths whose final component does not exist yet.
+pub fn normalize_jsonl_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut lexical = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => lexical.push(prefix.as_os_str()),
+            Component::RootDir => lexical.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = lexical.pop();
+            }
+            Component::Normal(part) => lexical.push(part),
+        }
+    }
+    if let Ok(canonical) = std::fs::canonicalize(&lexical) {
+        return Ok(canonical);
+    }
+
+    let mut existing = lexical.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            missing.push(name.to_os_string());
+        }
+        existing = existing.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("JSONL path {} has no existing ancestor", path.display()),
+            )
+        })?;
+    }
+    let mut canonical = std::fs::canonicalize(existing)?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonlJournalOpenMode {
@@ -92,30 +142,26 @@ impl JournalFailure {
     }
 }
 
-enum JournalCommand<T> {
-    Event(T),
-    Batch(Vec<T>),
+type EncodeJob = Box<dyn FnOnce(&mut Vec<u8>) -> Result<(), serde_json::Error> + Send + 'static>;
+
+enum JournalCommand {
+    Encode(EncodeJob),
+    Encoded(Vec<u8>),
     Flush(SyncSender<Result<(), JsonlJournalError>>),
     Close(SyncSender<Result<(), JsonlJournalError>>),
 }
 
-struct JsonlJournalInner<T>
-where
-    T: Serialize + Send + 'static,
-{
+struct JsonlJournalInner {
     path: PathBuf,
-    sender: SyncSender<JournalCommand<T>>,
+    sender: SyncSender<JournalCommand>,
     send_gate: Mutex<()>,
     worker: Mutex<Option<JoinHandle<()>>>,
     failure: Arc<JournalFailure>,
     closed: AtomicBool,
 }
 
-impl<T> JsonlJournalInner<T>
-where
-    T: Serialize + Send + 'static,
-{
-    fn send(&self, command: JournalCommand<T>) -> Result<(), JsonlJournalError> {
+impl JsonlJournalInner {
+    fn send(&self, command: JournalCommand) -> Result<(), JsonlJournalError> {
         let _send_guard = self.send_gate.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return Err(JsonlJournalError::new(format!(
@@ -168,10 +214,7 @@ where
     }
 }
 
-impl<T> Drop for JsonlJournalInner<T>
-where
-    T: Serialize + Send + 'static,
-{
+impl Drop for JsonlJournalInner {
     fn drop(&mut self) {
         let _ = self.close_and_join();
     }
@@ -181,7 +224,8 @@ pub struct JsonlJournal<T>
 where
     T: Serialize + Send + 'static,
 {
-    inner: Arc<JsonlJournalInner<T>>,
+    inner: Arc<JsonlJournalInner>,
+    marker: PhantomData<fn(T)>,
 }
 
 impl<T> Clone for JsonlJournal<T>
@@ -191,8 +235,108 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            marker: PhantomData,
         }
     }
+}
+
+fn validate_config(config: JsonlJournalConfig) -> io::Result<()> {
+    if config.queue_capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSONL journal queue capacity must be greater than zero",
+        ));
+    }
+    if config.buffer_capacity_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSONL journal buffer capacity must be greater than zero",
+        ));
+    }
+    if config.flush_interval.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSONL journal flush interval must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn open_shared_inner(
+    path: impl Into<PathBuf>,
+    mode: JsonlJournalOpenMode,
+    config: JsonlJournalConfig,
+) -> io::Result<Arc<JsonlJournalInner>> {
+    validate_config(config)?;
+    let path = normalize_jsonl_path(&path.into())?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut registry = JSONL_JOURNAL_REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|error| {
+            io::Error::other(format!("JSONL journal registry is poisoned: {error}"))
+        })?;
+    if let Some(existing) = registry.get(&path).and_then(Weak::upgrade) {
+        if !existing.closed.load(Ordering::Acquire) {
+            if let Some(error) = existing.failure.current() {
+                return Err(io::Error::other(error));
+            }
+            // The first live owner controls the initial truncate/append state.
+            // Every later role attaches to the same ordered writer.
+            return Ok(existing);
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    let file = options.open(&path)?;
+    if mode == JsonlJournalOpenMode::Truncate {
+        file.set_len(0)?;
+    }
+    let (sender, receiver) = sync_channel(config.queue_capacity);
+    let failure = Arc::new(JournalFailure::new());
+    let worker_failure = Arc::clone(&failure);
+    let worker_path = path.clone();
+    let worker = thread::Builder::new()
+        .name("ferrum-jsonl".to_string())
+        .spawn(move || {
+            run_writer(
+                file,
+                receiver,
+                worker_failure,
+                &worker_path,
+                config.buffer_capacity_bytes,
+                config.flush_interval,
+            )
+        })?;
+    let inner = Arc::new(JsonlJournalInner {
+        path: path.clone(),
+        sender,
+        send_gate: Mutex::new(()),
+        worker: Mutex::new(Some(worker)),
+        failure,
+        closed: AtomicBool::new(false),
+    });
+    registry.insert(path, Arc::downgrade(&inner));
+    Ok(inner)
+}
+
+fn flush_inner(inner: &JsonlJournalInner) -> Result<(), JsonlJournalError> {
+    let (reply_tx, reply_rx) = sync_channel(1);
+    inner.send(JournalCommand::Flush(reply_tx))?;
+    reply_rx.recv().map_err(|_| {
+        inner.failure.current().unwrap_or_else(|| {
+            JsonlJournalError::new(format!(
+                "JSONL journal flush barrier for {} was lost",
+                inner.path.display()
+            ))
+        })
+    })?
 }
 
 impl<T> JsonlJournal<T>
@@ -204,67 +348,9 @@ where
         mode: JsonlJournalOpenMode,
         config: JsonlJournalConfig,
     ) -> io::Result<Self> {
-        if config.queue_capacity == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "JSONL journal queue capacity must be greater than zero",
-            ));
-        }
-        if config.buffer_capacity_bytes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "JSONL journal buffer capacity must be greater than zero",
-            ));
-        }
-        if config.flush_interval.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "JSONL journal flush interval must be greater than zero",
-            ));
-        }
-
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let mut options = OpenOptions::new();
-        // Truncate controls only the initial file state. Every journal write
-        // must still append at the current EOF so a startup record written
-        // through another descriptor cannot be overwritten by this worker's
-        // stale file offset.
-        options.create(true).append(true);
-        let file = options.open(&path)?;
-        if mode == JsonlJournalOpenMode::Truncate {
-            file.set_len(0)?;
-        }
-        let (sender, receiver) = sync_channel(config.queue_capacity);
-        let failure = Arc::new(JournalFailure::new());
-        let worker_failure = Arc::clone(&failure);
-        let worker_path = path.clone();
-        let worker = thread::Builder::new()
-            .name("ferrum-jsonl".to_string())
-            .spawn(move || {
-                run_writer(
-                    file,
-                    receiver,
-                    worker_failure,
-                    &worker_path,
-                    config.buffer_capacity_bytes,
-                    config.flush_interval,
-                )
-            })?;
-
         Ok(Self {
-            inner: Arc::new(JsonlJournalInner {
-                path,
-                sender,
-                send_gate: Mutex::new(()),
-                worker: Mutex::new(Some(worker)),
-                failure,
-                closed: AtomicBool::new(false),
-            }),
+            inner: open_shared_inner(path, mode, config)?,
+            marker: PhantomData,
         })
     }
 
@@ -285,27 +371,30 @@ where
     }
 
     pub fn enqueue(&self, event: T) -> Result<(), JsonlJournalError> {
-        self.inner.send(JournalCommand::Event(event))
+        self.inner
+            .send(JournalCommand::Encode(Box::new(move |encoded| {
+                serde_json::to_writer(&mut *encoded, &event)?;
+                encoded.push(b'\n');
+                Ok(())
+            })))
     }
 
     pub fn enqueue_batch(&self, events: Vec<T>) -> Result<(), JsonlJournalError> {
         if events.is_empty() {
             return Ok(());
         }
-        self.inner.send(JournalCommand::Batch(events))
+        self.inner
+            .send(JournalCommand::Encode(Box::new(move |encoded| {
+                for event in &events {
+                    serde_json::to_writer(&mut *encoded, event)?;
+                    encoded.push(b'\n');
+                }
+                Ok(())
+            })))
     }
 
     pub fn flush(&self) -> Result<(), JsonlJournalError> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.inner.send(JournalCommand::Flush(reply_tx))?;
-        reply_rx.recv().map_err(|_| {
-            self.inner.failure.current().unwrap_or_else(|| {
-                JsonlJournalError::new(format!(
-                    "JSONL journal flush barrier for {} was lost",
-                    self.inner.path.display()
-                ))
-            })
-        })?
+        flush_inner(&self.inner)
     }
 
     pub fn close(&self) -> Result<(), JsonlJournalError> {
@@ -317,16 +406,44 @@ where
     }
 }
 
-fn run_writer<T>(
+pub fn write_jsonl_records<T: Serialize>(
+    path: &Path,
+    mode: JsonlJournalOpenMode,
+    records: &[T],
+) -> Result<(), JsonlJournalError> {
+    if records.is_empty() {
+        return Err(JsonlJournalError::new(format!(
+            "JSONL record set for {} must not be empty",
+            path.display()
+        )));
+    }
+    let mut encoded = Vec::with_capacity(4096);
+    for record in records {
+        serde_json::to_writer(&mut encoded, record).map_err(|error| {
+            JsonlJournalError::new(format!(
+                "serialize JSONL record for {}: {error}",
+                path.display()
+            ))
+        })?;
+        encoded.push(b'\n');
+    }
+
+    let inner = open_shared_inner(path.to_path_buf(), mode, JsonlJournalConfig::default())
+        .map_err(|error| {
+            JsonlJournalError::new(format!("open JSONL journal {}: {error}", path.display()))
+        })?;
+    inner.send(JournalCommand::Encoded(encoded))?;
+    flush_inner(&inner)
+}
+
+fn run_writer(
     file: File,
-    receiver: Receiver<JournalCommand<T>>,
+    receiver: Receiver<JournalCommand>,
     failure: Arc<JournalFailure>,
     path: &Path,
     buffer_capacity_bytes: usize,
     flush_interval: Duration,
-) where
-    T: Serialize + Send + 'static,
-{
+) {
     let mut writer = BufWriter::with_capacity(buffer_capacity_bytes, file);
     let mut encoded = Vec::with_capacity(4096);
     let mut writable = true;
@@ -346,27 +463,22 @@ fn run_writer<T>(
             None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match command {
-            Ok(JournalCommand::Event(event)) => {
+            Ok(JournalCommand::Encode(job)) => {
                 flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
-                write_events_if_healthy(
-                    &mut writer,
-                    &mut encoded,
-                    std::slice::from_ref(&event),
-                    &failure,
-                    path,
-                    &mut writable,
-                );
+                encoded.clear();
+                if let Err(error) = job(&mut encoded) {
+                    writable = false;
+                    failure.record(JsonlJournalError::new(format!(
+                        "serialize JSONL event for {}: {error}",
+                        path.display()
+                    )));
+                } else {
+                    write_encoded_if_healthy(&mut writer, &encoded, &failure, path, &mut writable);
+                }
             }
-            Ok(JournalCommand::Batch(events)) => {
+            Ok(JournalCommand::Encoded(encoded)) => {
                 flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
-                write_events_if_healthy(
-                    &mut writer,
-                    &mut encoded,
-                    &events,
-                    &failure,
-                    path,
-                    &mut writable,
-                );
+                write_encoded_if_healthy(&mut writer, &encoded, &failure, path, &mut writable);
             }
             Ok(JournalCommand::Flush(reply)) => {
                 flush_if_healthy(&mut writer, &failure, path, &mut writable);
@@ -389,30 +501,15 @@ fn run_writer<T>(
     flush_if_healthy(&mut writer, &failure, path, &mut writable);
 }
 
-fn write_events_if_healthy<T>(
+fn write_encoded_if_healthy(
     writer: &mut BufWriter<File>,
-    encoded: &mut Vec<u8>,
-    events: &[T],
+    encoded: &[u8],
     failure: &JournalFailure,
     path: &Path,
     writable: &mut bool,
-) where
-    T: Serialize,
-{
+) {
     if !*writable {
         return;
-    }
-    encoded.clear();
-    for event in events {
-        if let Err(error) = serde_json::to_writer(&mut *encoded, event) {
-            *writable = false;
-            failure.record(JsonlJournalError::new(format!(
-                "serialize JSONL event for {}: {error}",
-                path.display()
-            )));
-            return;
-        }
-        encoded.push(b'\n');
     }
     if let Err(error) = writer.write_all(encoded) {
         *writable = false;
@@ -515,6 +612,101 @@ mod tests {
             ]
         );
         drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn journal_and_direct_records_share_an_atomic_jsonl_boundary() {
+        const RECORDS_PER_WRITER: u64 = 32;
+        let path = temp_path("mixed-writers");
+        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let producer = {
+            let journal = journal.clone();
+            std::thread::spawn(move || {
+                for sequence in 0..RECORDS_PER_WRITER {
+                    journal
+                        .enqueue(serde_json::json!({
+                            "source": "journal",
+                            "sequence": sequence,
+                        }))
+                        .unwrap();
+                }
+            })
+        };
+        for sequence in 0..RECORDS_PER_WRITER {
+            write_jsonl_records(
+                &path,
+                JsonlJournalOpenMode::Append,
+                &[serde_json::json!({
+                    "source": "direct",
+                    "sequence": sequence,
+                })],
+            )
+            .unwrap();
+        }
+        producer.join().unwrap();
+        journal.close().unwrap();
+
+        let rows = read_values(&path);
+        assert_eq!(rows.len(), 2 * RECORDS_PER_WRITER as usize);
+        let identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["source"].as_str().unwrap().to_string(),
+                    row["sequence"].as_u64().unwrap(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(identities.len(), 2 * RECORDS_PER_WRITER as usize);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[derive(Serialize)]
+    struct TypedRecord {
+        source: &'static str,
+        sequence: u64,
+    }
+
+    #[test]
+    fn path_aliases_and_distinct_record_types_share_one_ordered_writer() {
+        let path = temp_path("typed-alias");
+        let alias = path
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(path.file_name().unwrap());
+        let json_journal = JsonlJournal::<serde_json::Value>::create(path.clone()).unwrap();
+        let typed_journal = JsonlJournal::<TypedRecord>::create(alias).unwrap();
+        assert_eq!(json_journal.path(), typed_journal.path());
+
+        json_journal
+            .enqueue(serde_json::json!({"source": "json", "sequence": 1}))
+            .unwrap();
+        typed_journal
+            .enqueue(TypedRecord {
+                source: "typed",
+                sequence: 2,
+            })
+            .unwrap();
+        write_jsonl_records(
+            &path,
+            JsonlJournalOpenMode::Append,
+            &[serde_json::json!({"source": "direct", "sequence": 3})],
+        )
+        .unwrap();
+        typed_journal.flush().unwrap();
+
+        assert_eq!(
+            read_values(&path),
+            vec![
+                serde_json::json!({"source": "json", "sequence": 1}),
+                serde_json::json!({"source": "typed", "sequence": 2}),
+                serde_json::json!({"source": "direct", "sequence": 3}),
+            ]
+        );
+        drop(typed_journal);
+        drop(json_journal);
         let _ = std::fs::remove_file(path);
     }
 

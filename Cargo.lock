@@ -1680,6 +1680,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "config",
+ "ferrum-bench-core",
  "ferrum-engine",
  "ferrum-interfaces",
  "ferrum-sampler",

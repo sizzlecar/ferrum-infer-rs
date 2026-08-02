@@ -1,5 +1,73 @@
 use super::*;
 
+#[derive(Debug)]
+struct SequenceTokenTiming {
+    wall_anchor_unix_nanos: i64,
+    wall_anchor_max_error_nanos: u64,
+    decode_ready_nanos_since_request_start: Option<u64>,
+    token_commit_nanos_since_request_start: Vec<u64>,
+}
+
+impl SequenceTokenTiming {
+    fn capture_anchor() -> Result<(Instant, Self)> {
+        let wall_before = system_time_unix_nanos(SystemTime::now())?;
+        let request_start = Instant::now();
+        let wall_after = system_time_unix_nanos(SystemTime::now())?;
+        let lower = wall_before.min(wall_after);
+        let upper = wall_before.max(wall_after);
+        let span = upper.saturating_sub(lower);
+        let midpoint = lower.saturating_add(span / 2);
+        Ok((
+            request_start,
+            Self {
+                wall_anchor_unix_nanos: midpoint,
+                wall_anchor_max_error_nanos: u64::try_from(span).unwrap_or(u64::MAX),
+                decode_ready_nanos_since_request_start: None,
+                token_commit_nanos_since_request_start: Vec::new(),
+            },
+        ))
+    }
+
+    fn record_commit(&mut self, request_start: Instant) {
+        let elapsed = u64::try_from(request_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let monotonic = self
+            .token_commit_nanos_since_request_start
+            .last()
+            .copied()
+            .map_or(elapsed, |previous| previous.max(elapsed));
+        self.token_commit_nanos_since_request_start.push(monotonic);
+    }
+
+    fn record_decode_ready(&mut self, request_start: Instant) {
+        self.decode_ready_nanos_since_request_start
+            .get_or_insert_with(|| {
+                u64::try_from(request_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            });
+    }
+
+    fn into_evidence(self, output_tokens: usize) -> Result<EngineTokenTimingEvidence> {
+        let evidence = EngineTokenTimingEvidence {
+            clock_source: "rust_std_instant".to_string(),
+            wall_anchor_unix_nanos: self.wall_anchor_unix_nanos,
+            wall_anchor_max_error_nanos: self.wall_anchor_max_error_nanos,
+            decode_ready_nanos_since_request_start: self.decode_ready_nanos_since_request_start,
+            token_commit_nanos_since_request_start: self.token_commit_nanos_since_request_start,
+        };
+        evidence.validate(output_tokens).map_err(|error| {
+            FerrumError::internal(format!("invalid engine token timing evidence: {error}"))
+        })?;
+        Ok(evidence)
+    }
+}
+
+fn system_time_unix_nanos(time: SystemTime) -> Result<i64> {
+    let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
+        FerrumError::internal(format!("system clock predates Unix epoch: {error}"))
+    })?;
+    i64::try_from(duration.as_nanos())
+        .map_err(|_| FerrumError::internal("system clock Unix nanos exceed i64"))
+}
+
 /// State of a running sequence in the continuous batch.
 #[derive(Debug)]
 pub struct SequenceState {
@@ -23,6 +91,10 @@ pub struct SequenceState {
     pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     pub(super) request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
+    /// Present only for callers that explicitly request the latency preset.
+    /// One entry is recorded after each generated token becomes committed
+    /// engine state, independent of text decoding or stream flushing.
+    token_timing: Option<SequenceTokenTiming>,
     /// Wall-clock `Instant` at which the first SSE chunk was actually
     /// sent to the client stream. Populated lazily by `send_stream_update`
     /// the first time a non-empty delta is emitted (multi-byte UTF-8
@@ -538,6 +610,12 @@ impl SequenceState {
                 mask.set_tokens_validity(&model_eos_token_ids, false);
             }
         }
+        let (start_time, token_timing) = if request.evidence_request.capture_engine_token_timing {
+            let (start_time, timing) = SequenceTokenTiming::capture_anchor()?;
+            (start_time, Some(timing))
+        } else {
+            (Instant::now(), None)
+        };
         Ok(Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -554,7 +632,8 @@ impl SequenceState {
             stream_sender: None,
             response_sender: None,
             request_slot: None,
-            start_time: Instant::now(),
+            start_time,
+            token_timing,
             first_emit_at: None,
             last_emit_at: None,
             emitted_chunks: 0,
@@ -579,6 +658,40 @@ impl SequenceState {
 
     pub fn total_tokens(&self) -> usize {
         self.input_tokens.len() + self.generated_tokens.len()
+    }
+
+    pub(super) fn record_generated_token_commit(&mut self) {
+        if let Some(timing) = &mut self.token_timing {
+            timing.record_commit(self.start_time);
+        }
+    }
+
+    pub(super) fn record_decode_ready(&mut self) {
+        if let Some(timing) = &mut self.token_timing {
+            timing.record_decode_ready(self.start_time);
+        }
+    }
+
+    pub(super) fn take_execution_evidence(&mut self) -> Result<Option<InferenceExecutionEvidence>> {
+        let capture_prompt = self
+            .original_request
+            .evidence_request
+            .capture_prompt_token_ids;
+        let timing = self
+            .token_timing
+            .take()
+            .map(|timing| timing.into_evidence(self.generated_tokens.len()))
+            .transpose()?;
+        Ok(
+            (capture_prompt || timing.is_some()).then(|| InferenceExecutionEvidence {
+                prompt_token_ids: if capture_prompt {
+                    std::mem::take(&mut self.input_tokens)
+                } else {
+                    Vec::new()
+                },
+                engine_token_timing: timing,
+            }),
+        )
     }
 
     /// Original immutable sampling parameters used to prepare this request.
@@ -719,6 +832,7 @@ impl SequenceState {
         self.prefill_tokens_processed = prefill_tokens_processed;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
+        self.record_decode_ready();
         model_cache_update
     }
 
@@ -735,6 +849,7 @@ impl SequenceState {
             recurrent_state.map(|state| SequenceRecurrentState::new(state, recurrent_state_slots));
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
+        self.record_decode_ready();
         model_cache_update
     }
 
@@ -753,6 +868,9 @@ impl SequenceState {
         } else {
             RequestPhase::Prefilling
         };
+        if is_final_chunk {
+            self.record_decode_ready();
+        }
         model_cache_update
     }
 
@@ -776,6 +894,9 @@ impl SequenceState {
         } else {
             RequestPhase::Prefilling
         };
+        if is_final_chunk {
+            self.record_decode_ready();
+        }
         model_cache_update
     }
 

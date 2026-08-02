@@ -477,13 +477,7 @@ impl EngineInner {
                     finish_reason,
                 );
                 let prompt_token_count = seq.input_tokens.len();
-                let execution_evidence = seq
-                    .original_request
-                    .evidence_request
-                    .capture_prompt_token_ids
-                    .then(|| InferenceExecutionEvidence {
-                        prompt_token_ids: std::mem::take(&mut seq.input_tokens),
-                    });
+                let execution_evidence = seq.take_execution_evidence()?;
 
                 // TPOT histogram (PLAYBOOK § 7 definition):
                 //   tpot = (e2e − ttft) / (output_tokens − 1)
